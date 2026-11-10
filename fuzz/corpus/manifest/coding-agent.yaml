@@ -1,0 +1,78 @@
+# A coding agent working on one project directory.
+# Blast radius = ~/code/myproject (rw, in the workspace container). The harness container that
+# talks to the model has no mounts and no network; it acts only through broker tools.
+# Git hooks and .git/config stay read-only. Everything else on the host is invisible.
+# Network: only PyPI and GitHub, port 443, through the broker's proxy. DNS does not exist in the sandbox.
+# Secrets: GITHUB_TOKEN is injected by the proxy (TLS terminated only for api.github.com and
+# github.com) — as a Bearer token for the API and as Basic auth for git over HTTPS. The sandbox sees
+# only a placeholder GH_TOKEN so `gh` starts; the real value never enters.
+# Shell: every command is shown to you and waits for approval (podman exec in the workspace).
+# fetch: GET/HEAD run; anything that sends data waits for approval (fetch_writes: approve).
+# Because files and a credential meet allowed hosts, summary() opens with [data-can-leave].
+apiVersion: sallyport/v1
+kind: Manifest
+name: coding-agent
+description: Edits ~/code/myproject, installs from PyPI, talks to the GitHub API with your token, runs shell with approval.
+
+runtime:
+  image: ghcr.io/ceapf/sallyport-workspace-python@sha256:0000000000000000000000000000000000000000000000000000000000000000  # replace with the built digest
+  cpus: 6
+  memory: 12GiB
+  pids: 1024
+  timeout: 4h
+  tmp_size: 4GiB
+  tmp_exec: true        # pip builds need an executable temp dir
+
+model:
+  ref: library://qwen2.5-coder-7b-instruct-q4_k_m
+  context: 16384
+  gpu_layers: auto
+
+filesystem:
+  mounts:
+    - host: ~/code/myproject
+      guest: /workspace/myproject
+      mode: rw
+
+network:
+  mode: proxy
+  allow:
+    - host: pypi.org
+      ports: [443]
+    - host: files.pythonhosted.org
+      ports: [443]
+    - host: api.github.com
+      ports: [443]
+    - host: github.com
+      ports: [443]
+  max_request_bytes: 8MiB
+  max_response_bytes: 256MiB   # wheels
+  max_connections: 32
+
+secrets:
+  - name: GITHUB_TOKEN
+    inject:
+      host: api.github.com
+      header: Authorization
+      format: "Bearer {value}"
+    expose_env: GH_TOKEN
+  - name: GITHUB_TOKEN
+    inject:
+      host: github.com
+      header: Authorization
+      format: "Basic {basic}"
+      basic_user: x-access-token
+
+tools:
+  builtin: [fs_read, fs_list, fs_write, fs_delete, fetch, shell]
+  shell: approve
+  destructive_requires_approval: true
+  fetch_writes: approve
+  mcp: []
+
+approvals:
+  timeout: 10m
+  max_pending: 5
+
+audit:
+  level: full

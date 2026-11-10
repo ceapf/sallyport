@@ -1,0 +1,22 @@
+# Local hooks only: no third-party hook repos (supply chain). Install: pre-commit install
+repos:
+  - repo: local
+    hooks:
+      - id: fmt
+        name: cargo fmt --check
+        entry: cargo fmt --all -- --check
+        language: system
+        pass_filenames: false
+        types: [rust]
+      - id: forbid-unsafe
+        name: no unsafe
+        entry: make forbid-unsafe
+        language: system
+        pass_filenames: false
+        types: [rust]
+      - id: doctor-syntax
+        name: doctor.sh syntax
+        entry: bash -n scripts/doctor.sh
+        language: system
+        pass_filenames: false
+        files: ^scripts/doctor\.sh$

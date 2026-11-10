@@ -1,0 +1,28 @@
+{
+  "model": "opusplan",
+  "env": {
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "60",
+    "ECC_DISABLED_MCPS": "chrome-devtools"
+  },
+  "permissions": {
+    "deny": [
+      "Read(./.env*)",
+      "Read(~/.ssh/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.gnupg/**)",
+      "Read(~/.config/sallyport/secrets.toml)",
+      "Read(**/*.pem)",
+      "Read(**/id_ed25519*)",
+      "Read(**/id_rsa*)"
+    ],
+    "ask": [
+      "Bash(git push:*)",
+      "Bash(rm -rf:*)",
+      "Bash(sudo:*)",
+      "Bash(gh repo:*)",
+      "Bash(podman system:*)",
+      "Bash(podman rmi:*)",
+      "Bash(podman volume:*)"
+    ]
+  }
+}

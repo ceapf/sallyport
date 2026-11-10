@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+authors = ["The Sallyport Authors"]
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# CLAUDE.md: unwrap denied outside tests (clippy.toml allows it in tests); expect warns.
+unwrap_used = "deny"
+expect_used = "warn"
+# `indexing_slicing = "deny"` is enabled per parser module with #![deny(clippy::indexing_slicing)].
+
+[profile.release]
+# Untrusted-input parsers: arithmetic overflow must trap, never wrap silently.
+overflow-checks = true

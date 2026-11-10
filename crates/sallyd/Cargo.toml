@@ -1,0 +1,12 @@
+[package]
+name = "sallyd"
+description = "Sallyport: sallyd"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

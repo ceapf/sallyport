@@ -1,0 +1,14 @@
+---
+source: crates/sally-core/tests/snapshots.rs
+expression: "stable(&f, &summary(&v.manifest))"
+---
+[data-can-leave] Anything this agent reads — $ROOT/home/Documents/research and whatever your BRAVE_SEARCH_KEY unlocks on api.search.brave.com — can be sent to api.search.brave.com (acting as you) and any public hostname.
+This agent:
+- uses a model you pick at launch.
+- can read $ROOT/home/Documents/research (at /workspace/research); can write there with your approval; cannot delete there.
+- can reach api.search.brave.com on port 443, any public hostname on port 443 (through the Sallyport proxy only).
+- uses your BRAVE_SEARCH_KEY secret only toward api.search.brave.com (the agent never sees the value).
+- cannot run shell commands.
+- fetch can only read (GET/HEAD) without your approval.
+- may call: fs_read, fs_list, fs_write, fetch.
+- is limited to 2 CPUs, 4GiB memory, 256 processes, and 2h of wall time.

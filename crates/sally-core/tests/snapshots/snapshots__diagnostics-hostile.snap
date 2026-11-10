@@ -1,0 +1,16 @@
+---
+source: crates/sally-core/tests/snapshots.rs
+expression: "text.join(\"\\n\")"
+---
+error: filesystem.mounts[0].host: "~/.ssh" is inside $ROOT/home/.ssh — credential folders are never mountable (denylisted) [denylisted]
+error: filesystem.mounts[1].guest: "/etc" must be under /workspace/ [guest-path]
+error: network.allow[1].host: "10.0.0.1" is an IP literal; only hostnames are allowed [ip-literal]
+error: network.allow[0].host: "*" requires network.acknowledge_unrestricted_egress: true [unacknowledged-wildcard]
+error: secrets[0].inject.host: "*.github.com": host must be exact (no wildcards) [not-exact-host]
+error: secrets[0].inject.header: "Host" is reserved for the proxy [bad-header]
+error: secrets[0].inject.format: exactly one of {value} or {basic} must appear (found 2) [bad-format]
+error: tools.acknowledge_unapproved_shell: shell: allow with destructive_requires_approval: false runs every command without approval; set tools.acknowledge_unapproved_shell: true to accept this [unacknowledged-risk]
+error: tools.mcp[0].env.LD_PRELOAD: "LD_PRELOAD" changes how the workspace loads code, finds sockets, or verifies TLS; Sallyport sets these itself [invalid-value]
+error: tools.mcp[0].env.OPENAI_API_KEY: "OPENAI_API_KEY" is a secret-like env name; grant secrets via `secrets:` injection, never env [secret-like-env]
+warning: tools.shell: "allow" — shell commands run without approval at all (destructive_requires_approval is false) [risky]
+warning: network.allow: Anything this agent reads — $ROOT/home/code/myproject and whatever your GITHUB_TOKEN unlocks on *.github.com — can be sent to any public hostname. [data-can-leave]

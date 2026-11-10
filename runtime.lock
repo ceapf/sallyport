@@ -1,0 +1,14 @@
+# Pinned OCI runtime for Sallyport sandboxes (AMENDMENTS-02 B5).
+#
+# Read by scripts/doctor.sh (V14) now and by install.sh (M6). Format: KEY=value, one per line,
+# no quoting, no shell expansion. Consumers parse it; nothing sources it.
+#
+# To bump: download the release binary, CHECKSUMS and CHECKSUMS.asc; verify the signature against
+# the signer fingerprint (CRUN_SIGNER_FPR) and the SHA-256 against CHECKSUMS; update all pin
+# fields together; set PIN_DATE to the day of the bump. doctor warns when PIN_DATE is more than
+# six months old.
+CRUN_VERSION=1.30.1
+CRUN_URL=https://github.com/containers/crun/releases/download/1.30.1/crun-1.30.1-linux-amd64
+CRUN_SHA256=86d1e6a0e76945975d3aebfab39cbc6a26eea15f1c3fc66b6776d19e5dc346a0
+CRUN_SIGNER_FPR=AC404C1C0BF735C63FF4D562263D6DF2E163E1EA
+PIN_DATE=2026-11-09

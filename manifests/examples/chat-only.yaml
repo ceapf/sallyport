@@ -1,0 +1,39 @@
+# The safest session: a model you talk to. No files, no network, no tools.
+# Enforcement: no mounts → the workspace container gets no -v flags; network.mode none → no
+# shim, no net.sock; tools.builtin and tools.mcp empty → tools/list is empty and every tools/call
+# is denied. Nothing private + no outward channel → no [data-can-leave] finding.
+apiVersion: sallyport/v1
+kind: Manifest
+name: chat-only
+description: Plain chat with a local model. The sandbox can see nothing and reach nothing.
+
+runtime:
+  cpus: 2
+  memory: 2GiB
+  pids: 64
+  timeout: 8h
+
+model:
+  ref: any            # pick in the UI at launch
+  context: 8192
+  gpu_layers: auto
+
+filesystem:
+  mounts: []
+
+network:
+  mode: none
+
+secrets: []
+
+tools:
+  builtin: []
+  shell: deny
+  mcp: []
+
+approvals:
+  timeout: 5m
+  max_pending: 5
+
+audit:
+  level: actions

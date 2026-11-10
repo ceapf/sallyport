@@ -1,0 +1,36 @@
+# Rust
+/target
+**/*.rs.bk
+/target/redteam
+
+# Node
+node_modules
+dist
+
+# Python
+__pycache__
+.venv
+*.pyc
+
+# Tauri
+app/src-tauri/target
+app/src-tauri/gen
+
+# Claude Code (per-user overrides)
+.claude/settings.local.json
+
+# Secrets / env
+.env*
+
+# Model weights — never commit
+*.gguf
+*.safetensors
+
+# Image digest lock scratch
+images/digests.lock.tmp
+
+# Windows "downloaded from the internet" markers (WSL copies)
+*:Zone.Identifier
+
+# cargo-mutants output
+mutants.out*/

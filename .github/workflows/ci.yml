@@ -1,0 +1,97 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_DENY_VERSION: "0.20.2"
+  CARGO_FUZZ_VERSION: "0.13.2"
+  CARGO_NEXTEST_VERSION: "0.9.151"
+  CARGO_LLVM_COV_VERSION: "0.9.1"
+  ZIZMOR_VERSION: "1.32.0"
+  FUZZ_NIGHTLY: "nightly-2026-11-01"
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # No caches at all: nothing restored from a cache (build output or tool binary) decides a
+      # security gate. Tools are built from crates.io with --locked at a pinned version.
+      - run: cargo install cargo-nextest --locked --version "$CARGO_NEXTEST_VERSION"
+      - name: verify cargo-nextest version
+        run: cargo nextest --version | grep -Fw "$CARGO_NEXTEST_VERSION"
+      - run: make fmt clippy forbid-unsafe nextest
+  coverage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup component add llvm-tools-preview
+      - run: cargo install cargo-llvm-cov --locked --version "$CARGO_LLVM_COV_VERSION"
+      - name: verify cargo-llvm-cov version
+        run: cargo llvm-cov --version | grep -Fw "$CARGO_LLVM_COV_VERSION"
+      - run: make coverage
+  zizmor:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: cargo install zizmor --locked --version "$ZIZMOR_VERSION"
+      - name: verify zizmor version
+        run: zizmor --version | grep -Fw "$ZIZMOR_VERSION"
+      # Offline: no GitHub API token is given to the analyzer.
+      - run: make zizmor
+  deny:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: cargo install cargo-deny --locked --version "$CARGO_DENY_VERSION"
+      - name: verify cargo-deny version
+        run: cargo deny --version | grep -Fw "$CARGO_DENY_VERSION"
+      - run: make deny
+  # Fuzz smoke (required for merge): 60 s per target. Every crash becomes a regression test before
+  # its fix merges. Nightly is pinned here only; the workspace stays on rust-toolchain.toml stable.
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install "$FUZZ_NIGHTLY" --profile minimal
+      - run: cargo install cargo-fuzz --locked --version "$CARGO_FUZZ_VERSION"
+      - name: verify cargo-fuzz version
+        run: cargo fuzz --version | grep -Fw "$CARGO_FUZZ_VERSION"
+      - run: cargo "+$FUZZ_NIGHTLY" fuzz build --fuzz-dir fuzz
+      - run: make fuzz CARGO_FUZZ_TOOLCHAIN="+$FUZZ_NIGHTLY"
+      - if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+  doctor-syntax:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: bash -n scripts/doctor.sh && bash -n scripts/redact.sh
+      - run: bash tests/scripts/redact_test.sh

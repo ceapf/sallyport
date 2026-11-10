@@ -1,0 +1,436 @@
+# Sallyport — Architecture (v1)
+
+## 1. Stack, and where it departs from the original design
+
+| Layer | Choice | Notes |
+|---|---|---|
+| Broker, sandbox orchestration, model validation, proxies, CLI | **Rust** (`tokio`, `hyper` 1.x + `rustls`, `rustix` for `openat2`, `rusqlite`, `serde`, `schemars`, `clap`, `tracing`) | Memory safety exactly where untrusted bytes are parsed. `#![forbid(unsafe_code)]` in every crate. |
+| Desktop shell + UI | **Tauri v2** + React + TypeScript (Vite) | Kept. The Rust side of Tauri is a *thin client* of `sallyd`; the webview gets no fs/shell plugins. |
+| Inference | **llama.cpp `llama-server`** in our own CUDA image | Kept. Pinned commit, built with `-DCMAKE_CUDA_ARCHITECTURES="86;89;120"`, CUDA 12.9. Prebuilt images lack sm_120. |
+| Sandboxing | **Podman rootless + crun**, GPU via CDI | See THREAT_MODEL §6 for why not gVisor/microVM on WSL2 in v1. |
+| Reference harness + SDK | **Python 3.12** | Runs inside Z3; language has no security weight; maximizes moddability. |
+| Training sidecar | **deferred to v2** | Not in v1 at all. |
+
+**Two deliberate deviations from the original requirements:**
+
+1. **The broker is a separate daemon (`sallyd`), not a library inside the Tauri process.** Tauri
+   starts it as a sidecar and the CLI talks to the same socket. Reasons: the UI crashing must not
+   kill sandboxes; CLI and UI coexist; M1 is CLI-only and must not depend on Tauri; one process
+   holds secrets, not two.
+2. **"Egress proxy" is not a network proxy the sandbox can route to — the sandbox has no network.**
+   Every container runs `--network=none`. A tiny static binary (`sally-shim`) inside the agent
+   sandbox listens on `127.0.0.1:3128` and forwards each TCP connection over a bind-mounted Unix
+   socket to `sallyd`, which speaks HTTP-proxy (CONNECT / absolute-form) and applies policy. This
+   kills DNS exfiltration, raw-socket exfiltration and any "find the gateway" tricks by
+   construction, and it needs zero iptables, which rootless Podman can't give us anyway.
+
+## 2. Components
+
+```mermaid
+flowchart LR
+    subgraph host["Host (WSL2 Ubuntu) — your UID"]
+        direction TB
+        tauri["Tauri app<br/>(React UI + thin Rust bridge)"]
+        cli["sally CLI"]
+        subgraph sallyd["sallyd (one process)"]
+            rpc["rpc: control.sock + per-session agent.sock<br/>JSON-RPC 2.0 / NDJSON"]
+            sess["session manager"]
+            man["manifest loader + validator"]
+            sbx["sandbox driver (podman CLI)<br/>profiles: inference / agent"]
+            infer["infer router<br/>→ llama-server over infer.sock"]
+            tools["tool router<br/>fs.* (openat2) · fetch · shell (podman exec)"]
+            appr["approval queue"]
+            egress["egress proxy + token proxy<br/>(hyper + rustls)"]
+            secrets["secrets store (0600)"]
+            lib["model library<br/>sqlite + blobs/sha256/*"]
+            hf["HF client + downloader<br/>quarantine → verify → promote"]
+            audit["audit writer (hash chain)"]
+        end
+    end
+    subgraph z2["Z2 inference container"]
+        ls["llama-server --host /run/sallyport/infer.sock"]
+    end
+    subgraph z3["Z3 agent container"]
+        harness["harness (Python SDK)"]
+        mcp["MCP stdio servers"]
+        shim["sally-shim :3128 → net.sock"]
+    end
+    tauri --> rpc
+    cli --> rpc
+    rpc --> sess
+    sess --> man & sbx & infer & tools & appr & egress & audit
+    sbx -. podman run .-> z2 & z3
+    infer <--> ls
+    harness <--> rpc
+    harness --> mcp
+    harness -. HTTP_PROXY .-> shim
+    shim --> egress
+    tools --> appr
+    egress --> secrets
+    hf --> lib
+    lib -. ro mount .-> ls
+```
+
+### 2.1 `sallyd` modules (crate `sallyd`, library crate `sally-core` for pure logic)
+
+| Module | Responsibility | Trust-critical? |
+|---|---|---|
+| `sally-core::manifest` | Parse (strict), validate (denylist, realpath, wildcard rules, secret refs), summarize (plain English), JSON Schema export | **yes** |
+| `sally-core::model::{gguf,safetensors,detect,hash,import}` | Format detection by magic, bounded parsers, SHA-256, zip import hardening, fit estimation | **yes** |
+| `sally-core::audit` | Hash-chained NDJSON writer, verifier, redaction of secret values and oversize args | yes |
+| `sally-core::secrets` | Load/store 0600 TOML; `Secret` newtype with redacted `Debug`, `zeroize` on drop; name-only references everywhere else | **yes** |
+| `sally-core::hf` | HF Hub API client (search, repo files with LFS sha256, Range fetch of GGUF header), resumable downloader to quarantine | no (but handles untrusted bytes → bounded) |
+| `sally-core::library` | SQLite index of blobs; content-addressed store; immutability (`chmod 0444`) | yes |
+| `sallyd::sandbox` | Build `podman run` argv from manifest + profile; mount prep (realpath re-check, socket dirs); launch/exec/kill/wait; image digest check | **yes** |
+| `sallyd::rpc` | Two listeners: `control.sock` (trusted methods) and per-session `agent.sock` (restricted methods); NDJSON framing; `SO_PEERCRED` UID check; request size limits | **yes** |
+| `sallyd::session` | Lifecycle: validate → ensure inference loaded → create socket dir → launch agent → wire → monitor → teardown (always, even on panic — `Drop` guard) | yes |
+| `sallyd::infer` | Pool of at most one loaded model (v1); start/stop inference container; forward OpenAI-compatible requests over `infer.sock`; validate request JSON (allowed fields, size caps); stream back | yes |
+| `sallyd::tools::{fs,fetch,shell}` | Brokered tools with policy + approvals | **yes** |
+| `sallyd::approvals` | Queue, canonicalization, rendering sanitization, single-use IDs, timeout, flood control, notifications to UI/CLI | **yes** |
+| `sallyd::egress::{server,policy,inject}` | Accept streams from `net.sock`; parse proxy requests (bounded); policy decision; resolve → filter → pinned connect; CONNECT splice; absolute-form forwarding with optional injection + TLS upgrade + redaction | **yes** |
+| `sally-shim` (separate crate, musl static) | `listen tcp 127.0.0.1:3128 → connect unix /run/sallyport/net.sock`, one UDS connection per TCP connection, bidirectional copy, nothing else | low (dumb, inside Z3) |
+| `sally-proto` | Shared request/response types; `ts-rs` generates TypeScript for the UI | no |
+| `sally` CLI | `doctor`, `manifest validate`, `models …`, `secrets …`, `sandbox run`, `run`, `chat`, `approvals`, `audit tail\|verify`, `sessions …` | no |
+
+## 3. Process and sandbox layout
+
+### 3.1 Host filesystem
+```
+~/.config/sallyport/
+  config.toml                 # paths, podman binary, image digests; [sandbox] runtime, runtime_path
+  secrets.toml                # 0600; name = "value"
+  manifests/*.yaml            # user manifests
+~/.local/share/sallyport/
+  library/library.db          # sqlite
+  library/blobs/sha256/<hex>  # immutable 0444 model files
+  library/quarantine/<uuid>/  # downloads before verification
+  audit/audit-YYYYMM.jsonl    # hash-chained
+  logs/
+  bin/crun -> crun-<version>  # pinned upstream OCI runtime (static, signature-verified); the
+                              # default sandbox.runtime_path. Never the distro crun (AMENDMENTS-02 B5)
+$XDG_RUNTIME_DIR/sallyport/
+  control.sock                # 0600; CLI + UI
+  infer/<instance-id>/infer.sock   # created by llama-server inside Z2
+  sessions/<session-id>/agent.sock # created by sallyd, mounted into Z3
+  sessions/<session-id>/net.sock   # created by sallyd, mounted into Z3 (proxy mode only)
+```
+
+### 3.2 Inference container (Z2) — `podman run` argv (normative)
+```
+podman run --rm --name sp-infer-<id>
+  --network=none --no-hosts          # NOT --dns=none: Podman 4.9 rejects it with --network=none (preflight V4); none mode already yields no resolv.conf
+  --read-only --read-only-tmpfs=false
+  --tmpfs /tmp:rw,noexec,nosuid,nodev,size=256m
+  --cap-drop=ALL --security-opt=no-new-privileges
+  --security-opt seccomp=<profiles/seccomp-inference.json>
+  --security-opt label=disable
+  --userns=keep-id --user <uid>:<gid>
+  --pids-limit 64 --cpus <n> [--memory <m>]      # memory optional: mmap'd weights count as page cache
+  --init --env-host=false
+  --device nvidia.com/gpu=all
+  -v <blobs>/sha256/<hex>:/models/model.gguf:ro,nosuid,nodev
+  -v $XDG_RUNTIME_DIR/sallyport/infer/<id>:/run/sallyport:rw,nosuid,nodev
+  ghcr.io/<org>/sallyport-inference@sha256:<digest>
+  llama-server --host /run/sallyport/infer.sock -m /models/model.gguf
+               -ngl <n> -c <ctx> --jinja --no-webui -np 1 --log-disable
+```
+Nothing else is mounted. No `--slot-save-path`, no `--models-dir`. The container cannot open any
+file it wasn't handed.
+
+### 3.3 Agent container (Z3)
+```
+podman run --rm --name sp-agent-<id>
+  --network=none --no-hosts
+  --read-only --read-only-tmpfs=false
+  --tmpfs /tmp:rw,[no]exec,nosuid,nodev,size=<tmp_size>
+  --cap-drop=ALL --security-opt=no-new-privileges
+  --security-opt seccomp=<profiles/seccomp-agent.json>
+  --security-opt label=disable
+  --userns=keep-id --user <uid>:<gid>
+  --pids-limit <pids> --cpus <cpus> --memory <memory>
+  --init --env-host=false --hostname sandbox
+  --env SALLY_SESSION_SOCK=/run/sallyport/agent.sock
+  --env SALLY_MCP_SERVERS=<json>
+  [--env HTTP_PROXY=http://127.0.0.1:3128 --env HTTPS_PROXY=… --env ALL_PROXY=… --env NO_PROXY= ]   # proxy mode
+  -v <host>:<guest>:<ro|rw>,nosuid,nodev            # per manifest mount (brokered → ro)
+  -v $XDG_RUNTIME_DIR/sallyport/sessions/<id>:/run/sallyport:rw,nosuid,nodev   # agent.sock [+ net.sock]
+  ghcr.io/<org>/sallyport-harness-python@sha256:<digest>
+  /opt/sallyport/entry        # starts sally-shim (proxy mode) then exec's the harness
+```
+
+### 3.4 Seccomp
+Start from `containers-common`'s default profile and **remove**: `mount, umount2, pivot_root,
+chroot, ptrace, process_vm_readv, process_vm_writev, keyctl, add_key, request_key, bpf,
+perf_event_open, userfaultfd, io_uring_setup, io_uring_enter, io_uring_register, unshare,
+setns, kexec_load, kexec_file_load, reboot, swapon, swapoff, init_module, finit_module,
+delete_module, acct, settimeofday, clock_settime, mknod, mknodat, personality, uselib,
+vhangup, quotactl, lookup_dcookie, nfsservctl, open_by_handle_at, name_to_handle_at`. The
+inference profile additionally removes `socket, connect, bind, listen` for `AF_INET/AF_INET6`
+(argument filter; AF_UNIX stays). Profiles are files in `profiles/` and are tested (RT-FS-07, 09).
+
+## 4. Broker API
+
+Transport: JSON-RPC 2.0, newline-delimited JSON over Unix stream sockets. Max frame 1 MiB
+(control) / 256 KiB (agent) except `infer.complete` bodies (4 MiB). Notifications stream events.
+Errors use JSON-RPC codes plus `data.reason`.
+
+### 4.1 `control.sock` — trusted clients (CLI, Tauri)
+
+| Method | Purpose |
+|---|---|
+| `doctor.run` | environment checks (returns the V1–V9 table results) |
+| `manifests.list` / `manifests.get` / `manifests.validate` / `manifests.save` / `manifests.summary` | manifest CRUD + plain-English summary |
+| `models.list` / `models.inspect` / `models.import` (path) / `models.remove` / `models.fit` (model, ctx) | library |
+| `hf.search` (query, filters) / `hf.files` (repo, revision) / `hf.pull` (repo, file) → job id | Hugging Face |
+| `jobs.list` / `jobs.cancel`; notification `job.progress` | long-running work |
+| `infer.load` (model) / `infer.unload` / `infer.status` | inference lifecycle |
+| `chat.complete` (session-less chat using the loaded model; same body as `infer.complete`) | Chat screen |
+| `sessions.create` (manifest, task, model?) / `sessions.list` / `sessions.stop` / `sessions.attach` | agent sessions |
+| `ui.send` (session, text) — user → harness; notification `ui.message` — harness → user | chat with an agent |
+| `approvals.list` / `approvals.decide` (id, approve\|deny\|deny_all_session); notification `approval.requested` / `approval.flood` | gate |
+| `secrets.set` (name, value) / `secrets.list` (names only) / `secrets.remove` | store; values are write-only |
+| `audit.tail` (filter, follow) / `audit.verify` | log |
+
+### 4.2 `agent.sock` — untrusted client (the harness). **Method table is a strict allowlist.**
+
+| Method | Behavior |
+|---|---|
+| `session.info` | task text, manifest summary, tool list, model name |
+| `infer.complete` (OpenAI chat-completion body) | validated (allowed fields, max tokens ≤ manifest, size cap) and forwarded to Z2; streamed back as `infer.delta` notifications then `infer.done` |
+| `tools.list` | tools granted by manifest, with JSON schemas |
+| `tools.call` (name, args) | dispatch → policy → (approval) → execute → result. Returns `{status: "ok"\|"denied"\|"pending", approval_id?}`; on pending, a later notification `tools.result` carries the outcome |
+| `ui.post` (text) / `ui.next_input` (blocking, timeout) | converse with the user through the UI/CLI |
+| `audit.note` (text ≤ 4 KiB) | harness may annotate its own trail (rate-limited) |
+
+Everything else → `-32601`. The `net.sock` stream channel is not JSON-RPC; it carries raw proxy
+connections from the shim.
+
+### 4.3 Built-in tools (brokered)
+
+| Tool | Args | Policy |
+|---|---|---|
+| `fs.list` | `{path}` | path must resolve inside a mount; `ro\|rw\|brokered` all allowed |
+| `fs.read` | `{path, offset?, len?}` | same; size cap |
+| `fs.write` | `{path, content_b64}` | `brokered` mounts only (rw mounts: write directly in the sandbox); `approve.writes` globs → pending |
+| `fs.delete` | `{path}` | `brokered` only; `approve.deletes` globs → pending |
+| `fetch` | `{url, method?, headers?, body?}` | goes through the same egress policy + injection as the proxy; response capped and redacted |
+| `shell` | `{cmd: [..], cwd?}` | `deny` → denied; `approve` → pending; `allow` → run unless destructive-tagged; executes via `podman exec` **inside the same Z3 container**, output streamed, capped |
+
+All `fs.*` paths are resolved relative to the mount's pinned `O_PATH` fd with
+`openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)`.
+
+## 5. Data flows
+
+### 5.1 Pull a model from Hugging Face
+```mermaid
+sequenceDiagram
+    participant UI
+    participant D as sallyd
+    participant HF as Hugging Face
+    participant LIB as library
+    UI->>D: hf.files(repo)
+    D->>HF: GET /api/models/{repo}?blobs=true (HF token from store, host only)
+    HF-->>D: siblings[] {rfilename, size, lfs.sha256}
+    D->>HF: GET resolve/{file} Range: 0-4194303 (GGUF header only)
+    D-->>UI: quants with sizes, metadata, fit badge (VRAM/RAM estimate)
+    UI->>D: hf.pull(repo, file)
+    D->>D: check free disk ≥ size + 5%
+    D->>HF: GET resolve/{file} (resumable) → quarantine/<uuid>/
+    D->>D: ext allowlist → magic → strict header parse → sha256 == lfs.sha256?
+    alt any check fails
+        D->>D: delete quarantine, audit model.refuse(reason)
+        D-->>UI: error with reason
+    else ok
+        D->>LIB: mv → blobs/sha256/<hex>, chmod 0444, insert row
+        D-->>UI: job.done; audit model.import
+    end
+```
+
+### 5.2 Agent tool call with approval
+```mermaid
+sequenceDiagram
+    participant H as harness (Z3)
+    participant D as sallyd
+    participant U as user (UI/CLI)
+    participant C as podman exec (Z3)
+    H->>D: tools.call shell {cmd:["rm","-rf","build/"]}
+    D->>D: manifest.tools.shell == approve → canonicalize → audit tool.pending
+    D-->>H: {status: pending, approval_id}
+    D-->>U: approval.requested {id, rendered (escaped), risk_tags:[destructive]}
+    U->>D: approvals.decide(id, approve)
+    D->>D: id single-use ✓, not expired ✓, args from *broker's* stored copy
+    D->>C: podman exec sp-agent-<id> rm -rf build/
+    C-->>D: exit code, stdout/err (capped)
+    D->>D: audit tool.executed
+    D-->>H: tools.result {approval_id, exit, output}
+```
+
+### 5.3 Egress with credential injection
+```mermaid
+sequenceDiagram
+    participant P as pip / fetch tool / curl (Z3)
+    participant S as sally-shim (Z3)
+    participant E as egress proxy (sallyd)
+    participant X as api.github.com
+    P->>S: GET http://api.github.com/user  (HTTP_PROXY=127.0.0.1:3128)
+    S->>E: new UDS connection, bytes copied
+    E->>E: parse request-target → authority api.github.com:80→443 rule? allowed ✓
+    E->>E: secrets map has api.github.com → inject "Authorization: Bearer ****"; strip client Authorization; strip Accept-Encoding
+    E->>E: resolve → filter (no loopback/private) → pin IP
+    E->>X: TLS (rustls, SNI api.github.com) GET /user
+    X-->>E: 200 body
+    E->>E: redact any occurrence of the secret value; do not follow 3xx
+    E-->>S: response
+    S-->>P: response
+    E->>E: audit egress.allow {host, port, bytes_in, bytes_out, injected: GITHUB_TOKEN}
+```
+For `CONNECT host:443` (TLS from the client) the proxy applies policy and splices bytes; no
+injection is possible or attempted.
+
+### 5.4 Session start
+`sessions.create` → validate manifest (again) → resolve model → `infer.load` if needed (Z2 up,
+health check over `infer.sock`) → create session dir + `agent.sock` (+ `net.sock`) → re-check
+mounts (TOCTOU) → `podman run` Z3 → wait for harness `session.info` within 30 s → `running`.
+Teardown on stop/timeout/crash: `podman kill`, remove session dir, audit `session.stop`.
+
+## 6. Repository structure
+
+```
+sallyport/
+├── CLAUDE.md
+├── THREAT_MODEL.md
+├── SECURITY.md                      # M6
+├── README.md
+├── Cargo.toml                       # workspace; [workspace.lints] forbid unsafe, clippy pedantic subset
+├── rust-toolchain.toml              # pinned stable
+├── deny.toml                        # cargo-deny: licenses, advisories, bans
+├── Makefile                         # dev, test, redteam, redteam-gpu, images, lint
+├── crates/
+│   ├── sally-core/                  # manifest, model parsers, audit, secrets, hf, library (no I/O side effects beyond fs)
+│   ├── sallyd/                      # daemon: rpc, session, sandbox, infer, tools, approvals, egress
+│   ├── sally-cli/                   # `sally`
+│   ├── sally-shim/                  # static musl binary, std only
+│   └── sally-proto/                 # shared types + ts-rs export
+├── harness/
+│   └── python/
+│       ├── sallyport_sdk/           # Session, chat(), tools, ui
+│       ├── reference_harness/       # ReAct loop
+│       └── tests/
+├── images/
+│   ├── inference/Containerfile      # pinned llama.cpp commit, CUDA 12.9, arch 86;89;120
+│   ├── inference-cpu/Containerfile  # CI + non-NVIDIA
+│   ├── harness-python/Containerfile # python:3.12-slim@sha256, non-root, SDK, sally-shim
+│   └── build.sh                     # builds, records digests into images/digests.lock
+├── profiles/
+│   ├── seccomp-agent.json
+│   └── seccomp-inference.json
+├── manifests/
+│   ├── schema/manifest.v1.schema.json   # generated
+│   └── examples/{chat-only,coding-agent,web-research}.yaml
+├── app/                             # Tauri v2 + React/TS (M5)
+│   ├── src/                         # React
+│   └── src-tauri/                   # thin bridge: spawn sallyd sidecar, forward allowlisted RPC
+├── tests/
+│   ├── redteam/
+│   │   ├── REDTEAM_SUITE.md
+│   │   ├── harness/                 # Rust integration test runner: launch sandbox from fixture manifest, run attack, assert
+│   │   ├── attacks/                 # shell/python attack scripts executed inside Z3
+│   │   ├── fixtures/manifests/      # manifests per test
+│   │   ├── corpus/                  # malicious GGUF/safetensors/zip generators (python, run on host)
+│   │   └── mock_upstream/           # TLS mock server (echo, gzip echo, redirect) for SEC tests
+│   └── e2e/                         # GPU-local end-to-end (tiny model)
+├── fuzz/                            # cargo-fuzz targets: gguf, safetensors, manifest, proxy request parser
+├── scripts/
+│   ├── doctor.sh                    # V1–V9 checks (also surfaced via `sally doctor`)
+│   └── install.sh                   # M6
+├── docs/
+│   ├── 00_DECISIONS.md  01_SCOPE.md  ARCHITECTURE.md  MANIFEST_SPEC.md  MILESTONES.md
+│   └── reports/M*.md                # written by Claude Code at each milestone end
+└── .github/workflows/
+    ├── ci.yml                       # fmt, clippy -D warnings, test, cargo-deny, python lint/tests, ts lint/tests
+    └── redteam.yml                  # rootless podman on ubuntu-24.04; make redteam; fails on any attack success
+```
+
+## 7. Key implementation notes
+
+- **Verified on the dev machine (preflight 2026-11-09, `docs/reports/M0-preflight.md`)**: Podman
+  4.9.3 + crun 1.14.1 rootless; GPU via CDI works rootless (spec auto-generated by
+  `nvidia-cdi-refresh.service` into `/var/run/cdi/nvidia.yaml` — never generate a second copy by
+  hand); `--network=none` leaves `lo` up and no `resolv.conf`; Unix sockets cross bind mounts in
+  both directions under `--userns=keep-id`; `openat2` with `RESOLVE_BENEATH` works on kernel
+  6.18 (first verified on 5.15.167); HF exposes the hash at `siblings[].lfs.sha256`. Minimum supported Podman is 4.9.
+  Resource limits require cgroup v2, which on WSL2 needs `kernelCommandLine = cgroup_no_v1=all`
+  in `.wslconfig` — `sally doctor` must check `podman info` reports `cgroups=v2` and fail loudly
+  otherwise, because Podman silently *drops* `--memory`/`--pids-limit` on v1.
+- **OCI runtime**: every `podman` call carries `--runtime <sandbox.runtime_path>`, which
+  `sally_core::config::check_runtime_binary` has checked (regular executable, owned by the user or
+  root, neither it nor its directory writable by group/others). The default is the pinned
+  upstream crun (1.30.1 on the dev machine, minimum 1.25.1); doctor V1–V5 and V13 run with it,
+  V14 reports its provenance. The distro crun 1.14.1 is never used.
+- **Podman invocation**: shell out to the `podman` binary with `tokio::process::Command` and an
+  argv built by a pure function `profile::argv(&Manifest, &SessionPaths) -> Vec<OsString>` that is
+  unit-tested by snapshot (RT-SUP-01 also asserts digest pinning on it). No REST API in v1.
+- **Unix socket bidirectionality with `--userns=keep-id`**: host UID == container UID, so
+  `llama-server` can create `infer.sock` in a bind-mounted dir and `sallyd` can connect, and vice
+  versa for `agent.sock`. Verify in M1 (V5).
+- **VRAM fit estimate** (GGUF metadata keys `general.architecture`, `<arch>.block_count`,
+  `<arch>.embedding_length`, `<arch>.attention.head_count`, `<arch>.attention.head_count_kv`):
+  `weights = file_size`; `kv = 2 * n_layer * ctx * n_head_kv * (n_embd / n_head) * 2 bytes` (f16
+  cache); `overhead ≈ 600 MiB` (CUDA context + compute buffers); fits if
+  `weights + kv + overhead ≤ 0.92 * VRAM`. Partial offload: `gpu_layers = floor((0.92*VRAM - kv -
+  overhead) / (weights / n_layer))`. RAM check: `weights + kv ≤ 0.8 * free RAM` for CPU fallback.
+  Show three states: **Fits on GPU** / **Partial (N of L layers)** / **CPU only** / **Won't fit**.
+  Calibrate against real llama-server VRAM readings in M3 and adjust the constant.
+- **GGUF strict parser limits**: magic `GGUF`, version ∈ {2,3}, `tensor_count ≤ 65 536`,
+  `kv_count ≤ 4 096`, string len ≤ 65 536 B, array len ≤ 4 194 304, nested arrays depth ≤ 2,
+  tensor name ≤ 64 B and unique, `n_dims ≤ 4`, dims product via `checked_mul`, valid ggml type,
+  offset aligned to `general.alignment` (default 32, must be power of two ≤ 65 536),
+  `data_start + offset + nbytes ≤ file_len`. Parse header + tensor infos only; never read tensor
+  data; never allocate proportional to an untrusted count before bounds are checked.
+- **Safetensors strict check**: `header_len ≤ 100 MiB` and `8 + header_len ≤ file_len`; header is
+  a JSON object; each entry has known `dtype`, `shape` (`checked_mul`), `data_offsets` ascending,
+  contiguous, within `file_len - 8 - header_len`; `__metadata__` values are strings.
+- **Proxy request parsing**: hand-written, bounded (request line ≤ 8 KiB, headers ≤ 64 KiB, ≤ 100
+  headers), reject anything that isn't `CONNECT authority` or absolute-form `http://` with
+  `Host` matching the authority. Reject `Transfer-Encoding` + `Content-Length` conflicts
+  (smuggling). Only HTTP/1.1.
+- **Approval rendering**: escape all C0/C1 controls and `\x1b`, strip Unicode bidi overrides
+  (U+202A–U+202E, U+2066–U+2069), NFC-normalize, cap at 2 000 chars with an explicit
+  `… (+N bytes, sha256 …)` tail. Paths shown as *host realpath* **and** guest path.
+- **Audit entry**: `{seq, ts, session, actor: user|harness|sallyd, event, decision, args
+  (redacted, ≤ 4 KiB, sha256 of full), prev_hash, hash}` with `hash = sha256(prev_hash ||
+  canonical_json(entry_without_hash))`. Monthly files; chain continues across files via the first
+  entry's `prev_hash`.
+- **Tauri bridge**: Rust side exposes one command `rpc(method: String, params: Value)` that
+  forwards to `control.sock` **only** for methods in a compile-time allowlist (no
+  `secrets.list` of values exists anyway). Capabilities file grants `core:default` only.
+  `WEBKIT_DISABLE_DMABUF_RENDERER=1` set at the top of `main()` on Linux. Markdown via
+  `react-markdown` + `rehype-sanitize` (default schema minus `img`), no `rehype-raw`.
+
+## 8. CI and tooling
+
+Required on every PR (`.github/workflows/ci.yml`; every action pinned by commit SHA, default
+`permissions: contents: read`, **no caches**: no build output or tool binary restored from a
+cache decides a gate, because a poisoned cache entry would print whatever version it is asked for.
+Tools are built with `cargo install --locked --version <pinned>`; a later speed-up may switch to
+upstream release binaries checked against committed SHA-256 sums):
+
+| Job | Gate |
+|---|---|
+| `rust` | `make fmt clippy forbid-unsafe nextest` (cargo-nextest, plus doctests) |
+| `deny` | `cargo deny check` for the workspace and `fuzz/` |
+| `coverage` | `make coverage`: cargo-llvm-cov, `sally-core` ≥ 90 % lines (sallyd policy/approvals/egress ≥ 85 % once they exist) |
+| `fuzz` | 60 s per cargo-fuzz target on a pinned nightly |
+| `zizmor` | GitHub Actions static analysis, offline, no findings at `low` or above |
+| `doctor-syntax` | `bash -n scripts/doctor.sh` |
+
+Nightly (`nightly.yml`): `make mutants`, cargo-mutants over the deny paths
+(`manifest::validate`, `paths`, `host`, `config` today; `egress::policy`, `approvals`, `tools::fs`
+as they land) with a **zero-survivor gate**: a surviving mutant in a deny path is an untested
+control. cargo-mutants runs with `TMPDIR` under `target/` because `/tmp` is denylisted.
+
+Dev-dependencies: `insta` (summary and diagnostic snapshots; review changes with
+`cargo insta review`) and `proptest` (wildcard matcher, host-pattern round trip; redaction
+windows in task 9b). Dependabot opens weekly PRs for cargo (workspace and `fuzz/`) and GitHub
+Actions; nothing auto-merges. Release provenance (build attestations, cosign) is M6.
+

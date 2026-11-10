@@ -1,0 +1,26 @@
+# Fuzz targets (cargo-fuzz). Not a workspace member: libFuzzer needs nightly + sanitizers, the
+# workspace builds on pinned stable. CI runs each target for 60 s (see .github/workflows/ci.yml).
+[package]
+name = "sallyport-fuzz"
+version = "0.0.0"
+authors = ["The Sallyport Authors"]
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+sally-core = { path = "../crates/sally-core", version = "0.1.0" }
+
+# Detach from the root workspace.
+[workspace]
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,5 @@
+apiVersion: sallyport/v1
+kind: Manifest
+name: t
+model:
+  ref: any

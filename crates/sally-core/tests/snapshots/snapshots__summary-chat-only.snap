@@ -1,0 +1,11 @@
+---
+source: crates/sally-core/tests/snapshots.rs
+expression: "stable(&f, &summary(&v.manifest))"
+---
+This agent:
+- uses a model you pick at launch.
+- sees no host files.
+- has no network access.
+- cannot run shell commands.
+- is audited at reduced detail (every action and connection is still recorded; per-request HTTP lines, file reads, and inference metadata are not).
+- is limited to 2 CPUs, 2GiB memory, 64 processes, and 8h of wall time.

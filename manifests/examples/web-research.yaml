@@ -1,0 +1,61 @@
+# A web research agent. It may read the whole web (acknowledged risk: anything it can read, it
+# could also leak to — the audit log records every host and byte count). It writes findings to a
+# notes directory, but that mount is `brokered`: the workspace sees it read-only, and every write
+# goes through the broker and needs your approval (omitting approve globs means "approve
+# everything"). No shell at all. summary() opens with [data-can-leave]: the notes and whatever the
+# search key unlocks could be sent to any host.
+apiVersion: sallyport/v1
+kind: Manifest
+name: web-research
+description: Searches and reads the web, drafts notes into ~/Documents/research with your approval. No shell, no code execution tools.
+
+runtime:
+  cpus: 2
+  memory: 4GiB
+  pids: 256
+  timeout: 2h
+
+model:
+  ref: any
+  context: 32768
+  gpu_layers: auto
+
+filesystem:
+  mounts:
+    - host: ~/Documents/research
+      guest: /workspace/research
+      mode: brokered
+      approve:
+        writes: ["**"]
+        deletes: ["**"]      # deletes are additionally refused if fs_delete is not in tools.builtin (it isn't)
+
+network:
+  mode: proxy
+  allow:
+    - host: api.search.brave.com
+      ports: [443]
+    - host: "*"              # any other hostname, 443 only; IP literals and private ranges still denied
+      ports: [443]
+  acknowledge_unrestricted_egress: true
+  max_request_bytes: 1MiB
+  max_response_bytes: 16MiB
+  max_connections: 16
+
+secrets:
+  - name: BRAVE_SEARCH_KEY
+    inject:
+      host: api.search.brave.com
+      header: X-Subscription-Token
+      format: "{value}"
+
+tools:
+  builtin: [fs_read, fs_list, fs_write, fetch]
+  shell: deny
+  mcp: []
+
+approvals:
+  timeout: 5m
+  max_pending: 3
+
+audit:
+  level: full
