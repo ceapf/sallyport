@@ -105,58 +105,81 @@ flowchart LR
   library/blobs/sha256/<hex>  # immutable 0444 model files
   library/quarantine/<uuid>/  # downloads before verification
   audit/audit-YYYYMM.jsonl    # hash-chained; audit.head = newest {seq, hash}; audit.lock
+  sessions/<id>/stage/<n>/{upper,work}   # staged mount n: kept for `sally session changes`
+  sessions/<id>/git/<k>/{upper,work}     # .git overlays of rw mounts: discarded at teardown
   logs/
   bin/crun -> crun-<version>  # pinned upstream OCI runtime (static, signature-verified); the
                               # default sandbox.runtime_path. Never the distro crun (AMENDMENTS-02 B5)
 $XDG_RUNTIME_DIR/sallyport/
   control.sock                # 0600; CLI + UI
   infer/<instance-id>/infer.sock   # created by llama-server inside Z2
-  sessions/<session-id>/agent.sock # created by sallyd, mounted into Z3
-  sessions/<session-id>/net.sock   # created by sallyd, mounted into Z3 (proxy mode only)
+  sessions/<session-id>/workspace/net.sock   # created by sallyd, workspace role only (proxy mode)
+  sessions/<session-id>/harness/{llm,agent}.sock   # created by sallyd, harness role only
 ```
 
-### 3.2 Inference container (Z2) — `podman run` argv (normative)
+### 3.2 `podman run` argv: common prologue (normative)
+Built by the pure `sallyd::sandbox::{workspace,harness,inference}_argv` (one container per role,
+AMENDMENTS-01 §2). Every builder checks its own output with `check_argv`, an **allowlist**: only
+the options below, each with a value of the expected shape, the hardening flags exactly once,
+`-v` sources only under validated mount roots or the session's own directories, and the image
+pinned by digest. The snapshots in `crates/sallyd/tests/snapshots/` are the normative examples.
 ```
-podman run --rm --name sp-infer-<id>
-  --network=none --no-hosts          # NOT --dns=none: Podman 4.9 rejects it with --network=none (preflight V4); none mode already yields no resolv.conf
+podman --runtime <checked runtime_path>          # AMENDMENTS-02 B5: never the distro crun
+  run --rm --name sp-{ws|h|infer}-<id>
+  --pull=never --http-proxy=false --log-driver=none --ulimit core=0   # AMENDMENTS-01 §6.1
+  --network=none --no-hosts          # NOT --dns=none: Podman 4.9 rejects it with --network=none (preflight V4)
   --read-only --read-only-tmpfs=false
-  --tmpfs /tmp:rw,noexec,nosuid,nodev,size=256m
   --cap-drop=ALL --security-opt=no-new-privileges
-  --security-opt seccomp=<profiles/seccomp-inference.json>
+  --security-opt seccomp=<profiles>/seccomp-{workspace|harness|inference}.json
   --security-opt label=disable
   --userns=keep-id --user <uid>:<gid>
-  --pids-limit 64 --cpus <n> [--memory <m>]      # memory optional: mmap'd weights count as page cache
-  --init --env-host=false
-  --device nvidia.com/gpu=all
-  -v <blobs>/sha256/<hex>:/models/model.gguf:ro,nosuid,nodev
-  -v $XDG_RUNTIME_DIR/sallyport/infer/<id>:/run/sallyport:rw,nosuid,nodev
-  ghcr.io/<org>/sallyport-inference@sha256:<digest>
+```
+Bind mounts are `<host>:<guest>:{ro|rw},nosuid,nodev,bind` (`bind` = non-recursive). Overlays
+are `<host>:<guest>:O,upperdir=<scratch>/upper,workdir=<scratch>/work` with nothing else: Podman
+4.9.3 refuses other options next to `O` (probed in Task 6a), so overlays are not `nosuid,nodev`;
+`no-new-privileges`, `--cap-drop=ALL` and the seccomp profile keep set-id files and device nodes
+inert there.
+
+### 3.3 Per role
+**Workspace** (mounts, egress socket, toolchain; idles until the broker execs into it):
+```
+  --tmpfs /tmp:rw,{noexec|exec},nosuid,nodev,size=<tmp_size>
+  --pids-limit <pids> --cpus <cpus> --memory <memory>b
+  --init --env-host=false --hostname sandbox
+  [--env {HTTP,HTTPS,ALL}_PROXY=http://127.0.0.1:3128 (and lowercase) --env NO_PROXY= --env no_proxy=]   # proxy mode
+  [--env {SSL_CERT_FILE,REQUESTS_CA_BUNDLE,CURL_CA_BUNDLE,GIT_SSL_CAINFO,PIP_CERT,CARGO_HTTP_CAINFO,AWS_CA_BUNDLE}=/run/sallyport/ca-bundle.pem
+   --env NODE_EXTRA_CA_CERTS=/run/sallyport/session-ca.pem]                                            # proxy mode + secrets
+  [--env <expose_env>=sallyport-placeholder]
+  -v <host>:<guest>:ro,…        # ro and brokered
+  -v <host>:<guest>:rw,…        # rw, then for each .git directory the launch scan found (AMENDMENTS-02 B2(a)):
+  -v <host>/<rel>/.git:<guest>/<rel>/.git:O,upperdir=<data>/sessions/<id>/git/<k>/upper,workdir=…/work
+  -v <host>/<rel>/.git:<guest>/<rel>/.git:ro,…                 # .git files (worktree/submodule pointers)
+  -v <host>:<guest>:O,upperdir=<data>/sessions/<id>/stage/<n>/upper,workdir=…/work      # staged (B2(b))
+  -v $XDG_RUNTIME_DIR/sallyport/sessions/<id>/workspace:/run/sallyport:rw,…               # net.sock + CA bundle
+  <runtime.image or bundled workspace image>@sha256:<digest> /opt/sallyport/entry --idle
+```
+**Harness** (no mounts, no egress, no GPU; fixed 1 CPU, 1 GiB, 128 pids):
+```
+  --tmpfs /tmp:rw,noexec,nosuid,nodev,size=256MiB --pids-limit 128 --cpus 1 --memory 1GiB
+  --init --env-host=false --hostname sandbox
+  --env OPENAI_BASE_URL=http://127.0.0.1:8080/v1 --env OPENAI_API_KEY=sallyport
+  -v $XDG_RUNTIME_DIR/sallyport/sessions/<id>/harness:/run/sallyport:rw,…                 # llm.sock, agent.sock
+  <harness.image or bundled harness image>@sha256:<digest> /opt/sallyport/entry
+```
+**Inference** (GPU, one read-only model file):
+```
+  --tmpfs /tmp:rw,noexec,nosuid,nodev,size=256MiB --pids-limit 64 --cpus <n> [--memory <m>b]
+  --init --env-host=false [--device nvidia.com/gpu=all]
+  -v <blobs>/sha256/<hex>:/models/model.gguf:ro,…
+  -v $XDG_RUNTIME_DIR/sallyport/infer/<id>:/run/sallyport:rw,…
+  <inference image>@sha256:<digest>
   llama-server --host /run/sallyport/infer.sock -m /models/model.gguf
                -ngl <n> -c <ctx> --jinja --no-webui -np 1 --log-disable
 ```
-Nothing else is mounted. No `--slot-save-path`, no `--models-dir`. The container cannot open any
-file it wasn't handed.
-
-### 3.3 Agent container (Z3)
-```
-podman run --rm --name sp-agent-<id>
-  --network=none --no-hosts
-  --read-only --read-only-tmpfs=false
-  --tmpfs /tmp:rw,[no]exec,nosuid,nodev,size=<tmp_size>
-  --cap-drop=ALL --security-opt=no-new-privileges
-  --security-opt seccomp=<profiles/seccomp-agent.json>
-  --security-opt label=disable
-  --userns=keep-id --user <uid>:<gid>
-  --pids-limit <pids> --cpus <cpus> --memory <memory>
-  --init --env-host=false --hostname sandbox
-  --env SALLY_SESSION_SOCK=/run/sallyport/agent.sock
-  --env SALLY_MCP_SERVERS=<json>
-  [--env HTTP_PROXY=http://127.0.0.1:3128 --env HTTPS_PROXY=… --env ALL_PROXY=… --env NO_PROXY= ]   # proxy mode
-  -v <host>:<guest>:<ro|rw>,nosuid,nodev            # per manifest mount (brokered → ro)
-  -v $XDG_RUNTIME_DIR/sallyport/sessions/<id>:/run/sallyport:rw,nosuid,nodev   # agent.sock [+ net.sock]
-  ghcr.io/<org>/sallyport-harness-python@sha256:<digest>
-  /opt/sallyport/entry        # starts sally-shim (proxy mode) then exec's the harness
-```
+`-m` is always passed (without it llama-server boots as a multi-model router); `check_argv`
+refuses `--models-dir`, `--models-preset`, `--slot-save-path` and any `--webui*`/`--ui*` flag
+other than `--no-webui` in the command (AMENDMENTS-01 §6.2). Each role has its own socket
+directory; no role can see another's sockets.
 
 ### 3.4 Seccomp
 Start from `containers-common`'s default profile and **remove**: `mount, umount2, pivot_root,

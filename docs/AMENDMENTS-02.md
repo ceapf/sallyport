@@ -94,18 +94,6 @@ plus the live summary.
   - PASS: the host directory tree hash is identical during and after the session;
   - `sally session changes` lists exactly those paths.
 
-## B3. MCP `approve: never` needs acknowledgement; the flags consolidate
-
-Replace `acknowledge_unapproved_shell` and `acknowledge_unapproved_fetch` with one list,
-`tools.acknowledge_unapproved: [shell, fetch, "mcp:<name>"]`. An entry is required:
-- for `fetch` when `fetch_writes: allow` and any mount or secret is present;
-- for `mcp:<name>` when that server has `approve: never` and any mount or secret is present;
-- for `shell` when `shell: allow` and either destructive approval is off or `[data-can-leave]`
-  fires.
-
-Unknown or unnecessary entries are errors, so stale acknowledgements cannot linger. The code
-stays `unacknowledged-risk`.
-
 ## B4. Mount source
 
 Decision: the inode re-check fallback is adopted, with two additions:
@@ -120,7 +108,6 @@ Decision: the inode re-check fallback is adopted, with two additions:
 
 Folded in Task 1f into `ARCHITECTURE.md` §3.1/§7, `THREAT_MODEL.md` §6 and `scripts/doctor.sh`
 (V14), with `sally_core::config` (`sandbox.runtime_path`). Still to do:
-- **Task 6a:** the argv builder passes `--runtime <checked runtime_path>` on every `podman` call.
 - **M6:** `install.sh` installs the upstream static crun (≥ 1.25.1, checksum and signature
   verified) under `~/.local/share/sallyport/bin/`.
 - **Pin file (done at publication):** `runtime.lock` at the repository root holds the crun

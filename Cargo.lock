@@ -580,6 +580,12 @@ version = "0.1.0"
 [[package]]
 name = "sallyd"
 version = "0.1.0"
+dependencies = [
+ "insta",
+ "proptest",
+ "sally-core",
+ "thiserror",
+]
 
 [[package]]
 name = "schemars"

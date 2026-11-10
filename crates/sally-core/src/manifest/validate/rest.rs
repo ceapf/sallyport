@@ -5,8 +5,7 @@ use std::collections::HashSet;
 use super::super::diag::{Code, Diags};
 use super::super::hostenv::HostEnv;
 use super::super::types::{
-    BuiltinTool, FetchWrites, Harness, Manifest, Model, MountMode, NetworkMode, Runtime,
-    ShellPolicy,
+    BuiltinTool, Harness, Manifest, Model, MountMode, NetworkMode, Runtime, ShellPolicy,
 };
 use super::super::units::{ByteSize, Cpus, Duration, GpuLayers};
 use super::EgressRule;
@@ -208,21 +207,6 @@ pub(super) fn check_tools(m: &Manifest, d: &mut Diags) {
 // validator requires the flag exactly when one returns true, and
 // `ValidatedManifest::acknowledged_risks` reports the flag exactly then.
 
-/// `shell` enabled in `allow` mode without destructive approval: every command runs unapproved.
-pub(super) fn shell_needs_ack(m: &Manifest) -> bool {
-    m.tools.builtin.contains(&BuiltinTool::Shell)
-        && m.tools.shell == ShellPolicy::Allow
-        && !m.tools.destructive_requires_approval
-}
-
-/// `fetch` enabled with unapproved writes, a network path, and private data to carry out (§5).
-pub(super) fn fetch_needs_ack(m: &Manifest) -> bool {
-    m.tools.builtin.contains(&BuiltinTool::Fetch)
-        && m.tools.fetch_writes == FetchWrites::Allow
-        && m.network.mode == NetworkMode::Proxy
-        && has_private_data(m)
-}
-
 /// Some allow rule reaches attacker-registrable hosts. `egress` is the parsed rule list (also
 /// parsed under `mode: none`, where the validator still requires the flag so a later mode
 /// switch cannot silently widen; the risk is only *in effect* with `mode: proxy`).
@@ -230,36 +214,9 @@ pub(super) fn wildcard_needs_ack(egress: &[EgressRule]) -> bool {
     egress.iter().any(|r| r.host.is_effectively_unrestricted())
 }
 
-/// Any mount or secret: something the model could read or act on that is not public. Reads the
-/// raw manifest; equivalent to the resolved mounts once validation has passed.
-fn has_private_data(m: &Manifest) -> bool {
-    !m.filesystem.mounts.is_empty() || !m.secrets.is_empty()
-}
-
-/// Records the error for a missing acknowledgement, or the warning for a needless one.
-fn check_ack(d: &mut Diags, field: &str, needed: bool, set: bool, what: &str) {
-    let path = format!("tools.{field}");
-    match (needed, set) {
-        (true, false) => d.error(
-            path,
-            Code::UnacknowledgedRisk,
-            format!("{what}; set tools.{field}: true to accept this"),
-        ),
-        (false, true) => d.warn(path, Code::Inconsistent, "set but has no effect"),
-        (true, true) | (false, false) => {}
-    }
-}
-
 fn check_shell(m: &Manifest, d: &mut Diags) {
     let t = &m.tools;
     let has_shell = t.builtin.contains(&BuiltinTool::Shell);
-    check_ack(
-        d,
-        "acknowledge_unapproved_shell",
-        shell_needs_ack(m),
-        t.acknowledge_unapproved_shell,
-        "shell: allow with destructive_requires_approval: false runs every command without approval",
-    );
     match (t.shell, has_shell) {
         (ShellPolicy::Allow, _) => {
             let tail = if t.destructive_requires_approval {
@@ -290,13 +247,6 @@ fn check_shell(m: &Manifest, d: &mut Diags) {
 }
 
 fn check_fetch(m: &Manifest, d: &mut Diags) {
-    check_ack(
-        d,
-        "acknowledge_unapproved_fetch",
-        fetch_needs_ack(m),
-        m.tools.acknowledge_unapproved_fetch,
-        "fetch_writes: allow lets fetch send mounted files or data your secrets unlock without approval",
-    );
     if m.tools.builtin.contains(&BuiltinTool::Fetch) && m.network.mode == NetworkMode::None {
         d.warn(
             "tools.builtin",
@@ -307,7 +257,7 @@ fn check_fetch(m: &Manifest, d: &mut Diags) {
 }
 
 /// `fs_read`/`fs_list` act on any mount; `fs_write`/`fs_delete` on `rw` and `brokered` mounts
-/// (`ro` → denied). Enabling them with nothing to act on is a mistake worth a warning.
+/// (`ro` → denied; `staged` → denied: only the sandbox's own commands write there). Enabling them with nothing to act on is a mistake worth a warning.
 fn check_fs_tools(m: &Manifest, d: &mut Diags) {
     let has = |tool| m.tools.builtin.contains(&tool);
     let mounts = &m.filesystem.mounts;
@@ -318,7 +268,9 @@ fn check_fs_tools(m: &Manifest, d: &mut Diags) {
             "fs_read/fs_list act on mounts, and there are none",
         );
     }
-    let writable = mounts.iter().any(|mt| mt.mode != MountMode::Ro);
+    let writable = mounts
+        .iter()
+        .any(|mt| matches!(mt.mode, MountMode::Rw | MountMode::Brokered));
     if (has(BuiltinTool::FsWrite) || has(BuiltinTool::FsDelete)) && !writable {
         d.warn(
             "tools.builtin",

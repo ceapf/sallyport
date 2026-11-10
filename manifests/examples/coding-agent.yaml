@@ -1,7 +1,9 @@
 # A coding agent working on one project directory.
-# Blast radius = ~/code/myproject (rw, in the workspace container). The harness container that
-# talks to the model has no mounts and no network; it acts only through broker tools.
-# Git hooks and .git/config stay read-only. Everything else on the host is invisible.
+# ~/code/myproject is mounted staged: the sandbox edits an overlay, every change lands in session
+# scratch, and the folder on your machine is not touched (`sally session changes` lists the
+# changes; applying them arrives in a later milestone). Commits made in the session are never
+# applied. The harness container that talks to the model has no mounts and no network; it acts
+# only through broker tools. Everything else on the host is invisible.
 # Network: only PyPI and GitHub, port 443, through the broker's proxy. DNS does not exist in the sandbox.
 # Secrets: GITHUB_TOKEN is injected by the proxy (TLS terminated only for api.github.com and
 # github.com) — as a Bearer token for the API and as Basic auth for git over HTTPS. The sandbox sees
@@ -32,7 +34,7 @@ filesystem:
   mounts:
     - host: ~/code/myproject
       guest: /workspace/myproject
-      mode: rw
+      mode: staged
 
 network:
   mode: proxy
@@ -64,7 +66,7 @@ secrets:
       basic_user: x-access-token
 
 tools:
-  builtin: [fs_read, fs_list, fs_write, fs_delete, fetch, shell]
+  builtin: [fs_read, fs_list, fetch, shell]   # file changes happen in the staged overlay, via shell
   shell: approve
   destructive_requires_approval: true
   fetch_writes: approve

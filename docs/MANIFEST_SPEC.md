@@ -60,8 +60,7 @@ tools:
   shell: deny                     # deny | approve | allow
   destructive_requires_approval: true   # applies when shell: allow
   fetch_writes: approve           # approve | allow — fetch methods other than GET/HEAD
-  acknowledge_unapproved_shell: false   # required for shell: allow + destructive_requires_approval: false
-  acknowledge_unapproved_fetch: false   # required for fetch_writes: allow + any mount or secret
+  acknowledge_unapproved: []      # shell | fetch | "mcp:<name>": each required exactly when its risk is live (§1.1)
   mcp: []                         # list of McpServer (below)
 
 approvals:
@@ -100,14 +99,19 @@ Omission never disables a gate; widening needs an explicit setting that `summary
 |---|---|---|
 | brokered `approve.writes` / `approve.deletes` omitted | `["**"]`: every write/delete needs approval | — |
 | `approve.deletes: []` (or `writes: []`) | that operation runs unapproved; `risky` warning; summary says "deletes without asking you" | — |
-| `shell: allow` + `destructive_requires_approval: false` | every command runs unapproved | `tools.acknowledge_unapproved_shell: true`, else `unacknowledged-risk` |
-| `fetch_writes: allow` + any mount or secret | `fetch` can send data unapproved | `tools.acknowledge_unapproved_fetch: true`, else `unacknowledged-risk` |
-| `tools.mcp[].approve: never` | that server's tools run unapproved | — (named in summary) |
+| `shell: allow` + (`destructive_requires_approval: false` or `[data-can-leave]`) | commands run unapproved (all of them, or all but destructive ones while private data can reach an allowed host) | `shell` in `tools.acknowledge_unapproved`, else `unacknowledged-risk` |
+| `fetch_writes: allow` + any mount or secret | `fetch` can send data unapproved | `fetch` in `tools.acknowledge_unapproved`, else `unacknowledged-risk` |
+| `tools.mcp[].approve: never` + any mount or secret | that server's tools run unapproved while it can reach private data | `"mcp:<name>"` in `tools.acknowledge_unapproved`, else `unacknowledged-risk` |
+| `tools.mcp[].approve: never`, no mount and no secret | that server's tools run unapproved | — (named in summary) |
 | `host: "*"` or a shared-hosting wildcard | unrestricted egress | `network.acknowledge_unrestricted_egress: true` |
 
-An `acknowledge_*` flag that is set but not needed is an `inconsistent` warning.
-`ValidatedManifest::acknowledged_risks()` lists the flags in effect; the UI shows a red banner
-and launch records one `manifest.acknowledged_risk` audit event per flag.
+`tools.acknowledge_unapproved` (AMENDMENTS-02 B3) is one list for every unapproved channel. An
+entry that is not needed is an `inconsistent` **error**, so a stale acknowledgement cannot linger;
+an unknown entry (anything but `shell`, `fetch` or `mcp:<name of a declared server>`) is
+`invalid-value`, a repeated one `duplicate`. `network.acknowledge_unrestricted_egress` set but not
+needed stays an `inconsistent` warning. `ValidatedManifest::acknowledged_risks()` lists what is in
+effect (`network.acknowledge_unrestricted_egress`, `tools.acknowledge_unapproved: <entry>`); the
+UI shows a red banner and launch records one `manifest.acknowledged_risk` audit event per entry.
 
 **`[data-can-leave]`** (AMENDMENTS-01 §5, Agents Rule of Two). The model and everything it reads
 are untrusted input. When a manifest has **private data** (any mount or secret) and an **outward
@@ -142,33 +146,46 @@ normal shape of a useful agent, so the point is that the user sees it every time
 ```yaml
 - host: ~/code/myproject          # absolute or ~-prefixed; resolved with realpath; MUST be a directory
   guest: /workspace/myproject     # /workspace/<seg>[/<seg>…], seg = [A-Za-z0-9._-], no `.`/`..`
-  mode: rw                        # ro | rw | brokered   (required)
+  mode: staged                    # ro | rw | brokered | staged   (required)
   approve:                        # only for mode: brokered (ignored otherwise)
     writes: ["**"]                # globs (relative to mount) whose writes need approval; omitted = ["**"]
     deletes: ["**"]               # globs whose deletes need approval; omitted = ["**"]
 ```
 Mounts exist only in the workspace container. The harness reaches them only through broker
 tools: `fs_read`/`fs_list` on any mode, `fs_write`/`fs_delete` on `rw` and `brokered` (denied on
-`ro`), and `shell` (`podman exec` in the workspace). Every such action is audited (SI-4).
+`ro` and `staged`), and `shell` (`podman exec` in the workspace). Every such action is audited
+(SI-4).
 
 - `ro`: bind mount read-only.
 - `rw`: bind mount read-write (`nosuid,nodev`). **This is the blast radius.** Writes are audited
-  (path, bytes, sha256) but not individually approved — shell commands can be.
+  (path, bytes, sha256) but not individually approved — shell commands can be. `summary()` opens
+  with (or, after `[data-can-leave]`, continues with) a `[direct-write]` line that names the
+  folders and suggests `staged`.
+- `staged` (AMENDMENTS-02 B2(b)): an overlay whose lower layer is the host directory; every write
+  lands in a kept upper directory under `~/.local/share/sallyport/sessions/<id>/stage/<n>/`, and
+  the host directory is untouched. `sally session changes <id>` lists changed and deleted paths;
+  M1 is discard-only, applying arrives in M4.5. Podman accepts no other option next to `O`
+  (probed on 4.9.3), so an overlay is not `nosuid,nodev`; `no-new-privileges`, `--cap-drop=ALL`
+  and the seccomp profile (no `mknod`) keep set-id files and device nodes inert there. Editing the
+  host folder while a staged session runs gives undefined results inside the sandbox; conflicts
+  are caught at apply.
 - `brokered`: bind mount **read-only**; `fs_write`/`fs_delete` are performed by the broker on the
   host under `openat2` confinement and apply the `approve` globs. Use for "the agent may propose
   edits to my notes". Omitted globs mean `["**"]`; an explicit empty list is a `risky` warning
   when the matching tool is enabled. Globs are relative, no `..`.
-- **Protected paths** (AMENDMENTS-01 §6.3): inside any mount, `.git/hooks/**`, `.git/config`,
-  `.git/modules/**/hooks/**` and `.git/modules/**/config` are overlaid read-only in the workspace
-  and `fs_write`/`fs_delete` there is denied `protected-path` (sandbox driver and broker, tasks
-  6/11). The validator refuses an `rw`/`brokered` mount whose realpath has a `.git` component or
-  is (inside) a git directory by structure — `HEAD` + `objects/` + `refs/`, i.e. bare repos and
-  separate git dirs (`protected-path`): from inside a git dir the overlays would not match.
-  `summary()` names what the policy does not cover: `Makefile`, `package.json` scripts,
-  `.vscode/tasks.json`, `.envrc`, `.git/commondir` and `.git` pointer files in submodules or
-  worktrees (both redirect git to attacker-chosen hooks/config), and new nested `.git` folders.
-  Superseded for `rw` and `staged` mounts by AMENDMENTS-02 B2 (`.git` overlay volumes; `.git`
-  files bound read-only), implemented in Task 6a.
+- **Git metadata** (AMENDMENTS-02 B2(a), replacing the read-only hooks/config overlays of
+  AMENDMENTS-01 §6.3). In an `rw` mount, every `.git` directory found by the launch scan is
+  mounted as an overlay whose upper directory is session scratch, discarded at teardown, and
+  every `.git` file (a worktree or submodule pointer) is bound read-only: git works inside the
+  sandbox while the host's history, config, hooks and `commondir` stay byte-identical. Commits
+  made in a session are discarded and file changes arrive as uncommitted modifications;
+  `summary()` says so. In a `staged` mount the host is untouched anyway and nothing under a `.git`
+  component is ever applied. Broker `fs_write`/`fs_delete` deny any path with a `.git` component
+  (`protected-path`). The validator refuses an `rw`/`brokered`/`staged` mount whose realpath has a
+  `.git` component or is (inside) a git directory by structure (`HEAD` + `objects/` + `refs/`,
+  i.e. bare repos and separate git dirs; `protected-path`). `summary()` names what an `rw` mount
+  cannot protect: `Makefile`, `package.json` scripts, `.vscode/tasks.json`, `.envrc`, and new
+  nested `.git` folders.
 - Mounts may not overlap on the host side (a `rw` parent would bypass a `brokered` child's
   approvals) and guests may not repeat or nest.
 - Host realpaths and guests may not contain `:`, `,` or control characters (they would be
@@ -303,9 +320,9 @@ validation — otherwise `mount-changed`/`is-symlink` (RT-FS-06).
 | `model.context/gpu_layers` | `sallyd::infer` → llama-server args, clamped by fit estimator | load | clamped, warning |
 | `filesystem.mounts[].host` | validator (realpath, denylist, is-dir, not-symlink) **and again** at launch (TOCTOU re-check) | validate + launch | reject |
 | `filesystem.mounts[].guest` | validator (`/workspace/…`, no `..`, unique) | validate | reject |
-| `filesystem.mounts[].mode` | workspace `podman run` bind (`ro`/`rw`, `nosuid,nodev`, non-recursive); `brokered` → `ro` + broker `fs_*` | launch + each `fs_*` call | EROFS in workspace; `fs_write`/`fs_delete` denied on `ro` |
+| `filesystem.mounts[].mode` | workspace `podman run` (`sallyd::sandbox::workspace_argv`): bind `ro`/`rw` with `nosuid,nodev,bind` (non-recursive); `brokered` → `ro` + broker `fs_*`; `staged` → `:O` overlay with upper/work in session scratch | launch + each `fs_*` call | EROFS in workspace; `fs_write`/`fs_delete` denied on `ro` and `staged` |
 | `filesystem.mounts[].approve` | `sallyd::approvals` glob match on canonical relative path; omitted = `["**"]` | each brokered write/delete | pending → approve/deny |
-| protected paths (`.git/hooks/**`, `.git/config`, …) | validator (no writable mount inside `.git`); RO overlays in workspace; broker `fs_write`/`fs_delete` | validate + launch + each call | reject / EROFS / `protected-path` |
+| git metadata (AMENDMENTS-02 B2(a)) | validator (no writable mount inside `.git`); `.git` directories in `rw` mounts as overlays over session scratch, `.git` files bound read-only (argv builder, Task 6a; launch scan, Task 6b); broker `fs_write`/`fs_delete` | validate + launch + each call | reject / EROFS / `protected-path` |
 | `filesystem.deny` | validator adds to denylist | validate | reject |
 | `network.mode` | `none` → no shim, no `net.sock`; `proxy` → shim started, `net.sock` mounted, proxy env set | launch | — |
 | `network.allow[]` | `sallyd::egress::policy` on every CONNECT/absolute-form request | each connection | HTTP 403, audit `egress.deny` |
@@ -319,7 +336,7 @@ validation — otherwise `mount-changed`/`is-symlink` (RT-FS-06).
 | `tools.shell` | `sallyd::tools::shell` → `podman exec` after policy | each shell call | deny / pending / run |
 | `tools.destructive_requires_approval` | pattern tagger in `tools::shell` | each shell call in `allow` mode | pending if tagged |
 | `tools.fetch_writes` | `sallyd::tools::fetch` | each non-GET/HEAD fetch | pending if `approve` |
-| `tools.acknowledge_*` | validator; launch audit `manifest.acknowledged_risk` | validate + launch | reject if needed and unset |
+| `tools.acknowledge_unapproved` | validator (`ack.rs`); launch audit `manifest.acknowledged_risk` | validate + launch | reject if needed and unset |
 | `tools.mcp[]` | env-name filter in validator; broker MCP gateway (M4) | validate + each relayed call | reject secret-like env; pending if `approve: always` |
 | `[data-can-leave]` | validator warning + `summary()` first line + UI | validate | warning (never blocks) |
 | `approvals.timeout/max_pending` | `sallyd::approvals` | each request | expire → deny; flood → auto-deny + `approval.flood` |
@@ -335,7 +352,7 @@ errors like:
 error: filesystem.mounts[0].host: "~/" is the home directory root (denylisted) [denylisted]
 error: secrets[0].inject.host: "*.github.com": host must be exact (no wildcards) [not-exact-host]
 error: network.allow[2].host: "*" requires network.acknowledge_unrestricted_egress: true [unacknowledged-wildcard]
-error: tools.acknowledge_unapproved_shell: shell: allow with destructive_requires_approval: false runs every command without approval; set tools.acknowledge_unapproved_shell: true to accept this [unacknowledged-risk]
+error: tools.acknowledge_unapproved: shell: allow with destructive_requires_approval: false runs every command without approval; add "shell" to tools.acknowledge_unapproved to accept this [unacknowledged-risk]
 warning: tools.shell: "allow" — shell commands run without approval unless tagged destructive [risky]
 ```
 

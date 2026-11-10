@@ -187,7 +187,7 @@ fn scrub_path(path: &str) -> String {
     let flat = scrub(path);
     flat.split('.')
         .map(|seg| {
-            if looks_like_token(seg) {
+            if looks_like_token(without_index(seg)) {
                 let head: String = seg.chars().take(4).collect();
                 format!("{head}…")
             } else {
@@ -226,6 +226,16 @@ fn mask_quoted(s: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// A path segment without a trailing list index (`acknowledge_unapproved[12]` →
+/// `acknowledge_unapproved`), so the index's digits do not make a long field name look like a
+/// token. Only an all-digit index is removed: a user key such as `x[<token>]` is judged whole.
+fn without_index(seg: &str) -> &str {
+    match seg.strip_suffix(']').and_then(|s| s.rsplit_once('[')) {
+        Some((name, idx)) if !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()) => name,
+        _ => seg,
+    }
 }
 
 /// Long, no spaces or slashes, and containing a digit. Field names (which can be long, e.g.
@@ -346,5 +356,22 @@ mod tests {
     fn scrub_flattens_and_bounds() {
         assert_eq!(scrub("a\nb\tc"), "a b c");
         assert_eq!(scrub(&"x".repeat(1000)).chars().count(), MAX_TEXT + 1);
+    }
+
+    #[test]
+    fn list_indices_do_not_make_long_field_names_look_like_tokens() {
+        assert_eq!(
+            scrub_path("tools.acknowledge_unapproved[1]"),
+            "tools.acknowledge_unapproved[1]"
+        );
+        assert_eq!(
+            scrub_path("network.acknowledge_unrestricted_egress[123]"),
+            "network.acknowledge_unrestricted_egress[123]"
+        );
+        let tok = ["gh", "p_", "abcdefghij0123456789xyz"].concat();
+        // A token-like key stays masked, with or without an index-looking suffix.
+        assert_eq!(scrub_path(&format!("tools.{tok}")), "tools.ghp_…");
+        assert_eq!(scrub_path(&format!("tools.{tok}[0]")), "tools.ghp_…");
+        assert_eq!(scrub_path(&format!("tools.x[{tok}]")), "tools.x[gh…");
     }
 }

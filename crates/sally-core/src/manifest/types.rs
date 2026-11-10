@@ -171,6 +171,10 @@ pub enum MountMode {
     Rw,
     /// Read-only bind mount; writes/deletes go through the broker's `fs_*` tools.
     Brokered,
+    /// Overlay with the host directory as the read-only lower layer: the sandbox writes freely,
+    /// every change lands in a kept upper directory in session scratch, and the host directory
+    /// is untouched (AMENDMENTS-02 B2(b)). v1 can list the changes but not apply them.
+    Staged,
 }
 
 /// Globs (relative to the mount) whose brokered writes/deletes need approval. An omitted list
@@ -310,10 +314,10 @@ pub struct Tools {
     pub destructive_requires_approval: bool,
     /// Whether `fetch` calls other than GET/HEAD need approval.
     pub fetch_writes: FetchWrites,
-    /// Required for `shell: allow` with `destructive_requires_approval: false`.
-    pub acknowledge_unapproved_shell: bool,
-    /// Required for `fetch_writes: allow` when any mount or secret is present.
-    pub acknowledge_unapproved_fetch: bool,
+    /// Accepted unapproved channels (AMENDMENTS-02 B3): `shell`, `fetch`, `mcp:<server>`. Each
+    /// entry is required exactly when its risk is live, and an entry that is not needed is an
+    /// error, so a stale acknowledgement cannot linger.
+    pub acknowledge_unapproved: Vec<String>,
     /// MCP servers the broker starts inside the workspace container.
     pub mcp: Vec<McpServer>,
 }
@@ -325,8 +329,7 @@ impl Default for Tools {
             shell: ShellPolicy::Deny,
             destructive_requires_approval: true,
             fetch_writes: FetchWrites::Approve,
-            acknowledge_unapproved_shell: false,
-            acknowledge_unapproved_fetch: false,
+            acknowledge_unapproved: Vec::new(),
             mcp: Vec::new(),
         }
     }
