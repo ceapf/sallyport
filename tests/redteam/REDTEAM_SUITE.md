@@ -46,6 +46,7 @@ Fixture manifests: `fx-coding` (= `coding-agent.yaml` with mock hosts), `fx-brok
 | RT-FS-09 | /proc and /sys tricks | `echo c > /proc/sysrq-trigger; cat /proc/kcore; ls /proc/1/root/..; cat /proc/sys/kernel/*; write /sys/*` | all fail (EACCES/ENOENT/EROFS); container PID 1 is the init, not host | CI | M1 |
 | RT-FS-10 | Reach broker state | attempt to open `/run/sallyport/../..`, any `control.sock`, audit dir, secrets file, library blobs dir by absolute host paths | ENOENT for all; only `agent.sock` (+ `net.sock`) exist under `/run/sallyport` | CI | M1 |
 | RT-FS-11 | WSL interop escape | `ls /mnt/c; /mnt/c/Windows/System32/cmd.exe /c whoami; cp attacks/hello.exe /workspace/myproject/; ./hello.exe` | `/mnt` empty/absent; exec of `.exe` fails (`ENOEXEC`/no interop); `CANARY_EXEC` not created on host | CI (skips `.exe` part if not WSL) | M1 |
+| RT-FS-16 | Nested host mount | a filesystem is mounted below a granted directory (made in podman's rootless mount namespace); the sandbox lists and reads it in `ro`, `rw`, `brokered` and `staged` mode | not visible in any bind mode (binds are non-recursive); `staged` refuses to launch on Podman 4.9.3 (overlay `EINVAL` in the keep-id namespace) and nothing runs | CI | M1 |
 
 ## NET — egress bypass and exfiltration
 
@@ -136,6 +137,7 @@ Fixture manifests: `fx-coding` (= `coding-agent.yaml` with mock hosts), `fx-brok
 | ID | Name | Attack | PASS condition | CI/GPU | M |
 |---|---|---|---|---|---|
 | RT-SUP-01 | Unpinned / mismatched image | manifest `runtime.image: ghcr.io/x/y:latest`; pinned digest that doesn't match the local image's digest; argv snapshot scan | refused `image_not_pinned` / `digest_mismatch`; argv never contains `--privileged`, `--cap-add`, `--network=host|bridge|pasta|slirp4netns`, `seccomp=unconfined`, `--userns=host`, non-GPU `--device` | CI | M1 |
+| RT-SUP-04 | Hostile podman configuration | a `containers.conf` in the test `HOME` adds a volume, a capability and host networking; `mounts.conf` and `storage.conf` alongside | none of it reaches the launched container (no extra mount, `CapEff` 0, only `lo`); the generated OCI config passes the per-role verifier, and doctored configs are refused (`sandbox.config_mismatch`) | CI | M1 (Task 14, #15) |
 
 ## UI — Tauri
 
@@ -147,7 +149,7 @@ Fixture manifests: `fx-coding` (= `coding-agent.yaml` with mock hosts), `fx-brok
 
 ---
 
-### Count: 63 tests (RT-FS 11, NET 11, SEC 9, MDL 9, INF 4, AG 10, AUD 2, MAN 3, SUP 1, UI 3) — 46 of them land in M1.
+### Count: 65 tests (RT-FS 12, NET 11, SEC 9, MDL 9, INF 4, AG 10, AUD 2, MAN 3, SUP 2, UI 3) — 48 of them land in M1.
 
 ### Adding a test
 1. Pick the SI it defends. 2. Add a row here with a concrete attack and a *mechanically checkable*

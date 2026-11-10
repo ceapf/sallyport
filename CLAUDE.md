@@ -97,6 +97,9 @@ manually for the tasks marked opus). Subagents are the files in `.claude/agents/
 - Resource limits need cgroup v2. If `podman info` reports v1, `sally doctor` must fail — Podman
   drops `--memory`/`--pids-limit` silently on v1. RT-AG-09 is blocked, never skipped, until v2.
 - The NVIDIA CDI spec is auto-generated at `/var/run/cdi/nvidia.yaml`; never generate a second one.
+- A mount made inside `podman unshare` persists in the rootless pause namespace, so every later
+  podman call sees it. Always `podman unshare umount` it. `CONTAINERS_CONF` replaces (does not
+  merge) the system and user `containers.conf` on 4.9.3.
 - ECC hooks are not enabled (one hook phones out). Skills and commands are installed; agents are
   project-level in `.claude/agents/` with pinned models.
 

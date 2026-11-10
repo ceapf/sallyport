@@ -168,7 +168,8 @@ tools: `fs_read`/`fs_list` on any mode, `fs_write`/`fs_delete` on `rw` and `brok
   (probed on 4.9.3), so an overlay is not `nosuid,nodev`; `no-new-privileges`, `--cap-drop=ALL`
   and the seccomp profile (no `mknod`) keep set-id files and device nodes inert there. Editing the
   host folder while a staged session runs gives undefined results inside the sandbox; conflicts
-  are caught at apply.
+  are caught at apply. On Podman 4.9.3 a `staged` folder with another filesystem mounted inside
+  it cannot launch (the runtime refuses the overlay in the keep-id namespace; ARCHITECTURE §3.5).
 - `brokered`: bind mount **read-only**; `fs_write`/`fs_delete` are performed by the broker on the
   host under `openat2` confinement and apply the `approve` globs. Use for "the agent may propose
   edits to my notes". Omitted globs mean `["**"]`; an explicit empty list is a `risky` warning
@@ -177,11 +178,16 @@ tools: `fs_read`/`fs_list` on any mode, `fs_write`/`fs_delete` on `rw` and `brok
   AMENDMENTS-01 §6.3). In an `rw` mount, every `.git` directory found by the launch scan is
   mounted as an overlay whose upper directory is session scratch, discarded at teardown, and
   every `.git` file (a worktree or submodule pointer) is bound read-only: git works inside the
-  sandbox while the host's history, config, hooks and `commondir` stay byte-identical. Commits
+  sandbox while the host's `.git` history, config, hooks and `commondir` stay byte-identical.
+  Hooks or config a repository takes from its working tree (`core.hooksPath`, `include.path`,
+  `.husky/`) are ordinary files in the writable folder and are not protected, nor is a `.git`
+  created after the launch scan; `summary()` says so. Commits
   made in a session are discarded and file changes arrive as uncommitted modifications;
   `summary()` says so. Every directory between the mount root and a nested `.git` entry is bound
   onto itself, so it cannot be renamed away from under its shield (`EBUSY`); the launch scan
-  covers every `rw` mount (an `rw` mount without a scan is refused). In a `staged` mount the host is untouched anyway and nothing under a `.git`
+  covers every `rw` mount (an `rw` mount without a scan is refused). More than 32 shielded
+  entries in one `rw` mount, or a tree beyond the scan's bounds, refuses the launch with advice
+  to use `staged`. In a `staged` mount the host is untouched anyway and nothing under a `.git`
   component is ever applied. Broker `fs_write`/`fs_delete` deny any path with a `.git` component
   (`protected-path`). The validator refuses an `rw`/`brokered`/`staged` mount whose realpath has a
   `.git` component or is (inside) a git directory by structure (`HEAD` + `objects/` + `refs/`,
@@ -191,6 +197,10 @@ tools: `fs_read`/`fs_list` on any mode, `fs_write`/`fs_delete` on `rw` and `brok
   `project.git`, a separate git dir).
 - Mounts may not overlap on the host side (a `rw` parent would bypass a `brokered` child's
   approvals) and guests may not repeat or nest.
+- Across live sessions (AMENDMENTS-02 B4), folders may overlap only when neither session mounts
+  them `rw` or `brokered`; the launch is refused (`overlap`) otherwise.
+- A Unix socket anywhere in a mount refuses the launch (`socket-in-mount`, RT-FS-13). Another
+  filesystem mounted inside a mount is not visible in the sandbox (RT-FS-16).
 - Host realpaths and guests may not contain `:`, `,` or control characters (they would be
   parsed as `podman -v`/`--mount` option separators).
 
@@ -321,7 +331,7 @@ validation — otherwise `mount-changed`/`is-symlink` (RT-FS-06).
 | `runtime.tmp_size/tmp_exec` | `podman run --tmpfs /tmp:…` | launch | — |
 | `model.ref` | `sallyd::infer` resolves in library; refuses unverified/unknown | session start | error to UI |
 | `model.context/gpu_layers` | `sallyd::infer` → llama-server args, clamped by fit estimator | load | clamped, warning |
-| `filesystem.mounts[].host` | validator (realpath, denylist, is-dir, not-symlink) **and again** at launch (TOCTOU re-check) | validate + launch | reject |
+| `filesystem.mounts[].host` | validator (realpath, denylist, is-dir, not-symlink) **and again** at launch: the launch scan re-opens the root without following symlinks and compares `st_dev:st_ino`, pins are re-checked before `podman init`, and bind mounts are compared inside the container after `init` (ARCHITECTURE §3.5) | validate + launch | reject / `sandbox.refuse` / `sandbox.mount_mismatch` |
 | `filesystem.mounts[].guest` | validator (`/workspace/…`, no `..`, unique) | validate | reject |
 | `filesystem.mounts[].mode` | workspace `podman run` (`sallyd::sandbox::workspace_argv`): bind `ro`/`rw` with `nosuid,nodev,bind` (non-recursive); `brokered` → `ro` + broker `fs_*`; `staged` → `:O` overlay with upper/work in session scratch | launch + each `fs_*` call | EROFS in workspace; `fs_write`/`fs_delete` denied on `ro` and `staged` |
 | `filesystem.mounts[].approve` | `sallyd::approvals` glob match on canonical relative path; omitted = `["**"]` | each brokered write/delete | pending → approve/deny |
