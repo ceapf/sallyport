@@ -298,7 +298,21 @@ are released only once the container is confirmed gone.
    the container is removed and `sandbox.mount_mismatch` is audited. Overlay lower layers report
    the overlay's own device, so they rely on step 6's host re-check and on the overlap rule.
    TODO(#15): the OCI config verifier runs here (Task 14).
-8. `podman start`.
+8. `podman start`, then the **running check** (Task 6c): after a 250 ms grace, `podman inspect`
+   must report the container running as the pid checked in step 7. `start` succeeds even when
+   the entry point exits at once, and a container that exited is already gone (`--rm`). Either
+   way the launch is refused (`not-running`), and everything it created is removed.
+
+**Stage watchdog** (`runtime.stage_size`, #14, Task 6c). A session with `staged` mounts gets a
+watchdog task. Every 2 s it sums the allocated bytes (`st_blocks`) of every entry under the
+session's staged upper directories. The walk goes through directory fds and never follows a
+symlink. It is bounded: 1 000 000 entries and 256 levels, with one open fd per level. When the sum
+exceeds the limit, the watchdog audits `session.resource_limit`, then `podman kill`s the container.
+The audit entry carries `resource: stage_size`, the limit, the measured size, and the mount
+holding the most. A tree it cannot measure (an unreadable directory, a bound reached, a missing
+root) counts as over the limit. The kill happens even if the audit write fails. Teardown stays
+with `Launcher::stop`, which keeps the staged data. The watchdog ends when the session's handle
+is dropped or the container is confirmed gone.
 
 **Teardown** (`Launcher::stop`) audits `sandbox.stop`, then runs `podman rm --force --time 0`
 and confirms the container is gone (`podman container exists`). If it is not gone, the session

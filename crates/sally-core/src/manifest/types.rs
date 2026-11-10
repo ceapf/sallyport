@@ -101,6 +101,9 @@ pub struct Runtime {
     pub tmp_size: ByteSize,
     /// Mount `/tmp` without `noexec`.
     pub tmp_exec: bool,
+    /// Limit on the session's staged upper directories together, 1MiB–1TiB. A watchdog in
+    /// `sallyd` kills a session that exceeds it and audits `session.resource_limit`.
+    pub stage_size: ByteSize,
 }
 
 impl Default for Runtime {
@@ -113,6 +116,7 @@ impl Default for Runtime {
             timeout: Duration::from_secs(2 * 3600),
             tmp_size: ByteSize::from_bytes(ByteSize::GIB),
             tmp_exec: false,
+            stage_size: ByteSize::from_bytes(10 * ByteSize::GIB),
         }
     }
 }

@@ -15,6 +15,7 @@ mod overlap;
 mod podman;
 mod profiles;
 mod scan;
+mod stage;
 mod types;
 
 pub use argv::{harness_argv, inference_argv, workspace_argv};

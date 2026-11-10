@@ -132,10 +132,12 @@ fn runtime_image_must_be_digest_pinned() {
 fn runtime_ranges() {
     let f = Fixture::new();
     assert_ok(&f.load(
-        "runtime:\n  cpus: 0.5\n  memory: 64MiB\n  pids: 16\n  timeout: 1m\n  tmp_size: 1MiB\n",
+        "runtime:\n  cpus: 0.5\n  memory: 64MiB\n  pids: 16\n  timeout: 1m\n  tmp_size: 1MiB\n  \
+         stage_size: 1MiB\n",
     ));
     assert_ok(&f.load(
-        "runtime:\n  cpus: 8\n  memory: 12GiB\n  pids: 4096\n  timeout: 24h\n  tmp_size: 12GiB\n",
+        "runtime:\n  cpus: 8\n  memory: 12GiB\n  pids: 4096\n  timeout: 24h\n  tmp_size: 12GiB\n  \
+         stage_size: 1TiB\n",
     ));
     for (body, path) in [
         ("cpus: 0.4", "runtime.cpus"),
@@ -148,6 +150,8 @@ fn runtime_ranges() {
         ("timeout: 25h", "runtime.timeout"),
         ("tmp_size: 9GiB", "runtime.tmp_size"), // > memory (default 8GiB)
         ("tmp_size: 0B", "runtime.tmp_size"),
+        ("stage_size: 1023KiB", "runtime.stage_size"),
+        ("stage_size: 1025GiB", "runtime.stage_size"), // > 1 TiB
     ] {
         assert_rejects(
             &f.load(&format!("runtime:\n  {body}\n")),
@@ -155,6 +159,14 @@ fn runtime_ranges() {
             Code::OutOfRange,
         );
     }
+}
+
+/// #14: staged upper directories are limited to 10 GiB per session unless the manifest says
+/// otherwise.
+#[test]
+fn stage_size_defaults_to_ten_gib() {
+    let m = parse(common::HEADER).unwrap();
+    assert_eq!(m.runtime.stage_size.bytes(), 10 << 30);
 }
 
 #[test]

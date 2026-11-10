@@ -11,7 +11,12 @@
 //!    mounts but runs nothing);
 //! 6. compare every bind pin inside the container's mount namespace (B4); on a mismatch remove the
 //!    container and audit `sandbox.mount_mismatch`;
-//! 7. `podman start`.
+//! 7. `podman start`, then confirm after a short grace that the container is running with the
+//!    pid that was checked (`start` succeeds even when the entry point exits at once).
+//!
+//! A session with `staged` mounts gets a watchdog task that measures their upper directories every
+//! [`STAGE_POLL`] and kills the container when they exceed `runtime.stage_size` (#14), auditing
+//! `session.resource_limit` first.
 //!
 //! The launch runs in its own task: a caller that goes away (a closed connection, an outer
 //! timeout) cannot leave a half-built session, and a finished launch nobody receives is stopped.
@@ -35,6 +40,7 @@ use super::inside::{Expect, Mismatch, check_in_container};
 use super::overlap::{ReserveError, Sessions, claims};
 use super::podman::{Podman, PodmanError};
 use super::scan::{LaunchScan, PinKind, ScanError, ScanLimits, scan_mounts};
+use super::stage::{STAGE_POLL, StageBounds, Verdict, measure};
 use super::types::{ArgvError, CheckedRuntime, CommonArgs, ImageRef, SessionPaths, UserIds};
 
 /// Bytes of podman's stdout and stderr kept per command; the rest is read and dropped.
@@ -43,6 +49,10 @@ const OUTPUT_CAP: usize = 64 * 1024;
 const PODMAN_TIMEOUT: Duration = Duration::from_secs(120);
 /// Longest free-text value in an audit entry (CLAUDE.md: nothing above 4 KiB is logged).
 const AUDIT_TEXT_CAP: usize = 4096;
+/// How long after `podman start` the container must still be running. An entry point that
+/// cannot run (a missing interpreter, a crash at startup) exits well within it; a later exit is
+/// the session's business (Task 12).
+const START_GRACE: Duration = Duration::from_millis(250);
 /// Container name prefixes of the session roles this launcher creates.
 const SESSION_PREFIXES: [&str; 2] = ["sp-ws-", "sp-h-"];
 
@@ -95,6 +105,9 @@ pub enum LaunchError {
     /// A mount inside the container is not the pinned object.
     #[error("sandbox.mount_mismatch: {0}")]
     MountMismatch(Mismatch),
+    /// The container was not running, with the checked pid, after `podman start`.
+    #[error("the container is not running after start: {0}")]
+    NotRunning(String),
     /// A podman command failed.
     #[error("podman {verb}: {msg}")]
     Command {
@@ -131,6 +144,7 @@ impl LaunchError {
             Self::Argv(_) => "argv",
             Self::Podman(_) => "podman-config",
             Self::MountMismatch(_) => "mount-mismatch",
+            Self::NotRunning(_) => "not-running",
             Self::Command { .. } => "podman",
             Self::Audit(_) | Self::Unaudited { .. } => "audit",
             Self::Internal(_) => "internal",
@@ -189,6 +203,44 @@ pub struct Running {
     name: String,
     paths: SessionPaths,
     level: AuditLevel,
+    /// The `stage_size` watchdog, if the session has staged mounts; aborted on drop.
+    watchdog: Option<Watchdog>,
+}
+
+/// A watchdog task, aborted when its session's handle goes away.
+#[derive(Debug)]
+struct Watchdog(tokio::task::JoinHandle<()>);
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// What the `stage_size` watchdog of one session measures.
+#[derive(Debug, Clone)]
+struct StageWatch {
+    /// `(mount index, upper directory)` of every staged mount.
+    stages: Vec<(usize, PathBuf)>,
+    /// `runtime.stage_size` in bytes.
+    limit: u64,
+}
+
+impl StageWatch {
+    fn of(req: &WorkspaceRequest) -> Option<Self> {
+        let stages: Vec<(usize, PathBuf)> = req
+            .manifest
+            .mounts()
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.mode == MountMode::Staged)
+            .map(|(i, _)| (i, req.paths.stage(i).upper))
+            .collect();
+        (!stages.is_empty()).then(|| Self {
+            stages,
+            limit: req.manifest.manifest().runtime.stage_size.bytes(),
+        })
+    }
 }
 
 impl Running {
@@ -349,8 +401,12 @@ impl Launcher {
     ) -> Result<Running, LaunchError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let this = Arc::clone(self);
+        let watch = StageWatch::of(&req);
         tokio::spawn(async move {
-            let result = this.launch(req).await;
+            let result = this.launch(req).await.map(|r| match watch {
+                Some(w) => this.watch(r, w),
+                None => r,
+            });
             if let Err(Ok(orphan)) = tx.send(result)
                 && let Err(e) = this.stop(orphan).await
             {
@@ -477,7 +533,65 @@ impl Launcher {
             name,
             paths: req.paths.clone(),
             level,
+            watchdog: None,
         })
+    }
+
+    /// Starts the `stage_size` watchdog of a started session.
+    fn watch(self: &Arc<Self>, mut r: Running, w: StageWatch) -> Running {
+        let this = Arc::clone(self);
+        let (sid, container, level) = (
+            r.paths.id().as_str().to_owned(),
+            r.container.clone(),
+            r.level,
+        );
+        let task = tokio::spawn(async move { this.watchdog(sid, container, level, w).await });
+        r.watchdog = Some(Watchdog(task));
+        r
+    }
+
+    /// Measures every [`STAGE_POLL`] until the limit is exceeded (or the tree cannot be
+    /// measured: fail closed), then audits `session.resource_limit` and kills the container. The
+    /// kill happens even if the audit entry cannot be written. Teardown stays with
+    /// [`Launcher::stop`], which keeps the staged data.
+    async fn watchdog(&self, sid: String, container: String, level: AuditLevel, w: StageWatch) {
+        let first = w.stages.first().map_or(0, |s| s.0);
+        let (measured, mount, detail) = loop {
+            tokio::time::sleep(STAGE_POLL).await;
+            let stages = w.stages.clone();
+            let verdict = blocking(move || Ok(measure(&stages, w.limit, StageBounds::default())))
+                .await
+                .unwrap_or_else(|e| Verdict::Unmeasurable {
+                    mount: first,
+                    reason: e.to_string(),
+                });
+            match verdict {
+                Verdict::Within { .. } => {}
+                Verdict::Over { bytes, mount } => break (Some(bytes), mount, None),
+                Verdict::Unmeasurable { mount, reason } => break (None, mount, Some(reason)),
+            }
+        };
+        let entry = NewEntry::new(Actor::Sallyd, "session.resource_limit")
+            .session(&sid)
+            .decision("deny")
+            .args(json!({
+                "role": "workspace",
+                "resource": "stage_size",
+                "limit": w.limit,
+                "measured": measured,
+                "mount": mount,
+                "detail": detail.as_deref().map(capped),
+            }));
+        let _ = self.audit(entry, level).await;
+        let kill = [
+            OsString::from("kill"),
+            "--signal".into(),
+            "KILL".into(),
+            container.as_str().into(),
+        ];
+        if self.run("kill", kill).await.is_err() {
+            let _ = self.remove_container(&container).await;
+        }
     }
 
     /// Step 2: hermetic podman and the runtime re-checked, then the launch scan.
@@ -569,9 +683,26 @@ impl Launcher {
             .await?;
         self.run("start", [OsString::from("start"), container.into()])
             .await?;
-        // TODO(#17): confirm the container is running; `start` succeeds even when the entry
-        // point fails to exec (Task 6c).
-        Ok(())
+        tokio::time::sleep(START_GRACE).await;
+        self.confirm_running(container, pid).await
+    }
+
+    /// Step 7: the container still runs, as the process whose mounts were checked. A container
+    /// that exited is already gone (`--rm`), so a failed inspect means "not running" too.
+    async fn confirm_running(&self, container: &str, pid: u32) -> Result<(), LaunchError> {
+        let state = self
+            .run(
+                "inspect",
+                [
+                    "inspect".into(),
+                    "--format".into(),
+                    "{{.State.Running}} {{.State.Pid}}".into(),
+                    container.into(),
+                ],
+            )
+            .await
+            .map_err(|e| LaunchError::NotRunning(e.to_string()))?;
+        running_as(&state, pid)
     }
 
     async fn init_pid(&self, container: &str) -> Result<u32, LaunchError> {
@@ -662,7 +793,7 @@ impl Launcher {
     /// [`StopError`] when the container cannot be confirmed gone: the session keeps its claims
     /// and the error carries the handle back for a retry. A failure after that (scratch
     /// removal) is reported too, but the session is released.
-    pub async fn stop(&self, r: Running) -> Result<(), Box<StopError>> {
+    pub async fn stop(&self, mut r: Running) -> Result<(), Box<StopError>> {
         let sid = r.paths.id().as_str().to_owned();
         let audited = self
             .audit(
@@ -675,6 +806,8 @@ impl Launcher {
         if let Err(error) = self.remove_container(&r.name).await {
             return Err(Box::new(StopError { running: r, error }));
         }
+        // The container is gone: nothing left to watch.
+        drop(r.watchdog.take());
         let cleaned = self.remove_dirs(&r.paths, true).await;
         self.sessions.release(&sid);
         audited
@@ -763,6 +896,18 @@ impl Launcher {
                 String::from_utf8_lossy(&err).trim()
             )))
         }
+    }
+}
+
+/// `podman inspect` printed `true <pid>` with the pid checked after `init`.
+fn running_as(state: &str, pid: u32) -> Result<(), LaunchError> {
+    if state.trim() == format!("true {pid}") {
+        Ok(())
+    } else {
+        Err(LaunchError::NotRunning(format!(
+            "state {:?}, expected running as pid {pid}",
+            capped(state.trim())
+        )))
     }
 }
 
@@ -858,6 +1003,16 @@ mod tests {
         let c = capped(&long);
         assert!(c.len() <= AUDIT_TEXT_CAP + "…".len());
         assert!(c.ends_with('…'));
+    }
+
+    #[test]
+    fn only_running_as_the_checked_pid_counts() {
+        assert!(running_as("true 42\n", 42).is_ok());
+        for bad in ["false 0", "true 43", "true 42 x", "", "TRUE 42"] {
+            let e = running_as(bad, 42).unwrap_err();
+            assert!(matches!(e, LaunchError::NotRunning(_)), "{bad:?}");
+            assert_eq!(e.reason(), "not-running");
+        }
     }
 
     #[test]
