@@ -114,8 +114,11 @@ This repository is public. These rules hold for files, commit messages, PR title
 issues, comments and CI output.
 - No personal identifiers, machine names, user names, home paths or account names. Write paths as
   `$HOME/…` or `/home/<user>/…`. Reports quote `scripts/doctor.sh --redact` output only.
-- Commits use the GitHub noreply identity and `TZ=UTC`. No session URLs anywhere, trailers
-  included.
+  Exception: the maintainer's first name is permitted (it is the public GitHub profile name); the
+  full name never is. Files still refer to "the maintainer".
+- Local commits use the GitHub noreply identity and `TZ=UTC`. No session URLs anywhere, trailers
+  included. Merge commits that GitHub creates (PR merges) carry the maintainer's profile name and
+  time zone, with GitHub as committer; that is accepted.
 - The local guard hooks (`.git/hooks/pre-commit`, `commit-msg`, `pre-push`) block identifiers and
   credential shapes. If one blocks, fix the content. Never use `--no-verify`. Never replace,
   remove or bypass them: no `pre-commit install`, no `core.hooksPath`, no hook edits.
