@@ -56,6 +56,16 @@ pub struct ResolvedMount {
     id: DirId,
 }
 
+impl ResolvedMount {
+    /// `(st_dev, st_ino)` of the host directory at validation. The sandbox driver pins the mount
+    /// root to it: the launch scan opens the root without following symlinks and compares, and
+    /// the post-init check compares what the container sees (AMENDMENTS-02 B4).
+    #[must_use]
+    pub fn identity(&self) -> (u64, u64) {
+        (self.id.dev, self.id.ino)
+    }
+}
+
 /// One egress allow rule after validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EgressRule {

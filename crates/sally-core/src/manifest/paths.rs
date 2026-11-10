@@ -244,8 +244,8 @@ fn has_separator_char(s: &str) -> bool {
 /// different directory at the same path between validation and launch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DirId {
-    dev: u64,
-    ino: u64,
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
 }
 
 /// Checks a mount host path and returns its realpath and directory identity.

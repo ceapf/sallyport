@@ -33,7 +33,7 @@ impl CheckedRuntime {
     /// Runs the runtime binary checks and keeps the realpath. Performs blocking I/O.
     ///
     /// # Errors
-    /// [`ConfigError::Runtime`] naming the failed check.
+    /// [`ConfigError::Binary`] naming the failed check.
     pub fn check(path: &Path) -> Result<Self, ConfigError> {
         check_runtime_binary(path).map(Self)
     }
@@ -145,6 +145,8 @@ pub struct CommonArgs {
     ///
     /// TODO(#10): check its ownership like [`CheckedRuntime`] (AMENDMENTS-02 B5).
     pub profiles: PathBuf,
+    /// Sallyport's empty OCI hooks directory, passed as `--hooks-dir` so no host hook runs (#11).
+    pub hooks_dir: PathBuf,
 }
 
 /// Host directories of one session (ARCHITECTURE §3.1, AMENDMENTS-01 §2, AMENDMENTS-02 B2).
@@ -232,23 +234,6 @@ impl OverlayDirs {
     }
 }
 
-/// What the launch scan found inside one `rw` mount (AMENDMENTS-02 B2(a)): `.git` directories,
-/// mounted as overlays over session scratch, and `.git` files (worktree or submodule pointers),
-/// bound read-only. Paths are relative to the mount root and end in a `.git` component. Every
-/// `rw` mount needs a scan, empty if it found nothing.
-///
-/// TODO(#10): only the no-follow launch scanner (Task 6b) may construct this; today the
-/// fields are public and the paths are trusted lexically.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GitScan {
-    /// Index of the mount in the manifest.
-    pub mount: usize,
-    /// `.git` directories.
-    pub dirs: Vec<PathBuf>,
-    /// `.git` files.
-    pub files: Vec<PathBuf>,
-}
-
 /// One inference instance (ARCHITECTURE §3.2, AMENDMENTS-01 §6.2).
 #[derive(Debug, Clone)]
 pub struct InferenceSpec {
@@ -257,9 +242,7 @@ pub struct InferenceSpec {
     /// Host socket directory, `$XDG_RUNTIME_DIR/sallyport/infer/<id>`.
     pub socket_dir: PathBuf,
     /// The verified model blob (SI-6), mounted read-only.
-    ///
-    /// TODO(#10): a `VerifiedModel` type that only the SI-6 import can construct.
-    pub model: PathBuf,
+    pub model: VerifiedModel,
     /// Inference image.
     pub image: ImageRef,
     /// Pass the GPU through (`--device nvidia.com/gpu=all`).
@@ -272,4 +255,67 @@ pub struct InferenceSpec {
     pub cpus: Cpus,
     /// `--memory`; optional because mmap'd weights count as page cache.
     pub memory: Option<ByteSize>,
+}
+
+/// A model blob in the library, pinned by identity (#10): `<blobs>/sha256/<64 lowercase hex>`, a
+/// regular file owned by the current user with no write bit (the library stores blobs 0444),
+/// opened without following a symlink. The SHA-256 itself is checked once, at import (SI-6,
+/// M2); TODO(M2): the import in `sally-core::model` becomes the only constructor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedModel {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+impl VerifiedModel {
+    /// Pins the blob named `sha256_hex` in `blobs`. Performs blocking I/O.
+    ///
+    /// # Errors
+    /// [`ArgvError::Input`] naming the failed check.
+    pub fn pin(blobs: &Path, sha256_hex: &str) -> Result<Self, ArgvError> {
+        use rustix::fs::{Mode, OFlags, ResolveFlags};
+        if sha256_hex.len() != 64
+            || !sha256_hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return input("model: the blob name must be 64 lowercase hex digits");
+        }
+        let path = blobs.join("sha256").join(sha256_hex);
+        let fd = rustix::fs::openat2(
+            rustix::fs::CWD,
+            &path,
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+        )
+        .or_else(|e| input(format!("model {}: {e}", path.display())))?;
+        let st = rustix::fs::fstat(&fd).or_else(|e| input(format!("model: {e}")))?;
+        let regular =
+            rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::RegularFile;
+        if !regular || st.st_uid != rustix::process::geteuid().as_raw() || st.st_mode & 0o222 != 0 {
+            return input(format!(
+                "model {}: must be a regular file owned by the current user with no write bit",
+                path.display()
+            ));
+        }
+        Ok(Self {
+            path,
+            dev: st.st_dev,
+            ino: st.st_ino,
+        })
+    }
+
+    /// The blob's path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// `(st_dev, st_ino)` when pinned.
+    #[must_use]
+    pub fn identity(&self) -> (u64, u64) {
+        (self.dev, self.ino)
+    }
 }
