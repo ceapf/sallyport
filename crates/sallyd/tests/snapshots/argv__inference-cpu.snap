@@ -1,6 +1,5 @@
 ---
 source: crates/sallyd/tests/argv.rs
-assertion_line: 242
 expression: f.redact(&a)
 ---
 --runtime

@@ -9,8 +9,8 @@ mod check;
 mod types;
 
 pub use argv::{harness_argv, inference_argv, workspace_argv};
-pub use check::check_argv;
+pub use check::{Allowed, Grant, Source, check_argv};
 pub use types::{
-    ArgvError, CheckedRuntime, CommonArgs, GitScan, ImageRef, InferenceSpec, SessionId,
-    SessionPaths, UserIds,
+    ArgvError, CheckedRuntime, CommonArgs, GitScan, ImageRef, InferenceSpec, OverlayDirs, Role,
+    SessionId, SessionPaths, UserIds,
 };

@@ -1,6 +1,5 @@
 ---
 source: crates/sallyd/tests/argv.rs
-assertion_line: 176
 expression: f.redact(&a)
 ---
 --runtime
@@ -60,7 +59,7 @@ $ROOT/home/code/myproject:/workspace/p:O,upperdir=$ROOT/home/.local/share/sallyp
 -v
 $ROOT/home/code/other:/workspace/o:O,upperdir=$ROOT/home/.local/share/sallyport/sessions/s-0001/stage/1/upper,workdir=$ROOT/home/.local/share/sallyport/sessions/s-0001/stage/1/work
 -v
-$ROOT/run/sallyport/sessions/s-0001/workspace:/run/sallyport:rw,nosuid,nodev,bind
+$ROOT/run/sallyport/sessions/s-0001/workspace:/run/sallyport:ro,nosuid,nodev,bind
 ghcr.io/sallyport/workspace@sha256:1111111111111111111111111111111111111111111111111111111111111111
 /opt/sallyport/entry
 --idle

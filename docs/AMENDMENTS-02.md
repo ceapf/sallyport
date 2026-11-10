@@ -89,6 +89,11 @@ plus the live summary.
   - PASS: the host `.git` tree hash is unchanged;
   - a host-side `git status` canary does not execute;
   - `fs_write` to any `.git` path is denied.
+  - Variants (security review of Task 6a): in an `rw` mount with a nested repository
+    `sub/.git` and a submodule pointer file `mod/.git`, the sandbox runs
+    `mv sub sub2 && mkdir -p sub/.git` and the same for `mod`. PASS: both renames fail with
+    `EBUSY` (the parents are self-bound) and the host `sub/.git` and `mod/.git` are unchanged.
+    A bare `project.git` inside an `rw` mount is **not** shielded and `summary()` says so.
 - New **RT-FS-15**. In a `staged` mount the sandbox creates, modifies and deletes files, including
   `.vscode/settings.json` and a nested `sub/.git/config`.
   - PASS: the host directory tree hash is identical during and after the session;

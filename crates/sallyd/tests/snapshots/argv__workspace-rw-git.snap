@@ -1,6 +1,5 @@
 ---
 source: crates/sallyd/tests/argv.rs
-assertion_line: 150
 expression: f.redact(&a)
 ---
 --runtime
@@ -42,13 +41,21 @@ sandbox
 -v
 $ROOT/home/code/myproject:/workspace/p:rw,nosuid,nodev,bind
 -v
+$ROOT/home/code/myproject/sub:/workspace/p/sub:rw,nosuid,nodev,bind
+-v
+$ROOT/home/code/myproject/sub/module:/workspace/p/sub/module:rw,nosuid,nodev,bind
+-v
+$ROOT/home/code/myproject/vendor:/workspace/p/vendor:rw,nosuid,nodev,bind
+-v
+$ROOT/home/code/myproject/vendor/lib:/workspace/p/vendor/lib:rw,nosuid,nodev,bind
+-v
 $ROOT/home/code/myproject/.git:/workspace/p/.git:O,upperdir=$ROOT/home/.local/share/sallyport/sessions/s-0001/git/0/upper,workdir=$ROOT/home/.local/share/sallyport/sessions/s-0001/git/0/work
 -v
 $ROOT/home/code/myproject/vendor/lib/.git:/workspace/p/vendor/lib/.git:O,upperdir=$ROOT/home/.local/share/sallyport/sessions/s-0001/git/1/upper,workdir=$ROOT/home/.local/share/sallyport/sessions/s-0001/git/1/work
 -v
 $ROOT/home/code/myproject/sub/module/.git:/workspace/p/sub/module/.git:ro,nosuid,nodev,bind
 -v
-$ROOT/run/sallyport/sessions/s-0001/workspace:/run/sallyport:rw,nosuid,nodev,bind
+$ROOT/run/sallyport/sessions/s-0001/workspace:/run/sallyport:ro,nosuid,nodev,bind
 ghcr.io/sallyport/workspace@sha256:1111111111111111111111111111111111111111111111111111111111111111
 /opt/sallyport/entry
 --idle

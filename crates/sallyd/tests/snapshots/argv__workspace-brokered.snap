@@ -1,6 +1,5 @@
 ---
 source: crates/sallyd/tests/argv.rs
-assertion_line: 162
 expression: f.redact(&a)
 ---
 --runtime
@@ -42,7 +41,7 @@ sandbox
 -v
 $ROOT/home/Documents/research:/workspace/r:ro,nosuid,nodev,bind
 -v
-$ROOT/run/sallyport/sessions/s-0001/workspace:/run/sallyport:rw,nosuid,nodev,bind
+$ROOT/run/sallyport/sessions/s-0001/workspace:/run/sallyport:ro,nosuid,nodev,bind
 ghcr.io/sallyport/workspace@sha256:1111111111111111111111111111111111111111111111111111111111111111
 /opt/sallyport/entry
 --idle

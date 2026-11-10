@@ -361,6 +361,29 @@ fn rt_man_02_privilege_escalation_attempts_rejected_with_documented_codes() {
     }
 }
 
+/// SI-11: Podman reads `<transport>:<rest>` as "load from this host path or daemon" even with
+/// `--pull=never`, so a digest suffix on a transport reference pins nothing.
+#[test]
+fn rt_man_02_image_transport_prefixes_are_refused() {
+    let f = Fixture::new();
+    let d = "0".repeat(64);
+    for image in [
+        "dir:/home/u/project/img",
+        "dir:5000/rel",
+        "oci:foo",
+        "oci-archive:/x.tar",
+        "docker-archive:/x.tar",
+        "docker-daemon:x",
+        "containers-storage:x",
+        "docker://ghcr.io/a/b",
+    ] {
+        for field in ["runtime", "harness"] {
+            let r = f.load(&format!("{field}:\n  image: \"{image}@sha256:{d}\"\n"));
+            assert_rejects(&r, &format!("{field}.image"), Code::NotPinned);
+        }
+    }
+}
+
 // ---- RT-MAN-03: TOCTOU on the manifest file -----------------------------------------------------
 
 #[test]

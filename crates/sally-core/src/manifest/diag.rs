@@ -231,9 +231,18 @@ fn mask_quoted(s: &str) -> String {
 /// A path segment without a trailing list index (`acknowledge_unapproved[12]` →
 /// `acknowledge_unapproved`), so the index's digits do not make a long field name look like a
 /// token. Only an all-digit index is removed: a user key such as `x[<token>]` is judged whole.
+/// A list index this long is not a real index (lists are bounded far below it); a longer digit
+/// run stays part of the segment and is masked like any other token.
+const MAX_INDEX_DIGITS: usize = 4;
+
 fn without_index(seg: &str) -> &str {
     match seg.strip_suffix(']').and_then(|s| s.rsplit_once('[')) {
-        Some((name, idx)) if !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()) => name,
+        Some((name, idx))
+            if (1..=MAX_INDEX_DIGITS).contains(&idx.len())
+                && idx.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            name
+        }
         _ => seg,
     }
 }
@@ -373,5 +382,12 @@ mod tests {
         assert_eq!(scrub_path(&format!("tools.{tok}")), "tools.ghp_…");
         assert_eq!(scrub_path(&format!("tools.{tok}[0]")), "tools.ghp_…");
         assert_eq!(scrub_path(&format!("tools.x[{tok}]")), "tools.x[gh…");
+        // A long digit run is not an index: it is masked with its segment.
+        let digits = "1234567890123456789012";
+        assert_eq!(scrub_path(&format!("tools.x[{digits}]")), "tools.x[12…");
+        assert_eq!(
+            scrub_path(&format!("tools.acknowledge_unapproved[{digits}]")),
+            "tools.ackn…"
+        );
     }
 }

@@ -15,7 +15,7 @@ use super::validate::{ResolvedMount, ValidatedManifest, data_can_leave};
 /// Files a host may execute that an `rw` mount cannot protect: `.git` folders are overlays and
 /// `.git` pointer files are read-only (AMENDMENTS-02 B2(a)), but nothing else is.
 const UNPROTECTED_HOST_FILES: &str = "Makefile, package.json scripts, .vscode/tasks.json, .envrc, \
-     or a new nested .git folder";
+     a new nested .git folder, or a git repository not named .git, such as a bare project.git";
 /// Longest rendering of an MCP server's command in the summary.
 const MAX_COMMAND_SHOWN: usize = 200;
 

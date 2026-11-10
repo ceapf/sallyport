@@ -179,13 +179,16 @@ tools: `fs_read`/`fs_list` on any mode, `fs_write`/`fs_delete` on `rw` and `brok
   every `.git` file (a worktree or submodule pointer) is bound read-only: git works inside the
   sandbox while the host's history, config, hooks and `commondir` stay byte-identical. Commits
   made in a session are discarded and file changes arrive as uncommitted modifications;
-  `summary()` says so. In a `staged` mount the host is untouched anyway and nothing under a `.git`
+  `summary()` says so. Every directory between the mount root and a nested `.git` entry is bound
+  onto itself, so it cannot be renamed away from under its shield (`EBUSY`); the launch scan
+  covers every `rw` mount (an `rw` mount without a scan is refused). In a `staged` mount the host is untouched anyway and nothing under a `.git`
   component is ever applied. Broker `fs_write`/`fs_delete` deny any path with a `.git` component
   (`protected-path`). The validator refuses an `rw`/`brokered`/`staged` mount whose realpath has a
   `.git` component or is (inside) a git directory by structure (`HEAD` + `objects/` + `refs/`,
   i.e. bare repos and separate git dirs; `protected-path`). `summary()` names what an `rw` mount
-  cannot protect: `Makefile`, `package.json` scripts, `.vscode/tasks.json`, `.envrc`, and new
-  nested `.git` folders.
+  cannot protect: `Makefile`, `package.json` scripts, `.vscode/tasks.json`, `.envrc`, new
+  nested `.git` folders, and git repositories inside the mount that are not named `.git` (a bare
+  `project.git`, a separate git dir).
 - Mounts may not overlap on the host side (a `rw` parent would bypass a `brokered` child's
   approvals) and guests may not repeat or nest.
 - Host realpaths and guests may not contain `:`, `,` or control characters (they would be

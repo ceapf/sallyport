@@ -618,6 +618,8 @@ fn summary_explains_protected_git_files_and_what_is_not_covered() {
         s.contains("Makefile, package.json scripts, .vscode/tasks.json, .envrc"),
         "{s}"
     );
+    // Security review of 6a: only entries named exactly `.git` are shielded.
+    assert!(s.contains("a git repository not named .git"), "{s}");
 }
 
 // ---- stable codes ----------------------------------------------------------------------------

@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use sally_core::config::{ConfigError, check_runtime_binary};
-use sally_core::manifest::{ByteSize, Cpus};
+use sally_core::manifest::{ByteSize, Cpus, is_pinned_image_ref};
 
 /// Why an argv could not be built.
 #[derive(Debug, thiserror::Error)]
@@ -75,7 +75,8 @@ impl SessionId {
     }
 }
 
-/// An image pinned by digest: `<name>@sha256:<64 lowercase hex>` (SI-11).
+/// An image pinned by digest (SI-11), in the grammar of
+/// [`sally_core::manifest::is_pinned_image_ref`]: never a Podman transport such as `dir:`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageRef(String);
 
@@ -85,22 +86,12 @@ impl ImageRef {
     /// # Errors
     /// [`ArgvError::Input`] unless it is a digest-pinned reference with a plain name.
     pub fn parse(s: &str) -> Result<Self, ArgvError> {
-        let Some((name, digest)) = s.split_once("@sha256:") else {
-            return input("image must be pinned by digest (<name>@sha256:<hex>)");
-        };
-        let name_ok = !name.is_empty()
-            && !name.starts_with('-')
-            && name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"./_-:".contains(&b));
-        let digest_ok = digest.len() == 64
-            && digest
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-        if name_ok && digest_ok {
+        if is_pinned_image_ref(s) {
             Ok(Self(s.to_owned()))
         } else {
-            input("image must be <name>@sha256:<64 lowercase hex>")
+            input(
+                "image must be <registry/name>@sha256:<64 lowercase hex>, with no transport prefix",
+            )
         }
     }
 
@@ -120,6 +111,29 @@ pub struct UserIds {
     pub gid: u32,
 }
 
+/// The three sandbox roles (AMENDMENTS-01 §2; SI-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// Mounts, the egress socket and the toolchain.
+    Workspace,
+    /// The agent: model and tool sockets only.
+    Harness,
+    /// The model server: GPU and read-only weights.
+    Inference,
+}
+
+impl Role {
+    /// The role's seccomp profile file name under [`CommonArgs::profiles`].
+    #[must_use]
+    pub const fn profile(self) -> &'static str {
+        match self {
+            Self::Workspace => "seccomp-workspace.json",
+            Self::Harness => "seccomp-harness.json",
+            Self::Inference => "seccomp-inference.json",
+        }
+    }
+}
+
 /// Settings shared by every role.
 #[derive(Debug, Clone)]
 pub struct CommonArgs {
@@ -128,6 +142,8 @@ pub struct CommonArgs {
     /// Host user.
     pub ids: UserIds,
     /// Directory holding `seccomp-{workspace,harness,inference}.json`.
+    ///
+    /// TODO(#10): check its ownership like [`CheckedRuntime`] (AMENDMENTS-02 B5).
     pub profiles: PathBuf,
 }
 
@@ -187,22 +203,42 @@ impl SessionPaths {
     /// Upper and work directories of the staged mount at manifest index `mount`; kept after the
     /// session so `sally session changes` can read them.
     #[must_use]
-    pub fn stage(&self, mount: usize) -> (PathBuf, PathBuf) {
-        let d = self.data.join("stage").join(mount.to_string());
-        (d.join("upper"), d.join("work"))
+    pub fn stage(&self, mount: usize) -> OverlayDirs {
+        OverlayDirs::under(&self.data.join("stage").join(mount.to_string()))
     }
 
     /// Upper and work directories of the `k`-th `.git` overlay; discarded at teardown.
     #[must_use]
-    pub fn git_overlay(&self, k: usize) -> (PathBuf, PathBuf) {
-        let d = self.data.join("git").join(k.to_string());
-        (d.join("upper"), d.join("work"))
+    pub fn git_overlay(&self, k: usize) -> OverlayDirs {
+        OverlayDirs::under(&self.data.join("git").join(k.to_string()))
+    }
+}
+
+/// The scratch directories of one overlay mount.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayDirs {
+    /// Receives every change made through the overlay.
+    pub upper: PathBuf,
+    /// Overlayfs work directory (same filesystem as `upper`).
+    pub work: PathBuf,
+}
+
+impl OverlayDirs {
+    fn under(d: &Path) -> Self {
+        Self {
+            upper: d.join("upper"),
+            work: d.join("work"),
+        }
     }
 }
 
 /// What the launch scan found inside one `rw` mount (AMENDMENTS-02 B2(a)): `.git` directories,
 /// mounted as overlays over session scratch, and `.git` files (worktree or submodule pointers),
-/// bound read-only. Paths are relative to the mount root and end in a `.git` component.
+/// bound read-only. Paths are relative to the mount root and end in a `.git` component. Every
+/// `rw` mount needs a scan, empty if it found nothing.
+///
+/// TODO(#10): only the no-follow launch scanner (Task 6b) may construct this; today the
+/// fields are public and the paths are trusted lexically.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitScan {
     /// Index of the mount in the manifest.
@@ -221,6 +257,8 @@ pub struct InferenceSpec {
     /// Host socket directory, `$XDG_RUNTIME_DIR/sallyport/infer/<id>`.
     pub socket_dir: PathBuf,
     /// The verified model blob (SI-6), mounted read-only.
+    ///
+    /// TODO(#10): a `VerifiedModel` type that only the SI-6 import can construct.
     pub model: PathBuf,
     /// Inference image.
     pub image: ImageRef,

@@ -4,6 +4,7 @@ use std::collections::HashSet;
 
 use super::super::diag::{Code, Diags};
 use super::super::hostenv::HostEnv;
+use super::super::image::is_pinned_image_ref;
 use super::super::types::{
     BuiltinTool, Harness, Manifest, Model, MountMode, NetworkMode, Runtime, ShellPolicy,
 };
@@ -129,32 +130,14 @@ pub(super) fn check_runtime(r: &Runtime, env: &HostEnv, d: &mut Diags) {
     );
 }
 
-/// `<name>@sha256:<64 lowercase hex>` (SI-11). Tags before the digest are allowed but ignored
-/// by the runtime; the digest is what gets checked against the local image.
+/// SI-11: the shared grammar in [`crate::manifest::is_pinned_image_ref`].
 fn check_image(s: &str) -> Result<(), String> {
-    let hint = "must be pinned by digest: <image>@sha256:<64 hex chars>";
-    let Some((name, digest)) = s.split_once("@sha256:") else {
-        return Err(format!("{s:?} {hint}"));
-    };
-    let name_ok = !name.is_empty()
-        && name.len() <= 255
-        && name
-            .bytes()
-            .next()
-            .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-        && name.bytes().all(|b| {
-            b.is_ascii_lowercase()
-                || b.is_ascii_digit()
-                || matches!(b, b'.' | b'_' | b'-' | b'/' | b':')
-        });
-    let digest_ok = digest.len() == 64
-        && digest
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-    if name_ok && digest_ok {
+    if is_pinned_image_ref(s) {
         Ok(())
     } else {
-        Err(format!("{s:?} {hint}"))
+        Err(format!(
+            "{s:?} must be pinned by digest: <image>@sha256:<64 hex chars>"
+        ))
     }
 }
 
@@ -203,9 +186,9 @@ pub(super) fn check_tools(m: &Manifest, d: &mut Diags) {
     check_fs_tools(m, d);
 }
 
-// The `*_needs_ack` predicates are the single definition of "this widening is live": the
-// validator requires the flag exactly when one returns true, and
-// `ValidatedManifest::acknowledged_risks` reports the flag exactly then.
+// `wildcard_needs_ack` (and `ack::needed` for `tools.acknowledge_unapproved`) are the single
+// definition of "this widening is live": the validator requires the acknowledgement exactly when
+// one says so, and `ValidatedManifest::acknowledged_risks` reports it exactly then.
 
 /// Some allow rule reaches attacker-registrable hosts. `egress` is the parsed rule list (also
 /// parsed under `mode: none`, where the validator still requires the flag so a later mode

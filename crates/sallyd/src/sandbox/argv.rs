@@ -2,28 +2,31 @@
 //! socket, toolchain), harness (model and tool sockets only), inference (GPU, read-only weights).
 //!
 //! Every builder returns the arguments that follow the `podman` program name, starting with
-//! `--runtime <checked path> run`, and runs [`check_argv`] on its own output before returning it.
+//! `--runtime <checked path> run`, and runs [`check_argv`] on its own output, against an
+//! [`Allowed`] policy derived from the role and the manifest, before returning it.
 
-use std::collections::{BTreeSet, HashSet};
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use sally_core::manifest::{ByteSize, MountMode, NetworkMode, ValidatedManifest};
 
-use super::check::check_argv;
-use super::types::{ArgvError, CommonArgs, GitScan, ImageRef, InferenceSpec, SessionPaths, input};
+use super::check::{Allowed, Grant, Source, check_argv};
+use super::types::{
+    ArgvError, CommonArgs, GitScan, ImageRef, InferenceSpec, OverlayDirs, Role, SessionPaths, input,
+};
 
 /// The entry point baked into the workspace and harness images.
-const ENTRY: &str = "/opt/sallyport/entry";
+pub(super) const ENTRY: &str = "/opt/sallyport/entry";
 /// Where each role's socket directory appears inside its container.
-const SOCKETS_GUEST: &str = "/run/sallyport";
+pub(super) const SOCKETS_GUEST: &str = "/run/sallyport";
 /// The shim inside the workspace listens here and forwards to `net.sock` (SI-1).
-const PROXY_URL: &str = "http://127.0.0.1:3128";
+pub(super) const PROXY_URL: &str = "http://127.0.0.1:3128";
 /// `secrets[].expose_env` value: a public constant, never the secret (MANIFEST_SPEC).
-const PLACEHOLDER: &str = "sallyport-placeholder";
+pub(super) const PLACEHOLDER: &str = "sallyport-placeholder";
 /// Trust bundles for the session CA when the proxy intercepts TLS (AMENDMENTS-01 §4).
-const CA_BUNDLE: &str = "/run/sallyport/ca-bundle.pem";
-const SESSION_CA: &str = "/run/sallyport/session-ca.pem";
-const CA_BUNDLE_VARS: [&str; 7] = [
+pub(super) const CA_BUNDLE: &str = "/run/sallyport/ca-bundle.pem";
+pub(super) const SESSION_CA: &str = "/run/sallyport/session-ca.pem";
+pub(super) const CA_BUNDLE_VARS: [&str; 7] = [
     "SSL_CERT_FILE",
     "REQUESTS_CA_BUNDLE",
     "CURL_CA_BUNDLE",
@@ -32,7 +35,7 @@ const CA_BUNDLE_VARS: [&str; 7] = [
     "CARGO_HTTP_CAINFO",
     "AWS_CA_BUNDLE",
 ];
-const PROXY_VARS: [&str; 6] = [
+pub(super) const PROXY_VARS: [&str; 6] = [
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "ALL_PROXY",
@@ -40,6 +43,14 @@ const PROXY_VARS: [&str; 6] = [
     "https_proxy",
     "all_proxy",
 ];
+/// The harness reaches the model through the shim on this port (AMENDMENTS-01 §3.2).
+pub(super) const OPENAI_BASE_URL: &str = "http://127.0.0.1:8080/v1";
+/// A dummy key: the broker answers on `llm.sock` and needs none (AMENDMENTS-01 §3.2).
+pub(super) const HARNESS_API_KEY: &str = "sallyport";
+/// Where the model file appears in the inference container.
+pub(super) const MODEL_GUEST: &str = "/models/model.gguf";
+/// `llama-server` listens here, inside the inference socket directory.
+pub(super) const INFER_SOCKET: &str = "/run/sallyport/infer.sock";
 /// Harness resources are fixed in v1 (AMENDMENTS-01 §2).
 const HARNESS_CPUS: &str = "1";
 const HARNESS_MEMORY: u64 = 1024 * 1024 * 1024;
@@ -47,56 +58,46 @@ const HARNESS_PIDS: u32 = 128;
 /// `/tmp` of the harness and inference containers.
 const SMALL_TMP: u64 = 256 * 1024 * 1024;
 const INFERENCE_PIDS: u32 = 64;
-/// The harness reaches the model through the shim on this port (AMENDMENTS-01 §3.2).
-const OPENAI_BASE_URL: &str = "http://127.0.0.1:8080/v1";
-
-/// Role-specific seccomp profile file names under [`CommonArgs::profiles`].
-#[derive(Clone, Copy)]
-enum Role {
-    Workspace,
-    Harness,
-    Inference,
-}
-
-impl Role {
-    const fn profile(self) -> &'static str {
-        match self {
-            Self::Workspace => "seccomp-workspace.json",
-            Self::Harness => "seccomp-harness.json",
-            Self::Inference => "seccomp-inference.json",
-        }
-    }
-}
 
 /// A path as it may appear in a `-v`, `--security-opt` or `--runtime` argument: absolute, UTF-8,
 /// and free of `:`, `,` and control characters, which would change the meaning of the argument.
 pub(crate) fn path_arg(p: &Path, what: &str) -> Result<String, ArgvError> {
     let Some(s) = p.to_str() else {
-        return input(format!("{what} is not valid UTF-8"));
+        return input(format!("{what}: not valid UTF-8"));
     };
     if !p.is_absolute() {
-        return input(format!("{what} must be an absolute path"));
+        return input(format!("{what}: must be an absolute path"));
     }
     if s.chars().any(|c| c == ':' || c == ',' || c.is_control())
-        || s.split('/').any(|seg| seg == "." || seg == "..")
+        || s.split('/')
+            .skip(1)
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
     {
         return input(format!(
-            "{what} contains ':', ',', a control character, or a . or .. segment"
+            "{what}: contains ':', ',', a control character, or an empty, . or .. segment"
         ));
     }
     Ok(s.to_owned())
 }
 
 /// A `.git` path found by the launch scan, relative to its mount: plain segments only, ending in
-/// `.git`.
-fn git_rel(p: &Path) -> Result<String, ArgvError> {
-    let bad = || input("git scan entries are relative paths of plain segments ending in .git");
+/// `.git`, with no `.git` segment before the last (the scanner does not descend into one).
+fn git_rel(p: &Path, what: &str) -> Result<String, ArgvError> {
+    let bad = || {
+        input(format!(
+            "{what}: must be a relative path of plain segments ending in .git, with no other \
+             .git segment"
+        ))
+    };
     let Some(s) = p.to_str() else { return bad() };
     let segs: Vec<&str> = s.split('/').collect();
+    let Some((last, parents)) = segs.split_last() else {
+        return bad();
+    };
     let plain = segs
         .iter()
         .all(|seg| !seg.is_empty() && *seg != "." && *seg != "..");
-    if s.starts_with('/') || !plain || segs.last() != Some(&".git") {
+    if s.starts_with('/') || !plain || *last != ".git" || parents.contains(&".git") {
         return bad();
     }
     if s.chars().any(|c| c == ':' || c == ',' || c.is_control()) {
@@ -174,14 +175,9 @@ impl Argv {
     /// Podman refuses other options next to `O` (probed on 4.9.3), so an overlay carries no
     /// `nosuid,nodev`; `no-new-privileges`, `--cap-drop=ALL` and the seccomp profile (no
     /// `mknod`) are what keep set-id files and device nodes inert there.
-    fn overlay(
-        &mut self,
-        host: &str,
-        guest: &str,
-        (upper, work): (PathBuf, PathBuf),
-    ) -> Result<(), ArgvError> {
-        let upper = path_arg(&upper, "overlay upper directory")?;
-        let work = path_arg(&work, "overlay work directory")?;
+    fn overlay(&mut self, host: &str, guest: &str, dirs: &OverlayDirs) -> Result<(), ArgvError> {
+        let upper = path_arg(&dirs.upper, "overlay upper directory")?;
+        let work = path_arg(&dirs.work, "overlay work directory")?;
         self.push([
             "-v",
             &format!("{host}:{guest}:O,upperdir={upper},workdir={work}"),
@@ -189,18 +185,27 @@ impl Argv {
         Ok(())
     }
 
-    fn finish(self, roots: &[PathBuf]) -> Result<Vec<String>, ArgvError> {
-        let roots: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
-        check_argv(&self.0, &roots)?;
+    fn finish(self, allowed: &Allowed) -> Result<Vec<String>, ArgvError> {
+        check_argv(&self.0, allowed)?;
         Ok(self.0)
+    }
+}
+
+fn source(path: &Path, guest: &str, grant: Grant) -> Source {
+    Source {
+        path: path.to_owned(),
+        guest: guest.to_owned(),
+        grant,
     }
 }
 
 /// The workspace container: the manifest's mounts, the egress socket in proxy mode, and the
 /// toolchain image; it idles until the broker execs into it (AMENDMENTS-01 §2).
 ///
-/// `git` lists what the launch scan found in each `rw` mount (AMENDMENTS-02 B2(a)): every `.git`
-/// directory becomes an overlay over session scratch, every `.git` file a read-only bind.
+/// `git` holds the launch scan of every `rw` mount (AMENDMENTS-02 B2(a)), one per `rw` mount and
+/// empty if it found nothing: every `.git` directory becomes an overlay over session scratch,
+/// every `.git` file a read-only bind, and every directory between the mount root and either is
+/// bound onto itself so it cannot be renamed away from under its shield (EBUSY).
 ///
 /// # Errors
 /// [`ArgvError::Input`] for a malformed input; [`ArgvError::Forbidden`] if the result fails
@@ -222,6 +227,40 @@ pub fn workspace_argv(
         Some(m.runtime.memory.bytes()),
     );
     a.push(["--init", "--env-host=false", "--hostname", "sandbox"]);
+    workspace_env(&mut a, v);
+    let mut sources = workspace_mounts(&mut a, paths, v, &scans)?;
+    let sockets = paths.workspace_sockets();
+    a.bind(
+        &path_arg(&sockets, "workspace socket directory")?,
+        SOCKETS_GUEST,
+        "ro",
+    );
+    sources.push(source(&sockets, SOCKETS_GUEST, Grant::Ro));
+    let image = match &m.runtime.image {
+        Some(i) => ImageRef::parse(i).map_err(|e| field_err("runtime.image", e))?,
+        None => default_image.clone(),
+    };
+    a.push([image.as_str(), ENTRY, "--idle"]);
+    a.finish(&Allowed {
+        role: Role::Workspace,
+        ids: c.ids,
+        profiles: c.profiles.clone(),
+        sources,
+        scratch: Some(paths.data_root().to_owned()),
+    })
+}
+
+fn field_err(field: &str, e: ArgvError) -> ArgvError {
+    match e {
+        ArgvError::Input(msg) => ArgvError::Input(format!("{field}: {msg}")),
+        other => other,
+    }
+}
+
+/// Proxy variables (proxy mode), CA bundle variables (proxy mode with secrets), and the
+/// placeholder for every `expose_env` name.
+fn workspace_env(a: &mut Argv, v: &ValidatedManifest) {
+    let m = v.manifest();
     if m.network.mode == NetworkMode::Proxy {
         for var in PROXY_VARS {
             a.env(var, PROXY_URL);
@@ -243,70 +282,121 @@ pub fn workspace_argv(
     for name in exposed {
         a.env(name, PLACEHOLDER);
     }
-    let mut roots = vec![paths.data_root().to_owned(), paths.socket_root().to_owned()];
+}
+
+/// Emits every manifest mount and returns the sources the checker may accept.
+fn workspace_mounts(
+    a: &mut Argv,
+    paths: &SessionPaths,
+    v: &ValidatedManifest,
+    scans: &BTreeMap<usize, &GitScan>,
+) -> Result<Vec<Source>, ArgvError> {
+    let mut sources = Vec::new();
     let mut overlays = 0usize;
     for (i, mt) in v.mounts().iter().enumerate() {
-        let host = path_arg(&mt.host, "mount host")?;
-        let guest = path_arg(Path::new(&mt.guest), "mount guest")?;
-        roots.push(mt.host.clone());
-        match mt.mode {
-            MountMode::Ro | MountMode::Brokered => a.bind(&host, &guest, "ro"),
-            MountMode::Staged => a.overlay(&host, &guest, paths.stage(i))?,
+        let host = path_arg(&mt.host, &format!("filesystem.mounts[{i}].host"))?;
+        let guest = path_arg(
+            Path::new(&mt.guest),
+            &format!("filesystem.mounts[{i}].guest"),
+        )?;
+        let grant = match mt.mode {
+            MountMode::Ro | MountMode::Brokered => {
+                a.bind(&host, &guest, "ro");
+                Grant::Ro
+            }
+            MountMode::Staged => {
+                a.overlay(&host, &guest, &paths.stage(i))?;
+                Grant::Overlay
+            }
             MountMode::Rw => {
                 a.bind(&host, &guest, "rw");
-                if let Some(scan) = scans.get(&i) {
-                    for dir in &scan.dirs {
-                        let rel = git_rel(dir)?;
-                        a.overlay(
-                            &format!("{host}/{rel}"),
-                            &format!("{guest}/{rel}"),
-                            paths.git_overlay(overlays),
-                        )?;
-                        overlays += 1;
-                    }
-                    for file in &scan.files {
-                        let rel = git_rel(file)?;
-                        a.bind(&format!("{host}/{rel}"), &format!("{guest}/{rel}"), "ro");
-                    }
-                }
+                let scan = scans.get(&i).ok_or_else(|| {
+                    ArgvError::Input(format!("filesystem.mounts[{i}]: rw mount has no git scan"))
+                })?;
+                git_shields(a, paths, (&host, &guest), scan, &mut overlays)?;
+                Grant::Rw
             }
-        }
+        };
+        sources.push(source(&mt.host, &guest, grant));
     }
-    let sockets = path_arg(&paths.workspace_sockets(), "workspace socket directory")?;
-    a.bind(&sockets, SOCKETS_GUEST, "rw");
-    let image = match &m.runtime.image {
-        Some(i) => ImageRef::parse(i)?,
-        None => default_image.clone(),
-    };
-    a.push([image.as_str(), ENTRY, "--idle"]);
-    a.finish(&roots)
+    Ok(sources)
+}
+
+/// AMENDMENTS-02 B2(a) inside one `rw` mount: pin the parents, overlay `.git` directories, bind
+/// `.git` files read-only.
+fn git_shields(
+    a: &mut Argv,
+    paths: &SessionPaths,
+    (host, guest): (&str, &str),
+    scan: &GitScan,
+    overlays: &mut usize,
+) -> Result<(), ArgvError> {
+    let at =
+        |kind: &str, j: usize| format!("git scan of filesystem.mounts[{}].{kind}[{j}]", scan.mount);
+    let dirs = scan
+        .dirs
+        .iter()
+        .enumerate()
+        .map(|(j, d)| git_rel(d, &at("dirs", j)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let files = scan
+        .files
+        .iter()
+        .enumerate()
+        .map(|(j, f)| git_rel(f, &at("files", j)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let parents: BTreeSet<&str> = dirs
+        .iter()
+        .chain(&files)
+        .flat_map(|rel| {
+            rel.match_indices('/')
+                .map(move |(k, _)| rel.get(..k).unwrap_or(rel))
+        })
+        .collect();
+    for p in parents {
+        a.bind(&format!("{host}/{p}"), &format!("{guest}/{p}"), "rw");
+    }
+    for rel in &dirs {
+        a.overlay(
+            &format!("{host}/{rel}"),
+            &format!("{guest}/{rel}"),
+            &paths.git_overlay(*overlays),
+        )?;
+        *overlays += 1;
+    }
+    for rel in &files {
+        a.bind(&format!("{host}/{rel}"), &format!("{guest}/{rel}"), "ro");
+    }
+    Ok(())
 }
 
 /// Checks the git scans: each names an existing `rw` mount, once, with unique `.git` paths.
 fn scans_by_mount<'a>(
     v: &ValidatedManifest,
     git: &'a [GitScan],
-) -> Result<std::collections::BTreeMap<usize, &'a GitScan>, ArgvError> {
-    let mut out = std::collections::BTreeMap::new();
+) -> Result<BTreeMap<usize, &'a GitScan>, ArgvError> {
+    let mut out = BTreeMap::new();
     for scan in git {
+        let at = format!("git scan of filesystem.mounts[{}]", scan.mount);
         match v.mounts().get(scan.mount) {
             Some(mt) if mt.mode == MountMode::Rw => {}
-            Some(_) => return input("git scans apply only to rw mounts"),
-            None => return input("git scan names a mount that does not exist"),
+            Some(_) => return input(format!("{at}: git scans apply only to rw mounts")),
+            None => return input(format!("{at}: no such mount")),
         }
         if out.insert(scan.mount, scan).is_some() {
-            return input("two git scans for the same mount");
+            return input(format!("{at}: listed twice"));
         }
-        let mut seen = HashSet::new();
+        let mut seen = BTreeSet::new();
         if !scan.dirs.iter().chain(&scan.files).all(|p| seen.insert(p)) {
-            return input("a .git path is listed twice");
+            return input(format!("{at}: a .git path is listed twice"));
         }
     }
     Ok(out)
 }
 
 /// The harness container: no mounts, no egress, no GPU; only its own socket directory with
-/// `llm.sock` and `agent.sock`. Resources are fixed in v1 (AMENDMENTS-01 §2).
+/// `llm.sock` and `agent.sock`, read-only (it only connects). Resources are fixed in v1
+/// (AMENDMENTS-01 §2).
 ///
 /// # Errors
 /// As [`workspace_argv`].
@@ -321,21 +411,31 @@ pub fn harness_argv(
     a.limits(HARNESS_PIDS, HARNESS_CPUS, Some(HARNESS_MEMORY));
     a.push(["--init", "--env-host=false", "--hostname", "sandbox"]);
     a.env("OPENAI_BASE_URL", OPENAI_BASE_URL);
-    // A dummy: the broker answers on llm.sock and needs no key (AMENDMENTS-01 §3.2).
-    a.env("OPENAI_API_KEY", "sallyport");
-    let sockets = path_arg(&paths.harness_sockets(), "harness socket directory")?;
-    a.bind(&sockets, SOCKETS_GUEST, "rw");
+    a.env("OPENAI_API_KEY", HARNESS_API_KEY);
+    let sockets = paths.harness_sockets();
+    a.bind(
+        &path_arg(&sockets, "harness socket directory")?,
+        SOCKETS_GUEST,
+        "ro",
+    );
     let image = match &v.manifest().harness {
-        Some(h) => ImageRef::parse(&h.image)?,
+        Some(h) => ImageRef::parse(&h.image).map_err(|e| field_err("harness.image", e))?,
         None => default_image.clone(),
     };
     a.push([image.as_str(), ENTRY]);
-    a.finish(&[paths.socket_root().to_owned()])
+    a.finish(&Allowed {
+        role: Role::Harness,
+        ids: c.ids,
+        profiles: c.profiles.clone(),
+        sources: vec![source(&sockets, SOCKETS_GUEST, Grant::Ro)],
+        scratch: None,
+    })
 }
 
 /// The inference container (ARCHITECTURE §3.2, AMENDMENTS-01 §6.2): the GPU, one read-only
-/// model file, its socket directory, and a fixed `llama-server` command that always passes `-m`
-/// and never a flag granting file or network reach.
+/// model file, its socket directory (read-write: `llama-server` creates the socket), and a fixed
+/// `llama-server` command that always passes `-m` and never a flag granting file or network
+/// reach.
 ///
 /// # Errors
 /// As [`workspace_argv`].
@@ -355,22 +455,11 @@ pub fn inference_argv(c: &CommonArgs, s: &InferenceSpec) -> Result<Vec<String>, 
     if s.gpu {
         a.push(["--device", "nvidia.com/gpu=all"]);
     }
-    let model = path_arg(&s.model, "model file")?;
-    a.bind(&model, "/models/model.gguf", "ro");
+    a.bind(&path_arg(&s.model, "model file")?, MODEL_GUEST, "ro");
     let sockets = path_arg(&s.socket_dir, "inference socket directory")?;
     a.bind(&sockets, SOCKETS_GUEST, "rw");
-    a.push([
-        s.image.as_str(),
-        "llama-server",
-        "--host",
-        "/run/sallyport/infer.sock",
-    ]);
-    a.push([
-        "-m",
-        "/models/model.gguf",
-        "-ngl",
-        &s.gpu_layers.to_string(),
-    ]);
+    a.push([s.image.as_str(), "llama-server", "--host", INFER_SOCKET]);
+    a.push(["-m", MODEL_GUEST, "-ngl", &s.gpu_layers.to_string()]);
     a.push([
         "-c",
         &s.context.to_string(),
@@ -380,5 +469,14 @@ pub fn inference_argv(c: &CommonArgs, s: &InferenceSpec) -> Result<Vec<String>, 
         "1",
         "--log-disable",
     ]);
-    a.finish(&[s.model.clone(), s.socket_dir.clone()])
+    a.finish(&Allowed {
+        role: Role::Inference,
+        ids: c.ids,
+        profiles: c.profiles.clone(),
+        sources: vec![
+            source(&s.model, MODEL_GUEST, Grant::Ro),
+            source(&s.socket_dir, SOCKETS_GUEST, Grant::Rw),
+        ],
+        scratch: None,
+    })
 }

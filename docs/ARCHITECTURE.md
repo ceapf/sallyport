@@ -119,10 +119,23 @@ $XDG_RUNTIME_DIR/sallyport/
 
 ### 3.2 `podman run` argv: common prologue (normative)
 Built by the pure `sallyd::sandbox::{workspace,harness,inference}_argv` (one container per role,
-AMENDMENTS-01 §2). Every builder checks its own output with `check_argv`, an **allowlist**: only
-the options below, each with a value of the expected shape, the hardening flags exactly once,
-`-v` sources only under validated mount roots or the session's own directories, and the image
-pinned by digest. The snapshots in `crates/sallyd/tests/snapshots/` are the normative examples.
+AMENDMENTS-01 §2). Every builder checks its own output with `check_argv` against a per-role
+policy (`Allowed`), an **allowlist**:
+- only the options below, each with its exact value or value shape (`--user` is the session's
+  ids, the seccomp profile is the role's file under the profiles directory, `--device` only
+  `nvidia.com/gpu=all` and only for inference, environment variables only the role's exact
+  name/value pairs plus `expose_env` placeholders);
+- every option at most once (mounts, variables and `--security-opt` kinds included), every
+  hardening option exactly once;
+- every `-v` source a declared source of that role at its declared guest path: `ro` grants only a
+  read-only bind, `rw` a read-write bind plus binds and overlays of paths inside it at the
+  matching guest path, `staged` only an overlay; overlay upper and work directories only inside
+  the session's scratch directory; another role's socket directory is never a source (SI-2);
+- the image in the shared digest-pinned grammar (`sally_core::manifest::is_pinned_image_ref`:
+  never a Podman transport such as `dir:` or `docker-daemon:`, SI-11);
+- the command after the image exactly the role's fixed command.
+
+The snapshots in `crates/sallyd/tests/snapshots/` are the normative examples.
 ```
 podman --runtime <checked runtime_path>          # AMENDMENTS-02 B5: never the distro crun
   run --rm --name sp-{ws|h|infer}-<id>
@@ -151,11 +164,13 @@ inert there.
    --env NODE_EXTRA_CA_CERTS=/run/sallyport/session-ca.pem]                                            # proxy mode + secrets
   [--env <expose_env>=sallyport-placeholder]
   -v <host>:<guest>:ro,…        # ro and brokered
-  -v <host>:<guest>:rw,…        # rw, then for each .git directory the launch scan found (AMENDMENTS-02 B2(a)):
+  -v <host>:<guest>:rw,…        # rw; then from the launch scan (required for every rw mount, AMENDMENTS-02 B2(a)):
+  -v <host>/<p>:<guest>/<p>:rw,…                               # every directory between the root and a .git entry, bound
+                                                               # onto itself so it cannot be renamed away (EBUSY)
   -v <host>/<rel>/.git:<guest>/<rel>/.git:O,upperdir=<data>/sessions/<id>/git/<k>/upper,workdir=…/work
   -v <host>/<rel>/.git:<guest>/<rel>/.git:ro,…                 # .git files (worktree/submodule pointers)
   -v <host>:<guest>:O,upperdir=<data>/sessions/<id>/stage/<n>/upper,workdir=…/work      # staged (B2(b))
-  -v $XDG_RUNTIME_DIR/sallyport/sessions/<id>/workspace:/run/sallyport:rw,…               # net.sock + CA bundle
+  -v $XDG_RUNTIME_DIR/sallyport/sessions/<id>/workspace:/run/sallyport:ro,…               # net.sock + CA bundle (connect only)
   <runtime.image or bundled workspace image>@sha256:<digest> /opt/sallyport/entry --idle
 ```
 **Harness** (no mounts, no egress, no GPU; fixed 1 CPU, 1 GiB, 128 pids):
@@ -163,7 +178,7 @@ inert there.
   --tmpfs /tmp:rw,noexec,nosuid,nodev,size=256MiB --pids-limit 128 --cpus 1 --memory 1GiB
   --init --env-host=false --hostname sandbox
   --env OPENAI_BASE_URL=http://127.0.0.1:8080/v1 --env OPENAI_API_KEY=sallyport
-  -v $XDG_RUNTIME_DIR/sallyport/sessions/<id>/harness:/run/sallyport:rw,…                 # llm.sock, agent.sock
+  -v $XDG_RUNTIME_DIR/sallyport/sessions/<id>/harness:/run/sallyport:ro,…                 # llm.sock, agent.sock (connect only)
   <harness.image or bundled harness image>@sha256:<digest> /opt/sallyport/entry
 ```
 **Inference** (GPU, one read-only model file):
@@ -171,15 +186,18 @@ inert there.
   --tmpfs /tmp:rw,noexec,nosuid,nodev,size=256MiB --pids-limit 64 --cpus <n> [--memory <m>b]
   --init --env-host=false [--device nvidia.com/gpu=all]
   -v <blobs>/sha256/<hex>:/models/model.gguf:ro,…
-  -v $XDG_RUNTIME_DIR/sallyport/infer/<id>:/run/sallyport:rw,…
+  -v $XDG_RUNTIME_DIR/sallyport/infer/<id>:/run/sallyport:rw,…   # llama-server creates infer.sock
   <inference image>@sha256:<digest>
   llama-server --host /run/sallyport/infer.sock -m /models/model.gguf
                -ngl <n> -c <ctx> --jinja --no-webui -np 1 --log-disable
 ```
 `-m` is always passed (without it llama-server boots as a multi-model router); `check_argv`
-refuses `--models-dir`, `--models-preset`, `--slot-save-path` and any `--webui*`/`--ui*` flag
-other than `--no-webui` in the command (AMENDMENTS-01 §6.2). Each role has its own socket
-directory; no role can see another's sockets.
+accepts exactly this command with only the `-ngl`/`-c` numbers varying, so `--models-dir`,
+`--models-preset`, `--slot-save-path`, `--webui*`, `--path`, `--lora`, `-hf` and every other flag
+are refused (AMENDMENTS-01 §6.2). Each role has its own socket directory; no role can see
+another's sockets. Podman configuration outside the argv (`containers.conf`, `mounts.conf`, OCI
+hooks, `CONTAINER_HOST`) is not covered by `check_argv`; the launcher controls it (Task 6b,
+TODO(#11)).
 
 ### 3.4 Seccomp
 Start from `containers-common`'s default profile and **remove**: `mount, umount2, pivot_root,
