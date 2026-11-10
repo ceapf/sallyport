@@ -51,6 +51,11 @@ fn test_image() -> ImageRef {
             "build",
             "--pull=never",
             "--network=none",
+            // Reproducible: nextest runs each test in its own process, and parallel uncached
+            // builds would otherwise differ (creation time), re-tag the name, and leave an
+            // earlier process's `name@digest` unresolvable.
+            "--timestamp",
+            "0",
             "-q",
             "-t",
             "localhost/sallyport-test:6b",
