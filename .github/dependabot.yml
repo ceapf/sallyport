@@ -1,5 +1,6 @@
-# Weekly dependency PRs (AMENDMENTS-01 §15). Every PR still has to pass `cargo deny`, the full CI
-# set and review; nothing auto-merges.
+# Weekly dependency PRs (AMENDMENTS-01 §15): one grouped PR per ecosystem and directory per week,
+# all SemVer levels included. Every PR still has to pass `cargo deny` and the full CI set; nothing
+# auto-merges. Merge policy for these PRs: CLAUDE.md, "Public repository rules".
 version: 2
 updates:
   - package-ecosystem: cargo
@@ -9,17 +10,23 @@ updates:
       day: monday
     open-pull-requests-limit: 5
     groups:
-      cargo-minor:
-        update-types: [minor, patch]
+      cargo:
+        patterns: ["*"]
   - package-ecosystem: cargo
     directory: /fuzz
     schedule:
       interval: weekly
       day: monday
     open-pull-requests-limit: 2
+    groups:
+      cargo-fuzz:
+        patterns: ["*"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        patterns: ["*"]
