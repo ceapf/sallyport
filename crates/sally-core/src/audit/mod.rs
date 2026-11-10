@@ -17,6 +17,9 @@
 //! writer drops it on open (SI-4 writes before the effect, so the action never happened) and
 //! records `audit.recovered`.
 //!
+//! **Verification beside a writer:** `verify` reads the head first and accepts a log that runs
+//! past it; a log that ends before the head is tail deletion.
+//!
 //! **Residual:** whoever can rewrite the whole directory, head included, can rewrite the whole
 //! chain (THREAT_MODEL, "whole audit chain can be rewritten by the user"). The directory is never
 //! mounted into a sandbox.
@@ -31,5 +34,14 @@ pub use entry::{
     Actor, Entry, GENESIS_HASH, MAX_ARGS_BYTES, MAX_LINE_BYTES, VerifyErrorKind, parse_line,
 };
 pub use redact::{MIN_BASE64_PATTERN, Redactor};
+/// Strict parse of the bytes of an `audit.head` file: `(seq, hash)`. Bounded and canonical-only;
+/// the fuzz entry point for the head parser.
+///
+/// # Errors
+/// [`VerifyErrorKind::HeadInvalid`].
+pub fn parse_head(bytes: &[u8]) -> Result<(u64, String), VerifyErrorKind> {
+    layout::Head::parse(bytes).map(|h| (h.seq, h.hash))
+}
+
 pub use verify::{HeadStatus, VerifyError, VerifyReport, verify};
 pub use writer::{Appended, AuditError, AuditWriter, Clock, Detail, NewEntry, SystemClock};

@@ -1,7 +1,11 @@
 //! On-disk layout of the audit directory: monthly log files, the head file, the lock file.
 
+use std::fs::File;
+use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+use rustix::fs::{Mode, OFlags};
 use serde::{Deserialize, Serialize};
 
 use super::entry::{VerifyErrorKind, is_hex64};
@@ -10,6 +14,8 @@ use super::entry::{VerifyErrorKind, is_hex64};
 pub(crate) const HEAD_FILE: &str = "audit.head";
 pub(crate) const HEAD_TMP: &str = "audit.head.tmp";
 pub(crate) const LOCK_FILE: &str = "audit.lock";
+/// A head line is about 90 bytes; anything larger is not one.
+const MAX_HEAD_BYTES: usize = 512;
 const LOG_PREFIX: &str = "audit-";
 const LOG_SUFFIX: &str = ".jsonl";
 
@@ -27,20 +33,45 @@ impl Head {
         format!("{}\n", serde_json::to_string(self).unwrap_or_default())
     }
 
-    /// `Ok(None)` if there is no head file.
-    pub(crate) fn read(dir: &Path) -> Result<Option<Self>, VerifyErrorKind> {
-        let bytes = match std::fs::read(dir.join(HEAD_FILE)) {
-            Ok(b) if b.len() <= 512 => b,
-            Ok(_) => return Err(VerifyErrorKind::HeadInvalid),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(_) => return Err(VerifyErrorKind::Unreadable),
-        };
-        let head: Self =
-            serde_json::from_slice(&bytes).map_err(|_| VerifyErrorKind::HeadInvalid)?;
+    /// Strict parse: bounded, canonical bytes only.
+    pub(crate) fn parse(bytes: &[u8]) -> Result<Self, VerifyErrorKind> {
+        if bytes.len() > MAX_HEAD_BYTES {
+            return Err(VerifyErrorKind::HeadInvalid);
+        }
+        let head: Self = serde_json::from_slice(bytes).map_err(|_| VerifyErrorKind::HeadInvalid)?;
         if head.seq == 0 || !is_hex64(&head.hash) || head.line().as_bytes() != bytes {
             return Err(VerifyErrorKind::HeadInvalid);
         }
-        Ok(Some(head))
+        Ok(head)
+    }
+
+    /// `Ok(None)` if there is no head file. Refuses a symlink or a non-regular file, checks the
+    /// size before reading, and never reads more than the limit.
+    pub(crate) fn read(dir: &Path) -> Result<Option<Self>, VerifyErrorKind> {
+        let fd = match rustix::fs::open(
+            dir.join(HEAD_FILE),
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::NOENT) => return Ok(None),
+            Err(_) => return Err(VerifyErrorKind::Unreadable),
+        };
+        let file = File::from(fd);
+        let meta = file.metadata().map_err(|_| VerifyErrorKind::Unreadable)?;
+        if !meta.is_file() {
+            return Err(VerifyErrorKind::Unreadable);
+        }
+        if meta.uid() != rustix::process::geteuid().as_raw()
+            || usize::try_from(meta.len()).map_or(true, |n| n > MAX_HEAD_BYTES)
+        {
+            return Err(VerifyErrorKind::HeadInvalid);
+        }
+        let mut bytes = Vec::with_capacity(MAX_HEAD_BYTES + 1);
+        file.take(u64::try_from(MAX_HEAD_BYTES + 1).unwrap_or(u64::MAX))
+            .read_to_end(&mut bytes)
+            .map_err(|_| VerifyErrorKind::Unreadable)?;
+        Self::parse(&bytes).map(Some)
     }
 }
 

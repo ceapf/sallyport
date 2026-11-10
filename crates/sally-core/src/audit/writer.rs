@@ -3,7 +3,13 @@
 //!
 //! **Fail closed:** if [`AuditWriter::append`] returns an error the caller must not perform the
 //! action the entry describes. An entry is durable before `append` returns, and an entry for an
-//! action that then does not happen is harmless.
+//! action that then does not happen is harmless. `append` blocks on `fsync`; async callers run
+//! it in `spawn_blocking`.
+//!
+//! **Residuals** (all need the access that could rewrite `audit.head` too): deleting entries
+//! 2..N together with the head leaves a one-entry log that verifies; a forged entry appended
+//! right after the head is adopted as a crash leftover. Rotation only moves forward, so a
+//! wrong-clock future month stays the current file until restart.
 
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::Write;
@@ -15,8 +21,8 @@ use rustix::fs::{FlockOperation, Mode, OFlags};
 use serde_json::{Value, json};
 
 use super::entry::{
-    Actor, Entry, GENESIS_HASH, MAX_ARGS_BYTES, MAX_LINE_BYTES, VerifyErrorKind, is_decision,
-    is_event, is_session, parse_line, sha256_hex, truncation_marker,
+    Actor, Entry, GENESIS_HASH, MAX_ARGS_BYTES, MAX_LINE_BYTES, is_decision, is_event, is_session,
+    parse_line, sha256_hex, truncation_marker,
 };
 use super::layout::{HEAD_FILE, HEAD_TMP, Head, LOCK_FILE, list_log_files, log_file_name};
 use super::redact::Redactor;
@@ -51,7 +57,10 @@ pub enum Detail {
 }
 
 /// An entry to append; the writer adds `seq`, `ts`, hashes and redaction.
-#[derive(Debug, Clone)]
+///
+/// `Debug` omits the arguments: they are unredacted until the writer processes them, and a
+/// `tracing` call that formats an entry must not put a secret in a log (SI-3).
+#[derive(Clone)]
 pub struct NewEntry {
     actor: Actor,
     event: String,
@@ -61,8 +70,22 @@ pub struct NewEntry {
     detail: Detail,
 }
 
+impl std::fmt::Debug for NewEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewEntry")
+            .field("actor", &self.actor)
+            .field("event", &self.event)
+            .field("session", &self.session)
+            .field("decision", &self.decision)
+            .field("args", &"<omitted>")
+            .field("detail", &self.detail)
+            .finish()
+    }
+}
+
 impl NewEntry {
     /// A decision-level entry with no session, decision or args.
+    #[must_use]
     pub fn new(actor: Actor, event: impl Into<String>) -> Self {
         Self {
             actor,
@@ -237,16 +260,18 @@ impl std::fmt::Debug for AuditWriter {
     }
 }
 
+/// The end of the chain as found on disk, before any repair.
 struct Loaded {
     tip: Option<Entry>,
     current: Option<Current>,
-    dropped: u64,
+    /// Torn bytes after the last complete line of the newest file, and where to cut them.
+    torn: Option<(u64, u64)>,
 }
 
 impl AuditWriter {
     /// Opens (creating if needed, mode 0700) the audit directory, takes the writer lock, finds
-    /// the end of the chain, drops a torn final line left by a crash (recording
-    /// `audit.recovered`), and reconciles the head file.
+    /// the end of the chain, checks it against the head file, and only then drops a torn final
+    /// line left by a crash (recording `audit.recovered`).
     ///
     /// # Errors
     /// [`AuditError`]: another writer, a directory that is not private, damage, or a missing
@@ -262,8 +287,19 @@ impl AuditWriter {
         check_private_dir(dir)?;
         let lock = take_lock(dir)?;
         let files = list_log_files(dir).map_err(io_at(dir))?;
-        let loaded = load_tip(&files)?;
+        let mut loaded = load_tip(&files)?;
+        // Reconcile before cutting anything: a "torn" tail that the head says should be a whole
+        // entry is evidence of tampering, and must survive.
         reconcile_head(dir, loaded.tip.as_ref())?;
+        let mut dropped = 0;
+        if let (Some((cut, torn_bytes)), Some(cur)) = (loaded.torn, loaded.current.as_mut()) {
+            cur.file
+                .set_len(cut)
+                .and_then(|()| cur.file.sync_all())
+                .map_err(io_at(dir))?;
+            cur.len = cut;
+            dropped = torn_bytes;
+        }
         let (tip_seq, tip_hash) = loaded
             .tip
             .as_ref()
@@ -278,10 +314,11 @@ impl AuditWriter {
             tip_hash,
             poisoned: false,
         };
-        if loaded.dropped > 0 {
-            let note = NewEntry::new(Actor::Sallyd, "audit.recovered")
-                .args(json!({ "dropped_bytes": loaded.dropped }));
-            writer.commit(&note)?;
+        if dropped > 0 {
+            writer.commit(
+                &NewEntry::new(Actor::Sallyd, "audit.recovered")
+                    .args(json!({ "dropped_bytes": dropped })),
+            )?;
         }
         Ok(writer)
     }
@@ -315,6 +352,34 @@ impl AuditWriter {
         if self.poisoned {
             return Err(AuditError::Poisoned);
         }
+        let now = self.clock.now();
+        let month = now.strftime("%Y%m").to_string();
+        self.ensure_file(&month)?;
+        let entry = self.build_entry(new, now);
+        let mut line = entry.to_line();
+        if line.len() > MAX_LINE_BYTES {
+            return Err(AuditError::InvalidEntry("entry is too large"));
+        }
+        line.push('\n');
+        self.write_line(&line)?;
+        self.tip_seq = entry.seq;
+        self.tip_hash = entry.hash.clone();
+        // The entry is durable. If the head cannot be brought up to date the writer must not
+        // go on appending past a stale head, so it stops.
+        if let Err(e) = write_head(
+            &self.dir,
+            &Head {
+                seq: entry.seq,
+                hash: entry.hash,
+            },
+        ) {
+            self.poisoned = true;
+            return Err(e);
+        }
+        Ok(self.tip_seq)
+    }
+
+    fn build_entry(&self, new: &NewEntry, now: Timestamp) -> Entry {
         let redacted = self.redactor.redact_value(&new.args);
         let full = serde_json::to_string(&redacted).unwrap_or_default();
         let args_sha256 = sha256_hex(full.as_bytes());
@@ -323,9 +388,6 @@ impl AuditWriter {
         } else {
             redacted
         };
-        let now = self.clock.now();
-        let month = now.strftime("%Y%m").to_string();
-        self.ensure_file(&month)?;
         let mut entry = Entry {
             seq: self.tip_seq.saturating_add(1),
             ts: now.strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
@@ -339,12 +401,10 @@ impl AuditWriter {
             hash: String::new(),
         };
         entry.hash = entry.compute_hash();
-        let mut line = entry.to_line();
-        if line.len() > MAX_LINE_BYTES {
-            return Err(AuditError::InvalidEntry("entry is too large"));
-        }
-        line.push('\n');
-        let path = self.dir.join(log_file_name(&month));
+        entry
+    }
+
+    fn write_line(&mut self, line: &str) -> Result<(), AuditError> {
         let Some(cur) = self.current.as_mut() else {
             return Err(AuditError::Poisoned);
         };
@@ -357,21 +417,12 @@ impl AuditWriter {
             if cur.file.set_len(cur.len).is_err() {
                 self.poisoned = true;
             }
-            return Err(io_at(&path)(e));
+            return Err(io_at(&self.dir.join(log_file_name(&cur.month)))(e));
         }
         cur.len = cur
             .len
             .saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX));
-        self.tip_seq = entry.seq;
-        self.tip_hash = entry.hash.clone();
-        write_head(
-            &self.dir,
-            &Head {
-                seq: entry.seq,
-                hash: entry.hash,
-            },
-        )?;
-        Ok(self.tip_seq)
+        Ok(())
     }
 
     /// Makes sure the current file is the one for `month`, or a later one if the clock stepped
@@ -393,9 +444,7 @@ impl AuditWriter {
             .map_err(io_at(&path))?;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .map_err(io_at(&path))?;
-        File::open(&self.dir)
-            .and_then(|d| d.sync_all())
-            .map_err(io_at(&self.dir))?;
+        sync_dir(&self.dir)?;
         self.current = Some(Current {
             file,
             month: month.to_owned(),
@@ -405,14 +454,21 @@ impl AuditWriter {
     }
 }
 
+fn sync_dir(dir: &Path) -> Result<(), AuditError> {
+    File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(io_at(dir))
+}
+
 fn take_lock(dir: &Path) -> Result<File, AuditError> {
     let path = dir.join(LOCK_FILE);
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(&path)
-        .map_err(io_at(&path))?;
+    let fd = rustix::fs::open(
+        &path,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )
+    .map_err(|e| io_at(&path)(e.into()))?;
+    let file = File::from(fd);
     match rustix::fs::flock(&file, FlockOperation::NonBlockingLockExclusive) {
         Ok(()) => Ok(file),
         Err(rustix::io::Errno::WOULDBLOCK) => Err(AuditError::Locked {
@@ -422,21 +478,26 @@ fn take_lock(dir: &Path) -> Result<File, AuditError> {
     }
 }
 
-fn open_log_rw(path: &Path) -> Result<File, AuditError> {
-    let corrupt = |msg| AuditError::Corrupt {
-        path: path.display().to_string(),
-        msg,
+/// Opens a log file refusing symlinks, non-regular files, other owners and group/other access.
+fn open_log(path: &Path, writable: bool) -> Result<File, AuditError> {
+    let access = if writable {
+        OFlags::RDWR | OFlags::APPEND
+    } else {
+        OFlags::RDONLY
     };
     let fd = rustix::fs::open(
         path,
-        OFlags::RDWR | OFlags::APPEND | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        access | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     )
     .map_err(|e| io_at(path)(e.into()))?;
     let file = File::from(fd);
     let meta = file.metadata().map_err(io_at(path))?;
     if !meta.is_file() {
-        return Err(corrupt("is not a regular file"));
+        return Err(AuditError::Corrupt {
+            path: path.display().to_string(),
+            msg: "is not a regular file",
+        });
     }
     if meta.uid() != rustix::process::geteuid().as_raw() || meta.permissions().mode() & 0o077 != 0 {
         return Err(AuditError::Permissions {
@@ -447,80 +508,86 @@ fn open_log_rw(path: &Path) -> Result<File, AuditError> {
     Ok(file)
 }
 
-/// Finds the end of the chain: the last entry of the newest non-empty file, dropping a torn
-/// final line of the newest file.
+/// Finds the end of the chain: the last complete entry of the newest non-empty file. Reads
+/// only; a torn final line of the newest file is reported, not cut.
 fn load_tip(files: &[(String, PathBuf)]) -> Result<Loaded, AuditError> {
     let mut loaded = Loaded {
         tip: None,
         current: None,
-        dropped: 0,
+        torn: None,
     };
     for (i, (month, path)) in files.iter().enumerate().rev() {
         let newest = i + 1 == files.len();
-        let file = open_log_rw(path)?;
-        let (entry, len, dropped) = last_entry(&file, path, newest)?;
+        let file = open_log(path, newest)?;
+        let found = last_entry(&file, path, newest)?;
         if newest {
-            loaded.dropped = dropped;
+            loaded.torn = (found.dropped > 0).then_some((found.keep, found.dropped));
             loaded.current = Some(Current {
                 file,
                 month: month.clone(),
-                len,
+                len: found.keep,
             });
         }
-        if entry.is_some() {
-            loaded.tip = entry;
+        if found.entry.is_some() {
+            loaded.tip = found.entry;
             break;
         }
     }
     Ok(loaded)
 }
 
-/// The last complete entry of `file`, the file's good length, and how many torn bytes were cut.
-fn last_entry(
-    file: &File,
-    path: &Path,
-    may_repair: bool,
-) -> Result<(Option<Entry>, u64, u64), AuditError> {
+struct LastEntry {
+    entry: Option<Entry>,
+    /// Length of the file up to and including the last complete line.
+    keep: u64,
+    /// Torn bytes after it.
+    dropped: u64,
+}
+
+/// The last complete entry of `file`. If the file does not end in a newline, the partial final
+/// line is a torn write (only the newest file may have one): it is excluded, not removed.
+fn last_entry(file: &File, path: &Path, may_be_torn: bool) -> Result<LastEntry, AuditError> {
     let corrupt = |msg| AuditError::Corrupt {
         path: path.display().to_string(),
         msg,
     };
     let chunk_max = u64::try_from(2 * MAX_LINE_BYTES + 2).unwrap_or(u64::MAX);
-    let mut dropped = 0u64;
-    let mut len = file.metadata().map_err(io_at(path))?.len();
+    let total = file.metadata().map_err(io_at(path))?.len();
+    let mut end = total;
     loop {
-        if len == 0 {
-            return Ok((None, 0, dropped));
+        if end == 0 {
+            return Ok(LastEntry {
+                entry: None,
+                keep: 0,
+                dropped: total,
+            });
         }
-        let n = len.min(chunk_max);
+        let n = end.min(chunk_max);
         let mut buf = vec![0u8; usize::try_from(n).map_err(|_| corrupt("is too large"))?];
-        file.read_exact_at(&mut buf, len - n).map_err(io_at(path))?;
+        file.read_exact_at(&mut buf, end - n).map_err(io_at(path))?;
         if buf.last() == Some(&b'\n') {
-            let body = buf.get(..buf.len() - 1).unwrap_or_default();
+            let body = buf.get(..buf.len().saturating_sub(1)).unwrap_or_default();
             let start = body.iter().rposition(|b| *b == b'\n').map_or(0, |p| p + 1);
-            if start == 0 && n < len {
+            if start == 0 && n < end {
                 return Err(corrupt("has a line longer than the limit"));
             }
             let line = body.get(start..).unwrap_or_default();
             let entry = parse_line(line)
                 .map_err(|_| corrupt("its last entry is damaged; run `sally audit verify`"))?;
-            return Ok((Some(entry), len, dropped));
+            return Ok(LastEntry {
+                entry: Some(entry),
+                keep: end,
+                dropped: total - end,
+            });
         }
-        // No trailing newline: a torn write (only the newest file may have one).
-        if !may_repair {
+        if !may_be_torn || end != total {
             return Err(corrupt("does not end with a complete entry"));
         }
-        let cut = match buf.iter().rposition(|b| *b == b'\n') {
-            Some(p) => u64::try_from(p + 1).unwrap_or(0),
-            None if n == len => 0,
+        end = match buf.iter().rposition(|b| *b == b'\n') {
+            Some(p) => end - n + u64::try_from(p + 1).unwrap_or(0),
+            None if n == end => 0,
             None => return Err(corrupt("has a torn line longer than the limit")),
         };
-        let keep = len - n + cut;
-        file.set_len(keep)
-            .and_then(|()| file.sync_all())
-            .map_err(io_at(path))?;
-        dropped = dropped.saturating_add(len - keep);
-        len = keep;
     }
 }
 
@@ -560,27 +627,26 @@ fn reconcile_head(dir: &Path, tip: Option<&Entry>) -> Result<(), AuditError> {
     }
 }
 
+/// Replaces `audit.head` durably: exclusive-create a 0600 temporary file (a planted symlink or
+/// stale file is removed first, never followed), fsync it, rename it over the head, fsync the
+/// directory.
 fn write_head(dir: &Path, head: &Head) -> Result<(), AuditError> {
     let tmp = dir.join(HEAD_TMP);
     let target = dir.join(HEAD_FILE);
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io_at(&tmp)(e)),
+    }
     let mut f = OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(&tmp)
         .map_err(io_at(&tmp))?;
     f.write_all(head.line().as_bytes())
         .and_then(|()| f.sync_data())
         .map_err(io_at(&tmp))?;
-    std::fs::rename(&tmp, &target).map_err(io_at(&target))
-}
-
-impl From<VerifyErrorKind> for AuditError {
-    fn from(_: VerifyErrorKind) -> Self {
-        Self::Corrupt {
-            path: String::new(),
-            msg: "audit data is damaged",
-        }
-    }
+    std::fs::rename(&tmp, &target).map_err(io_at(&target))?;
+    sync_dir(dir)
 }

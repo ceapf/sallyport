@@ -4,7 +4,7 @@
 
 mod common;
 
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -597,7 +597,7 @@ fn flipping_any_byte_of_an_entry_fails_verification_at_that_seq() {
             "offset {off}: first bad seq {} must not come after the edited entry",
             err.seq
         );
-        assert!(err.seq >= 3 || off < 8, "offset {off}: bad seq {}", err.seq);
+        assert_eq!(err.seq, 3, "offset {off}: bad seq {}", err.seq);
     }
     std::fs::write(&log, &original).unwrap();
     verify(&s.dir()).unwrap();
@@ -846,6 +846,13 @@ fn fuzz_corpus_satisfies_the_parser_invariants() {
         let path = entry.unwrap().path();
         let data = std::fs::read(&path).unwrap();
         seen += 1;
+        if let Ok((seq, hash)) = sally_core::audit::parse_head(&data) {
+            assert_eq!(
+                format!("{{\"seq\":{seq},\"hash\":\"{hash}\"}}\n").as_bytes(),
+                data.as_slice()
+            );
+            continue;
+        }
         if let Ok(e) = sally_core::audit::parse_line(&data) {
             accepted += 1;
             assert_eq!(e.to_line().as_bytes(), data.as_slice());
@@ -858,6 +865,372 @@ fn fuzz_corpus_satisfies_the_parser_invariants() {
             );
         }
     }
-    assert!(seen >= 5, "corpus went missing");
+    assert!(seen >= 7, "corpus went missing");
     assert_eq!(accepted, 1, "exactly the valid seed parses");
+}
+
+// ---- review round: head reconciliation, splices, symlinks, redaction gaps -------------------
+
+fn hash_of(line: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(line).unwrap()["hash"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+fn set_head(s: &Scratch, seq: u64, hash: &str) {
+    std::fs::write(
+        s.dir().join("audit.head"),
+        format!("{{\"seq\":{seq},\"hash\":\"{hash}\"}}\n"),
+    )
+    .unwrap();
+}
+
+fn open_err(s: &Scratch) -> AuditError {
+    AuditWriter::open(&s.dir(), Box::new(TestClock::at(JAN)))
+        .err()
+        .unwrap()
+}
+
+const A64: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+#[test]
+fn open_refuses_when_every_log_file_is_gone_but_the_head_remains() {
+    let s = Scratch::new("alllogsgone");
+    let log = filled(&s, 2);
+    std::fs::remove_file(log).unwrap();
+    assert!(matches!(open_err(&s), AuditError::TailMissing));
+}
+
+#[test]
+fn open_refuses_a_multi_entry_log_without_a_head() {
+    let s = Scratch::new("nohead");
+    filled(&s, 3);
+    std::fs::remove_file(s.dir().join("audit.head")).unwrap();
+    assert!(matches!(open_err(&s), AuditError::HeadMissing));
+}
+
+#[test]
+fn open_adopts_a_lone_first_entry_without_a_head() {
+    let s = Scratch::new("firstnohead");
+    filled(&s, 1);
+    std::fs::remove_file(s.dir().join("audit.head")).unwrap();
+    drop(open(&s, &TestClock::at(JAN)));
+    assert_eq!(
+        verify(&s.dir()).unwrap().head,
+        sally_core::audit::HeadStatus::Current
+    );
+}
+
+#[test]
+fn open_refuses_heads_that_disagree_with_the_log() {
+    let s = Scratch::new("headdisagree");
+    let log = filled(&s, 3);
+    let l = lines(&log);
+    // Same seq, different hash.
+    set_head(&s, 3, A64);
+    assert!(matches!(open_err(&s), AuditError::Corrupt { .. }));
+    // One behind, but not this log's entry.
+    set_head(&s, 2, A64);
+    assert!(
+        matches!(open_err(&s), AuditError::Corrupt { .. }),
+        "a forged extension must not be adopted"
+    );
+    // Two behind: never produced by a crash.
+    set_head(&s, 1, &hash_of(&l[0]));
+    assert!(matches!(open_err(&s), AuditError::Corrupt { .. }));
+}
+
+#[test]
+fn verify_distinguishes_a_wrong_head_from_a_lagging_one() {
+    let s = Scratch::new("verifyhead");
+    let log = filled(&s, 4);
+    let l = lines(&log);
+    set_head(&s, 4, A64);
+    assert_eq!(
+        verify(&s.dir()).unwrap_err().kind,
+        VerifyErrorKind::HeadMismatch
+    );
+    set_head(&s, 2, A64);
+    assert_eq!(
+        verify(&s.dir()).unwrap_err().kind,
+        VerifyErrorKind::HeadMismatch
+    );
+    // A writer may be a few entries ahead of the head while verify runs.
+    set_head(&s, 2, &hash_of(&l[1]));
+    assert_eq!(
+        verify(&s.dir()).unwrap().head,
+        sally_core::audit::HeadStatus::LogAhead
+    );
+}
+
+#[test]
+fn malformed_heads_are_invalid() {
+    let s = Scratch::new("badheads");
+    let log = filled(&s, 2);
+    let h = hash_of(&lines(&log)[1]);
+    let head = s.dir().join("audit.head");
+    for text in [
+        format!("{{\"seq\": 2,\"hash\":\"{h}\"}}\n"),
+        format!("{{\"seq\":0,\"hash\":\"{h}\"}}\n"),
+        format!("{{\"seq\":2,\"hash\":\"{h}\",\"x\":1}}\n"),
+        format!("{{\"seq\":2,\"hash\":\"{h}\"}}"),
+        format!("{{\"seq\":2,\"hash\":\"{}\"}}\n", h.to_uppercase()),
+    ] {
+        std::fs::write(&head, text).unwrap();
+        assert_eq!(
+            verify(&s.dir()).unwrap_err().kind,
+            VerifyErrorKind::HeadInvalid
+        );
+        assert!(AuditWriter::open(&s.dir(), Box::new(TestClock::at(JAN))).is_err());
+    }
+}
+
+#[test]
+fn a_huge_sparse_head_is_refused_without_reading_it() {
+    let s = Scratch::new("hugehead");
+    filled(&s, 2);
+    let head = s.dir().join("audit.head");
+    let f = std::fs::File::create(&head).unwrap();
+    f.set_len(200 * 1024 * 1024).unwrap();
+    drop(f);
+    std::fs::set_permissions(&head, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        verify(&s.dir()).unwrap_err().kind,
+        VerifyErrorKind::HeadInvalid
+    );
+}
+
+#[test]
+fn a_head_that_is_a_symlink_or_fifo_is_refused_without_following_it() {
+    let s = Scratch::new("headlink");
+    filled(&s, 2);
+    let head = s.dir().join("audit.head");
+    std::fs::remove_file(&head).unwrap();
+    symlink("/dev/zero", &head).unwrap();
+    assert_eq!(
+        verify(&s.dir()).unwrap_err().kind,
+        VerifyErrorKind::Unreadable
+    );
+    assert!(AuditWriter::open(&s.dir(), Box::new(TestClock::at(JAN))).is_err());
+    std::fs::remove_file(&head).unwrap();
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        &head,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::from_raw_mode(0o600),
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        verify(&s.dir()).unwrap_err().kind,
+        VerifyErrorKind::Unreadable
+    );
+}
+
+#[test]
+fn a_planted_symlink_at_the_head_temp_name_is_not_followed() {
+    let s = Scratch::new("tmplink");
+    filled(&s, 1);
+    let victim = s.0.join("victim.txt");
+    std::fs::write(&victim, "keep me").unwrap();
+    symlink(&victim, s.dir().join("audit.head.tmp")).unwrap();
+    let mut w = open(&s, &TestClock::at(JAN));
+    w.append(note("a.next"), AuditLevel::Full).unwrap();
+    drop(w);
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+    let head = s.dir().join("audit.head");
+    assert!(
+        !std::fs::symlink_metadata(&head)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        std::fs::metadata(&head).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    verify(&s.dir()).unwrap();
+}
+
+#[test]
+fn a_symlinked_or_loosely_permissioned_log_file_is_refused() {
+    let s = Scratch::new("loglink");
+    let log = filled(&s, 2);
+    let real = s.dir().join("real.jsonl");
+    std::fs::rename(&log, &real).unwrap();
+    symlink(&real, &log).unwrap();
+    assert_eq!(
+        verify(&s.dir()).unwrap_err().kind,
+        VerifyErrorKind::Unreadable
+    );
+    assert!(AuditWriter::open(&s.dir(), Box::new(TestClock::at(JAN))).is_err());
+    std::fs::remove_file(&log).unwrap();
+    std::fs::rename(&real, &log).unwrap();
+    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(matches!(open_err(&s), AuditError::Permissions { .. }));
+}
+
+#[test]
+fn an_entry_whose_args_were_edited_and_rehashed_still_fails_the_args_check() {
+    let s = Scratch::new("argsedit");
+    let log = filled(&s, 1);
+    let line = lines(&log).remove(0);
+    let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+    let suffix = format!(",\"hash\":\"{}\"}}", v["hash"].as_str().unwrap());
+    let body = format!("{}}}", line.strip_suffix(&suffix).unwrap())
+        .replace("\"cmd\":\"ls\"", "\"cmd\":\"rm\"");
+    let new_hash = sha256_hex(format!("{}{body}", v["prev_hash"].as_str().unwrap()).as_bytes());
+    let forged = format!(
+        "{},\"hash\":\"{new_hash}\"}}",
+        body.strip_suffix('}').unwrap()
+    );
+    write_lines(&log, &[forged]);
+    assert_eq!(
+        verify(&s.dir()).unwrap_err().kind,
+        VerifyErrorKind::ArgsHashMismatch
+    );
+}
+
+#[test]
+fn splicing_in_an_entry_from_another_chain_is_a_broken_link() {
+    let a = Scratch::new("spliceA");
+    let b = Scratch::new("spliceB");
+    let la = filled(&a, 3);
+    let lb = {
+        let clock = TestClock::at(JAN);
+        let mut w = open(&b, &clock);
+        for i in 0..3 {
+            w.append(
+                note("other.event").args(json!({ "n": i })),
+                AuditLevel::Full,
+            )
+            .unwrap();
+        }
+        b.dir().join("audit-202601.jsonl")
+    };
+    let mut l = lines(&la);
+    l[1] = lines(&lb)[1].clone();
+    write_lines(&la, &l);
+    assert_eq!(
+        verify(&a.dir()).unwrap_err().kind,
+        VerifyErrorKind::ChainBroken
+    );
+}
+
+#[test]
+fn middle_deletion_and_reordering_are_sequence_errors() {
+    let s = Scratch::new("seqkinds");
+    let log = filled(&s, 5);
+    let original = lines(&log);
+    let mut l = original.clone();
+    l.remove(2);
+    write_lines(&log, &l);
+    assert_eq!(verify(&s.dir()).unwrap_err().kind, VerifyErrorKind::SeqGap);
+    let mut l = original;
+    l.swap(1, 2);
+    write_lines(&log, &l);
+    assert_eq!(verify(&s.dir()).unwrap_err().kind, VerifyErrorKind::SeqGap);
+}
+
+#[test]
+fn a_torn_tail_that_the_head_says_was_complete_is_kept_as_evidence() {
+    let s = Scratch::new("tornevidence");
+    let log = filled(&s, 3);
+    let before = std::fs::read(&log).unwrap();
+    std::fs::write(&log, &before[..before.len() - 1]).unwrap();
+    let damaged = std::fs::read(&log).unwrap();
+    assert!(matches!(open_err(&s), AuditError::TailMissing));
+    assert_eq!(
+        std::fs::read(&log).unwrap(),
+        damaged,
+        "open must not cut a tail the head vouches for"
+    );
+}
+
+#[test]
+fn verify_tolerates_an_append_in_flight() {
+    let s = Scratch::new("inflight");
+    let log = filled(&s, 2);
+    let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+    std::io::Write::write_all(&mut f, b"{\"seq\":3,\"ts\":\"2026-01-1").unwrap();
+    drop(f);
+    let report = verify(&s.dir()).unwrap();
+    assert!(report.torn_tail);
+    assert_eq!(
+        (report.entries, report.head),
+        (2, sally_core::audit::HeadStatus::Current)
+    );
+}
+
+#[test]
+fn new_entry_debug_does_not_print_args() {
+    let secret = token();
+    let shown = format!(
+        "{:?}",
+        note("tool.executed").args(json!({ "token": secret }))
+    );
+    assert!(!shown.contains(&secret));
+    assert!(shown.contains("tool.executed"));
+}
+
+#[test]
+fn overlapping_secrets_are_both_removed_whole() {
+    let a = "AAAAAAAAAAAA1234567890";
+    let b = "1234567890ZZZZZZZZZZ";
+    let r = Redactor::new([("A", a), ("B", b)]);
+    let out = r.redact_str("x AAAAAAAAAAAA1234567890ZZZZZZZZZZ y");
+    assert!(!out.contains("AAAAAA") && !out.contains("ZZZZZ"), "{out}");
+    assert!(
+        out.starts_with("x [REDACTED:") && out.ends_with(" y"),
+        "{out}"
+    );
+}
+
+#[test]
+fn partially_encoded_and_json_escaped_secrets_are_redacted() {
+    let pw = "pa ss+word/with=special&chars";
+    let r = Redactor::new([("PASSWORD", pw)]);
+    for form in [
+        "pa%20ss%2Bword/with%3Dspecial%26chars",
+        "pa%20ss%2Bword%2Fwith%3Dspecial%26chars",
+        "pa+ss%2Bword%2Fwith%3Dspecial%26chars",
+        "pa%20ss%2bword%2fwith%3dspecial%26chars",
+    ] {
+        assert!(r.redact_str(form).contains("[REDACTED:PASSWORD]"), "{form}");
+    }
+    let tricky = "pa\"ss\\word-with-quotes";
+    let r = Redactor::new([("PW", tricky)]);
+    let embedded = serde_json::to_string(&json!({ "pw": tricky })).unwrap();
+    assert!(
+        r.redact_str(&embedded).contains("[REDACTED:PW]"),
+        "{embedded}"
+    );
+    let args = r.redact_value(&json!({ "body": embedded }));
+    assert!(!args.to_string().contains("word-with-quotes"));
+}
+
+#[test]
+fn keys_that_redact_to_the_same_text_keep_both_values() {
+    let r = Redactor::new([("S", "supersecretvalue1234")]);
+    let out = r.redact_value(&json!({ "supersecretvalue1234": 1, "[REDACTED:S]": 2 }));
+    assert_eq!(out.as_object().unwrap().len(), 2, "{out}");
+}
+
+#[test]
+fn object_keys_are_written_in_sorted_order() {
+    let s = Scratch::new("sortedkeys");
+    let clock = TestClock::at(JAN);
+    let mut w = open(&s, &clock);
+    w.append(
+        note("a.b").args(json!({ "zeta": 1, "alpha": { "y": 1, "b": 2 } })),
+        AuditLevel::Full,
+    )
+    .unwrap();
+    drop(w);
+    let line = &lines(&s.dir().join("audit-202601.jsonl"))[0];
+    assert!(
+        line.contains("\"args\":{\"alpha\":{\"b\":2,\"y\":1},\"zeta\":1}"),
+        "{line}"
+    );
 }

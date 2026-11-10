@@ -80,16 +80,48 @@ impl Redactor {
         }
     }
 
-    /// `s` with every known secret form replaced.
+    /// `s` with every known secret form replaced. All matches are located in the original
+    /// text and overlapping ones merged before replacing, so two secrets that overlap are both
+    /// removed whole (replacing one pattern at a time would let the first replacement eat
+    /// characters of the second and leave part of it in the clear).
     #[must_use]
     pub fn redact_str<'s>(&self, s: &'s str) -> Cow<'s, str> {
-        let mut out = Cow::Borrowed(s);
+        let mut hits: Vec<(usize, usize, &str)> = Vec::new();
         for p in &self.patterns {
-            if out.contains(p.needle.expose().as_str()) {
-                out = Cow::Owned(out.replace(p.needle.expose().as_str(), &p.placeholder));
+            let needle = p.needle.expose().as_str();
+            for (start, _) in s.match_indices(needle) {
+                hits.push((
+                    start,
+                    start.saturating_add(needle.len()),
+                    p.placeholder.as_str(),
+                ));
             }
         }
-        out
+        if hits.is_empty() {
+            return Cow::Borrowed(s);
+        }
+        hits.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+        let mut out = String::with_capacity(s.len());
+        let mut pos = 0usize;
+        let mut open: Option<(usize, usize, &str)> = None;
+        for (start, end, placeholder) in hits {
+            open = match open {
+                Some((os, oe, op)) if start < oe => Some((os, oe.max(end), op)),
+                Some((os, oe, op)) => {
+                    out.push_str(s.get(pos..os).unwrap_or_default());
+                    out.push_str(op);
+                    pos = oe;
+                    Some((start, end, placeholder))
+                }
+                None => Some((start, end, placeholder)),
+            };
+        }
+        if let Some((os, oe, op)) = open {
+            out.push_str(s.get(pos..os).unwrap_or_default());
+            out.push_str(op);
+            out.push_str(s.get(oe..).unwrap_or_default());
+        }
+        Cow::Owned(out)
     }
 
     /// `v` with every string, object key and number redacted. Numbers that spell a secret
@@ -106,11 +138,20 @@ impl Redactor {
         match v {
             Value::String(s) => Value::String(self.redact_str(s).into_owned()),
             Value::Array(a) => Value::Array(a.iter().map(|x| self.value(x, depth + 1)).collect()),
-            Value::Object(o) => Value::Object(
-                o.iter()
-                    .map(|(k, x)| (self.redact_str(k).into_owned(), self.value(x, depth + 1)))
-                    .collect::<Map<String, Value>>(),
-            ),
+            Value::Object(o) => {
+                let mut out = Map::new();
+                for (k, x) in o {
+                    let mut key = self.redact_str(k).into_owned();
+                    // Two keys can redact to the same text; never drop a value silently.
+                    let mut n = 2usize;
+                    while out.contains_key(&key) {
+                        key = format!("{}#{n}", self.redact_str(k));
+                        n = n.saturating_add(1);
+                    }
+                    out.insert(key, self.value(x, depth + 1));
+                }
+                Value::Object(out)
+            }
             Value::Number(n) => {
                 let text = n.to_string();
                 match self.redact_str(&text) {
@@ -126,14 +167,25 @@ impl Redactor {
 /// Every form of a secret worth redacting.
 fn forms(bytes: &[u8], raw: &str) -> Vec<String> {
     let mut out = vec![raw.to_owned()];
-    // Percent-encoding, both hex cases, and the form-encoding variant where a space is `+`.
-    for plus_space in [false, true] {
-        for upper in [true, false] {
-            let pct = percent_encode(bytes, upper, plus_space);
-            if !out.contains(&pct) {
-                out.push(pct);
+    // Percent-encoding as real encoders produce it: both hex cases, `+` for space (forms), and
+    // the characters common encoders leave alone (`/` for Python's `quote`, `!'()*` for
+    // `encodeURIComponent`).
+    for safe in [&b""[..], b"/", b"!'()*"] {
+        for plus_space in [false, true] {
+            for upper in [true, false] {
+                let pct = percent_encode(bytes, upper, plus_space, safe);
+                if !out.contains(&pct) {
+                    out.push(pct);
+                }
             }
         }
+    }
+    // The secret as it appears inside a JSON string (quotes and backslashes escaped).
+    if let Ok(json) = serde_json::to_string(raw)
+        && let Some(inner) = json.strip_prefix('"').and_then(|j| j.strip_suffix('"'))
+        && !out.iter().any(|o| o == inner)
+    {
+        out.push(inner.to_owned());
     }
     for alphabet in [STANDARD, URL_SAFE] {
         for lead in 0..3usize {
@@ -172,12 +224,12 @@ fn base64_no_pad(data: &[u8], alphabet: &[u8; 64]) -> String {
     out
 }
 
-/// RFC 3986 unreserved characters kept, everything else `%XX` (a space is `+` when
+/// RFC 3986 unreserved characters and `safe` kept, everything else `%XX` (a space is `+` when
 /// `plus_space`, as in `application/x-www-form-urlencoded`).
-fn percent_encode(bytes: &[u8], upper: bool, plus_space: bool) -> String {
+fn percent_encode(bytes: &[u8], upper: bool, plus_space: bool, safe: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len());
     for &b in bytes {
-        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) || safe.contains(&b) {
             out.push(char::from(b));
         } else if plus_space && b == b' ' {
             out.push('+');

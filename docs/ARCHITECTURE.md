@@ -409,7 +409,9 @@ sallyport/
   because a prefix of a valid chain is itself valid; the log may be one entry ahead of it after
   a crash, which is accepted and repaired. A torn final line is dropped on open (the entry is
   written before the action, so the action never happened) and recorded as `audit.recovered`.
-  `append` fsyncs before returning; on any error the caller must not perform the action.
+  `append` fsyncs before returning (entry, then head and its directory); on any error the caller
+  must not perform the action, and a failed head update stops the writer. `sally audit verify`
+  reads the head first and accepts a log that runs past it, so it is safe beside a live writer.
 - **Redaction** (`sally-core::audit::Redactor`): the raw secret, its percent-encoding (both hex
   cases, and `+` for space), and its base64 in three alignments and both alphabets trimmed to the
   characters that do not depend on neighbouring bytes (patterns under 12 characters skipped), so
