@@ -22,12 +22,16 @@ pub struct DirError {
     pub path: String,
     /// What is wrong.
     pub msg: String,
+    /// The session's directories already existed and nothing was created: whatever is there
+    /// (a stopped session's kept `staged` changes) must not be removed.
+    pub reused: bool,
 }
 
 fn fail<T>(path: &Path, msg: impl Into<String>) -> Result<T, DirError> {
     Err(DirError {
         path: path.display().to_string(),
         msg: msg.into(),
+        reused: false,
     })
 }
 
@@ -132,6 +136,17 @@ impl SessionDirs {
         git_overlays: usize,
     ) -> Result<Self, DirError> {
         check_runtime_dir(xdg_runtime_dir)?;
+        // Refuse a used id before creating anything, so the caller's cleanup never touches a
+        // stopped session's kept data.
+        for session in [paths.socket_root(), paths.data_root()] {
+            if std::fs::symlink_metadata(session).is_ok() {
+                return Err(DirError {
+                    path: session.display().to_string(),
+                    msg: "already exists; a session id is never reused".into(),
+                    reused: true,
+                });
+            }
+        }
         for session in [paths.socket_root(), paths.data_root()] {
             let Some(sessions) = session.parent() else {
                 return fail(session, "has no parent");

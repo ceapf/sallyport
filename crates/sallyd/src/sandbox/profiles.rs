@@ -1,7 +1,8 @@
 //! The seccomp profiles (ARCHITECTURE §3.4), embedded in the binary (#10). At launch they are
 //! written into the session's 0700 directory, so no file outside Sallyport's control decides what
 //! a sandbox may call. `scripts/gen_seccomp.py` derives them from containers-common's default
-//! profile; the tests here check the properties independently of the generator.
+//! profile; the tests here check the properties independently of the generator. TODO(#17):
+//! container red-team tests for the socket-family, clone and native-architecture filters.
 
 use std::io::Write as _;
 use std::os::fd::AsFd;
@@ -106,6 +107,11 @@ mod tests {
         "nfsservctl",
         "open_by_handle_at",
         "name_to_handle_at",
+        // 6b security review: no unfilterable socket multiplexer, no kernel log.
+        "socketcall",
+        "syslog",
+        // Flags in memory seccomp cannot read; ENOSYS makes libc fall back to `clone`.
+        "clone3",
     ];
     const ROLES: [Role; 3] = [Role::Workspace, Role::Harness, Role::Inference];
 
@@ -135,32 +141,87 @@ mod tests {
         }
     }
 
-    #[test]
-    fn inference_may_only_create_unix_sockets() {
-        let socket_rules: Vec<Value> = rules(Role::Inference)
+    /// The address families a role's `socket` rules allow, each as `(family, extra args)`.
+    fn socket_families(role: Role) -> Vec<(u64, usize)> {
+        let mut out: Vec<(u64, usize)> = rules(role)
             .into_iter()
             .filter(|r| allows(r, "socket"))
+            .map(|r| {
+                assert_eq!(r["names"], serde_json::json!(["socket"]), "{role:?}: {r}");
+                let args = r["args"].as_array().unwrap();
+                assert_eq!(args[0]["index"], 0, "{role:?}: {r}");
+                assert_eq!(args[0]["op"], "SCMP_CMP_EQ", "{role:?}: {r}");
+                assert!(
+                    r.get("includes")
+                        .is_none_or(|i| i == &serde_json::json!({}))
+                );
+                (args[0]["value"].as_u64().unwrap(), args.len() - 1)
+            })
             .collect();
-        assert_eq!(socket_rules.len(), 1);
-        let r = &socket_rules[0];
-        assert_eq!(r["names"], serde_json::json!(["socket"]));
-        assert_eq!(r["args"].as_array().unwrap().len(), 1);
-        assert_eq!(r["args"][0]["index"], 0);
-        assert_eq!(r["args"][0]["value"], 1, "AF_UNIX");
-        assert_eq!(r["args"][0]["op"], "SCMP_CMP_EQ");
-        assert!(
-            r.get("includes")
-                .is_none_or(|i| i == &serde_json::json!({}))
-        );
+        out.sort_unstable();
+        out
     }
 
+    /// 6b security review H2: an allowlist of address families, never an unconditional
+    /// `socket`. AF_VSOCK (40) ignores network namespaces and reaches the hypervisor host.
     #[test]
-    fn workspace_and_harness_keep_inet_sockets_for_the_loopback_shim() {
+    fn sockets_are_an_allowlist_of_address_families() {
         for role in [Role::Workspace, Role::Harness] {
-            assert!(
-                rules(role)
-                    .iter()
-                    .any(|r| allows(r, "socket") && r.get("args").is_none_or(Value::is_null)),
+            // AF_UNIX, AF_INET, AF_INET6, AF_NETLINK (without NETLINK_AUDIT).
+            assert_eq!(
+                socket_families(role),
+                [(1, 0), (2, 0), (10, 0), (16, 1)],
+                "{role:?}"
+            );
+            let netlink = rules(role)
+                .into_iter()
+                .find(|r| allows(r, "socket") && r["args"][0]["value"] == 16)
+                .unwrap();
+            assert_eq!(netlink["args"][1]["index"], 2);
+            assert_eq!(netlink["args"][1]["value"], 9, "NETLINK_AUDIT");
+            assert_eq!(netlink["args"][1]["op"], "SCMP_CMP_NE");
+        }
+        assert_eq!(socket_families(Role::Inference), [(1, 0)], "AF_UNIX only");
+    }
+
+    /// 6b security review H1: `clone` may not create namespaces (no nested user or network
+    /// namespace, so no CAP_NET_ADMIN over nf_tables); exactly Docker's mask.
+    #[test]
+    fn clone_is_allowed_only_without_namespace_flags() {
+        for role in ROLES {
+            let clone: Vec<Value> = rules(role)
+                .into_iter()
+                .filter(|r| allows(r, "clone"))
+                .collect();
+            assert_eq!(clone.len(), 1, "{role:?}");
+            let r = &clone[0];
+            assert_eq!(r["names"], serde_json::json!(["clone"]));
+            assert_eq!(r["args"].as_array().unwrap().len(), 1);
+            assert_eq!(r["args"][0]["index"], 0);
+            assert_eq!(r["args"][0]["op"], "SCMP_CMP_MASKED_EQ");
+            assert_eq!(r["args"][0]["value"], 0x7E02_0000_u64);
+            assert_eq!(r["args"][0]["valueTwo"], 0);
+        }
+    }
+
+    /// 6b security review H2: only native architectures, so the 32-bit ABI (`int 0x80`,
+    /// `socketcall`) never matches an allow rule.
+    #[test]
+    fn only_native_architectures_are_listed() {
+        for role in ROLES {
+            let p: Value = serde_json::from_str(profile(role)).unwrap();
+            let arches: Vec<&str> = p["archMap"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| {
+                    assert_eq!(a["subArchitectures"], serde_json::json!([]), "{role:?}");
+                    a["architecture"].as_str().unwrap()
+                })
+                .collect();
+            assert_eq!(
+                arches,
+                ["SCMP_ARCH_X86_64", "SCMP_ARCH_AARCH64"],
                 "{role:?}"
             );
         }

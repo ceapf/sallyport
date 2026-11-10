@@ -1,9 +1,11 @@
-//! Launch and teardown of the workspace container (Task 6b). Order matters:
+//! Launch and teardown of the workspace container (Task 6b; ARCHITECTURE §3.5). Order matters:
 //!
-//! 1. reserve the session's mounts against every live session (B4 overlap rule);
-//! 2. re-check the runtime and the empty hooks directory; scan every mount (sockets, `.git`
-//!    shields, pins); create the 0700 session directories and write the seccomp profiles;
-//! 3. build and check the argv (`create`, never `run`);
+//! 1. reserve the session's mounts against every live session (B4 overlap rule, by path and by
+//!    identity);
+//! 2. re-check hermetic podman and the runtime; scan every mount (sockets, `.git` shields,
+//!    pins);
+//! 3. create the 0700 session directories and write the seccomp profiles; build and check the
+//!    argv (`create`, never `run`);
 //! 4. audit `sandbox.launch` (SI-4: before anything is visible);
 //! 5. `podman create`; re-check every pin on the host; `podman init` (the runtime builds the
 //!    mounts but runs nothing);
@@ -11,8 +13,11 @@
 //!    container and audit `sandbox.mount_mismatch`;
 //! 7. `podman start`.
 //!
-//! Any failure after step 1 removes what was created and audits `sandbox.refuse`. TODO(#15): the
-//! OCI config verifier runs between 6 and 7 (Task 14).
+//! The launch runs in its own task: a caller that goes away (a closed connection, an outer
+//! timeout) cannot leave a half-built session, and a finished launch nobody receives is stopped.
+//! A failure removes the container by its name (even when `create` printed no id), removes only
+//! the directories this launch created, and keeps the session's overlap claims while a container
+//! might still exist. TODO(#15): the OCI config verifier runs between 6 and 7 (Task 14).
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -36,6 +41,10 @@ use super::types::{ArgvError, CheckedRuntime, CommonArgs, ImageRef, SessionPaths
 const OUTPUT_CAP: usize = 64 * 1024;
 /// A podman command that takes longer is killed.
 const PODMAN_TIMEOUT: Duration = Duration::from_secs(120);
+/// Longest free-text value in an audit entry (CLAUDE.md: nothing above 4 KiB is logged).
+const AUDIT_TEXT_CAP: usize = 4096;
+/// Container name prefixes of the session roles this launcher creates.
+const SESSION_PREFIXES: [&str; 2] = ["sp-ws-", "sp-h-"];
 
 /// Where audit entries go. Appends are blocking file I/O; the launcher calls them from
 /// `spawn_blocking`.
@@ -68,6 +77,9 @@ pub enum LaunchError {
     /// The launch scan refused a mount.
     #[error(transparent)]
     Scan(#[from] ScanError),
+    /// A mount root's identity chain could not be read.
+    #[error("filesystem.mounts: {0}")]
+    Claims(#[source] std::io::Error),
     /// The overlap rule refused the session.
     #[error(transparent)]
     Overlap(#[from] ReserveError),
@@ -93,7 +105,15 @@ pub enum LaunchError {
     },
     /// The audit log could not be written; nothing is launched without it (SI-4).
     #[error("audit: {0}")]
-    Audit(String),
+    Audit(#[source] AuditError),
+    /// The launch failed, and then its refusal could not be audited either.
+    #[error("{original} (and the refusal could not be audited: {audit})")]
+    Unaudited {
+        /// Why the launch failed.
+        original: Box<LaunchError>,
+        /// Why the audit entry failed.
+        audit: Box<LaunchError>,
+    },
     /// A background task failed.
     #[error("internal: {0}")]
     Internal(String),
@@ -105,32 +125,90 @@ impl LaunchError {
         match self {
             Self::Scan(ScanError::SocketInMount { .. }) => "socket-in-mount",
             Self::Scan(ScanError::TooManyShields { .. } | ScanError::Limit { .. }) => "scan-limit",
-            Self::Scan(_) => "mount-changed",
+            Self::Scan(_) | Self::Claims(_) => "mount-changed",
             Self::Overlap(_) => "overlap",
             Self::Dirs(_) => "session-dir",
             Self::Argv(_) => "argv",
             Self::Podman(_) => "podman-config",
             Self::MountMismatch(_) => "mount-mismatch",
             Self::Command { .. } => "podman",
-            Self::Audit(_) => "audit",
+            Self::Audit(_) | Self::Unaudited { .. } => "audit",
             Self::Internal(_) => "internal",
         }
     }
+}
+
+/// [`Launcher::stop`] could not confirm the container is gone; the session keeps its overlap
+/// claims and the caller keeps the handle to retry.
+#[derive(Debug, thiserror::Error)]
+#[error("stop {}: {error}", running.name)]
+pub struct StopError {
+    /// The session, still live.
+    pub running: Running,
+    /// What failed.
+    pub error: LaunchError,
 }
 
 fn join_err(e: tokio::task::JoinError) -> LaunchError {
     LaunchError::Internal(e.to_string())
 }
 
-/// A started workspace container.
+/// Runs blocking work off the async runtime.
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, LaunchError> + Send + 'static,
+) -> Result<T, LaunchError> {
+    tokio::task::spawn_blocking(f).await.map_err(join_err)?
+}
+
+/// Cuts free text for an audit entry at a character boundary.
+fn capped(s: &str) -> String {
+    if s.len() <= AUDIT_TEXT_CAP {
+        return s.to_owned();
+    }
+    let mut end = AUDIT_TEXT_CAP;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", s.get(..end).unwrap_or_default())
+}
+
+fn mode_str(m: MountMode) -> &'static str {
+    match m {
+        MountMode::Ro => "ro",
+        MountMode::Rw => "rw",
+        MountMode::Brokered => "brokered",
+        MountMode::Staged => "staged",
+    }
+}
+
+/// A started workspace container. Only [`Launcher::launch_workspace`] makes one, and only
+/// [`Launcher::stop`] ends it.
 #[derive(Debug)]
 pub struct Running {
-    /// Podman's container id (64 hex digits).
-    pub container: String,
-    /// The session's paths.
-    pub paths: SessionPaths,
-    /// The session's audit level.
+    container: String,
+    name: String,
+    paths: SessionPaths,
     level: AuditLevel,
+}
+
+impl Running {
+    /// Podman's container id (64 hex digits).
+    #[must_use]
+    pub fn container(&self) -> &str {
+        &self.container
+    }
+
+    /// The container name, `sp-ws-<session id>`.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The session's directories.
+    #[must_use]
+    pub fn paths(&self) -> &SessionPaths {
+        &self.paths
+    }
 }
 
 /// What a workspace launch needs.
@@ -139,29 +217,9 @@ pub struct WorkspaceRequest {
     /// The session's directories.
     pub paths: SessionPaths,
     /// The validated manifest.
-    pub manifest: ValidatedManifest,
+    pub manifest: Arc<ValidatedManifest>,
     /// The bundled workspace image, used when the manifest names none.
     pub default_image: ImageRef,
-}
-
-/// Launches and tears down sandboxes for one `sallyd`.
-pub struct Launcher {
-    podman: Podman,
-    runtime: CheckedRuntime,
-    ids: UserIds,
-    xdg_runtime_dir: PathBuf,
-    sessions: Arc<Sessions>,
-    audit: Arc<dyn AuditSink>,
-    limits: ScanLimits,
-}
-
-impl std::fmt::Debug for Launcher {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Launcher")
-            .field("podman", &self.podman)
-            .field("runtime", &self.runtime)
-            .finish_non_exhaustive()
-    }
 }
 
 /// Where a launcher's collaborators come from.
@@ -182,11 +240,38 @@ pub struct LauncherParts {
     pub limits: ScanLimits,
 }
 
+/// Launches and tears down sandboxes for one `sallyd`. Shared as `Arc<Launcher>`.
+pub struct Launcher {
+    podman: Podman,
+    runtime: CheckedRuntime,
+    ids: UserIds,
+    xdg_runtime_dir: PathBuf,
+    sessions: Arc<Sessions>,
+    audit: Arc<dyn AuditSink>,
+    limits: ScanLimits,
+}
+
+impl std::fmt::Debug for Launcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Launcher")
+            .field("podman", &self.podman)
+            .field("runtime", &self.runtime)
+            .finish_non_exhaustive()
+    }
+}
+
+/// How far a failed launch got, so cleanup removes exactly what it made.
+#[derive(Debug, Default)]
+struct Progress {
+    dirs: bool,
+    container: Option<String>,
+}
+
 impl Launcher {
     /// A launcher.
     #[must_use]
-    pub fn new(p: LauncherParts) -> Self {
-        Self {
+    pub fn new(p: LauncherParts) -> Arc<Self> {
+        Arc::new(Self {
             podman: p.podman,
             runtime: p.runtime,
             ids: p.ids,
@@ -194,7 +279,7 @@ impl Launcher {
             sessions: p.sessions,
             audit: p.audit,
             limits: p.limits,
-        }
+        })
     }
 
     async fn audit(&self, entry: NewEntry, level: AuditLevel) -> Result<(), LaunchError> {
@@ -202,67 +287,154 @@ impl Launcher {
         tokio::task::spawn_blocking(move || sink.append(entry, level))
             .await
             .map_err(join_err)?
-            .map_err(|e| LaunchError::Audit(e.to_string()))
+            .map_err(LaunchError::Audit)
+    }
+
+    /// Removes session containers a previous `sallyd` left behind (`sp-ws-<scope>…`,
+    /// `sp-h-<scope>…`), so the overlap rule starts from what is really running. `sallyd` calls
+    /// it with an empty scope before it accepts the first launch. Audits each removal.
+    ///
+    /// # Errors
+    /// [`LaunchError`] if podman cannot list or remove them.
+    pub async fn remove_orphans(&self, scope: &str) -> Result<Vec<String>, LaunchError> {
+        let out = self
+            .run(
+                "ps",
+                [
+                    "ps".into(),
+                    "--all".into(),
+                    "--format".into(),
+                    "{{.Names}}".into(),
+                ],
+            )
+            .await?;
+        let mut removed = Vec::new();
+        for name in out.lines().map(str::trim) {
+            let ours = SESSION_PREFIXES.iter().any(|p| {
+                name.strip_prefix(p)
+                    .is_some_and(|rest| rest.starts_with(scope) && plain_name(rest))
+            });
+            if !ours {
+                continue;
+            }
+            self.audit(
+                NewEntry::new(Actor::Sallyd, "sandbox.orphan_removed")
+                    .decision("deny")
+                    .args(json!({"container": name})),
+                AuditLevel::default(),
+            )
+            .await?;
+            self.run("rm", rm_args(name)).await?;
+            removed.push(name.to_owned());
+        }
+        Ok(removed)
     }
 
     /// Launches the workspace container of a session and starts it once every check passed.
+    /// The work runs in its own task: dropping the returned future does not interrupt it, and a
+    /// launch that finishes after its caller went away is stopped again.
     ///
     /// # Errors
-    /// [`LaunchError`]; everything created on the way is removed and `sandbox.refuse` (or
+    /// [`LaunchError`]; what was created is removed and `sandbox.refuse` (or
     /// `sandbox.mount_mismatch`) is audited.
-    pub async fn launch_workspace(&self, req: WorkspaceRequest) -> Result<Running, LaunchError> {
+    pub async fn launch_workspace(
+        self: &Arc<Self>,
+        req: WorkspaceRequest,
+    ) -> Result<Running, LaunchError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let result = this.launch(req).await;
+            if let Err(Ok(orphan)) = tx.send(result) {
+                let _ = this.stop(orphan).await;
+            }
+        });
+        rx.await
+            .map_err(|_| LaunchError::Internal("the launch task ended without a result".into()))?
+    }
+
+    async fn launch(&self, req: WorkspaceRequest) -> Result<Running, LaunchError> {
         let level = req.manifest.manifest().audit.level;
         let sid = req.paths.id().as_str().to_owned();
-        if let Err(e) = self.sessions.reserve(&sid, claims(&req.manifest)) {
-            let e = LaunchError::from(e);
-            self.refused(&sid, &e, level).await?;
-            return Err(e);
+        let v = Arc::clone(&req.manifest);
+        let reserved = match blocking(move || claims(&v).map_err(LaunchError::Claims)).await {
+            Ok(c) => self.sessions.reserve(&sid, c).map_err(LaunchError::from),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = reserved {
+            return Err(self
+                .refused(&sid, e, level, "nothing to clean up".into())
+                .await);
         }
-        match self.launch_reserved(&req, level).await {
+        let mut progress = Progress::default();
+        match self.launch_reserved(&req, level, &mut progress).await {
             Ok(r) => Ok(r),
             Err(e) => {
-                let _ = self.remove_dirs(&req.paths, false).await;
-                self.sessions.release(&sid);
-                self.refused(&sid, &e, level).await?;
-                Err(e)
+                let cleanup = self.clean_failed(&req.paths, &progress).await;
+                let outcome = match &cleanup {
+                    Ok(()) => "removed".to_owned(),
+                    Err(c) => format!("incomplete, the session stays reserved: {c}"),
+                };
+                if cleanup.is_ok() {
+                    self.sessions.release(&sid);
+                }
+                Err(self.refused(&sid, e, level, outcome).await)
             }
         }
     }
 
+    /// Audits a refusal; returns the error to report (the original, or both when the audit
+    /// entry fails too).
     async fn refused(
         &self,
         sid: &str,
-        e: &LaunchError,
+        e: LaunchError,
         level: AuditLevel,
-    ) -> Result<(), LaunchError> {
+        cleanup: String,
+    ) -> LaunchError {
         let event = if matches!(e, LaunchError::MountMismatch(_)) {
             "sandbox.mount_mismatch"
         } else {
             "sandbox.refuse"
         };
-        self.audit(
-            NewEntry::new(Actor::Sallyd, event)
-                .session(sid)
-                .decision("deny")
-                .args(json!({"role": "workspace", "reason": e.reason(), "detail": e.to_string()})),
-            level,
-        )
-        .await
+        let entry = NewEntry::new(Actor::Sallyd, event)
+            .session(sid)
+            .decision("deny")
+            .args(json!({
+                "role": "workspace",
+                "reason": e.reason(),
+                "detail": capped(&e.to_string()),
+                "cleanup": capped(&cleanup),
+            }));
+        match self.audit(entry, level).await {
+            Ok(()) => e,
+            Err(a) => LaunchError::Unaudited {
+                original: Box::new(e),
+                audit: Box::new(a),
+            },
+        }
     }
 
     async fn launch_reserved(
         &self,
         req: &WorkspaceRequest,
         level: AuditLevel,
+        progress: &mut Progress,
     ) -> Result<Running, LaunchError> {
-        let (scan, argv) = self.prepare(req).await?;
+        let (runtime, scan) = self.check_and_scan(req).await?;
+        let argv = self.dirs_and_argv(req, runtime, &scan, progress).await?;
         let m = req.manifest.manifest();
         let mounts: Vec<_> = req
             .manifest
             .mounts()
             .iter()
-            .map(|x| json!({"guest": x.guest, "mode": format!("{:?}", x.mode).to_lowercase()}))
+            .map(|x| json!({"guest": x.guest, "mode": mode_str(x.mode)}))
             .collect();
+        let shields: usize = scan
+            .git()
+            .iter()
+            .map(|g| g.dirs().len() + g.files().len())
+            .sum();
         self.audit(
             NewEntry::new(Actor::Sallyd, "sandbox.launch")
                 .session(req.paths.id().as_str())
@@ -271,83 +443,91 @@ impl Launcher {
                     "role": "workspace",
                     "image": m.runtime.image.as_deref().unwrap_or(req.default_image.as_str()),
                     "mounts": mounts,
-                    "git_shields": scan.git().iter().map(|g| g.dirs().len() + g.files().len()).sum::<usize>(),
+                    "git_shields": shields,
                 })),
             level,
         )
         .await?;
-        let out = self.run("create", argv.iter().map(OsString::from)).await?;
+        let name = format!("sp-ws-{}", req.paths.id().as_str());
+        progress.container = Some(name.clone());
+        let out = self
+            .run("create", argv.into_iter().map(OsString::from))
+            .await?;
         let container = container_id(&out)?;
-        if let Err(e) = self.checked_start(req, &scan, &container).await {
-            let _ = self.run("rm", rm_args(&container)).await;
-            return Err(e);
-        }
+        self.checked_start(req, scan, &container).await?;
         Ok(Running {
             container,
+            name,
             paths: req.paths.clone(),
             level,
         })
     }
 
-    /// Steps 2 and 3, on the blocking pool.
-    async fn prepare(
+    /// Step 2: hermetic podman and the runtime re-checked, then the launch scan.
+    async fn check_and_scan(
         &self,
         req: &WorkspaceRequest,
-    ) -> Result<(LaunchScan, Vec<String>), LaunchError> {
+    ) -> Result<(CheckedRuntime, LaunchScan), LaunchError> {
         let podman = self.podman.clone();
-        let runtime = self.runtime.clone();
-        let ids = self.ids;
+        let runtime = self.runtime.path().to_owned();
         let limits = self.limits;
-        let xdg = self.xdg_runtime_dir.clone();
-        let req = req.clone();
-        tokio::task::spawn_blocking(move || -> Result<_, LaunchError> {
+        let v = Arc::clone(&req.manifest);
+        blocking(move || {
             podman.recheck()?;
-            let runtime = CheckedRuntime::check(runtime.path())
+            let runtime = CheckedRuntime::check(&runtime)
                 .map_err(|e| LaunchError::Podman(PodmanError::Binary(e)))?;
-            let scan = scan_mounts(&req.manifest, &limits)?;
-            let staged: Vec<usize> = req
-                .manifest
-                .mounts()
-                .iter()
-                .enumerate()
-                .filter(|(_, m)| m.mode == MountMode::Staged)
-                .map(|(i, _)| i)
-                .collect();
-            let overlays = scan.git().iter().map(|g| g.dirs().len()).sum();
-            let dirs = SessionDirs::create(&req.paths, &xdg, &staged, overlays)?;
-            let common = CommonArgs {
-                runtime,
-                ids,
-                profiles: dirs.profiles().to_owned(),
-                hooks_dir: podman.hooks_dir().to_owned(),
-            };
-            let argv = workspace_argv(
-                &common,
-                &req.paths,
-                &req.manifest,
-                &scan,
-                &req.default_image,
-            )?;
-            Ok((scan, argv))
+            Ok((runtime, scan_mounts(&v, &limits)?))
         })
         .await
-        .map_err(join_err)?
+    }
+
+    /// Step 3. Records in `progress` whether directories were created, so a failure removes
+    /// them and never a stopped session's kept data.
+    async fn dirs_and_argv(
+        &self,
+        req: &WorkspaceRequest,
+        runtime: CheckedRuntime,
+        scan: &LaunchScan,
+        progress: &mut Progress,
+    ) -> Result<Vec<String>, LaunchError> {
+        let staged: Vec<usize> = req
+            .manifest
+            .mounts()
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.mode == MountMode::Staged)
+            .map(|(i, _)| i)
+            .collect();
+        let overlays = scan.git().iter().map(|g| g.dirs().len()).sum();
+        let (paths, xdg) = (req.paths.clone(), self.xdg_runtime_dir.clone());
+        let created =
+            blocking(move || Ok(SessionDirs::create(&paths, &xdg, &staged, overlays))).await?;
+        progress.dirs = created.as_ref().map_or_else(|e| !e.reused, |_| true);
+        let dirs = created?;
+        let common = CommonArgs {
+            runtime,
+            ids: self.ids,
+            profiles: dirs.profiles().to_owned(),
+            hooks_dir: self.podman.hooks_dir(),
+            mounts_file: self.podman.mounts_file(),
+        };
+        Ok(workspace_argv(
+            &common,
+            &req.paths,
+            &req.manifest,
+            scan,
+            &req.default_image,
+        )?)
     }
 
     /// Steps 5 (after create) to 7.
     async fn checked_start(
         &self,
         req: &WorkspaceRequest,
-        scan: &LaunchScan,
+        scan: LaunchScan,
         container: &str,
     ) -> Result<(), LaunchError> {
-        let (v, s) = (req.manifest.clone(), scan.clone());
-        tokio::task::spawn_blocking(move || s.recheck_host(&v))
-            .await
-            .map_err(join_err)??;
-        self.run("init", [OsString::from("init"), container.into()])
-            .await?;
-        let pid = self.init_pid(container).await?;
+        let v = Arc::clone(&req.manifest);
         let expect: Vec<Expect> = scan
             .pins()
             .iter()
@@ -358,12 +538,16 @@ impl Launcher {
                 ino: p.ino,
             })
             .collect();
-        tokio::task::spawn_blocking(move || check_in_container(pid, &expect))
-            .await
-            .map_err(join_err)?
-            .map_err(LaunchError::MountMismatch)?;
+        blocking(move || Ok(scan.recheck_host(&v)?)).await?;
+        self.run("init", [OsString::from("init"), container.into()])
+            .await?;
+        let pid = self.init_pid(container).await?;
+        blocking(move || check_in_container(pid, &expect).map_err(LaunchError::MountMismatch))
+            .await?;
         self.run("start", [OsString::from("start"), container.into()])
             .await?;
+        // TODO(#17): confirm the container is running; `start` succeeds even when the entry
+        // point fails to exec (Task 6c).
         Ok(())
     }
 
@@ -388,13 +572,67 @@ impl Launcher {
         }
     }
 
+    /// Cleanup after a failed launch: the container by name if `create` was attempted (it may
+    /// exist without a printed id), then the directories this launch created.
+    async fn clean_failed(&self, paths: &SessionPaths, p: &Progress) -> Result<(), LaunchError> {
+        if let Some(name) = &p.container {
+            self.remove_container(name).await?;
+        }
+        if p.dirs {
+            self.remove_dirs(paths, false).await?;
+        }
+        Ok(())
+    }
+
+    /// `podman rm --force`, then confirms the container is gone.
+    async fn remove_container(&self, name: &str) -> Result<(), LaunchError> {
+        let removed = self.run("rm", rm_args(name)).await;
+        match self.container_exists(name).await? {
+            false => Ok(()),
+            true => Err(removed.err().unwrap_or(LaunchError::Command {
+                verb: "rm",
+                msg: format!("{name} still exists"),
+            })),
+        }
+    }
+
+    async fn container_exists(&self, name: &str) -> Result<bool, LaunchError> {
+        let status = self
+            .podman
+            .command()
+            .args(["container", "exists", name])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let status = tokio::time::timeout(PODMAN_TIMEOUT, status)
+            .await
+            .map_err(|_| LaunchError::Command {
+                verb: "container exists",
+                msg: "timed out".into(),
+            })?
+            .map_err(|e| LaunchError::Command {
+                verb: "container exists",
+                msg: e.to_string(),
+            })?;
+        match status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(LaunchError::Command {
+                verb: "container exists",
+                msg: status.to_string(),
+            }),
+        }
+    }
+
     /// Stops and removes the container, discards the `.git` overlays, the profiles and the
     /// socket directory, keeps the `staged` upper directories, and releases the session's
     /// mounts. Audits `sandbox.stop` first.
     ///
     /// # Errors
-    /// [`LaunchError`] if a step fails; the later steps still run and the session is released.
-    pub async fn stop(&self, r: Running) -> Result<(), LaunchError> {
+    /// [`StopError`] when the container cannot be confirmed gone: the session keeps its claims
+    /// and the error carries the handle back for a retry. A failure after that (scratch
+    /// removal) is reported too, but the session is released.
+    pub async fn stop(&self, r: Running) -> Result<(), Box<StopError>> {
         let sid = r.paths.id().as_str().to_owned();
         let audited = self
             .audit(
@@ -404,22 +642,33 @@ impl Launcher {
                 r.level,
             )
             .await;
-        let removed = self.run("rm", rm_args(&r.container)).await.map(|_| ());
+        if let Err(error) = self.remove_container(&r.name).await {
+            return Err(Box::new(StopError { running: r, error }));
+        }
         let cleaned = self.remove_dirs(&r.paths, true).await;
         self.sessions.release(&sid);
-        audited.and(removed).and(cleaned)
+        audited
+            .and(cleaned)
+            .map_err(|error| Box::new(StopError { running: r, error }))
     }
 
     /// Removes the session's scratch. Files in overlay work directories belong to the
     /// container's user namespace, so removal runs through `podman unshare`.
     async fn remove_dirs(&self, paths: &SessionPaths, keep_stage: bool) -> Result<(), LaunchError> {
-        let data = paths.data_root();
-        let targets: Vec<PathBuf> = if keep_stage {
-            vec![data.join("git"), data.join("profiles")]
-        } else {
-            vec![data.to_owned()]
-        };
-        for t in targets.iter().filter(|t| t.exists()) {
+        let data = paths.data_root().to_owned();
+        let targets = blocking(move || {
+            let all = if keep_stage {
+                vec![data.join("git"), data.join("profiles")]
+            } else {
+                vec![data]
+            };
+            Ok(all
+                .into_iter()
+                .filter(|t| std::fs::symlink_metadata(t).is_ok())
+                .collect::<Vec<_>>())
+        })
+        .await?;
+        for t in &targets {
             let t = path_arg(t, "session scratch")?;
             self.run(
                 "unshare",
@@ -434,13 +683,12 @@ impl Launcher {
             .await?;
         }
         let sockets = paths.socket_root().to_owned();
-        tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(&sockets) {
+        blocking(move || match std::fs::remove_dir_all(&sockets) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(LaunchError::Internal(format!("{}: {e}", sockets.display()))),
         })
         .await
-        .map_err(join_err)?
     }
 
     /// Runs one hermetic podman command; stdout on success.
@@ -481,6 +729,13 @@ impl Launcher {
     }
 }
 
+/// `[a-z0-9-]`, as session ids are.
+fn plain_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 fn rm_args(container: &str) -> [OsString; 5] {
     [
         "rm".into(),
@@ -508,8 +763,9 @@ fn container_id(out: &str) -> Result<String, LaunchError> {
     }
 }
 
-/// Reads everything, keeps the first [`OUTPUT_CAP`] bytes, so a chatty process never blocks on
-/// a full pipe and never grows memory without bound.
+/// Reads until end of file, keeping the first [`OUTPUT_CAP`] bytes, so a chatty process never
+/// blocks on a full pipe and never grows memory without bound. A read error ends the read; the
+/// command's timeout then bounds the wait for the process.
 async fn read_capped(mut r: impl AsyncRead + Unpin) -> Vec<u8> {
     let mut kept = Vec::new();
     let mut buf = [0u8; 8192];
@@ -551,5 +807,22 @@ mod tests {
         let data = vec![b'x'; OUTPUT_CAP * 3 + 17];
         let kept = read_capped(data.as_slice()).await;
         assert_eq!(kept.len(), OUTPUT_CAP);
+    }
+
+    #[test]
+    fn audit_text_is_capped_at_a_character_boundary() {
+        assert_eq!(capped("short"), "short");
+        let long = "é".repeat(AUDIT_TEXT_CAP);
+        let c = capped(&long);
+        assert!(c.len() <= AUDIT_TEXT_CAP + "…".len());
+        assert!(c.ends_with('…'));
+    }
+
+    #[test]
+    fn orphan_names_are_plain() {
+        assert!(plain_name("t1-0-a"));
+        for bad in ["", "A", "a b", "a/b", "a;b"] {
+            assert!(!plain_name(bad), "{bad:?}");
+        }
     }
 }

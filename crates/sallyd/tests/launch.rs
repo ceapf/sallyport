@@ -18,6 +18,7 @@ use sallyd::sandbox::{
     PodmanHost, Running, ScanLimits, SessionId, SessionPaths, Sessions, UserIds, WorkspaceRequest,
     check_in_container, resolve_podman,
 };
+use std::time::Duration;
 
 mod common;
 use common::*;
@@ -81,14 +82,7 @@ struct Events(Mutex<Vec<String>>);
 
 impl AuditSink for Events {
     fn append(&self, e: NewEntry, _: AuditLevel) -> Result<(), AuditError> {
-        let line = format!("{e:?}");
-        let event = line
-            .split("event: \"")
-            .nth(1)
-            .and_then(|r| r.split('"').next())
-            .unwrap_or_default()
-            .to_owned();
-        self.0.lock().unwrap().push(event);
+        self.0.lock().unwrap().push(e.event().to_owned());
         Ok(())
     }
 }
@@ -101,9 +95,11 @@ impl Events {
 
 struct Lx {
     f: Fx,
-    launcher: Launcher,
+    launcher: Arc<Launcher>,
     events: Arc<Events>,
     xdg: PathBuf,
+    /// Prefix of every session id this fixture makes: `t<pid>-<n>`.
+    scope: String,
 }
 
 fn host_env(var: &str) -> Option<PathBuf> {
@@ -149,18 +145,19 @@ impl Lx {
             audit: events.clone(),
             limits: ScanLimits::default(),
         });
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self {
             f,
             launcher,
             events,
             xdg,
+            scope: format!("t{}-{n}", std::process::id()),
         }
     }
 
     fn paths(&self, tag: &str) -> SessionPaths {
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let id = SessionId::parse(&format!("t{}-{n}-{tag}", std::process::id())).unwrap();
+        let id = SessionId::parse(&format!("{}-{tag}", self.scope)).unwrap();
         SessionPaths::new(
             id,
             &self.xdg.join("sallyport"),
@@ -169,27 +166,40 @@ impl Lx {
         .unwrap()
     }
 
+    fn request(&self, v: &ValidatedManifest, tag: &str) -> WorkspaceRequest {
+        WorkspaceRequest {
+            paths: self.paths(tag),
+            manifest: Arc::new(v.clone()),
+            default_image: test_image(),
+        }
+    }
+
     async fn launch(&self, v: &ValidatedManifest, tag: &str) -> Result<Running, LaunchError> {
-        self.launcher
-            .launch_workspace(WorkspaceRequest {
-                paths: self.paths(tag),
-                manifest: v.clone(),
-                default_image: test_image(),
-            })
-            .await
+        self.launcher.launch_workspace(self.request(v, tag)).await
+    }
+
+    async fn stop(&self, r: Running) {
+        self.launcher.stop(r).await.unwrap();
     }
 }
 
 impl Drop for Lx {
-    /// Overlay work directories belong to the container's user namespace.
+    /// Removes this fixture's containers even when a test failed, then its files (overlay work
+    /// directories belong to the container's user namespace).
     fn drop(&mut self) {
+        let names = podman(&["ps", "--all", "--format", "{{.Names}}"]);
+        for name in String::from_utf8_lossy(&names.stdout).lines() {
+            if name.starts_with(&format!("sp-ws-{}-", self.scope)) {
+                let _ = podman(&["rm", "--force", "--time", "0", name]);
+            }
+        }
         let _ = podman(&["unshare", "rm", "-rf", "--", self.f.root.to_str().unwrap()]);
     }
 }
 
 /// `podman exec` in the container: (exit code, stdout + stderr).
 fn exec(r: &Running, script: &str) -> (i32, String) {
-    let out = podman(&["exec", &r.container, "sh", "-c", script]);
+    let out = podman(&["exec", r.container(), "sh", "-c", script]);
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -238,11 +248,11 @@ fn a_launch_is_hardened_audited_and_torn_down() {
         let home = x.f.root.join("home");
         assert!(!home.join("code/other/new").exists());
         assert!(!home.join("code/myproject/.git/probe").exists());
-        let data = r.paths.data_root().to_owned();
-        let sockets = r.paths.socket_root().to_owned();
+        let data = r.paths().data_root().to_owned();
+        let sockets = r.paths().socket_root().to_owned();
         assert_eq!(x.events.list(), ["sandbox.launch"]);
-        let container = r.container.clone();
-        x.launcher.stop(r).await.unwrap();
+        let container = r.container().to_owned();
+        x.stop(r).await;
         assert!(!exists(&container));
         assert!(!data.join("git").exists() && !data.join("profiles").exists());
         assert!(
@@ -292,9 +302,9 @@ fn overlapping_sessions_are_refused_while_the_first_is_live() {
         let ra = x.launch(&a, "a").await.unwrap();
         let e = x.launch(&b, "b").await.unwrap_err();
         assert!(matches!(e, LaunchError::Overlap(_)), "{e}");
-        x.launcher.stop(ra).await.unwrap();
+        x.stop(ra).await;
         let rb = x.launch(&b, "b2").await.unwrap();
-        x.launcher.stop(rb).await.unwrap();
+        x.stop(rb).await;
         assert_eq!(
             x.events.list(),
             [
@@ -318,7 +328,7 @@ fn the_in_container_check_compares_identities_from_the_host() {
         let v =
             x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "rw")]));
         let r = x.launch(&v, "pin").await.unwrap();
-        let out = podman(&["inspect", "--format", "{{.State.Pid}}", &r.container]);
+        let out = podman(&["inspect", "--format", "{{.State.Pid}}", r.container()]);
         let pid: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
         let id = |rel: &str| {
             use std::os::unix::fs::MetadataExt;
@@ -346,7 +356,7 @@ fn the_in_container_check_compares_identities_from_the_host() {
             missing.to_string().contains("cannot be opened"),
             "{missing}"
         );
-        x.launcher.stop(r).await.unwrap();
+        x.stop(r).await;
     });
 }
 
@@ -392,7 +402,7 @@ fn rt_fs_12_git_shields_hold_inside_the_container() {
             std::fs::read_to_string(host.join("mod/.git")).unwrap(),
             "gitdir: elsewhere\n"
         );
-        x.launcher.stop(r).await.unwrap();
+        x.stop(r).await;
     });
 }
 
@@ -451,7 +461,7 @@ fn rt_fs_16_a_nested_host_mount_is_not_visible() {
             );
             assert!(!out.contains("NESTED-SECRET"), "{mode}: {out}");
             assert!(out.contains("No such file"), "{mode}: {out}");
-            x.launcher.stop(r).await.unwrap();
+            x.stop(r).await;
         }
         // `staged`: Podman 4.9.3 refuses an overlay whose lower directory has a mount inside it
         // in the keep-id user namespace (EINVAL, probed in Task 6b), so the launch is refused
@@ -461,7 +471,9 @@ fn rt_fs_16_a_nested_host_mount_is_not_visible() {
             "/workspace/p",
             "staged",
         )]));
-        let e = x.launch(&v, "staged").await.unwrap_err();
+        let req = x.request(&v, "staged");
+        let paths = req.paths.clone();
+        let e = x.launcher.launch_workspace(req).await.unwrap_err();
         assert!(
             matches!(e, LaunchError::Command { verb: "init", .. }),
             "{e}"
@@ -470,6 +482,14 @@ fn rt_fs_16_a_nested_host_mount_is_not_visible() {
             x.events.list().last().map(String::as_str),
             Some("sandbox.refuse")
         );
+        // 6b reviews: a failed launch removes its container (by name) and everything it
+        // created, and releases its claims.
+        assert!(!exists(&format!("sp-ws-{}", paths.id().as_str())));
+        assert!(!paths.data_root().exists() && !paths.socket_root().exists());
+        let rw =
+            x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "rw")]));
+        let r = x.launch(&rw, "after").await.unwrap();
+        x.stop(r).await;
     });
 }
 
@@ -508,6 +528,7 @@ fn hostile_user_podman_configuration_is_ignored() {
         ),
     )
     .unwrap();
+    let _cleanup = RemoveOnDrop(fx_home.clone());
     rt().block_on(async {
         let x = Lx::with_home(Some(fx_home.clone()));
         let v =
@@ -528,7 +549,145 @@ fn hostile_user_podman_configuration_is_ignored() {
             Some("lo"),
             "own network namespace: {out}"
         );
-        x.launcher.stop(r).await.unwrap();
+        x.stop(r).await;
     });
-    std::fs::remove_dir_all(&fx_home).unwrap();
+}
+
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// 6b reviews (Rust H1, security M3): relaunching a stopped session's id is refused before
+/// anything is created, and the kept staged changes survive.
+#[test]
+fn a_reused_session_id_never_deletes_kept_staged_changes() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let v =
+            x.f.load(&mounts(&[mount("~/code/other", "/workspace/o", "staged")]));
+        let req = x.request(&v, "reuse");
+        let r = x.launcher.launch_workspace(req.clone()).await.unwrap();
+        let (code, out) = exec(&r, "echo keep > /workspace/o/work.txt");
+        assert_eq!(code, 0, "{out}");
+        x.stop(r).await;
+        let kept = req.paths.stage(0).upper.join("work.txt");
+        assert!(kept.exists());
+        let e = x.launcher.launch_workspace(req).await.unwrap_err();
+        assert!(matches!(&e, LaunchError::Dirs(d) if d.reused), "{e}");
+        assert!(kept.exists(), "the refused launch removed nothing");
+        assert_eq!(
+            x.events.list(),
+            ["sandbox.launch", "sandbox.stop", "sandbox.refuse"]
+        );
+    });
+}
+
+/// 6b reviews (Rust H2, security M1): claims are released once the container is confirmed
+/// gone, also when something else removed it first.
+#[test]
+fn stop_releases_the_claims_once_the_container_is_gone() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let v =
+            x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "rw")]));
+        let r = x.launch(&v, "gone").await.unwrap();
+        assert!(
+            podman(&["rm", "--force", "--time", "0", r.name()])
+                .status
+                .success()
+        );
+        x.stop(r).await;
+        let again = x.launch(&v, "again").await.unwrap();
+        x.stop(again).await;
+    });
+}
+
+/// 6b security review M1: containers a crashed `sallyd` left behind are removed before the
+/// first launch, so the overlap rule starts from what is really running.
+#[test]
+fn orphans_of_a_previous_sallyd_are_removed() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let v =
+            x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "rw")]));
+        let r = x.launch(&v, "orphan").await.unwrap();
+        let name = r.name().to_owned();
+        drop(r); // the handle dies with the "crashed" sallyd; the container keeps running
+        assert!(exists(&name));
+        let removed = x.launcher.remove_orphans(&x.scope).await.unwrap();
+        assert_eq!(removed, std::slice::from_ref(&name));
+        assert!(!exists(&name));
+        assert_eq!(
+            x.events.list().last().map(String::as_str),
+            Some("sandbox.orphan_removed")
+        );
+    });
+}
+
+/// 6b Rust review H3: a caller that stops waiting (an outer timeout, a closed connection)
+/// leaves no container and no claim behind: the launch finishes in its own task and stops
+/// what nobody received.
+#[test]
+fn a_dropped_launch_cleans_up_after_itself() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let v =
+            x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "rw")]));
+        let req = x.request(&v, "cancel");
+        let name = format!("sp-ws-{}", req.paths.id().as_str());
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(1), x.launcher.launch_workspace(req)).await;
+        assert!(cancelled.is_err(), "the launch outlived its caller");
+        // Nothing else launches until the cancelled launch has finished in its own task: it must
+        // have launched and then stopped what nobody received.
+        for _ in 0..600 {
+            if x.events.list().len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(x.events.list(), ["sandbox.launch", "sandbox.stop"]);
+        // `stop` audits first, then removes the container and releases the claims.
+        let mut again = None;
+        for _ in 0..600 {
+            match x.launch(&v, "after-cancel").await {
+                Ok(r) => {
+                    again = Some(r);
+                    break;
+                }
+                Err(LaunchError::Overlap(_)) => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        let again = again.expect("the cancelled launch released its claims");
+        assert!(!exists(&name));
+        x.stop(again).await;
+    });
+}
+
+/// 6b security review M4 / L5: everything podman reads from Sallyport's state is re-checked
+/// before each launch; a line in the empty mounts file refuses the launch.
+#[test]
+fn a_tampered_podman_state_refuses_the_launch() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let mounts_file =
+            x.f.root
+                .join("home/.local/share/sallyport/podman/mounts.conf");
+        std::fs::write(&mounts_file, "/etc:/run/secrets\n").unwrap();
+        let v =
+            x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "ro")]));
+        let e = x.launch(&v, "tamper").await.unwrap_err();
+        assert!(
+            e.to_string().contains("changed since sallyd wrote it"),
+            "{e}"
+        );
+        assert_eq!(x.events.list(), ["sandbox.refuse"]);
+    });
 }

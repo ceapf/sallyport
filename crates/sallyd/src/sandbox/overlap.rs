@@ -4,15 +4,25 @@
 //! mount. This also closes the 6a re-review's H1 race: the parent pins and `.git` shields of one
 //! session cannot be swapped for a symlink by another live session, because none can write there.
 //!
+//! Overlap is decided by path *and* by identity: each claim carries the `st_dev:st_ino` of its
+//! root and of every ancestor up to `/` (walked with `..` from the root, so a directory reached
+//! through a bind alias, a doubly mounted subvolume or another path still conflicts; 6b security
+//! review M2).
+//!
 //! The rule is a pure function ([`conflict`]); [`Sessions`] holds the live claims of this
-//! `sallyd` and reserves atomically. One `sallyd` runs per user (its control socket is the lock),
-//! so in-process state is the whole picture.
+//! `sallyd` and reserves atomically. One `sallyd` runs per user (its control socket is the lock);
+//! containers a previous `sallyd` left behind are removed before the first launch
+//! ([`super::Launcher::remove_orphans`]), so in-process state is the whole picture.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use rustix::fs::{Mode, OFlags};
 use sally_core::manifest::{MountMode, ValidatedManifest};
+
+/// Bound on the ancestor walk (the kernel's path depth is far below it).
+const MAX_ANCESTORS: usize = 4096;
 
 /// One host directory a session mounts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,18 +31,43 @@ pub struct Claim {
     pub host: PathBuf,
     /// Mount mode.
     pub mode: MountMode,
+    /// `st_dev:st_ino` of the root, then of each ancestor up to `/`.
+    pub chain: Vec<(u64, u64)>,
 }
 
-/// The claims of a validated manifest, in manifest order.
-#[must_use]
-pub fn claims(v: &ValidatedManifest) -> Vec<Claim> {
+/// The claims of a validated manifest, in manifest order, with each root's identity chain.
+/// Performs blocking I/O.
+///
+/// # Errors
+/// The I/O error of a root or ancestor that cannot be opened.
+pub fn claims(v: &ValidatedManifest) -> std::io::Result<Vec<Claim>> {
     v.mounts()
         .iter()
-        .map(|m| Claim {
-            host: m.host.clone(),
-            mode: m.mode,
+        .map(|m| {
+            Ok(Claim {
+                host: m.host.clone(),
+                mode: m.mode,
+                chain: identity_chain(&m.host)?,
+            })
         })
         .collect()
+}
+
+/// The identities of `dir` and its ancestors, walking `..` from an fd (not the path string).
+fn identity_chain(dir: &Path) -> std::io::Result<Vec<(u64, u64)>> {
+    let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    let mut fd = rustix::fs::open(dir, flags | OFlags::NOFOLLOW, Mode::empty())?;
+    let mut chain = Vec::new();
+    for _ in 0..MAX_ANCESTORS {
+        let st = rustix::fs::fstat(&fd)?;
+        let id = (st.st_dev, st.st_ino);
+        if chain.last() == Some(&id) {
+            return Ok(chain);
+        }
+        chain.push(id);
+        fd = rustix::fs::openat(&fd, "..", flags, Mode::empty())?;
+    }
+    Err(std::io::Error::other("ancestor walk did not reach /"))
 }
 
 /// A refused overlap.
@@ -58,9 +93,14 @@ fn writes(mode: MountMode) -> bool {
     matches!(mode, MountMode::Rw | MountMode::Brokered)
 }
 
-/// Same directory, or one inside the other (component-wise).
-fn overlaps(a: &Path, b: &Path) -> bool {
-    a.starts_with(b) || b.starts_with(a)
+/// Same directory, or one inside the other: by path (component-wise), or by identity (either
+/// root appears in the other's ancestor chain).
+fn overlaps(a: &Claim, b: &Claim) -> bool {
+    let root = |c: &Claim| c.chain.first().copied();
+    a.host.starts_with(&b.host)
+        || b.host.starts_with(&a.host)
+        || root(a).is_some_and(|r| b.chain.contains(&r))
+        || root(b).is_some_and(|r| a.chain.contains(&r))
 }
 
 /// The first conflict between `new` and any live session's claims.
@@ -72,7 +112,7 @@ pub fn conflict<'a>(
     for (session, held) in live {
         for h in held {
             for n in new {
-                if (writes(h.mode) || writes(n.mode)) && overlaps(&h.host, &n.host) {
+                if (writes(h.mode) || writes(n.mode)) && overlaps(h, n) {
                     return Some(Conflict {
                         session: session.to_owned(),
                         held: h.host.display().to_string(),
@@ -150,11 +190,64 @@ mod tests {
         MountMode::Staged,
     ];
 
+    /// A claim with a made-up identity chain derived from the path, as if every path were
+    /// distinct on disk.
     fn c(host: &str, mode: MountMode) -> Claim {
+        let mut chain = Vec::new();
+        let mut p = Some(Path::new(host));
+        while let Some(x) = p {
+            chain.push((1, fake_ino(x)));
+            p = x.parent();
+        }
         Claim {
             host: host.into(),
             mode,
+            chain,
         }
+    }
+
+    fn fake_ino(p: &Path) -> u64 {
+        p.as_os_str().len() as u64 * 1000
+            + p.as_os_str()
+                .as_encoded_bytes()
+                .iter()
+                .map(|b| u64::from(*b))
+                .sum::<u64>()
+    }
+
+    /// 6b security review M2: the same directory under two paths (a bind alias).
+    #[test]
+    fn an_alias_of_a_held_directory_conflicts_by_identity() {
+        let held = c("/h/a/d", MountMode::Rw);
+        let mut alias = c("/h/b/d/sub", MountMode::Staged);
+        // /h/b/d is the same directory as /h/a/d.
+        alias.chain[1] = held.chain[0];
+        let held = [held];
+        assert!(conflict([("s1", held.as_slice())], &[alias.clone()]).is_some());
+        // And the other way round: the alias is live, the original path is new.
+        let alias_held = [alias];
+        assert!(
+            conflict(
+                [("s1", alias_held.as_slice())],
+                &[c("/h/a/d", MountMode::Rw)]
+            )
+            .is_some()
+        );
+        // Read-only on both sides never conflicts, aliased or not.
+        let mut ro_alias = c("/h/b/d", MountMode::Ro);
+        ro_alias.chain[0] = c("/h/a/d", MountMode::Ro).chain[0];
+        let held = [c("/h/a/d", MountMode::Staged)];
+        assert!(conflict([("s1", held.as_slice())], &[ro_alias]).is_none());
+    }
+
+    #[test]
+    fn identity_chains_reach_the_root() {
+        let dir = std::env::temp_dir();
+        let chain = identity_chain(&dir).unwrap();
+        let root = std::fs::metadata("/").unwrap();
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(chain.last(), Some(&(root.dev(), root.ino())));
+        assert!(chain.len() >= 2);
     }
 
     #[test]

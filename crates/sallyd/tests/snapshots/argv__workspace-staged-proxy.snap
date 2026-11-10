@@ -6,6 +6,8 @@ expression: f.redact(&a)
 $ROOT/bin/crun
 --hooks-dir
 $ROOT/hooks
+--default-mounts-file
+$ROOT/mounts.conf
 create
 --rm
 --name

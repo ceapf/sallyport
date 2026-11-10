@@ -46,6 +46,9 @@ impl Default for ScanLimits {
     }
 }
 
+/// Bytes of relative paths queued for listing at once.
+const MAX_PENDING_PATH_BYTES: usize = 16 * 1024 * 1024;
+
 /// Why the launch scan refused a mount. Messages name the mount and say what to do.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -168,6 +171,9 @@ impl GitScan {
 /// The result of scanning every mount of a manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchScan {
+    /// Each mount's host realpath and validated identity, in manifest order: the scan belongs
+    /// to exactly this manifest.
+    roots: Vec<(PathBuf, (u64, u64))>,
     git: Vec<GitScan>,
     pins: Vec<Pin>,
 }
@@ -177,6 +183,12 @@ impl LaunchScan {
     #[must_use]
     pub fn git(&self) -> &[GitScan] {
         &self.git
+    }
+
+    /// Whether this scan was made for `v` (the same mounts, by realpath and identity).
+    #[must_use]
+    pub fn is_for(&self, v: &ValidatedManifest) -> bool {
+        self.roots == roots(v)
     }
 
     /// Every pinned host object: mount roots, shielded `.git` entries and their parents.
@@ -191,6 +203,9 @@ impl LaunchScan {
     /// # Errors
     /// [`ScanError::Changed`] for the first pin that no longer matches.
     pub fn recheck_host(&self, v: &ValidatedManifest) -> Result<(), ScanError> {
+        if !self.is_for(v) {
+            return changed(0, "the launch scan belongs to another manifest");
+        }
         for pin in &self.pins {
             let Some(m) = v.mounts().get(pin.mount) else {
                 return changed(pin.mount, "mount list changed");
@@ -282,13 +297,18 @@ struct Entry {
     mnt_id: u64,
 }
 
+/// What the scan needs from `statx`; a kernel that does not fill all of it (`STATX_MNT_ID`
+/// arrived in 5.8) would make every entry look like it is on the root's mount, so the scan
+/// refuses rather than walking into nested mounts (6b Rust review M1).
+const NEEDED: StatxFlags = StatxFlags::TYPE
+    .union(StatxFlags::INO)
+    .union(StatxFlags::MNT_ID);
+
 fn stat_entry(dir: impl AsFd, name: &CStr) -> rustix::io::Result<Entry> {
-    let st = rustix::fs::statx(
-        dir,
-        name,
-        AtFlags::SYMLINK_NOFOLLOW,
-        StatxFlags::TYPE | StatxFlags::INO | StatxFlags::MNT_ID,
-    )?;
+    let st = rustix::fs::statx(dir, name, AtFlags::SYMLINK_NOFOLLOW, NEEDED)?;
+    if !StatxFlags::from_bits_retain(st.stx_mask).contains(NEEDED) {
+        return Err(rustix::io::Errno::NOSYS);
+    }
     Ok(Entry {
         kind: FileType::from_raw_mode(st.stx_mode.into()),
         dev: rustix::fs::makedev(st.stx_dev_major, st.stx_dev_minor),
@@ -297,12 +317,20 @@ fn stat_entry(dir: impl AsFd, name: &CStr) -> rustix::io::Result<Entry> {
     })
 }
 
+fn roots(v: &ValidatedManifest) -> Vec<(PathBuf, (u64, u64))> {
+    v.mounts()
+        .iter()
+        .map(|m| (m.host.clone(), m.identity()))
+        .collect()
+}
+
 /// Scans every mount of `v`.
 ///
 /// # Errors
 /// [`ScanError`] for the first mount that is refused.
 pub fn scan_mounts(v: &ValidatedManifest, limits: &ScanLimits) -> Result<LaunchScan, ScanError> {
     let mut out = LaunchScan {
+        roots: roots(v),
         git: Vec::new(),
         pins: Vec::new(),
     };
@@ -319,6 +347,7 @@ struct Walk<'a> {
     root: OwnedFd,
     root_mnt: u64,
     entries: usize,
+    pending_bytes: usize,
     git: GitScan,
     pins: Vec<Pin>,
 }
@@ -336,6 +365,7 @@ impl<'a> Walk<'a> {
             root,
             root_mnt,
             entries: 0,
+            pending_bytes: 0,
             git: GitScan {
                 mount,
                 dirs: Vec::new(),
@@ -389,6 +419,7 @@ impl<'a> Walk<'a> {
         // depth, and whether it is inside a `.git` directory (listed for sockets only).
         let mut stack: Vec<(PathBuf, u64, usize, bool)> = vec![(PathBuf::new(), ino, 0, false)];
         while let Some((rel, ino, depth, in_git)) = stack.pop() {
+            self.pending_bytes = self.pending_bytes.saturating_sub(rel.as_os_str().len());
             self.list(&rel, ino, depth, in_git, &mut stack)?;
         }
         if self.rw() {
@@ -460,16 +491,25 @@ impl<'a> Walk<'a> {
             });
         }
         let is_git = name == c".git" && self.rw() && !in_git;
+        if e.mnt_id != self.root_mnt {
+            // A mount point (a directory or a bind-mounted file) of another mount: invisible in
+            // the sandbox; never entered, never shielded (6b Rust review M2).
+            return Ok(());
+        }
         match e.kind {
-            FileType::Directory if e.mnt_id != self.root_mnt => {
-                // Another filesystem mount: invisible in the sandbox; never entered, never shielded.
-            }
             FileType::Directory => {
                 if is_git {
                     self.shield(&child, e.dev, e.ino, PinKind::OverlayLower, true)?;
                 }
                 if depth + 1 > self.limits.max_depth {
                     return Err(self.limit(format!("depth {}", self.limits.max_depth)));
+                }
+                // Paths waiting to be listed are held in memory: bound them (6b security L1).
+                self.pending_bytes = self.pending_bytes.saturating_add(child.as_os_str().len());
+                if self.pending_bytes > MAX_PENDING_PATH_BYTES {
+                    return Err(
+                        self.limit(format!("{MAX_PENDING_PATH_BYTES} bytes of pending paths"))
+                    );
                 }
                 stack.push((child, e.ino, depth + 1, in_git || is_git));
             }

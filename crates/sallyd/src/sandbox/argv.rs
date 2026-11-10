@@ -2,7 +2,8 @@
 //! socket, toolchain), harness (model and tool sockets only), inference (GPU, read-only weights).
 //!
 //! Every builder returns the arguments that follow the `podman` program name, starting with
-//! `--runtime <checked path> --hooks-dir <empty dir> create`, and runs [`check_argv`] on its own
+//! `--runtime <checked path> --hooks-dir <empty dir> --default-mounts-file <empty file> create`,
+//! and runs [`check_argv`] on its own
 //! output, against an [`Allowed`] policy derived from the role and the manifest, before
 //! returning it. The launcher creates the container, checks it, and only then starts it.
 
@@ -118,6 +119,8 @@ impl Argv {
             &path_arg(c.runtime.path(), "runtime")?,
             "--hooks-dir",
             &path_arg(&c.hooks_dir, "hooks directory")?,
+            "--default-mounts-file",
+            &path_arg(&c.mounts_file, "mounts file")?,
             "create",
             "--rm",
         ]);
@@ -201,6 +204,7 @@ fn allowed(c: &CommonArgs, role: Role, sources: Vec<Source>, scratch: Option<&Pa
         role,
         runtime: c.runtime.path().to_owned(),
         hooks_dir: c.hooks_dir.clone(),
+        mounts_file: c.mounts_file.clone(),
         ids: c.ids,
         profiles: c.profiles.clone(),
         sources,
@@ -236,6 +240,9 @@ pub fn workspace_argv(
     default_image: &ImageRef,
 ) -> Result<Vec<String>, ArgvError> {
     let m = v.manifest();
+    if !scan.is_for(v) {
+        return input("the launch scan belongs to another manifest");
+    }
     let scans = scans_by_mount(v, scan.git())?;
     let mut a = Argv::new(c, format!("sp-ws-{}", paths.id().as_str()), Role::Workspace)?;
     a.tmpfs(m.runtime.tmp_size.bytes(), m.runtime.tmp_exec);

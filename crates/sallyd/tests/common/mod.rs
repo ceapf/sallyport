@@ -72,6 +72,7 @@ impl Fx {
             },
             profiles: root.join("profiles"),
             hooks_dir: root.join("hooks"),
+            mounts_file: root.join("mounts.conf"),
         };
         let paths = SessionPaths::new(
             SessionId::parse("s-0001").unwrap(),

@@ -106,6 +106,8 @@ pub struct Allowed {
     pub runtime: PathBuf,
     /// Sallyport's empty OCI hooks directory (`--hooks-dir`, #11).
     pub hooks_dir: PathBuf,
+    /// Sallyport's empty mounts file (`--default-mounts-file`).
+    pub mounts_file: PathBuf,
     /// The host user (`--user <uid>:<gid>`).
     pub ids: UserIds,
     /// The seccomp profile directory; the profile must be `<profiles>/seccomp-<role>.json`.
@@ -137,25 +139,29 @@ pub fn check_argv(args: &[String], allowed: &Allowed) -> Result<(), ArgvError> {
     check_tail(args.get(image_at..).unwrap_or_default(), allowed.role)
 }
 
-/// Number of tokens before the first `create` option: `--runtime <p> --hooks-dir <d> create`.
-const GLOBALS: usize = 5;
+/// Number of tokens before the first `create` option:
+/// `--runtime <p> --hooks-dir <d> --default-mounts-file <f> create`.
+const GLOBALS: usize = 7;
 
-/// The global options are exactly the checked runtime and Sallyport's hooks directory, and the
-/// verb is `create` (the launcher inspects the container before it starts it).
+/// The global options are exactly the checked runtime, Sallyport's hooks directory and mounts
+/// file, and the verb is `create` (the launcher inspects the container before it starts it).
 fn check_globals(args: &[String], a: &Allowed) -> Result<(), ArgvError> {
     let is = |tok: &String, p: &Path| Path::new(tok) == p;
     match args {
-        [f1, runtime, f2, hooks, verb, ..]
+        [f1, runtime, f2, hooks, f3, mounts, verb, ..]
             if f1 == "--runtime"
                 && is(runtime, &a.runtime)
                 && f2 == "--hooks-dir"
                 && is(hooks, &a.hooks_dir)
+                && f3 == "--default-mounts-file"
+                && is(mounts, &a.mounts_file)
                 && verb == "create" =>
         {
             Ok(())
         }
         _ => forbid(
-            "argv must start with --runtime <checked runtime> --hooks-dir <sallyport hooks dir> create",
+            "argv must start with --runtime <checked runtime> --hooks-dir <sallyport hooks dir> \
+             --default-mounts-file <sallyport mounts file> create",
         ),
     }
 }
@@ -167,6 +173,7 @@ fn check_allowed(a: &Allowed) -> Result<(), ArgvError> {
         a.profiles.as_path(),
         a.runtime.as_path(),
         a.hooks_dir.as_path(),
+        a.mounts_file.as_path(),
     ]);
     for p in all {
         // `/` as a source, scratch or profile directory would make every host path "inside" it.

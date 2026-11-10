@@ -10,7 +10,9 @@
 //!   Task 6b); `CONTAINERS_CONF_OVERRIDE` is never passed;
 //! - `XDG_CONFIG_HOME` pointing at an empty directory of that state directory, so the user's
 //!   `~/.config/containers/{storage,mounts,registries}.conf` are not read either;
-//! - `--hooks-dir` naming an empty Sallyport-owned directory (in the checked argv);
+//! - `--hooks-dir` naming an empty Sallyport-owned directory and `--default-mounts-file` naming
+//!   an empty Sallyport-owned file (both in the checked argv; the rootless `mounts.conf` is read
+//!   through the flag, not through `containers.conf`, probed in Task 6b);
 //! - a podman binary resolved once to an absolute path with the runtime's ownership checks.
 
 use std::ffi::{OsStr, OsString};
@@ -48,7 +50,7 @@ pub enum PodmanError {
     #[error(transparent)]
     Binary(#[from] ConfigError),
     /// A binary podman needs was not found.
-    #[error("{0} not found in any of {1:?}")]
+    #[error("podman helper {0}: not found in any of {1:?}")]
     Missing(&'static str, Vec<&'static str>),
     /// A host directory is not private, or not what it should be.
     #[error("{path}: {msg}")]
@@ -124,6 +126,10 @@ fn first_trusted(what: &'static str, candidates: &[&'static str]) -> Result<Path
         .ok_or_else(|| PodmanError::Missing(what, candidates.to_vec()))?;
     Ok(check_trusted_binary(p, what)?)
 }
+
+/// Field names for helper binaries in errors: they come from fixed system paths, not settings.
+const INIT_FIELD: &str = "podman helper catatonit";
+const CONMON_FIELD: &str = "podman helper conmon";
 
 /// A path as a TOML basic string: refuse what would need escaping rather than escape it.
 fn toml_path(p: &Path) -> Result<String, PodmanError> {
@@ -210,14 +216,15 @@ crun = [{runtime}]
 #[derive(Debug, Clone)]
 pub struct Podman {
     bin: PathBuf,
-    hooks: PathBuf,
+    state: PathBuf,
+    conf_text: String,
     env: Vec<(OsString, OsString)>,
 }
 
 impl Podman {
     /// Prepares `state` (`~/.local/share/sallyport/podman`, created 0700): an empty `hooks/`, an
-    /// empty `config/` (the `XDG_CONFIG_HOME` podman sees) and a freshly written
-    /// `containers.conf`. Performs blocking I/O.
+    /// empty `config/` (the `XDG_CONFIG_HOME` podman sees), an empty `mounts.conf` and a freshly
+    /// written `containers.conf`. Performs blocking I/O.
     ///
     /// # Errors
     /// [`PodmanError`] if a binary fails its checks or a directory is not private and empty.
@@ -229,8 +236,8 @@ impl Podman {
     ) -> Result<Self, PodmanError> {
         let bins = ConfBinaries {
             runtime: runtime.path().to_owned(),
-            init: first_trusted("catatonit", &INIT_CANDIDATES)?,
-            conmon: first_trusted("conmon", &CONMON_CANDIDATES)?,
+            init: first_trusted(INIT_FIELD, &INIT_CANDIDATES)?,
+            conmon: first_trusted(CONMON_FIELD, &CONMON_CANDIDATES)?,
         };
         private_dir(state)?;
         let hooks = state.join("hooks");
@@ -241,15 +248,16 @@ impl Podman {
         }
         let conf = state.join("containers.conf");
         let text = containers_conf(&hooks, &bins)?;
-        let tmp = state.join("containers.conf.tmp");
-        let _ = std::fs::remove_file(&tmp);
-        write_new_0600(&tmp, text.as_bytes())?;
-        std::fs::rename(&tmp, &conf).map_err(io_err(&conf))?;
-        Ok(Self {
+        replace_0600(state, "containers.conf", text.as_bytes())?;
+        replace_0600(state, "mounts.conf", b"")?;
+        let p = Self {
             bin: podman,
             env: Self::env(host, &conf, &config_home),
-            hooks,
-        })
+            state: state.to_owned(),
+            conf_text: text,
+        };
+        p.recheck()?;
+        Ok(p)
     }
 
     /// The complete environment of every podman process: `HOME`, `XDG_RUNTIME_DIR`, optionally
@@ -282,8 +290,14 @@ impl Podman {
 
     /// The empty hooks directory, for `--hooks-dir`.
     #[must_use]
-    pub fn hooks_dir(&self) -> &Path {
-        &self.hooks
+    pub fn hooks_dir(&self) -> PathBuf {
+        self.state.join("hooks")
+    }
+
+    /// The empty mounts file, for `--default-mounts-file`.
+    #[must_use]
+    pub fn mounts_file(&self) -> PathBuf {
+        self.state.join("mounts.conf")
     }
 
     /// The environment passed to podman.
@@ -292,14 +306,27 @@ impl Podman {
         &self.env
     }
 
-    /// Re-checks, before each launch, that the hooks directory is still private and empty.
-    /// Performs blocking I/O.
+    /// Re-checks, before each launch, everything podman reads from Sallyport's state: the state
+    /// directory is private, `hooks/` and `config/` are empty, `mounts.conf` is empty and
+    /// `containers.conf` is exactly what was generated; and the podman binary still passes its
+    /// ownership checks. Performs blocking I/O.
     ///
     /// # Errors
-    /// [`PodmanError::Dir`] if a file appeared in it.
+    /// [`PodmanError`] naming what changed.
     pub fn recheck(&self) -> Result<(), PodmanError> {
-        private_dir(&self.hooks)?;
-        ensure_empty(&self.hooks)
+        private_dir(&self.state)?;
+        for d in ["hooks", "config"] {
+            let d = self.state.join(d);
+            private_dir(&d)?;
+            ensure_empty(&d)?;
+        }
+        check_private_file(&self.mounts_file(), b"")?;
+        check_private_file(
+            &self.state.join("containers.conf"),
+            self.conf_text.as_bytes(),
+        )?;
+        check_trusted_binary(&self.bin, "sandbox.podman_path")?;
+        Ok(())
     }
 
     /// A podman command with the hermetic environment, no stdin, killed if dropped.
@@ -341,6 +368,35 @@ fn ensure_empty(dir: &Path) -> Result<(), PodmanError> {
         return dir_err(dir, "must be empty; sallyd owns it and puts nothing in it");
     }
     Ok(())
+}
+
+/// A regular file (not a symlink) owned by the current user, mode 0600, holding exactly
+/// `want`.
+fn check_private_file(path: &Path, want: &[u8]) -> Result<(), PodmanError> {
+    let meta = std::fs::symlink_metadata(path).map_err(io_err(path))?;
+    if !meta.is_file()
+        || meta.uid() != rustix::process::geteuid().as_raw()
+        || meta.permissions().mode() & 0o777 != 0o600
+    {
+        return dir_err(
+            path,
+            "must be a regular file owned by the current user, mode 0600",
+        );
+    }
+    if std::fs::read(path).map_err(io_err(path))? != want {
+        return dir_err(path, "changed since sallyd wrote it");
+    }
+    Ok(())
+}
+
+/// Writes `name` in `dir` through a fresh temporary file and a rename (never through an
+/// existing file or symlink).
+fn replace_0600(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), PodmanError> {
+    let tmp = dir.join(format!("{name}.tmp"));
+    let target = dir.join(name);
+    let _ = std::fs::remove_file(&tmp);
+    write_new_0600(&tmp, bytes)?;
+    std::fs::rename(&tmp, &target).map_err(io_err(&target))
 }
 
 fn write_new_0600(path: &Path, bytes: &[u8]) -> Result<(), PodmanError> {

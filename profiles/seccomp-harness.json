@@ -2,50 +2,11 @@
  "archMap": [
   {
    "architecture": "SCMP_ARCH_X86_64",
-   "subArchitectures": [
-    "SCMP_ARCH_X86",
-    "SCMP_ARCH_X32"
-   ]
+   "subArchitectures": []
   },
   {
    "architecture": "SCMP_ARCH_AARCH64",
-   "subArchitectures": [
-    "SCMP_ARCH_ARM"
-   ]
-  },
-  {
-   "architecture": "SCMP_ARCH_MIPS64",
-   "subArchitectures": [
-    "SCMP_ARCH_MIPS",
-    "SCMP_ARCH_MIPS64N32"
-   ]
-  },
-  {
-   "architecture": "SCMP_ARCH_MIPS64N32",
-   "subArchitectures": [
-    "SCMP_ARCH_MIPS",
-    "SCMP_ARCH_MIPS64"
-   ]
-  },
-  {
-   "architecture": "SCMP_ARCH_MIPSEL64",
-   "subArchitectures": [
-    "SCMP_ARCH_MIPSEL",
-    "SCMP_ARCH_MIPSEL64N32"
-   ]
-  },
-  {
-   "architecture": "SCMP_ARCH_MIPSEL64N32",
-   "subArchitectures": [
-    "SCMP_ARCH_MIPSEL",
-    "SCMP_ARCH_MIPSEL64"
-   ]
-  },
-  {
-   "architecture": "SCMP_ARCH_S390X",
-   "subArchitectures": [
-    "SCMP_ARCH_S390"
-   ]
+   "subArchitectures": []
   }
  ],
  "defaultAction": "SCMP_ACT_ERRNO",
@@ -119,8 +80,6 @@
     "clock_gettime64",
     "clock_nanosleep",
     "clock_nanosleep_time64",
-    "clone",
-    "clone3",
     "close",
     "close_range",
     "connect",
@@ -397,7 +356,6 @@
     "sigprocmask",
     "sigreturn",
     "sigsuspend",
-    "socketcall",
     "socketpair",
     "splice",
     "stat",
@@ -412,7 +370,6 @@
     "syncfs",
     "syscall",
     "sysinfo",
-    "syslog",
     "tee",
     "tgkill",
     "time",
@@ -752,7 +709,67 @@
    ]
   },
   {
-   "action": "SCMP_ACT_ERRNO",
+   "action": "SCMP_ACT_ALLOW",
+   "args": [
+    {
+     "index": 0,
+     "op": "SCMP_CMP_MASKED_EQ",
+     "value": 2114060288,
+     "valueTwo": 0
+    }
+   ],
+   "comment": "No namespace flags (ARCHITECTURE section 3.4).",
+   "names": [
+    "clone"
+   ]
+  },
+  {
+   "action": "SCMP_ACT_ALLOW",
+   "args": [
+    {
+     "index": 0,
+     "op": "SCMP_CMP_EQ",
+     "value": 1,
+     "valueTwo": 0
+    }
+   ],
+   "comment": "Address family 1 (ARCHITECTURE section 3.4).",
+   "names": [
+    "socket"
+   ]
+  },
+  {
+   "action": "SCMP_ACT_ALLOW",
+   "args": [
+    {
+     "index": 0,
+     "op": "SCMP_CMP_EQ",
+     "value": 2,
+     "valueTwo": 0
+    }
+   ],
+   "comment": "Address family 2 (ARCHITECTURE section 3.4).",
+   "names": [
+    "socket"
+   ]
+  },
+  {
+   "action": "SCMP_ACT_ALLOW",
+   "args": [
+    {
+     "index": 0,
+     "op": "SCMP_CMP_EQ",
+     "value": 10,
+     "valueTwo": 0
+    }
+   ],
+   "comment": "Address family 10 (ARCHITECTURE section 3.4).",
+   "names": [
+    "socket"
+   ]
+  },
+  {
+   "action": "SCMP_ACT_ALLOW",
    "args": [
     {
      "index": 0,
@@ -762,97 +779,12 @@
     },
     {
      "index": 2,
-     "op": "SCMP_CMP_EQ",
-     "value": 9,
-     "valueTwo": 0
-    }
-   ],
-   "comment": "",
-   "errno": "EINVAL",
-   "errnoRet": 22,
-   "excludes": {
-    "caps": [
-     "CAP_AUDIT_WRITE"
-    ]
-   },
-   "includes": {},
-   "names": [
-    "socket"
-   ]
-  },
-  {
-   "action": "SCMP_ACT_ALLOW",
-   "args": [
-    {
-     "index": 2,
      "op": "SCMP_CMP_NE",
      "value": 9,
      "valueTwo": 0
     }
    ],
-   "comment": "",
-   "excludes": {
-    "caps": [
-     "CAP_AUDIT_WRITE"
-    ]
-   },
-   "includes": {},
-   "names": [
-    "socket"
-   ]
-  },
-  {
-   "action": "SCMP_ACT_ALLOW",
-   "args": [
-    {
-     "index": 0,
-     "op": "SCMP_CMP_NE",
-     "value": 16,
-     "valueTwo": 0
-    }
-   ],
-   "comment": "",
-   "excludes": {
-    "caps": [
-     "CAP_AUDIT_WRITE"
-    ]
-   },
-   "includes": {},
-   "names": [
-    "socket"
-   ]
-  },
-  {
-   "action": "SCMP_ACT_ALLOW",
-   "args": [
-    {
-     "index": 2,
-     "op": "SCMP_CMP_NE",
-     "value": 9,
-     "valueTwo": 0
-    }
-   ],
-   "comment": "",
-   "excludes": {
-    "caps": [
-     "CAP_AUDIT_WRITE"
-    ]
-   },
-   "includes": {},
-   "names": [
-    "socket"
-   ]
-  },
-  {
-   "action": "SCMP_ACT_ALLOW",
-   "args": null,
-   "comment": "",
-   "excludes": {},
-   "includes": {
-    "caps": [
-     "CAP_AUDIT_WRITE"
-    ]
-   },
+   "comment": "Address family 16 (ARCHITECTURE section 3.4).",
    "names": [
     "socket"
    ]

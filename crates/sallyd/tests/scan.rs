@@ -266,6 +266,26 @@ fn session_directories_are_fresh_0700_and_hold_the_profiles() {
     }
     let e = SessionDirs::create(&f.paths, &xdg, &[], 0).unwrap_err();
     assert!(e.to_string().contains("never reused"), "{e}");
+    assert!(
+        e.reused,
+        "nothing was created, so nothing may be cleaned up"
+    );
+}
+
+/// A launch scan belongs to the manifest it was made for (6b Rust review): the builder and the
+/// host re-check refuse a scan of other mounts.
+#[test]
+fn a_scan_is_bound_to_its_manifest() {
+    let f = Fx::new();
+    f.tree("code/myproject", &[".git"], &[]);
+    let a = one(&f, "rw");
+    let b = f.load(&mounts(&[mount("~/code/other", "/workspace/p", "rw")]));
+    let scan = f.scan(&a);
+    assert!(scan.is_for(&a) && !scan.is_for(&b));
+    let e =
+        sallyd::sandbox::workspace_argv(&f.common, &f.paths, &b, &scan, &ws_image()).unwrap_err();
+    assert!(e.to_string().contains("another manifest"), "{e}");
+    assert!(scan.recheck_host(&b).is_err());
 }
 
 #[test]

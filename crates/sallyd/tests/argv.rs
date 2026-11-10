@@ -2,6 +2,9 @@
 //! §6.2) and every mount mode, including `staged` and the `.git` overlay (AMENDMENTS-02 B2), plus
 //! the forbidden-flag checker the red-team harness relies on (CLAUDE.md hard rules). Git scans
 //! come from the real launch scanner over fixture trees: only it can construct one (#10).
+//!
+//! Over the 800-line guideline on purpose: one allow and one deny case per checker predicate,
+//! kept next to each other so a reviewer sees every rule of `check_argv` in one file.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::os::unix::fs::PermissionsExt;
@@ -160,7 +163,9 @@ fn every_role_starts_with_the_checked_runtime_and_has_the_section_6_1_flags() {
         assert_eq!(a[1], f.root.join("bin/crun").display().to_string());
         assert_eq!(a[2], "--hooks-dir");
         assert_eq!(a[3], f.root.join("hooks").display().to_string());
-        assert_eq!(a[4], "create");
+        assert_eq!(a[4], "--default-mounts-file");
+        assert_eq!(a[5], f.root.join("mounts.conf").display().to_string());
+        assert_eq!(a[6], "create");
         for flag in [
             "--rm",
             "--pull=never",
@@ -367,6 +372,7 @@ fn allowed(f: &Fx, role: Role, project: Grant) -> Allowed {
         role,
         runtime: f.common.runtime.path().to_owned(),
         hooks_dir: f.common.hooks_dir.clone(),
+        mounts_file: f.common.mounts_file.clone(),
         ids: f.common.ids,
         profiles: f.common.profiles.clone(),
         sources: vec![
@@ -379,9 +385,9 @@ fn allowed(f: &Fx, role: Role, project: Grant) -> Allowed {
 
 fn with(a: &[String], extra: &[&str]) -> Vec<String> {
     // Insert just after `create`, where podman reads options.
-    let mut out = a[..5].to_vec();
+    let mut out = a[..7].to_vec();
     out.extend(extra.iter().map(|s| (*s).to_owned()));
-    out.extend_from_slice(&a[5..]);
+    out.extend_from_slice(&a[7..]);
     out
 }
 
@@ -697,15 +703,16 @@ fn checker_holds_every_mount_to_its_grant() {
 
 /// 6a re-review L3: the runtime and hooks directory are exact, and the verb is `create`.
 #[test]
-fn checker_pins_the_runtime_the_hooks_dir_and_the_verb() {
+fn checker_pins_the_runtime_the_hooks_dir_the_mounts_file_and_the_verb() {
     let f = Fx::new();
     let (a, allowed) = base(&f);
     let other = f.root.join("bin/other").display().to_string();
     for (i, bad) in [
         (1, other.as_str()),
         (3, other.as_str()),
-        (4, "run"),
-        (4, "exec"),
+        (5, other.as_str()),
+        (6, "run"),
+        (6, "exec"),
     ] {
         let mut b = a.clone();
         b[i] = bad.to_owned();
@@ -713,6 +720,8 @@ fn checker_pins_the_runtime_the_hooks_dir_and_the_verb() {
     }
     let swapped = [&a[2..4], &a[0..2], &a[4..]].concat();
     assert_forbidden(&swapped, &allowed, "globals reordered");
+    let without_mounts_file = [&a[0..4], &a[6..]].concat();
+    assert_forbidden(&without_mounts_file, &allowed, "no --default-mounts-file");
 }
 
 /// 6a re-review L2: `/` would make every host path "inside" a grant or scratch.
@@ -794,7 +803,7 @@ fn checker_requires_every_hardening_option_exactly_once() {
     let (a, allowed) = base(&f);
     // Removing any option other than a mount or a variable fails; duplicating any option fails.
     let image_at = a.iter().position(|x| x.starts_with("ghcr.io/")).unwrap();
-    let mut i = 5;
+    let mut i = 7;
     while i < image_at {
         let tok = &a[i];
         let takes_value = !tok.contains('=') && !a[i + 1].starts_with('-') && i + 1 < image_at;
@@ -983,7 +992,7 @@ proptest! {
         let image_at = a.iter().position(|x| x.starts_with("ghcr.io/")).unwrap();
         let tok = match &value { Some(v) => format!("--{name}={v}"), None => format!("--{name}") };
         // Insert at an option boundary (never between an option and its separate value).
-        let bounds: Vec<usize> = (5..=image_at)
+        let bounds: Vec<usize> = (7..=image_at)
             .filter(|&i| a[i].starts_with('-') || i == image_at)
             .collect();
         let i = bounds[at % bounds.len()];

@@ -147,6 +147,9 @@ pub struct CommonArgs {
     pub profiles: PathBuf,
     /// Sallyport's empty OCI hooks directory, passed as `--hooks-dir` so no host hook runs (#11).
     pub hooks_dir: PathBuf,
+    /// Sallyport's empty mounts file, passed as `--default-mounts-file` so no system
+    /// `mounts.conf` adds a mount (6b security review M4).
+    pub mounts_file: PathBuf,
 }
 
 /// Host directories of one session (ARCHITECTURE §3.1, AMENDMENTS-01 §2, AMENDMENTS-02 B2).
