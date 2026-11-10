@@ -67,7 +67,7 @@ zizmor:
 	zizmor --min-severity low .github/workflows
 
 # Fuzz smoke: 60 s per target (needs nightly + cargo-fuzz; CI pins both).
-FUZZ_TARGETS := manifest
+FUZZ_TARGETS := manifest secrets
 FUZZ_SECS ?= 60
 CARGO_FUZZ_TOOLCHAIN ?= +nightly
 fuzz:

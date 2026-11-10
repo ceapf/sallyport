@@ -184,11 +184,9 @@ fn check_inject_host(
     }
 }
 
+/// The grammar lives in `crate::secrets`; the store and this validator share one rule.
 fn is_secret_name(s: &str) -> bool {
-    let mut b = s.bytes();
-    s.len() <= 64
-        && b.next().is_some_and(|c| c.is_ascii_uppercase())
-        && b.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
+    crate::secrets::is_secret_name(s)
 }
 
 /// RFC 9110 `token`, at most 64 bytes, not reserved.
