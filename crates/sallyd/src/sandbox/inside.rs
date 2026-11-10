@@ -8,7 +8,7 @@
 //! Overlay lower layers cannot be compared this way (an overlay reports its own device); they are
 //! re-checked on the host just before `podman create` ([`super::LaunchScan::recheck_host`]), and
 //! the overlap rule keeps every other live sandbox from writing there. Blocking I/O.
-//! TODO(#17): a launcher-level `sandbox.mount_mismatch` test needs a red-team hook (Task 13).
+//! TODO(#17): a launcher-level `sandbox.mount_mismatch` test (Task 6c if cheap, else Task 13).
 
 use std::path::Path;
 

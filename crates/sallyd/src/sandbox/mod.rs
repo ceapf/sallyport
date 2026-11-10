@@ -20,7 +20,7 @@ mod types;
 pub use argv::{harness_argv, inference_argv, workspace_argv};
 pub use check::{Allowed, Grant, Source, check_argv};
 pub use dirs::{DirError, SessionDirs, check_runtime_dir};
-// TODO(#17): narrow the test-only items once Task 7 wires the launcher into the RPC layer.
+// TODO(#17): narrow the test-only items in Task 12, when the launcher gets its real callers.
 pub use inside::{Expect, Mismatch, check_in_container};
 pub use launch::{
     AuditSink, LaunchError, Launcher, LauncherParts, Running, SharedAudit, StopError,

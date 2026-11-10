@@ -295,7 +295,7 @@ impl Launcher {
     /// `sp-h-<scope>[-…]`), never a session live in this launcher, so the overlap rule starts
     /// from what is really running. `sallyd` calls it with an empty scope before it accepts the
     /// first launch. Audits each removal. TODO(#17): the single-instance lock that makes "a
-    /// previous sallyd" exact arrives with the control socket (Task 7).
+    /// previous sallyd" exact arrives with the control socket (Task 12).
     ///
     /// # Errors
     /// [`LaunchError`] if podman cannot list or remove them.
