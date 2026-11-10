@@ -1,0 +1,1 @@
+{"seq": 1,"ts":"2026-01-15T10:00:00.123Z","session":null,"actor":"sallyd","event":"session.start","decision":null,"args":{"a":1},"args_sha256":"015abd7f5cc57a2dd94b7590f04ad8084273905ee33ec5cebeae62276a97f862","prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","hash":"8c5dfa50677776a685f1677c22db3c0bd74a750da5304bafc91418c3892a9afc"}

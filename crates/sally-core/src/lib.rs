@@ -5,6 +5,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod audit;
 pub mod config;
+mod fsutil;
 pub mod manifest;
 pub mod secrets;
