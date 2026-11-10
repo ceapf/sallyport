@@ -168,6 +168,15 @@ impl Sessions {
         Ok(())
     }
 
+    /// Whether `id` holds claims.
+    #[must_use]
+    pub fn is_live(&self, id: &str) -> bool {
+        self.live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(id)
+    }
+
     /// Forgets `id` (teardown).
     pub fn release(&self, id: &str) {
         self.live

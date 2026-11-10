@@ -263,7 +263,8 @@ impl std::fmt::Debug for Launcher {
 /// How far a failed launch got, so cleanup removes exactly what it made.
 #[derive(Debug, Default)]
 struct Progress {
-    dirs: bool,
+    /// Session directories this launch created (and only those).
+    dirs: Vec<PathBuf>,
     container: Option<String>,
 }
 
@@ -290,9 +291,11 @@ impl Launcher {
             .map_err(LaunchError::Audit)
     }
 
-    /// Removes session containers a previous `sallyd` left behind (`sp-ws-<scope>…`,
-    /// `sp-h-<scope>…`), so the overlap rule starts from what is really running. `sallyd` calls
-    /// it with an empty scope before it accepts the first launch. Audits each removal.
+    /// Removes session containers a previous `sallyd` left behind (`sp-ws-<scope>[-…]`,
+    /// `sp-h-<scope>[-…]`), never a session live in this launcher, so the overlap rule starts
+    /// from what is really running. `sallyd` calls it with an empty scope before it accepts the
+    /// first launch. Audits each removal. TODO(#17): the single-instance lock that makes "a
+    /// previous sallyd" exact arrives with the control socket (Task 7).
     ///
     /// # Errors
     /// [`LaunchError`] if podman cannot list or remove them.
@@ -310,11 +313,14 @@ impl Launcher {
             .await?;
         let mut removed = Vec::new();
         for name in out.lines().map(str::trim) {
-            let ours = SESSION_PREFIXES.iter().any(|p| {
-                name.strip_prefix(p)
-                    .is_some_and(|rest| rest.starts_with(scope) && plain_name(rest))
-            });
-            if !ours {
+            let Some(id) = SESSION_PREFIXES
+                .iter()
+                .find_map(|p| name.strip_prefix(p))
+                .filter(|id| plain_name(id) && in_scope(id, scope))
+            else {
+                continue;
+            };
+            if self.sessions.is_live(id) {
                 continue;
             }
             self.audit(
@@ -345,8 +351,19 @@ impl Launcher {
         let this = Arc::clone(self);
         tokio::spawn(async move {
             let result = this.launch(req).await;
-            if let Err(Ok(orphan)) = tx.send(result) {
-                let _ = this.stop(orphan).await;
+            if let Err(Ok(orphan)) = tx.send(result)
+                && let Err(e) = this.stop(orphan).await
+            {
+                // Nobody holds the handle any more: record it (the claims stay held until
+                // remove_orphans at the next start).
+                let entry = NewEntry::new(Actor::Sallyd, "sandbox.stop_failed")
+                    .session(e.running.paths.id().as_str())
+                    .decision("deny")
+                    .args(json!({
+                        "container": e.running.name,
+                        "detail": capped(&e.error.to_string()),
+                    }));
+                let _ = this.audit(entry, e.running.level).await;
             }
         });
         rx.await
@@ -502,7 +519,13 @@ impl Launcher {
         let (paths, xdg) = (req.paths.clone(), self.xdg_runtime_dir.clone());
         let created =
             blocking(move || Ok(SessionDirs::create(&paths, &xdg, &staged, overlays))).await?;
-        progress.dirs = created.as_ref().map_or_else(|e| !e.reused, |_| true);
+        progress.dirs = match &created {
+            Ok(_) => vec![
+                req.paths.socket_root().to_owned(),
+                req.paths.data_root().to_owned(),
+            ],
+            Err(e) => e.created.clone(),
+        };
         let dirs = created?;
         let common = CommonArgs {
             runtime,
@@ -578,8 +601,15 @@ impl Launcher {
         if let Some(name) = &p.container {
             self.remove_container(name).await?;
         }
-        if p.dirs {
-            self.remove_dirs(paths, false).await?;
+        for d in &p.dirs {
+            // Only `sessions/<id>` under either root: what this launch created.
+            if d != paths.socket_root() && d != paths.data_root() {
+                return Err(LaunchError::Internal(format!(
+                    "refusing to remove {}",
+                    d.display()
+                )));
+            }
+            self.unshare_rm(d).await?;
         }
         Ok(())
     }
@@ -669,18 +699,7 @@ impl Launcher {
         })
         .await?;
         for t in &targets {
-            let t = path_arg(t, "session scratch")?;
-            self.run(
-                "unshare",
-                [
-                    "unshare".into(),
-                    "rm".into(),
-                    "-rf".into(),
-                    "--".into(),
-                    t.into(),
-                ],
-            )
-            .await?;
+            self.unshare_rm(t).await?;
         }
         let sockets = paths.socket_root().to_owned();
         blocking(move || match std::fs::remove_dir_all(&sockets) {
@@ -689,6 +708,24 @@ impl Launcher {
             Err(e) => Err(LaunchError::Internal(format!("{}: {e}", sockets.display()))),
         })
         .await
+    }
+
+    /// `podman unshare rm -rf -- <t>`: overlay work directories belong to the container's user
+    /// namespace.
+    async fn unshare_rm(&self, t: &std::path::Path) -> Result<(), LaunchError> {
+        let t = path_arg(t, "session scratch")?;
+        self.run(
+            "unshare",
+            [
+                "unshare".into(),
+                "rm".into(),
+                "-rf".into(),
+                "--".into(),
+                t.into(),
+            ],
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Runs one hermetic podman command; stdout on success.
@@ -727,6 +764,11 @@ impl Launcher {
             )))
         }
     }
+}
+
+/// `id` is `scope` itself or starts with `scope-`; an empty scope covers every id.
+fn in_scope(id: &str, scope: &str) -> bool {
+    scope.is_empty() || id == scope || id.strip_prefix(scope).is_some_and(|r| r.starts_with('-'))
 }
 
 /// `[a-z0-9-]`, as session ids are.
@@ -816,6 +858,15 @@ mod tests {
         let c = capped(&long);
         assert!(c.len() <= AUDIT_TEXT_CAP + "…".len());
         assert!(c.ends_with('…'));
+    }
+
+    #[test]
+    fn orphan_scope_ends_at_a_dash() {
+        assert!(in_scope("t1-1-a", "t1-1"));
+        assert!(in_scope("t1-1", "t1-1"));
+        assert!(in_scope("anything", ""));
+        assert!(!in_scope("t1-10-a", "t1-1"));
+        assert!(!in_scope("t1-1a", "t1-1"));
     }
 
     #[test]

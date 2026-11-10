@@ -25,6 +25,9 @@ pub struct DirError {
     /// The session's directories already existed and nothing was created: whatever is there
     /// (a stopped session's kept `staged` changes) must not be removed.
     pub reused: bool,
+    /// The session directories this call created before it failed, and only those: the
+    /// caller's cleanup removes exactly these (6b re-review M-1).
+    pub created: Vec<PathBuf>,
 }
 
 fn fail<T>(path: &Path, msg: impl Into<String>) -> Result<T, DirError> {
@@ -32,6 +35,7 @@ fn fail<T>(path: &Path, msg: impl Into<String>) -> Result<T, DirError> {
         path: path.display().to_string(),
         msg: msg.into(),
         reused: false,
+        created: Vec::new(),
     })
 }
 
@@ -135,18 +139,32 @@ impl SessionDirs {
         staged: &[usize],
         git_overlays: usize,
     ) -> Result<Self, DirError> {
-        check_runtime_dir(xdg_runtime_dir)?;
-        // Refuse a used id before creating anything, so the caller's cleanup never touches a
-        // stopped session's kept data.
+        // Refuse a used id first, before any other check can fail and before anything is
+        // created, so the caller's cleanup never touches a stopped session's kept data.
         for session in [paths.socket_root(), paths.data_root()] {
             if std::fs::symlink_metadata(session).is_ok() {
                 return Err(DirError {
                     path: session.display().to_string(),
                     msg: "already exists; a session id is never reused".into(),
                     reused: true,
+                    created: Vec::new(),
                 });
             }
         }
+        check_runtime_dir(xdg_runtime_dir)?;
+        let mut created = Vec::new();
+        Self::create_fresh(paths, staged, git_overlays, &mut created).map_err(|mut e| {
+            e.created = created;
+            e
+        })
+    }
+
+    fn create_fresh(
+        paths: &SessionPaths,
+        staged: &[usize],
+        git_overlays: usize,
+        created: &mut Vec<PathBuf>,
+    ) -> Result<Self, DirError> {
         for session in [paths.socket_root(), paths.data_root()] {
             let Some(sessions) = session.parent() else {
                 return fail(session, "has no parent");
@@ -157,6 +175,7 @@ impl SessionDirs {
             root_dir(root)?;
             private(sessions, false)?;
             private(session, true)?;
+            created.push(session.to_owned());
         }
         private(&paths.workspace_sockets(), true)?;
         private(&paths.harness_sockets(), true)?;

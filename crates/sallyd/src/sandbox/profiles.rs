@@ -167,7 +167,7 @@ mod tests {
     #[test]
     fn sockets_are_an_allowlist_of_address_families() {
         for role in [Role::Workspace, Role::Harness] {
-            // AF_UNIX, AF_INET, AF_INET6, AF_NETLINK (without NETLINK_AUDIT).
+            // AF_UNIX, AF_INET, AF_INET6, AF_NETLINK (NETLINK_ROUTE only).
             assert_eq!(
                 socket_families(role),
                 [(1, 0), (2, 0), (10, 0), (16, 1)],
@@ -178,8 +178,11 @@ mod tests {
                 .find(|r| allows(r, "socket") && r["args"][0]["value"] == 16)
                 .unwrap();
             assert_eq!(netlink["args"][1]["index"], 2);
-            assert_eq!(netlink["args"][1]["value"], 9, "NETLINK_AUDIT");
-            assert_eq!(netlink["args"][1]["op"], "SCMP_CMP_NE");
+            assert_eq!(netlink["args"][1]["value"], 0, "NETLINK_ROUTE");
+            assert_eq!(
+                netlink["args"][1]["op"], "SCMP_CMP_EQ",
+                "equality fails closed"
+            );
         }
         assert_eq!(socket_families(Role::Inference), [(1, 0)], "AF_UNIX only");
     }

@@ -12,8 +12,8 @@ properties below, so a regenerated profile that drifts fails CI.
   mount namespace, so the kernel surface those expose (nf_tables, mount) stays out of reach.
   `clone3` is not allowed at all (its flags live in memory seccomp cannot read); it fails with
   the default ENOSYS and libc falls back to `clone`.
-- `socket` is allowed per address family (AF_UNIX, AF_INET, AF_INET6, AF_NETLINK; inference
-  AF_UNIX only). Families network namespaces do not isolate (AF_VSOCK reaches the hypervisor
+- `socket` is allowed per address family (AF_UNIX, AF_INET, AF_INET6, AF_NETLINK with
+  NETLINK_ROUTE only; inference AF_UNIX only). Families network namespaces do not isolate (AF_VSOCK reaches the hypervisor
   host) and everything else get ENOSYS.
 - Only native architectures: no 32-bit sub-architectures, so `int 0x80` (and `socketcall`,
   which cannot be argument-filtered) never reaches an allow rule.
@@ -41,7 +41,7 @@ REMOVED = frozenset(
 REPLACED = frozenset({"clone", "clone3", "socket"})
 
 AF_UNIX, AF_INET, AF_INET6, AF_NETLINK = 1, 2, 10, 16
-NETLINK_AUDIT = 9
+NETLINK_ROUTE = 0
 # CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID
 # | CLONE_NEWNET
 NAMESPACE_FLAGS = 0x7E020000
@@ -83,8 +83,9 @@ def with_sockets(profile: dict[str, Any], families: list[int]) -> dict[str, Any]
     for family in families:
         args = [{"index": 0, "value": family, "valueTwo": 0, "op": "SCMP_CMP_EQ"}]
         if family == AF_NETLINK:
-            # As containers-common: no audit netlink (it refuses that one with EINVAL).
-            args.append({"index": 2, "value": NETLINK_AUDIT, "valueTwo": 0, "op": "SCMP_CMP_NE"})
+            # NETLINK_ROUTE only, by equality (fails closed; a NE check on the 64-bit argument
+            # is bypassable, the kernel truncates it to int).
+            args.append({"index": 2, "value": NETLINK_ROUTE, "valueTwo": 0, "op": "SCMP_CMP_EQ"})
         rules.append(
             {
                 "names": ["socket"],

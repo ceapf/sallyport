@@ -779,8 +779,8 @@
     },
     {
      "index": 2,
-     "op": "SCMP_CMP_NE",
-     "value": 9,
+     "op": "SCMP_CMP_EQ",
+     "value": 0,
      "valueTwo": 0
     }
    ],

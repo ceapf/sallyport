@@ -171,9 +171,10 @@ impl GitScan {
 /// The result of scanning every mount of a manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchScan {
-    /// Each mount's host realpath and validated identity, in manifest order: the scan belongs
-    /// to exactly this manifest.
-    roots: Vec<(PathBuf, (u64, u64))>,
+    /// Each mount's host realpath, validated identity, mode and guest path, in manifest order:
+    /// the scan belongs to exactly this manifest (a scan of a `ro` mount has no shields for an
+    /// `rw` one).
+    roots: Vec<Root>,
     git: Vec<GitScan>,
     pins: Vec<Pin>,
 }
@@ -317,10 +318,12 @@ fn stat_entry(dir: impl AsFd, name: &CStr) -> rustix::io::Result<Entry> {
     })
 }
 
-fn roots(v: &ValidatedManifest) -> Vec<(PathBuf, (u64, u64))> {
+type Root = (PathBuf, (u64, u64), MountMode, String);
+
+fn roots(v: &ValidatedManifest) -> Vec<Root> {
     v.mounts()
         .iter()
-        .map(|m| (m.host.clone(), m.identity()))
+        .map(|m| (m.host.clone(), m.identity(), m.mode, m.guest.clone()))
         .collect()
 }
 

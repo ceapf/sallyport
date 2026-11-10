@@ -231,7 +231,7 @@ review). Every remaining non-errno rule is a plain `SCMP_ACT_ALLOW`, and:
   nf_tables in a fresh network namespace. `clone3` is not allowed (its flags are in memory
   seccomp cannot read); it fails with ENOSYS and libc falls back to `clone`.
 - `socket` is allowed per address family: `AF_UNIX`, `AF_INET`, `AF_INET6` and `AF_NETLINK`
-  (not `NETLINK_AUDIT`) for workspace and harness, `AF_UNIX` only for inference. Every other
+  (`NETLINK_ROUTE` only, by equality) for workspace and harness, `AF_UNIX` only for inference. Every other
   family fails, in particular `AF_VSOCK`, which network namespaces do not isolate (on WSL2 and
   other VMs it reaches the host).
 - Only native architectures are listed (x86-64, aarch64, no 32-bit sub-architectures), so the

@@ -618,13 +618,21 @@ fn orphans_of_a_previous_sallyd_are_removed() {
         let name = r.name().to_owned();
         drop(r); // the handle dies with the "crashed" sallyd; the container keeps running
         assert!(exists(&name));
-        let removed = x.launcher.remove_orphans(&x.scope).await.unwrap();
+        // A session live in this launcher is never an orphan.
+        assert!(
+            x.launcher
+                .remove_orphans(&x.scope)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(exists(&name));
+        // The next sallyd starts with no live sessions and removes it.
+        let next = Lx::new();
+        let removed = next.launcher.remove_orphans(&x.scope).await.unwrap();
         assert_eq!(removed, std::slice::from_ref(&name));
         assert!(!exists(&name));
-        assert_eq!(
-            x.events.list().last().map(String::as_str),
-            Some("sandbox.orphan_removed")
-        );
+        assert_eq!(next.events.list(), ["sandbox.orphan_removed"]);
     });
 }
 

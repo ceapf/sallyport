@@ -295,7 +295,14 @@ fn the_runtime_dir_must_be_ours_and_private() {
     std::fs::set_permissions(&xdg, std::fs::Permissions::from_mode(0o755)).unwrap();
     let e = check_runtime_dir(&xdg).unwrap_err();
     assert!(e.to_string().contains("0700"), "{e}");
-    assert!(SessionDirs::create(&f.paths, &xdg, &[], 0).is_err());
+    let e = SessionDirs::create(&f.paths, &xdg, &[], 0).unwrap_err();
+    assert!(!e.reused && e.created.is_empty(), "nothing created: {e:?}");
+    // 6b re-review M-1: a stopped session's directory is reported as reused even when another
+    // check would fail too, so cleanup never removes its kept data.
+    std::fs::create_dir_all(f.paths.data_root().join("stage/0/upper")).unwrap();
+    let e = SessionDirs::create(&f.paths, &xdg, &[], 0).unwrap_err();
+    assert!(e.reused && e.created.is_empty(), "{e:?}");
+    std::fs::remove_dir_all(f.paths.data_root()).unwrap();
     std::fs::set_permissions(&xdg, std::fs::Permissions::from_mode(0o700)).unwrap();
     check_runtime_dir(&xdg).unwrap();
     let link = f.root.join("run-link");
