@@ -5,7 +5,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use sally_core::config::{
-    Config, ConfigError, RuntimeKind, check_runtime_binary, default_runtime_path, parse_config,
+    Config, ConfigError, RuntimeKind, check_runtime_binary, check_trusted_binary,
+    default_runtime_path, parse_config,
 };
 
 /// A scratch dir under the target dir (not /tmp: its ancestors must pass the runtime checks),
@@ -95,6 +96,10 @@ fn unknown_keys_and_bad_values_are_refused_with_the_field_named() {
             "[sandbox]\nruntime_path = \"relative/crun\"\n",
             "sandbox.runtime_path",
         ),
+        (
+            "[sandbox]\npodman_path = \"podman\"\n",
+            "sandbox.podman_path",
+        ),
     ] {
         let e = parse_config(text).unwrap_err().to_string();
         assert!(e.contains(field), "{text:?}: {e}");
@@ -180,4 +185,30 @@ fn a_symlink_is_judged_by_where_its_target_lives() {
 fn a_root_owned_system_binary_is_acceptable() {
     // /bin/sh is root-owned in root-owned directories on every supported host.
     assert!(check_runtime_binary(Path::new("/bin/sh")).is_ok());
+}
+
+#[test]
+fn podman_path_parses_and_defaults_to_none() {
+    assert_eq!(parse_config("").unwrap().sandbox.podman_path, None);
+    let c = parse_config("[sandbox]\npodman_path = \"/usr/bin/podman\"\n").unwrap();
+    assert_eq!(
+        c.sandbox.podman_path,
+        Some(PathBuf::from("/usr/bin/podman"))
+    );
+}
+
+/// #11: podman is resolved once and gets the same ownership checks as the runtime; the error
+/// names the field it came from.
+#[test]
+fn trusted_binary_errors_name_their_field() {
+    let s = Scratch::new("podman");
+    let d = s.dir("shared", 0o777);
+    let p = d.join("podman");
+    exe(&p, 0o755);
+    let e = check_trusted_binary(&p, "sandbox.podman_path")
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("sandbox.podman_path: "), "{e}");
+    assert!(e.contains("writable by group or others"), "{e}");
+    assert!(check_trusted_binary(Path::new("/bin/sh"), "sandbox.podman_path").is_ok());
 }
