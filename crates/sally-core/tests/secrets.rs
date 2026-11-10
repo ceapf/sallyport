@@ -507,11 +507,57 @@ proptest! {
         if let Err(e) = SecretStore::open(&s.store_path()) {
             let shown = format!("{e} | {e:?}");
             // Every run of 8+ non-space chars from the input must be absent from the error.
-            for word in text.split_whitespace().filter(|w| w.chars().count() >= 8) {
+            let vocab = vocabulary();
+            for word in text.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| w.len() >= 8 && !vocab.contains(*w)) {
                 prop_assert!(!shown.contains(word), "{shown}");
             }
         }
     }
+}
+
+/// Words of the store's fixed error vocabulary: errors carry only static text and a line number,
+/// so a mutated input that happens to spell the message must not count as a leak.
+fn vocabulary() -> std::collections::HashSet<String> {
+    let path = || PathBuf::from("/x/secrets.toml");
+    let mut shown: Vec<String> = Vec::new();
+    let many: String = (0..=MAX_SECRETS)
+        .map(|i| format!("S{i} = \"x\"\n"))
+        .collect();
+    for bytes in [&b"="[..], &b"\xff"[..], many.as_bytes()] {
+        shown.push(
+            SecretStore::from_bytes(path(), bytes)
+                .unwrap_err()
+                .to_string(),
+        );
+    }
+    shown.push(
+        SecretStore::from_bytes(path(), &vec![b'#'; MAX_STORE_BYTES + 1])
+            .unwrap_err()
+            .to_string(),
+    );
+    let mut store = SecretStore::empty(path());
+    let long = "x".repeat(MAX_VALUE_BYTES + 1);
+    for (name, value) in [
+        ("a", "x"),
+        ("A", ""),
+        ("A", "\n"),
+        ("A", " x"),
+        ("A", long.as_str()),
+    ] {
+        shown.push(store.set(name, value.to_owned()).unwrap_err().to_string());
+    }
+    shown
+        .iter()
+        .flat_map(|m| m.split(|c: char| !c.is_ascii_alphanumeric()))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn the_error_vocabulary_oracle_exempts_message_text_but_not_values() {
+    let vocab = vocabulary();
+    assert!(vocab.contains("unexpected"));
+    assert!(!vocab.contains("canaryvalue"));
 }
 
 // ---- review follow-ups --------------------------------------------------------------------
@@ -656,9 +702,34 @@ proptest! {
         let r = SecretStore::from_bytes(PathBuf::from("/x/secrets.toml"), text.as_bytes());
         if let Err(e) = r {
             let shown = format!("{e} | {e:?}");
-            for word in text.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| w.len() >= 8) {
+            let vocab = vocabulary();
+            for word in text.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| w.len() >= 8 && !vocab.contains(*w)) {
                 prop_assert!(!shown.contains(word), "{shown}");
             }
         }
     }
+}
+
+/// Replays the fuzz corpus (seeds and past crashes) through the fuzz target's oracle, so a
+/// regression shows up in `make test`, not only in the 60 s CI fuzz run.
+#[test]
+fn fuzz_corpus_satisfies_the_no_leak_oracle() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/corpus/secrets");
+    let vocab = vocabulary();
+    let mut seen = 0;
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let data = std::fs::read(entry.unwrap().path()).unwrap();
+        seen += 1;
+        if let Err(e) = SecretStore::from_bytes(PathBuf::from("/x/secrets.toml"), &data) {
+            let shown = format!("{e} | {e:?}");
+            let text = String::from_utf8_lossy(&data);
+            for word in text.split(|c: char| !c.is_ascii_alphanumeric()) {
+                assert!(
+                    word.len() < 8 || vocab.contains(word) || !shown.contains(word),
+                    "{shown}"
+                );
+            }
+        }
+    }
+    assert!(seen >= 3, "corpus went missing");
 }
