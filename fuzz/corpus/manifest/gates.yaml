@@ -13,7 +13,6 @@ tools:
   builtin: [fs_read, fs_list, fs_write, fs_delete, shell, fetch]
   shell: allow
   destructive_requires_approval: false
-  acknowledge_unapproved_shell: true
   fetch_writes: allow
-  acknowledge_unapproved_fetch: true
+  acknowledge_unapproved: [shell, fetch, "mcp:git"]
   mcp: [{name: git, command: [mcp-server-git], approve: never}]

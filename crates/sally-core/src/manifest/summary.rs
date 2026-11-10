@@ -12,13 +12,15 @@ use super::types::{
 };
 use super::validate::{ResolvedMount, ValidatedManifest, data_can_leave};
 
-/// Files a host may execute that the protected-path policy does not cover (AMENDMENTS §6.3).
+/// Files a host may execute that an `rw` mount cannot protect: `.git` folders are overlays and
+/// `.git` pointer files are read-only (AMENDMENTS-02 B2(a)), but nothing else is.
 const UNPROTECTED_HOST_FILES: &str = "Makefile, package.json scripts, .vscode/tasks.json, .envrc, \
-     .git/commondir or a .git pointer file in a submodule or worktree, or a new nested .git folder";
+     a new nested .git folder, or a git repository not named .git, such as a bare project.git";
 /// Longest rendering of an MCP server's command in the summary.
 const MAX_COMMAND_SHOWN: usize = 200;
 
-/// An optional `[data-can-leave]` line, then `This agent:` and one line per capability, each
+/// An optional `[data-can-leave]` line, an optional `[direct-write]` line (any `rw` mount; the
+/// second line when both are present), then `This agent:` and one line per capability, each
 /// starting with `- `. Lines are stable for UI snapshot tests.
 #[must_use]
 pub fn summary(v: &ValidatedManifest) -> String {
@@ -37,6 +39,10 @@ pub fn summary(v: &ValidatedManifest) -> String {
         out.push_str(&finding);
         out.push('\n');
     }
+    if let Some(line) = direct_write_line(v.mounts()) {
+        out.push_str(&line);
+        out.push('\n');
+    }
     out.push_str("This agent:\n");
     for l in lines {
         out.push_str("- ");
@@ -44,6 +50,28 @@ pub fn summary(v: &ValidatedManifest) -> String {
         out.push('\n');
     }
     out
+}
+
+/// AMENDMENTS-02 B2(b): `rw` stays, with a warning that names the folders and the alternative.
+fn direct_write_line(mounts: &[ResolvedMount]) -> Option<String> {
+    let hosts: Vec<String> = mounts
+        .iter()
+        .filter(|mt| mt.mode == MountMode::Rw)
+        .map(|mt| mt.host.display().to_string())
+        .collect();
+    (!hosts.is_empty()).then(|| {
+        format!(
+            "[direct-write] Changes the agent makes in {} land on your machine at once, with no \
+             review. Use mode: staged to review changes before they reach your files.",
+            hosts.join(", ")
+        )
+    })
+}
+
+/// Whether the manifest lists `entry` in `tools.acknowledge_unapproved` (a validated manifest
+/// lists exactly the needed entries).
+fn acknowledged(m: &Manifest, entry: &str) -> bool {
+    m.tools.acknowledge_unapproved.iter().any(|e| e == entry)
 }
 
 fn model_line(m: &Manifest) -> String {
@@ -65,9 +93,16 @@ fn file_lines(m: &Manifest, mounts: &[ResolvedMount]) -> Vec<String> {
             match mt.mode {
                 MountMode::Ro => format!("can read {host} (at {guest})."),
                 MountMode::Rw => format!(
-                    "can read, write, and delete anything in {host} (at {guest}). Its .git hooks \
-                     and config are write-protected, but other files your machine may run are \
-                     not ({UNPROTECTED_HOST_FILES})."
+                    "can read, write, and delete anything in {host} (at {guest}), directly on \
+                     your machine. Its .git folders are shielded: commits made in the session \
+                     are discarded, and file changes arrive as uncommitted modifications. Other \
+                     files your machine may run are not protected ({UNPROTECTED_HOST_FILES})."
+                ),
+                MountMode::Staged => format!(
+                    "can change files in {host} (at {guest}) only inside the sandbox; your folder \
+                     is not changed. The changes are kept apart (`sally session changes` lists \
+                     them; this version cannot apply them), and commits made in the session are \
+                     never applied."
                 ),
                 MountMode::Brokered => {
                     let writes =
@@ -150,7 +185,14 @@ fn shell_line(m: &Manifest) -> String {
         (ShellPolicy::Deny, _) | (_, false) => "cannot run shell commands.".into(),
         (ShellPolicy::Approve, true) => "can run shell commands with your approval.".into(),
         (ShellPolicy::Allow, true) if m.tools.destructive_requires_approval => {
-            "can run shell commands without approval (destructive ones need approval).".into()
+            let ack = if acknowledged(m, "shell") {
+                " (acknowledged)"
+            } else {
+                ""
+            };
+            format!(
+                "can run shell commands without approval (destructive ones need approval){ack}."
+            )
         }
         (ShellPolicy::Allow, true) => {
             "can run any shell command without approval (acknowledged).".into()
@@ -165,7 +207,7 @@ fn fetch_line(m: &Manifest) -> Option<String> {
     Some(match m.tools.fetch_writes {
         FetchWrites::Approve => "fetch can only read (GET/HEAD) without your approval.".into(),
         FetchWrites::Allow => {
-            let ack = if m.tools.acknowledge_unapproved_fetch {
+            let ack = if acknowledged(m, "fetch") {
                 " (acknowledged)"
             } else {
                 ""
@@ -187,13 +229,13 @@ fn tool_lines(m: &Manifest) -> Vec<String> {
     if !tools.is_empty() {
         lines.push(format!("may call: {}.", tools.join(", ")));
     }
-    lines.extend(m.tools.mcp.iter().map(mcp_line));
+    lines.extend(m.tools.mcp.iter().map(|s| mcp_line(m, s)));
     lines
 }
 
 /// The server's command runs at launch, unapproved, in the workspace (mounts + egress), so the
 /// summary shows it; only its tool calls are gated by `approve`.
-fn mcp_line(s: &McpServer) -> String {
+fn mcp_line(m: &Manifest, s: &McpServer) -> String {
     let mut cmd = s
         .command
         .iter()
@@ -218,6 +260,9 @@ fn mcp_line(s: &McpServer) -> String {
     };
     let calls = match s.approve {
         McpApproval::Always => "each of its tool calls needs your approval",
+        McpApproval::Never if acknowledged(m, &format!("mcp:{}", s.name)) => {
+            "its tool calls run without approval (acknowledged)"
+        }
         McpApproval::Never => "its tool calls run without approval",
     };
     format!(

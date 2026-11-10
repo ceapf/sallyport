@@ -4,9 +4,9 @@ use std::collections::HashSet;
 
 use super::super::diag::{Code, Diags};
 use super::super::hostenv::HostEnv;
+use super::super::image::is_pinned_image_ref;
 use super::super::types::{
-    BuiltinTool, FetchWrites, Harness, Manifest, Model, MountMode, NetworkMode, Runtime,
-    ShellPolicy,
+    BuiltinTool, Harness, Manifest, Model, MountMode, NetworkMode, Runtime, ShellPolicy,
 };
 use super::super::units::{ByteSize, Cpus, Duration, GpuLayers};
 use super::EgressRule;
@@ -130,32 +130,14 @@ pub(super) fn check_runtime(r: &Runtime, env: &HostEnv, d: &mut Diags) {
     );
 }
 
-/// `<name>@sha256:<64 lowercase hex>` (SI-11). Tags before the digest are allowed but ignored
-/// by the runtime; the digest is what gets checked against the local image.
+/// SI-11: the shared grammar in [`crate::manifest::is_pinned_image_ref`].
 fn check_image(s: &str) -> Result<(), String> {
-    let hint = "must be pinned by digest: <image>@sha256:<64 hex chars>";
-    let Some((name, digest)) = s.split_once("@sha256:") else {
-        return Err(format!("{s:?} {hint}"));
-    };
-    let name_ok = !name.is_empty()
-        && name.len() <= 255
-        && name
-            .bytes()
-            .next()
-            .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-        && name.bytes().all(|b| {
-            b.is_ascii_lowercase()
-                || b.is_ascii_digit()
-                || matches!(b, b'.' | b'_' | b'-' | b'/' | b':')
-        });
-    let digest_ok = digest.len() == 64
-        && digest
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-    if name_ok && digest_ok {
+    if is_pinned_image_ref(s) {
         Ok(())
     } else {
-        Err(format!("{s:?} {hint}"))
+        Err(format!(
+            "{s:?} must be pinned by digest: <image>@sha256:<64 hex chars>"
+        ))
     }
 }
 
@@ -204,24 +186,9 @@ pub(super) fn check_tools(m: &Manifest, d: &mut Diags) {
     check_fs_tools(m, d);
 }
 
-// The `*_needs_ack` predicates are the single definition of "this widening is live": the
-// validator requires the flag exactly when one returns true, and
-// `ValidatedManifest::acknowledged_risks` reports the flag exactly then.
-
-/// `shell` enabled in `allow` mode without destructive approval: every command runs unapproved.
-pub(super) fn shell_needs_ack(m: &Manifest) -> bool {
-    m.tools.builtin.contains(&BuiltinTool::Shell)
-        && m.tools.shell == ShellPolicy::Allow
-        && !m.tools.destructive_requires_approval
-}
-
-/// `fetch` enabled with unapproved writes, a network path, and private data to carry out (§5).
-pub(super) fn fetch_needs_ack(m: &Manifest) -> bool {
-    m.tools.builtin.contains(&BuiltinTool::Fetch)
-        && m.tools.fetch_writes == FetchWrites::Allow
-        && m.network.mode == NetworkMode::Proxy
-        && has_private_data(m)
-}
+// `wildcard_needs_ack` (and `ack::needed` for `tools.acknowledge_unapproved`) are the single
+// definition of "this widening is live": the validator requires the acknowledgement exactly when
+// one says so, and `ValidatedManifest::acknowledged_risks` reports it exactly then.
 
 /// Some allow rule reaches attacker-registrable hosts. `egress` is the parsed rule list (also
 /// parsed under `mode: none`, where the validator still requires the flag so a later mode
@@ -230,36 +197,9 @@ pub(super) fn wildcard_needs_ack(egress: &[EgressRule]) -> bool {
     egress.iter().any(|r| r.host.is_effectively_unrestricted())
 }
 
-/// Any mount or secret: something the model could read or act on that is not public. Reads the
-/// raw manifest; equivalent to the resolved mounts once validation has passed.
-fn has_private_data(m: &Manifest) -> bool {
-    !m.filesystem.mounts.is_empty() || !m.secrets.is_empty()
-}
-
-/// Records the error for a missing acknowledgement, or the warning for a needless one.
-fn check_ack(d: &mut Diags, field: &str, needed: bool, set: bool, what: &str) {
-    let path = format!("tools.{field}");
-    match (needed, set) {
-        (true, false) => d.error(
-            path,
-            Code::UnacknowledgedRisk,
-            format!("{what}; set tools.{field}: true to accept this"),
-        ),
-        (false, true) => d.warn(path, Code::Inconsistent, "set but has no effect"),
-        (true, true) | (false, false) => {}
-    }
-}
-
 fn check_shell(m: &Manifest, d: &mut Diags) {
     let t = &m.tools;
     let has_shell = t.builtin.contains(&BuiltinTool::Shell);
-    check_ack(
-        d,
-        "acknowledge_unapproved_shell",
-        shell_needs_ack(m),
-        t.acknowledge_unapproved_shell,
-        "shell: allow with destructive_requires_approval: false runs every command without approval",
-    );
     match (t.shell, has_shell) {
         (ShellPolicy::Allow, _) => {
             let tail = if t.destructive_requires_approval {
@@ -290,13 +230,6 @@ fn check_shell(m: &Manifest, d: &mut Diags) {
 }
 
 fn check_fetch(m: &Manifest, d: &mut Diags) {
-    check_ack(
-        d,
-        "acknowledge_unapproved_fetch",
-        fetch_needs_ack(m),
-        m.tools.acknowledge_unapproved_fetch,
-        "fetch_writes: allow lets fetch send mounted files or data your secrets unlock without approval",
-    );
     if m.tools.builtin.contains(&BuiltinTool::Fetch) && m.network.mode == NetworkMode::None {
         d.warn(
             "tools.builtin",
@@ -307,7 +240,7 @@ fn check_fetch(m: &Manifest, d: &mut Diags) {
 }
 
 /// `fs_read`/`fs_list` act on any mount; `fs_write`/`fs_delete` on `rw` and `brokered` mounts
-/// (`ro` → denied). Enabling them with nothing to act on is a mistake worth a warning.
+/// (`ro` → denied; `staged` → denied: only the sandbox's own commands write there). Enabling them with nothing to act on is a mistake worth a warning.
 fn check_fs_tools(m: &Manifest, d: &mut Diags) {
     let has = |tool| m.tools.builtin.contains(&tool);
     let mounts = &m.filesystem.mounts;
@@ -318,7 +251,9 @@ fn check_fs_tools(m: &Manifest, d: &mut Diags) {
             "fs_read/fs_list act on mounts, and there are none",
         );
     }
-    let writable = mounts.iter().any(|mt| mt.mode != MountMode::Ro);
+    let writable = mounts
+        .iter()
+        .any(|mt| matches!(mt.mode, MountMode::Rw | MountMode::Brokered));
     if (has(BuiltinTool::FsWrite) || has(BuiltinTool::FsDelete)) && !writable {
         d.warn(
             "tools.builtin",

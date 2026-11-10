@@ -112,7 +112,7 @@ fn check_approve(
             }
             globs.clone()
         }
-        (MountMode::Ro | MountMode::Rw, Some(_)) => {
+        (MountMode::Ro | MountMode::Rw | MountMode::Staged, Some(_)) => {
             d.warn(
                 path,
                 Code::Inconsistent,
@@ -120,7 +120,7 @@ fn check_approve(
             );
             ApproveGlobs::not_applicable()
         }
-        (MountMode::Ro | MountMode::Rw, None) => ApproveGlobs::not_applicable(),
+        (MountMode::Ro | MountMode::Rw | MountMode::Staged, None) => ApproveGlobs::not_applicable(),
     }
 }
 

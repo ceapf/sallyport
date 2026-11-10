@@ -2,6 +2,7 @@
 //!
 //! Every check here has an allow and a deny unit test (CLAUDE.md, MANIFEST_SPEC §3).
 
+mod ack;
 mod exposure;
 mod fs;
 mod net;
@@ -73,7 +74,7 @@ pub struct ValidatedManifest {
     manifest: Manifest,
     mounts: Vec<ResolvedMount>,
     egress: Vec<EgressRule>,
-    acknowledged: Vec<&'static str>,
+    acknowledged: Vec<String>,
 }
 
 impl ValidatedManifest {
@@ -96,10 +97,11 @@ impl ValidatedManifest {
         &self.egress
     }
 
-    /// The `acknowledge_*` flags that are set and in effect, as field paths. Launch records a
+    /// The acknowledgements that are set and in effect: `network.acknowledge_unrestricted_egress`
+    /// and `tools.acknowledge_unapproved: <entry>`. Launch records a
     /// `manifest.acknowledged_risk` audit event for each, and the UI shows a red banner.
     #[must_use]
-    pub fn acknowledged_risks(&self) -> &[&'static str] {
+    pub fn acknowledged_risks(&self) -> &[String] {
         &self.acknowledged
     }
 
@@ -182,12 +184,16 @@ pub fn validate(
     rest::check_tools(&manifest, &mut d);
     secrets::check_mcp(&manifest.tools.mcp, &mut d);
     rest::check_approvals_and_policy(&manifest, &mut d);
-    let acknowledged = acknowledged(&manifest, &egress);
+    let wildcard_live = wildcard_acknowledged(&manifest, &egress);
     let egress = match manifest.network.mode {
         super::types::NetworkMode::Proxy => egress,
         super::types::NetworkMode::None => Vec::new(),
     };
-    if let Some(finding) = exposure::data_can_leave(&manifest, &mounts, &egress) {
+    let finding = exposure::data_can_leave(&manifest, &mounts, &egress);
+    ack::check(&manifest, finding.is_some(), &mut d);
+    let mut acknowledged: Vec<String> = wildcard_live.into_iter().map(str::to_owned).collect();
+    acknowledged.extend(ack::acknowledged(&manifest, finding.is_some()));
+    if let Some(finding) = finding {
         d.warn("network.allow", Code::DataCanLeave, finding);
     }
     let warnings = d.finish()?;
@@ -202,28 +208,13 @@ pub fn validate(
     })
 }
 
-/// Flags that are set and whose risk is live (same predicates the checks use).
-fn acknowledged(m: &Manifest, parsed_egress: &[EgressRule]) -> Vec<&'static str> {
-    let proxy = m.network.mode == super::types::NetworkMode::Proxy;
-    [
-        (
-            m.network.acknowledge_unrestricted_egress
-                && proxy
-                && rest::wildcard_needs_ack(parsed_egress),
-            "network.acknowledge_unrestricted_egress",
-        ),
-        (
-            m.tools.acknowledge_unapproved_shell && rest::shell_needs_ack(m),
-            "tools.acknowledge_unapproved_shell",
-        ),
-        (
-            m.tools.acknowledge_unapproved_fetch && rest::fetch_needs_ack(m),
-            "tools.acknowledge_unapproved_fetch",
-        ),
-    ]
-    .into_iter()
-    .filter_map(|(set, name)| set.then_some(name))
-    .collect()
+/// `network.acknowledge_unrestricted_egress` when it is set and its risk is live (the same
+/// predicate the check uses). Tool acknowledgements come from [`ack::acknowledged`].
+fn wildcard_acknowledged(m: &Manifest, parsed_egress: &[EgressRule]) -> Option<&'static str> {
+    (m.network.acknowledge_unrestricted_egress
+        && m.network.mode == super::types::NetworkMode::Proxy
+        && rest::wildcard_needs_ack(parsed_egress))
+    .then_some("network.acknowledge_unrestricted_egress")
 }
 
 /// Parses and validates manifest text in one step. Performs blocking filesystem I/O.

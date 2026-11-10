@@ -908,14 +908,14 @@ fn summary_of_coding_agent() {
         "[data-can-leave] Anything this agent reads — $ROOT/home/code/myproject and whatever your GITHUB_TOKEN unlocks on api.github.com or github.com — can be sent to pypi.org, files.pythonhosted.org, api.github.com (acting as you) and github.com (acting as you).\n\
          This agent:\n\
          - uses the model qwen2.5-coder-7b-instruct-q4_k_m.\n\
-         - can read, write, and delete anything in $ROOT/home/code/myproject (at /workspace/myproject). Its .git hooks and config are write-protected, but other files your machine may run are not (Makefile, package.json scripts, .vscode/tasks.json, .envrc, .git/commondir or a .git pointer file in a submodule or worktree, or a new nested .git folder).\n\
+         - can change files in $ROOT/home/code/myproject (at /workspace/myproject) only inside the sandbox; your folder is not changed. The changes are kept apart (`sally session changes` lists them; this version cannot apply them), and commits made in the session are never applied.\n\
          - can reach pypi.org on port 443, files.pythonhosted.org on port 443, api.github.com on port 443, github.com on port 443 (through the Sallyport proxy only).\n\
          - uses your GITHUB_TOKEN secret only toward api.github.com (the agent never sees the value).\n\
          - sees GH_TOKEN set to a placeholder, never the real value.\n\
          - uses your GITHUB_TOKEN secret only toward github.com (the agent never sees the value).\n\
          - can run shell commands with your approval.\n\
          - fetch can only read (GET/HEAD) without your approval.\n\
-         - may call: fs_read, fs_list, fs_write, fs_delete, fetch.\n\
+         - may call: fs_read, fs_list, fetch.\n\
          - runs tools in a custom workspace image: ghcr.io/ceapf/sallyport-workspace-python@sha256:0000000000000000000000000000000000000000000000000000000000000000.\n\
          - can execute files it writes to /tmp.\n\
          - is limited to 6 CPUs, 12GiB memory, 1024 processes, and 4h of wall time.\n"
@@ -960,10 +960,8 @@ fn summary_discloses_unapproved_deletes_and_git_hooks() {
     std::fs::create_dir_all(f.home().join("code/myproject/.git")).unwrap();
     let body = "filesystem:\n  mounts:\n    - {host: \"~/code/myproject\", guest: /workspace/p, mode: rw}\n    - {host: \"~/Documents/research\", guest: /workspace/r, mode: brokered, approve: {deletes: []}}\ntools:\n  builtin: [fs_write, fs_delete]\n";
     let s = summary(&f.load(body).unwrap().manifest);
-    assert!(
-        s.contains("Its .git hooks and config are write-protected"),
-        "{s}"
-    );
+    assert!(s.contains("Its .git folders are shielded"), "{s}");
+    assert!(s.starts_with("[direct-write] "), "{s}");
     assert!(
         s.contains("can write there with your approval; deletes without asking you."),
         "{s}"

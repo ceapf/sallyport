@@ -186,16 +186,16 @@ fn unapproved_shell_requires_acknowledgement() {
         "tools:\n  builtin: [shell]\n  shell: allow\n  destructive_requires_approval: false\n";
     assert_rejects(
         &f.load(base),
-        "tools.acknowledge_unapproved_shell",
+        "tools.acknowledge_unapproved",
         Code::UnacknowledgedRisk,
     );
-    let r = f.load(&format!("{base}  acknowledge_unapproved_shell: true\n"));
+    let r = f.load(&format!("{base}  acknowledge_unapproved: [shell]\n"));
     assert_ok(&r);
     assert!(has_warning(&r, "tools.shell", Code::Risky));
     let v = r.unwrap().manifest;
     assert_eq!(
         v.acknowledged_risks(),
-        vec!["tools.acknowledge_unapproved_shell"]
+        vec!["tools.acknowledge_unapproved: shell"]
     );
     let s = summary(&v);
     assert!(
@@ -207,25 +207,23 @@ fn unapproved_shell_requires_acknowledgement() {
 }
 
 #[test]
-fn needless_acknowledgement_warns() {
+fn needless_acknowledgement_is_an_error() {
+    // B3: unnecessary entries are errors, so stale acknowledgements cannot linger.
     let f = Fixture::new();
-    let r = f.load(
-        "tools:\n  acknowledge_unapproved_shell: true\n  acknowledge_unapproved_fetch: true\n",
-    );
+    let r = f.load("tools:\n  acknowledge_unapproved: [shell, fetch]\n");
     assert_eq!(
-        warnings(&r),
+        errors(&r),
         vec![
             (
-                "tools.acknowledge_unapproved_shell".to_owned(),
+                "tools.acknowledge_unapproved[0]".to_owned(),
                 Code::Inconsistent
             ),
             (
-                "tools.acknowledge_unapproved_fetch".to_owned(),
+                "tools.acknowledge_unapproved[1]".to_owned(),
                 Code::Inconsistent
             ),
         ]
     );
-    assert!(r.unwrap().manifest.acknowledged_risks().is_empty());
 }
 
 #[test]
@@ -282,7 +280,7 @@ fn unapproved_fetch_writes_with_private_data_require_acknowledgement() {
     let with_mount = fetch_body(&mount("~/code/myproject", "/workspace/p", "ro"), allow);
     assert_rejects(
         &f.load(&with_mount),
-        "tools.acknowledge_unapproved_fetch",
+        "tools.acknowledge_unapproved",
         Code::UnacknowledgedRisk,
     );
     let with_secret = format!(
@@ -291,17 +289,15 @@ fn unapproved_fetch_writes_with_private_data_require_acknowledgement() {
     );
     assert_rejects(
         &f.load(&with_secret),
-        "tools.acknowledge_unapproved_fetch",
+        "tools.acknowledge_unapproved",
         Code::UnacknowledgedRisk,
     );
-    let r = f.load(&format!(
-        "{with_mount}  acknowledge_unapproved_fetch: true\n"
-    ));
+    let r = f.load(&format!("{with_mount}  acknowledge_unapproved: [fetch]\n"));
     assert_ok(&r);
     let v = r.unwrap().manifest;
     assert_eq!(
         v.acknowledged_risks(),
-        vec!["tools.acknowledge_unapproved_fetch"]
+        vec!["tools.acknowledge_unapproved: fetch"]
     );
     let s = summary(&v);
     assert!(
@@ -611,14 +607,19 @@ fn summary_explains_protected_git_files_and_what_is_not_covered() {
             .unwrap()
             .manifest,
     );
+    // AMENDMENTS-02 B2(a) replaces the hooks/config overlays of AMENDMENTS-01 §6.3: whole .git
+    // folders are overlays, so the claim is now about the folder and about commits.
+    assert!(s.contains("Its .git folders are shielded"), "{s}");
     assert!(
-        s.contains("Its .git hooks and config are write-protected"),
+        s.contains("commits made in the session are discarded"),
         "{s}"
     );
     assert!(
         s.contains("Makefile, package.json scripts, .vscode/tasks.json, .envrc"),
         "{s}"
     );
+    // Security review of 6a: only entries named exactly `.git` are shielded.
+    assert!(s.contains("a git repository not named .git"), "{s}");
 }
 
 // ---- stable codes ----------------------------------------------------------------------------
