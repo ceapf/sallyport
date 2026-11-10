@@ -8,6 +8,7 @@ use super::super::types::{Manifest, McpServer, NetworkMode, SecretGrant};
 use super::net::host_error;
 use super::rest::is_slug;
 use super::{EgressRule, SecretCatalog};
+use crate::secrets::is_secret_name;
 
 /// Headers the proxy owns (framing, hop-by-hop, routing). Injecting a secret into these could
 /// break request framing or redirect the request. Every `Proxy-*` header is refused as well.
@@ -182,11 +183,6 @@ fn check_inject_host(
         }
         Ok(_) => {}
     }
-}
-
-/// The grammar lives in `crate::secrets`; the store and this validator share one rule.
-fn is_secret_name(s: &str) -> bool {
-    crate::secrets::is_secret_name(s)
 }
 
 /// RFC 9110 `token`, at most 64 bytes, not reserved.
