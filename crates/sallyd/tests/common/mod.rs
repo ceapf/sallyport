@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use sally_core::manifest::{HostEnv, ValidatedManifest, load};
+pub mod container;
+
 use sallyd::sandbox::{
     CheckedRuntime, CommonArgs, ImageRef, LaunchScan, ScanLimits, SessionId, SessionPaths, UserIds,
     scan_mounts,

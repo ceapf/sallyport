@@ -103,6 +103,12 @@ impl NewEntry {
         &self.event
     }
 
+    /// The arguments as given, before redaction (they are redacted when written).
+    #[must_use]
+    pub fn arguments(&self) -> &Value {
+        &self.args
+    }
+
     /// Sets the session id.
     #[must_use]
     pub fn session(mut self, session: impl Into<String>) -> Self {
