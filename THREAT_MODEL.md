@@ -98,7 +98,7 @@ flowchart TB
 | SI-8 | Brokered file operations are confined by the kernel (`openat2` with `RESOLVE_BENEATH \| RESOLVE_NO_SYMLINKS \| RESOLVE_NO_MAGICLINKS` from a pinned directory fd), not by string comparison. | `sallyd::tools::fs` |
 | SI-9 | The egress policy decides on the request authority, resolves on the host, filters loopback/private/link-local/host-own addresses, and connects to the pinned resolved IP. Hostnames only; IP literals denied. TLS is intercepted only for hosts with a secret grant; every other allowed host is spliced untouched. | egress proxy |
 | SI-10 | The UI renders model output as sanitized Markdown only (no raw HTML), under a strict CSP, with no Tauri fs/shell capabilities exposed to the webview. | Tauri shell + React renderer |
-| SI-11 | All container images are referenced by digest. Weights are mounted read-only. No sandbox has write access to anything that persists except its granted `rw` mounts. | sandbox driver, library |
+| SI-11 | Images are referenced by digest in registry form only; transport prefixes (`dir:`, `oci:`, `docker-daemon:` and similar) are refused. Weights are mounted read-only. What a sandbox writes persists in exactly two places: granted `rw` mounts, and the session's staged upper directories inside Sallyport's own state directory. Staged data is inert: never executed, never mounted into another session, applied to the host only through the reviewed apply step, and deleted on discard or after apply. | sandbox driver, library |
 | SI-12 | `sallyd` itself makes no outbound connections except Hugging Face downloads the user initiated and proxied sandbox egress. No telemetry. | code review + RT-NET-11 |
 
 ## 3. Attacker capabilities

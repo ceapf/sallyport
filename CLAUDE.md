@@ -25,7 +25,7 @@ SI-7 Manifests are strict (`deny_unknown_fields`). The built-in mount denylist c
 SI-8 Brokered file ops use `openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_MAGICLINKS)` from a pinned dir fd — never string prefix checks.
 SI-9 Egress policy: hostname rules only, resolve on host, filter loopback/private/link-local/own, connect to the pinned IP. IP literals denied. TLS intercepted only for secret-grant hosts; all others spliced untouched.
 SI-10 UI renders model output as sanitized Markdown under strict CSP; the webview has no fs/shell capabilities.
-SI-11 Images by digest only. Weights mounted RO. Sandboxes persist nothing except granted `rw` mounts.
+SI-11 Images are referenced by digest in registry form only; transport prefixes (dir:, oci:, docker-daemon: and similar) are refused. Weights are mounted read-only. What a sandbox writes persists in exactly two places: granted rw mounts, and the session's staged upper directories inside Sallyport's own state directory. Staged data is inert: never executed, never mounted into another session, applied to the host only through the reviewed apply step, and deleted on discard or after apply.
 SI-12 `sallyd` makes no outbound connections except user-initiated HF downloads and proxied sandbox egress. No telemetry.
 
 If a task seems to require breaking one of these, **stop and ask**. Do not implement a workaround.
@@ -105,7 +105,8 @@ manually for the tasks marked opus). Subagents are the files in `.claude/agents/
 - Start every session with `/resume-session`; end with `/save-session`. One milestone *task* per session where possible; `/clear` between unrelated tasks.
 - Run `/context` (built-in) when the context feels heavy; never paste whole logs — `2>&1 | tail -60`. Use `cargo test -q -p <crate>` and `cargo clippy -q`.
 - Use `docs-lookup` (haiku) for API questions instead of fetching pages into the main context.
-- Reviews run as subagents (separate context). Request them once per task, not per edit.
+- Reviews run as subagents (separate context). One review per task, not per edit, plus one
+  diff-only re-review when post-review fixes rewrite a security-core component.
 - Don't read `THREAT_MODEL.md`/`ARCHITECTURE.md` repeatedly — read the section you need once per session.
 
 ## Public repository rules
