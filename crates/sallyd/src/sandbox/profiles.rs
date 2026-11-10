@@ -2,7 +2,7 @@
 //! written into the session's 0700 directory, so no file outside Sallyport's control decides what
 //! a sandbox may call. `scripts/gen_seccomp.py` derives them from containers-common's default
 //! profile; the tests here check the properties independently of the generator. TODO(#17):
-//! container red-team tests for the socket-family, clone and native-architecture filters.
+//! container red-team tests RT-NET-12 (socket families) and RT-FS-17 (namespaces), Task 6c.
 
 use std::io::Write as _;
 use std::os::fd::AsFd;
