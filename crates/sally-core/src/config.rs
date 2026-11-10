@@ -38,6 +38,9 @@ pub struct SandboxConfig {
     /// Absolute path of the runtime binary. `None` = [`default_runtime_path`], the pinned
     /// upstream build installed by `install.sh`.
     pub runtime_path: Option<PathBuf>,
+    /// Absolute path of the `podman` binary. `None` = the first `podman` on `sallyd`'s `PATH`
+    /// at startup. Either way it is resolved once and checked like the runtime (#11).
+    pub podman_path: Option<PathBuf>,
 }
 
 /// OCI runtime family.
@@ -69,9 +72,11 @@ pub enum ConfigError {
         /// What is wrong.
         msg: &'static str,
     },
-    /// The runtime binary failed a host check.
-    #[error("sandbox.runtime_path: {path}: {msg}")]
-    Runtime {
+    /// A trusted binary (the runtime, podman) failed a host check.
+    #[error("{field}: {path}: {msg}")]
+    Binary {
+        /// The setting the binary came from, e.g. `sandbox.runtime_path`.
+        field: &'static str,
         /// Host path as configured.
         path: String,
         /// What is wrong.
@@ -95,16 +100,16 @@ pub fn parse_config(text: &str) -> Result<Config, ConfigError> {
             msg: "runsc is not supported in v1 (gVisor is the M6 spike); use crun",
         });
     }
-    if config
-        .sandbox
-        .runtime_path
-        .as_ref()
-        .is_some_and(|p| !p.is_absolute())
-    {
-        return Err(ConfigError::Invalid {
-            field: "sandbox.runtime_path",
-            msg: "must be an absolute path",
-        });
+    for (field, path) in [
+        ("sandbox.runtime_path", &config.sandbox.runtime_path),
+        ("sandbox.podman_path", &config.sandbox.podman_path),
+    ] {
+        if path.as_ref().is_some_and(|p| !p.is_absolute()) {
+            return Err(ConfigError::Invalid {
+                field,
+                msg: "must be an absolute path",
+            });
+        }
     }
     Ok(config)
 }
@@ -125,9 +130,19 @@ pub fn default_runtime_path(data_home: &Path) -> PathBuf {
 /// the sandbox driver re-checks before every launch.
 ///
 /// # Errors
-/// [`ConfigError::Runtime`] naming the path and the failed check.
+/// [`ConfigError::Binary`] naming `sandbox.runtime_path`, the path and the failed check.
 pub fn check_runtime_binary(path: &Path) -> Result<PathBuf, ConfigError> {
-    let fail = |msg: &str| ConfigError::Runtime {
+    check_trusted_binary(path, "sandbox.runtime_path")
+}
+
+/// The checks of [`check_runtime_binary`] for any binary `sallyd` executes with the user's
+/// authority (the runtime, podman); errors name `field`.
+///
+/// # Errors
+/// [`ConfigError::Binary`] naming `field`, the path and the failed check.
+pub fn check_trusted_binary(path: &Path, field: &'static str) -> Result<PathBuf, ConfigError> {
+    let fail = |msg: &str| ConfigError::Binary {
+        field,
         path: path.display().to_string(),
         msg: msg.to_owned(),
     };

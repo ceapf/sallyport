@@ -29,6 +29,14 @@ jobs:
       - run: cargo install cargo-nextest --locked --version "$CARGO_NEXTEST_VERSION"
       - name: verify cargo-nextest version
         run: cargo nextest --version | grep -Fw "$CARGO_NEXTEST_VERSION"
+      # Container tests (crates/sallyd/tests/launch.rs) need rootless podman and their base image,
+      # pulled by digest; the test image is built from it without a network. They never skip.
+      - name: container test prerequisites
+        run: |
+          podman --version
+          test -n "$XDG_RUNTIME_DIR"
+          podman info --format '{{.Host.CgroupsVersion}} {{.Host.OCIRuntime.Path}}'
+          podman pull docker.io/library/alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
       - run: make fmt clippy forbid-unsafe nextest shim-check
   coverage:
     runs-on: ubuntu-24.04

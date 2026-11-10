@@ -97,6 +97,12 @@ impl NewEntry {
         }
     }
 
+    /// The event name (`noun.verb`).
+    #[must_use]
+    pub fn event(&self) -> &str {
+        &self.event
+    }
+
     /// Sets the session id.
     #[must_use]
     pub fn session(mut self, session: impl Into<String>) -> Self {

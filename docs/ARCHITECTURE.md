@@ -105,22 +105,36 @@ flowchart LR
   library/blobs/sha256/<hex>  # immutable 0444 model files
   library/quarantine/<uuid>/  # downloads before verification
   audit/audit-YYYYMM.jsonl    # hash-chained; audit.head = newest {seq, hash}; audit.lock
+  sessions/                   # 0700
+  sessions/<id>/              # 0700, created fresh per session (#10)
+  sessions/<id>/profiles/     # the embedded seccomp profiles, written 0600 at launch
   sessions/<id>/stage/<n>/{upper,work}   # staged mount n: kept for `sally session changes`
   sessions/<id>/git/<k>/{upper,work}     # .git overlays of rw mounts: discarded at teardown
+  podman/                     # 0700: hermetic podman (#11, §3.5)
+  podman/containers.conf      #   generated at startup; CONTAINERS_CONF of every podman call
+  podman/config/              #   empty; XDG_CONFIG_HOME of every podman call
+  podman/hooks/               #   empty; --hooks-dir of every podman call
+  podman/mounts.conf          #   empty; --default-mounts-file of every podman call
   logs/
   bin/crun -> crun-<version>  # pinned upstream OCI runtime (static, signature-verified); the
                               # default sandbox.runtime_path. Never the distro crun (AMENDMENTS-02 B5)
-$XDG_RUNTIME_DIR/sallyport/
+$XDG_RUNTIME_DIR/sallyport/   # $XDG_RUNTIME_DIR must be ours and 0700 (checked at launch)
   control.sock                # 0600; CLI + UI
   infer/<instance-id>/infer.sock   # created by llama-server inside Z2
+  sessions/<session-id>/      # 0700, created fresh per session
   sessions/<session-id>/workspace/net.sock   # created by sallyd, workspace role only (proxy mode)
   sessions/<session-id>/harness/{llm,agent}.sock   # created by sallyd, harness role only
 ```
 
-### 3.2 `podman run` argv: common prologue (normative)
+### 3.2 `podman create` argv: common prologue (normative)
 Built by the pure `sallyd::sandbox::{workspace,harness,inference}_argv` (one container per role,
-AMENDMENTS-01 §2). Every builder checks its own output with `check_argv` against a per-role
+AMENDMENTS-01 §2). The verb is `create`: the launcher checks the created container before it
+starts it (§3.5). Every builder checks its own output with `check_argv` against a per-role
 policy (`Allowed`), an **allowlist**:
+- the global options exactly `--runtime <the checked runtime> --hooks-dir <Sallyport's empty
+  hooks directory> --default-mounts-file <Sallyport's empty mounts file>`, then `create`;
+- one spelling per option: `--flag value` for the options written that way below, `--flag=value`
+  for the others, bare flags without a value; the other spelling is refused;
 - only the options below, each with its exact value or value shape (`--user` is the session's
   ids, the seccomp profile is the role's file under the profiles directory, `--device` only
   `nvidia.com/gpu=all` and only for inference, environment variables only the role's exact
@@ -130,7 +144,8 @@ policy (`Allowed`), an **allowlist**:
 - every `-v` source a declared source of that role at its declared guest path: `ro` grants only a
   read-only bind, `rw` a read-write bind plus binds and overlays of paths inside it at the
   matching guest path, `staged` only an overlay; overlay upper and work directories only inside
-  the session's scratch directory; another role's socket directory is never a source (SI-2);
+  the session's scratch directory, and no two of them equal or nested; another role's socket
+  directory is never a source (SI-2); `/` is never a source, scratch or profile directory;
 - the image in the shared digest-pinned grammar (`sally_core::manifest::is_pinned_image_ref`:
   never a Podman transport such as `dir:` or `docker-daemon:`, SI-11);
 - the command after the image exactly the role's fixed command.
@@ -138,12 +153,14 @@ policy (`Allowed`), an **allowlist**:
 The snapshots in `crates/sallyd/tests/snapshots/` are the normative examples.
 ```
 podman --runtime <checked runtime_path>          # AMENDMENTS-02 B5: never the distro crun
-  run --rm --name sp-{ws|h|infer}-<id>
+  --hooks-dir <data>/podman/hooks                # empty, Sallyport-owned (#11)
+  --default-mounts-file <data>/podman/mounts.conf  # empty: no system mounts.conf (6b review)
+  create --rm --name sp-{ws|h|infer}-<id>
   --pull=never --http-proxy=false --log-driver=none --ulimit core=0   # AMENDMENTS-01 §6.1
   --network=none --no-hosts          # NOT --dns=none: Podman 4.9 rejects it with --network=none (preflight V4)
   --read-only --read-only-tmpfs=false
-  --cap-drop=ALL --security-opt=no-new-privileges
-  --security-opt seccomp=<profiles>/seccomp-{workspace|harness|inference}.json
+  --cap-drop=ALL --security-opt no-new-privileges
+  --security-opt seccomp=<data>/sessions/<id>/profiles/seccomp-{workspace|harness|inference}.json
   --security-opt label=disable
   --userns=keep-id --user <uid>:<gid>
 ```
@@ -196,8 +213,7 @@ accepts exactly this command with only the `-ngl`/`-c` numbers varying, so `--mo
 `--models-preset`, `--slot-save-path`, `--webui*`, `--path`, `--lora`, `-hf` and every other flag
 are refused (AMENDMENTS-01 §6.2). Each role has its own socket directory; no role can see
 another's sockets. Podman configuration outside the argv (`containers.conf`, `mounts.conf`, OCI
-hooks, `CONTAINER_HOST`) is not covered by `check_argv`; the launcher controls it (Task 6b,
-TODO(#11)).
+hooks, `CONTAINER_HOST`) is not covered by `check_argv`; hermetic podman (§3.5) controls it.
 
 ### 3.4 Seccomp
 Start from `containers-common`'s default profile and **remove**: `mount, umount2, pivot_root,
@@ -205,9 +221,117 @@ chroot, ptrace, process_vm_readv, process_vm_writev, keyctl, add_key, request_ke
 perf_event_open, userfaultfd, io_uring_setup, io_uring_enter, io_uring_register, unshare,
 setns, kexec_load, kexec_file_load, reboot, swapon, swapoff, init_module, finit_module,
 delete_module, acct, settimeofday, clock_settime, mknod, mknodat, personality, uselib,
-vhangup, quotactl, lookup_dcookie, nfsservctl, open_by_handle_at, name_to_handle_at`. The
-inference profile additionally removes `socket, connect, bind, listen` for `AF_INET/AF_INET6`
-(argument filter; AF_UNIX stays). Profiles are files in `profiles/` and are tested (RT-FS-07, 09).
+vhangup, quotactl, lookup_dcookie, nfsservctl, open_by_handle_at, name_to_handle_at`, plus the
+same capabilities under other names: the new mount API (`fsopen, fsconfig, fsmount, fspick,
+move_mount, open_tree, mount_setattr`), `umount`, `stime, clock_settime64, clock_adjtime,
+clock_adjtime64`, `quotactl_fd` and `pidfd_getfd`, and `socketcall` and `syslog` (6b security
+review). Every remaining non-errno rule is a plain `SCMP_ACT_ALLOW`, and:
+- `clone` is allowed only without namespace flags (`arg0 & 0x7E020000 == 0`, Docker's rule): no
+  nested user, network, mount, PID, IPC, UTS or cgroup namespace, so no `CAP_NET_ADMIN` over
+  nf_tables in a fresh network namespace. `clone3` is not allowed (its flags are in memory
+  seccomp cannot read); it fails with ENOSYS and libc falls back to `clone`.
+- `socket` is allowed per address family: `AF_UNIX`, `AF_INET`, `AF_INET6` and `AF_NETLINK`
+  (`NETLINK_ROUTE` only, by equality) for workspace and harness, `AF_UNIX` only for inference. Every other
+  family fails, in particular `AF_VSOCK`, which network namespaces do not isolate (on WSL2 and
+  other VMs it reaches the host).
+- Only native architectures are listed (x86-64, aarch64, no 32-bit sub-architectures), so the
+  32-bit ABI (`int 0x80`, the unfilterable `socketcall`) never reaches an allow rule.
+
+The profiles are `profiles/seccomp-{workspace,harness,inference}.json`, derived by
+`scripts/gen_seccomp.py` from containers-common's profile and committed. They are embedded in
+`sallyd` and written into the session's 0700 `profiles/` directory at launch (#10), so no file
+outside Sallyport's control decides what a sandbox may call. Unit tests check the removals and
+the inference socket filter independently of the generator; RT-FS-07 and RT-FS-09 test them in
+a container.
+
+### 3.5 Launch (normative, Task 6b)
+`sallyd::sandbox::Launcher::launch_workspace`, in this order. The launch runs in its own task:
+a caller that goes away cannot interrupt it, and a launch nobody receives is stopped again. Any
+failure audits `sandbox.refuse` (or `sandbox.mount_mismatch`) with a reason and the cleanup
+outcome. It removes the container by its name `sp-ws-<id>`, even when `create` printed no id,
+and removes only the directories this launch created: an id whose directories exist is refused
+before anything is created, so a stopped session's kept `stage/` is never touched. The claims
+are released only once the container is confirmed gone.
+
+1. **Overlap rule** (AMENDMENTS-02 B4, RT-AG-08b). Two live sessions may mount overlapping host
+   directories (the same directory, or one inside the other) only when neither mount is `rw` or
+   `brokered`. Overlap is decided by path and by identity. Each claim carries the
+   `st_dev:st_ino` of its root and of every ancestor up to `/`, walked with `..` from an fd. A
+   directory reached through a bind alias or a second mount of the same filesystem therefore
+   still conflicts. No sandbox ever holds write access to an ancestor, a descendant or the same
+   directory as another session's mount, so no live sandbox can swap what another session's
+   launch scan pinned. `Launcher::remove_orphans` removes `sp-ws-*`/`sp-h-*` containers a
+   previous `sallyd` left running (audited `sandbox.orphan_removed`); `sallyd` calls it before
+   it accepts the first launch.
+2. **Checks.** The runtime binary and the podman binary are re-checked (B5). Everything podman
+   reads from Sallyport's state is re-checked too: the state directory is private, `hooks/` and
+   `config/` are empty, `mounts.conf` is empty, and `containers.conf` is byte-identical to what
+   was generated.
+3. **Launch scan** (`scan_mounts`). One bounded walk per mount from a pinned directory fd,
+   `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV)`
+   (SI-8):
+   - The mount root is opened without following any symlink, including in its ancestors, and
+     must still be the validated `st_dev:st_ino` (RT-FS-06).
+   - A Unix socket anywhere refuses the launch (`socket-in-mount`, RT-FS-13), in every mode and
+     inside `.git` (git's fsmonitor socket): `connect` works on a read-only mount.
+   - The walk never enters another filesystem mount, and never shields a mount point of any
+     kind, directory or bind-mounted file. Non-recursive binds and overlays hide nested mounts
+     from the sandbox (RT-FS-16). `statx` must report `STATX_MNT_ID` (kernel ≥ 5.8), or the
+     scan refuses rather than walk blind.
+   - In an `rw` mount, every `.git` directory and `.git` file is recorded, sorted, together with
+     the identity of each of them and of every directory between it and the root. A `.git`
+     symlink is neither shielded nor followed.
+   - More than 32 shielded entries in one `rw` mount, 250 000 entries, a depth of 64, or 16 MiB
+     of paths waiting to be listed, refuses the launch. For an `rw` mount the message recommends
+     `staged`. Only the scanner can construct a `GitScan` or a `LaunchScan`, and a scan is
+     bound to its manifest's mounts (realpath and identity).
+4. **Session directories** (#10). `sessions/<id>` is created fresh and 0700 under both roots,
+   along with the role socket directories, `profiles/` (with the embedded profiles written
+   0600), and the overlay upper and work directories, each 0700. `$XDG_RUNTIME_DIR` must be
+   owned by the user and 0700.
+5. **Argv** (§3.2), then **audit** `sandbox.launch` (SI-4: before anything is visible).
+6. `podman create`; then every pin is re-checked on the host (`LaunchScan::recheck_host`), then
+   `podman init`. The runtime builds the mounts but starts nothing.
+7. **Post-init mount check** (B4). From the host, under `/proc/<init-pid>/root` with
+   `RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS`, every bind-mounted pin (mount roots, the `.git`
+   parent self-binds, `.git` pointer files) must show its pinned `st_dev:st_ino`. On a mismatch
+   the container is removed and `sandbox.mount_mismatch` is audited. Overlay lower layers report
+   the overlay's own device, so they rely on step 6's host re-check and on the overlap rule.
+   TODO(#15): the OCI config verifier runs here (Task 14).
+8. `podman start`.
+
+**Teardown** (`Launcher::stop`) audits `sandbox.stop`, then runs `podman rm --force --time 0`
+and confirms the container is gone (`podman container exists`). If it is not gone, the session
+keeps its claims and the caller gets the handle back to retry. Otherwise teardown removes
+`git/` and `profiles/` through `podman unshare` (overlay work directories belong to the
+container's user namespace), removes the socket directory, keeps `stage/`, and releases the
+overlap claims.
+
+**Hermetic podman** (#11). Every podman process gets a cleared environment plus `HOME`,
+`XDG_RUNTIME_DIR`, `XDG_DATA_HOME` (when set) and `PATH=/usr/bin:/bin:/usr/sbin:/sbin`. It also
+gets:
+- `CONTAINERS_CONF=<data>/podman/containers.conf`, generated at startup. On Podman 4.9.3 it
+  replaces the system file, the user file and their drop-ins; probed in Task 6b.
+  `CONTAINERS_CONF_OVERRIDE` would still be read, and it is never passed.
+- `XDG_CONFIG_HOME=<data>/podman/config` (empty), so the user's `storage.conf`, `mounts.conf` and
+  `registries.conf` are not read either.
+- `--hooks-dir` naming the empty hooks directory and `--default-mounts-file` naming the empty
+  mounts file. Rootless podman reads `mounts.conf` through that flag; the `containers.conf` key
+  had no effect when probed in Task 6b.
+
+The generated file has no default volumes, devices, capabilities, environment, sysctls,
+ulimits, annotations or mounts. Namespaces are private, there is no keyring, events and logs are
+off, and remote is off. The runtime, `conmon` and `catatonit` (`--init`) are explicit paths that
+passed the runtime's ownership checks. The podman binary is resolved once
+(`sandbox.podman_path`, else the first `podman` on `sallyd`'s `PATH`) and gets the same checks.
+Every podman command has its output capped at 64 KiB per stream and is killed after 120 s.
+
+**Consequences.**
+- A user whose image store is configured through `~/.config/containers/storage.conf` (a
+  non-default `graphroot`) must move it to the default location. `sally doctor` will report it.
+- On Podman 4.9.3, a `staged` mount over a folder with another filesystem mounted inside it
+  cannot launch: the runtime refuses the overlay in the keep-id user namespace (`EINVAL`, probed
+  in Task 6b). The launch fails closed after `init`, and nothing runs.
 
 ## 4. Broker API
 
@@ -362,8 +486,9 @@ sallyport/
 │   ├── inference-cpu/Containerfile  # CI + non-NVIDIA
 │   ├── harness-python/Containerfile # python:3.12-slim@sha256, non-root, SDK, sally-shim
 │   └── build.sh                     # builds, records digests into images/digests.lock
-├── profiles/
-│   ├── seccomp-agent.json
+├── profiles/                        # embedded in sallyd; derived by scripts/gen_seccomp.py
+│   ├── seccomp-workspace.json
+│   ├── seccomp-harness.json
 │   └── seccomp-inference.json
 ├── manifests/
 │   ├── schema/manifest.v1.schema.json   # generated

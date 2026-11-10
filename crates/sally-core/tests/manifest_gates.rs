@@ -620,6 +620,16 @@ fn summary_explains_protected_git_files_and_what_is_not_covered() {
     );
     // Security review of 6a: only entries named exactly `.git` are shielded.
     assert!(s.contains("a git repository not named .git"), "{s}");
+    // 6a re-review L7: hooks or config a repository takes from its working tree are writable,
+    // and so is a .git created after the launch scan.
+    assert!(
+        s.contains("git hooks or config taken from the folder itself (core.hooksPath"),
+        "{s}"
+    );
+    assert!(
+        s.contains("a .git folder created during the session"),
+        "{s}"
+    );
 }
 
 // ---- stable codes ----------------------------------------------------------------------------

@@ -1,134 +1,24 @@
-//! Task 6a: the pure `podman run` argv builder for every role (AMENDMENTS-01 §2, §6.1, §6.2) and
-//! every mount mode, including `staged` and the `.git` overlay (AMENDMENTS-02 B2), plus the
-//! forbidden-flag checker the red-team harness relies on (CLAUDE.md hard rules).
+//! Tasks 6a/6b: the pure `podman create` argv builder for every role (AMENDMENTS-01 §2, §6.1,
+//! §6.2) and every mount mode, including `staged` and the `.git` overlay (AMENDMENTS-02 B2), plus
+//! the forbidden-flag checker the red-team harness relies on (CLAUDE.md hard rules). Git scans
+//! come from the real launch scanner over fixture trees: only it can construct one (#10).
+//!
+//! Over the 800-line guideline on purpose: one allow and one deny case per checker predicate,
+//! kept next to each other so a reviewer sees every rule of `check_argv` in one file.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::BTreeSet;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use proptest::prelude::*;
-use sally_core::manifest::{ByteSize, Cpus, HostEnv, ValidatedManifest, load};
+use sally_core::manifest::{ByteSize, Cpus};
 use sallyd::sandbox::{
-    Allowed, ArgvError, CheckedRuntime, CommonArgs, GitScan, Grant, ImageRef, InferenceSpec, Role,
-    SessionId, SessionPaths, Source, UserIds, check_argv, harness_argv, inference_argv,
-    workspace_argv,
+    Allowed, ArgvError, Grant, ImageRef, InferenceSpec, Role, SessionId, Source, VerifiedModel,
+    check_argv, harness_argv, inference_argv, workspace_argv,
 };
 
-const D0: &str = "0000000000000000000000000000000000000000000000000000000000000000";
-const D1: &str = "1111111111111111111111111111111111111111111111111111111111111111";
-const D2: &str = "2222222222222222222222222222222222222222222222222222222222222222";
-const HEADER: &str = "apiVersion: sallyport/v1\nkind: Manifest\nname: t\nmodel:\n  ref: any\n";
-
-static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-/// A throwaway `$HOME`, runtime and state directories, removed on drop. Lives under
-/// `CARGO_TARGET_TMPDIR`: a target directory under `/tmp` cannot host it, because the runtime
-/// check refuses a world-writable ancestor and the manifest denylist refuses `/tmp` mounts.
-struct Fx {
-    root: PathBuf,
-    env: HostEnv,
-    common: CommonArgs,
-    paths: SessionPaths,
-}
-
-impl Fx {
-    fn new() -> Self {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("sallyd-argv-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let home = root.join("home");
-        for d in [
-            "code/myproject",
-            "code/other",
-            "Documents/research",
-            ".config/sallyport",
-            ".local/share/sallyport",
-        ] {
-            std::fs::create_dir_all(home.join(d)).unwrap();
-        }
-        for d in ["run", "bin", "profiles"] {
-            std::fs::create_dir_all(root.join(d)).unwrap();
-        }
-        let root = std::fs::canonicalize(&root).unwrap();
-        let crun = root.join("bin/crun");
-        std::fs::write(&crun, "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(&crun, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let home = root.join("home");
-        let env = HostEnv {
-            home: home.clone(),
-            other_homes: Vec::new(),
-            xdg_config_home: None,
-            xdg_data_home: None,
-            xdg_runtime_dir: Some(root.join("run")),
-            podman_storage: vec![home.join(".local/share/containers/storage")],
-            nproc: 8,
-            mem_bytes: 16 << 30,
-        };
-        let common = CommonArgs {
-            runtime: CheckedRuntime::check(&crun).unwrap(),
-            ids: UserIds {
-                uid: 1000,
-                gid: 1000,
-            },
-            profiles: root.join("profiles"),
-        };
-        let paths = SessionPaths::new(
-            SessionId::parse("s-0001").unwrap(),
-            &root.join("run/sallyport"),
-            &home.join(".local/share/sallyport"),
-        )
-        .unwrap();
-        Self {
-            root,
-            env,
-            common,
-            paths,
-        }
-    }
-
-    fn load(&self, body: &str) -> ValidatedManifest {
-        let secrets: BTreeSet<String> = ["GITHUB_TOKEN".to_owned()].into_iter().collect();
-        match load(&format!("{HEADER}{body}"), &self.env, &secrets) {
-            Ok(v) => v.manifest,
-            Err(e) => panic!("{e:#?}"),
-        }
-    }
-
-    fn redact(&self, args: &[String]) -> String {
-        let root = self.root.display().to_string();
-        args.iter()
-            .map(|a| a.replace(&root, "$ROOT"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-}
-
-impl Drop for Fx {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
-}
-
-fn image(name: &str, digest: &str) -> ImageRef {
-    ImageRef::parse(&format!("ghcr.io/sallyport/{name}@sha256:{digest}")).unwrap()
-}
-
-fn ws_image() -> ImageRef {
-    image("workspace", D1)
-}
-
-fn mount(host: &str, guest: &str, mode: &str) -> String {
-    format!("    - host: \"{host}\"\n      guest: {guest}\n      mode: {mode}\n")
-}
-
-fn mounts(list: &[String]) -> String {
-    format!("filesystem:\n  mounts:\n{}", list.concat())
-}
-
-const PROXY: &str = "network:\n  mode: proxy\n  allow:\n    - host: pypi.org\n";
+mod common;
+use common::*;
 
 // ---- snapshots: workspace, every mount mode -------------------------------------------------
 
@@ -136,20 +26,20 @@ const PROXY: &str = "network:\n  mode: proxy\n  allow:\n    - host: pypi.org\n";
 fn snapshot_workspace_ro_no_network() {
     let f = Fx::new();
     let v = f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "ro")]));
-    let a = workspace_argv(&f.common, &f.paths, &v, &[], &ws_image()).unwrap();
+    let a = workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), &ws_image()).unwrap();
     insta::assert_snapshot!("workspace-ro", f.redact(&a));
 }
 
 #[test]
 fn snapshot_workspace_rw_with_git_overlays_and_pointer_files() {
     let f = Fx::new();
+    f.tree(
+        "code/myproject",
+        &[".git", "vendor/lib/.git"],
+        &["sub/module/.git"],
+    );
     let v = f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "rw")]));
-    let scan = GitScan {
-        mount: 0,
-        dirs: vec![PathBuf::from(".git"), PathBuf::from("vendor/lib/.git")],
-        files: vec![PathBuf::from("sub/module/.git")],
-    };
-    let a = workspace_argv(&f.common, &f.paths, &v, &[scan], &ws_image()).unwrap();
+    let a = workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), &ws_image()).unwrap();
     insta::assert_snapshot!("workspace-rw-git", f.redact(&a));
 }
 
@@ -161,7 +51,7 @@ fn snapshot_workspace_brokered_is_a_read_only_bind() {
         "/workspace/r",
         "brokered",
     )]));
-    let a = workspace_argv(&f.common, &f.paths, &v, &[], &ws_image()).unwrap();
+    let a = workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), &ws_image()).unwrap();
     insta::assert_snapshot!("workspace-brokered", f.redact(&a));
 }
 
@@ -175,13 +65,14 @@ fn snapshot_workspace_staged_mounts_and_proxy() {
             mount("~/code/other", "/workspace/o", "staged"),
         ])
     ));
-    let a = workspace_argv(&f.common, &f.paths, &v, &[], &ws_image()).unwrap();
+    let a = workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), &ws_image()).unwrap();
     insta::assert_snapshot!("workspace-staged-proxy", f.redact(&a));
 }
 
 #[test]
 fn snapshot_workspace_all_modes_secrets_and_custom_image() {
     let f = Fx::new();
+    f.tree("code/myproject", &[".git"], &[]);
     let v = f.load(&format!(
         "runtime:\n  image: ghcr.io/x/tools@sha256:{D2}\n  cpus: 2.5\n  memory: 3GiB\n  pids: 256\n  tmp_size: 512MiB\n  tmp_exec: true\n{}network:\n  mode: proxy\n  allow:\n    - host: api.github.com\nsecrets:\n  - name: GITHUB_TOKEN\n    inject: {{host: api.github.com, header: Authorization, format: \"Bearer {{value}}\"}}\n    expose_env: GH_TOKEN\n",
         mounts(&[
@@ -190,12 +81,7 @@ fn snapshot_workspace_all_modes_secrets_and_custom_image() {
             mount("~/Documents/research", "/workspace/r", "staged"),
         ])
     ));
-    let scan = GitScan {
-        mount: 0,
-        dirs: vec![PathBuf::from(".git")],
-        files: Vec::new(),
-    };
-    let a = workspace_argv(&f.common, &f.paths, &v, &[scan], &ws_image()).unwrap();
+    let a = workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), &ws_image()).unwrap();
     insta::assert_snapshot!("workspace-all-modes-secrets", f.redact(&a));
 }
 
@@ -217,12 +103,16 @@ fn inference(f: &Fx, gpu: bool, memory: Option<ByteSize>) -> InferenceSpec {
         .root
         .join("home/.local/share/sallyport/library/blobs/sha256")
         .join(D0);
-    std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
-    std::fs::write(&blob, b"GGUF").unwrap();
+    if !blob.exists() {
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, b"GGUF").unwrap();
+        std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o444)).unwrap();
+    }
+    let blobs = blob.parent().unwrap().parent().unwrap();
     InferenceSpec {
         instance: SessionId::parse("i-0001").unwrap(),
         socket_dir: f.root.join("run/sallyport/infer/i-0001"),
-        model: blob,
+        model: VerifiedModel::pin(blobs, D0).unwrap(),
         image: image("inference", D0),
         gpu,
         gpu_layers: 99,
@@ -248,15 +138,8 @@ fn snapshot_inference_gpu_and_cpu() {
 
 // ---- invariants of every argv ---------------------------------------------------------------
 
-fn scan(mount: usize, dirs: &[&str], files: &[&str]) -> GitScan {
-    GitScan {
-        mount,
-        dirs: dirs.iter().map(PathBuf::from).collect(),
-        files: files.iter().map(PathBuf::from).collect(),
-    }
-}
-
 fn every_argv(f: &Fx) -> Vec<Vec<String>> {
+    f.tree("code/myproject", &[".git"], &[]);
     let v = f.load(&format!(
         "{}{PROXY}",
         mounts(&[
@@ -266,14 +149,7 @@ fn every_argv(f: &Fx) -> Vec<Vec<String>> {
         ])
     ));
     vec![
-        workspace_argv(
-            &f.common,
-            &f.paths,
-            &v,
-            &[scan(0, &[".git"], &[])],
-            &ws_image(),
-        )
-        .unwrap(),
+        workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), &ws_image()).unwrap(),
         harness_argv(&f.common, &f.paths, &v, &image("harness", D0)).unwrap(),
         inference_argv(&f.common, &inference(f, true, None)).unwrap(),
     ]
@@ -285,7 +161,11 @@ fn every_role_starts_with_the_checked_runtime_and_has_the_section_6_1_flags() {
     for a in every_argv(&f) {
         assert_eq!(a[0], "--runtime", "{a:?}");
         assert_eq!(a[1], f.root.join("bin/crun").display().to_string());
-        assert_eq!(a[2], "run");
+        assert_eq!(a[2], "--hooks-dir");
+        assert_eq!(a[3], f.root.join("hooks").display().to_string());
+        assert_eq!(a[4], "--default-mounts-file");
+        assert_eq!(a[5], f.root.join("mounts.conf").display().to_string());
+        assert_eq!(a[6], "create");
         for flag in [
             "--rm",
             "--pull=never",
@@ -295,7 +175,6 @@ fn every_role_starts_with_the_checked_runtime_and_has_the_section_6_1_flags() {
             "--no-hosts",
             "--read-only",
             "--cap-drop=ALL",
-            "--security-opt=no-new-privileges",
             "--userns=keep-id",
             "--init",
             "--env-host=false",
@@ -306,8 +185,9 @@ fn every_role_starts_with_the_checked_runtime_and_has_the_section_6_1_flags() {
                 "{flag} in {a:?}"
             );
         }
-        let core = a.windows(2).any(|w| w[0] == "--ulimit" && w[1] == "core=0");
-        assert!(core, "{a:?}");
+        let pair = |x: &str, y: &str| a.windows(2).filter(|w| w[0] == x && w[1] == y).count();
+        assert_eq!(pair("--ulimit", "core=0"), 1, "{a:?}");
+        assert_eq!(pair("--security-opt", "no-new-privileges"), 1, "{a:?}");
     }
 }
 
@@ -353,15 +233,9 @@ fn roles_never_share_a_socket_directory() {
 #[test]
 fn git_overlays_land_in_session_scratch_and_never_touch_the_host_git() {
     let f = Fx::new();
+    f.tree("code/myproject", &[".git"], &[]);
     let v = f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "rw")]));
-    let a = workspace_argv(
-        &f.common,
-        &f.paths,
-        &v,
-        &[scan(0, &[".git"], &[])],
-        &ws_image(),
-    )
-    .unwrap();
+    let a = workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), &ws_image()).unwrap();
     let host_git = f
         .root
         .join("home/code/myproject/.git")
@@ -388,19 +262,13 @@ fn git_overlays_land_in_session_scratch_and_never_touch_the_host_git() {
 #[test]
 fn nested_git_parents_are_pinned_by_self_binds() {
     let f = Fx::new();
+    f.tree(
+        "code/myproject",
+        &["vendor/lib/.git", "vendor/x/.git"],
+        &["sub/module/.git"],
+    );
     let v = f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "rw")]));
-    let a = workspace_argv(
-        &f.common,
-        &f.paths,
-        &v,
-        &[scan(
-            0,
-            &["vendor/lib/.git", "vendor/x/.git"],
-            &["sub/module/.git"],
-        )],
-        &ws_image(),
-    )
-    .unwrap();
+    let a = workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), &ws_image()).unwrap();
     let host = f.root.join("home/code/myproject").display().to_string();
     let self_binds: Vec<&str> = a
         .iter()
@@ -420,49 +288,19 @@ fn nested_git_parents_are_pinned_by_self_binds() {
     );
 }
 
+/// Every `rw` mount gets a git scan, empty when it holds no `.git`; the builder's refusal of a
+/// missing, duplicate or malformed scan is unit-tested in `argv.rs` (only the scanner builds one).
 #[test]
-fn rw_mounts_need_a_git_scan_even_if_empty() {
+fn an_rw_mount_without_git_entries_gets_an_empty_scan() {
     let f = Fx::new();
     let v = f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "rw")]));
-    let r = workspace_argv(&f.common, &f.paths, &v, &[], &ws_image());
-    assert!(
-        matches!(&r, Err(ArgvError::Input(m)) if m.contains("filesystem.mounts[0]")),
-        "{r:?}"
-    );
-    workspace_argv(&f.common, &f.paths, &v, &[scan(0, &[], &[])], &ws_image()).unwrap();
+    let scan = f.scan(&v);
+    assert_eq!(scan.git().len(), 1);
+    assert!(scan.git()[0].dirs().is_empty() && scan.git()[0].files().is_empty());
+    workspace_argv(&f.common, &f.paths, &v, &scan, &ws_image()).unwrap();
 }
 
 // ---- builder refuses bad input ------------------------------------------------------------------
-
-#[test]
-fn git_scan_entries_are_validated() {
-    let f = Fx::new();
-    let v = f.load(&mounts(&[
-        mount("~/code/myproject", "/workspace/p", "rw"),
-        mount("~/code/other", "/workspace/o", "staged"),
-    ]));
-    let bad = [
-        vec![scan(0, &["../x/.git"], &[])],
-        vec![scan(0, &["/abs/.git"], &[])],
-        vec![scan(0, &["a:b/.git"], &[])],
-        vec![scan(0, &["a,ro/.git"], &[])],
-        vec![scan(0, &["not-git"], &[])],
-        vec![scan(0, &["a//.git"], &[])],
-        vec![scan(0, &[".git/modules/x/.git"], &[])],
-        vec![scan(0, &[], &["x/./.git"])],
-        vec![scan(0, &[".git"], &[".git"])],
-        vec![scan(0, &[], &[]), scan(0, &[], &[])],
-        vec![scan(0, &[], &[]), scan(1, &[".git"], &[])],
-        vec![scan(0, &[], &[]), scan(7, &[".git"], &[])],
-    ];
-    for scans in bad {
-        let r = workspace_argv(&f.common, &f.paths, &v, &scans, &ws_image());
-        assert!(
-            matches!(&r, Err(ArgvError::Input(m)) if m.contains("filesystem.mounts[")),
-            "{scans:?}: {r:?}"
-        );
-    }
-}
 
 #[test]
 fn identifiers_and_images_are_validated() {
@@ -496,8 +334,13 @@ fn identifiers_and_images_are_validated() {
 #[test]
 fn inference_refuses_a_model_or_socket_path_that_would_break_the_mount_syntax() {
     let f = Fx::new();
+    let blobs = f.root.join("bl:obs");
+    std::fs::create_dir_all(blobs.join("sha256")).unwrap();
+    let blob = blobs.join("sha256").join(D1);
+    std::fs::write(&blob, b"GGUF").unwrap();
+    std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o444)).unwrap();
     let mut spec = inference(&f, false, None);
-    spec.model = f.root.join("a:b");
+    spec.model = VerifiedModel::pin(&blobs, D1).unwrap();
     assert!(matches!(
         inference_argv(&f.common, &spec),
         Err(ArgvError::Input(_))
@@ -515,7 +358,7 @@ fn inference_refuses_a_model_or_socket_path_that_would_break_the_mount_syntax() 
 /// A workspace argv with one `ro` mount and the policy a hand-written caller would give it.
 fn base(f: &Fx) -> (Vec<String>, Allowed) {
     let v = f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "ro")]));
-    let a = workspace_argv(&f.common, &f.paths, &v, &[], &ws_image()).unwrap();
+    let a = workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), &ws_image()).unwrap();
     (a, allowed(f, Role::Workspace, Grant::Ro))
 }
 
@@ -527,6 +370,9 @@ fn allowed(f: &Fx, role: Role, project: Grant) -> Allowed {
     };
     Allowed {
         role,
+        runtime: f.common.runtime.path().to_owned(),
+        hooks_dir: f.common.hooks_dir.clone(),
+        mounts_file: f.common.mounts_file.clone(),
         ids: f.common.ids,
         profiles: f.common.profiles.clone(),
         sources: vec![
@@ -538,10 +384,10 @@ fn allowed(f: &Fx, role: Role, project: Grant) -> Allowed {
 }
 
 fn with(a: &[String], extra: &[&str]) -> Vec<String> {
-    // Insert just after `run`, where podman reads options.
-    let mut out = a[..3].to_vec();
+    // Insert just after `create`, where podman reads options.
+    let mut out = a[..7].to_vec();
     out.extend(extra.iter().map(|s| (*s).to_owned()));
-    out.extend_from_slice(&a[3..]);
+    out.extend_from_slice(&a[7..]);
     out
 }
 
@@ -603,6 +449,13 @@ fn checker_refuses_every_forbidden_flag() {
         &["--env-host"],
         &["--env-host=true"],
         &["--hooks-dir=/x"],
+        &["--hooks-dir", "/x"],
+        // One spelling per option (6a re-review L6).
+        &["--pull", "never"],
+        &["--security-opt=no-new-privileges"],
+        &["--user=1000:1000"],
+        &["--rm=true"],
+        &["--network"],
     ];
     for extra in forbidden {
         assert_forbidden(&with(&a, extra), &allowed, &format!("{extra:?}"));
@@ -660,6 +513,11 @@ fn checker_refuses_wrong_values_of_allowed_options() {
         ("--cap-drop=ALL", &["--cap-drop=NET_RAW"]),
         ("--userns=keep-id", &["--userns=auto"]),
         ("--env-host=false", &["--env-host=true"]),
+        // Right value, wrong spelling (6a re-review L6).
+        ("--user", &["--user=1000:1000"]),
+        ("--hostname", &["--hostname=sandbox"]),
+        ("--pull=never", &["--pull", "never"]),
+        ("--network=none", &["--network", "none"]),
     ];
     for (old, new) in cases {
         assert_forbidden(
@@ -843,13 +701,109 @@ fn checker_holds_every_mount_to_its_grant() {
     }
 }
 
+/// 6a re-review L3: the runtime and hooks directory are exact, and the verb is `create`.
+#[test]
+fn checker_pins_the_runtime_the_hooks_dir_the_mounts_file_and_the_verb() {
+    let f = Fx::new();
+    let (a, allowed) = base(&f);
+    let other = f.root.join("bin/other").display().to_string();
+    for (i, bad) in [
+        (1, other.as_str()),
+        (3, other.as_str()),
+        (5, other.as_str()),
+        (6, "run"),
+        (6, "exec"),
+    ] {
+        let mut b = a.clone();
+        b[i] = bad.to_owned();
+        assert_forbidden(&b, &allowed, &format!("[{i}] = {bad}"));
+    }
+    let swapped = [&a[2..4], &a[0..2], &a[4..]].concat();
+    assert_forbidden(&swapped, &allowed, "globals reordered");
+    let without_mounts_file = [&a[0..4], &a[6..]].concat();
+    assert_forbidden(&without_mounts_file, &allowed, "no --default-mounts-file");
+}
+
+/// 6a re-review L2: `/` would make every host path "inside" a grant or scratch.
+#[test]
+fn checker_refuses_root_as_a_policy_path() {
+    let f = Fx::new();
+    let (a, allowed) = base(&f);
+    let mut p = allowed.clone();
+    p.sources.push(Source {
+        path: "/".into(),
+        guest: "/workspace/z".into(),
+        grant: Grant::Rw,
+    });
+    assert_forbidden(&a, &p, "/ as a source");
+    let mut p = allowed.clone();
+    p.scratch = Some("/".into());
+    assert_forbidden(&a, &p, "/ as scratch");
+    let mut p = allowed;
+    p.profiles = "/".into();
+    assert_forbidden(&a, &p, "/ as the profile directory");
+}
+
+/// 6a re-review L1: overlays never share or nest upper and work directories, so one overlay's
+/// writes (a `.git` overlay's hooks) never show up in another (a staged mount's changes).
+#[test]
+fn checker_keeps_overlay_scratch_disjoint() {
+    let f = Fx::new();
+    let (a, _) = base(&f);
+    let p = f.root.join("home/code/myproject").display().to_string();
+    let d = f.paths.data_root().display().to_string();
+    let rw = allowed(&f, Role::Workspace, Grant::Rw);
+    let rw_base = replacing(
+        &a,
+        &format!("{p}:/workspace/p:ro,nosuid,nodev,bind"),
+        &[&format!("{p}:/workspace/p:rw,nosuid,nodev,bind")],
+    );
+    let ov = |rel: &str, upper: &str, work: &str| {
+        format!("{p}/{rel}:/workspace/p/{rel}:O,upperdir={d}/{upper},workdir={d}/{work}")
+    };
+    let first = ov(".git", "git/0/upper", "git/0/work");
+    check_argv(
+        &with(
+            &rw_base,
+            &[
+                "-v",
+                &first,
+                "-v",
+                &ov("s/.git", "git/1/upper", "git/1/work"),
+            ],
+        ),
+        &rw,
+    )
+    .unwrap();
+    for (upper, work) in [
+        ("git/0/upper", "git/1/work"),
+        ("git/1/upper", "git/0/work"),
+        ("git/0/upper/x", "git/1/work"),
+        ("git/1/upper", "git/0/upper"),
+        ("git", "git/1/work"),
+    ] {
+        let second = ov("s/.git", upper, work);
+        assert_forbidden(
+            &with(&rw_base, &["-v", &first, "-v", &second]),
+            &rw,
+            &format!("{upper} {work}"),
+        );
+    }
+    // Within one overlay, upper and work are disjoint too.
+    assert_forbidden(
+        &with(&rw_base, &["-v", &ov(".git", "git/0", "git/0/work")]),
+        &rw,
+        "work inside upper",
+    );
+}
+
 #[test]
 fn checker_requires_every_hardening_option_exactly_once() {
     let f = Fx::new();
     let (a, allowed) = base(&f);
     // Removing any option other than a mount or a variable fails; duplicating any option fails.
     let image_at = a.iter().position(|x| x.starts_with("ghcr.io/")).unwrap();
-    let mut i = 3;
+    let mut i = 7;
     while i < image_at {
         let tok = &a[i];
         let takes_value = !tok.contains('=') && !a[i + 1].starts_with('-') && i + 1 < image_at;
@@ -893,7 +847,7 @@ fn checker_requires_each_roles_fixed_command_and_a_pinned_image() {
         role: Role::Inference,
         sources: vec![
             Source {
-                path: spec.model.clone(),
+                path: spec.model.path().to_owned(),
                 guest: "/models/model.gguf".into(),
                 grant: Grant::Ro,
             },
@@ -974,6 +928,9 @@ fn checker_refuses_relative_or_empty_policy_paths() {
 fn every_mount_mix_builds_and_passes_the_checker() {
     let f = Fx::new();
     let hosts = ["~/code/myproject", "~/code/other", "~/Documents/research"];
+    for h in ["code/myproject", "code/other", "Documents/research"] {
+        f.tree(h, &[".git"], &["s/.git"]);
+    }
     let modes = ["ro", "rw", "brokered", "staged"];
     let mut mixes: Vec<Vec<&str>> = vec![Vec::new()];
     for len in 1..=3 {
@@ -1004,17 +961,14 @@ fn every_mount_mix_builds_and_passes_the_checker() {
                 body
             };
             let v = f.load(&body);
-            let scans: Vec<GitScan> = mix
-                .iter()
-                .enumerate()
-                .filter(|(_, m)| **m == "rw")
-                .map(|(i, _)| scan(i, &[".git"], &["s/.git"]))
-                .collect();
-            let a = workspace_argv(&f.common, &f.paths, &v, &scans, &ws_image()).unwrap();
+            let scan = f.scan(&v);
+            let rw = mix.iter().filter(|m| **m == "rw").count();
+            assert_eq!(scan.git().len(), rw);
+            let a = workspace_argv(&f.common, &f.paths, &v, &scan, &ws_image()).unwrap();
             // mounts + per rw scan (overlay, parent self-bind, pointer file) + sockets
             assert_eq!(
                 a.iter().filter(|x| *x == "-v").count(),
-                mix.len() + scans.len() * 3 + 1
+                mix.len() + rw * 3 + 1
             );
             let has_proxy = a.iter().any(|x| x == "HTTP_PROXY=http://127.0.0.1:3128");
             assert_eq!(has_proxy, proxy, "{mix:?}");
@@ -1038,7 +992,7 @@ proptest! {
         let image_at = a.iter().position(|x| x.starts_with("ghcr.io/")).unwrap();
         let tok = match &value { Some(v) => format!("--{name}={v}"), None => format!("--{name}") };
         // Insert at an option boundary (never between an option and its separate value).
-        let bounds: Vec<usize> = (3..=image_at)
+        let bounds: Vec<usize> = (7..=image_at)
             .filter(|&i| a[i].starts_with('-') || i == image_at)
             .collect();
         let i = bounds[at % bounds.len()];

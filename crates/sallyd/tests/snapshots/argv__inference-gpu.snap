@@ -4,7 +4,11 @@ expression: f.redact(&a)
 ---
 --runtime
 $ROOT/bin/crun
-run
+--hooks-dir
+$ROOT/hooks
+--default-mounts-file
+$ROOT/mounts.conf
+create
 --rm
 --name
 sp-infer-i-0001
@@ -18,7 +22,8 @@ core=0
 --read-only
 --read-only-tmpfs=false
 --cap-drop=ALL
---security-opt=no-new-privileges
+--security-opt
+no-new-privileges
 --security-opt
 seccomp=$ROOT/profiles/seccomp-inference.json
 --security-opt

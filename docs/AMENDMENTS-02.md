@@ -93,21 +93,21 @@ plus the live summary.
     `sub/.git` and a submodule pointer file `mod/.git`, the sandbox runs
     `mv sub sub2 && mkdir -p sub/.git` and the same for `mod`. PASS: both renames fail with
     `EBUSY` (the parents are self-bound) and the host `sub/.git` and `mod/.git` are unchanged.
+    (Task 6b: `crates/sallyd/tests/launch.rs::rt_fs_12_git_shields_hold_inside_the_container`
+    covers the renames, the overlay writes and the read-only pointer file; the full row with the
+    host canary runs in the red-team harness, Task 13.)
     A bare `project.git` inside an `rw` mount is **not** shielded and `summary()` says so.
 - New **RT-FS-15**. In a `staged` mount the sandbox creates, modifies and deletes files, including
   `.vscode/settings.json` and a nested `sub/.git/config`.
   - PASS: the host directory tree hash is identical during and after the session;
   - `sally session changes` lists exactly those paths.
 
-## B4. Mount source
+## B4. Mount source — folded
 
-Decision: the inode re-check fallback is adopted, with two additions:
-- **Overlap rule.** Two live sessions may overlap only when neither mount is `rw` or `brokered`,
-  so no sandbox ever holds write access to an ancestor of another session's mount root.
-- **Post-start check for bind mounts.** After the idle workspace container is up and before
-  anything runs, stat `/proc/<init-pid>/root/<guest>` from the host and compare `st_dev:st_ino`
-  with the pinned inode. On a mismatch, kill the container and audit `sandbox.mount_mismatch`. If
-  that path is not readable rootless, drop the check and document the window.
+Folded in Task 6b into `ARCHITECTURE.md` §3.5 (overlap rule, launch scan pins, host re-check
+before `podman init`, post-init check through `/proc/<init-pid>/root`, `sandbox.mount_mismatch`).
+The post-init check is readable rootless (probed) and runs before `start`, so nothing in the
+container has run when it compares.
 
 ## B5. Pin the OCI runtime — remaining
 

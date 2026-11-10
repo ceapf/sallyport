@@ -16,8 +16,9 @@ use super::argv::{
 };
 use super::types::{ArgvError, ImageRef, Role, UserIds};
 
-/// Options that take a separate value when written without `=`.
-const VALUE_FLAGS: [&str; 16] = [
+/// Options written `--flag value`, as two tokens; `--flag=value` is refused, so the argv has one
+/// spelling and does not depend on how podman parses either form.
+const SPACE_FLAGS: [&str; 12] = [
     "--name",
     "--ulimit",
     "--tmpfs",
@@ -30,11 +31,20 @@ const VALUE_FLAGS: [&str; 16] = [
     "--env",
     "-v",
     "--device",
-    "--network",
-    "--userns",
-    "--pull",
-    "--cap-drop",
 ];
+/// Options written `--flag=value`, as one token; the two-token form is refused.
+const EQ_FLAGS: [&str; 8] = [
+    "--pull",
+    "--http-proxy",
+    "--log-driver",
+    "--network",
+    "--read-only-tmpfs",
+    "--cap-drop",
+    "--userns",
+    "--env-host",
+];
+/// Options that take no value.
+const BARE_FLAGS: [&str; 4] = ["--rm", "--no-hosts", "--read-only", "--init"];
 /// Options that may appear more than once (with distinct values).
 const REPEATABLE: [&str; 3] = ["-v", "--env", "--security-opt"];
 /// Options every role must carry exactly once (`--security-opt` is counted per kind in
@@ -92,6 +102,12 @@ pub struct Source {
 pub struct Allowed {
     /// The role the argv is for.
     pub role: Role,
+    /// The checked OCI runtime (`--runtime`, AMENDMENTS-02 B5).
+    pub runtime: PathBuf,
+    /// Sallyport's empty OCI hooks directory (`--hooks-dir`, #11).
+    pub hooks_dir: PathBuf,
+    /// Sallyport's empty mounts file (`--default-mounts-file`).
+    pub mounts_file: PathBuf,
     /// The host user (`--user <uid>:<gid>`).
     pub ids: UserIds,
     /// The seccomp profile directory; the profile must be `<profiles>/seccomp-<role>.json`.
@@ -112,10 +128,7 @@ fn forbid<T>(msg: impl Into<String>) -> Result<T, ArgvError> {
 /// [`ArgvError::Forbidden`] naming the first offending option.
 pub fn check_argv(args: &[String], allowed: &Allowed) -> Result<(), ArgvError> {
     check_allowed(allowed)?;
-    match args {
-        [flag, runtime, run, ..] if flag == "--runtime" && run == "run" && abs_clean(runtime) => {}
-        _ => return forbid("argv must start with --runtime <absolute path> run"),
-    }
+    check_globals(args, allowed)?;
     let (options, image_at) = split_options(args)?;
     let mut seen = Seen::default();
     for (flag, value) in &options {
@@ -126,16 +139,49 @@ pub fn check_argv(args: &[String], allowed: &Allowed) -> Result<(), ArgvError> {
     check_tail(args.get(image_at..).unwrap_or_default(), allowed.role)
 }
 
+/// Number of tokens before the first `create` option:
+/// `--runtime <p> --hooks-dir <d> --default-mounts-file <f> create`.
+const GLOBALS: usize = 7;
+
+/// The global options are exactly the checked runtime, Sallyport's hooks directory and mounts
+/// file, and the verb is `create` (the launcher inspects the container before it starts it).
+fn check_globals(args: &[String], a: &Allowed) -> Result<(), ArgvError> {
+    let is = |tok: &String, p: &Path| Path::new(tok) == p;
+    match args {
+        [f1, runtime, f2, hooks, f3, mounts, verb, ..]
+            if f1 == "--runtime"
+                && is(runtime, &a.runtime)
+                && f2 == "--hooks-dir"
+                && is(hooks, &a.hooks_dir)
+                && f3 == "--default-mounts-file"
+                && is(mounts, &a.mounts_file)
+                && verb == "create" =>
+        {
+            Ok(())
+        }
+        _ => forbid(
+            "argv must start with --runtime <checked runtime> --hooks-dir <sallyport hooks dir> \
+             --default-mounts-file <sallyport mounts file> create",
+        ),
+    }
+}
+
 fn check_allowed(a: &Allowed) -> Result<(), ArgvError> {
     let paths = a.sources.iter().map(|s| s.path.as_path());
     let guests = a.sources.iter().map(|s| Path::new(&s.guest));
-    let all = paths
-        .chain(guests)
-        .chain(a.scratch.as_deref())
-        .chain([a.profiles.as_path()]);
+    let all = paths.chain(guests).chain(a.scratch.as_deref()).chain([
+        a.profiles.as_path(),
+        a.runtime.as_path(),
+        a.hooks_dir.as_path(),
+        a.mounts_file.as_path(),
+    ]);
     for p in all {
-        if !p.to_str().is_some_and(abs_clean) {
-            return forbid(format!("allowed path {} must be absolute", p.display()));
+        // `/` as a source, scratch or profile directory would make every host path "inside" it.
+        if !p.to_str().is_some_and(|s| abs_clean(s) && s != "/") {
+            return forbid(format!(
+                "allowed path {} must be absolute and not /",
+                p.display()
+            ));
         }
     }
     Ok(())
@@ -143,10 +189,12 @@ fn check_allowed(a: &Allowed) -> Result<(), ArgvError> {
 
 type Options = Vec<(String, Option<String>)>;
 
-/// Splits the options (after `--runtime <path> run`) from the image and command.
+/// Splits the options (after the globals and the verb) from the image and command. Each option
+/// must use its one spelling: [`SPACE_FLAGS`] as two tokens, [`EQ_FLAGS`] as `--flag=value`,
+/// [`BARE_FLAGS`] alone; anything else is refused in [`check_option`].
 fn split_options(args: &[String]) -> Result<(Options, usize), ArgvError> {
     let mut out = Vec::new();
-    let mut i = 3;
+    let mut i = GLOBALS;
     loop {
         let Some(tok) = args.get(i) else {
             return forbid("no image");
@@ -154,16 +202,23 @@ fn split_options(args: &[String]) -> Result<(Options, usize), ArgvError> {
         if !tok.starts_with('-') {
             return Ok((out, i));
         }
-        let (flag, value) = match tok.split_once('=') {
-            Some((f, v)) => (f.to_owned(), Some(v.to_owned())),
-            None if VALUE_FLAGS.contains(&tok.as_str()) => {
-                i += 1;
-                let Some(v) = args.get(i) else {
-                    return forbid(format!("{tok} has no value"));
-                };
-                (tok.clone(), Some(v.clone()))
+        let (flag, value) = if SPACE_FLAGS.contains(&tok.as_str()) {
+            i += 1;
+            let Some(v) = args.get(i) else {
+                return forbid(format!("{tok} has no value"));
+            };
+            (tok.clone(), Some(v.clone()))
+        } else if let Some((f, v)) = tok.split_once('=') {
+            if !EQ_FLAGS.contains(&f) {
+                return forbid(format!("{f} must not be written as {f}=…"));
             }
-            None => (tok.clone(), None),
+            (f.to_owned(), Some(v.to_owned()))
+        } else if BARE_FLAGS.contains(&tok.as_str()) {
+            (tok.clone(), None)
+        } else if EQ_FLAGS.contains(&tok.as_str()) {
+            return forbid(format!("{tok} must be written as {tok}=<value>"));
+        } else {
+            return forbid(format!("podman option {tok} is not allowed here"));
         };
         out.push((flag, value));
         i += 1;
@@ -177,6 +232,8 @@ struct Seen {
     security: HashSet<String>,
     dests: HashSet<String>,
     env: HashSet<String>,
+    /// Overlay upper and work directories so far: no two may be equal or nested.
+    scratch: Vec<PathBuf>,
 }
 
 impl Seen {
@@ -354,7 +411,7 @@ fn volume(v: &str, a: &Allowed, seen: &mut Seen) -> Result<(), ArgvError> {
     let kind = match opts.split(',').collect::<Vec<_>>().as_slice() {
         ["ro", "nosuid", "nodev", "bind"] => Kind::Ro,
         ["rw", "nosuid", "nodev", "bind"] => Kind::Rw,
-        ["O", upper, work] if overlay_dirs_ok(upper, work, a) => Kind::Overlay,
+        ["O", upper, work] if overlay_dirs_ok(upper, work, a, seen) => Kind::Overlay,
         _ => {
             return forbid(format!(
                 "-v options {opts} must be ro|rw,nosuid,nodev,bind or an overlay in session scratch"
@@ -397,17 +454,32 @@ fn granted(s: &Source, src: &Path, dst: &Path, kind: Kind) -> bool {
             .is_ok_and(|rel| !rel.as_os_str().is_empty() && dst == Path::new(&s.guest).join(rel))
 }
 
-fn overlay_dirs_ok(upper: &str, work: &str, a: &Allowed) -> bool {
+/// Upper and work directories inside session scratch, and disjoint from each other and from
+/// every other overlay's: a shared upper directory would leak one overlay's writes into another
+/// (a `.git` overlay's hooks into a staged mount's changes).
+fn overlay_dirs_ok(upper: &str, work: &str, a: &Allowed, seen: &mut Seen) -> bool {
     let Some(scratch) = &a.scratch else {
         return false;
     };
-    let in_scratch = |opt: &str, key: &str| {
+    let dir = |opt: &str, key: &str| {
         opt.strip_prefix(key)
-            .is_some_and(|p| abs_clean(p) && strictly_under(Path::new(p), scratch))
+            .filter(|p| abs_clean(p) && strictly_under(Path::new(p), scratch))
+            .map(PathBuf::from)
     };
-    upper.strip_prefix("upperdir=") != work.strip_prefix("workdir=")
-        && in_scratch(upper, "upperdir=")
-        && in_scratch(work, "workdir=")
+    let (Some(upper), Some(work)) = (dir(upper, "upperdir="), dir(work, "workdir=")) else {
+        return false;
+    };
+    let overlaps = |x: &Path, y: &Path| x.starts_with(y) || y.starts_with(x);
+    if overlaps(&upper, &work)
+        || seen
+            .scratch
+            .iter()
+            .any(|s| overlaps(s, &upper) || overlaps(s, &work))
+    {
+        return false;
+    }
+    seen.scratch.extend([upper, work]);
+    true
 }
 
 fn strictly_under(p: &Path, root: &Path) -> bool {
