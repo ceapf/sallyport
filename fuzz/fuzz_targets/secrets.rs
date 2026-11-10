@@ -8,17 +8,16 @@
 #![no_main]
 #![forbid(unsafe_code)]
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use libfuzzer_sys::fuzz_target;
 use sally_core::secrets::{MAX_SECRETS, MAX_STORE_BYTES, MAX_VALUE_BYTES, SecretStore};
 
-/// Words (8+ alphanumerics) that appear in the store's fixed error messages. Errors carry only
-/// static text and a line number, so these are the only words an error may contain.
-fn vocabulary() -> &'static HashSet<String> {
-    static VOCAB: OnceLock<HashSet<String>> = OnceLock::new();
+/// The store's fixed error messages. Errors carry only static text and a line number, so any
+/// run of input text that is a piece of one of these is not an echo of the input.
+fn vocabulary() -> &'static [String] {
+    static VOCAB: OnceLock<Vec<String>> = OnceLock::new();
     VOCAB.get_or_init(|| {
         let path = || PathBuf::from("/fuzz/secrets.toml");
         let mut shown = Vec::new();
@@ -48,10 +47,6 @@ fn vocabulary() -> &'static HashSet<String> {
             }
         }
         shown
-            .iter()
-            .flat_map(|m| m.split(|c: char| !c.is_ascii_alphanumeric()))
-            .map(str::to_owned)
-            .collect()
     })
 }
 
@@ -71,7 +66,7 @@ fuzz_target!(|data: &[u8]| {
             let shown = format!("{e} | {e:?}");
             let text = String::from_utf8_lossy(data);
             for word in text.split(|c: char| !c.is_ascii_alphanumeric()) {
-                if word.len() >= 8 && !vocabulary().contains(word) {
+                if word.len() >= 8 && !vocabulary().iter().any(|m| m.contains(word)) {
                     assert!(!shown.contains(word), "error text leaked input: {shown}");
                 }
             }

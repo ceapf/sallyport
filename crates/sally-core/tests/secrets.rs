@@ -508,16 +508,16 @@ proptest! {
             let shown = format!("{e} | {e:?}");
             // Every run of 8+ non-space chars from the input must be absent from the error.
             let vocab = vocabulary();
-            for word in text.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| w.len() >= 8 && !vocab.contains(*w)) {
+            for word in text.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| w.len() >= 8 && !vocab.iter().any(|m| m.contains(*w))) {
                 prop_assert!(!shown.contains(word), "{shown}");
             }
         }
     }
 }
 
-/// Words of the store's fixed error vocabulary: errors carry only static text and a line number,
+/// The store's fixed error messages: errors carry only static text and a line number,
 /// so a mutated input that happens to spell the message must not count as a leak.
-fn vocabulary() -> std::collections::HashSet<String> {
+fn vocabulary() -> Vec<String> {
     let path = || PathBuf::from("/x/secrets.toml");
     let mut shown: Vec<String> = Vec::new();
     let many: String = (0..=MAX_SECRETS)
@@ -547,17 +547,13 @@ fn vocabulary() -> std::collections::HashSet<String> {
         shown.push(store.set(name, value.to_owned()).unwrap_err().to_string());
     }
     shown
-        .iter()
-        .flat_map(|m| m.split(|c: char| !c.is_ascii_alphanumeric()))
-        .map(str::to_owned)
-        .collect()
 }
 
 #[test]
 fn the_error_vocabulary_oracle_exempts_message_text_but_not_values() {
     let vocab = vocabulary();
-    assert!(vocab.contains("unexpected"));
-    assert!(!vocab.contains("canaryvalue"));
+    assert!(vocab.iter().any(|m| m.contains("unexpect")));
+    assert!(!vocab.iter().any(|m| m.contains("canaryvalue")));
 }
 
 // ---- review follow-ups --------------------------------------------------------------------
@@ -703,7 +699,7 @@ proptest! {
         if let Err(e) = r {
             let shown = format!("{e} | {e:?}");
             let vocab = vocabulary();
-            for word in text.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| w.len() >= 8 && !vocab.contains(*w)) {
+            for word in text.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| w.len() >= 8 && !vocab.iter().any(|m| m.contains(*w))) {
                 prop_assert!(!shown.contains(word), "{shown}");
             }
         }
@@ -725,7 +721,9 @@ fn fuzz_corpus_satisfies_the_no_leak_oracle() {
             let text = String::from_utf8_lossy(&data);
             for word in text.split(|c: char| !c.is_ascii_alphanumeric()) {
                 assert!(
-                    word.len() < 8 || vocab.contains(word) || !shown.contains(word),
+                    word.len() < 8
+                        || vocab.iter().any(|m| m.contains(word))
+                        || !shown.contains(word),
                     "{shown}"
                 );
             }
