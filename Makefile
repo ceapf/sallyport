@@ -2,7 +2,7 @@
 CARGO ?= cargo --locked
 MUSL  := x86_64-unknown-linux-musl
 
-.PHONY: lint fmt clippy deny forbid-unsafe test test-scripts nextest coverage mutants zizmor shim fuzz redteam redteam-gpu e2e-gpu doctor
+.PHONY: lint fmt clippy deny forbid-unsafe test test-scripts nextest coverage mutants zizmor shim shim-check fuzz redteam redteam-gpu e2e-gpu doctor
 
 lint: fmt clippy forbid-unsafe deny
 
@@ -33,7 +33,7 @@ forbid-unsafe:
 	@! grep -rnE '\bunsafe\b' crates --include='*.rs' | grep -vE '^[^:]+:[0-9]+:[[:space:]]*(//|#!\[forbid\(unsafe_code\)\])' \
 	  || { echo "unsafe keyword found"; exit 1; }
 
-test: test-scripts
+test: test-scripts shim-check
 	$(CARGO) test -q --workspace
 
 # Shell-script tests (doctor's --redact filter).
@@ -78,6 +78,17 @@ fuzz:
 # Static shim for the sandbox image (copied into images/sandbox-base by images/build.sh).
 shim:
 	$(CARGO) build --release -p sally-shim --target $(MUSL)
+
+# The shim runs inside a sandbox with nothing to rely on: it must stay a static binary with no
+# dependencies beyond std (it is part of what the sandbox trusts, so it stays small and dumb).
+shim-check: shim
+	@command -v readelf >/dev/null || { echo "shim-check: readelf not found (install binutils)"; exit 1; }; \
+	bin=target/$(MUSL)/release/sally-shim; \
+	if readelf -d $$bin | grep -q NEEDED || readelf -l $$bin | grep -q INTERP; then \
+	  echo "shim-check: $$bin is not statically linked"; exit 1; fi; \
+	n=$$($(CARGO) tree -p sally-shim --prefix none -e no-dev | wc -l); \
+	if [ "$$n" != 1 ]; then echo "shim-check: sally-shim has dependencies besides std"; exit 1; fi; \
+	echo "shim-check: ok (static, std only)"
 
 # Redacted by default: doctor output goes into reports and issues (CLAUDE.md, public repository rules).
 doctor:

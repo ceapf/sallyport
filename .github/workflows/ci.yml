@@ -29,7 +29,7 @@ jobs:
       - run: cargo install cargo-nextest --locked --version "$CARGO_NEXTEST_VERSION"
       - name: verify cargo-nextest version
         run: cargo nextest --version | grep -Fw "$CARGO_NEXTEST_VERSION"
-      - run: make fmt clippy forbid-unsafe nextest
+      - run: make fmt clippy forbid-unsafe nextest shim-check
   coverage:
     runs-on: ubuntu-24.04
     timeout-minutes: 30

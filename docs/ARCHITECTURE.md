@@ -88,7 +88,7 @@ flowchart LR
 | `sallyd::tools::{fs,fetch,shell}` | Brokered tools with policy + approvals | **yes** |
 | `sallyd::approvals` | Queue, canonicalization, rendering sanitization, single-use IDs, timeout, flood control, notifications to UI/CLI | **yes** |
 | `sallyd::egress::{server,policy,inject}` | Accept streams from `net.sock`; parse proxy requests (bounded); policy decision; resolve → filter → pinned connect; CONNECT splice; absolute-form forwarding with optional injection + TLS upgrade + redaction | **yes** |
-| `sally-shim` (separate crate, musl static) | `listen tcp 127.0.0.1:3128 → connect unix /run/sallyport/net.sock`, one UDS connection per TCP connection, bidirectional copy, nothing else | low (dumb, inside Z3) |
+| `sally-shim` (separate crate, musl static, std only) | generic relay (AMENDMENTS-01 §3.3): `--listen LOOPBACK_IP:PORT=/abs/sock` (repeatable; `127.0.0.1:3128` → `net.sock`, `127.0.0.1:8080` → `llm.sock`) with one fresh UDS connection per TCP connection, opaque bidirectional copy with fixed 16 KiB buffers, half-close propagated, at most `--max-connections` (default 32, shared by all listeners; each costs two threads against the sandbox's `pids` limit) live connections, and a 30 s linger for a client that never closes after the server finished; `--stdio /abs/sock` for stdio clients. Parses nothing, holds no policy, refuses non-loopback addresses; `make shim-check` keeps it static and dependency-free | low (dumb, inside the sandbox) |
 | `sally-proto` | Shared request/response types; `ts-rs` generates TypeScript for the UI | no |
 | `sally` CLI | `doctor`, `manifest validate`, `models …`, `secrets …`, `sandbox run`, `run`, `chat`, `approvals`, `audit tail\|verify`, `sessions …` | no |
 
