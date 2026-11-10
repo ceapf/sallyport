@@ -573,8 +573,21 @@ fn stdio_mode_fails_cleanly_when_stdout_is_closed() {
     );
     drop(child.0.stdout.take()); // the reader of the shim's stdout goes away
     let mut stdin = child.0.stdin.take().unwrap();
-    stdin.write_all(b"hello\n").unwrap();
-    let status = child.0.wait().unwrap();
+    // Keep sending until the shim exits. One write is not enough in a multithreaded test
+    // binary: a sibling test's fork() can hold a copy of the pipe's read end until its exec, and
+    // a write that lands in that window succeeds instead of failing with EPIPE.
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            started.elapsed() < T,
+            "the shim kept running with its stdout closed"
+        );
+        let _ = stdin.write_all(b"hello\n");
+        thread::sleep(Duration::from_millis(50));
+    };
     assert_eq!(status.code(), Some(1), "{status:?}");
     let mut err = String::new();
     child

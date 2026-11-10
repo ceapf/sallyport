@@ -85,7 +85,7 @@ pub struct SetOutcome {
 }
 
 /// Whether `s` is a legal secret name: `[A-Z][A-Z0-9_]{0,63}`. The manifest validator uses the
-/// same rule.
+/// same rule. TODO(#7): refuse credential-shaped names (e.g. AWS key IDs) as well.
 #[must_use]
 pub fn is_secret_name(s: &str) -> bool {
     let mut b = s.bytes();

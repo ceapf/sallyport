@@ -15,13 +15,14 @@
 //! Concurrency: a `SecretStore` is a snapshot and `save` writes all of it, so two processes
 //! editing the store can silently undo each other (a removed credential could come back).
 //! `sallyd` is the single writer; the CLI edits through its RPC, never the file directly.
+//! TODO(#8): enforce the single writer (RPC-only edits, `flock` on the store directory).
 //!
 //! Residuals: the TOML parser keeps a copy of the whole input inside its error value on a
 //! malformed file, and the OS may leave pages of freed memory behind; the buffers this module
 //! controls (file bytes, rendered text, stored values) are zeroized. The directory is checked by
 //! path, not by directory fd, so a user able to write the parent's parent could race the check
 //! (denial of service or a misplaced store, never disclosure: the file stays 0600).
-//! TODO(issue#): pin the directory fd and use `openat`/`renameat` (SI-8 style) in a later hardening pass.
+//! TODO(#6): pin the directory fd and use `openat`/`renameat` (SI-8 style).
 //!
 //! Blocking I/O: [`SecretStore::open`] and [`SecretStore::save`] do file I/O; async callers use
 //! `spawn_blocking`.
