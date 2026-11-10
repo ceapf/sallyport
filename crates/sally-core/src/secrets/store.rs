@@ -30,8 +30,6 @@ const MAX_NAME_BYTES: usize = 64;
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Any group or other permission bit.
 const GROUP_OTHER: u32 = 0o077;
-/// Group or other write bit.
-const GROUP_OTHER_WRITE: u32 = 0o022;
 
 /// Why a store operation was refused. Messages never include secret material.
 #[derive(Debug, thiserror::Error)]
@@ -382,38 +380,19 @@ fn parent_of(path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
-/// Checks the directory that holds the store: owned by the current user or root, and not
-/// writable by group or others (whoever can rename inside it can swap the file). `Ok(false)` if
-/// the directory does not exist yet.
+/// Checks the directory that holds the store (see [`crate::fsutil::check_private_dir`]).
+/// `Ok(false)` if it does not exist yet.
 fn check_parent(path: &Path) -> Result<bool, SecretsError> {
-    let dir = parent_of(path);
-    let meta = match std::fs::metadata(dir) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => {
-            return Err(SecretsError::Io {
-                path: dir.display().to_string(),
-                source: e,
-            });
+    Ok(crate::fsutil::check_private_dir(parent_of(path))?)
+}
+
+impl From<crate::fsutil::FsIssue> for SecretsError {
+    fn from(issue: crate::fsutil::FsIssue) -> Self {
+        match issue {
+            crate::fsutil::FsIssue::Permissions { path, msg } => Self::Permissions { path, msg },
+            crate::fsutil::FsIssue::Io { path, source } => Self::Io { path, source },
         }
-    };
-    let euid = rustix::process::geteuid().as_raw();
-    if !meta.is_dir() {
-        return Err(perm(dir, "is not a directory"));
     }
-    if meta.uid() != euid && meta.uid() != 0 {
-        return Err(perm(dir, "is not owned by the current user or root"));
-    }
-    let mode = meta.permissions().mode() & 0o7777;
-    if mode & GROUP_OTHER_WRITE != 0 {
-        return Err(perm(
-            dir,
-            &format!(
-                "mode is {mode:04o}; the directory must not be writable by group or others; run chmod go-w"
-            ),
-        ));
-    }
-    Ok(true)
 }
 
 fn write_private(f: &mut File, bytes: &[u8]) -> std::io::Result<()> {

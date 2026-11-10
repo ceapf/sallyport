@@ -104,7 +104,7 @@ flowchart LR
   library/library.db          # sqlite
   library/blobs/sha256/<hex>  # immutable 0444 model files
   library/quarantine/<uuid>/  # downloads before verification
-  audit/audit-YYYYMM.jsonl    # hash-chained
+  audit/audit-YYYYMM.jsonl    # hash-chained; audit.head = newest {seq, hash}; audit.lock
   logs/
   bin/crun -> crun-<version>  # pinned upstream OCI runtime (static, signature-verified); the
                               # default sandbox.runtime_path. Never the distro crun (AMENDMENTS-02 B5)
@@ -398,9 +398,23 @@ sallyport/
   (U+202A–U+202E, U+2066–U+2069), NFC-normalize, cap at 2 000 chars with an explicit
   `… (+N bytes, sha256 …)` tail. Paths shown as *host realpath* **and** guest path.
 - **Audit entry**: `{seq, ts, session, actor: user|harness|sallyd, event, decision, args
-  (redacted, ≤ 4 KiB, sha256 of full), prev_hash, hash}` with `hash = sha256(prev_hash ||
-  canonical_json(entry_without_hash))`. Monthly files; chain continues across files via the first
-  entry's `prev_hash`.
+  (redacted, ≤ 4 KiB), args_sha256, prev_hash, hash}` with `hash = sha256(prev_hash ||
+  canonical_json(entry_without_hash))`; canonical JSON is compact with the fields in that order
+  and object keys sorted, and a reader rejects any line that is not byte-for-byte what the
+  writer would produce. `args` longer than 4 KiB is stored as `{"truncated":true,"bytes":N}`.
+  `args_sha256` hashes the **redacted** full args, never the raw ones (a hash of the raw value
+  would let a short secret be brute-forced). Monthly files (UTC); the chain continues across
+  files via the first entry's `prev_hash`, and files only rotate forward. `audit.head`
+  (`{seq, hash}`, rewritten after every entry) makes deleting the newest entries detectable,
+  because a prefix of a valid chain is itself valid; the log may be one entry ahead of it after
+  a crash, which is accepted and repaired. A torn final line is dropped on open (the entry is
+  written before the action, so the action never happened) and recorded as `audit.recovered`.
+  `append` fsyncs before returning; on any error the caller must not perform the action.
+- **Redaction** (`sally-core::audit::Redactor`): the raw secret, its percent-encoding (both hex
+  cases, and `+` for space), and its base64 in three alignments and both alphabets trimmed to the
+  characters that do not depend on neighbouring bytes (patterns under 12 characters skipped), so
+  the base64 of any string containing the secret is caught (AMENDMENTS-02 B1). Matches become
+  `[REDACTED:NAME]`.
 - **Tauri bridge**: Rust side exposes one command `rpc(method: String, params: Value)` that
   forwards to `control.sock` **only** for methods in a compile-time allowlist (no
   `secrets.list` of values exists anyway). Capabilities file grants `core:default` only.
