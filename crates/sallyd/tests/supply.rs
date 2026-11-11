@@ -6,7 +6,6 @@
 //! case covers as well. The fixture is `common::container`; these tests never skip.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::path::Path;
 use std::process::Command;
 
 use sallyd::sandbox::LaunchError;
@@ -58,42 +57,83 @@ fn rt_sup_01_a_pinned_digest_not_in_local_storage_is_refused() {
     });
 }
 
-/// `strace -f` of hermetic podman: every `connect` it makes is local (`AF_UNIX`, netlink, or
-/// loopback). Returns the log, so a caller can check the trace is not vacuous.
-fn traced(x: &Lx, args: &[&str], log: &Path) -> String {
-    let status = Command::new("strace")
-        .args(["-f", "-qq", "-e", "trace=connect,execve", "-o"])
-        .arg(log)
+/// Hermetic podman, untraced.
+fn hermetic(x: &Lx, args: &[&str]) -> std::process::Output {
+    let out = Command::new(x.podman.bin())
+        .args(args)
+        .env_clear()
+        .envs(x.podman.environment().iter().map(|(k, v)| (k, v)))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "podman {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
+}
+
+/// The image store's `images.json`, under the graph root hermetic podman reports.
+fn images_json(x: &Lx) -> String {
+    let info = hermetic(
+        x,
+        &[
+            "info",
+            "--format",
+            "{{.Store.GraphRoot}}\t{{.Store.GraphDriverName}}",
+        ],
+    );
+    let info = String::from_utf8(info.stdout).unwrap();
+    let (root, driver) = info.trim().split_once('\t').unwrap();
+    assert!(root.starts_with('/') && !driver.is_empty(), "{info:?}");
+    format!("{root}/{driver}-images/images.json")
+}
+
+/// The sockets syscalls that can carry an address, and the ones that prove the lookup ran.
+const TRACE: &str = "trace=connect,sendto,sendmsg,sendmmsg,openat,execve";
+
+/// `strace -f` of hermetic podman `args`. Asserts its exit code and stderr, that podman ran and
+/// opened the image store (`store`), and that no `connect`/`send*` names an `AF_INET` or
+/// `AF_INET6` address, loopback included (`AF_UNIX` and netlink are local).
+fn traced(x: &Lx, args: &[&str], store: &str, code: i32, stderr: &str) {
+    let log = x.f.root.join("strace.log");
+    let out = Command::new("strace")
+        .args(["-f", "-qq", "-e", TRACE, "-o"])
+        .arg(&log)
         .arg(x.podman.bin())
         .args(args)
         .env_clear()
         .envs(x.podman.environment().iter().map(|(k, v)| (k, v)))
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+        .output()
         .expect("strace must be installed (CI: container test prerequisites)");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(code), "podman {args:?}: {err}");
+    assert!(err.contains(stderr), "podman {args:?}: {err}");
+    let text = std::fs::read_to_string(&log).unwrap();
+    let bin = x.podman.bin().to_string_lossy();
     assert!(
-        !status.success(),
-        "podman {args:?} must fail for an absent image"
-    );
-    let text = std::fs::read_to_string(log).unwrap();
-    assert!(
-        text.contains("execve(") && text.contains(&*x.podman.bin().to_string_lossy()),
+        text.lines()
+            .any(|l| l.contains("execve(") && l.contains(&*bin)),
         "the trace saw podman run: {text}"
     );
-    for line in text.lines().filter(|l| l.contains("connect(")) {
-        let local = line.contains("sa_family=AF_UNIX")
-            || line.contains("sa_family=AF_NETLINK")
-            || line.contains("inet_addr(\"127.")
-            || line.contains("inet_pton(AF_INET6, \"::1\"");
-        assert!(local, "outbound connect: {line}");
+    assert!(
+        text.lines()
+            .any(|l| l.contains("openat(") && l.contains(&format!("\"{store}\""))),
+        "podman {args:?} looked the image up in {store}: {text}"
+    );
+    let sends = ["connect(", "sendto(", "sendmsg(", "sendmmsg("];
+    for line in text.lines().filter(|l| sends.iter().any(|s| l.contains(s))) {
+        let inet =
+            line.contains("AF_INET") || line.contains("inet_addr(") || line.contains("inet_pton(");
+        assert!(!inet, "podman {args:?} addressed an IP: {line}");
     }
-    text
 }
 
-/// A missing digest is refused, and neither the launcher's check (`podman image exists`) nor
-/// the enforcement (`podman create --pull=never`) connects anywhere but locally.
+/// A missing digest is refused as not found (not as a podman error), and neither the launcher's
+/// check (`podman image exists`) nor the enforcement (`podman create --pull=never`) sends to any
+/// IP address, loopback included.
 #[test]
 fn rt_sup_02_a_missing_digest_is_refused_without_an_outbound_connection() {
     rt().block_on(async {
@@ -102,12 +142,13 @@ fn rt_sup_02_a_missing_digest_is_refused_without_an_outbound_connection() {
         let v = with_image(&x, &image);
         let e = x.launch(&v, "sup02").await.unwrap_err();
         refused_as_digest_mismatch(&x, &e);
-        let log = x.f.root.join("strace.log");
-        traced(&x, &["image", "exists", &image], &log);
-        traced(
-            &x,
-            &["create", "--pull=never", "--network=none", &image, "true"],
-            &log,
-        );
+        assert!(e.to_string().contains("not in local storage"), "{e}");
+        // A traced podman cannot start the setuid uid-map helpers, so the rootless namespace
+        // must already exist: an untraced hermetic call creates it whatever ran before.
+        hermetic(&x, &["unshare", "true"]);
+        let store = images_json(&x);
+        traced(&x, &["image", "exists", &image], &store, 1, "");
+        let create = ["create", "--pull=never", "--network=none", &image, "true"];
+        traced(&x, &create, &store, 125, "image not known");
     });
 }
