@@ -419,6 +419,37 @@ fn literals_do_not_end_a_function_or_add_operands() {
     assert_operands(body, &[], "self-test");
 }
 
+/// Every `Proof:` comment names a test (`file.rs` `test_name`) that exists in that file.
+#[test]
+fn every_cited_proof_test_exists() {
+    let mut cited = 0;
+    for line in config_text().lines().filter(|l| l.contains("Proof:")) {
+        let mut ticks = line.split('`').skip(1).step_by(2);
+        let name = ticks
+            .next()
+            .unwrap_or_else(|| panic!("no test named: {line}"));
+        let file = line
+            .split_whitespace()
+            .find(|w| w.ends_with(".rs"))
+            .unwrap_or_else(|| panic!("no file named: {line}"));
+        // Where the excluded files and their proofs live.
+        let dirs = [
+            "crates/sally-core/tests",
+            "crates/sally-core/src/audit",
+            "crates/sally-core/src/secrets",
+            "crates/sallyd/src/sandbox",
+        ];
+        let found = dirs
+            .iter()
+            .map(|d| root().join(d).join(file))
+            .filter_map(|p| std::fs::read_to_string(p).ok())
+            .any(|src| src.contains(&format!("fn {name}(")));
+        assert!(found, "{line}: no `fn {name}` in {file}");
+        cited += 1;
+    }
+    assert!(cited >= 2, "the proofs are no longer cited");
+}
+
 /// Each group of entries sits under a reason comment.
 #[test]
 fn every_exclusion_group_has_a_reason() {

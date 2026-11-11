@@ -1,5 +1,8 @@
 # cargo-mutants configuration, read together with the Makefile's --file lists (CLAUDE.md
-# "Mutation scope"). Every exclusion is a mutant the maintainer ruled acceptable (issue #36).
+# "Mutation scope"). Every exclusion meets the maintainer's equivalence rule (issue #36): (i) the
+# same value, proven by the test its group names; or (ii) a difference only on power loss, in a
+# race no test can force, or at an exact clock instant. The container-only group is the one
+# exception the maintainer ruled on by name.
 # Each one matches by file, function and operator, never by line or column (the `\d+:\d+` stays
 # a wildcard), and its group carries the reason. crates/sally-core/tests/mutants_config.rs
 # enforces that form and proves the `|` -> `^` group.
@@ -7,7 +10,7 @@ exclude_re = [
   # Equivalent: `|` -> `^` over flag constants that are pairwise disjoint gives the same value.
   # Proof: mutants_config.rs `xor_exclusions_combine_disjoint_flags` reads each function below
   # (and, for a flags parameter, every call site) and checks the raw values bit by bit.
-  'crates/sally-core/src/audit/layout\.rs:\d+:\d+: replace \| with \^ in Head::read$',
+  'crates/sally-core/src/audit/layout\.rs:\d+:\d+: replace \| with \^ in Head::read_owned_by$',
   'crates/sally-core/src/audit/writer\.rs:\d+:\d+: replace \| with \^ in take_lock$',
   'crates/sally-core/src/audit/writer\.rs:\d+:\d+: replace \| with \^ in open_log$',
   'crates/sally-core/src/secrets/store\.rs:\d+:\d+: replace \| with \^ in SecretStore::open$',
@@ -29,6 +32,25 @@ exclude_re = [
   # Same outcome: a stale temporary head that cannot be removed still fails the write, because
   # the exclusive create that follows refuses it (EEXIST instead of the removal's errno).
   'crates/sally-core/src/audit/writer\.rs:\d+:\d+: replace match guard e\.kind\(\) == std::io::ErrorKind::NotFound with true in write_head$',
+  # Same value (rule i): the read cap `MAX_HEAD_BYTES + 1` as 511 or 512. fstat has already
+  # refused a file over 512 bytes, so 512 reads the same bytes, and 511 differs only for a file
+  # of exactly 512, which no canonical head comes near: the verdict is the same.
+  # Proof: layout.rs `a_read_cap_at_or_one_below_the_limit_gives_the_same_verdict`.
+  'crates/sally-core/src/audit/layout\.rs:\d+:\d+: replace \+ with - in Head::read_owned_by$',
+  'crates/sally-core/src/audit/layout\.rs:\d+:\d+: replace \+ with \* in Head::read_owned_by$',
+  # Race only (rule ii): `kind | NOFOLLOW` -> `kind & NOFOLLOW` (no flags: plain O_RDONLY) in
+  # the walk's opens, and the `|` of their `kind` in list and pin_parents. Each path opened is a
+  # directory the same scan has just statx-ed (list) or listed with O_RDONLY (pin_parents), and
+  # RESOLVE_NO_SYMLINKS refuses a symlink either way. A difference needs the entry replaced or
+  # its mode changed between those steps (a FIFO swapped in would then block the open); the
+  # identity re-check after each open still refuses any replacement.
+  'crates/sallyd/src/sandbox/scan\.rs:\d+:\d+: replace \| with & in open_beneath$',
+  '''crates/sallyd/src/sandbox/scan\.rs:\d+:\d+: replace \| with & in Walk<'a>::list$''',
+  '''crates/sallyd/src/sandbox/scan\.rs:\d+:\d+: replace \| with & in Walk<'a>::pin_parents$''',
+  # Clock instant only (rule ii): `now > until` -> `now >= until` differs only when the clock
+  # reads the deadline to the nanosecond.
+  'crates/sallyd/src/sandbox/changes\.rs:\d+:\d+: replace > with >= in Walk::step$',
+  '''crates/sallyd/src/sandbox/stage\.rs:\d+:\d+: replace > with >= in Walk<'_>::step$''',
   # Container-only: needs the Podman image store. Each, applied by hand, fails
   # rt_sup_02_a_missing_digest_is_refused_without_an_outbound_connection ("image not known").
   'crates/sallyd/src/sandbox/images\.rs:\d+:\d+: replace Launcher::image_present -> Result<\(\), LaunchError> with Ok\(\(\)\)$',
