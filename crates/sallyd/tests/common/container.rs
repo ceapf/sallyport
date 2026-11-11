@@ -33,7 +33,7 @@ pub fn podman(args: &[&str]) -> std::process::Output {
         .expect("podman must be installed")
 }
 
-fn executable(path: &Path, body: &[u8]) {
+pub fn executable(path: &Path, body: &[u8]) {
     std::fs::write(path, body).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
@@ -216,13 +216,14 @@ pub fn test_runtime() -> PathBuf {
 
 impl Lx {
     pub fn new() -> Self {
-        Self::build(None, None, DiskFloor::default(), Some(io_lock(false)))
+        Self::build(None, None, None, DiskFloor::default(), Some(io_lock(false)))
     }
 
     /// `podman_home`: the `$HOME` hermetic podman is given (default: the real one).
     pub fn with_home(podman_home: Option<PathBuf>) -> Self {
         Self::build(
             podman_home,
+            None,
             None,
             DiskFloor::default(),
             Some(io_lock(false)),
@@ -234,6 +235,20 @@ impl Lx {
         Self::build(
             None,
             Some(runtime),
+            None,
+            DiskFloor::default(),
+            Some(io_lock(false)),
+        )
+    }
+
+    /// `wrap` turns the real podman binary into the one the launcher runs (a test wrapper that
+    /// ends by running the real one). It bypasses `resolve_podman`'s trust check, so test-only.
+    pub fn with_podman(wrap: impl FnOnce(&Path) -> PathBuf) -> Self {
+        let real = resolve_podman(None, std::env::var_os("PATH").as_deref()).unwrap();
+        Self::build(
+            None,
+            None,
+            Some(wrap(&real)),
             DiskFloor::default(),
             Some(io_lock(false)),
         )
@@ -242,12 +257,13 @@ impl Lx {
     /// `floor`: the launcher's free-space floor, as `sallyd`'s configuration would set it. For
     /// the disk-filling tests, whose caller already holds [`io_lock`] exclusively.
     pub fn with_floor(floor: DiskFloor) -> Self {
-        Self::build(None, None, floor, None)
+        Self::build(None, None, None, floor, None)
     }
 
     fn build(
         podman_home: Option<PathBuf>,
         runtime: Option<&Path>,
+        podman_bin: Option<PathBuf>,
         floor: DiskFloor,
         io: Option<std::fs::File>,
     ) -> Self {
@@ -265,7 +281,8 @@ impl Lx {
         let runtime = CheckedRuntime::check(runtime.unwrap_or(&test_runtime())).unwrap();
         let state = f.root.join("home/.local/share/sallyport/podman");
         std::fs::create_dir_all(state.parent().unwrap()).unwrap();
-        let bin = resolve_podman(None, std::env::var_os("PATH").as_deref()).unwrap();
+        let bin = podman_bin
+            .unwrap_or_else(|| resolve_podman(None, std::env::var_os("PATH").as_deref()).unwrap());
         let podman = Podman::setup(bin, &runtime, &state, &host).unwrap();
         let events = Arc::new(Events::default());
         let launcher = Launcher::new(LauncherParts {
