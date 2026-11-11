@@ -37,7 +37,7 @@ create --rm --name sp-<role>-<id> --pull=never --http-proxy=false --log-driver=n
 --security-opt no-new-privileges --security-opt seccomp=<per-role profile>
 --security-opt label=disable --userns=keep-id --user 1000:1000
 --tmpfs /tmp:rw,{exec|noexec},nosuid,nodev,size=<tmp_size> --pids-limit <n> --cpus <c>
---memory <m>b --init --env-host=false [--hostname sandbox]
+--memory <m>b --memory-swap <m>b --init --env-host=false [--hostname sandbox]
 -v <session socket dir>:/run/sallyport:ro,nosuid,nodev,bind   (inference: rw, its own dir)
 <image>@sha256:<digest> <entry>
 ```
@@ -60,7 +60,7 @@ received, read through `podman unshare`.
 | seccomp | default `SCMP_ACT_ERRNO` with errno 38 (ENOSYS), 18 rule groups | same (harness profile) |
 | masked / read-only paths | 12 / 6 (podman defaults; `/proc/kcore` masked) | same |
 | mounts | `/workspace/*` per mode; `/run/sallyport` `ro`; `/tmp` tmpfs `nosuid,nodev`; `/sys` and `/sys/fs/cgroup` `ro`; `/dev` tmpfs `ro`; `/dev/shm` `ro,noexec`; `/etc/{passwd,group,hostname}` `ro` | no `/workspace`; the rest the same |
-| limits | pids 512, memory 8 GiB (+ the same again as swap), CPU quota 4 | pids 128, memory 1 GiB (+1 GiB swap), CPU quota 1 |
+| limits | pids 512, memory 8 GiB, **no swap** (`--memory-swap` = `--memory`; `memory.swap.max` 0), CPU quota 4 | pids 128, memory 1 GiB, no swap, CPU quota 1 |
 | rlimits | core 0, nofile 1048576, nproc (host default) | same |
 | hooks | none | none |
 | process | `/run/podman-init -- /opt/sallyport/entry --idle` | `/run/podman-init -- /opt/sallyport/entry` |
@@ -69,8 +69,18 @@ The generated config is still not verified before start. That is RT-SUP-04, #15,
 
 ## 3. Red-team rows (Tasks 6a–6c)
 
-All of these tests run in CI unless the row says otherwise. Rows assigned to later tasks
-(egress, approvals, tools, audit) are not listed here.
+All of these tests run in CI unless the row says otherwise. The rows not listed here, with the
+task that owns each:
+- RT-FS-04: Task 11.
+- RT-FS-10: Tasks 7 and 12.
+- RT-NET-02 to 07, 09 and 10: Task 8.
+- RT-NET-11: Task 13.
+- RT-AG-01: Task 11 (unit), M4 (e2e).
+- RT-AG-02 to 04: Task 10.
+- RT-AG-05 and 07: Task 11.
+- RT-AG-06: Task 7.
+- RT-AG-10: M4.
+- RT-SUP-04: Task 14 (#15).
 
 | Row | Tests (`rt_…`) | Result |
 |---|---|---|
@@ -149,6 +159,11 @@ more than one, they are #26 (Task 12). `resource: stage_size` keeps the manifest
 | #26 | audit: kebab-case the `session.resource_limit` reason values (new) | 12 |
 | #27 | audit: `session.resource_limit` for the pids, memory and `/tmp` limits (new) | 12 |
 | #28 | sandbox: follow-ups from the Task 6c-2 reviews (new) | 12 / 13 / 14 |
+| #29 | sandbox: keep SELinux confinement on SELinux hosts (new, Checkpoint 3 review) | M6 |
+| #30 | nightly mutation test has never passed (new, Checkpoint 3 review) | next session |
+
+The `oci-dump` helper (capture a live container's OCI config for a report) goes to Task 14
+with #15.
 
 ## 5. Sessions used against the plan
 
@@ -171,7 +186,12 @@ proxy and tools).
   AMENDMENTS-02.
 
 That line's cut order is: fetch-write approvals, `{basic}`, the template-mismatch flag, then
-`sally session changes`. **The decision is the maintainer's.**
+`sally session changes`.
+
+**Maintainer decision (Checkpoint 3 review):**
+- The revised M1 estimate is **about 22 sessions**.
+- Full scope is kept: no cuts now.
+- The AMENDMENTS-02 cut order stays in reserve and is revisited at Checkpoint 4.
 
 ## 6. CI cost
 
@@ -182,5 +202,10 @@ That line's cut order is: fetch-write approvals, `{basic}`, the template-mismatc
 | Nightly mutation test | no successful run on record |
 
 The one nightly run listed, scheduled at 2026-11-10 17:07Z, **failed** in `make mutants` after
-1.4 min. Its log cannot be retrieved with `gh`, and no run for today's 09:17Z schedule is
-listed. This needs the maintainer's look; no issue has been opened.
+1.4 min.
+- The job log, read through the API, shows that `MUTANTS_FILES`' unquoted glob expands into
+  extra positional arguments, which cargo-mutants rejects. No mutant ever ran.
+- The workflow is `active`. That run itself started about 8 h after its 09:17Z schedule, and no
+  run for 2026-11-11 09:17Z was listed by 10:50Z. A late or dropped best-effort schedule is
+  more likely than a disabled workflow.
+- Tracked as #30, the next session's work.
