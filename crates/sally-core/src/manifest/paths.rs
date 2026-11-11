@@ -557,6 +557,39 @@ mod tests {
         }
     }
 
+    /// MANIFEST_SPEC §2: a rule is matched in its realpath form as well as its lexical one. With
+    /// `~/.ssh -> ~/dotfiles/ssh`, the link's target, anything inside it and its parent are
+    /// refused by path (#33: `rule` keeps the canonical form exactly when it differs).
+    #[test]
+    fn a_symlinked_rule_is_also_matched_at_its_target() {
+        let t = TmpHome::new("link");
+        let home = t.home();
+        std::fs::remove_dir(home.join(".ssh")).unwrap();
+        std::fs::create_dir_all(home.join("dotfiles/ssh/keys")).unwrap();
+        std::os::unix::fs::symlink(home.join("dotfiles/ssh"), home.join(".ssh")).unwrap();
+        let d = Denylist::new(&env(home.to_str().unwrap()), &[]);
+        let ssh = home.join(".ssh").display().to_string();
+        for (rel, how) in [
+            ("dotfiles/ssh", "is inside"),
+            ("dotfiles/ssh/keys", "is inside"),
+            ("dotfiles", "contains"),
+        ] {
+            let why = d.refusal(&home.join(rel)).unwrap_or_default();
+            assert!(why.starts_with(&format!("{how} {ssh}")), "{rel}: {why:?}");
+        }
+        // RT-FS-14 half: the target's parent is an ancestor by identity too, so an alias of
+        // `~/dotfiles` "contains" the protected folder.
+        let why = d.refusal_by_id(t.id("home/dotfiles")).unwrap_or_default();
+        assert!(
+            why.contains("which contains") && why.contains(&ssh),
+            "{why:?}"
+        );
+        // No over-match: a sibling is refused at most by the temp-dir rule TmpHome lives under.
+        let tmp = std::env::temp_dir().display().to_string();
+        let why = d.refusal(&home.join("code/x")).unwrap_or_default();
+        assert!(why.is_empty() || why.contains(&tmp), "{why}");
+    }
+
     #[test]
     fn overlap_is_component_wise() {
         assert!(overlaps(Path::new("/a/b"), Path::new("/a")));
