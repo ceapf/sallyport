@@ -32,7 +32,8 @@ jobs:
           path: mutants.out/
           if-no-files-found: ignore
   # The wider scope (CLAUDE.md "Mutation scope"), zero survivors too. Only container-free tests
-  # run per mutant, so no podman is needed. Sharded to keep each job well under 60 minutes.
+  # run per mutant, so no podman is needed. Shards are sized for about 30 minutes each, under the
+  # 60-minute target; the 90-minute timeout is headroom, not the budget.
   mutants-wide:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
