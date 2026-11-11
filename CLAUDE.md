@@ -96,7 +96,8 @@ manually for the tasks marked opus). Subagents are the files in `.claude/agents/
 
 | Work | Who | Model |
 |---|---|---|
-| Milestone planning (`/plan`), architecture changes | planner, architect | opus |
+| Milestone planning (`/plan`), architecture changes | planner | opus |
+| Rulings on design questions (see Decision routing) | architect | fable |
 | Implementing: manifest validator, sandbox driver, egress/token proxy, approvals, brokered fs, GGUF/safetensors parsers, zip import, RPC method tables, Tauri bridge | main session with `/model opus` | opus |
 | Implementing: everything else (HF client, library, CLI, SDK, harness, UI, docs, CI) | main session (opusplan → sonnet) | sonnet |
 | Review of any file under `crates/sallyd`, `crates/sally-core`, `crates/sally-shim`, `profiles/`, `images/`, `app/src-tauri` | security-reviewer **and** rust-reviewer | opus |
@@ -107,6 +108,20 @@ manually for the tasks marked opus). Subagents are the files in `.claude/agents/
 | Docs, changelog, README | doc-updater, docs-lookup | haiku |
 | Dead code / cleanup | refactor-cleaner | sonnet |
 | E2E / UI tests | e2e-runner | sonnet |
+
+## Decision routing
+
+- Ask the `architect` agent, not the maintainer, for: a design choice the docs don't settle; a
+  deviation from a spec or a red-team row; a deferral; a mutation exclusion; a reviewer finding
+  that needs a design choice.
+- Give it the question, the options and the file paths. Batch questions that arise together into
+  one call.
+- Record every ruling in the PR body under "Architect rulings": question, ruling, reason.
+- Stop for the maintainer only for: merging a checkpoint PR; changing an invariant, a hard rule or
+  this section; removing or weakening a test or control; cutting scope; repo settings, history or
+  force-pushes; identity or privacy; a ruling a reviewer disputes; the same failure three times.
+- A ruling is not the maintainer's approval. Permission prompts and the items above stay with the
+  maintainer.
 
 ## Dev environment facts (don't rediscover)
 
