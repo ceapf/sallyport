@@ -85,7 +85,7 @@ container-free tests run: unit tests, all of sally-core's `tests/`, `sallyd` `ar
   `manifest/host.rs`, `config.rs`.
 - `make mutants-wide-{core,sallyd,shim}` (sharded): sally-core `manifest/{image,hostenv,parse,
   summary,units}.rs`, `secrets/{store,secret}.rs`, `audit/{entry,redact,verify,writer,layout}.rs`,
-  `fsutil.rs`; sallyd `sandbox/{argv,check,types,profiles,overlap,scan,images,changes,dirs,
+  `fsutil.rs`, `fd.rs`; sallyd `sandbox/{argv,check,types,profiles,overlap,scan,images,changes,dirs,
   podman,disk,stage}.rs`, `sandbox/launch/error.rs`; sally-shim `args.rs`, `relay.rs`.
 
 ## Agent / model routing (ECC)
@@ -129,8 +129,9 @@ manually for the tasks marked opus). Subagents are the files in `.claude/agents/
 - Start every session with `/resume-session`; end with `/save-session`. One milestone *task* per session where possible; `/clear` between unrelated tasks.
 - Run `/context` (built-in) when the context feels heavy; never paste whole logs — `2>&1 | tail -60`. Use `cargo test -q -p <crate>` and `cargo clippy -q`.
 - Use `docs-lookup` (haiku) for API questions instead of fetching pages into the main context.
-- Save and stop at **30 %** of the context window (`/save-session`); the rest runs in a fresh
-  session.
+- Save and stop at **45 %** of the context window by the context meter (`/save-session`); the
+  rest runs in a fresh session. Prefer stopping right after a merge over leaving an unpushed
+  branch.
 - Reviews run as subagents (separate context). One review per task, not per edit, plus one
   diff-only re-review when post-review fixes rewrite a security-core component.
 - Reviews run on the local diff before the first push, so CI runs once per PR. A test-only PR

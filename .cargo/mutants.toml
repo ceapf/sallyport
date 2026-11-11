@@ -1,0 +1,36 @@
+# cargo-mutants configuration, read together with the Makefile's --file lists (CLAUDE.md
+# "Mutation scope"). Every exclusion is a mutant the maintainer ruled acceptable (issue #36).
+# Each one matches by file, function and operator, never by line or column (the `\d+:\d+` stays
+# a wildcard), and its group carries the reason. crates/sally-core/tests/mutants_config.rs
+# enforces that form and proves the `|` -> `^` group.
+exclude_re = [
+  # Equivalent: `|` -> `^` over flag constants that are pairwise disjoint gives the same value.
+  # Proof: mutants_config.rs `xor_exclusions_combine_disjoint_flags` reads each function below
+  # (and, for a flags parameter, every call site) and checks the raw values bit by bit.
+  'crates/sally-core/src/audit/layout\.rs:\d+:\d+: replace \| with \^ in Head::read$',
+  'crates/sally-core/src/audit/writer\.rs:\d+:\d+: replace \| with \^ in take_lock$',
+  'crates/sally-core/src/audit/writer\.rs:\d+:\d+: replace \| with \^ in open_log$',
+  'crates/sally-core/src/secrets/store\.rs:\d+:\d+: replace \| with \^ in SecretStore::open$',
+  'crates/sallyd/src/sandbox/disk\.rs:\d+:\d+: replace \| with \^ in open_dir$',
+  'crates/sallyd/src/sandbox/overlap\.rs:\d+:\d+: replace \| with \^ in identity_chain$',
+  'crates/sallyd/src/sandbox/profiles\.rs:\d+:\d+: replace \| with \^ in write_profiles$',
+  'crates/sallyd/src/sandbox/scan\.rs:\d+:\d+: replace \| with \^ in open_beneath$',
+  'crates/sallyd/src/sandbox/scan\.rs:\d+:\d+: replace \| with \^ in open_root$',
+  '''crates/sallyd/src/sandbox/scan\.rs:\d+:\d+: replace \| with \^ in Walk<'a>::list$''',
+  '''crates/sallyd/src/sandbox/scan\.rs:\d+:\d+: replace \| with \^ in Walk<'a>::pin_parents$''',
+  'crates/sallyd/src/sandbox/stage\.rs:\d+:\d+: replace \| with \^ in open_dir$',
+  'crates/sallyd/src/sandbox/types\.rs:\d+:\d+: replace \| with \^ in VerifiedModel::pin$',
+  # Power loss only: the directory fsync makes a rename or a new file durable across a crash.
+  # Nothing a test can observe without cutting power differs.
+  'crates/sally-core/src/audit/writer\.rs:\d+:\d+: replace sync_dir -> Result<\(\), AuditError> with Ok\(\(\)\)$',
+  # Same value: with `>=` an untorn newest file is "cut" at its own length (a no-op set_len plus
+  # one fsync) and, with 0 bytes dropped, no audit.recovered entry is written.
+  'crates/sally-core/src/audit/writer\.rs:\d+:\d+: replace > with >= in load_tip$',
+  # Same outcome: a stale temporary head that cannot be removed still fails the write, because
+  # the exclusive create that follows refuses it (EEXIST instead of the removal's errno).
+  'crates/sally-core/src/audit/writer\.rs:\d+:\d+: replace match guard e\.kind\(\) == std::io::ErrorKind::NotFound with true in write_head$',
+  # Container-only: needs the Podman image store. Each, applied by hand, fails
+  # rt_sup_02_a_missing_digest_is_refused_without_an_outbound_connection ("image not known").
+  'crates/sallyd/src/sandbox/images\.rs:\d+:\d+: replace Launcher::image_present -> Result<\(\), LaunchError> with Ok\(\(\)\)$',
+  'crates/sallyd/src/sandbox/images\.rs:\d+:\d+: delete ! in Launcher::image_present$',
+]

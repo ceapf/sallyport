@@ -6,7 +6,10 @@ set -euo pipefail
 
 base="${1:?usage: check-trailers.sh <base> <head>}"
 head="${2:?usage: check-trailers.sh <base> <head>}"
-re='^[[:space:]]*(co-authored-by|claude-session)[[:space:]]*:|generated with'
+# The footer form only: a line that starts with "Generated with", after an optional emoji
+# (non-ASCII bytes under LC_ALL=C). Prose that mentions the phrase mid-line passes.
+re='^[[:space:]]*(co-authored-by|claude-session)[[:space:]]*:|^[[:space:]]*([^[:print:][:space:]]+[[:space:]]*)?generated with'
+export LC_ALL=C
 
 # A plain assignment, so an unknown or unfetched SHA fails here (set -e) instead of passing empty.
 commits="$(git rev-list "$base..$head")"

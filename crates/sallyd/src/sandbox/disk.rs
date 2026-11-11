@@ -81,12 +81,8 @@ impl Watched {
 }
 
 fn open_dir(path: &Path) -> Result<(OwnedFd, u64), String> {
-    let fd = rustix::fs::open(
-        path,
-        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|e| format!("{}: {e}", path.display()))?;
+    let fd = sally_core::fd::open(path, OFlags::PATH | OFlags::DIRECTORY, Mode::empty())
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     let dev = std::fs::metadata(path)
         .map_err(|e| format!("{}: {e}", path.display()))?
         .dev();

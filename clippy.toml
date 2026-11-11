@@ -1,3 +1,16 @@
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-indexing-slicing-in-tests = true
+# Every rustix open goes through sally_core::fd, which always adds O_CLOEXEC.
+disallowed-methods = [
+  { path = "rustix::fs::open", reason = "use sally_core::fd::open (adds O_CLOEXEC)" },
+  { path = "rustix::fs::openat", reason = "use sally_core::fd::openat (adds O_CLOEXEC)" },
+  { path = "rustix::fs::openat2", reason = "use sally_core::fd::openat2 (adds O_CLOEXEC)" },
+  # Other descriptor creators that make an inheritable descriptor unless the caller asks
+  # otherwise. None is used in product code; one needs a reviewed exception and O_CLOEXEC.
+  { path = "rustix::io::dup", reason = "makes an inheritable descriptor (no O_CLOEXEC)" },
+  { path = "rustix::io::dup2", reason = "makes an inheritable descriptor (no O_CLOEXEC)" },
+  { path = "rustix::io::dup3", reason = "inheritable unless DupFlags::CLOEXEC is passed" },
+  { path = "rustix::fs::memfd_create", reason = "inheritable unless MemfdFlags::CLOEXEC is passed" },
+  { path = "rustix::fs::inotify::init", reason = "inheritable unless CreateFlags::CLOEXEC is passed" },
+]

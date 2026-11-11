@@ -286,10 +286,10 @@ impl VerifiedModel {
             return input("model: the blob name must be 64 lowercase hex digits");
         }
         let path = blobs.join("sha256").join(sha256_hex);
-        let fd = rustix::fs::openat2(
+        let fd = sally_core::fd::openat2(
             rustix::fs::CWD,
             &path,
-            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            OFlags::PATH | OFlags::NOFOLLOW,
             Mode::empty(),
             ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
         )

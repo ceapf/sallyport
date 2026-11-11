@@ -32,10 +32,10 @@ pub fn profile(role: Role) -> &'static str {
 /// The I/O error, e.g. `EEXIST`.
 pub fn write_profiles(dir: impl AsFd) -> std::io::Result<()> {
     for role in [Role::Workspace, Role::Harness, Role::Inference] {
-        let fd = rustix::fs::openat(
+        let fd = sally_core::fd::openat(
             &dir,
             role.profile(),
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW,
             Mode::RUSR | Mode::WUSR,
         )?;
         std::fs::File::from(fd).write_all(profile(role).as_bytes())?;

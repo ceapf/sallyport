@@ -24,5 +24,6 @@
       "Bash(podman rmi:*)",
       "Bash(podman volume:*)"
     ]
-  }
+  },
+  "attribution": { "commit": "", "pr": "" }
 }

@@ -136,10 +136,10 @@ pub(crate) fn measure(
 
 /// Opens directory `name` in `at` without following a symlink (also used by `changes.rs`).
 pub(super) fn open_dir(at: impl rustix::fd::AsFd, name: &std::ffi::CStr) -> Result<Dir, Errno> {
-    let fd = rustix::fs::openat(
+    let fd = sally_core::fd::openat(
         at,
         name,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
         Mode::empty(),
     )?;
     Dir::new(fd)

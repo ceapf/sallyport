@@ -211,10 +211,8 @@ fn forms(bytes: &[u8], raw: &str) -> Vec<String> {
 fn base64_no_pad(data: &[u8], alphabet: &[u8; 64]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
-        let n = chunk
-            .iter()
-            .enumerate()
-            .fold(0u32, |acc, (i, b)| acc | (u32::from(*b) << (16 - 8 * i)));
+        let byte = |i: usize| chunk.get(i).copied().unwrap_or(0);
+        let n = u32::from_be_bytes([0, byte(0), byte(1), byte(2)]);
         // A chunk of k bytes yields k + 1 characters.
         for i in 0..=chunk.len() {
             let idx = usize::try_from((n >> (18 - 6 * i)) & 63).unwrap_or(0);

@@ -48,9 +48,9 @@ impl Head {
     /// `Ok(None)` if there is no head file. Refuses a symlink or a non-regular file, checks the
     /// size before reading, and never reads more than the limit.
     pub(crate) fn read(dir: &Path) -> Result<Option<Self>, VerifyErrorKind> {
-        let fd = match rustix::fs::open(
+        let fd = match crate::fd::open(
             dir.join(HEAD_FILE),
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
             Mode::empty(),
         ) {
             Ok(fd) => fd,

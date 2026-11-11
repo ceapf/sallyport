@@ -55,8 +55,8 @@ pub fn claims(v: &ValidatedManifest) -> std::io::Result<Vec<Claim>> {
 
 /// The identities of `dir` and its ancestors, walking `..` from an fd (not the path string).
 fn identity_chain(dir: &Path) -> std::io::Result<Vec<(u64, u64)>> {
-    let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC;
-    let mut fd = rustix::fs::open(dir, flags | OFlags::NOFOLLOW, Mode::empty())?;
+    let flags = OFlags::PATH | OFlags::DIRECTORY;
+    let mut fd = sally_core::fd::open(dir, flags | OFlags::NOFOLLOW, Mode::empty())?;
     let mut chain = Vec::new();
     for _ in 0..MAX_ANCESTORS {
         let st = rustix::fs::fstat(&fd)?;
@@ -65,7 +65,7 @@ fn identity_chain(dir: &Path) -> std::io::Result<Vec<(u64, u64)>> {
             return Ok(chain);
         }
         chain.push(id);
-        fd = rustix::fs::openat(&fd, "..", flags, Mode::empty())?;
+        fd = sally_core::fd::openat(&fd, "..", flags, Mode::empty())?;
     }
     Err(std::io::Error::other("ancestor walk did not reach /"))
 }

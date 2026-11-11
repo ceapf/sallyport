@@ -7,6 +7,7 @@
 
 pub mod audit;
 pub mod config;
+pub mod fd;
 mod fsutil;
 pub mod manifest;
 pub mod secrets;

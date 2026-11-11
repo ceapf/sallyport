@@ -370,9 +370,7 @@ impl AuditWriter {
         self.ensure_file(&month)?;
         let entry = self.build_entry(new, now);
         let mut line = entry.to_line();
-        if line.len() > MAX_LINE_BYTES {
-            return Err(AuditError::InvalidEntry("entry is too large"));
-        }
+        check_line_len(&line)?;
         line.push('\n');
         self.write_line(&line)?;
         self.tip_seq = entry.seq;
@@ -467,6 +465,16 @@ impl AuditWriter {
     }
 }
 
+/// Refuses a serialized line (newline excluded) longer than [`MAX_LINE_BYTES`]. No entry the
+/// field validators accept reaches the limit today (`tests::largest_possible_entry_fits`); this
+/// stays as the backstop for a field added later, since readers refuse longer lines.
+fn check_line_len(line: &str) -> Result<(), AuditError> {
+    if line.len() > MAX_LINE_BYTES {
+        return Err(AuditError::InvalidEntry("entry is too large"));
+    }
+    Ok(())
+}
+
 fn sync_dir(dir: &Path) -> Result<(), AuditError> {
     File::open(dir)
         .and_then(|d| d.sync_all())
@@ -475,9 +483,9 @@ fn sync_dir(dir: &Path) -> Result<(), AuditError> {
 
 fn take_lock(dir: &Path) -> Result<File, AuditError> {
     let path = dir.join(LOCK_FILE);
-    let fd = rustix::fs::open(
+    let fd = crate::fd::open(
         &path,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::NOFOLLOW,
         Mode::from_raw_mode(0o600),
     )
     .map_err(|e| io_at(&path)(e.into()))?;
@@ -498,9 +506,9 @@ fn open_log(path: &Path, writable: bool) -> Result<File, AuditError> {
     } else {
         OFlags::RDONLY
     };
-    let fd = rustix::fs::open(
+    let fd = crate::fd::open(
         path,
-        access | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        access | OFlags::NOFOLLOW | OFlags::NONBLOCK,
         Mode::empty(),
     )
     .map_err(|e| io_at(path)(e.into()))?;
@@ -662,4 +670,56 @@ fn write_head(dir: &Path, head: &Head) -> Result<(), AuditError> {
         .map_err(io_at(&tmp))?;
     std::fs::rename(&tmp, &target).map_err(io_at(&target))?;
     sync_dir(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The limit is inclusive: a line of exactly `MAX_LINE_BYTES` is written, one byte more is
+    /// refused.
+    #[test]
+    fn the_line_limit_is_inclusive() {
+        for (len, ok) in [(MAX_LINE_BYTES, true), (MAX_LINE_BYTES + 1, false)] {
+            let got = check_line_len(&"x".repeat(len));
+            assert_eq!(got.is_ok(), ok, "{len} bytes");
+            if !ok {
+                assert!(matches!(got, Err(AuditError::InvalidEntry(_))));
+            }
+        }
+    }
+
+    /// Documents the bound: the largest entry the field validators accept serializes to well
+    /// under `MAX_LINE_BYTES` (about 4.7 KiB of 8 KiB), so `check_line_len` cannot fire today.
+    /// The token fields need no JSON escaping, and `args` re-serializes to the same bytes the
+    /// `MAX_ARGS_BYTES` cap measured. A field added later must keep this test green.
+    #[test]
+    fn largest_possible_entry_fits() {
+        let event = format!("a{}", "b".repeat(63));
+        let session = "S".repeat(64);
+        let decision = "d".repeat(32);
+        assert!(is_event(&event) && is_session(&session) && is_decision(&decision));
+        // Each is the longest its validator accepts.
+        assert!(!is_event(&format!("{event}b")));
+        assert!(!is_session(&format!("{session}S")));
+        assert!(!is_decision(&format!("{decision}d")));
+        let args = Value::String("a".repeat(MAX_ARGS_BYTES - 2));
+        assert_eq!(serde_json::to_string(&args).unwrap().len(), MAX_ARGS_BYTES);
+        let hash = "f".repeat(64);
+        let entry = Entry {
+            seq: u64::MAX,
+            ts: "9999-12-31T23:59:59.999Z".into(),
+            session: Some(session),
+            actor: Actor::Harness, // the longest actor name
+            event,
+            decision: Some(decision),
+            args,
+            args_sha256: hash.clone(),
+            prev_hash: hash.clone(),
+            hash,
+        };
+        let line = entry.to_line();
+        assert!(check_line_len(&line).is_ok());
+        assert!(line.len() < MAX_LINE_BYTES * 3 / 5, "{} bytes", line.len());
+    }
 }
