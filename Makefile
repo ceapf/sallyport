@@ -36,10 +36,11 @@ forbid-unsafe:
 test: test-scripts shim-check
 	$(CARGO) test -q --workspace
 
-# Shell-script tests (doctor's --redact filter, the commit trailer check).
+# Shell-script tests (doctor's --redact filter, the commit trailer check, the mutation gate).
 test-scripts:
 	bash tests/scripts/redact_test.sh
 	bash tests/scripts/check_trailers_test.sh
+	bash tests/scripts/mutants_gate_test.sh
 
 # CI runner (AMENDMENTS-01 §15). nextest skips doctests, so they run separately.
 nextest:
@@ -59,9 +60,12 @@ MUTANTS_FILES := crates/sally-core/src/manifest/validate/*.rs crates/sally-core/
 # cargo-mutants copies the tree to $$TMPDIR; /tmp is denylisted for mounts, so the copy (and the
 # test fixtures under its target dir) must live elsewhere. Move the fixtures, not the wall.
 MUTANTS_TMP := $(CURDIR)/target/mutants-tmp
+# The gate fails on missed mutants only; a timed-out mutant hangs a test, so it counts as
+# detected and goes to the job summary (maintainer ruling, #36; scripts/mutants-gate.sh).
 mutants:
 	mkdir -p $(MUTANTS_TMP)
-	TMPDIR=$(MUTANTS_TMP) cargo mutants --package sally-core --no-shuffle $(foreach f,$(MUTANTS_FILES),--file '$(f)')
+	TMPDIR=$(MUTANTS_TMP) cargo mutants --package sally-core --no-shuffle $(foreach f,$(MUTANTS_FILES),--file '$(f)'); \
+	  bash scripts/mutants-gate.sh $$? mutants.out
 
 # The wider scope (CLAUDE.md "Mutation scope"): every other file whose security decisions can be
 # tested without starting a container, zero survivors too. Per mutant only container-free tests
@@ -85,7 +89,8 @@ MUTANTS_OUT ?=
 mutants_wide = mkdir -p $(MUTANTS_TMP) && TMPDIR=$(MUTANTS_TMP) cargo mutants --package $(1) \
   --no-shuffle $(if $(MUTANTS_SHARD),--shard $(MUTANTS_SHARD) --sharding round-robin) \
   $(if $(MUTANTS_OUT),--output $(MUTANTS_OUT)) $(foreach f,$(2),--file '$(f)') \
-  $(foreach a,$(3),--cargo-test-arg=$(a))
+  $(foreach a,$(3),--cargo-test-arg=$(a)); \
+  bash scripts/mutants-gate.sh $$? $(if $(MUTANTS_OUT),$(MUTANTS_OUT)/mutants.out,mutants.out)
 mutants-wide-core:
 	$(call mutants_wide,sally-core,$(MUTANTS_WIDE_CORE),$(MUTANTS_WIDE_TESTS_CORE))
 mutants-wide-sallyd:

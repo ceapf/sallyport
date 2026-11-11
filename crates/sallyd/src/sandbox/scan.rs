@@ -267,7 +267,7 @@ fn open_root(mount: usize, m: &ResolvedMount) -> Result<OwnedFd, ScanError> {
     .map_err(|e| ScanError::Changed {
         mount,
         msg: format!(
-            "{} can no longer be opened without following a symlink: {e}",
+            "{} can no longer be opened as a directory without following a symlink: {e}",
             m.host.display()
         ),
     })?;

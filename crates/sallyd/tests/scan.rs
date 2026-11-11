@@ -159,6 +159,14 @@ fn rt_fs_06_a_root_replaced_since_validation_is_refused() {
     std::os::unix::fs::symlink("code2", &code).unwrap();
     let e = scan_mounts(&v, &ScanLimits::default()).unwrap_err();
     assert!(e.to_string().contains("without following a symlink"), "{e}");
+    // A root replaced by a regular file is refused at the open (O_DIRECTORY), not later by the
+    // identity check; a FIFO in its place would block an open without it.
+    std::fs::remove_file(&code).unwrap();
+    std::fs::rename(f.root.join("home/code2"), &code).unwrap();
+    std::fs::rename(&p, f.root.join("home/code/moved")).unwrap();
+    std::fs::write(&p, "not a directory\n").unwrap();
+    let e = scan_mounts(&v, &ScanLimits::default()).unwrap_err();
+    assert!(e.to_string().contains("opened as a directory"), "{e}");
 }
 
 #[test]
@@ -232,6 +240,22 @@ fn recheck_host_catches_a_swapped_parent_or_entry() {
         scan.recheck_host(&v).is_err(),
         "a symlink is never followed"
     );
+}
+
+/// The re-check opens each pin with O_PATH only: a shielded `.git` file nobody may read (mode
+/// 000) is still compared, never opened for reading (which would fail here, and would block on
+/// a FIFO swapped in). The tests run as a non-root user, as in CI.
+#[test]
+fn recheck_host_opens_pins_by_path_only() {
+    let f = Fx::new();
+    f.tree("code/myproject", &[], &["m/.git"]);
+    let git = project(&f).join("m/.git");
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let v = one(&f, "rw");
+    let scan = f.scan(&v);
+    let checked = scan.recheck_host(&v);
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o600)).unwrap();
+    checked.unwrap();
 }
 
 // ---- session directories (#10) --------------------------------------------------------------
