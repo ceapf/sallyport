@@ -126,9 +126,10 @@ jobs:
           persist-credentials: false
           # The whole history, so the pull request's own commits can be listed.
           fetch-depth: 0
-      - run: bash -n scripts/doctor.sh && bash -n scripts/redact.sh && bash -n scripts/check-trailers.sh
+      - run: bash -n scripts/doctor.sh && bash -n scripts/redact.sh && bash -n scripts/check-trailers.sh && bash -n scripts/mutants-gate.sh
       - run: bash tests/scripts/redact_test.sh
       - run: bash tests/scripts/check_trailers_test.sh
+      - run: bash tests/scripts/mutants_gate_test.sh
       # Commits carry Signed-off-by only: no co-author or tool lines (CLAUDE.md, Conventions).
       - name: no co-author or tool lines in the pull request's commits
         if: github.event_name == 'pull_request'
