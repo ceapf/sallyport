@@ -39,7 +39,7 @@ fn bind_socket(p: &Path) -> UnixListener {
 /// RT-FS-13: a Unix socket anywhere in a mount refuses the launch, in every mode (`connect`
 /// works on a read-only mount), including inside a `.git` directory (git's fsmonitor socket).
 #[test]
-fn a_socket_in_any_mount_refuses_the_launch() {
+fn rt_fs_13_a_socket_in_any_mount_refuses_the_launch() {
     for at in ["s.sock", "deep/er/s.sock", ".git/fsmonitor--daemon.ipc"] {
         for mode in MODES {
             let f = Fx::new();
@@ -136,7 +136,7 @@ fn walk_bounds_refuse_rather_than_truncate() {
 /// RT-FS-06 at launch: the root is re-opened without following symlinks and must be the
 /// directory validation saw.
 #[test]
-fn a_root_replaced_since_validation_is_refused() {
+fn rt_fs_06_a_root_replaced_since_validation_is_refused() {
     let f = Fx::new();
     let v = one(&f, "rw");
     let p = project(&f);
