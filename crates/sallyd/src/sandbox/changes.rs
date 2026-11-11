@@ -133,7 +133,7 @@ impl Walk {
     }
 
     fn step(&mut self) -> Result<(), String> {
-        if Instant::now() > self.until {
+        if super::stage::past(self.until) {
             let secs = self.bounds.deadline.as_secs();
             return Err(format!("the walk took longer than {secs} s"));
         }

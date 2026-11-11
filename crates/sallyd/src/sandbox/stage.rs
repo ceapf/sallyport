@@ -145,6 +145,12 @@ pub(super) fn open_dir(at: impl rustix::fd::AsFd, name: &std::ffi::CStr) -> Resu
     Dir::new(fd)
 }
 
+/// The walk deadline `until` has passed. Its own function so the mutation config can exclude
+/// its `>` -> `>=` (equal only at the exact clock instant) without the entry bound's `>`.
+pub(super) fn past(until: Instant) -> bool {
+    Instant::now() > until
+}
+
 /// The state of one measurement across areas.
 struct Walk<'a> {
     bounds: StageBounds,
@@ -159,7 +165,7 @@ impl Walk<'_> {
         if self.cancel.load(Ordering::Relaxed) {
             return Err(Stop::Cancelled);
         }
-        if Instant::now() > self.until {
+        if past(self.until) {
             let secs = self.bounds.deadline.as_secs();
             return Err(format!("the walk took longer than {secs} s").into());
         }

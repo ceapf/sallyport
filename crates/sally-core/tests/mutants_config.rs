@@ -419,7 +419,40 @@ fn literals_do_not_end_a_function_or_add_operands() {
     assert_operands(body, &[], "self-test");
 }
 
-/// Every `Proof:` comment names a test (`file.rs` `test_name`) that exists in that file.
+/// `src` defines `fn name` as a test that runs: the line is code (not a comment), and the
+/// attributes and doc lines right above it include `#[test]` and no `ignore`.
+fn is_live_test(src: &str, name: &str) -> bool {
+    let lines: Vec<&str> = src.lines().map(str::trim).collect();
+    let Some(at) = lines
+        .iter()
+        .position(|l| l.starts_with(&format!("fn {name}(")))
+    else {
+        return false;
+    };
+    let above: Vec<&str> = lines[..at]
+        .iter()
+        .rev()
+        .take_while(|l| l.starts_with("#[") || l.starts_with("//"))
+        .copied()
+        .collect();
+    above.contains(&"#[test]")
+        && !above
+            .iter()
+            .any(|l| l.starts_with("#[") && l.contains("ignore"))
+}
+
+#[test]
+fn a_cited_proof_must_be_a_live_test() {
+    assert!(is_live_test("/// doc\n#[test]\nfn p() {}", "p"));
+    assert!(!is_live_test("fn p() {}", "p"), "not a test");
+    assert!(
+        !is_live_test("#[test]\n#[ignore]\nfn p() {}", "p"),
+        "ignored"
+    );
+    assert!(!is_live_test("#[test]\n// fn p() {}", "p"), "commented out");
+}
+
+/// Every `Proof:` comment names a live test (`file.rs` `test_name`) in that file.
 #[test]
 fn every_cited_proof_test_exists() {
     let mut cited = 0;
@@ -443,8 +476,8 @@ fn every_cited_proof_test_exists() {
             .iter()
             .map(|d| root().join(d).join(file))
             .filter_map(|p| std::fs::read_to_string(p).ok())
-            .any(|src| src.contains(&format!("fn {name}(")));
-        assert!(found, "{line}: no `fn {name}` in {file}");
+            .any(|src| is_live_test(&src, name));
+        assert!(found, "{line}: no live `#[test] fn {name}` in {file}");
         cited += 1;
     }
     assert!(cited >= 2, "the proofs are no longer cited");

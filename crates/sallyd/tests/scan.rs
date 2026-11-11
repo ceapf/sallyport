@@ -242,6 +242,22 @@ fn recheck_host_catches_a_swapped_parent_or_entry() {
     );
 }
 
+/// The re-check opens each pin with O_PATH only: a shielded `.git` file nobody may read (mode
+/// 000) is still compared, never opened for reading (which would fail here, and would block on
+/// a FIFO swapped in). The tests run as a non-root user, as in CI.
+#[test]
+fn recheck_host_opens_pins_by_path_only() {
+    let f = Fx::new();
+    f.tree("code/myproject", &[], &["m/.git"]);
+    let git = project(&f).join("m/.git");
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let v = one(&f, "rw");
+    let scan = f.scan(&v);
+    let checked = scan.recheck_host(&v);
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o600)).unwrap();
+    checked.unwrap();
+}
+
 // ---- session directories (#10) --------------------------------------------------------------
 
 fn mode(p: &Path) -> u32 {

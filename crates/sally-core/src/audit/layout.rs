@@ -151,12 +151,13 @@ mod tests {
     }
 
     /// Proof for the `.cargo/mutants.toml` exclusion of `+` -> `-` and `+` -> `*` in
-    /// `Head::read`'s read cap (`MAX_HEAD_BYTES + 1`): the fstat check has already refused a
+    /// `Head::read_owned_by`'s read cap (`MAX_HEAD_BYTES + 1`): the fstat check has already refused a
     /// file over the limit, so a cap of the limit reads the same bytes, and a cap one byte
     /// short changes only a file of exactly the limit, which no canonical head comes near:
     /// both reads give the same verdict.
     #[test]
     fn a_read_cap_at_or_one_below_the_limit_gives_the_same_verdict() {
+        // Below the shortest truncated read (511 bytes), with a wide margin (about 100 bytes).
         let longest = head(u64::MAX).line().len();
         assert!(longest < MAX_HEAD_BYTES - 1, "{longest} bytes");
         let mut full = head(1).line().into_bytes();
