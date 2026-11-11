@@ -29,8 +29,6 @@ exclude_re = [
   # Same outcome: a stale temporary head that cannot be removed still fails the write, because
   # the exclusive create that follows refuses it (EEXIST instead of the removal's errno).
   'crates/sally-core/src/audit/writer\.rs:\d+:\d+: replace match guard e\.kind\(\) == std::io::ErrorKind::NotFound with true in write_head$',
-  # Race only: differs only if the store changes size between the fstat and the read.
-  'crates/sally-core/src/secrets/store\.rs:\d+:\d+: replace > with < in read_bounded$',
   # Container-only: needs the Podman image store. Each, applied by hand, fails
   # rt_sup_02_a_missing_digest_is_refused_without_an_outbound_connection ("image not known").
   'crates/sallyd/src/sandbox/images\.rs:\d+:\d+: replace Launcher::image_present -> Result<\(\), LaunchError> with Ok\(\(\)\)$',

@@ -465,3 +465,25 @@ fn parse(bytes: &[u8]) -> Result<BTreeMap<String, Secret<String>>, SecretsError>
     }
     Ok(entries)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A store that holds more bytes than its fstat reported (it grew in between) is refused;
+    /// exactly the reported size is read whole.
+    #[test]
+    fn a_store_longer_than_its_reported_size_is_refused() {
+        let path = std::env::temp_dir().join(format!("sp-read-bounded-{}", std::process::id()));
+        std::fs::write(&path, b"abcdef").unwrap();
+        let open = || File::open(&path).unwrap();
+        let grown = read_bounded(open(), 5, &path);
+        let exact = read_bounded(open(), 6, &path);
+        std::fs::remove_file(&path).unwrap();
+        match grown {
+            Err(e) => assert!(e.to_string().contains("changed while"), "{e}"),
+            Ok(_) => panic!("a store that grew after the fstat was read"),
+        }
+        assert_eq!(exact.unwrap().as_slice(), b"abcdef");
+    }
+}
