@@ -159,6 +159,14 @@ fn rt_fs_06_a_root_replaced_since_validation_is_refused() {
     std::os::unix::fs::symlink("code2", &code).unwrap();
     let e = scan_mounts(&v, &ScanLimits::default()).unwrap_err();
     assert!(e.to_string().contains("without following a symlink"), "{e}");
+    // A root replaced by a regular file is refused at the open (O_DIRECTORY), not later by the
+    // identity check; a FIFO in its place would block an open without it.
+    std::fs::remove_file(&code).unwrap();
+    std::fs::rename(f.root.join("home/code2"), &code).unwrap();
+    std::fs::rename(&p, f.root.join("home/code/moved")).unwrap();
+    std::fs::write(&p, "not a directory\n").unwrap();
+    let e = scan_mounts(&v, &ScanLimits::default()).unwrap_err();
+    assert!(e.to_string().contains("opened as a directory"), "{e}");
 }
 
 #[test]
