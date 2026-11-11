@@ -28,7 +28,7 @@ impl Launcher {
         }
     }
 
-    async fn container_exists(&self, name: &str) -> Result<bool, LaunchError> {
+    pub(super) async fn container_exists(&self, name: &str) -> Result<bool, LaunchError> {
         let status = self
             .podman
             .command()

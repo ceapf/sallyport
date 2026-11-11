@@ -32,7 +32,8 @@ fn a_launch_is_hardened_audited_and_torn_down() {
              grep Seccomp: /proc/self/status; ls /workspace; touch /workspace/r/x 2>&1; \
              echo staged > /workspace/o/new; echo ok > /workspace/p/.git/probe; \
              cat /proc/net/route 2>/dev/null | wc -l",
-        );
+        )
+        .await;
         assert_eq!(code, 0, "{out}");
         let uid = rustix::process::getuid().as_raw().to_string();
         assert!(out.starts_with(&format!("{uid}\n")), "{out}");
@@ -166,12 +167,13 @@ fn rt_ag_09_writing_past_stage_size_kills_the_session() {
         let (code, out) = exec(
             &small,
             "dd if=/dev/zero of=/workspace/o/ok bs=1024 count=1024",
-        );
+        )
+        .await;
         assert_eq!(code, 0, "{out}");
         tokio::time::sleep(Duration::from_secs(5)).await;
         assert!(exists(small.container()), "within the limit: still running");
         // The write itself may be cut short by the kill.
-        let _ = exec(&small, "dd if=/dev/zero of=/workspace/o/big bs=1M count=16");
+        let _ = exec(&small, "dd if=/dev/zero of=/workspace/o/big bs=1M count=16").await;
         assert!(
             gone_within_deadline(small.container()).await,
             "the watchdog killed the session"
@@ -180,6 +182,7 @@ fn rt_ag_09_writing_past_stage_size_kills_the_session() {
         assert_eq!(limit["resource"], "stage_size", "{limit}");
         assert_eq!(limit["limit"], 4 << 20, "{limit}");
         assert_eq!(limit["area"], "filesystem.mounts[1]", "{limit}");
+        assert_eq!(limit["reason"], "stage_size", "{limit}");
         assert!(limit["measured"].as_u64().unwrap() > 4 << 20, "{limit}");
         assert!(exists(bystander.container()), "the other session is alive");
         let paths = small.paths().clone();
@@ -217,13 +220,15 @@ fn rt_ag_09_writing_past_stage_size_into_a_git_overlay_kills_the_session() {
         let _ = exec(
             &r,
             "dd if=/dev/zero of=/workspace/p/.git/pack bs=1M count=16",
-        );
+        )
+        .await;
         assert!(
             gone_within_deadline(r.container()).await,
             "the watchdog killed the session"
         );
         let limit = x.events.args("session.resource_limit").expect("audited");
-        assert_eq!(limit["area"], "filesystem.mounts[0]/.git", "{limit}");
+        assert_eq!(limit["area"], "filesystem.mounts[0].git[0]", "{limit}");
+        assert_eq!(limit["reason"], "stage_size", "{limit}");
         assert!(
             !x.f.root.join("home/code/myproject/.git/pack").exists(),
             "the host .git is untouched"
@@ -347,7 +352,8 @@ fn rt_fs_12_git_shields_hold_inside_the_container() {
              printf '#!/bin/sh\\ntouch /tmp/pwned\\n' > sub/.git/hooks/pre-commit; echo hook=$?; \
              echo '[core] fsmonitor = evil' >> sub/.git/config; echo cfg=$?; \
              echo gitdir: /etc > mod/.git; echo ptr=$?",
-        );
+        )
+        .await;
         assert!(
             out.contains("mv-sub=1") && out.contains("mv-mod=1"),
             "{out}"
@@ -426,7 +432,8 @@ fn rt_fs_16_a_nested_host_mount_is_not_visible() {
             let (_, out) = exec(
                 &r,
                 "ls -a /workspace/p/nested; cat /workspace/p/nested/canary 2>&1",
-            );
+            )
+            .await;
             assert!(!out.contains("NESTED-SECRET"), "{mode}: {out}");
             assert!(out.contains("No such file"), "{mode}: {out}");
             x.stop(r).await;
@@ -506,7 +513,8 @@ fn hostile_user_podman_configuration_is_ignored() {
             &r,
             "ls /hostile /run/secrets 2>&1; env | grep HOSTILE; grep CapEff /proc/self/status; \
              ls /sys/class/net",
-        );
+        )
+        .await;
         assert!(
             !out.contains("canary") && !out.contains("HOSTILE=1"),
             "{out}"
@@ -539,7 +547,7 @@ fn a_reused_session_id_never_deletes_kept_staged_changes() {
             x.f.load(&mounts(&[mount("~/code/other", "/workspace/o", "staged")]));
         let req = x.request(&v, "reuse");
         let r = x.launcher.launch_workspace(req.clone()).await.unwrap();
-        let (code, out) = exec(&r, "echo keep > /workspace/o/work.txt");
+        let (code, out) = exec(&r, "echo keep > /workspace/o/work.txt").await;
         assert_eq!(code, 0, "{out}");
         x.stop(r).await;
         let kept = req.paths.stage(0).upper.join("work.txt");

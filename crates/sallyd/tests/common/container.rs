@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use sally_core::audit::{AuditError, NewEntry};
 use sally_core::manifest::{AuditLevel, ValidatedManifest};
 use sallyd::sandbox::{
-    AuditSink, CheckedRuntime, ImageRef, LaunchError, Launcher, LauncherParts, Podman, PodmanHost,
-    Running, ScanLimits, SessionId, SessionPaths, Sessions, UserIds, WorkspaceRequest,
+    AuditSink, CheckedRuntime, DiskFloor, ImageRef, LaunchError, Launcher, LauncherParts, Podman,
+    PodmanHost, Running, ScanLimits, SessionId, SessionPaths, Sessions, UserIds, WorkspaceRequest,
     resolve_podman,
 };
 
@@ -181,20 +181,25 @@ pub fn test_runtime() -> PathBuf {
 
 impl Lx {
     pub fn new() -> Self {
-        Self::build(None, None)
+        Self::build(None, None, DiskFloor::default())
     }
 
     /// `podman_home`: the `$HOME` hermetic podman is given (default: the real one).
     pub fn with_home(podman_home: Option<PathBuf>) -> Self {
-        Self::build(podman_home, None)
+        Self::build(podman_home, None, DiskFloor::default())
     }
 
     /// `runtime`: the OCI runtime podman is given (default: [`test_runtime`]).
     pub fn with_runtime(runtime: &Path) -> Self {
-        Self::build(None, Some(runtime))
+        Self::build(None, Some(runtime), DiskFloor::default())
     }
 
-    fn build(podman_home: Option<PathBuf>, runtime: Option<&Path>) -> Self {
+    /// `floor`: the launcher's free-space floor, as `sallyd`'s configuration would set it.
+    pub fn with_floor(floor: DiskFloor) -> Self {
+        Self::build(None, None, floor)
+    }
+
+    fn build(podman_home: Option<PathBuf>, runtime: Option<&Path>, floor: DiskFloor) -> Self {
         let f = Fx::new();
         let xdg = f.root.join("run");
         std::fs::set_permissions(&xdg, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -220,6 +225,7 @@ impl Lx {
             sessions: Arc::new(Sessions::default()),
             audit: events.clone(),
             limits: ScanLimits::default(),
+            disk_floor: floor,
         });
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -310,9 +316,16 @@ pub fn exec_in(container: &str, args: &[&str]) -> (i32, String) {
     (out.status.code().unwrap_or(-1), text)
 }
 
-/// `sh -c <script>` in the workspace container.
-pub fn exec(r: &Running, script: &str) -> (i32, String) {
-    exec_in(r.container(), &["sh", "-c", script])
+/// `sh -c <script>` in the workspace container, as the broker will exec: holding the session's
+/// exec gate (so it never meets a container frozen for a measurement), off the runtime (the
+/// watchdog runs on it).
+pub async fn exec(r: &Running, script: &str) -> (i32, String) {
+    let gate = r.exec_gate();
+    let _held = gate.lock().await;
+    let (c, s) = (r.container().to_owned(), script.to_owned());
+    tokio::task::spawn_blocking(move || exec_in(&c, &["sh", "-c", &s]))
+        .await
+        .unwrap()
 }
 
 pub fn exists(container: &str) -> bool {

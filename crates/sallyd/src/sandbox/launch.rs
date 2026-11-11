@@ -35,12 +35,13 @@ use serde_json::json;
 use super::argv::workspace_argv;
 use super::commands::{container_id, rm_args};
 use super::dirs::{DirError, SessionDirs};
+use super::disk::DiskFloor;
 use super::inside::{Expect, Mismatch, check_in_container};
 use super::overlap::{ReserveError, Sessions, claims};
 use super::podman::{Podman, PodmanError};
 use super::scan::{LaunchScan, PinKind, ScanError, ScanLimits, scan_mounts};
 use super::types::{ArgvError, CheckedRuntime, CommonArgs, ImageRef, SessionPaths, UserIds};
-use super::watchdog::{StageWatch, Watchdog};
+use super::watchdog::{Target, WatchPlan, Watchdog, watch_plan};
 
 /// Longest free-text value in an audit entry (CLAUDE.md: nothing above 4 KiB is logged).
 const AUDIT_TEXT_CAP: usize = 4096;
@@ -48,6 +49,8 @@ const AUDIT_TEXT_CAP: usize = 4096;
 /// cannot run (a missing interpreter, a crash at startup) exits well within it; a later exit is
 /// the session's business (Task 12).
 const START_GRACE: Duration = Duration::from_millis(250);
+/// How often a launch nobody received retries its `stop`.
+const STOP_RETRY: Duration = Duration::from_secs(2);
 /// Container name prefixes of the session roles this launcher creates.
 const SESSION_PREFIXES: [&str; 2] = ["sp-ws-", "sp-h-"];
 
@@ -103,6 +106,10 @@ pub enum LaunchError {
     /// The container was not running, with the checked pid, after `podman start`.
     #[error("the container is not running after start: {0}")]
     NotRunning(String),
+    /// A filesystem the sandbox could write to lacks the free-space floor (plus
+    /// `runtime.stage_size` on the state filesystem).
+    #[error("not enough free disk space: {0}")]
+    DiskSpace(String),
     /// A podman command failed.
     #[error("podman {verb}: {msg}")]
     Command {
@@ -140,6 +147,7 @@ impl LaunchError {
             Self::Podman(_) => "podman-config",
             Self::MountMismatch(_) => "mount-mismatch",
             Self::NotRunning(_) => "not-running",
+            Self::DiskSpace(_) => "disk-floor",
             Self::Command { .. } => "podman",
             Self::Audit(_) | Self::Unaudited { .. } => "audit",
             Self::Internal(_) => "internal",
@@ -198,11 +206,20 @@ pub struct Running {
     name: String,
     paths: SessionPaths,
     level: AuditLevel,
-    /// The `stage_size` watchdog, if the sandbox can write to the host disk; cancelled on drop.
+    /// The disk watchdog, if the sandbox can write to the host disk; stopped on drop.
     watchdog: Option<Watchdog>,
+    exec_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Running {
+    /// The session's exec gate. Every `podman exec` into the container (the shell tool, Task 11)
+    /// holds it, and the disk watchdog holds it while the container is frozen for a measurement,
+    /// so an exec never meets a paused container.
+    #[must_use]
+    pub fn exec_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(&self.exec_gate)
+    }
+
     /// Podman's container id (64 hex digits).
     #[must_use]
     pub fn container(&self) -> &str {
@@ -249,6 +266,8 @@ pub struct LauncherParts {
     pub audit: Arc<dyn AuditSink>,
     /// Scan bounds.
     pub limits: ScanLimits,
+    /// The free-space floor (`DiskFloor::default()` unless configured).
+    pub disk_floor: DiskFloor,
 }
 
 /// Launches and tears down sandboxes for one `sallyd`. Shared as `Arc<Launcher>`.
@@ -260,9 +279,10 @@ pub struct Launcher {
     sessions: Arc<Sessions>,
     audit: Arc<dyn AuditSink>,
     limits: ScanLimits,
-    /// One stage watchdog walk at a time across all sessions, so a sandbox with a huge or deep
-    /// tree cannot multiply `sallyd`'s open fds or blocking threads (6c-1 review M2/M3).
-    pub(super) walks: tokio::sync::Semaphore,
+    pub(super) disk_floor: DiskFloor,
+    /// One stage walk at a time across all sessions, so a sandbox with a huge or deep tree
+    /// cannot multiply `sallyd`'s open fds or blocking threads (6c-1 review M2/M3).
+    pub(super) walks: Arc<tokio::sync::Semaphore>,
 }
 
 impl std::fmt::Debug for Launcher {
@@ -294,7 +314,8 @@ impl Launcher {
             sessions: p.sessions,
             audit: p.audit,
             limits: p.limits,
-            walks: tokio::sync::Semaphore::new(1),
+            disk_floor: p.disk_floor,
+            walks: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
 
@@ -369,22 +390,38 @@ impl Launcher {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let this = Arc::clone(self);
         tokio::spawn(async move {
-            let result = this.launch(req).await.map(|(mut r, w)| {
-                r.watchdog = w.map(|w| {
-                    let sid = r.paths.id().as_str().to_owned();
-                    Watchdog::spawn(&this, sid, r.container.clone(), r.level, w)
+            let result = this.launch(req).await.map(|(mut r, plan)| {
+                r.watchdog = plan.map(|plan| {
+                    let target = Target {
+                        sid: r.paths.id().as_str().to_owned(),
+                        container: r.container.clone(),
+                        level: r.level,
+                        exec_gate: Arc::clone(&r.exec_gate),
+                    };
+                    Watchdog::spawn(&this, target, plan)
                 });
                 r
             });
-            if let Err(Ok(orphan)) = tx.send(result)
-                && let Err(mut e) = this.stop(orphan).await
-            {
-                // Nobody holds the handle any more, but the container may still run: keep it
-                // bounded, and record it (the claims stay held until remove_orphans at the next
-                // start).
-                if let Some(w) = e.running.watchdog.take() {
-                    w.detach();
-                }
+            if let Err(Ok(orphan)) = tx.send(result) {
+                this.stop_unreceived(orphan).await;
+            }
+        });
+        rx.await
+            .map_err(|_| LaunchError::Internal("the launch task ended without a result".into()))?
+    }
+
+    /// Stops a launch nobody received, retrying until the container is gone. Meanwhile the
+    /// handle keeps its disk watchdog, so the session stays bounded (6c-1 re-review M2). The
+    /// first failure is audited as `sandbox.stop_failed`.
+    async fn stop_unreceived(&self, mut running: Running) {
+        let mut reported = false;
+        loop {
+            let e = match self.stop(running).await {
+                Ok(()) => return,
+                Err(e) => e,
+            };
+            if !reported {
+                reported = true;
                 let entry = NewEntry::new(Actor::Sallyd, "sandbox.stop_failed")
                     .session(e.running.paths.id().as_str())
                     .decision("deny")
@@ -392,17 +429,21 @@ impl Launcher {
                         "container": e.running.name,
                         "detail": capped(&e.error.to_string()),
                     }));
-                let _ = this.audit(entry, e.running.level).await;
+                let _ = self.audit(entry, e.running.level).await;
             }
-        });
-        rx.await
-            .map_err(|_| LaunchError::Internal("the launch task ended without a result".into()))?
+            // `stop` also fails after the container is gone (scratch removal): nothing runs.
+            if matches!(self.container_exists(&e.running.name).await, Ok(false)) {
+                return;
+            }
+            running = e.running;
+            tokio::time::sleep(STOP_RETRY).await;
+        }
     }
 
     async fn launch(
         &self,
         req: WorkspaceRequest,
-    ) -> Result<(Running, Option<StageWatch>), LaunchError> {
+    ) -> Result<(Running, Option<WatchPlan>), LaunchError> {
         let level = req.manifest.manifest().audit.level;
         let sid = req.paths.id().as_str().to_owned();
         let v = Arc::clone(&req.manifest);
@@ -469,9 +510,8 @@ impl Launcher {
         req: &WorkspaceRequest,
         level: AuditLevel,
         progress: &mut Progress,
-    ) -> Result<(Running, Option<StageWatch>), LaunchError> {
-        let (runtime, scan) = self.check_and_scan(req).await?;
-        let watch = StageWatch::of(&req.manifest, &req.paths, &scan);
+    ) -> Result<(Running, Option<WatchPlan>), LaunchError> {
+        let (runtime, scan, plan) = self.check_and_scan(req).await?;
         let argv = self.dirs_and_argv(req, runtime, &scan, progress).await?;
         let m = req.manifest.manifest();
         let mounts: Vec<_> = req
@@ -511,24 +551,28 @@ impl Launcher {
             paths: req.paths.clone(),
             level,
             watchdog: None,
+            exec_gate: Arc::new(tokio::sync::Mutex::new(())),
         };
-        Ok((running, watch))
+        Ok((running, plan))
     }
 
-    /// Step 2: hermetic podman and the runtime re-checked, then the launch scan.
+    /// Step 2: hermetic podman and the runtime re-checked, then the launch scan, then the
+    /// free-space check of every filesystem the sandbox could write to (`disk.rs`).
     async fn check_and_scan(
         &self,
         req: &WorkspaceRequest,
-    ) -> Result<(CheckedRuntime, LaunchScan), LaunchError> {
+    ) -> Result<(CheckedRuntime, LaunchScan, Option<WatchPlan>), LaunchError> {
         let podman = self.podman.clone();
         let runtime = self.runtime.path().to_owned();
-        let limits = self.limits;
-        let v = Arc::clone(&req.manifest);
+        let (limits, floor) = (self.limits, self.disk_floor);
+        let (v, paths) = (Arc::clone(&req.manifest), req.paths.clone());
         blocking(move || {
             podman.recheck()?;
             let runtime = CheckedRuntime::check(&runtime)
                 .map_err(|e| LaunchError::Podman(PodmanError::Binary(e)))?;
-            Ok((runtime, scan_mounts(&v, &limits)?))
+            let scan = scan_mounts(&v, &limits)?;
+            let plan = watch_plan(&v, &paths, &scan, &floor)?;
+            Ok((runtime, scan, plan))
         })
         .await
     }

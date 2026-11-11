@@ -2,35 +2,26 @@
 //!
 //! A sandbox writes to the disk that holds Sallyport's state in two places: the upper directories
 //! of its `staged` mounts (kept) and of the `.git` overlays of its `rw` mounts (discarded at
-//! teardown). There is no quota a rootless launcher can set, so `sallyd` measures them. Every
-//! poll, the launcher sums the allocated bytes of every entry under every such upper directory.
-//! It counts `st_blocks`, so a sparse file counts what it really uses, and a hard link counts once
-//! per link: over-counting only hurts the session itself. A session that exceeds its limit is
-//! killed.
+//! teardown). The walk sums the allocated bytes of every entry under them. It counts `st_blocks`,
+//! so a sparse file counts what it really uses, and a hard link counts once per link:
+//! over-counting only hurts the session itself.
 //!
-//! The tree is the sandbox's: the walk goes through directory fds, never follows a symlink, and is
-//! bounded in entries and depth, holding one fd per level. An entry that disappears during the
-//! walk (a build's temp file) counts as zero. Anything else it cannot measure counts as over the
-//! limit, failing closed: an unreadable directory, an entry swapped for a symlink, a bound
-//! reached, a missing root.
+//! The walk runs only while the sandbox is frozen (`podman pause`, `watchdog.rs`), so the tree
+//! cannot change under it: any error fails closed, including an entry that vanished (only a host
+//! process could remove it). The tree is still the sandbox's, so the walk goes through directory
+//! fds, never follows a symlink, and is bounded in entries, depth and time, holding one fd per
+//! level.
 //!
-//! Residual risks (THREAT_MODEL §6). The watchdog is a poll, so a session can overshoot by what it
-//! writes in one interval. A file the sandbox keeps open after unlinking it (or an `O_TMPFILE`)
-//! uses space the walk cannot see. A subtree moved during a walk, from a directory not yet read
-//! into one already read, is missed for that pass.
+//! `stage_size` is a soft limit (THREAT_MODEL §6): the walk sees names, not the filesystem's
+//! accounting, so a file the sandbox keeps open after unlinking it (or an `O_TMPFILE`) is not
+//! counted. The free-space floor (`disk.rs`) is the hard guarantee.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
 use rustix::io::Errno;
-
-/// The shortest time between two measurements of a session. A measurement that took longer waits
-/// [`WALK_SPACING`] times its own duration, so a huge tree is not walked back to back.
-pub(crate) const STAGE_POLL: Duration = Duration::from_secs(2);
-/// See [`STAGE_POLL`].
-pub(crate) const WALK_SPACING: u32 = 4;
 
 /// Bounds of one measurement.
 #[derive(Debug, Clone, Copy)]
@@ -39,6 +30,8 @@ pub(crate) struct StageBounds {
     pub max_entries: u64,
     /// Directory depth below an upper directory; at most `max_depth + 1` fds are held.
     pub max_depth: usize,
+    /// Longest a walk may take (the sandbox is frozen meanwhile); past it, it fails closed.
+    pub deadline: Duration,
 }
 
 impl Default for StageBounds {
@@ -46,6 +39,7 @@ impl Default for StageBounds {
         Self {
             max_entries: 1_000_000,
             max_depth: 64,
+            deadline: Duration::from_secs(10),
         }
     }
 }
@@ -53,8 +47,9 @@ impl Default for StageBounds {
 /// One upper directory a sandbox writes to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Area {
-    /// What it is, for the audit entry: `filesystem.mounts[1]` or
-    /// `filesystem.mounts[0] .git overlay 2`.
+    /// What it is, for the audit entry: `filesystem.mounts[1]` (a staged mount) or
+    /// `filesystem.mounts[0].git[2]` (the third `.git` directory the launch scan found in that
+    /// `rw` mount). Never a host path the sandbox could have chosen.
     pub label: String,
     /// The upper directory.
     pub upper: PathBuf,
@@ -98,18 +93,24 @@ impl From<String> for Stop {
     }
 }
 
-/// Measures `areas` against `limit` bytes. Blocking; checks `cancel` before every entry.
+/// Measures `areas` against `limit` bytes. Blocking; checks `cancel` and the deadline before
+/// every entry.
 pub(crate) fn measure(
     areas: &[Area],
     limit: u64,
     bounds: StageBounds,
     cancel: &AtomicBool,
 ) -> Verdict {
-    let mut entries = 0u64;
+    let mut walk = Walk {
+        bounds,
+        entries: 0,
+        until: Instant::now() + bounds.deadline,
+        cancel,
+    };
     let mut total = 0u64;
     let mut largest: Option<(u64, &str)> = None;
     for area in areas {
-        let bytes = match usage(area, bounds, &mut entries, cancel) {
+        let bytes = match usage(area, &mut walk) {
             Ok(b) => b,
             Err(Stop::Cancelled) => return Verdict::Cancelled,
             Err(Stop::Failed(reason)) => {
@@ -143,15 +144,36 @@ fn open_dir(at: impl rustix::fd::AsFd, name: &std::ffi::CStr) -> Result<Dir, Err
     Dir::new(fd)
 }
 
-/// Allocated bytes of `area` and everything below it, counting into `entries`. Depth-first with
-/// one open directory per level, so at most `max_depth + 1` fds are held. An entry that is gone
-/// by the time it is stat'ed or opened (`ENOENT`) counts as zero; every other error fails.
-fn usage(
-    area: &Area,
+/// The state of one measurement across areas.
+struct Walk<'a> {
     bounds: StageBounds,
-    entries: &mut u64,
-    cancel: &AtomicBool,
-) -> Result<u64, Stop> {
+    entries: u64,
+    until: Instant,
+    cancel: &'a AtomicBool,
+}
+
+impl Walk<'_> {
+    /// Called before every entry: cancelled, past the deadline, or over the entry bound.
+    fn step(&mut self) -> Result<(), Stop> {
+        if self.cancel.load(Ordering::Relaxed) {
+            return Err(Stop::Cancelled);
+        }
+        if Instant::now() > self.until {
+            let secs = self.bounds.deadline.as_secs();
+            return Err(format!("the walk took longer than {secs} s").into());
+        }
+        self.entries = self.entries.saturating_add(1);
+        if self.entries > self.bounds.max_entries {
+            return Err(format!("more than {} entries", self.bounds.max_entries).into());
+        }
+        Ok(())
+    }
+}
+
+/// Allocated bytes of `area` and everything below it. Depth-first with one open directory per
+/// level, so at most `max_depth + 1` fds are held. Any error fails, an entry that vanished
+/// included: the sandbox is frozen.
+fn usage(area: &Area, walk: &mut Walk<'_>) -> Result<u64, Stop> {
     let root_name = std::ffi::CString::new(area.upper.as_os_str().as_encoded_bytes())
         .map_err(|_| "the upper directory path contains a NUL byte".to_owned())?;
     let first = open_dir(rustix::fs::CWD, &root_name)
@@ -163,9 +185,6 @@ fn usage(
     // The path from the root to the directory being read; its length is the depth.
     let mut path = vec![first];
     loop {
-        if cancel.load(Ordering::Relaxed) {
-            return Err(Stop::Cancelled);
-        }
         let depth = path.len();
         let Some(dir) = path.last_mut() else { break };
         let Some(entry) = dir.read() else {
@@ -177,26 +196,18 @@ fn usage(
         if name.to_bytes() == b"." || name.to_bytes() == b".." {
             continue;
         }
-        *entries = entries.saturating_add(1);
-        if *entries > bounds.max_entries {
-            return Err(format!("more than {} entries", bounds.max_entries).into());
-        }
+        walk.step()?;
         let fd = dir.fd().map_err(|e| format!("directory fd: {e}"))?;
-        let st = match rustix::fs::statat(fd, name, AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(st) => st,
-            Err(Errno::NOENT) => continue,
-            Err(e) => return Err(format!("cannot stat an entry: {e}").into()),
-        };
+        let st = rustix::fs::statat(fd, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|e| format!("cannot stat an entry: {e}"))?;
         bytes = bytes.saturating_add(allocated(&st));
         if FileType::from_raw_mode(st.st_mode) == FileType::Directory {
-            if depth > bounds.max_depth {
-                return Err(format!("deeper than {} directories", bounds.max_depth).into());
+            if depth > walk.bounds.max_depth {
+                let max = walk.bounds.max_depth;
+                return Err(format!("deeper than {max} directories").into());
             }
-            match open_dir(fd, name) {
-                Ok(child) => path.push(child),
-                Err(Errno::NOENT) => {}
-                Err(e) => return Err(format!("cannot open a directory: {e}").into()),
-            }
+            let child = open_dir(fd, name).map_err(|e| format!("cannot open a directory: {e}"))?;
+            path.push(child);
         }
     }
     Ok(bytes)
@@ -282,38 +293,21 @@ mod tests {
         }
     }
 
-    /// Review H1/M1 (6c-1): files created and deleted while the walk runs (a build's temp files)
-    /// never make a tree unmeasurable.
+    /// 6c-1 re-review M1: a walk has a deadline, and running past it fails closed.
     #[test]
-    fn churn_during_the_walk_is_not_a_failure() {
-        let t = Tmp::new("churn");
-        let a = t.area(0);
-        let dir = a.upper.clone();
-        let stop = std::sync::Arc::new(AtomicBool::new(false));
-        let churn = {
-            let stop = std::sync::Arc::clone(&stop);
-            std::thread::spawn(move || {
-                let mut i = 0u64;
-                while !stop.load(Ordering::Relaxed) {
-                    let d = dir.join(format!("d{}", i % 50));
-                    let _ = std::fs::create_dir(&d);
-                    let _ = std::fs::write(d.join("f"), b"x");
-                    let _ = std::fs::write(dir.join(format!("f{}", i % 50)), b"x");
-                    let _ = std::fs::remove_file(d.join("f"));
-                    let _ = std::fs::remove_dir(&d);
-                    let _ = std::fs::remove_file(dir.join(format!("f{}", (i + 25) % 50)));
-                    i += 1;
-                }
-            })
+    fn a_walk_past_its_deadline_fails_closed() {
+        let t = Tmp::new("deadline");
+        let a = t.area(4);
+        fill(&a.upper.join("f"), 1);
+        let none = StageBounds {
+            deadline: std::time::Duration::ZERO,
+            ..StageBounds::default()
         };
-        let verdicts: Vec<Verdict> = (0..300)
-            .map(|_| run(std::slice::from_ref(&a), u64::MAX, StageBounds::default()))
-            .collect();
-        stop.store(true, Ordering::Relaxed);
-        churn.join().unwrap();
-        for v in verdicts {
-            assert!(matches!(v, Verdict::Within { .. }), "{v:?}");
-        }
+        let v = run(&[a], u64::MAX, none);
+        assert!(
+            matches!(&v, Verdict::Unmeasurable { reason, .. } if reason.contains("longer than")),
+            "{v:?}"
+        );
     }
 
     #[test]
@@ -381,6 +375,7 @@ mod tests {
         let few = StageBounds {
             max_entries: 10,
             max_depth: 8,
+            ..StageBounds::default()
         };
         let v = run(&[a], u64::MAX, few);
         assert!(
@@ -392,6 +387,7 @@ mod tests {
         let shallow = StageBounds {
             max_entries: 1000,
             max_depth: 4,
+            ..StageBounds::default()
         };
         let v = run(std::slice::from_ref(&b), u64::MAX, shallow);
         assert!(
@@ -401,6 +397,7 @@ mod tests {
         let deep_enough = StageBounds {
             max_entries: 1000,
             max_depth: 16,
+            ..StageBounds::default()
         };
         assert!(matches!(
             run(&[b], u64::MAX, deep_enough),

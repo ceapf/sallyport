@@ -303,31 +303,54 @@ are released only once the container is confirmed gone.
    the entry point exits at once, and a container that exited is already gone (`--rm`). Either
    way the launch is refused (`not-running`), and everything it created is removed.
 
-**Stage watchdog** (`runtime.stage_size`, #14, Task 6c). A sandbox writes to the host disk in two
-places: the upper directories of its `staged` mounts, and of the `.git` overlays of its `rw`
-mounts. A session with either gets a watchdog task, which sums the allocated bytes (`st_blocks`)
-of every entry under all of them.
+**Disk watchdog** (#14, Task 6c; maintainer design after the 6c-1 reviews). A sandbox writes to
+the host disk through its `rw` mounts and through the upper directories of its `staged` mounts
+and of its `.git` overlays. Each session whose sandbox can do either gets two tasks:
 
-The walk:
-- goes through directory fds, never follows a symlink, and holds one fd per level;
-- is bounded at 1 000 000 entries and 64 levels;
-- runs one at a time across all sessions;
-- waits at least 2 s between walks of a session, or four times the last walk's duration if that
-  is longer;
-- counts an entry that disappears mid-walk as zero (`ENOENT`).
+- **Free-space floor** (the hard, race-free guarantee; `disk.rs`).
+  - It watches every filesystem the sandbox can write to: the state filesystem, when the session
+    has staged mounts or `.git` overlays, and the filesystem of each `rw` mount root. Each is held
+    by an `O_PATH` fd.
+  - Every 250 ms it reads `fstatfs`. When the space available to unprivileged users falls below
+    the floor, `max(4 GiB, 5 %)` by default, the session is killed. The audit reason is
+    `disk_floor`, with the filesystem, the free bytes and the floor.
+  - A `statfs` that fails or takes over 5 s fails closed.
+  - A launch is refused (`disk-floor`) unless every watched filesystem has the floor free, plus
+    `runtime.stage_size` on the state filesystem.
+  - It reads the filesystem's own accounting, so renames, open unlinked files and `O_TMPFILE`s
+    all count.
+  - It never waits for a walk, the walk permit or the exec gate.
+- **`stage_size`** (a soft limit).
+  - There is no periodic walk. The floor task tracks the state filesystem's used bytes, and wakes
+    the stage task only when they have grown past the session's headroom since the last accurate
+    measurement. The baseline is lowered whenever usage shrinks, which is conservative.
+  - The stage task takes the session's exec gate (`Running::exec_gate`, held around every
+    `podman exec`), then the global one-walk permit. Then it runs `podman pause` (the cgroup v2
+    freezer), walks the upper directories, and runs `podman unpause`.
+  - The walk goes through directory fds, never follows a symlink, holds one fd per level, and is
+    bounded at 1 000 000 entries, 64 levels and 10 s. The permit stays with the walk until it
+    stops.
+  - Because the sandbox is frozen, any error fails closed, including an entry that vanished.
+  - Over the limit, unmeasurable, or past the deadline: that session is killed (reasons
+    `stage_size`, `unmeasurable`). The audit entry names the area: `filesystem.mounts[n]` or
+    `filesystem.mounts[n].git[j]`, never a host path.
+  - Walks of one session are at least 2 s apart, or four times the last walk's duration if that
+    is longer.
 
-Anything else the walk cannot measure counts as over the limit: an unreadable directory, an entry
-swapped for a symlink, a bound reached, or a missing root.
+**Freeze hygiene.**
+- A guard unpauses on every path except a kill, panics and cancellation included. If the unpause
+  fails, the container is removed.
+- A failed `unpause` after a walk kills the session (`unpause_failed`).
+- A failed `pause` kills it (`pause_failed`), unless the container is gone; then the watchdog
+  ends.
 
-Over the limit, the watchdog first audits `session.resource_limit`, with `resource: stage_size`,
-the limit, the measured size and the largest area (`filesystem.mounts[n]`, or
-`filesystem.mounts[n]/<path>/.git`). Then it kills and removes the container, retrying every 2 s
-until the container is confirmed gone. If the first attempt fails, it audits
-`session.kill_failed` once. The kill happens even if an audit write fails.
+**Killing.** Every kill audits `session.resource_limit` first, then kills and removes the
+container, retrying every 2 s until it is confirmed gone. It audits `session.kill_failed` once if
+the first attempt fails. The kill happens even if an audit write fails.
 
 Teardown stays with `Launcher::stop`, which keeps the staged data. Dropping the session's handle
-cancels the watchdog and any walk in progress. The exception is a launch nobody received whose
-`stop` failed: there the watchdog is detached and keeps the session bounded.
+stops both tasks and any walk in progress. A launch nobody received is stopped with retries
+until its container is gone, and keeps its watchdog meanwhile.
 
 **Teardown** (`Launcher::stop`) audits `sandbox.stop`, then runs `podman rm --force --time 0`
 and confirms the container is gone (`podman container exists`). If it is not gone, the session
