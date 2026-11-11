@@ -211,6 +211,9 @@ fn rt_man_01_the_size_limit_is_inclusive() {
     assert_eq!(exact.len(), MAX_MANIFEST_BYTES);
     parse(&exact).unwrap();
     parse_bytes(exact.as_bytes()).unwrap();
+    // A small manifest too: `parse` re-checks the size, so only an input well under the limit
+    // shows that `parse_bytes`'s own check does not refuse it.
+    parse_bytes(format!("{HEADER}#\n").as_bytes()).unwrap();
     let over = format!("{exact} ");
     assert_eq!(parse(&over).unwrap_err().errors[0].code, Code::TooLarge);
     let e = parse_bytes(over.as_bytes()).unwrap_err();
