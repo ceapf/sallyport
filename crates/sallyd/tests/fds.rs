@@ -1,11 +1,11 @@
-//! RT-SEC-14: no broker file descriptor reaches Podman or a container. The broker holds its
-//! long-lived descriptors (the audit log and its lock, the secrets store), launches through the
-//! normal path (which holds its own while it runs podman), and then:
-//! - on the Podman side, conmon (which outlives `podman start`) and a process Podman runs
-//!   through the launcher's own hermetic command (`podman unshare`) hold no descriptor that
-//!   refers to a broker object. Podman's own descriptors are expected: conmon's pipes and
-//!   `userdata` files, and the pipe `podman unshare` passes its child as fd 3 (also from a plain
-//!   shell);
+//! RT-SEC-14: no broker file descriptor reaches Podman or a container. The broker holds
+//! long-lived descriptors (the audit log and its lock, plus one from each `sally_core::fd`
+//! wrapper: `open`, `openat`, `openat2`), launches through the normal path, and then:
+//! - on the Podman side, podman itself at each run of the launch, conmon (which outlives
+//!   `podman start`) and a process Podman runs through the launcher's own hermetic command
+//!   (`podman unshare`) hold no descriptor that refers to a broker object. Podman's own
+//!   descriptors are expected: the stdio the launcher gives it, conmon's pipes and `userdata`
+//!   files, and the pipe `podman unshare` passes its child as fd 3 (also from a plain shell);
 //! - in the container, the entry process holds only fds 0, 1 and 2, and PID 1 (the init,
 //!   catatonit) adds only its own signalfd.
 //!
@@ -13,14 +13,15 @@
 //! that, during the launch, records every descriptor the broker process holds at the moment it
 //! runs podman (`/proc/<parent>/fd`), so a descriptor nobody thought of is still compared. Only
 //! what the test harness held before the broker started, and `/dev/null` (a shared device every
-//! process opens), are left out.
+//! process opens), are left out. The same wrapper records its own descriptors, which podman
+//! inherits through `exec`.
 //!
 //! Identity is `st_dev:st_ino`; anonymous-inode descriptors (eventfd, epoll, signalfd) share one
 //! inode and are not compared. A planted inheritable descriptor (a `dup` without `O_CLOEXEC`)
-//! shows that both Podman-side observation points see a leak when there is one. The control is
+//! shows that every Podman-side observation point sees a leak when there is one. The control is
 //! `sally_core::fd`, which opens every `rustix` descriptor with `O_CLOEXEC` (`std` does the same
-//! for its own). The container never sees the planted descriptor: the OCI runtime closes
-//! descriptors above 2, a second layer.
+//! for its own): dropping it from any one wrapper fails the test. The container never sees the
+//! planted descriptor: the OCI runtime closes descriptors above 2, a second layer.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::BTreeSet;
@@ -28,7 +29,7 @@ use std::os::fd::OwnedFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use rustix::fs::{Mode, OFlags};
+use rustix::fs::{Mode, OFlags, ResolveFlags};
 use sally_core::audit::{Actor, AuditWriter, NewEntry, SystemClock};
 use sally_core::manifest::AuditLevel;
 use sallyd::sandbox::Running;
@@ -103,8 +104,9 @@ fn broker_refs<'a>(fds: impl IntoIterator<Item = &'a Fd>, broker: &BTreeSet<Id>)
 }
 
 /// A podman wrapper that, while recording is on, appends the descriptors of its parent (the
-/// broker, at the moment it runs podman) to a file, then runs the real podman. The listing
-/// runs in a subshell, so podman's environment is unchanged.
+/// broker, at the moment it runs podman) to `broker`, and its own (what podman inherits) to
+/// `podman`, then runs the real podman. The listings run in subshells, so podman's
+/// environment and descriptors are unchanged.
 struct Recorder {
     dir: PathBuf,
 }
@@ -120,8 +122,16 @@ impl Recorder {
 
     fn wrap(&self, real: &Path) -> PathBuf {
         let (dir, real) = (self.dir.display(), real.display());
+        for p in [dir.to_string(), real.to_string()] {
+            assert!(!p.contains('\''), "the wrapper single-quotes {p}");
+        }
+        // `$$` is the wrapper itself (also inside a subshell): podman runs as it, via `exec`.
+        let list = |pids: &str, file: &str| {
+            format!("(PATH=/usr/bin:/bin; PIDS={pids}; {LIST_FDS}) >>'{dir}/{file}'")
+        };
+        let (broker, own) = (list("$PPID", "broker"), list("$$", "podman"));
         let script = format!(
-            "#!/bin/sh\nif [ -e '{dir}/on' ]; then\n  (PATH=/usr/bin:/bin; PIDS=$PPID; {LIST_FDS}) >>'{dir}/fds'\nfi\nexec '{real}' \"$@\"\n"
+            "#!/bin/sh\nif [ -e '{dir}/on' ]; then\n  {broker}\n  {own}\nfi\nexec '{real}' \"$@\"\n"
         );
         let bin = self.dir.join("podman");
         executable(&bin, script.as_bytes());
@@ -137,16 +147,34 @@ impl Recorder {
         }
     }
 
-    /// Every descriptor recorded, each checked to be the broker's own.
-    fn broker_fds(&self) -> Vec<Fd> {
-        let text = std::fs::read_to_string(self.dir.join("fds")).expect("podman ran recorded");
-        let me = std::process::id().to_string();
+    fn read(&self, file: &str) -> Vec<(String, Fd)> {
+        let text = std::fs::read_to_string(self.dir.join(file)).expect("podman ran recorded");
         parse_fds(&text)
+    }
+
+    /// Every broker descriptor recorded, each checked to be this process's own.
+    fn broker_fds(&self) -> Vec<Fd> {
+        let me = std::process::id().to_string();
+        self.read("broker")
             .into_iter()
             .map(|(pid, f)| {
                 assert_eq!(pid, me, "the wrapper's parent is not the broker");
                 f
             })
+            .collect()
+    }
+
+    /// What podman itself held at each recorded run, beyond the stdio the launcher gives it
+    /// (`/dev/null` and its own output pipes).
+    fn podman_fds(&self) -> Vec<Fd> {
+        let me = std::process::id().to_string();
+        self.read("podman")
+            .into_iter()
+            .map(|(pid, f)| {
+                assert_ne!(pid, me, "the wrapper listed the broker as podman");
+                f
+            })
+            .filter(|f| !["0", "1", "2"].contains(&f.fd.as_str()))
             .collect()
     }
 }
@@ -196,10 +224,18 @@ struct Held {
     store: OwnedFd,
     store_id: Id,
     audit_log: Id,
+    /// One descriptor from each other `sally_core::fd` wrapper, held across the launch.
+    _dirs: [OwnedFd; 2],
+    openat_id: Id,
+    openat2_id: Id,
 }
 
-/// Opens what the broker holds for its lifetime, through the production code paths.
-fn hold(x: &Lx) -> Held {
+/// Opens long-lived broker descriptors: the audit writer through its production path, and one
+/// descriptor from each `sally_core::fd` wrapper. `open` takes the store with the flags
+/// `SecretStore::open` uses (which closes its own after reading; this one stands for any
+/// descriptor the broker keeps), `openat` the audit dir and `openat2` the mount root `dir`,
+/// with the flags the launch scan uses.
+fn hold(x: &Lx, dir: &Path) -> Held {
     let audit_dir = x.f.root.join("audit");
     std::fs::DirBuilder::new()
         .mode(0o700)
@@ -232,11 +268,25 @@ fn hold(x: &Lx) -> Held {
         .flatten()
         .find(|e| e.file_name().to_string_lossy().ends_with(".jsonl"))
         .expect("the audit writer created its log");
+    let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW;
+    let by_openat =
+        sally_core::fd::openat(rustix::fs::CWD, &audit_dir, dir_flags, Mode::empty()).unwrap();
+    let by_openat2 = sally_core::fd::openat2(
+        rustix::fs::CWD,
+        dir,
+        dir_flags,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    )
+    .unwrap();
     Held {
         _audit: audit,
         store,
         store_id: id_of(&store_path).unwrap(),
         audit_log: id_of(&log.path()).unwrap(),
+        _dirs: [by_openat, by_openat2],
+        openat_id: id_of(&audit_dir).unwrap(),
+        openat2_id: id_of(dir).unwrap(),
     }
 }
 
@@ -275,22 +325,33 @@ fn rt_sec_14_no_broker_descriptor_reaches_podman_or_a_container() {
             mount("~/code/staged", "/workspace/s", "staged"),
             mount("~/code/ro", "/workspace/r", "ro"),
         ]));
-        let held = hold(&x);
+        let held = hold(&x, &ro);
         rec.recording(true);
         let r = x.launch(&v, "sec14").await.unwrap();
         rec.recording(false);
-        let broker = broker_set(&rec, &baseline);
-        // The recording ran while the broker held its long-lived descriptors.
+        // The recording itself (not this process's later view) saw every held descriptor.
+        let recorded: BTreeSet<Id> = rec.broker_fds().into_iter().filter_map(|f| f.id).collect();
         for (what, id) in [
             ("the audit log", held.audit_log),
-            ("the secrets store", held.store_id),
+            ("the store (fd::open)", held.store_id),
+            ("the audit dir (fd::openat)", held.openat_id),
+            ("the mount root (fd::openat2)", held.openat2_id),
         ] {
             assert!(
-                broker.contains(&id),
-                "the broker set misses {what}: {:#?}",
+                recorded.contains(&id),
+                "the recording misses {what}: {:#?}",
                 rec.broker_fds()
             );
         }
+        let broker = broker_set(&rec, &baseline);
+
+        // What podman itself inherited, at each run of the launch.
+        let podman = rec.podman_fds();
+        assert_eq!(
+            broker_refs(&podman, &broker).len(),
+            0,
+            "podman: {podman:#?}"
+        );
 
         let conmon = conmon_fds(&x, &r).await;
         assert_eq!(
@@ -320,13 +381,17 @@ fn rt_sec_14_no_broker_descriptor_reaches_podman_or_a_container() {
         x.stop(r).await;
 
         // Each Podman-side observation point sees a leak when there is one.
+        #[allow(clippy::disallowed_methods)] // the plant: an inheritable descriptor on purpose
         let leak = rustix::io::dup(&held.store).unwrap();
         let planted = |fds: &[Fd]| fds.iter().any(|f| f.id == Some(held.store_id));
         assert!(
             planted(&podman_child_fds(&x).await),
             "podman child misses the plant"
         );
+        rec.recording(true);
         let r = x.launch(&v, "sec14l").await.unwrap();
+        rec.recording(false);
+        assert!(planted(&rec.podman_fds()), "podman misses the plant");
         assert!(
             planted(&conmon_fds(&x, &r).await),
             "conmon misses the plant"
