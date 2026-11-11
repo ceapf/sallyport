@@ -163,6 +163,63 @@ fn several_needed_entries_each_appear_once() {
     );
 }
 
+/// The message of the one `UnacknowledgedRisk` error `body` produces.
+fn ack_message(f: &Fixture, body: &str) -> String {
+    let e = f.load(body).unwrap_err();
+    let asks: Vec<&str> = e
+        .errors
+        .iter()
+        .filter(|d| d.code == Code::UnacknowledgedRisk)
+        .map(|d| d.message.as_str())
+        .collect();
+    assert_eq!(asks.len(), 1, "{e:#?}");
+    asks[0].to_owned()
+}
+
+/// Each needed entry is asked for with its own reason (#33: the `reason` arms and the
+/// destructive-approval guard).
+#[test]
+fn each_needed_entry_is_asked_for_with_its_exact_reason() {
+    let f = Fixture::new();
+    let shell = "tools:\n  builtin: [shell]\n  shell: allow\n";
+    // Guard true: destructive approval off.
+    assert_eq!(
+        ack_message(
+            &f,
+            &format!(
+                "{}{shell}  destructive_requires_approval: false\n",
+                mount("ro")
+            )
+        ),
+        "shell: allow with destructive_requires_approval: false runs every command without \
+         approval; add \"shell\" to tools.acknowledge_unapproved to accept this"
+    );
+    // Guard false: destructive approval kept, but data can leave.
+    assert_eq!(
+        ack_message(&f, &format!("{}{PROXY}{shell}", mount("ro"))),
+        "shell: allow runs commands without approval while mounted files or secrets can reach \
+         an allowed host ([data-can-leave]); add \"shell\" to tools.acknowledge_unapproved to \
+         accept this"
+    );
+    assert_eq!(
+        ack_message(
+            &f,
+            &format!(
+                "{}{PROXY}tools:\n  builtin: [fetch]\n  fetch_writes: allow\n",
+                mount("ro")
+            )
+        ),
+        "fetch_writes: allow lets fetch send mounted files or data your secrets unlock without \
+         approval; add \"fetch\" to tools.acknowledge_unapproved to accept this"
+    );
+    assert_eq!(
+        ack_message(&f, &format!("{}tools:\n{}", mount("ro"), mcp_never())),
+        "MCP server docs has approve: never, so its tool calls run without approval while it \
+         can reach mounted files or secrets; add \"mcp:docs\" to tools.acknowledge_unapproved \
+         to accept this"
+    );
+}
+
 // ---- B2(b): staged -----------------------------------------------------------------------------
 
 #[test]
