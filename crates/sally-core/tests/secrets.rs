@@ -170,6 +170,67 @@ fn value_length_limit_is_inclusive() {
     store.set("TOKEN", "x".repeat(MAX_VALUE_BYTES)).unwrap();
 }
 
+/// The documented bounds, restated: the tests above use the constants, so a changed constant
+/// would pass them.
+#[test]
+fn bounds_are_the_documented_values() {
+    assert_eq!(
+        (
+            MAX_STORE_BYTES,
+            MAX_SECRETS,
+            MAX_VALUE_BYTES,
+            SHORT_SECRET_BYTES
+        ),
+        (1024 * 1024, 256, 8 * 1024, 16)
+    );
+}
+
+/// The file bounds are inclusive on the read path too: exactly 1 MiB and exactly 256 secrets
+/// open; one more of either is refused.
+#[test]
+fn a_file_exactly_at_the_bounds_opens() {
+    let s = Scratch::new("bounds");
+    let p = s.store_path();
+    let comments = "#".repeat(MAX_STORE_BYTES);
+    s.write(&comments, 0o600);
+    assert_eq!(SecretStore::open(&p).unwrap().names().count(), 0);
+    SecretStore::from_bytes(p.clone(), comments.as_bytes()).unwrap();
+    let many = |n: usize| -> String {
+        (0..n)
+            .map(|i| format!("S{i} = \"{}\"\n", long("v")))
+            .collect()
+    };
+    let full = SecretStore::from_bytes(p.clone(), many(MAX_SECRETS).as_bytes()).unwrap();
+    assert_eq!(full.names().count(), MAX_SECRETS);
+    assert!(matches!(
+        SecretStore::from_bytes(p, many(MAX_SECRETS + 1).as_bytes()),
+        Err(SecretsError::TooMany)
+    ));
+}
+
+/// The sweep removes only stale temporary files of this store: `.<name>.*.tmp`. A backup that
+/// shares the prefix, or another `.tmp` file, is the user's and stays; so does a symlink with a
+/// temporary's name (only regular files are swept).
+#[test]
+fn save_sweeps_only_this_stores_stale_temporaries() {
+    let s = Scratch::new("sweep");
+    let stale = s.0.join(".secrets.toml.1.0.tmp");
+    let keep = [s.0.join(".secrets.toml.bak"), s.0.join("other.tmp")];
+    for p in keep.iter().chain([&stale]) {
+        std::fs::write(p, "x").unwrap();
+    }
+    let link = s.0.join(".secrets.toml.1.1.tmp");
+    std::os::unix::fs::symlink(&keep[0], &link).unwrap();
+    let mut store = SecretStore::open(&s.store_path()).unwrap();
+    store.set("TOKEN", long("v")).unwrap();
+    store.save().unwrap();
+    assert!(!stale.exists(), "stale temporary");
+    for p in &keep {
+        assert!(p.exists(), "{}", p.display());
+    }
+    assert!(link.symlink_metadata().is_ok(), "symlink kept");
+}
+
 #[test]
 fn interior_spaces_are_allowed() {
     let mut store = SecretStore::empty(PathBuf::from("/nonexistent/secrets.toml"));

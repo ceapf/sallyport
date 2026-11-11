@@ -7,7 +7,8 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 
 use sallyd::sandbox::{
-    PinKind, ScanError, ScanLimits, SessionDirs, VerifiedModel, check_runtime_dir, scan_mounts,
+    PinKind, ScanError, ScanLimits, SessionDirs, VerifiedModel, check_runtime_dir, claims,
+    scan_mounts,
 };
 
 mod common;
@@ -347,4 +348,94 @@ fn a_model_blob_is_pinned_only_when_named_by_hash_read_only_and_not_a_symlink() 
     for bad in ["", "../x", &D0.to_uppercase().replace('0', "A"), &D0[1..]] {
         assert!(VerifiedModel::pin(&blobs, bad).is_err(), "{bad:?}");
     }
+    // A short hex name is refused by its name even when such a read-only file exists.
+    blob(&D0[1..], 0o444);
+    assert!(
+        VerifiedModel::pin(&blobs, &D0[1..]).is_err(),
+        "63 hex digits"
+    );
+    // A read-only directory under a hex name is not a blob.
+    let d3 = "3".repeat(64);
+    let dir = blobs.join("sha256").join(&d3);
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    assert!(VerifiedModel::pin(&blobs, &d3).is_err(), "directory");
+    // Pinning opens with O_PATH: it never reads the blob, so read permission is not needed.
+    let d4 = "4".repeat(64);
+    blob(&d4, 0o000);
+    assert!(VerifiedModel::pin(&blobs, &d4).is_ok(), "mode 0000");
+    // No symlink anywhere on the way, not only at the blob itself.
+    let aliased = f.root.join("aliased");
+    std::fs::create_dir_all(&aliased).unwrap();
+    std::os::unix::fs::symlink(blobs.join("sha256"), aliased.join("sha256")).unwrap();
+    assert!(
+        VerifiedModel::pin(&aliased, D0).is_err(),
+        "symlinked sha256 dir"
+    );
+}
+
+#[test]
+fn claims_carry_each_mounts_realpath_mode_and_identity_chain() {
+    let f = Fx::new();
+    let c = claims(&one(&f, "rw")).unwrap();
+    let meta = std::fs::metadata(project(&f)).unwrap();
+    let root = std::fs::metadata("/").unwrap();
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0].host, project(&f));
+    assert_eq!(c[0].mode, sally_core::manifest::MountMode::Rw);
+    assert_eq!(c[0].chain.first(), Some(&(meta.dev(), meta.ino())));
+    assert_eq!(c[0].chain.last(), Some(&(root.dev(), root.ino())));
+}
+
+/// The walk bounds are inclusive: a tree exactly at a bound passes.
+#[test]
+fn walk_bounds_admit_a_tree_exactly_at_the_bound() {
+    let f = Fx::new();
+    for i in 0..10 {
+        std::fs::write(project(&f).join(format!("f{i}")), "").unwrap();
+    }
+    // 10 files + a, b, c, d: 14 entries; d is at depth 4.
+    std::fs::create_dir_all(project(&f).join("a/b/c/d")).unwrap();
+    for (entries, depth, ok) in [(14, 64, true), (13, 64, false), (250_000, 4, true)] {
+        let limits = ScanLimits {
+            max_entries: entries,
+            max_depth: depth,
+            ..ScanLimits::default()
+        };
+        let r = scan_mounts(&one(&f, "ro"), &limits);
+        assert_eq!(r.is_ok(), ok, "{entries} entries, depth {depth}: {r:?}");
+    }
+}
+
+/// The bytes of paths queued for listing are bounded at 16 MiB (restated here, not imported): a
+/// directory whose subdirectories' paths add up to exactly that passes, one byte more refuses.
+#[test]
+fn pending_paths_are_bounded_at_exactly_16_mib() {
+    const BOUND: usize = 16 * 1024 * 1024;
+    const NAME: usize = 255;
+    let f = Fx::new();
+    // A chain of 13 long names keeps every child path long but under PATH_MAX.
+    let chain: PathBuf = (0..13)
+        .map(|i| format!("{i:02}{}", "c".repeat(NAME - 2)))
+        .collect();
+    let deep = project(&f).join(&chain);
+    std::fs::create_dir_all(&deep).unwrap();
+    // A child's queued path is `<chain>/<name>`.
+    let prefix = chain.as_os_str().len() + 1;
+    let per_child = prefix + NAME;
+    let children = BOUND.div_ceil(per_child);
+    let mut excess = children * per_child - BOUND;
+    for i in 0..children {
+        let cut = excess.min(NAME - 6);
+        excess -= cut;
+        let name = format!("{i:05}{}", "x".repeat(NAME - 5 - cut));
+        std::fs::create_dir(deep.join(name)).unwrap();
+    }
+    assert_eq!(excess, 0);
+    let limits = ScanLimits::default();
+    scan_mounts(&one(&f, "ro"), &limits).unwrap();
+    // One more queued path, however short, crosses the bound.
+    std::fs::create_dir(deep.join("z")).unwrap();
+    let e = scan_mounts(&one(&f, "ro"), &limits).unwrap_err();
+    assert!(e.to_string().contains("bytes of pending paths"), "{e}");
 }

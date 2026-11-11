@@ -133,6 +133,9 @@ manually for the tasks marked opus). Subagents are the files in `.claude/agents/
   session.
 - Reviews run as subagents (separate context). One review per task, not per edit, plus one
   diff-only re-review when post-review fixes rewrite a security-core component.
+- Reviews run on the local diff before the first push, so CI runs once per PR. A test-only PR
+  needs no reviewer pass: the local mutants run on the touched files is its review.
+- LOW fixes that touch only comments or docs ride in the next PR; they get no CI run of their own.
 - Reviewer prompts ask, for each new `rt_` test, which control's removal makes it fail (a test
   that still passes without its control is a finding).
 - Don't read `THREAT_MODEL.md`/`ARCHITECTURE.md` repeatedly — read the section you need once per session.

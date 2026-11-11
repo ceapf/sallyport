@@ -259,6 +259,52 @@ mod tests {
         assert!(chain.len() >= 2);
     }
 
+    /// The walk opens with `O_PATH` (no read permission needed) and never through a symlink.
+    #[test]
+    fn identity_chains_need_no_read_permission_and_refuse_a_symlinked_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("sp-overlap-chain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("d");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(&dir, base.join("link")).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o100)).unwrap();
+        let chain = identity_chain(&dir);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = identity_chain(&base.join("link"));
+        std::fs::remove_dir_all(&base).unwrap();
+        assert!(chain.is_ok(), "search-only dir: {chain:?}");
+        assert!(link.is_err(), "symlinked root: {link:?}");
+    }
+
+    /// Path containment alone is a conflict, even with no identity to compare.
+    #[test]
+    fn nested_paths_conflict_without_identities() {
+        let bare = |host: &str| Claim {
+            host: host.into(),
+            mode: MountMode::Rw,
+            chain: Vec::new(),
+        };
+        for (a, b) in [("/h/p", "/h/p/sub"), ("/h/p/sub", "/h/p")] {
+            let held = [bare(a)];
+            assert!(
+                conflict([("s1", held.as_slice())], &[bare(b)]).is_some(),
+                "{a} {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_is_live_from_reserve_to_release() {
+        let s = Sessions::default();
+        assert!(!s.is_live("a"));
+        s.reserve("a", vec![]).unwrap();
+        assert!(s.is_live("a"));
+        assert!(!s.is_live("b"));
+        s.release("a");
+        assert!(!s.is_live("a"));
+    }
+
     #[test]
     fn overlapping_mounts_conflict_exactly_when_either_side_can_write() {
         let shapes = [("/h/p", "/h/p"), ("/h/p", "/h/p/sub"), ("/h/p/sub", "/h/p")];
