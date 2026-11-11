@@ -2,7 +2,7 @@
 CARGO ?= cargo --locked
 MUSL  := x86_64-unknown-linux-musl
 
-.PHONY: lint fmt clippy deny forbid-unsafe test test-scripts nextest coverage mutants zizmor shim shim-check fuzz redteam redteam-gpu e2e-gpu doctor
+.PHONY: lint fmt clippy deny forbid-unsafe test test-scripts nextest coverage mutants mutants-wide-core mutants-wide-sallyd mutants-wide-shim zizmor shim shim-check fuzz redteam redteam-gpu e2e-gpu doctor
 
 lint: fmt clippy forbid-unsafe deny
 
@@ -61,6 +61,36 @@ MUTANTS_TMP := $(CURDIR)/target/mutants-tmp
 mutants:
 	mkdir -p $(MUTANTS_TMP)
 	TMPDIR=$(MUTANTS_TMP) cargo mutants --package sally-core --no-shuffle $(foreach f,$(MUTANTS_FILES),--file '$(f)')
+
+# The wider scope (CLAUDE.md "Mutation scope"): every other file whose security decisions can be
+# tested without starting a container, zero survivors too. Per mutant only container-free tests
+# run: the crate's unit tests plus the integration binaries that start no container (sally-core's
+# all start none). Launch, teardown and the watchdog tasks stay with the rt_ tests.
+# MUTANTS_SHARD=k/n runs one round-robin shard; MUTANTS_OUT=<dir> moves mutants.out.
+MUTANTS_WIDE_CORE := $(addprefix crates/sally-core/src/,manifest/image.rs manifest/hostenv.rs \
+                     manifest/parse.rs manifest/summary.rs manifest/units.rs secrets/store.rs \
+                     secrets/secret.rs audit/entry.rs audit/redact.rs audit/verify.rs \
+                     audit/writer.rs audit/layout.rs fsutil.rs)
+MUTANTS_WIDE_SALLYD := $(addprefix crates/sallyd/src/sandbox/,argv.rs check.rs types.rs profiles.rs \
+                       overlap.rs scan.rs images.rs changes.rs dirs.rs podman.rs disk.rs stage.rs \
+                       launch/error.rs)
+MUTANTS_WIDE_SHIM := $(addprefix crates/sally-shim/src/,args.rs relay.rs)
+MUTANTS_WIDE_TESTS_CORE :=
+MUTANTS_WIDE_TESTS_SALLYD := --lib --test=argv --test=scan
+MUTANTS_WIDE_TESTS_SHIM := --lib --test=relay
+MUTANTS_SHARD ?=
+MUTANTS_OUT ?=
+# $(1) package, $(2) files, $(3) cargo test args
+mutants_wide = mkdir -p $(MUTANTS_TMP) && TMPDIR=$(MUTANTS_TMP) cargo mutants --package $(1) \
+  --no-shuffle $(if $(MUTANTS_SHARD),--shard $(MUTANTS_SHARD) --sharding round-robin) \
+  $(if $(MUTANTS_OUT),--output $(MUTANTS_OUT)) $(foreach f,$(2),--file '$(f)') \
+  $(foreach a,$(3),--cargo-test-arg=$(a))
+mutants-wide-core:
+	$(call mutants_wide,sally-core,$(MUTANTS_WIDE_CORE),$(MUTANTS_WIDE_TESTS_CORE))
+mutants-wide-sallyd:
+	$(call mutants_wide,sallyd,$(MUTANTS_WIDE_SALLYD),$(MUTANTS_WIDE_TESTS_SALLYD))
+mutants-wide-shim:
+	$(call mutants_wide,sally-shim,$(MUTANTS_WIDE_SHIM),$(MUTANTS_WIDE_TESTS_SHIM))
 
 # GitHub Actions static analysis.
 zizmor:

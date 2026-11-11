@@ -31,3 +31,38 @@ jobs:
           name: mutants-out
           path: mutants.out/
           if-no-files-found: ignore
+  # The wider scope (CLAUDE.md "Mutation scope"), zero survivors too. Only container-free tests
+  # run per mutant, so no podman is needed. Shards are sized for about 30 minutes each, under the
+  # 60-minute target; the 90-minute timeout is headroom, not the budget.
+  mutants-wide:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { set: core, shard: 0/2 }
+          - { set: core, shard: 1/2 }
+          - { set: sallyd, shard: 0/4 }
+          - { set: sallyd, shard: 1/4 }
+          - { set: sallyd, shard: 2/4 }
+          - { set: sallyd, shard: 3/4 }
+          - { set: shim, shard: 0/1 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: cargo install cargo-mutants --locked --version "$CARGO_MUTANTS_VERSION"
+      - name: verify cargo-mutants version
+        run: cargo mutants --version | grep -Fw "$CARGO_MUTANTS_VERSION"
+      - name: mutants (${{ matrix.set }} ${{ matrix.shard }})
+        env:
+          SET: ${{ matrix.set }}
+          SHARD: ${{ matrix.shard }}
+        run: make "mutants-wide-$SET" MUTANTS_SHARD="$SHARD" MUTANTS_OUT=target/mutants-wide
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mutants-wide-${{ matrix.set }}-${{ strategy.job-index }}
+          path: target/mutants-wide/mutants.out/
+          if-no-files-found: ignore

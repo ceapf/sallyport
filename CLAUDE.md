@@ -74,6 +74,20 @@ If a task seems to require breaking one of these, **stop and ask**. Do not imple
 - Coverage targets: `sally-core` ≥ 90% lines; `sallyd` policy/approvals/egress ≥ 85%; UI components ≥ 70%.
 - Snapshot-test the `podman run` argv for each profile.
 
+### Mutation scope ("zero survivors" means these files)
+
+Rule: a file is in scope when its security decisions can be tested without starting a container.
+Orchestration that only container tests can prove (`sandbox/launch.rs`, `launch/teardown.rs`,
+`watchdog.rs`, `commands.rs`, `inside.rs`) stays with the `rt_` tests. Per mutant only
+container-free tests run: unit tests, all of sally-core's `tests/`, `sallyd` `argv` + `scan`,
+`sally-shim` `relay`. A new file that fits the rule joins its list in the same PR. Nightly, two jobs:
+- `make mutants` (deny paths): sally-core `manifest/validate/*.rs`, `manifest/paths.rs`,
+  `manifest/host.rs`, `config.rs`.
+- `make mutants-wide-{core,sallyd,shim}` (sharded): sally-core `manifest/{image,hostenv,parse,
+  summary,units}.rs`, `secrets/{store,secret}.rs`, `audit/{entry,redact,verify,writer,layout}.rs`,
+  `fsutil.rs`; sallyd `sandbox/{argv,check,types,profiles,overlap,scan,images,changes,dirs,
+  podman,disk,stage}.rs`, `sandbox/launch/error.rs`; sally-shim `args.rs`, `relay.rs`.
+
 ## Agent / model routing (ECC)
 
 Main session: `opusplan` (if the `/model` picker lacks it, default to sonnet and switch to opus
@@ -122,6 +136,9 @@ manually for the tasks marked opus). Subagents are the files in `.claude/agents/
 - Reviewer prompts ask, for each new `rt_` test, which control's removal makes it fail (a test
   that still passes without its control is a finding).
 - Don't read `THREAT_MODEL.md`/`ARCHITECTURE.md` repeatedly — read the section you need once per session.
+- One PR in CI at a time. While it runs, work locally on the next item; branch from `main` only
+  after the first has merged, or stack the branch on it. Never sit idle waiting on a run that
+  nothing depends on.
 
 ## Public repository rules
 
