@@ -111,25 +111,44 @@ fn rt_fs_03_symlinks_resolve_inside_the_container() {
         let dir = home(&x).join("code/myproject");
         std::os::unix::fs::symlink(home(&x).join(".ssh"), dir.join("evil")).unwrap();
         let r = launch_with(&x, "rw", "fs03").await;
-        let (_, out) = exec(
+        let (code, out) = exec(&r, "ln -s /etc/shadow /workspace/p/s 2>&1").await;
+        assert_eq!(code, 0, "{out}");
+        // The link resolves to the container's own /etc/shadow (same st_dev:st_ino), or dangles
+        // like it; never to the host's file.
+        let (_, ids) = exec(&r, "stat -L -c '%d:%i' /workspace/p/s /etc/shadow 2>&1").await;
+        let lines: Vec<&str> = ids.lines().collect();
+        let dangling = lines.iter().all(|l| l.contains("No such file"));
+        assert!(
+            lines.len() == 2 && (lines.first() == lines.get(1) || dangling),
+            "s resolves inside the container: {ids}"
+        );
+        let host = {
+            use std::os::unix::fs::MetadataExt;
+            let m = std::fs::metadata("/etc/shadow").unwrap();
+            format!("{}:{}", m.dev(), m.ino())
+        };
+        assert!(!ids.contains(&host), "s is the host's /etc/shadow: {ids}");
+        // A link the sandbox makes to the canary's absolute host path resolves in the container.
+        let key = home(&x).join(".ssh/id_ed25519");
+        let (code, out) = exec(
             &r,
-            "ln -s /etc/shadow /workspace/p/s && cat /workspace/p/s 2>&1; \
-             cat /workspace/p/evil/id_ed25519 2>&1; ls /workspace/p/evil/ 2>&1",
+            &format!("ln -s '{}' /workspace/p/s2 2>&1", key.display()),
         )
         .await;
-        assert!(!out.contains(&c), "{out}");
-        assert!(
-            out.contains("No such file or directory"),
-            "evil: ENOENT: {out}"
-        );
-        let shadow = std::fs::read_to_string("/etc/shadow").unwrap_or_default();
-        let (_, mine) = exec(&r, "cat /workspace/p/s 2>&1").await;
-        assert!(
-            mine.contains("Permission denied")
-                || shadow.is_empty()
-                || !shadow.contains(mine.trim()),
-            "the container's own /etc/shadow, or refused: {mine}"
-        );
+        assert_eq!(code, 0, "{out}");
+        for cmd in [
+            "cat /workspace/p/evil/id_ed25519",
+            "ls /workspace/p/evil/",
+            "cat /workspace/p/s2",
+        ] {
+            let (code, out) = exec(&r, &format!("{cmd} 2>&1")).await;
+            assert_ne!(code, 0, "{cmd}: {out}");
+            assert!(!out.contains(&c), "{cmd}: {out}");
+            assert!(
+                out.contains("No such file or directory"),
+                "{cmd}: ENOENT: {out}"
+            );
+        }
         x.stop(r).await;
     });
 }
@@ -150,6 +169,7 @@ fn rt_fs_07_device_nodes_cannot_be_created() {
         }
         assert!(!home(&x).join("code/myproject/mem").exists());
         let (_, out) = exec(&r, "grep -E ' /(tmp|workspace/p) ' /proc/self/mountinfo").await;
+        assert_eq!(out.lines().count(), 2, "/tmp and /workspace/p: {out}");
         for line in out.lines() {
             assert!(line.contains("nodev"), "nodev: {line}");
         }

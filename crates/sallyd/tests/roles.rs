@@ -265,19 +265,27 @@ fn rt_net_08_raw_sockets_and_icmp_fail() {
                 Role::Inference => ("socket errno=38", "socket errno=38"),
                 Role::Workspace | Role::Harness => ("socket errno=1", "socket errno=13"),
             };
+            // Raw sockets must be refused at creation (the capability drop, not only
+            // `--network=none`); a ping socket may instead be created and fail to send.
             let cases = [
-                ("send 2 3 1 1.1.1.1 0", raw),            // SOCK_RAW, IPPROTO_ICMP
-                ("send 2 3 255 1.1.1.1 0", raw),          // SOCK_RAW, IPPROTO_RAW
-                ("send 10 3 58 2606:4700::1111 0", raw),  // SOCK_RAW, ICMPv6
-                ("send 2 2 1 1.1.1.1 0", icmp),           // SOCK_DGRAM, IPPROTO_ICMP
-                ("send 10 2 58 2606:4700::1111 0", icmp), // SOCK_DGRAM, ICMPv6
+                ("send 2 3 1 1.1.1.1 0", raw, false),   // SOCK_RAW, IPPROTO_ICMP
+                ("send 2 3 255 1.1.1.1 0", raw, false), // SOCK_RAW, IPPROTO_RAW
+                ("send 10 3 58 2606:4700::1111 0", raw, false), // SOCK_RAW, ICMPv6
+                ("send 2 2 1 1.1.1.1 0", icmp, true),   // SOCK_DGRAM, IPPROTO_ICMP
+                ("send 10 2 58 2606:4700::1111 0", icmp, true), // SOCK_DGRAM, ICMPv6
             ];
-            let calls: Vec<&str> = cases.iter().map(|(c, _)| *c).collect();
-            for ((call, got), (_, refused)) in probe(b, &calls).iter().zip(&cases) {
+            let calls: Vec<&str> = cases.iter().map(|(c, _, _)| *c).collect();
+            for ((call, got), (_, refused, may_send)) in probe(b, &calls).iter().zip(&cases) {
+                let failed_send = *may_send && got == "sendto errno=101";
                 assert!(
-                    got == refused || got == "sendto errno=101",
-                    "{:?}: probe {call}: {got} (want {refused}, or a send that fails)",
-                    b.role
+                    got == refused || failed_send,
+                    "{:?}: probe {call}: {got} (want {refused}{})",
+                    b.role,
+                    if *may_send {
+                        ", or a send that fails"
+                    } else {
+                        ""
+                    }
                 );
             }
             let (code, out) = exec_in(&b.container, &["ping", "-c", "1", "-W", "2", "1.1.1.1"]);
