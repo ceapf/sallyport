@@ -89,8 +89,122 @@ fn constants(text: &str) -> Vec<(&'static str, String)> {
     out
 }
 
+/// `src` with the contents of string and char literals blanked (same length), so a brace or a
+/// `|` inside one is not read as code. Lifetimes (`'a`) are left alone.
+fn strip_literals(src: &str) -> String {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let starts_word = i == 0 || !is_ident(chars[i - 1]);
+        let raw_hashes = (c == 'r' && starts_word)
+            .then(|| chars[i + 1..].iter().take_while(|&&h| h == '#').count())
+            .filter(|&n| chars.get(i + 1 + n) == Some(&'"'));
+        if let Some(n) = raw_hashes {
+            let close: String = std::iter::once('"').chain("#".repeat(n).chars()).collect();
+            let body_start = i + 2 + n;
+            let rest: String = chars[body_start..].iter().collect();
+            let at = rest.find(&close).expect("unterminated raw string");
+            let end = body_start + rest[..at].chars().count();
+            out.push_str(&" ".repeat(end + close.len() - i));
+            i = end + close.len();
+        } else if c == '"' {
+            let mut j = i + 1;
+            while chars[j] != '"' {
+                j += if chars[j] == '\\' { 2 } else { 1 };
+            }
+            out.push_str(&" ".repeat(j + 1 - i));
+            i = j + 1;
+        } else if c == '\'' && chars.get(i + 1) == Some(&'\\') {
+            let j = i
+                + 2
+                + chars[i + 2..]
+                    .iter()
+                    .position(|&q| q == '\'')
+                    .expect("char literal");
+            out.push_str(&" ".repeat(j + 1 - i));
+            i = j + 1;
+        } else if c == '\'' && chars.get(i + 2) == Some(&'\'') {
+            out.push_str("   ");
+            i += 3;
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Names of the parameters whose type mentions a flags type (however it is spelled).
+fn flag_params(sig: &str) -> Vec<String> {
+    let params = sig.split_once('(').map_or("", |(_, p)| p);
+    params
+        .split(',')
+        .filter(|p| TYPES.iter().any(|t| p.contains(t)))
+        .filter_map(|p| p.split_once(':'))
+        .map(|(n, _)| n.trim().trim_start_matches("mut ").to_owned())
+        .collect()
+}
+
+fn is_ident(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == ':'
+}
+
+/// `op` is a local whose `let` initializer is built from known constants only (an `if`/`else`
+/// between them is fine): no call, field, method, path or bare constant other than those.
+fn local_of_constants(flat: &str, op: &str) -> bool {
+    let Some((_, rest)) = flat.split_once(&format!("let {op} = ")) else {
+        return false;
+    };
+    let init = rest.split(';').next().unwrap_or_default();
+    let words: Vec<&str> = init
+        .split(|c: char| !is_ident(c))
+        .filter(|w| !w.is_empty())
+        .collect();
+    let paths = words.iter().filter(|w| w.contains("::")).count();
+    let bare_caps = words
+        .iter()
+        .any(|w| !w.contains("::") && w.chars().any(|c| c.is_ascii_uppercase()));
+    !init.contains(['(', '.']) && !bare_caps && paths == constants(init).len() && paths > 0
+}
+
+/// Every operand of every binary `|` in `body` is a known `Type::CONST` (an unknown one fails
+/// in [`value`]), one of `params`, or a local built from known constants: no raw value, call,
+/// field or other constant slips in.
+fn assert_operands(body: &str, params: &[String], what: &str) {
+    let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    for (at, _) in flat.match_indices(" | ") {
+        let before = &flat[..at];
+        let left_start = before
+            .char_indices()
+            .rev()
+            .take_while(|&(_, c)| is_ident(c))
+            .last()
+            .map_or(at, |(i, _)| i);
+        let left = &before[left_start..];
+        let ahead = before[..left_start].chars().next_back();
+        let after = &flat[at + 3..];
+        let right: String = after.chars().take_while(|&c| is_ident(c)).collect();
+        let call = after[right.len()..].starts_with('(');
+        for (op, bad) in [(left, ahead == Some('.')), (right.as_str(), call)] {
+            let known = match op.split_once("::") {
+                Some((ty, name)) if TYPES.contains(&ty) => {
+                    value(ty, name);
+                    true
+                }
+                _ => params.iter().any(|p| p == op) || local_of_constants(&flat, op),
+            };
+            assert!(
+                known && !bad,
+                "{what}: `|` operand `{op}` is not a known flag constant or flags parameter"
+            );
+        }
+    }
+}
+
 /// The source of `fn name` in `src`: signature through its matching closing brace. The name
-/// must be defined exactly once in the file.
+/// must be defined exactly once in the file. `src` must already be [`strip_literals`]ed.
 fn function<'a>(src: &'a str, name: &str, file: &str) -> &'a str {
     let starts: Vec<usize> = src
         .match_indices(&format!("fn {name}"))
@@ -153,20 +267,16 @@ fn xor_exclusions_combine_disjoint_flags() {
         };
         let file = file.replace(r"\.", ".");
         let name = func.rsplit("::").next().unwrap();
-        let src = std::fs::read_to_string(root().join(&file)).unwrap();
+        let src = strip_literals(&std::fs::read_to_string(root().join(&file)).unwrap());
         let body = function(&src, name, &file);
         let what = format!("{file} {func}");
-        for line in body.lines().filter(|l| l.contains(" | ")) {
-            assert!(
-                !constants(line).is_empty(),
-                "{what}: `|` on a line without a known flag constant: {line}"
-            );
-        }
+        let sig = &body[..body.find('{').unwrap()];
+        let params = flag_params(sig);
+        assert_operands(body, &params, &what);
         let own = constants(body);
         assert!(!own.is_empty(), "{what}: no flag constants found");
         assert_disjoint(&own, &what);
-        let sig = &body[..body.find('{').unwrap()];
-        if TYPES.iter().any(|t| sig.contains(&format!(": {t}"))) {
+        if !params.is_empty() {
             assert!(
                 !sig.trim_start().starts_with("pub"),
                 "{what}: a flags parameter must be private"
@@ -238,6 +348,75 @@ fn the_proof_refuses_a_repeated_constant() {
 #[should_panic(expected = "not a constant the disjointness proof knows")]
 fn the_proof_refuses_an_unknown_constant() {
     assert_disjoint(&constants("OFlags::NOATIME | OFlags::PATH"), "self-test");
+}
+
+/// The operand check refuses a raw value, a call, a field and an unlisted constant.
+#[test]
+#[should_panic(expected = "is not a known flag constant")]
+fn the_proof_refuses_a_call_operand() {
+    assert_operands("Mode::from_raw_mode(0o600) | Mode::RUSR", &[], "self-test");
+}
+
+#[test]
+#[should_panic(expected = "is not a known flag constant")]
+fn the_proof_refuses_an_unlisted_constant_operand() {
+    let kind = vec!["kind".to_owned()];
+    assert_operands("kind | OFlags::NOFOLLOW | EXTRA", &kind, "self-test");
+}
+
+#[test]
+#[should_panic(expected = "is not a known flag constant")]
+fn the_proof_refuses_a_field_operand() {
+    assert_operands(
+        "self.flags | OFlags::PATH",
+        &["flags".to_owned()],
+        "self-test",
+    );
+}
+
+#[test]
+#[should_panic(expected = "is not a known flag constant")]
+fn the_proof_refuses_a_local_built_from_a_call() {
+    let body = "let access = Mode::from_raw_mode(0o600); access | Mode::RUSR";
+    assert_operands(body, &[], "self-test");
+}
+
+#[test]
+#[should_panic(expected = "is not a known flag constant")]
+fn the_proof_refuses_a_local_holding_an_unlisted_constant() {
+    let body = "let access = if w { EXTRA } else { OFlags::RDONLY }; access | OFlags::PATH";
+    assert_operands(body, &[], "self-test");
+}
+
+#[test]
+fn the_proof_accepts_a_local_built_from_constants() {
+    let body = "let access = if writable { OFlags::RDWR | OFlags::APPEND } else { OFlags::RDONLY }; \
+                access | OFlags::NOFOLLOW";
+    assert_operands(body, &[], "self-test");
+}
+
+#[test]
+fn the_proof_accepts_constants_and_flags_parameters() {
+    let sig = "fn f(root: &OwnedFd, kind: rustix::fs::OFlags, n: usize)";
+    let params = flag_params(sig);
+    assert_eq!(params, ["kind"]);
+    assert_operands(
+        "OFlags::RDONLY\n        | OFlags::DIRECTORY | kind",
+        &params,
+        "self-test",
+    );
+}
+
+/// A brace or `|` inside a literal is not code: the body is not cut short, and the literal's
+/// text is not an operand.
+#[test]
+fn literals_do_not_end_a_function_or_add_operands() {
+    let src = "fn f() { let c = '}'; let s = \"} | x\"; let r = r#\"}\"#; let e = '\\''; \
+               OFlags::PATH | OFlags::DIRECTORY }\nfn g() {}";
+    let stripped = strip_literals(src);
+    let body = function(&stripped, "f", "self-test");
+    assert!(body.ends_with("OFlags::DIRECTORY }"), "{body}");
+    assert_operands(body, &[], "self-test");
 }
 
 /// Each group of entries sits under a reason comment.
