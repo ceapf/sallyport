@@ -577,9 +577,17 @@ mod tests {
             let why = d.refusal(&home.join(rel)).unwrap_or_default();
             assert!(why.starts_with(&format!("{how} {ssh}")), "{rel}: {why:?}");
         }
-        // TmpHome lives under the temp dir, itself a rule; a sibling is refused only for that.
+        // RT-FS-14 half: the target's parent is an ancestor by identity too, so an alias of
+        // `~/dotfiles` "contains" the protected folder.
+        let why = d.refusal_by_id(t.id("home/dotfiles")).unwrap_or_default();
+        assert!(
+            why.contains("which contains") && why.contains(&ssh),
+            "{why:?}"
+        );
+        // No over-match: a sibling is refused at most by the temp-dir rule TmpHome lives under.
+        let tmp = std::env::temp_dir().display().to_string();
         let why = d.refusal(&home.join("code/x")).unwrap_or_default();
-        assert!(!why.contains(".ssh"), "{why}");
+        assert!(why.is_empty() || why.contains(&tmp), "{why}");
     }
 
     #[test]
