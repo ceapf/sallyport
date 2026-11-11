@@ -120,9 +120,34 @@ mod tests {
             "localhost:5000/x",
             "registry.example.com:443/team/img:v1.2",
             "a/b_c.d-e",
+            // One segment is a name, never a registry, even when it reads like one.
+            "localhost",
+            "a.b",
+            "reg-1.example.com/x",
         ] {
             assert!(
                 is_pinned_image_ref(&format!("{name}@sha256:{}", d())),
+                "{name}"
+            );
+        }
+        // The name bound is inclusive: exactly 255 bytes pass.
+        let longest = format!("{}/x", "a".repeat(253));
+        assert_eq!(longest.len(), 255);
+        assert!(is_pinned_image_ref(&format!("{longest}@sha256:{}", d())));
+    }
+
+    #[test]
+    fn a_registry_port_is_one_to_five_digits() {
+        for (name, ok) in [
+            ("reg.io:1/x", true),
+            ("reg.io:65535/x", true),
+            ("reg.io:12a/x", false),
+            ("reg.io:/x", false),
+            ("reg.io:123456/x", false),
+        ] {
+            assert_eq!(
+                is_pinned_image_ref(&format!("{name}@sha256:{}", d())),
+                ok,
                 "{name}"
             );
         }

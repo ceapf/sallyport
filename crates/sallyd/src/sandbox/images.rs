@@ -114,4 +114,51 @@ mod tests {
             assert!(!carries_digest(&bad, D), "{bad:?}");
         }
     }
+
+    /// The manifest's `runtime.image` wins; without one the bundled default is used.
+    #[test]
+    fn the_workspace_image_is_the_manifests_else_the_default() {
+        #![allow(clippy::unwrap_used)]
+        use std::sync::Arc;
+
+        use sally_core::manifest::{HostEnv, load};
+
+        use super::super::launch::WorkspaceRequest;
+        use super::super::types::{ImageRef, SessionId, SessionPaths};
+
+        let env = HostEnv {
+            home: "/nonexistent/home".into(),
+            other_homes: Vec::new(),
+            xdg_config_home: None,
+            xdg_data_home: None,
+            xdg_runtime_dir: None,
+            podman_storage: Vec::new(),
+            nproc: 8,
+            mem_bytes: 16 << 30,
+        };
+        let header = "apiVersion: sallyport/v1\nkind: Manifest\nname: t\nmodel:\n  ref: any\n";
+        let custom = format!("ghcr.io/x/tools@{D}");
+        let default = format!("ghcr.io/sallyport/workspace@{D}");
+        let request = |body: &str| WorkspaceRequest {
+            paths: SessionPaths::new(
+                SessionId::parse("s-1").unwrap(),
+                "/s".as_ref(),
+                "/d".as_ref(),
+            )
+            .unwrap(),
+            manifest: Arc::new(
+                load(
+                    &format!("{header}{body}"),
+                    &env,
+                    &std::collections::BTreeSet::new(),
+                )
+                .unwrap()
+                .manifest,
+            ),
+            default_image: ImageRef::parse(&default).unwrap(),
+        };
+        let named = request(&format!("runtime:\n  image: {custom}\n"));
+        assert_eq!(named.image(), custom);
+        assert_eq!(request("").image(), default);
+    }
 }

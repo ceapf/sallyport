@@ -65,3 +65,23 @@ pub(crate) fn check_private_dir(dir: &Path) -> Result<bool, FsIssue> {
     }
     Ok(true)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Root-owned is accepted like owned by the current user; absent is `Ok(false)`; any other
+    /// lookup failure is an error, never "absent".
+    #[test]
+    fn root_owned_passes_and_only_not_found_means_absent() {
+        assert!(matches!(check_private_dir(Path::new("/")), Ok(true)));
+        let missing = std::env::temp_dir().join(format!("sp-fsutil-{}", std::process::id()));
+        assert!(matches!(check_private_dir(&missing), Ok(false)));
+        // ENOTDIR: a path through a regular file.
+        let through_file = Path::new("/proc/self/status/x");
+        assert!(matches!(
+            check_private_dir(through_file),
+            Err(FsIssue::Io { .. })
+        ));
+    }
+}

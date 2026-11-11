@@ -202,6 +202,21 @@ fn rt_man_01_oversized_input_is_refused_before_parsing() {
     assert!(parse_bytes(&vec![b' '; MAX_MANIFEST_BYTES + 1]).is_err());
 }
 
+/// The size limit is inclusive, for text and bytes alike: a valid manifest of exactly
+/// `MAX_MANIFEST_BYTES` parses, one byte more is `too-large`.
+#[test]
+fn rt_man_01_the_size_limit_is_inclusive() {
+    let pad = MAX_MANIFEST_BYTES - HEADER.len() - 2;
+    let exact = format!("{HEADER}#{}\n", "x".repeat(pad));
+    assert_eq!(exact.len(), MAX_MANIFEST_BYTES);
+    parse(&exact).unwrap();
+    parse_bytes(exact.as_bytes()).unwrap();
+    let over = format!("{exact} ");
+    assert_eq!(parse(&over).unwrap_err().errors[0].code, Code::TooLarge);
+    let e = parse_bytes(over.as_bytes()).unwrap_err();
+    assert_eq!(e.errors[0].code, Code::TooLarge);
+}
+
 #[test]
 fn rt_man_01_deep_nesting_is_refused() {
     for text in [
