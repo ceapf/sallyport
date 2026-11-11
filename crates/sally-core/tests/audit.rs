@@ -23,9 +23,14 @@ use sha2::{Digest, Sha256};
 struct Scratch(PathBuf);
 
 impl Scratch {
+    /// A directory of its own: the counter keeps two tests that pick the same name from
+    /// deleting each other's files when they run in parallel (a flaky failure there made
+    /// equivalent mutants look caught).
     fn new(name: &str) -> Self {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("sally-audit-{}-{name}", std::process::id()));
+            .join(format!("sally-audit-{}-{n}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1169,6 +1174,15 @@ fn a_head_that_is_a_symlink_or_fifo_is_refused_without_following_it() {
     let s = Scratch::new("headlink");
     filled(&s, 2);
     let head = s.dir().join("audit.head");
+    // A link to a copy of the valid head: only O_NOFOLLOW refuses it.
+    let copy = s.0.join("copy.head");
+    std::fs::copy(&head, &copy).unwrap();
+    std::fs::remove_file(&head).unwrap();
+    symlink(&copy, &head).unwrap();
+    assert_eq!(
+        verify(&s.dir()).unwrap_err().kind,
+        VerifyErrorKind::Unreadable
+    );
     std::fs::remove_file(&head).unwrap();
     symlink("/dev/zero", &head).unwrap();
     assert_eq!(

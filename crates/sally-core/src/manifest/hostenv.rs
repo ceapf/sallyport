@@ -145,5 +145,63 @@ mod tests {
         let env = env.unwrap_or_else(|_| unreachable!());
         assert!(env.home.is_absolute());
         assert!(env.nproc >= 1 && env.mem_bytes > 0);
+        let info = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+        assert_eq!(Some(env.mem_bytes), parse_meminfo(&info));
+    }
+
+    /// The passwd home of the current uid, from `getent` (independent of the code under test).
+    fn getent_home() -> PathBuf {
+        let uid = rustix::process::geteuid().as_raw().to_string();
+        let out = std::process::Command::new("getent")
+            .args(["passwd", &uid])
+            .output()
+            .unwrap_or_else(|e| panic!("getent: {e}"));
+        let line = String::from_utf8_lossy(&out.stdout).into_owned();
+        PathBuf::from(line.trim_end().split(':').nth(5).unwrap_or_default())
+    }
+
+    const CHILD: &str = "SP_HOSTENV_CHILD";
+
+    /// Runs inside the child below, where `HOME` is what the parent set.
+    #[test]
+    fn home_and_other_homes_child() {
+        let Some(want_home) = std::env::var_os(CHILD) else {
+            return;
+        };
+        let passwd = getent_home();
+        let env = HostEnv::from_process().unwrap_or_else(|e| panic!("{e}"));
+        if want_home.is_empty() {
+            // No HOME: the passwd home is the home, and not also "another" home.
+            assert_eq!(env.home, passwd);
+            assert_eq!(env.other_homes, Vec::<PathBuf>::new());
+        } else {
+            assert_eq!(env.home, PathBuf::from(&want_home));
+            assert_eq!(env.other_homes, [passwd]);
+        }
+    }
+
+    /// `HOME` wins and the passwd home of this uid is kept as another home; without `HOME` the
+    /// passwd home is used. Each case runs in a child process with its own environment.
+    #[test]
+    fn home_comes_from_home_else_passwd() {
+        assert!(getent_home().is_absolute(), "this uid needs a passwd entry");
+        let exe = std::env::current_exe().unwrap_or_else(|e| panic!("{e}"));
+        for home in [Some("/sp-elsewhere/home"), None] {
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.args([
+                "--exact",
+                "manifest::hostenv::tests::home_and_other_homes_child",
+                "--test-threads=1",
+            ])
+            .env(CHILD, home.unwrap_or(""));
+            match home {
+                Some(h) => cmd.env("HOME", h),
+                None => cmd.env_remove("HOME"),
+            };
+            let out = cmd.output().unwrap_or_else(|e| panic!("{e}"));
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success(), "{home:?}: {stdout}");
+            assert!(stdout.contains("1 passed"), "{home:?}: {stdout}");
+        }
     }
 }

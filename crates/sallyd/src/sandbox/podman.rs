@@ -510,4 +510,211 @@ mod tests {
         let e = resolve_podman(Some(Path::new("/nonexistent/podman")), None).unwrap_err();
         assert!(e.to_string().starts_with("sandbox.podman_path: "), "{e}");
     }
+
+    #[test]
+    fn a_helper_is_the_first_candidate_that_exists_and_passes_the_checks() {
+        let p = first_trusted("t", &["/nonexistent/a", "/bin/sh", "/usr/bin/env"]).unwrap();
+        assert_eq!(p, std::fs::canonicalize("/bin/sh").unwrap());
+        let e = first_trusted("t", &["/nonexistent/a"]).unwrap_err();
+        assert!(matches!(e, PodmanError::Missing("t", _)), "{e}");
+    }
+
+    /// A private scratch directory, removed (after restoring write access) on drop.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("sp-podman-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
+            Self(p)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The state `Podman::setup` leaves, without the host's catatonit and conmon.
+    fn podman_at(state: &Path) -> Podman {
+        private_dir(state).unwrap();
+        for d in ["hooks", "config"] {
+            private_dir(&state.join(d)).unwrap();
+        }
+        let text = containers_conf(&state.join("hooks"), &bins()).unwrap();
+        replace_0600(state, "containers.conf", text.as_bytes()).unwrap();
+        replace_0600(state, "mounts.conf", b"").unwrap();
+        let host = PodmanHost {
+            home: "/home/u".into(),
+            xdg_runtime_dir: "/run/user/1000".into(),
+            xdg_data_home: None,
+        };
+        Podman {
+            bin: "/bin/sh".into(),
+            env: Podman::env(&host, &state.join("containers.conf"), &state.join("config")),
+            state: state.to_owned(),
+            conf_text: text,
+        }
+    }
+
+    fn dir_msg(r: Result<(), PodmanError>) -> String {
+        match r {
+            Err(PodmanError::Dir { msg, .. }) => msg,
+            other => panic!("want a Dir error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_accessors_name_the_state_files() {
+        let s = Scratch::new("acc");
+        let p = podman_at(&s.0);
+        assert_eq!(p.hooks_dir(), s.0.join("hooks"));
+        assert_eq!(p.mounts_file(), s.0.join("mounts.conf"));
+        assert_eq!(p.environment(), p.env.as_slice());
+        assert_eq!(p.environment().len(), 5);
+        assert_eq!(p.bin(), Path::new("/bin/sh"));
+    }
+
+    /// The re-check passes on the state setup wrote and refuses each kind of tampering.
+    #[test]
+    fn recheck_refuses_every_change_to_the_state() {
+        type Tamper = fn(&Path);
+        let cases: [(&str, Tamper, &str); 9] = [
+            ("state mode", |s| chmod(s, 0o750), "must be mode 0700"),
+            (
+                "hooks entry",
+                |s| touch(&s.join("hooks/x")),
+                "must be empty",
+            ),
+            (
+                "config entry",
+                |s| touch(&s.join("config/x")),
+                "must be empty",
+            ),
+            (
+                "mounts body",
+                |s| put(&s.join("mounts.conf"), b"x"),
+                "changed since",
+            ),
+            (
+                "conf body",
+                |s| put(&s.join("containers.conf"), b"x"),
+                "changed since",
+            ),
+            (
+                "mounts mode",
+                |s| chmod(&s.join("mounts.conf"), 0o644),
+                "mode 0600",
+            ),
+            (
+                "mounts dir",
+                |s| as_dir(&s.join("mounts.conf")),
+                "mode 0600",
+            ),
+            (
+                "mounts link",
+                |s| as_link(&s.join("mounts.conf")),
+                "mode 0600",
+            ),
+            (
+                "hooks link",
+                |s| as_link(&s.join("hooks")),
+                "is not a directory",
+            ),
+        ];
+        for (what, tamper, want) in cases {
+            let s = Scratch::new("recheck");
+            let p = podman_at(&s.0);
+            p.recheck()
+                .unwrap_or_else(|e| panic!("{what}: control: {e}"));
+            tamper(&s.0);
+            let msg = dir_msg(p.recheck());
+            assert!(msg.contains(want), "{what}: {msg}");
+        }
+        let s = Scratch::new("recheck-bin");
+        let mut p = podman_at(&s.0);
+        p.bin = "/nonexistent/podman".into();
+        assert!(matches!(p.recheck(), Err(PodmanError::Binary(_))));
+    }
+
+    fn chmod(p: &Path, mode: u32) {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn touch(p: &Path) {
+        std::fs::write(p, b"").unwrap();
+    }
+
+    /// Rewrites `p` keeping its mode 0600, so only the bytes differ.
+    fn put(p: &Path, bytes: &[u8]) {
+        std::fs::write(p, bytes).unwrap();
+        chmod(p, 0o600);
+    }
+
+    /// Replaces the file `p` with a 0600 directory of the same name.
+    fn as_dir(p: &Path) {
+        std::fs::remove_file(p).unwrap();
+        std::fs::DirBuilder::new().mode(0o600).create(p).unwrap();
+    }
+
+    /// Replaces `p` with a symlink to a copy that would pass every other check.
+    fn as_link(p: &Path) {
+        let real = p.with_extension("real");
+        std::fs::rename(p, &real).unwrap();
+        std::os::unix::fs::symlink(&real, p).unwrap();
+    }
+
+    #[test]
+    fn private_dir_creates_0700_and_keeps_an_existing_private_dir() {
+        let s = Scratch::new("private");
+        let d = s.0.join("new");
+        private_dir(&d).unwrap();
+        let mode = std::fs::metadata(&d).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        private_dir(&d).unwrap();
+        // A failure other than "exists" is reported as itself, not as the later lstat's NotFound.
+        chmod(&s.0, 0o500);
+        let e = private_dir(&s.0.join("other"));
+        chmod(&s.0, 0o700);
+        if !rustix::process::geteuid().is_root() {
+            match e {
+                Err(PodmanError::Io { source, .. }) => {
+                    assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    /// Another user's directory is refused even when its mode would pass (`/root` is root's,
+    /// 0700 on supported hosts).
+    #[test]
+    fn a_directory_of_another_user_is_refused() {
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        let root_home = Path::new("/root");
+        let meta = std::fs::symlink_metadata(root_home).unwrap();
+        assert_eq!((meta.uid(), meta.permissions().mode() & 0o077), (0, 0));
+        assert!(dir_msg(private_dir(root_home)).contains("not owned by the current user"));
+    }
+
+    #[test]
+    fn replace_writes_a_fresh_0600_file_and_never_follows_a_link() {
+        let s = Scratch::new("replace");
+        let outside = s.0.join("outside");
+        std::fs::write(&outside, b"keep").unwrap();
+        std::os::unix::fs::symlink(&outside, s.0.join("f")).unwrap();
+        std::os::unix::fs::symlink(&outside, s.0.join("f.tmp")).unwrap();
+        replace_0600(&s.0, "f", b"new").unwrap();
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
+        assert_eq!(std::fs::read(s.0.join("f")).unwrap(), b"new");
+        let meta = std::fs::symlink_metadata(s.0.join("f")).unwrap();
+        assert!(meta.is_file());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert!(write_new_0600(&s.0.join("f"), b"x").is_err(), "create_new");
+    }
 }

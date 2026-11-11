@@ -7,8 +7,8 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 
 use sallyd::sandbox::{
-    PinKind, ScanError, ScanLimits, SessionDirs, VerifiedModel, check_runtime_dir, claims,
-    scan_mounts,
+    ChangeKind, PinKind, ScanError, ScanLimits, SessionDirs, VerifiedModel, check_runtime_dir,
+    claims, scan_mounts, staged_changes,
 };
 
 mod common;
@@ -438,4 +438,26 @@ fn pending_paths_are_bounded_at_exactly_16_mib() {
     std::fs::create_dir(deep.join("z")).unwrap();
     let e = scan_mounts(&one(&f, "ro"), &limits).unwrap_err();
     assert!(e.to_string().contains("bytes of pending paths"), "{e}");
+}
+
+/// `staged_changes` lists the upper directories of `staged` mounts only, tagged by mount: an
+/// upper directory at a `rw` mount's index is not a change (the RT-FS-15 listing, host side).
+#[test]
+fn staged_changes_list_only_staged_mounts() {
+    let f = Fx::new();
+    let v = f.load(&mounts(&[
+        mount("~/code/other", "/workspace/o", "rw"),
+        mount("~/code/myproject", "/workspace/p", "staged"),
+    ]));
+    for (n, name) in [(0, "not-staged.txt"), (1, "new.txt")] {
+        let upper = f.paths.stage(n).upper;
+        std::fs::create_dir_all(&upper).unwrap();
+        std::fs::write(upper.join(name), "x").unwrap();
+    }
+    let found: Vec<_> = staged_changes(&v, &f.paths)
+        .unwrap()
+        .into_iter()
+        .map(|c| (c.mount, c.path.display().to_string(), c.kind))
+        .collect();
+    assert_eq!(found, [(1, "new.txt".to_owned(), ChangeKind::Written)]);
 }

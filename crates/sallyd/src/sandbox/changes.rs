@@ -366,6 +366,35 @@ mod tests {
         assert!(t.list(few).unwrap_err().contains("more than 2 entries"));
     }
 
+    /// Every bound is inclusive: exactly the entry count, depth and listing bytes pass; one
+    /// less fails. A walk past its deadline fails closed.
+    #[test]
+    fn the_bounds_are_inclusive_and_the_deadline_fails_closed() {
+        let t = Tmp::new("exact");
+        // Entries a, a/b, a/b/c, a/b/c/d.txt; directory c is found at depth 3.
+        t.file("a/b/c/d.txt");
+        let bounds = |max_entries, max_depth| StageBounds {
+            max_entries,
+            max_depth,
+            ..StageBounds::default()
+        };
+        assert_eq!(t.list(bounds(4, 3)).unwrap().len(), 1);
+        assert!(t.list(bounds(3, 3)).unwrap_err().contains("more than 3"));
+        assert!(t.list(bounds(4, 2)).unwrap_err().contains("deeper than 2"));
+        // One listed path, "a/b/c/d.txt": 11 bytes plus the 64-byte per-entry cost.
+        let mut walk = Walk::new(StageBounds::default());
+        walk.max_bytes = 75;
+        assert_eq!(list_upper(&t.0, &mut walk).unwrap().len(), 1);
+        let mut walk = Walk::new(StageBounds::default());
+        walk.max_bytes = 74;
+        assert!(list_upper(&t.0, &mut walk).is_err());
+        let none = StageBounds {
+            deadline: std::time::Duration::ZERO,
+            ..StageBounds::default()
+        };
+        assert!(t.list(none).unwrap_err().contains("longer than"));
+    }
+
     /// Names the sandbox chooses cannot grow the listing past its byte cap.
     #[test]
     fn the_listing_is_bounded_in_path_bytes() {
@@ -381,6 +410,23 @@ mod tests {
         assert_eq!(list_upper(&t.0, &mut walk).unwrap().len(), 8);
     }
 
+    /// Only a 0/0 character device is a whiteout: a real device node (`/dev/null`, 1:3) is a
+    /// written entry, never a deletion the apply step would carry out.
+    #[test]
+    fn only_a_zero_zero_device_is_a_deletion() {
+        let dev = rustix::fs::open(
+            "/dev",
+            rustix::fs::OFlags::PATH | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+        let walk = Walk::new(StageBounds::default());
+        match classify(dev.as_fd(), c"null", 1, &walk).unwrap() {
+            Some(Entry::Leaf(kind)) => assert_eq!(kind, ChangeKind::Written),
+            _ => panic!("/dev/null is a leaf"),
+        }
+    }
+
     /// An xattr error other than "absent" fails the listing instead of hiding a replacement.
     #[test]
     fn an_unreadable_opaque_marker_fails_closed() {
@@ -390,6 +436,15 @@ mod tests {
             t.0.join("d"),
             rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
             rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+        assert_eq!(opaque(&fd), Ok(false));
+        // A one-byte marker other than `y` is not opaque.
+        rustix::fs::fsetxattr(
+            &fd,
+            "user.overlay.opaque",
+            b"n",
+            rustix::fs::XattrFlags::empty(),
         )
         .unwrap();
         assert_eq!(opaque(&fd), Ok(false));

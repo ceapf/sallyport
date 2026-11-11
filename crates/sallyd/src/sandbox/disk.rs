@@ -205,4 +205,27 @@ mod tests {
         assert!(!rw_only[0].state);
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    /// The watch fd is `O_PATH` (no read permission needed), a directory, and close-on-exec, so
+    /// no podman process inherits it.
+    #[test]
+    fn a_watch_fd_is_a_path_fd_of_a_directory_and_close_on_exec() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("../../target/disk-unit")
+            .join(format!("{}-flags", std::process::id()));
+        let unreadable = dir.join("wx");
+        std::fs::create_dir_all(&unreadable).unwrap();
+        std::fs::write(dir.join("file"), b"").unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let opened = open_dir(&unreadable);
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (fd, _) = opened.unwrap();
+        let fd_flags = rustix::io::fcntl_getfd(&fd).unwrap();
+        assert!(fd_flags.contains(rustix::io::FdFlags::CLOEXEC));
+        let e = open_dir(&dir.join("file")).unwrap_err();
+        assert!(e.contains("Not a directory"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

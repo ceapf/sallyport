@@ -99,3 +99,23 @@ pub(crate) fn list_log_files(dir: &Path) -> std::io::Result<Vec<(String, PathBuf
     files.sort();
     Ok(files)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::month_of;
+
+    /// A log file name holds exactly six digits: both checks apply, each alone refuses.
+    #[test]
+    fn a_month_is_exactly_six_digits() {
+        assert_eq!(month_of("audit-202601.jsonl"), Some("202601"));
+        for bad in [
+            "audit-20261.jsonl",
+            "audit-2026011.jsonl",
+            "audit-2026x1.jsonl",
+            "audit-202601.json",
+            "x-202601.jsonl",
+        ] {
+            assert_eq!(month_of(bad), None, "{bad}");
+        }
+    }
+}
