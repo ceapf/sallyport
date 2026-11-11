@@ -198,3 +198,83 @@ impl SessionDirs {
         &self.profiles
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("sp-dirs-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
+            Self(p)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn msg<T: std::fmt::Debug>(r: Result<T, DirError>) -> String {
+        r.unwrap_err().msg
+    }
+
+    /// Each check of `private`, alone: an existing entry with and without `fresh`, and an
+    /// error other than "exists" reported as itself.
+    #[test]
+    fn private_dirs_are_fresh_when_asked_and_report_their_own_error() {
+        let s = Scratch::new("private");
+        let d = s.0.join("d");
+        private(&d, true).unwrap();
+        private(&d, false).unwrap();
+        assert_eq!(
+            msg(private(&d, true)),
+            "already exists; a session id is never reused"
+        );
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        std::fs::set_permissions(&s.0, std::fs::Permissions::from_mode(0o500)).unwrap();
+        for fresh in [false, true] {
+            let m = msg(private(&s.0.join("new"), fresh));
+            assert!(m.contains("Permission denied"), "fresh={fresh}: {m}");
+        }
+    }
+
+    /// Owned by another user is refused on its own, with every other check passing: `/` is
+    /// root's and 0755 (a root), `/root` is root's and 0700 (a private directory).
+    #[test]
+    fn directories_of_another_user_are_refused() {
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        let slash = std::fs::metadata("/").unwrap();
+        assert_eq!((slash.uid(), slash.permissions().mode() & 0o022), (0, 0));
+        assert!(msg(root_dir(Path::new("/"))).contains("owned by the current user"));
+        let root_home = std::fs::symlink_metadata("/root").unwrap();
+        assert_eq!(
+            (root_home.uid(), root_home.permissions().mode() & 0o777),
+            (0, 0o700)
+        );
+        assert!(msg(private(Path::new("/root"), false)).contains("owned by the current user"));
+    }
+
+    #[test]
+    fn a_root_must_not_be_writable_by_others_and_is_created_0700() {
+        let s = Scratch::new("root");
+        let r = s.0.join("a/b");
+        root_dir(&r).unwrap();
+        let mode = std::fs::metadata(&r).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        std::fs::set_permissions(&r, std::fs::Permissions::from_mode(0o720)).unwrap();
+        assert!(msg(root_dir(&r)).contains("not writable by group or others"));
+    }
+}

@@ -476,4 +476,94 @@ mod tests {
             assert_eq!(v.map(|v| v.to_string()).as_deref(), Some(s));
         }
     }
+
+    /// The digit-run bound counts digits, not value: 21 digits are refused even when the value
+    /// fits.
+    #[test]
+    fn a_digit_run_is_bounded_by_length() {
+        let twenty = format!("{}1B", "0".repeat(19));
+        assert_eq!(ByteSize::parse(&twenty), Some(ByteSize(1)));
+        let twenty_one = format!("{}1B", "0".repeat(20));
+        assert_eq!(ByteSize::parse(&twenty_one), None);
+    }
+
+    /// Each `Cpus` bound is inclusive on the accepted side.
+    #[test]
+    fn cpus_bounds_are_exact() {
+        assert_eq!(Cpus::from_f64(0.0), Some(Cpus(0)));
+        assert_eq!(Cpus::from_f64(4_294_967.295), Some(Cpus(u32::MAX)));
+        assert_eq!(Cpus::from_f64(4_294_967.296), None);
+        // Exactly 1e-6 away from an integer after scaling is still "three decimals".
+        let v = 1e-6_f64 / 1000.0;
+        assert!((v * 1000.0 - 1e-6).abs() == 0.0, "precondition");
+        assert_eq!(Cpus::from_f64(v), Some(Cpus(0)));
+    }
+
+    /// What a person reads when a unit value is refused names the expected form.
+    #[test]
+    fn refusals_say_what_was_expected() {
+        let header = "apiVersion: sallyport/v1\nkind: Manifest\nname: t\nmodel:\n  ref: any\n";
+        for (body, want) in [
+            ("runtime:\n  memory: 8GB\n", BYTES_EXPECTING),
+            ("runtime:\n  timeout: 9d\n", DURATION_EXPECTING),
+            (
+                "runtime:\n  cpus: 0.0001\n",
+                "a finite non-negative number with at most 3 decimals",
+            ),
+            ("  gpu_layers: lots\n", "\"auto\" or a non-negative integer"),
+        ] {
+            // The gpu_layers line continues the header's `model:` block.
+            let e = crate::manifest::parse(&format!("{header}{body}")).unwrap_err();
+            let msg = &e
+                .errors
+                .first()
+                .map(|d| d.message.clone())
+                .unwrap_or_default();
+            assert!(msg.contains(want), "{body}: {msg}");
+        }
+    }
+
+    #[test]
+    fn gpu_layers_accept_auto_and_u32_and_refuse_negatives() {
+        let doc = |v: &str| {
+            format!(
+                "apiVersion: sallyport/v1\nkind: Manifest\nname: t\nmodel:\n  ref: any\n  gpu_layers: {v}\n"
+            )
+        };
+        let layers = |v: &str| crate::manifest::parse(&doc(v)).map(|m| m.model.gpu_layers);
+        assert_eq!(layers("auto").ok(), Some(GpuLayers::Auto));
+        assert_eq!(layers("33").ok(), Some(GpuLayers::Layers(33)));
+        for bad in ["-1", "4294967296"] {
+            assert!(layers(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// The editor's schema: each unit type under its own name, with its own body.
+    #[test]
+    fn the_json_schema_names_and_describes_each_unit() {
+        let schema = serde_json::to_value(crate::manifest::json_schema()).unwrap_or_default();
+        let defs = schema.get("$defs").cloned().unwrap_or_default();
+        let want = serde_json::json!({
+            "ByteSize": {
+                "type": "string",
+                "pattern": "^[0-9]{1,20}(B|KiB|MiB|GiB|TiB)$",
+                "description": BYTES_EXPECTING,
+            },
+            "Duration": {
+                "type": "string",
+                "pattern": "^[0-9]{1,20}(s|m|h)$",
+                "description": DURATION_EXPECTING,
+            },
+            "Cpus": { "type": "number", "minimum": 0, "multipleOf": 0.001 },
+            "GpuLayers": {
+                "oneOf": [
+                    { "const": "auto" },
+                    { "type": "integer", "minimum": 0, "maximum": u32::MAX },
+                ]
+            },
+        });
+        for (name, body) in want.as_object().into_iter().flatten() {
+            assert_eq!(defs.get(name), Some(body), "$defs.{name}");
+        }
+    }
 }

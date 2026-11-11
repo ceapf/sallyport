@@ -405,4 +405,69 @@ mod tests {
             Verdict::Within { .. }
         ));
     }
+
+    fn reason(v: &Verdict) -> &str {
+        match v {
+            Verdict::Unmeasurable { reason, .. } => reason,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Every bound is inclusive: exactly the limit, entry count and depth pass; one less fails.
+    #[test]
+    fn the_limit_and_the_bounds_are_inclusive() {
+        let t = Tmp::new("exact");
+        let a = t.area(0);
+        // Entries "1", "1/2" … "1/…/9": nine entries, the deepest directory found at depth 9.
+        std::fs::create_dir_all(a.upper.join("1/2/3/4/5/6/7/8/9")).unwrap();
+        let areas = [a];
+        let Verdict::Within { bytes } = run(&areas, u64::MAX, StageBounds::default()) else {
+            panic!("control")
+        };
+        assert_eq!(
+            run(&areas, bytes, StageBounds::default()),
+            Verdict::Within { bytes }
+        );
+        assert!(matches!(
+            run(&areas, bytes - 1, StageBounds::default()),
+            Verdict::Over { .. }
+        ));
+        let bounds = |max_entries, max_depth| StageBounds {
+            max_entries,
+            max_depth,
+            ..StageBounds::default()
+        };
+        assert_eq!(
+            run(&areas, u64::MAX, bounds(9, 9)),
+            Verdict::Within { bytes }
+        );
+        let v = run(&areas, u64::MAX, bounds(8, 9));
+        assert!(reason(&v).contains("more than 8 entries"), "{v:?}");
+        let v = run(&areas, u64::MAX, bounds(9, 8));
+        assert!(reason(&v).contains("deeper than 8"), "{v:?}");
+    }
+
+    /// On a tie the first area is named.
+    #[test]
+    fn a_tie_names_the_first_area() {
+        let t = Tmp::new("tie");
+        let areas = [t.area(0), t.area(3)];
+        match run(&areas, 0, StageBounds::default()) {
+            Verdict::Over { largest, .. } => assert_eq!(largest, "filesystem.mounts[0]"),
+            v => panic!("{v:?}"),
+        }
+    }
+
+    /// The root must be a directory: a file there is refused when it is opened.
+    #[test]
+    fn a_file_as_the_upper_root_is_refused_at_open() {
+        let t = Tmp::new("fileroot");
+        let file = t.0.join("not-a-dir");
+        fill(&file, 1);
+        let v = run(&[area(0, file)], u64::MAX, StageBounds::default());
+        assert!(
+            reason(&v).starts_with("cannot open the upper directory"),
+            "{v:?}"
+        );
+    }
 }
