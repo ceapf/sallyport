@@ -11,7 +11,12 @@
 //! Other directories are only the parents of changes and are not listed (an empty directory
 //! the sandbox created is therefore not listed either). The tree is the sandbox's, so the walk
 //! goes through directory fds, never follows a symlink, and is bounded like the stage walk. The
-//! session may still be running: an entry that vanishes during the walk is skipped.
+//! session may still be running: an entry that vanishes during the walk is skipped. The listing
+//! also keeps at most `MAX_LISTING_BYTES` of paths in memory.
+//!
+//! This reads the kernel overlay's format, which rootless Podman 4.9 uses for `:O` mounts
+//! (whiteout devices, opaque xattrs). fuse-overlayfs (`.wh.` files), redirect and metacopy are
+//! not interpreted: Sallyport does not configure them.
 
 use std::ffi::{CStr, OsStr};
 use std::os::unix::ffi::OsStrExt;
@@ -85,10 +90,16 @@ pub fn staged_changes(
     Ok(out)
 }
 
-/// Entry count and deadline across all mounts of one listing.
+/// Most path bytes one listing keeps in memory: the sandbox chooses the names, and empty files
+/// cost almost nothing against `stage_size`, so the entry bound alone does not bound the memory.
+const MAX_LISTING_BYTES: u64 = 16 << 20;
+
+/// Entry count, listing size and deadline across all mounts of one listing.
 struct Walk {
     bounds: StageBounds,
     entries: u64,
+    bytes: u64,
+    max_bytes: u64,
     until: Instant,
 }
 
@@ -97,8 +108,23 @@ impl Walk {
         Self {
             bounds,
             entries: 0,
+            bytes: 0,
+            max_bytes: MAX_LISTING_BYTES,
             until: Instant::now() + bounds.deadline,
         }
+    }
+
+    /// Accounts for one listed path; fails closed past `max_bytes`.
+    fn keep(&mut self, path: &Path) -> Result<(), String> {
+        let len = u64::try_from(path.as_os_str().len()).unwrap_or(u64::MAX);
+        self.bytes = self.bytes.saturating_add(len);
+        if self.bytes > self.max_bytes {
+            return Err(format!(
+                "the listing exceeds {} bytes of paths",
+                self.max_bytes
+            ));
+        }
+        Ok(())
     }
 
     fn step(&mut self) -> Result<(), String> {
@@ -114,15 +140,23 @@ impl Walk {
     }
 }
 
-/// Whether the directory `fd` carries an overlay opaque marker.
-fn opaque(fd: impl AsFd) -> bool {
-    let mut buf = [0u8; 1];
-    [c"trusted.overlay.opaque", c"user.overlay.opaque"]
-        .into_iter()
-        .any(|name| matches!(rustix::fs::fgetxattr(&fd, name, &mut buf), Ok(1) if buf == *b"y"))
+/// Whether the directory `fd` carries an overlay opaque marker (the value `y`). An absent
+/// attribute (ENODATA), a longer value (ERANGE: not `y`) or a filesystem without that namespace
+/// (EOPNOTSUPP) is not opaque; any other error fails the listing rather than hide a replacement.
+fn opaque(fd: impl AsFd) -> Result<bool, String> {
+    for name in [c"trusted.overlay.opaque", c"user.overlay.opaque"] {
+        let mut buf = [0u8; 1];
+        match rustix::fs::fgetxattr(&fd, name, &mut buf) {
+            Ok(1) if buf == *b"y" => return Ok(true),
+            Ok(_) | Err(Errno::NODATA | Errno::RANGE | Errno::OPNOTSUPP) => {}
+            Err(e) => return Err(format!("cannot read {name:?}: {e}")),
+        }
+    }
+    Ok(false)
 }
 
 /// The changes under one upper directory, depth-first with one open directory per level.
+/// TODO(#28): share one walker with `stage::measure`; name the relative path in errors.
 fn list_upper(upper: &Path, walk: &mut Walk) -> Result<Vec<(PathBuf, ChangeKind)>, String> {
     let root = std::ffi::CString::new(upper.as_os_str().as_bytes())
         .map_err(|_| "the upper directory path contains a NUL byte".to_owned())?;
@@ -156,9 +190,13 @@ fn list_upper(upper: &Path, walk: &mut Walk) -> Result<Vec<(PathBuf, ChangeKind)
             continue;
         };
         match kind {
-            Entry::Leaf(kind) => out.push((path, kind)),
+            Entry::Leaf(kind) => {
+                walk.keep(&path)?;
+                out.push((path, kind));
+            }
             Entry::Dir { child, replaced } => {
                 if replaced {
+                    walk.keep(&path)?;
                     out.push((path.clone(), ChangeKind::Replaced));
                 }
                 stack.push(child);
@@ -202,7 +240,7 @@ fn classify(
                 Err(e) => return Err(format!("cannot open a directory: {e}")),
             };
             let dfd = child.fd().map_err(|e| format!("directory fd: {e}"))?;
-            let replaced = opaque(dfd);
+            let replaced = opaque(dfd)?;
             Ok(Some(Entry::Dir { child, replaced }))
         }
         FileType::CharacterDevice if st.st_rdev == 0 => Ok(Some(Entry::Leaf(ChangeKind::Deleted))),
@@ -220,7 +258,12 @@ mod tests {
 
     impl Tmp {
         fn new(tag: &str) -> Self {
-            let p = std::env::temp_dir().join(format!("sp-changes-{}-{tag}", std::process::id()));
+            // Under target/, like the stage walk's tests: `user.*` xattrs need a real filesystem
+            // (a tmpfs `/tmp` only has them from kernel 6.6).
+            let p = std::env::current_dir()
+                .unwrap()
+                .join("../../target/changes-unit")
+                .join(format!("{}-{tag}", std::process::id()));
             let _ = std::fs::remove_dir_all(&p);
             std::fs::create_dir_all(&p).unwrap();
             Self(p)
@@ -303,9 +346,8 @@ mod tests {
     #[test]
     fn a_missing_upper_lists_nothing_and_bounds_fail_closed() {
         let t = Tmp::new("bounds");
-        let gone = Tmp(t.0.join("absent"));
-        assert_eq!(gone.list(StageBounds::default()).unwrap(), []);
-        std::mem::forget(gone);
+        let absent = list_upper(&t.0.join("absent"), &mut Walk::new(StageBounds::default()));
+        assert_eq!(absent.unwrap(), []);
         t.file("a/b/c/d.txt");
         let shallow = StageBounds {
             max_depth: 1,
@@ -317,5 +359,42 @@ mod tests {
             ..StageBounds::default()
         };
         assert!(t.list(few).unwrap_err().contains("more than 2 entries"));
+    }
+
+    /// Names the sandbox chooses cannot grow the listing past its byte cap.
+    #[test]
+    fn the_listing_is_bounded_in_path_bytes() {
+        let t = Tmp::new("bytes");
+        for i in 0..8 {
+            t.file(&format!("{}{i}", "n".repeat(200)));
+        }
+        let mut walk = Walk::new(StageBounds::default());
+        walk.max_bytes = 1000;
+        let e = list_upper(&t.0, &mut walk).unwrap_err();
+        assert!(e.contains("exceeds 1000 bytes"), "{e}");
+        let mut walk = Walk::new(StageBounds::default());
+        assert_eq!(list_upper(&t.0, &mut walk).unwrap().len(), 8);
+    }
+
+    /// An xattr error other than "absent" fails the listing instead of hiding a replacement.
+    #[test]
+    fn an_unreadable_opaque_marker_fails_closed() {
+        let t = Tmp::new("xattr");
+        std::fs::create_dir(t.0.join("d")).unwrap();
+        let fd = rustix::fs::open(
+            t.0.join("d"),
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+        assert_eq!(opaque(&fd), Ok(false));
+        // An O_PATH fd cannot read xattrs (EBADF): a stand-in for EACCES/EIO.
+        let path_fd = rustix::fs::open(
+            t.0.join("d"),
+            rustix::fs::OFlags::PATH | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+        assert!(opaque(&path_fd).is_err());
     }
 }
