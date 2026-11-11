@@ -169,11 +169,16 @@ fn rt_ag_09_rename_churn_does_not_evade_stage_size() {
         ));
         let r = x.launch(&v, "churn").await.unwrap();
         // The renamer starts first, so every file is moving (within d1, and between d1 and
-        // d2) for the whole time the data grows past the limit.
-        let script = "cd /workspace/o; mkdir -p d1 d2; touch d1/f1 d1/f2 d1/f3 d1/f4; \
+        // d2) for the whole time the data grows past the limit. The writer opens all four
+        // files before the renamer starts and writes through those fds: `dd of=<name>` would
+        // re-create a name the renamer had just moved away, and the renamer's next `mv` would
+        // then replace that new file, so as little as 24 of the 96 MiB was kept (6c-2: a run
+        // ended at 48 MiB, under the limit, and was rightly not killed).
+        let script = "cd /workspace/o; mkdir -p d1 d2; \
+             exec 3>>d1/f1 4>>d1/f2 5>>d1/f3 6>>d1/f4; \
              (while :; do for i in 1 2 3 4; do mv d1/f$i d1/g$i; mv d1/g$i d2/f$i; \
              mv d2/f$i d1/f$i; done; done) & \
-             for i in 1 2 3 4; do dd if=/dev/zero of=d1/f$i bs=1M count=24 2>/dev/null; done; \
+             for fd in 3 4 5 6; do dd if=/dev/zero bs=1M count=24 2>/dev/null >&$fd; done; \
              sleep 30";
         let (_, out) = sh(r.container(), script.to_owned()).await;
         let du = sh(r.container(), "du -sk /workspace/o".to_owned()).await;
