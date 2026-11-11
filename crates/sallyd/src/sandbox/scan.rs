@@ -251,22 +251,16 @@ const RESOLVE: ResolveFlags = ResolveFlags::BENEATH
     .union(ResolveFlags::NO_XDEV);
 
 fn open_beneath(root: &OwnedFd, rel: &Path, kind: OFlags) -> rustix::io::Result<OwnedFd> {
-    rustix::fs::openat2(
-        root,
-        rel,
-        kind | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-        RESOLVE,
-    )
+    sally_core::fd::openat2(root, rel, kind | OFlags::NOFOLLOW, Mode::empty(), RESOLVE)
 }
 
 /// Opens a mount root without following any symlink on the way (its validated realpath has
 /// none) and checks it is still the validated directory.
 fn open_root(mount: usize, m: &ResolvedMount) -> Result<OwnedFd, ScanError> {
-    let fd = rustix::fs::openat2(
+    let fd = sally_core::fd::openat2(
         rustix::fs::CWD,
         &m.host,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
         Mode::empty(),
         ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
     )

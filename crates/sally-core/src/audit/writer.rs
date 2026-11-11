@@ -475,9 +475,9 @@ fn sync_dir(dir: &Path) -> Result<(), AuditError> {
 
 fn take_lock(dir: &Path) -> Result<File, AuditError> {
     let path = dir.join(LOCK_FILE);
-    let fd = rustix::fs::open(
+    let fd = crate::fd::open(
         &path,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::NOFOLLOW,
         Mode::from_raw_mode(0o600),
     )
     .map_err(|e| io_at(&path)(e.into()))?;
@@ -498,9 +498,9 @@ fn open_log(path: &Path, writable: bool) -> Result<File, AuditError> {
     } else {
         OFlags::RDONLY
     };
-    let fd = rustix::fs::open(
+    let fd = crate::fd::open(
         path,
-        access | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        access | OFlags::NOFOLLOW | OFlags::NONBLOCK,
         Mode::empty(),
     )
     .map_err(|e| io_at(path)(e.into()))?;

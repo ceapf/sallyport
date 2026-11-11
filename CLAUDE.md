@@ -85,7 +85,7 @@ container-free tests run: unit tests, all of sally-core's `tests/`, `sallyd` `ar
   `manifest/host.rs`, `config.rs`.
 - `make mutants-wide-{core,sallyd,shim}` (sharded): sally-core `manifest/{image,hostenv,parse,
   summary,units}.rs`, `secrets/{store,secret}.rs`, `audit/{entry,redact,verify,writer,layout}.rs`,
-  `fsutil.rs`; sallyd `sandbox/{argv,check,types,profiles,overlap,scan,images,changes,dirs,
+  `fsutil.rs`, `fd.rs`; sallyd `sandbox/{argv,check,types,profiles,overlap,scan,images,changes,dirs,
   podman,disk,stage}.rs`, `sandbox/launch/error.rs`; sally-shim `args.rs`, `relay.rs`.
 
 ## Agent / model routing (ECC)

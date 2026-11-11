@@ -164,9 +164,9 @@ impl SecretStore {
         if !check_parent(path)? {
             return Ok(Self::empty(path.to_owned()));
         }
-        let fd = match rustix::fs::open(
+        let fd = match crate::fd::open(
             path,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
             Mode::empty(),
         ) {
             Ok(fd) => fd,

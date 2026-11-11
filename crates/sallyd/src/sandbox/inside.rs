@@ -42,9 +42,9 @@ pub struct Mismatch {
 /// opened.
 pub fn check_in_container(pid: u32, expect: &[Expect]) -> Result<(), Mismatch> {
     let proc_root = format!("/proc/{pid}/root");
-    let root = rustix::fs::open(
+    let root = sally_core::fd::open(
         Path::new(&proc_root),
-        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        OFlags::PATH | OFlags::DIRECTORY,
         Mode::empty(),
     )
     .map_err(|e| Mismatch {
@@ -53,10 +53,10 @@ pub fn check_in_container(pid: u32, expect: &[Expect]) -> Result<(), Mismatch> {
     })?;
     for x in expect {
         let rel = x.guest.trim_start_matches('/');
-        let st = rustix::fs::openat2(
+        let st = sally_core::fd::openat2(
             &root,
             rel,
-            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            OFlags::PATH | OFlags::NOFOLLOW,
             Mode::empty(),
             ResolveFlags::IN_ROOT | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
         )

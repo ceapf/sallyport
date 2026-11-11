@@ -414,7 +414,7 @@ mod tests {
     /// written entry, never a deletion the apply step would carry out.
     #[test]
     fn only_a_zero_zero_device_is_a_deletion() {
-        let dev = rustix::fs::open(
+        let dev = sally_core::fd::open(
             "/dev",
             rustix::fs::OFlags::PATH | rustix::fs::OFlags::DIRECTORY,
             rustix::fs::Mode::empty(),
@@ -432,7 +432,7 @@ mod tests {
     fn an_unreadable_opaque_marker_fails_closed() {
         let t = Tmp::new("xattr");
         std::fs::create_dir(t.0.join("d")).unwrap();
-        let fd = rustix::fs::open(
+        let fd = sally_core::fd::open(
             t.0.join("d"),
             rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
             rustix::fs::Mode::empty(),
@@ -449,7 +449,7 @@ mod tests {
         .unwrap();
         assert_eq!(opaque(&fd), Ok(false));
         // An O_PATH fd cannot read xattrs (EBADF): a stand-in for EACCES/EIO.
-        let path_fd = rustix::fs::open(
+        let path_fd = sally_core::fd::open(
             t.0.join("d"),
             rustix::fs::OFlags::PATH | rustix::fs::OFlags::DIRECTORY,
             rustix::fs::Mode::empty(),
