@@ -60,7 +60,7 @@ MUTANTS_FILES := crates/sally-core/src/manifest/validate/*.rs crates/sally-core/
 MUTANTS_TMP := $(CURDIR)/target/mutants-tmp
 mutants:
 	mkdir -p $(MUTANTS_TMP)
-	TMPDIR=$(MUTANTS_TMP) cargo mutants --package sally-core --no-shuffle $(foreach f,$(MUTANTS_FILES),--file $(f))
+	TMPDIR=$(MUTANTS_TMP) cargo mutants --package sally-core --no-shuffle $(foreach f,$(MUTANTS_FILES),--file '$(f)')
 
 # GitHub Actions static analysis.
 zizmor:
