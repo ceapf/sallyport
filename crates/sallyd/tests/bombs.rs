@@ -67,8 +67,14 @@ fn rt_ag_09_a_fork_bomb_is_held_by_the_pids_limit() {
         let (code, out) = exec(&r, "(b() { b | b & }; b) >/dev/null 2>&1 & echo started").await;
         assert_eq!((code, out.trim()), (0, "started"));
         tokio::time::sleep(Duration::from_secs(3)).await;
-        let peak: u64 = read(&cg, "pids.peak").trim().parse().unwrap();
-        assert!(peak <= u64::from(PIDS), "pids.peak {peak}");
+        // pids.peak where the kernel has it (6.x), else the count now, mid-bomb.
+        let file = if cg.join("pids.peak").exists() {
+            "pids.peak"
+        } else {
+            "pids.current"
+        };
+        let peak: u64 = read(&cg, file).trim().parse().unwrap();
+        assert!(peak <= u64::from(PIDS), "{file} {peak}");
         assert!(
             event(&read(&cg, "pids.events"), "max ") > 0,
             "forks were refused"
@@ -88,6 +94,10 @@ fn rt_ag_09_a_memory_bomb_is_oom_killed_inside_the_container() {
     rt().block_on(async {
         let x = Lx::new();
         let r = launch_small(&x, "oom").await;
+        let cg = cgroup(&x, &r).await;
+        assert_eq!(read(&cg, "memory.max").trim(), (64u64 << 20).to_string());
+        let marker = std::env::current_dir().unwrap().join("oom");
+        let _ = std::fs::remove_file(&marker);
         let (_, out) = exec(
             &r,
             "awk 'BEGIN { s = \"x\"; while (1) s = s s }'; echo \"rc=$?\"",
@@ -100,6 +110,12 @@ fn rt_ag_09_a_memory_bomb_is_oom_killed_inside_the_container() {
         let (code, out) = exec(&r, "echo alive").await;
         assert_eq!((code, out.trim()), (0, "alive"), "the session survives");
         x.stop(r).await;
+        // conmon writes an `oom` marker into the working directory podman started it from: the
+        // launcher's podman runs from its private state directory, never the caller's.
+        assert!(
+            !marker.exists(),
+            "conmon wrote into sallyd's working directory"
+        );
     });
 }
 

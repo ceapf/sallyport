@@ -329,12 +329,15 @@ impl Podman {
         Ok(())
     }
 
-    /// A podman command with the hermetic environment, no stdin, killed if dropped.
+    /// A podman command with the hermetic environment, no stdin, killed if dropped, run from the
+    /// private state directory: the container's conmon inherits the working directory and writes
+    /// into it (an `oom` marker when the sandbox is OOM-killed), never into `sallyd`'s own.
     #[must_use]
     pub fn command(&self) -> tokio::process::Command {
         let mut c = tokio::process::Command::new(&self.bin);
         c.env_clear()
             .envs(self.env.iter().map(|(k, v)| (k, v)))
+            .current_dir(&self.state)
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true);
         c
