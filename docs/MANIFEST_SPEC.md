@@ -35,6 +35,7 @@ runtime:                          # optional; the WORKSPACE container; defaults 
   timeout: 2h                     # session wall clock; 1m–24h
   tmp_size: 1GiB
   tmp_exec: false                 # mount /tmp noexec unless true
+  stage_size: 10GiB               # limit on staged + .git overlay writes together; exceeded = session killed
 
 model:
   ref: library://<name-or-sha256> | any   # required; `any` lets the user pick at launch
@@ -131,6 +132,7 @@ normal shape of a useful agent, so the point is that the user sees it every time
 | `runtime.cpus` | finite, 0.5 – host CPUs |
 | `runtime.memory` | 64MiB – 75% of host RAM |
 | `runtime.tmp_size` | 1MiB – `runtime.memory` (tmpfs pages are charged to the memory cgroup) |
+| `runtime.stage_size` | 1MiB – 1TiB |
 | `runtime.image`, `harness.image` | `<lowercase name>@sha256:<64 lowercase hex>` |
 | `model.ref` | `any` or `library://[a-z0-9._-]{1,128}` |
 | `model.context` / `gpu_layers` | 1 – 2²⁰ / 0 – 1024 |
@@ -329,6 +331,8 @@ validation — otherwise `mount-changed`/`is-symlink` (RT-FS-06).
 | `runtime.cpus/memory/pids` | `sallyd::sandbox` → `podman run --cpus --memory --pids-limit` | launch | out of range → reject at validate |
 | `runtime.timeout` | `sallyd::session` timer → `podman kill` | runtime | session stopped, audit `session.timeout` |
 | `runtime.tmp_size/tmp_exec` | `podman run --tmpfs /tmp:…` | launch | — |
+| `runtime.stage_size` (soft) | `sallyd::sandbox` disk watchdog: when the state filesystem's usage grows past the session's headroom, `podman pause`, walk the staged and `.git` overlay upper dirs (10 s deadline), `unpause` → `podman kill` + `rm` until gone; launch needs the floor plus `stage_size` free | launch + runtime | session killed, audit `session.resource_limit` (before the kill; `session.kill_failed` if the first kill fails); staged data kept |
+| (no field) free-space floor, `max(4 GiB, 5 %)` | `sallyd::sandbox` disk watchdog: `fstatfs` every 250 ms of every filesystem the sandbox can write to (state, `rw` mount roots) | launch + runtime | below the floor: session killed, audit `session.resource_limit` reason `disk_floor`; launch refused `disk-floor` |
 | `model.ref` | `sallyd::infer` resolves in library; refuses unverified/unknown | session start | error to UI |
 | `model.context/gpu_layers` | `sallyd::infer` → llama-server args, clamped by fit estimator | load | clamped, warning |
 | `filesystem.mounts[].host` | validator (realpath, denylist, is-dir, not-symlink) **and again** at launch: the launch scan re-opens the root without following symlinks and compares `st_dev:st_ino`, pins are re-checked before `podman init`, and bind mounts are compared inside the container after `init` (ARCHITECTURE §3.5) | validate + launch | reject / `sandbox.refuse` / `sandbox.mount_mismatch` |

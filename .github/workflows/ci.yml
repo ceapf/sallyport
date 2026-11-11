@@ -29,15 +29,36 @@ jobs:
       - run: cargo install cargo-nextest --locked --version "$CARGO_NEXTEST_VERSION"
       - name: verify cargo-nextest version
         run: cargo nextest --version | grep -Fw "$CARGO_NEXTEST_VERSION"
-      # Container tests (crates/sallyd/tests/launch.rs) need rootless podman and their base image,
-      # pulled by digest; the test image is built from it without a network. They never skip.
+      # Container tests (crates/sallyd/tests/{launch,roles}.rs) need rootless podman, their base
+      # image pulled by digest, and a C compiler for the red-team probe (tests/redteam/probe); the
+      # test images are built without a network. They never skip.
       - name: container test prerequisites
         run: |
           podman --version
+          cc --version | head -n1
           test -n "$XDG_RUNTIME_DIR"
           podman info --format '{{.Host.CgroupsVersion}} {{.Host.OCIRuntime.Path}}'
           podman pull docker.io/library/alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
       - run: make fmt clippy forbid-unsafe nextest shim-check
+  # The red-team rows implemented so far (`make redteam`); a required check from Task 6c on.
+  redteam:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: cargo install cargo-nextest --locked --version "$CARGO_NEXTEST_VERSION"
+      - name: verify cargo-nextest version
+        run: cargo nextest --version | grep -Fw "$CARGO_NEXTEST_VERSION"
+      - name: red-team prerequisites
+        run: |
+          podman --version
+          cc --version | head -n1
+          test -n "$XDG_RUNTIME_DIR"
+          podman info --format '{{.Host.CgroupsVersion}} {{.Host.OCIRuntime.Path}}'
+          podman pull docker.io/library/alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+      - run: make redteam
   coverage:
     runs-on: ubuntu-24.04
     timeout-minutes: 30

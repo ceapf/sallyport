@@ -2,227 +2,18 @@
 //! rule and post-init mount check, hermetic podman (#11), RT-FS-12 variants (EBUSY parents),
 //! RT-FS-13 (socket in a mount) and RT-FS-16 (a nested host mount is not visible).
 //!
-//! These tests never skip: without podman or the base image they fail. CI pulls the base image
-//! by digest first (`ci.yml`); the test image is built from it offline.
+//! The fixture is `common::container`; these tests never skip.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::{Arc, Mutex, OnceLock};
-
-use sally_core::audit::{AuditError, NewEntry};
-use sally_core::manifest::{AuditLevel, ValidatedManifest};
-use sallyd::sandbox::{
-    AuditSink, CheckedRuntime, Expect, ImageRef, LaunchError, Launcher, LauncherParts, Podman,
-    PodmanHost, Running, ScanLimits, SessionId, SessionPaths, Sessions, UserIds, WorkspaceRequest,
-    check_in_container, resolve_podman,
-};
+use std::path::PathBuf;
 use std::time::Duration;
 
+use sallyd::sandbox::{Expect, LaunchError, check_in_container};
+
 mod common;
+use common::container::*;
 use common::*;
-
-/// The base image CI pulls by digest; everything else is built from it without a network.
-const BASE: &str = "docker.io/library/alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc";
-
-fn podman(args: &[&str]) -> std::process::Output {
-    Command::new("podman")
-        .args(args)
-        .output()
-        .expect("podman must be installed")
-}
-
-/// `localhost/sallyport-test@sha256:…`: the base image plus `/opt/sallyport/entry`, which idles.
-fn test_image() -> ImageRef {
-    static IMAGE: OnceLock<String> = OnceLock::new();
-    let r = IMAGE.get_or_init(|| {
-        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("sallyport-test-image");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("Containerfile"),
-            format!("FROM {BASE}\nCOPY entry /opt/sallyport/entry\n"),
-        )
-        .unwrap();
-        std::fs::write(dir.join("entry"), "#!/bin/sh\nexec sleep 2147483647\n").unwrap();
-        std::fs::set_permissions(dir.join("entry"), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
-        let out = podman(&[
-            "build",
-            "--pull=never",
-            "--network=none",
-            // Reproducible: nextest runs each test in its own process, and parallel uncached
-            // builds would otherwise differ (creation time), re-tag the name, and leave an
-            // earlier process's `name@digest` unresolvable.
-            "--timestamp",
-            "0",
-            "-q",
-            "-t",
-            "localhost/sallyport-test:6b",
-            dir.to_str().unwrap(),
-        ]);
-        assert!(
-            out.status.success(),
-            "build: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let out = podman(&[
-            "image",
-            "inspect",
-            "--format",
-            "{{.Digest}}",
-            "localhost/sallyport-test:6b",
-        ]);
-        format!(
-            "localhost/sallyport-test@{}",
-            String::from_utf8_lossy(&out.stdout).trim()
-        )
-    });
-    ImageRef::parse(r).unwrap()
-}
-
-/// Records every audit entry's event name.
-#[derive(Default)]
-struct Events(Mutex<Vec<String>>);
-
-impl AuditSink for Events {
-    fn append(&self, e: NewEntry, _: AuditLevel) -> Result<(), AuditError> {
-        self.0.lock().unwrap().push(e.event().to_owned());
-        Ok(())
-    }
-}
-
-impl Events {
-    fn list(&self) -> Vec<String> {
-        self.0.lock().unwrap().clone()
-    }
-}
-
-struct Lx {
-    f: Fx,
-    launcher: Arc<Launcher>,
-    events: Arc<Events>,
-    xdg: PathBuf,
-    /// Prefix of every session id this fixture makes: `t<pid>-<n>`.
-    scope: String,
-}
-
-fn host_env(var: &str) -> Option<PathBuf> {
-    std::env::var_os(var).map(PathBuf::from)
-}
-
-impl Lx {
-    fn new() -> Self {
-        Self::with_home(None)
-    }
-
-    /// `podman_home`: the `$HOME` hermetic podman is given (default: the real one).
-    fn with_home(podman_home: Option<PathBuf>) -> Self {
-        let f = Fx::new();
-        let xdg = f.root.join("run");
-        std::fs::set_permissions(&xdg, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let real_home = host_env("HOME").unwrap();
-        let host = PodmanHost {
-            home: podman_home.unwrap_or_else(|| real_home.clone()),
-            xdg_runtime_dir: host_env("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR"),
-            xdg_data_home: Some(
-                host_env("XDG_DATA_HOME").unwrap_or(real_home.join(".local/share")),
-            ),
-        };
-        let runtime = CheckedRuntime::check(Path::new(
-            &std::env::var("SALLYPORT_TEST_RUNTIME").unwrap_or_else(|_| "/usr/bin/crun".into()),
-        ))
-        .unwrap();
-        let state = f.root.join("home/.local/share/sallyport/podman");
-        std::fs::create_dir_all(state.parent().unwrap()).unwrap();
-        let bin = resolve_podman(None, std::env::var_os("PATH").as_deref()).unwrap();
-        let podman = Podman::setup(bin, &runtime, &state, &host).unwrap();
-        let events = Arc::new(Events::default());
-        let launcher = Launcher::new(LauncherParts {
-            podman,
-            runtime,
-            ids: UserIds {
-                uid: rustix::process::getuid().as_raw(),
-                gid: rustix::process::getgid().as_raw(),
-            },
-            xdg_runtime_dir: xdg.clone(),
-            sessions: Arc::new(Sessions::default()),
-            audit: events.clone(),
-            limits: ScanLimits::default(),
-        });
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Self {
-            f,
-            launcher,
-            events,
-            xdg,
-            scope: format!("t{}-{n}", std::process::id()),
-        }
-    }
-
-    fn paths(&self, tag: &str) -> SessionPaths {
-        let id = SessionId::parse(&format!("{}-{tag}", self.scope)).unwrap();
-        SessionPaths::new(
-            id,
-            &self.xdg.join("sallyport"),
-            &self.f.root.join("home/.local/share/sallyport"),
-        )
-        .unwrap()
-    }
-
-    fn request(&self, v: &ValidatedManifest, tag: &str) -> WorkspaceRequest {
-        WorkspaceRequest {
-            paths: self.paths(tag),
-            manifest: Arc::new(v.clone()),
-            default_image: test_image(),
-        }
-    }
-
-    async fn launch(&self, v: &ValidatedManifest, tag: &str) -> Result<Running, LaunchError> {
-        self.launcher.launch_workspace(self.request(v, tag)).await
-    }
-
-    async fn stop(&self, r: Running) {
-        self.launcher.stop(r).await.unwrap();
-    }
-}
-
-impl Drop for Lx {
-    /// Removes this fixture's containers even when a test failed, then its files (overlay work
-    /// directories belong to the container's user namespace).
-    fn drop(&mut self) {
-        let names = podman(&["ps", "--all", "--format", "{{.Names}}"]);
-        for name in String::from_utf8_lossy(&names.stdout).lines() {
-            if name.starts_with(&format!("sp-ws-{}-", self.scope)) {
-                let _ = podman(&["rm", "--force", "--time", "0", name]);
-            }
-        }
-        let _ = podman(&["unshare", "rm", "-rf", "--", self.f.root.to_str().unwrap()]);
-    }
-}
-
-/// `podman exec` in the container: (exit code, stdout + stderr).
-fn exec(r: &Running, script: &str) -> (i32, String) {
-    let out = podman(&["exec", r.container(), "sh", "-c", script]);
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    (out.status.code().unwrap_or(-1), text)
-}
-
-fn exists(container: &str) -> bool {
-    podman(&["container", "exists", container]).status.success()
-}
-
-fn rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-}
 
 #[test]
 fn a_launch_is_hardened_audited_and_torn_down() {
@@ -241,7 +32,8 @@ fn a_launch_is_hardened_audited_and_torn_down() {
              grep Seccomp: /proc/self/status; ls /workspace; touch /workspace/r/x 2>&1; \
              echo staged > /workspace/o/new; echo ok > /workspace/p/.git/probe; \
              cat /proc/net/route 2>/dev/null | wc -l",
-        );
+        )
+        .await;
         assert_eq!(code, 0, "{out}");
         let uid = rustix::process::getuid().as_raw().to_string();
         assert!(out.starts_with(&format!("{uid}\n")), "{out}");
@@ -266,6 +58,182 @@ fn a_launch_is_hardened_audited_and_torn_down() {
         );
         assert!(!sockets.exists());
         assert_eq!(x.events.list(), ["sandbox.launch", "sandbox.stop"]);
+    });
+}
+
+/// #17 (Task 6c): `podman start` succeeds even when the entry point exits at once. The launcher
+/// confirms the container is running, and otherwise refuses, removes it and its directories, and
+/// releases its claims.
+#[test]
+fn an_entry_that_exits_at_once_refuses_the_launch() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let v =
+            x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "rw")]));
+        let mut req = x.request(&v, "exit");
+        req.default_image = exiting_image();
+        let paths = req.paths.clone();
+        let e = x.launcher.launch_workspace(req).await.unwrap_err();
+        assert!(matches!(e, LaunchError::NotRunning(_)), "{e}");
+        assert_eq!(x.events.list(), ["sandbox.launch", "sandbox.refuse"]);
+        let refuse = x.events.args("sandbox.refuse").unwrap();
+        assert_eq!(refuse["reason"], "not-running", "{refuse}");
+        assert!(!exists(&format!("sp-ws-{}", paths.id().as_str())));
+        assert!(!paths.data_root().exists() && !paths.socket_root().exists());
+        let r = x.launch(&v, "after-exit").await.unwrap();
+        x.stop(r).await;
+    });
+}
+
+/// AMENDMENTS-02 B4, launcher level (#17): the mount source is swapped after the host re-check,
+/// while `podman init` runs (a runtime wrapper renames the granted directory and puts another in
+/// its place when `crun create` is called). The post-init check sees another object, the launch
+/// is refused before `start` and audited as `sandbox.mount_mismatch`, and nothing ran.
+#[test]
+fn a_mount_swapped_during_init_is_a_mismatch() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("swap-runtime-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let _cleanup = RemoveOnDrop(dir.clone());
+    let marker = dir.join("swapped");
+    let wrapper = dir.join("crun-swap");
+    let write_wrapper = |granted: &std::path::Path| {
+        let script = format!(
+            "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = create ] && [ ! -e '{m}' ]; then\n    \
+             touch '{m}'; mv '{g}' '{g}.orig' && mkdir '{g}'\n  fi\ndone\nexec '{rt}' \"$@\"\n",
+            m = marker.display(),
+            g = granted.display(),
+            rt = test_runtime().display(),
+        );
+        std::fs::write(&wrapper, script).unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    // The fixture's paths are only known once it exists; the wrapper must exist first.
+    write_wrapper(std::path::Path::new("/nonexistent"));
+    rt().block_on(async {
+        let x = Lx::with_runtime(&wrapper);
+        let granted = x.f.root.join("home/code/myproject");
+        write_wrapper(&granted);
+        let v =
+            x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "rw")]));
+        let req = x.request(&v, "swap");
+        let paths = req.paths.clone();
+        let e = x.launcher.launch_workspace(req).await.unwrap_err();
+        assert!(marker.exists(), "the wrapper ran");
+        assert!(matches!(e, LaunchError::MountMismatch(_)), "{e}");
+        assert_eq!(
+            x.events.list(),
+            ["sandbox.launch", "sandbox.mount_mismatch"]
+        );
+        assert!(!exists(&format!("sp-ws-{}", paths.id().as_str())));
+        assert!(!paths.data_root().exists() && !paths.socket_root().exists());
+    });
+}
+
+/// Waits up to 20 s for the container to be gone.
+async fn gone_within_deadline(container: &str) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        if !exists(container) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    false
+}
+
+/// RT-AG-09, `runtime.stage_size` (#14): a sandbox that writes past the limit into a staged
+/// mount is killed and `session.resource_limit` is audited first. Within the limit it keeps
+/// running, and so does another session (6c-1 security review L4). `stop` still tears the killed
+/// session down and keeps its staged data.
+#[test]
+fn rt_ag_09_writing_past_stage_size_kills_the_session() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let body = format!(
+            "{}runtime:\n  stage_size: 4MiB\n",
+            mounts(&[
+                mount("~/code/myproject", "/workspace/p", "ro"),
+                mount("~/code/other", "/workspace/o", "staged"),
+            ])
+        );
+        let v = x.f.load(&body);
+        let small = x.launch(&v, "stage").await.unwrap();
+        let other = x.f.load(&format!(
+            "{}runtime:\n  stage_size: 4MiB\n",
+            mounts(&[mount("~/Documents/research", "/workspace/r", "staged")])
+        ));
+        let bystander = x.launch(&other, "bystander").await.unwrap();
+        let (code, out) = exec(
+            &small,
+            "dd if=/dev/zero of=/workspace/o/ok bs=1024 count=1024",
+        )
+        .await;
+        assert_eq!(code, 0, "{out}");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(exists(small.container()), "within the limit: still running");
+        // The write itself may be cut short by the kill.
+        let _ = exec(&small, "dd if=/dev/zero of=/workspace/o/big bs=1M count=16").await;
+        assert!(
+            gone_within_deadline(small.container()).await,
+            "the watchdog killed the session"
+        );
+        let limit = x.events.args("session.resource_limit").expect("audited");
+        assert_eq!(limit["resource"], "stage_size", "{limit}");
+        assert_eq!(limit["limit"], 4 << 20, "{limit}");
+        assert_eq!(limit["area"], "filesystem.mounts[1]", "{limit}");
+        assert_eq!(limit["reason"], "stage_size", "{limit}");
+        assert!(limit["measured"].as_u64().unwrap() > 4 << 20, "{limit}");
+        assert!(exists(bystander.container()), "the other session is alive");
+        let paths = small.paths().clone();
+        x.stop(small).await;
+        x.stop(bystander).await;
+        assert!(
+            paths.stage(1).upper.join("ok").exists(),
+            "staged data is kept"
+        );
+        assert_eq!(
+            x.events.list(),
+            [
+                "sandbox.launch",
+                "sandbox.launch",
+                "session.resource_limit",
+                "sandbox.stop",
+                "sandbox.stop"
+            ]
+        );
+    });
+}
+
+/// RT-AG-09, `runtime.stage_size` through a `.git` overlay (6c-1 Rust review H2): an `rw` mount
+/// with no staged mount still cannot fill the host disk through `<mount>/.git`.
+#[test]
+fn rt_ag_09_writing_past_stage_size_into_a_git_overlay_kills_the_session() {
+    rt().block_on(async {
+        let x = Lx::new();
+        x.f.tree("code/myproject", &[".git"], &[]);
+        let v = x.f.load(&format!(
+            "{}runtime:\n  stage_size: 4MiB\n",
+            mounts(&[mount("~/code/myproject", "/workspace/p", "rw")])
+        ));
+        let r = x.launch(&v, "git-fill").await.unwrap();
+        let _ = exec(
+            &r,
+            "dd if=/dev/zero of=/workspace/p/.git/pack bs=1M count=16",
+        )
+        .await;
+        assert!(
+            gone_within_deadline(r.container()).await,
+            "the watchdog killed the session"
+        );
+        let limit = x.events.args("session.resource_limit").expect("audited");
+        assert_eq!(limit["area"], "filesystem.mounts[0].git[0]", "{limit}");
+        assert_eq!(limit["reason"], "stage_size", "{limit}");
+        assert!(
+            !x.f.root.join("home/code/myproject/.git/pack").exists(),
+            "the host .git is untouched"
+        );
+        x.stop(r).await;
     });
 }
 
@@ -384,7 +352,8 @@ fn rt_fs_12_git_shields_hold_inside_the_container() {
              printf '#!/bin/sh\\ntouch /tmp/pwned\\n' > sub/.git/hooks/pre-commit; echo hook=$?; \
              echo '[core] fsmonitor = evil' >> sub/.git/config; echo cfg=$?; \
              echo gitdir: /etc > mod/.git; echo ptr=$?",
-        );
+        )
+        .await;
         assert!(
             out.contains("mv-sub=1") && out.contains("mv-mod=1"),
             "{out}"
@@ -463,7 +432,8 @@ fn rt_fs_16_a_nested_host_mount_is_not_visible() {
             let (_, out) = exec(
                 &r,
                 "ls -a /workspace/p/nested; cat /workspace/p/nested/canary 2>&1",
-            );
+            )
+            .await;
             assert!(!out.contains("NESTED-SECRET"), "{mode}: {out}");
             assert!(out.contains("No such file"), "{mode}: {out}");
             x.stop(r).await;
@@ -543,7 +513,8 @@ fn hostile_user_podman_configuration_is_ignored() {
             &r,
             "ls /hostile /run/secrets 2>&1; env | grep HOSTILE; grep CapEff /proc/self/status; \
              ls /sys/class/net",
-        );
+        )
+        .await;
         assert!(
             !out.contains("canary") && !out.contains("HOSTILE=1"),
             "{out}"
@@ -576,7 +547,7 @@ fn a_reused_session_id_never_deletes_kept_staged_changes() {
             x.f.load(&mounts(&[mount("~/code/other", "/workspace/o", "staged")]));
         let req = x.request(&v, "reuse");
         let r = x.launcher.launch_workspace(req.clone()).await.unwrap();
-        let (code, out) = exec(&r, "echo keep > /workspace/o/work.txt");
+        let (code, out) = exec(&r, "echo keep > /workspace/o/work.txt").await;
         assert_eq!(code, 0, "{out}");
         x.stop(r).await;
         let kept = req.paths.stage(0).upper.join("work.txt");

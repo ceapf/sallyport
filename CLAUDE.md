@@ -34,6 +34,9 @@ If a task seems to require breaking one of these, **stop and ask**. Do not imple
 
 - Never weaken, skip, `#[ignore]`, or delete a red-team test to make CI green. If a test is wrong, fix the test *and* explain why in the PR body. A skipped RT test needs a tracked issue and an expiry date in the skip reason.
 - Never add `unsafe`. Every crate has `#![forbid(unsafe_code)]`. If you believe it is unavoidable, stop and ask.
+  One approved exception (Task 6c): the red-team syscall probe `tests/redteam/probe/probe.c`.
+  It lives only in the red-team test tree, is built at test time, is never linked into or shipped
+  with any product binary or release image, and stays a single small file.
 - Never log a secret value, a full file body, or raw model output above 4 KiB. Use `Secret<T>` (redacted `Debug`).
 - Never introduce a dependency without checking `cargo deny check` passes and noting why it's needed. Prefer std / tokio / hyper / rustls / serde / rustix / rusqlite / clap / tracing / thiserror / anyhow / schemars / sha2 / zeroize / uuid / jiff.
 - Never run `podman` with `--privileged`, `--cap-add`, `--network=host|bridge|slirp4netns|pasta`, `--security-opt seccomp=unconfined`, `--userns=host`, `--device` other than `nvidia.com/gpu`, or `-v` of a denylisted path — not even in tests. The red-team harness greps the argv for these.
@@ -132,9 +135,8 @@ issues, comments and CI output.
 - CI verdicts come only from this command printing `true`, never from reading a list of check
   lines, and every report of a CI result names it (gh 2.45 has no `pr checks --json`):
   `gh pr view <N> --json statusCheckRollup --jq '[.statusCheckRollup[] | select(.name |
-  IN("rust","coverage","deny","fuzz","zizmor","doctor-syntax"))] | (length == 6 and all(.[];
-  .conclusion == "SUCCESS"))'`. The names are the ruleset's required checks; add `redteam` (and
-  raise the count) when it lands.
+  IN("rust","coverage","deny","fuzz","zizmor","doctor-syntax","redteam"))] | (length == 7 and
+  all(.[]; .conclusion == "SUCCESS"))'`. The names are the ruleset's required checks.
 - Standing merge rule: you may merge PRs **you authored from branches in this repository** when CI
   is green, the required reviews have run with findings fixed or deferred by TODO, and the task is
   in the approved plan. Never merge a PR carrying a checkpoint deliverable until the maintainer

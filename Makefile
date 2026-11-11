@@ -94,6 +94,15 @@ shim-check: shim
 doctor:
 	bash scripts/doctor.sh --redact
 
-# Red-team targets arrive with task 13; until then they fail loudly rather than pass vacuously.
-redteam redteam-gpu e2e-gpu:
-	@echo "$@: not implemented yet (M1 task 13)"; exit 1
+# Red-team rows implemented so far: every test named `rt_<row>_…` in the workspace (Task 6c);
+# Task 13 adds the harness and the remaining M1 rows. No GPU needed. RT-AG-09 needs cgroup v2:
+# without it the run fails, never skips (CLAUDE.md). An empty selection fails too.
+REDTEAM_FILTER := test(/(^|::)rt_/)
+redteam:
+	@v=$$(podman info --format '{{.Host.CgroupsVersion}}'); \
+	  [ "$$v" = v2 ] || { echo "redteam: cgroup v2 required (RT-AG-09), podman reports '$$v'"; exit 1; }
+	$(CARGO) nextest run --workspace --no-fail-fast --no-tests=fail -E '$(REDTEAM_FILTER)'
+
+# GPU targets arrive with M3; until then they fail loudly rather than pass vacuously.
+redteam-gpu e2e-gpu:
+	@echo "$@: not implemented yet (M3)"; exit 1

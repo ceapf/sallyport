@@ -15,6 +15,8 @@ const MAX_DESCRIPTION: usize = 512;
 const MIN_CPUS: Cpus = Cpus::from_millis(500);
 const MIN_MEMORY: u64 = 64 * ByteSize::MIB;
 const PIDS: (u32, u32) = (16, 4096);
+/// `runtime.stage_size`: 1 MiB to 1 TiB (#14).
+const STAGE_SIZE: (u64, u64) = (ByteSize::MIB, 1024 * ByteSize::GIB);
 const SESSION_TIMEOUT: (u64, u64) = (60, 24 * 3600);
 const APPROVAL_TIMEOUT: (u64, u64) = (30, 3600);
 const MAX_PENDING: (u32, u32) = (1, 64);
@@ -126,6 +128,14 @@ pub(super) fn check_runtime(r: &Runtime, env: &HostEnv, d: &mut Diags) {
         r.tmp_size.bytes(),
         ByteSize::MIB,
         r.memory.bytes(),
+        bytes,
+    );
+    in_range(
+        d,
+        "runtime.stage_size",
+        r.stage_size.bytes(),
+        STAGE_SIZE.0,
+        STAGE_SIZE.1,
         bytes,
     );
 }

@@ -103,6 +103,13 @@ impl NewEntry {
         &self.event
     }
 
+    /// The arguments as given, **before redaction** (they are redacted when written). For audit
+    /// sinks and tests; never log or display them (CLAUDE.md: no secret values in logs).
+    #[must_use]
+    pub fn arguments(&self) -> &Value {
+        &self.args
+    }
+
     /// Sets the session id.
     #[must_use]
     pub fn session(mut self, session: impl Into<String>) -> Self {

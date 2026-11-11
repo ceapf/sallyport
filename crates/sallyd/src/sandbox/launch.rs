@@ -11,7 +11,11 @@
 //!    mounts but runs nothing);
 //! 6. compare every bind pin inside the container's mount namespace (B4); on a mismatch remove the
 //!    container and audit `sandbox.mount_mismatch`;
-//! 7. `podman start`.
+//! 7. `podman start`, then confirm after a short grace that the container is running with the
+//!    pid that was checked (`start` succeeds even when the entry point exits at once).
+//!
+//! A session whose sandbox can write to the host disk (`staged` mounts, `.git` overlays) gets a
+//! watchdog that kills it when those writes exceed `runtime.stage_size` (#14; `watchdog.rs`).
 //!
 //! The launch runs in its own task: a caller that goes away (a closed connection, an outer
 //! timeout) cannot leave a half-built session, and a finished launch nobody receives is stopped.
@@ -27,22 +31,26 @@ use std::time::Duration;
 use sally_core::audit::{Actor, AuditError, AuditWriter, NewEntry};
 use sally_core::manifest::{AuditLevel, MountMode, ValidatedManifest};
 use serde_json::json;
-use tokio::io::{AsyncRead, AsyncReadExt as _};
 
-use super::argv::{path_arg, workspace_argv};
+use super::argv::workspace_argv;
+use super::commands::{container_id, rm_args};
 use super::dirs::{DirError, SessionDirs};
+use super::disk::DiskFloor;
 use super::inside::{Expect, Mismatch, check_in_container};
 use super::overlap::{ReserveError, Sessions, claims};
 use super::podman::{Podman, PodmanError};
 use super::scan::{LaunchScan, PinKind, ScanError, ScanLimits, scan_mounts};
 use super::types::{ArgvError, CheckedRuntime, CommonArgs, ImageRef, SessionPaths, UserIds};
+use super::watchdog::{Target, WatchPlan, Watchdog, watch_plan};
 
-/// Bytes of podman's stdout and stderr kept per command; the rest is read and dropped.
-const OUTPUT_CAP: usize = 64 * 1024;
-/// A podman command that takes longer is killed.
-const PODMAN_TIMEOUT: Duration = Duration::from_secs(120);
 /// Longest free-text value in an audit entry (CLAUDE.md: nothing above 4 KiB is logged).
 const AUDIT_TEXT_CAP: usize = 4096;
+/// How long after `podman start` the container must still be running. An entry point that
+/// cannot run (a missing interpreter, a crash at startup) exits well within it; a later exit is
+/// the session's business (Task 12).
+const START_GRACE: Duration = Duration::from_millis(250);
+/// How often a launch nobody received retries its `stop`.
+const STOP_RETRY: Duration = Duration::from_secs(2);
 /// Container name prefixes of the session roles this launcher creates.
 const SESSION_PREFIXES: [&str; 2] = ["sp-ws-", "sp-h-"];
 
@@ -95,6 +103,13 @@ pub enum LaunchError {
     /// A mount inside the container is not the pinned object.
     #[error("sandbox.mount_mismatch: {0}")]
     MountMismatch(Mismatch),
+    /// The container was not running, with the checked pid, after `podman start`.
+    #[error("the container is not running after start: {0}")]
+    NotRunning(String),
+    /// A filesystem the sandbox could write to lacks the free-space floor (plus
+    /// `runtime.stage_size` on the state filesystem).
+    #[error("not enough free disk space: {0}")]
+    DiskSpace(String),
     /// A podman command failed.
     #[error("podman {verb}: {msg}")]
     Command {
@@ -131,6 +146,8 @@ impl LaunchError {
             Self::Argv(_) => "argv",
             Self::Podman(_) => "podman-config",
             Self::MountMismatch(_) => "mount-mismatch",
+            Self::NotRunning(_) => "not-running",
+            Self::DiskSpace(_) => "disk-floor",
             Self::Command { .. } => "podman",
             Self::Audit(_) | Self::Unaudited { .. } => "audit",
             Self::Internal(_) => "internal",
@@ -161,7 +178,7 @@ async fn blocking<T: Send + 'static>(
 }
 
 /// Cuts free text for an audit entry at a character boundary.
-fn capped(s: &str) -> String {
+pub(super) fn capped(s: &str) -> String {
     if s.len() <= AUDIT_TEXT_CAP {
         return s.to_owned();
     }
@@ -189,9 +206,21 @@ pub struct Running {
     name: String,
     paths: SessionPaths,
     level: AuditLevel,
+    /// The disk watchdog, if the sandbox can write to the host disk; stopped on drop.
+    watchdog: Option<Watchdog>,
+    exec_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Running {
+    /// The session's exec gate. The disk watchdog holds it while the container is frozen for a
+    /// measurement, so a new `podman exec` never meets a paused container. An exec holds it only
+    /// while starting: a running exec process is in the container's cgroup and freezes with it.
+    /// TODO(#24): the shell tool (Task 11) follows that contract and gets an RT case.
+    #[must_use]
+    pub fn exec_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(&self.exec_gate)
+    }
+
     /// Podman's container id (64 hex digits).
     #[must_use]
     pub fn container(&self) -> &str {
@@ -238,17 +267,23 @@ pub struct LauncherParts {
     pub audit: Arc<dyn AuditSink>,
     /// Scan bounds.
     pub limits: ScanLimits,
+    /// The free-space floor (`DiskFloor::default()` unless configured).
+    pub disk_floor: DiskFloor,
 }
 
 /// Launches and tears down sandboxes for one `sallyd`. Shared as `Arc<Launcher>`.
 pub struct Launcher {
-    podman: Podman,
+    pub(super) podman: Podman,
     runtime: CheckedRuntime,
     ids: UserIds,
     xdg_runtime_dir: PathBuf,
     sessions: Arc<Sessions>,
     audit: Arc<dyn AuditSink>,
     limits: ScanLimits,
+    pub(super) disk_floor: DiskFloor,
+    /// One stage walk at a time across all sessions, so a sandbox with a huge or deep tree
+    /// cannot multiply `sallyd`'s open fds or blocking threads (6c-1 review M2/M3).
+    pub(super) walks: Arc<tokio::sync::Semaphore>,
 }
 
 impl std::fmt::Debug for Launcher {
@@ -280,10 +315,16 @@ impl Launcher {
             sessions: p.sessions,
             audit: p.audit,
             limits: p.limits,
+            disk_floor: p.disk_floor,
+            walks: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
 
-    async fn audit(&self, entry: NewEntry, level: AuditLevel) -> Result<(), LaunchError> {
+    pub(super) async fn audit(
+        &self,
+        entry: NewEntry,
+        level: AuditLevel,
+    ) -> Result<(), LaunchError> {
         let sink = Arc::clone(&self.audit);
         tokio::task::spawn_blocking(move || sink.append(entry, level))
             .await
@@ -350,12 +391,38 @@ impl Launcher {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let this = Arc::clone(self);
         tokio::spawn(async move {
-            let result = this.launch(req).await;
-            if let Err(Ok(orphan)) = tx.send(result)
-                && let Err(e) = this.stop(orphan).await
-            {
-                // Nobody holds the handle any more: record it (the claims stay held until
-                // remove_orphans at the next start).
+            let result = this.launch(req).await.map(|(mut r, plan)| {
+                r.watchdog = plan.map(|plan| {
+                    let target = Target {
+                        sid: r.paths.id().as_str().to_owned(),
+                        container: r.container.clone(),
+                        level: r.level,
+                        exec_gate: Arc::clone(&r.exec_gate),
+                    };
+                    Watchdog::spawn(&this, target, plan)
+                });
+                r
+            });
+            if let Err(Ok(orphan)) = tx.send(result) {
+                this.stop_unreceived(orphan).await;
+            }
+        });
+        rx.await
+            .map_err(|_| LaunchError::Internal("the launch task ended without a result".into()))?
+    }
+
+    /// Stops a launch nobody received, retrying until the container is gone. Meanwhile the
+    /// handle keeps its disk watchdog, so the session stays bounded (6c-1 re-review M2). The
+    /// first failure is audited as `sandbox.stop_failed`.
+    async fn stop_unreceived(&self, mut running: Running) {
+        let mut reported = false;
+        loop {
+            let e = match self.stop(running).await {
+                Ok(()) => return,
+                Err(e) => e,
+            };
+            if !reported {
+                reported = true;
                 let entry = NewEntry::new(Actor::Sallyd, "sandbox.stop_failed")
                     .session(e.running.paths.id().as_str())
                     .decision("deny")
@@ -363,14 +430,21 @@ impl Launcher {
                         "container": e.running.name,
                         "detail": capped(&e.error.to_string()),
                     }));
-                let _ = this.audit(entry, e.running.level).await;
+                let _ = self.audit(entry, e.running.level).await;
             }
-        });
-        rx.await
-            .map_err(|_| LaunchError::Internal("the launch task ended without a result".into()))?
+            // `stop` also fails after the container is gone (scratch removal): nothing runs.
+            if matches!(self.container_exists(&e.running.name).await, Ok(false)) {
+                return;
+            }
+            running = e.running;
+            tokio::time::sleep(STOP_RETRY).await;
+        }
     }
 
-    async fn launch(&self, req: WorkspaceRequest) -> Result<Running, LaunchError> {
+    async fn launch(
+        &self,
+        req: WorkspaceRequest,
+    ) -> Result<(Running, Option<WatchPlan>), LaunchError> {
         let level = req.manifest.manifest().audit.level;
         let sid = req.paths.id().as_str().to_owned();
         let v = Arc::clone(&req.manifest);
@@ -437,8 +511,8 @@ impl Launcher {
         req: &WorkspaceRequest,
         level: AuditLevel,
         progress: &mut Progress,
-    ) -> Result<Running, LaunchError> {
-        let (runtime, scan) = self.check_and_scan(req).await?;
+    ) -> Result<(Running, Option<WatchPlan>), LaunchError> {
+        let (runtime, scan, plan) = self.check_and_scan(req).await?;
         let argv = self.dirs_and_argv(req, runtime, &scan, progress).await?;
         let m = req.manifest.manifest();
         let mounts: Vec<_> = req
@@ -472,28 +546,34 @@ impl Launcher {
             .await?;
         let container = container_id(&out)?;
         self.checked_start(req, scan, &container).await?;
-        Ok(Running {
+        let running = Running {
             container,
             name,
             paths: req.paths.clone(),
             level,
-        })
+            watchdog: None,
+            exec_gate: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        Ok((running, plan))
     }
 
-    /// Step 2: hermetic podman and the runtime re-checked, then the launch scan.
+    /// Step 2: hermetic podman and the runtime re-checked, then the launch scan, then the
+    /// free-space check of every filesystem the sandbox could write to (`disk.rs`).
     async fn check_and_scan(
         &self,
         req: &WorkspaceRequest,
-    ) -> Result<(CheckedRuntime, LaunchScan), LaunchError> {
+    ) -> Result<(CheckedRuntime, LaunchScan, Option<WatchPlan>), LaunchError> {
         let podman = self.podman.clone();
         let runtime = self.runtime.path().to_owned();
-        let limits = self.limits;
-        let v = Arc::clone(&req.manifest);
+        let (limits, floor) = (self.limits, self.disk_floor);
+        let (v, paths) = (Arc::clone(&req.manifest), req.paths.clone());
         blocking(move || {
             podman.recheck()?;
             let runtime = CheckedRuntime::check(&runtime)
                 .map_err(|e| LaunchError::Podman(PodmanError::Binary(e)))?;
-            Ok((runtime, scan_mounts(&v, &limits)?))
+            let scan = scan_mounts(&v, &limits)?;
+            let plan = watch_plan(&v, &paths, &scan, &floor)?;
+            Ok((runtime, scan, plan))
         })
         .await
     }
@@ -569,9 +649,26 @@ impl Launcher {
             .await?;
         self.run("start", [OsString::from("start"), container.into()])
             .await?;
-        // TODO(#17): confirm the container is running; `start` succeeds even when the entry
-        // point fails to exec (Task 6c).
-        Ok(())
+        tokio::time::sleep(START_GRACE).await;
+        self.confirm_running(container, pid).await
+    }
+
+    /// Step 7: the container still runs, as the process whose mounts were checked. A container
+    /// that exited is already gone (`--rm`), so a failed inspect means "not running" too.
+    async fn confirm_running(&self, container: &str, pid: u32) -> Result<(), LaunchError> {
+        let state = self
+            .run(
+                "inspect",
+                [
+                    "inspect".into(),
+                    "--format".into(),
+                    "{{.State.Running}} {{.State.Pid}}".into(),
+                    container.into(),
+                ],
+            )
+            .await
+            .map_err(|e| LaunchError::NotRunning(e.to_string()))?;
+        running_as(&state, pid)
     }
 
     async fn init_pid(&self, container: &str) -> Result<u32, LaunchError> {
@@ -614,46 +711,6 @@ impl Launcher {
         Ok(())
     }
 
-    /// `podman rm --force`, then confirms the container is gone.
-    async fn remove_container(&self, name: &str) -> Result<(), LaunchError> {
-        let removed = self.run("rm", rm_args(name)).await;
-        match self.container_exists(name).await? {
-            false => Ok(()),
-            true => Err(removed.err().unwrap_or(LaunchError::Command {
-                verb: "rm",
-                msg: format!("{name} still exists"),
-            })),
-        }
-    }
-
-    async fn container_exists(&self, name: &str) -> Result<bool, LaunchError> {
-        let status = self
-            .podman
-            .command()
-            .args(["container", "exists", name])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        let status = tokio::time::timeout(PODMAN_TIMEOUT, status)
-            .await
-            .map_err(|_| LaunchError::Command {
-                verb: "container exists",
-                msg: "timed out".into(),
-            })?
-            .map_err(|e| LaunchError::Command {
-                verb: "container exists",
-                msg: e.to_string(),
-            })?;
-        match status.code() {
-            Some(0) => Ok(true),
-            Some(1) => Ok(false),
-            _ => Err(LaunchError::Command {
-                verb: "container exists",
-                msg: status.to_string(),
-            }),
-        }
-    }
-
     /// Stops and removes the container, discards the `.git` overlays, the profiles and the
     /// socket directory, keeps the `staged` upper directories, and releases the session's
     /// mounts. Audits `sandbox.stop` first.
@@ -662,7 +719,7 @@ impl Launcher {
     /// [`StopError`] when the container cannot be confirmed gone: the session keeps its claims
     /// and the error carries the handle back for a retry. A failure after that (scratch
     /// removal) is reported too, but the session is released.
-    pub async fn stop(&self, r: Running) -> Result<(), Box<StopError>> {
+    pub async fn stop(&self, mut r: Running) -> Result<(), Box<StopError>> {
         let sid = r.paths.id().as_str().to_owned();
         let audited = self
             .audit(
@@ -672,9 +729,17 @@ impl Launcher {
                 r.level,
             )
             .await;
-        if let Err(error) = self.remove_container(&r.name).await {
+        // Holding the exec gate waits out a walk in progress (which holds it while the container
+        // is frozen) and keeps a new one from freezing the container during removal.
+        let gate = Arc::clone(&r.exec_gate);
+        let held = gate.lock().await;
+        let removed = self.remove_container(&r.name).await;
+        drop(held);
+        if let Err(error) = removed {
             return Err(Box::new(StopError { running: r, error }));
         }
+        // The container is gone: nothing left to watch.
+        drop(r.watchdog.take());
         let cleaned = self.remove_dirs(&r.paths, true).await;
         self.sessions.release(&sid);
         audited
@@ -709,60 +774,17 @@ impl Launcher {
         })
         .await
     }
+}
 
-    /// `podman unshare rm -rf -- <t>`: overlay work directories belong to the container's user
-    /// namespace.
-    async fn unshare_rm(&self, t: &std::path::Path) -> Result<(), LaunchError> {
-        let t = path_arg(t, "session scratch")?;
-        self.run(
-            "unshare",
-            [
-                "unshare".into(),
-                "rm".into(),
-                "-rf".into(),
-                "--".into(),
-                t.into(),
-            ],
-        )
-        .await
-        .map(|_| ())
-    }
-
-    /// Runs one hermetic podman command; stdout on success.
-    async fn run(
-        &self,
-        verb: &'static str,
-        args: impl IntoIterator<Item = OsString>,
-    ) -> Result<String, LaunchError> {
-        let fail = |msg: String| LaunchError::Command { verb, msg };
-        let mut child = self
-            .podman
-            .command()
-            .args(args)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| fail(e.to_string()))?;
-        let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) else {
-            return Err(fail("no pipes".into()));
-        };
-        let work = async {
-            let (out, err) = tokio::join!(read_capped(out), read_capped(err));
-            let status = child.wait().await;
-            (out, err, status)
-        };
-        let (out, err, status) = tokio::time::timeout(PODMAN_TIMEOUT, work)
-            .await
-            .map_err(|_| fail(format!("timed out after {}s", PODMAN_TIMEOUT.as_secs())))?;
-        let status = status.map_err(|e| fail(e.to_string()))?;
-        if status.success() {
-            Ok(String::from_utf8_lossy(&out).into_owned())
-        } else {
-            Err(fail(format!(
-                "{status}: {}",
-                String::from_utf8_lossy(&err).trim()
-            )))
-        }
+/// `podman inspect` printed `true <pid>` with the pid checked after `init`.
+fn running_as(state: &str, pid: u32) -> Result<(), LaunchError> {
+    if state.trim() == format!("true {pid}") {
+        Ok(())
+    } else {
+        Err(LaunchError::NotRunning(format!(
+            "state {:?}, expected running as pid {pid}",
+            capped(state.trim())
+        )))
     }
 }
 
@@ -778,78 +800,11 @@ fn plain_name(s: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-fn rm_args(container: &str) -> [OsString; 5] {
-    [
-        "rm".into(),
-        "--force".into(),
-        "--time".into(),
-        "0".into(),
-        container.into(),
-    ]
-}
-
-/// The id `podman create` prints: 64 lowercase hex digits on the last line.
-fn container_id(out: &str) -> Result<String, LaunchError> {
-    let id = out.trim().lines().last().unwrap_or_default();
-    if id.len() == 64
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        Ok(id.to_owned())
-    } else {
-        Err(LaunchError::Command {
-            verb: "create",
-            msg: "did not print a container id".into(),
-        })
-    }
-}
-
-/// Reads until end of file, keeping the first [`OUTPUT_CAP`] bytes, so a chatty process never
-/// blocks on a full pipe and never grows memory without bound. A read error ends the read; the
-/// command's timeout then bounds the wait for the process.
-async fn read_capped(mut r: impl AsyncRead + Unpin) -> Vec<u8> {
-    let mut kept = Vec::new();
-    let mut buf = [0u8; 8192];
-    loop {
-        match r.read(&mut buf).await {
-            Ok(0) | Err(_) => return kept,
-            Ok(n) => {
-                let room = OUTPUT_CAP.saturating_sub(kept.len());
-                kept.extend_from_slice(buf.get(..n.min(room)).unwrap_or_default());
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-
-    #[test]
-    fn container_ids_are_exactly_64_lowercase_hex() {
-        let id = "a".repeat(64);
-        assert_eq!(container_id(&format!("{id}\n")).unwrap(), id);
-        assert_eq!(container_id(&format!("warning\n{id}\n")).unwrap(), id);
-        for bad in [
-            "",
-            "abc",
-            &"A".repeat(64),
-            &"a".repeat(65),
-            &format!("{}-", "a".repeat(63)),
-        ] {
-            assert!(container_id(bad).is_err(), "{bad:?}");
-        }
-    }
-
-    #[tokio::test]
-    async fn output_is_capped_but_fully_drained() {
-        let data = vec![b'x'; OUTPUT_CAP * 3 + 17];
-        let kept = read_capped(data.as_slice()).await;
-        assert_eq!(kept.len(), OUTPUT_CAP);
-    }
 
     #[test]
     fn audit_text_is_capped_at_a_character_boundary() {
@@ -858,6 +813,16 @@ mod tests {
         let c = capped(&long);
         assert!(c.len() <= AUDIT_TEXT_CAP + "…".len());
         assert!(c.ends_with('…'));
+    }
+
+    #[test]
+    fn only_running_as_the_checked_pid_counts() {
+        assert!(running_as("true 42\n", 42).is_ok());
+        for bad in ["false 0", "true 43", "true 42 x", "", "TRUE 42"] {
+            let e = running_as(bad, 42).unwrap_err();
+            assert!(matches!(e, LaunchError::NotRunning(_)), "{bad:?}");
+            assert_eq!(e.reason(), "not-running");
+        }
     }
 
     #[test]
