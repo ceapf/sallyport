@@ -249,7 +249,9 @@ fn rt_net_01_direct_tcp_and_udp_find_no_route() {
 
 /// RT-NET-08: no raw sockets (no role has `CAP_NET_RAW`) and no ICMP out: `ping` fails in every
 /// role, and an unprivileged ICMP ("ping") socket is refused with EACCES: the container's
-/// `net.ipv4.ping_group_range` does not include the sandbox's group.
+/// `net.ipv4.ping_group_range` does not include the sandbox's group. Each probe sends one echo
+/// request; the error code alone does not pass: if a socket is ever created, its send must fail
+/// with ENETUNREACH (no packet leaves).
 #[test]
 fn rt_net_08_raw_sockets_and_icmp_fail() {
     rt().block_on(async {
@@ -260,18 +262,24 @@ fn rt_net_08_raw_sockets_and_icmp_fail() {
         }
         for b in &boxes {
             let (raw, icmp) = match b.role {
-                Role::Inference => (SECCOMP, SECCOMP),
-                Role::Workspace | Role::Harness => ("errno=1", "errno=13"),
+                Role::Inference => ("socket errno=38", "socket errno=38"),
+                Role::Workspace | Role::Harness => ("socket errno=1", "socket errno=13"),
             };
-            check(
-                b,
-                &[
-                    ("connect 2 3 1 1.1.1.1 0", raw),           // SOCK_RAW, IPPROTO_ICMP
-                    ("connect 2 3 255 1.1.1.1 0", raw),         // SOCK_RAW, IPPROTO_RAW
-                    ("connect 10 3 58 2606:4700::1111 0", raw), // SOCK_RAW, ICMPv6
-                    ("connect 2 2 1 1.1.1.1 0", icmp),          // SOCK_DGRAM, IPPROTO_ICMP
-                ],
-            );
+            let cases = [
+                ("send 2 3 1 1.1.1.1 0", raw),            // SOCK_RAW, IPPROTO_ICMP
+                ("send 2 3 255 1.1.1.1 0", raw),          // SOCK_RAW, IPPROTO_RAW
+                ("send 10 3 58 2606:4700::1111 0", raw),  // SOCK_RAW, ICMPv6
+                ("send 2 2 1 1.1.1.1 0", icmp),           // SOCK_DGRAM, IPPROTO_ICMP
+                ("send 10 2 58 2606:4700::1111 0", icmp), // SOCK_DGRAM, ICMPv6
+            ];
+            let calls: Vec<&str> = cases.iter().map(|(c, _)| *c).collect();
+            for ((call, got), (_, refused)) in probe(b, &calls).iter().zip(&cases) {
+                assert!(
+                    got == refused || got == "sendto errno=101",
+                    "{:?}: probe {call}: {got} (want {refused}, or a send that fails)",
+                    b.role
+                );
+            }
             let (code, out) = exec_in(&b.container, &["ping", "-c", "1", "-W", "2", "1.1.1.1"]);
             assert_ne!(code, 0, "{:?}: ping: {out}", b.role);
         }
