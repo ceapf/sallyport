@@ -108,7 +108,8 @@ flowchart LR
   sessions/                   # 0700
   sessions/<id>/              # 0700, created fresh per session (#10)
   sessions/<id>/profiles/     # the embedded seccomp profiles, written 0600 at launch
-  sessions/<id>/stage/<n>/{upper,work}   # staged mount n: kept for `sally session changes`
+  sessions/<id>/stage/<n>/{upper,work}   # staged mount n: kept for `sally session changes`;
+                                         # sandbox::staged_changes lists upper/ (RT-FS-15)
   sessions/<id>/git/<k>/{upper,work}     # .git overlays of rw mounts: discarded at teardown
   podman/                     # 0700: hermetic podman (#11, §3.5)
   podman/containers.conf      #   generated at startup; CONTAINERS_CONF of every podman call
@@ -288,7 +289,12 @@ are released only once the container is confirmed gone.
 4. **Session directories** (#10). `sessions/<id>` is created fresh and 0700 under both roots,
    along with the role socket directories, `profiles/` (with the embedded profiles written
    0600), and the overlay upper and work directories, each 0700. `$XDG_RUNTIME_DIR` must be
-   owned by the user and 0700.
+   owned by the user and 0700. Then the **image check** (`images.rs`, RT-SUP-01/02): hermetic
+   `podman image exists` must find the pinned reference and `image inspect` must list the pinned
+   digest among its `RepoDigests` (exactly one JSON list of strings; anything else is refused).
+   Otherwise the launch is refused `digest-mismatch`; a podman error is refused as `podman`. The
+   check exists for the clear reason only: enforcement is the digest reference plus
+   `--pull=never` at `podman create`, so nothing depends on the gap between the two.
 5. **Argv** (§3.2), then **audit** `sandbox.launch` (SI-4: before anything is visible).
 6. `podman create`; then every pin is re-checked on the host (`LaunchScan::recheck_host`), then
    `podman init`. The runtime builds the mounts but starts nothing.

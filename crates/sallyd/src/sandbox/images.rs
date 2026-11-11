@@ -20,8 +20,14 @@ impl WorkspaceRequest {
 }
 
 impl Launcher {
+    // TODO(#28): the harness and inference launchers (Task 13) call this too.
     /// Refuses unless hermetic podman finds `image` (a digest-pinned reference) in local storage
     /// and the image it resolves to carries the pinned digest.
+    ///
+    /// The name is checked by `podman image exists` alone (it resolves `name@digest` as a
+    /// whole); the inspect step compares the digest only. A reference holds one `@` (the
+    /// validator's pinned grammar), so `split_once` here and `rsplit_once` on podman's output
+    /// agree.
     ///
     /// # Errors
     /// [`LaunchError::ImageMissing`] when the image is absent, or when `podman image inspect`

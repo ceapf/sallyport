@@ -317,6 +317,14 @@ Candidates whose root is a symlink, a file, or missing are refused. A candidate 
 *symlink to* a denylisted path (e.g. mounting `~/code` when `~/code/.ssh -> ~/.ssh`) is allowed:
 symlinks inside a mount resolve inside the container rootfs, which is the point of RT-FS-03.
 
+Rules also match by identity (RT-FS-14). Each rule records the `st_dev`/`st_ino` of its directory
+and, for a subtree rule, of every existing ancestor. A mount root with one of those identities is
+`denylisted` whatever its path: a bind alias (or a second mount of the same filesystem) of
+`~/.ssh` "is the same directory as" it, and an alias of `~/.local` or of the home's parent
+"contains" a protected folder. An alias of a directory *inside* a protected folder is not
+detected: the same path-versus-filesystem ancestry gap as the overlap rule's re-review M-2
+(#17, Task 14).
+
 At launch the driver re-checks every mount root (`ValidatedManifest::recheck_mounts`): it must
 pass the same checks, have the same realpath, and be the same directory (`st_dev`/`st_ino`) as at
 validation — otherwise `mount-changed`/`is-symlink` (RT-FS-06).
@@ -397,6 +405,7 @@ never on message text); the field path uses `a.b[0].c` form.
 | `secret-like-env` | MCP env name looks like a secret |
 | `bad-header` / `bad-format` | injection header/format invalid |
 | `mount-changed` | launch-time re-check: mount root replaced since validation |
+| `digest-mismatch` | launch refusal (`sandbox.refuse`): the pinned image is not in local storage, or the local image does not carry the pinned digest (`sallyd::sandbox::images`); images are never pulled |
 | `unacknowledged-risk` | an `acknowledge_*` flag is needed (§1.1) |
 | `protected-path` | writable mount inside `.git`; also the broker's denial code for protected-path writes |
 | `socket-in-mount` | launch-time bounded scan found a Unix socket in a mount tree (sandbox driver, task 6) |

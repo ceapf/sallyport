@@ -171,7 +171,8 @@ impl Denylist {
     /// Returns why a directory with identity `id` is refused, if it is: it is a rule's
     /// directory, or an ancestor of a subtree rule's, under another path (a bind mount or a
     /// second mount of the same filesystem; RT-FS-14). Aliases of directories *inside* a rule
-    /// are not detected (THREAT_MODEL residual M-2).
+    /// are not detected: TODO(#28) (the same ancestry gap as the overlap rule's re-review M-2,
+    /// #17).
     pub(crate) fn refusal_by_id(&self, id: DirId) -> Option<String> {
         let why = |r: &Rule| r.reason.map_or_else(String::new, |w| format!(" — {w}"));
         let same = self.rules.iter().find(|r| r.ids.contains(&id));
@@ -208,6 +209,8 @@ fn subtree_rule(p: &Path, reason: &'static str) -> Rule {
 }
 
 fn rule(p: &Path, scope: Scope, label: Option<&str>, reason: Option<&'static str>) -> Rule {
+    // TODO(#28): a rule that is a dangling symlink contributes neither its target nor the
+    // target's ancestors.
     let lexical = normalize(p);
     let mut forms = vec![lexical.clone()];
     if let Ok(real) = std::fs::canonicalize(p)
