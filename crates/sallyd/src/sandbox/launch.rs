@@ -212,9 +212,10 @@ pub struct Running {
 }
 
 impl Running {
-    /// The session's exec gate. Every `podman exec` into the container (the shell tool, Task 11)
-    /// holds it, and the disk watchdog holds it while the container is frozen for a measurement,
-    /// so an exec never meets a paused container.
+    /// The session's exec gate. The disk watchdog holds it while the container is frozen for a
+    /// measurement, so a new `podman exec` never meets a paused container. An exec holds it only
+    /// while starting: a running exec process is in the container's cgroup and freezes with it.
+    /// TODO(#24): the shell tool (Task 11) follows that contract and gets an RT case.
     #[must_use]
     pub fn exec_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
         Arc::clone(&self.exec_gate)
@@ -728,7 +729,13 @@ impl Launcher {
                 r.level,
             )
             .await;
-        if let Err(error) = self.remove_container(&r.name).await {
+        // Holding the exec gate waits out a walk in progress (which holds it while the container
+        // is frozen) and keeps a new one from freezing the container during removal.
+        let gate = Arc::clone(&r.exec_gate);
+        let held = gate.lock().await;
+        let removed = self.remove_container(&r.name).await;
+        drop(held);
+        if let Err(error) = removed {
             return Err(Box::new(StopError { running: r, error }));
         }
         // The container is gone: nothing left to watch.

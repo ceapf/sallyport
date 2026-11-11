@@ -324,9 +324,10 @@ and of its `.git` overlays. Each session whose sandbox can do either gets two ta
   - There is no periodic walk. The floor task tracks the state filesystem's used bytes, and wakes
     the stage task only when they have grown past the session's headroom since the last accurate
     measurement. The baseline is lowered whenever usage shrinks, which is conservative.
-  - The stage task takes the session's exec gate (`Running::exec_gate`, held around every
-    `podman exec`), then the global one-walk permit. Then it runs `podman pause` (the cgroup v2
-    freezer), walks the upper directories, and runs `podman unpause`.
+  - The stage task takes the global one-walk permit, then the session's exec gate. An exec holds
+    `Running::exec_gate` only while it starts, because a running exec process freezes with the
+    container's cgroup (TODO(#24), Task 11). Then the stage task runs `podman pause` (the cgroup
+    v2 freezer), walks the upper directories, and runs `podman unpause`.
   - The walk goes through directory fds, never follows a symlink, holds one fd per level, and is
     bounded at 1 000 000 entries, 64 levels and 10 s. The permit stays with the walk until it
     stops.

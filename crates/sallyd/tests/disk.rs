@@ -17,16 +17,11 @@ use common::*;
 
 const MIB: u64 = 1 << 20;
 
-/// Floor tests write hundreds of MiB against a floor relative to the free space they saw, so
-/// two at once would eat each other's margin. This lock serializes them across test threads
-/// and nextest's processes.
+/// These tests write hundreds of MiB at full speed against a floor relative to the free space
+/// they saw. They hold the I/O lock exclusively: two at once would eat each other's margin, and
+/// their disk saturation must not stall other tests' containers.
 fn serial() -> std::fs::File {
-    let f = std::fs::File::create(
-        std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("disk-tests.lock"),
-    )
-    .unwrap();
-    rustix::fs::flock(&f, rustix::fs::FlockOperation::LockExclusive).unwrap();
-    f
+    io_lock(true)
 }
 
 /// Bytes available to unprivileged users on the filesystem of the test fixtures.
@@ -35,12 +30,30 @@ fn free_now() -> u64 {
     s.f_bavail * s.f_frsize
 }
 
-/// A launcher whose floor sits `margin` bytes below the current free space.
+/// A launcher whose floor sits `margin` bytes below the current free space. Fails (never skips)
+/// unless 8 GiB more than the margin is free, so a broken watchdog cannot fill a nearly full disk
+/// (re-review L6).
 fn floor_below_free(margin: u64) -> Lx {
+    let free = free_now();
+    assert!(
+        free >= margin + 8192 * MIB,
+        "the floor tests need {} MiB free, have {} MiB",
+        (margin + 8192 * MIB) / MIB,
+        free / MIB
+    );
     Lx::with_floor(DiskFloor {
-        min_bytes: free_now() - margin,
+        min_bytes: free - margin,
         percent: 0,
     })
+}
+
+/// Removes a host file the test made, even when the test fails.
+struct RemoveFile(std::path::PathBuf);
+
+impl Drop for RemoveFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 async fn gone_within(container: &str, limit: Duration) -> bool {
@@ -64,9 +77,11 @@ async fn sh(container: &str, script: String) -> (i32, String) {
 }
 
 /// Writes zeros at full speed until the session is killed (the exec then returns). Capped at
-/// 4 GiB, so a broken watchdog fails the test instead of filling the disk.
-async fn write_until_killed(r: &Running, path: &str) {
-    let script = format!("dd if=/dev/zero of={path} bs=1M count=4096 2>/dev/null; sleep 30");
+/// twice the room above the floor, so a broken watchdog fails the test instead of filling the
+/// disk.
+async fn write_until_killed(r: &Running, path: &str, room: u64) {
+    let count = 2 * room / MIB;
+    let script = format!("dd if=/dev/zero of={path} bs=1M count={count} 2>/dev/null; sleep 30");
     let _ = sh(r.container(), script).await;
 }
 
@@ -79,7 +94,7 @@ fn rt_ag_09_a_full_speed_writer_in_an_rw_mount_is_stopped_by_the_floor() {
         let v =
             x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "rw")]));
         let r = x.launch(&v, "rw-fill").await.unwrap();
-        write_until_killed(&r, "/workspace/p/fill").await;
+        write_until_killed(&r, "/workspace/p/fill", 512 * MIB).await;
         assert!(gone_within(r.container(), Duration::from_secs(20)).await);
         let a = x.events.args("session.resource_limit").expect("audited");
         assert_eq!(a["reason"], "disk_floor", "{a}");
@@ -104,6 +119,7 @@ fn rt_ag_09_a_full_speed_writer_in_a_staged_mount_is_stopped_by_the_floor() {
             mounts(&[mount("~/code/other", "/workspace/o", "staged")])
         ));
         let r = x.launch(&v, "staged-fill").await.unwrap();
+        let _hog_guard = RemoveFile(x.f.root.join("hog"));
         let hog = std::fs::File::create(x.f.root.join("hog")).unwrap();
         rustix::fs::fallocate(&hog, rustix::fs::FallocateFlags::empty(), 0, 1536 * MIB).unwrap();
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -111,7 +127,7 @@ fn rt_ag_09_a_full_speed_writer_in_a_staged_mount_is_stopped_by_the_floor() {
             exists(r.container()),
             "the host's own write is not the session's"
         );
-        write_until_killed(&r, "/workspace/o/fill").await;
+        write_until_killed(&r, "/workspace/o/fill", 512 * MIB).await;
         assert!(gone_within(r.container(), Duration::from_secs(20)).await);
         let a = x.events.args("session.resource_limit").expect("audited");
         assert_eq!(a["reason"], "disk_floor", "{a}");
@@ -146,7 +162,7 @@ fn a_launch_without_room_for_stage_size_above_the_floor_is_refused() {
 fn rt_ag_09_rename_churn_does_not_evade_stage_size() {
     let _serial = serial();
     rt().block_on(async {
-        let x = Lx::new();
+        let x = Lx::with_floor(DiskFloor::default());
         let v = x.f.load(&format!(
             "{}runtime:\n  stage_size: 64MiB\n",
             mounts(&[mount("~/code/other", "/workspace/o", "staged")])
@@ -198,7 +214,7 @@ fn rt_ag_09_a_busy_walk_does_not_delay_another_sessions_floor() {
             x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "rw")]));
         let writer = x.launch(&rw, "writer").await.unwrap();
         let started = Instant::now();
-        write_until_killed(&writer, "/workspace/p/fill").await;
+        write_until_killed(&writer, "/workspace/p/fill", 768 * MIB).await;
         assert!(gone_within(writer.container(), Duration::from_secs(20)).await);
         assert!(
             started.elapsed() < Duration::from_secs(20),

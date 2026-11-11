@@ -51,15 +51,62 @@ fn probe_binary(out: &Path) {
     assert!(status.success(), "cc {}", src.display());
 }
 
-/// Builds `localhost/<name>:6c` reproducibly and returns `localhost/<name>@sha256:…`. Each test
-/// process builds in its own directory: nextest runs each test in a process of its own, and the
-/// identical inputs give every process the same digest (`--timestamp 0`; without it, parallel
-/// builds re-tag the name and leave an earlier process's `name@digest` unresolvable). That also
-/// relies on `cc -static` producing identical bytes for identical input, which gcc does today; a
-/// toolchain that embeds build ids or paths would break it.
+/// An exclusive or shared `flock` on `<CARGO_TARGET_TMPDIR>/<name>.lock`, held until the file is
+/// dropped. It works across nextest's processes and `cargo test`'s threads alike.
+pub fn lock(name: &str, exclusive: bool) -> std::fs::File {
+    let f = std::fs::File::create(
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}.lock")),
+    )
+    .unwrap();
+    let op = if exclusive {
+        rustix::fs::FlockOperation::LockExclusive
+    } else {
+        rustix::fs::FlockOperation::LockShared
+    };
+    rustix::fs::flock(&f, op).unwrap();
+    f
+}
+
+/// The I/O lock: ordinary container tests share it; tests that write hundreds of MiB at full
+/// speed take it exclusively, so their disk saturation never stalls another test's container
+/// (seen on CI: `podman rm` timing out on a process blocked in I/O).
+pub fn io_lock(exclusive: bool) -> std::fs::File {
+    lock("container-io", exclusive)
+}
+
+/// Builds `localhost/<name>:<input key>` once and returns `localhost/<name>@sha256:…`. The tag
+/// is a hash of every input (the base reference, the entry, the stand-in, the probe source), and
+/// the build runs under a lock: a process finding the tag reuses it. So a tag never moves to
+/// another image, and an earlier process's `name@digest` always resolves (CI saw "image not
+/// known" when parallel builds re-tagged one name).
 fn build(name: &str, entry: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/redteam/probe/probe.c");
+    let mut h = std::hash::DefaultHasher::new();
+    (BASE, entry, STAND_IN, std::fs::read(&src).unwrap()).hash(&mut h);
+    let tag = format!("localhost/{name}:{:016x}", h.finish());
+    let _held = lock("test-image", true);
+    if !podman(&["image", "exists", &tag]).status.success() {
+        build_image(&tag, entry);
+    }
+    let out = podman(&["image", "inspect", "--format", "{{.Digest}}", &tag]);
+    assert!(
+        out.status.success(),
+        "inspect: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    format!(
+        "localhost/{name}@{}",
+        String::from_utf8_lossy(&out.stdout).trim()
+    )
+}
+
+/// The `llama-server` stand-in: it idles.
+const STAND_IN: &str = "#!/bin/sh\nexec sleep 2147483647\n";
+
+fn build_image(tag: &str, entry: &str) {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("{name}-image-{}", std::process::id()));
+        .join(format!("test-image-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
@@ -71,12 +118,8 @@ fn build(name: &str, entry: &str) -> String {
     )
     .unwrap();
     executable(&dir.join("entry"), entry.as_bytes());
-    executable(
-        &dir.join("llama-server"),
-        b"#!/bin/sh\nexec sleep 2147483647\n",
-    );
+    executable(&dir.join("llama-server"), STAND_IN.as_bytes());
     probe_binary(&dir.join("probe"));
-    let tag = format!("localhost/{name}:6c");
     let out = podman(&[
         "build",
         "--pull=never",
@@ -85,7 +128,7 @@ fn build(name: &str, entry: &str) -> String {
         "0",
         "-q",
         "-t",
-        &tag,
+        tag,
         dir.to_str().unwrap(),
     ]);
     assert!(
@@ -94,16 +137,6 @@ fn build(name: &str, entry: &str) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     let _ = std::fs::remove_dir_all(&dir);
-    let out = podman(&["image", "inspect", "--format", "{{.Digest}}", &tag]);
-    assert!(
-        out.status.success(),
-        "inspect: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    format!(
-        "localhost/{name}@{}",
-        String::from_utf8_lossy(&out.stdout).trim()
-    )
 }
 
 /// `localhost/sallyport-test@sha256:…`: the base image, an entry and a `llama-server` that both
@@ -166,6 +199,8 @@ pub struct Lx {
     pub xdg: PathBuf,
     /// Prefix of every session id this fixture makes: `t<pid>-<n>`.
     pub scope: String,
+    /// The shared I/O lock ([`io_lock`]); released after `Drop` has removed the containers.
+    _io: Option<std::fs::File>,
 }
 
 fn host_env(var: &str) -> Option<PathBuf> {
@@ -181,25 +216,41 @@ pub fn test_runtime() -> PathBuf {
 
 impl Lx {
     pub fn new() -> Self {
-        Self::build(None, None, DiskFloor::default())
+        Self::build(None, None, DiskFloor::default(), Some(io_lock(false)))
     }
 
     /// `podman_home`: the `$HOME` hermetic podman is given (default: the real one).
     pub fn with_home(podman_home: Option<PathBuf>) -> Self {
-        Self::build(podman_home, None, DiskFloor::default())
+        Self::build(
+            podman_home,
+            None,
+            DiskFloor::default(),
+            Some(io_lock(false)),
+        )
     }
 
     /// `runtime`: the OCI runtime podman is given (default: [`test_runtime`]).
     pub fn with_runtime(runtime: &Path) -> Self {
-        Self::build(None, Some(runtime), DiskFloor::default())
+        Self::build(
+            None,
+            Some(runtime),
+            DiskFloor::default(),
+            Some(io_lock(false)),
+        )
     }
 
-    /// `floor`: the launcher's free-space floor, as `sallyd`'s configuration would set it.
+    /// `floor`: the launcher's free-space floor, as `sallyd`'s configuration would set it. For
+    /// the disk-filling tests, whose caller already holds [`io_lock`] exclusively.
     pub fn with_floor(floor: DiskFloor) -> Self {
-        Self::build(None, None, floor)
+        Self::build(None, None, floor, None)
     }
 
-    fn build(podman_home: Option<PathBuf>, runtime: Option<&Path>, floor: DiskFloor) -> Self {
+    fn build(
+        podman_home: Option<PathBuf>,
+        runtime: Option<&Path>,
+        floor: DiskFloor,
+        io: Option<std::fs::File>,
+    ) -> Self {
         let f = Fx::new();
         let xdg = f.root.join("run");
         std::fs::set_permissions(&xdg, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -237,6 +288,7 @@ impl Lx {
             events,
             xdg,
             scope: format!("t{}-{n}", std::process::id()),
+            _io: io,
         }
     }
 

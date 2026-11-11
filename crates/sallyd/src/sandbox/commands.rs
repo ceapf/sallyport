@@ -14,11 +14,25 @@ use super::launch::{LaunchError, Launcher};
 const OUTPUT_CAP: usize = 64 * 1024;
 /// A podman command that takes longer is killed.
 const PODMAN_TIMEOUT: Duration = Duration::from_secs(120);
+/// `podman rm` attempts before a removal is reported as failed, and the pause between them.
+const RM_ATTEMPTS: u32 = 4;
+const RM_RETRY: Duration = Duration::from_secs(2);
 
 impl Launcher {
-    /// `podman rm --force`, then confirms the container is gone.
+    /// `podman rm --force`, then confirms the container is gone. A process can outlive podman's
+    /// wait for it: frozen by the disk watchdog, or blocked in disk I/O on a saturated disk (seen on
+    /// CI runners: "given PID did not die within timeout"). A failed removal therefore thaws the
+    /// container and retries, up to [`RM_ATTEMPTS`] times, [`RM_RETRY`] apart.
     pub(super) async fn remove_container(&self, name: &str) -> Result<(), LaunchError> {
-        let removed = self.run("rm", rm_args(name)).await;
+        let mut removed = self.run("rm", rm_args(name)).await;
+        for _ in 1..RM_ATTEMPTS {
+            if removed.is_ok() || !self.container_exists(name).await? {
+                break;
+            }
+            let _ = self.run("unpause", ["unpause".into(), name.into()]).await;
+            tokio::time::sleep(RM_RETRY).await;
+            removed = self.run("rm", rm_args(name)).await;
+        }
         match self.container_exists(name).await? {
             false => Ok(()),
             true => Err(removed.err().unwrap_or(LaunchError::Command {

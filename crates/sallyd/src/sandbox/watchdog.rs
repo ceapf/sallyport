@@ -394,12 +394,14 @@ async fn stage_task(s: Arc<Shared>) {
         if s.ended() {
             return;
         }
-        // The session's own exec gate first: a long exec in this session must not hold the
-        // global permit and delay every other session's walk.
-        let _gate = s.target.exec_gate.lock().await;
+        // The global permit first, then the session's gate (held by an exec only while it
+        // starts): a session waiting for other sessions' walks must not block its own execs
+        // meanwhile (re-review L2).
         let Ok(permit) = Arc::clone(&s.launcher.walks).acquire_owned().await else {
             return;
         };
+        // Released before any kill, so `stop` (which takes the gate) never waits on a kill loop.
+        let gate = s.target.exec_gate.lock().await;
         let paused = match Paused::pause(&s.launcher, &s.target.container).await {
             Ok(p) => p,
             Err(PauseError::Gone) => {
@@ -407,6 +409,7 @@ async fn stage_task(s: Arc<Shared>) {
                 return;
             }
             Err(PauseError::Failed(detail)) => {
+                drop(gate);
                 return s
                     .enforce(stage_args(watch, None, "pause_failed", &detail))
                     .await;
@@ -438,6 +441,7 @@ async fn stage_task(s: Arc<Shared>) {
                     };
                 }
                 if let Err(detail) = paused.resume().await {
+                    drop(gate);
                     return s
                         .enforce(stage_args(watch, None, "unpause_failed", &detail))
                         .await;
@@ -446,12 +450,14 @@ async fn stage_task(s: Arc<Shared>) {
             Verdict::Cancelled => return,
             Verdict::Over { bytes, largest } => {
                 paused.keep();
+                drop(gate);
                 let mut args = stage_args(watch, Some(bytes), "stage_size", "");
                 args["area"] = json!(largest);
                 return s.enforce(args).await;
             }
             Verdict::Unmeasurable { area, reason } => {
                 paused.keep();
+                drop(gate);
                 let mut args = stage_args(watch, None, "unmeasurable", &reason);
                 args["area"] = json!(area);
                 return s.enforce(args).await;
