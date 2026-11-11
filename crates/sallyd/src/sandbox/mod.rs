@@ -11,6 +11,7 @@ mod check;
 mod commands;
 mod dirs;
 mod disk;
+mod images;
 mod inside;
 mod launch;
 mod overlap;

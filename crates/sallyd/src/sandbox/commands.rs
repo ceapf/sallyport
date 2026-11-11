@@ -18,6 +18,13 @@ const PODMAN_TIMEOUT: Duration = Duration::from_secs(120);
 const RM_ATTEMPTS: u32 = 4;
 const RM_RETRY: Duration = Duration::from_secs(2);
 
+/// What `podman <kind> exists` looks for.
+#[derive(Clone, Copy)]
+pub(super) enum Stored {
+    Container,
+    Image,
+}
+
 impl Launcher {
     /// `podman rm --force`, then confirms the container is gone. A process can outlive podman's
     /// wait for it: frozen by the disk watchdog, or blocked in disk I/O on a saturated disk (seen on
@@ -43,30 +50,32 @@ impl Launcher {
     }
 
     pub(super) async fn container_exists(&self, name: &str) -> Result<bool, LaunchError> {
+        self.exists(Stored::Container, name).await
+    }
+
+    /// `podman <kind> exists <name>`: exit 0 is true, exit 1 false; anything else (another exit
+    /// code, a signal, a timeout) is an error.
+    pub(super) async fn exists(&self, kind: Stored, name: &str) -> Result<bool, LaunchError> {
+        let (noun, verb) = match kind {
+            Stored::Container => ("container", "container exists"),
+            Stored::Image => ("image", "image exists"),
+        };
+        let fail = |msg: String| LaunchError::Command { verb, msg };
         let status = self
             .podman
             .command()
-            .args(["container", "exists", name])
+            .args([noun, "exists", name])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
         let status = tokio::time::timeout(PODMAN_TIMEOUT, status)
             .await
-            .map_err(|_| LaunchError::Command {
-                verb: "container exists",
-                msg: "timed out".into(),
-            })?
-            .map_err(|e| LaunchError::Command {
-                verb: "container exists",
-                msg: e.to_string(),
-            })?;
+            .map_err(|_| fail("timed out".into()))?
+            .map_err(|e| fail(e.to_string()))?;
         match status.code() {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
-            _ => Err(LaunchError::Command {
-                verb: "container exists",
-                msg: status.to_string(),
-            }),
+            _ => Err(fail(status.to_string())),
         }
     }
 
