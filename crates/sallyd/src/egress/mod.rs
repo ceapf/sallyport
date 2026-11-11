@@ -3,4 +3,6 @@
 //! pass the [`addr`] filter before the proxy connects to the pinned address.
 
 pub mod addr;
+pub mod authority;
 pub mod head;
+pub mod policy;
