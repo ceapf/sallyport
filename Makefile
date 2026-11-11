@@ -36,9 +36,10 @@ forbid-unsafe:
 test: test-scripts shim-check
 	$(CARGO) test -q --workspace
 
-# Shell-script tests (doctor's --redact filter).
+# Shell-script tests (doctor's --redact filter, the commit trailer check).
 test-scripts:
 	bash tests/scripts/redact_test.sh
+	bash tests/scripts/check_trailers_test.sh
 
 # CI runner (AMENDMENTS-01 §15). nextest skips doctests, so they run separately.
 nextest:

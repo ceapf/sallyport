@@ -194,6 +194,7 @@ issues, comments and CI output.
 ## Conventions
 
 - Commits: Conventional Commits (`feat(egress): …`, `test(redteam): …`, `sec(sandbox): …` for hardening). One logical change per commit. Sign-off line (DCO).
+- Commits carry Signed-off-by only. No co-author or tool trailers. PR descriptions carry no tool footer.
 - Branch per milestone task: `m1/egress-policy`. PRs into `main` only with CI green.
 - Audit event names: `noun.verb` (`egress.deny`, `tool.pending`, `model.refuse`). RPC methods: `noun.verb`.
 - Paths in user-facing messages are host realpaths; in sandbox-facing messages, guest paths.
