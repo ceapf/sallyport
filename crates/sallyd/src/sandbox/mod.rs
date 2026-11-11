@@ -8,6 +8,7 @@
 
 mod argv;
 mod check;
+mod commands;
 mod dirs;
 mod inside;
 mod launch;
