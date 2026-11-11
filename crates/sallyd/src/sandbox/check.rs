@@ -18,7 +18,7 @@ use super::types::{ArgvError, ImageRef, Role, UserIds};
 
 /// Options written `--flag value`, as two tokens; `--flag=value` is refused, so the argv has one
 /// spelling and does not depend on how podman parses either form.
-const SPACE_FLAGS: [&str; 12] = [
+const SPACE_FLAGS: [&str; 13] = [
     "--name",
     "--ulimit",
     "--tmpfs",
@@ -27,6 +27,7 @@ const SPACE_FLAGS: [&str; 12] = [
     "--pids-limit",
     "--cpus",
     "--memory",
+    "--memory-swap",
     "--hostname",
     "--env",
     "-v",
@@ -234,6 +235,9 @@ struct Seen {
     env: HashSet<String>,
     /// Overlay upper and work directories so far: no two may be equal or nested.
     scratch: Vec<PathBuf>,
+    /// The values of `--memory` and `--memory-swap`, compared in [`require`].
+    memory: Option<String>,
+    swap: Option<String>,
 }
 
 impl Seen {
@@ -291,7 +295,14 @@ fn check_option(
         ("--name", Some(v)) => ok(name_ok(v, a.role)),
         ("--pids-limit", Some(v)) => ok(positive(v)),
         ("--cpus", Some(v)) => ok(cpus_ok(v)),
-        ("--memory", Some(v)) => ok(v.strip_suffix('b').is_some_and(positive)),
+        ("--memory", Some(v)) => {
+            seen.memory = Some(v.to_owned());
+            ok(v.strip_suffix('b').is_some_and(positive))
+        }
+        ("--memory-swap", Some(v)) => {
+            seen.swap = Some(v.to_owned());
+            Ok(())
+        }
         ("--tmpfs", Some(v)) => ok(tmpfs_ok(v)),
         ("--env", Some(v)) => env(v, a.role, seen),
         ("-v", Some(v)) => volume(v, a, seen),
@@ -514,6 +525,10 @@ fn require(seen: &Seen, role: Role) -> Result<(), ArgvError> {
                 return forbid(format!("{flag} must appear exactly once"));
             }
         }
+    }
+    // No swap: `--memory-swap` equals `--memory`, and appears exactly when it does.
+    if seen.swap != seen.memory {
+        return forbid("--memory-swap must equal --memory (no swap)");
     }
     Ok(())
 }

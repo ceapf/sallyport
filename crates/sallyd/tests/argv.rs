@@ -462,6 +462,55 @@ fn checker_refuses_every_forbidden_flag() {
     }
 }
 
+/// No swap in any role: `--memory-swap` must equal `--memory`, and appears exactly when it
+/// does (an inference session without a memory limit carries neither).
+#[test]
+fn checker_requires_swap_equal_to_memory() {
+    let f = Fx::new();
+    let (a, allowed) = base(&f);
+    let memory = a
+        .iter()
+        .position(|x| x == "--memory")
+        .and_then(|i| a.get(i + 1))
+        .unwrap()
+        .clone();
+    let swap = a
+        .iter()
+        .position(|x| x == "--memory-swap")
+        .and_then(|i| a.get(i + 1))
+        .cloned();
+    assert_eq!(swap, Some(memory.clone()), "the builder sets swap = memory");
+    assert_forbidden(
+        &replacing(&a, "--memory-swap", &[]),
+        &allowed,
+        "no swap flag",
+    );
+    assert_forbidden(
+        &replacing(&a, "--memory-swap", &["--memory-swap", "-1"]),
+        &allowed,
+        "unlimited swap",
+    );
+    let more = format!(
+        "{}b",
+        memory.trim_end_matches('b').parse::<u64>().unwrap() * 2
+    );
+    assert_forbidden(
+        &replacing(&a, "--memory-swap", &["--memory-swap", &more]),
+        &allowed,
+        "swap above memory",
+    );
+    let spec = inference(&f, false, Some(ByteSize::from_bytes(2 << 30)));
+    let inf = inference_argv(&f.common, &spec).unwrap();
+    assert!(
+        inf.windows(2)
+            .any(|w| w == ["--memory-swap", "2147483648b"]),
+        "{inf:?}"
+    );
+    let spec = inference(&f, false, None);
+    let inf = inference_argv(&f.common, &spec).unwrap();
+    assert!(!inf.iter().any(|x| x.starts_with("--memory")), "{inf:?}");
+}
+
 #[test]
 fn checker_refuses_wrong_values_of_allowed_options() {
     let f = Fx::new();

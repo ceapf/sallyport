@@ -167,7 +167,9 @@ impl Argv {
     fn limits(&mut self, pids: u32, cpus: &str, memory: Option<u64>) {
         self.push(["--pids-limit", &pids.to_string(), "--cpus", cpus]);
         if let Some(m) = memory {
-            self.push(["--memory", &format!("{m}b")]);
+            // Swap equal to memory: no swap at all, in any role.
+            let m = format!("{m}b");
+            self.push(["--memory", &m, "--memory-swap", &m]);
         }
     }
 

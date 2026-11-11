@@ -96,6 +96,8 @@ fn rt_ag_09_a_memory_bomb_is_oom_killed_inside_the_container() {
         let r = launch_small(&x, "oom").await;
         let cg = cgroup(&x, &r).await;
         assert_eq!(read(&cg, "memory.max").trim(), (64u64 << 20).to_string());
+        // `--memory-swap` equals `--memory`: no swap, so the bomb cannot push the host to swap.
+        assert_eq!(read(&cg, "memory.swap.max").trim(), "0");
         let marker = std::env::current_dir().unwrap().join("oom");
         let _ = std::fs::remove_file(&marker);
         let (_, out) = exec(

@@ -165,6 +165,8 @@ podman --runtime <checked runtime_path>          # AMENDMENTS-02 B5: never the d
   --security-opt label=disable
   --userns=keep-id --user <uid>:<gid>
 ```
+`label=disable`: the mounts are the user's own directories, which SELinux would only allow after relabelling (`:z`/`:Z` rewrites host labels); keeping SELinux confinement on SELinux hosts is #29 (M6).
+`--user` is the caller's own `getuid`/`getgid` (the snapshots' `1000:1000` is the fixture's): with `keep-id` that is the host user inside, so `rw` writes stay the user's.
 Bind mounts are `<host>:<guest>:{ro|rw},nosuid,nodev,bind` (`bind` = non-recursive). Overlays
 are `<host>:<guest>:O,upperdir=<scratch>/upper,workdir=<scratch>/work` with nothing else: Podman
 4.9.3 refuses other options next to `O` (probed in Task 6a), so overlays are not `nosuid,nodev`;
@@ -175,7 +177,7 @@ inert there.
 **Workspace** (mounts, egress socket, toolchain; idles until the broker execs into it):
 ```
   --tmpfs /tmp:rw,{noexec|exec},nosuid,nodev,size=<tmp_size>
-  --pids-limit <pids> --cpus <cpus> --memory <memory>b
+  --pids-limit <pids> --cpus <cpus> --memory <memory>b --memory-swap <memory>b   # no swap
   --init --env-host=false --hostname sandbox
   [--env {HTTP,HTTPS,ALL}_PROXY=http://127.0.0.1:3128 (and lowercase) --env NO_PROXY= --env no_proxy=]   # proxy mode
   [--env {SSL_CERT_FILE,REQUESTS_CA_BUNDLE,CURL_CA_BUNDLE,GIT_SSL_CAINFO,PIP_CERT,CARGO_HTTP_CAINFO,AWS_CA_BUNDLE}=/run/sallyport/ca-bundle.pem
@@ -193,7 +195,7 @@ inert there.
 ```
 **Harness** (no mounts, no egress, no GPU; fixed 1 CPU, 1 GiB, 128 pids):
 ```
-  --tmpfs /tmp:rw,noexec,nosuid,nodev,size=256MiB --pids-limit 128 --cpus 1 --memory 1GiB
+  --tmpfs /tmp:rw,noexec,nosuid,nodev,size=256MiB --pids-limit 128 --cpus 1 --memory 1GiB --memory-swap 1GiB
   --init --env-host=false --hostname sandbox
   --env OPENAI_BASE_URL=http://127.0.0.1:8080/v1 --env OPENAI_API_KEY=sallyport
   -v $XDG_RUNTIME_DIR/sallyport/sessions/<id>/harness:/run/sallyport:ro,…                 # llm.sock, agent.sock (connect only)
@@ -201,7 +203,7 @@ inert there.
 ```
 **Inference** (GPU, one read-only model file):
 ```
-  --tmpfs /tmp:rw,noexec,nosuid,nodev,size=256MiB --pids-limit 64 --cpus <n> [--memory <m>b]
+  --tmpfs /tmp:rw,noexec,nosuid,nodev,size=256MiB --pids-limit 64 --cpus <n> [--memory <m>b --memory-swap <m>b]
   --init --env-host=false [--device nvidia.com/gpu=all]
   -v <blobs>/sha256/<hex>:/models/model.gguf:ro,…
   -v $XDG_RUNTIME_DIR/sallyport/infer/<id>:/run/sallyport:rw,…   # llama-server creates infer.sock
