@@ -228,43 +228,59 @@ fn wsl_interop() -> Option<std::path::PathBuf> {
     (reg.exists() && cmd.exists()).then(|| cmd.to_owned())
 }
 
-/// RT-FS-11 (as rewritten after 6c-1): `/mnt` is absent or empty, and a Windows executable in a
-/// mount does not reach Windows: the canary it would create on `C:` is never created. On a host
-/// without WSL interop only the `/mnt` part applies (REDTEAM_SUITE: the `.exe` part is WSL
-/// only). The same command run on the host first proves the canary would be created.
+/// RT-FS-11, first part (every host): `/mnt` is absent or empty in the sandbox.
 #[test]
-fn rt_fs_11_a_windows_executable_does_not_reach_windows() {
+fn rt_fs_11_mnt_is_absent_or_empty() {
     rt().block_on(async {
         let x = Lx::new();
-        let exe = wsl_interop();
-        if let Some(cmd) = &exe {
-            std::fs::copy(cmd, home(&x).join("code/myproject/cmd.exe")).unwrap();
-        }
         let r = launch_with(&x, "rw", "fs11").await;
         let (_, out) = exec(&r, "ls -A /mnt 2>/dev/null | wc -l").await;
         assert_eq!(out.trim(), "0", "/mnt is absent or empty");
-        let Some(cmd) = exe else {
-            eprintln!("RT-FS-11: not WSL with interop; the .exe part does not apply");
-            x.stop(r).await;
-            return;
-        };
+        x.stop(r).await;
+    });
+}
+
+/// `cmd.exe /c <line>` on the host, from a Windows working directory.
+fn host_cmd(cmd: &Path, line: &str) -> std::process::Output {
+    std::process::Command::new(cmd)
+        .args(["/c", line])
+        .current_dir("/mnt/c/ProgramData")
+        .output()
+        .unwrap()
+}
+
+/// RT-FS-11, second part (local, WSL only): a Windows executable in a mount does not reach
+/// Windows. The only approved `#[ignore]` on an `rt_` test (CLAUDE.md): off WSL nextest lists it
+/// as skipped, never as passed; on WSL `make redteam` runs it and fails if it did not run. Run
+/// anywhere else it fails. A host-side control first creates and deletes one empty canary file
+/// under `C:\ProgramData` with the same command, so the sandbox's failure is not vacuous.
+#[test]
+#[ignore = "requires WSL"]
+fn rt_fs_11_wsl_a_windows_executable_does_not_reach_windows() {
+    let cmd = wsl_interop().expect("RT-FS-11 .exe part: WSL with interop and cmd.exe required");
+    rt().block_on(async {
+        let x = Lx::new();
+        std::fs::copy(&cmd, home(&x).join("code/myproject/cmd.exe")).unwrap();
+        let r = launch_with(&x, "rw", "fs11w").await;
         let name = canary();
         let host_canary = Path::new("/mnt/c/ProgramData").join(&name);
-        let write = format!("echo x > C:\\ProgramData\\{name}");
-        let control = std::process::Command::new(&cmd)
-            .args(["/c", &write])
-            .current_dir("/mnt/c/ProgramData")
-            .output()
-            .unwrap();
-        assert!(host_canary.exists(), "control: {control:?}");
-        std::fs::remove_file(&host_canary).unwrap();
+        let write = format!("type nul > C:\\ProgramData\\{name}");
+        let made = host_cmd(&cmd, &write);
+        let size = std::fs::metadata(&host_canary).map(|m| m.len());
+        assert!(matches!(size, Ok(0)), "control create: {size:?} {made:?}");
+        let gone = host_cmd(&cmd, &format!("del C:\\ProgramData\\{name}"));
+        assert!(!host_canary.exists(), "control delete: {gone:?}");
         let (code, out) = exec(
             &r,
             &format!("cd /workspace/p && ./cmd.exe /c '{write}' 2>&1"),
         )
         .await;
+        let reached = host_canary.exists();
+        if reached {
+            std::fs::remove_file(&host_canary).unwrap();
+        }
+        assert!(!reached, "the sandbox reached Windows: {out}");
         assert_ne!(code, 0, "{out}");
-        assert!(!host_canary.exists(), "the sandbox reached Windows: {out}");
         x.stop(r).await;
     });
 }
