@@ -261,7 +261,7 @@ fn rt_fs_13_a_socket_in_a_mount_refuses_the_launch() {
 
 /// AMENDMENTS-02 B4 (RT-AG-08b): a second live session may not overlap a writable mount.
 #[test]
-fn overlapping_sessions_are_refused_while_the_first_is_live() {
+fn rt_ag_08b_overlapping_sessions_are_refused_while_the_first_is_live() {
     rt().block_on(async {
         let x = Lx::new();
         std::fs::create_dir_all(x.f.root.join("home/code/myproject/sub")).unwrap();

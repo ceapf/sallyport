@@ -147,4 +147,36 @@ pub fn mounts(list: &[String]) -> String {
     format!("filesystem:\n  mounts:\n{}", list.concat())
 }
 
+/// Every entry under `root` (symlinks not followed), sorted: path, type, mode, size, mtime and
+/// the bytes of each file or the target of each link. Equal states mean an unchanged tree (the
+/// red-team rows' "tree hash"; fixtures are small, so the bytes are kept rather than hashed).
+pub fn tree_state(root: &std::path::Path) -> Vec<String> {
+    use std::os::unix::fs::MetadataExt;
+    let mut out = Vec::new();
+    let mut todo = vec![root.to_path_buf()];
+    while let Some(p) = todo.pop() {
+        let m = std::fs::symlink_metadata(&p).unwrap();
+        let rel = p.strip_prefix(root).unwrap().display().to_string();
+        let body = if m.is_dir() {
+            for e in std::fs::read_dir(&p).unwrap() {
+                todo.push(e.unwrap().path());
+            }
+            String::new()
+        } else if m.file_type().is_symlink() {
+            std::fs::read_link(&p).unwrap().display().to_string()
+        } else {
+            String::from_utf8_lossy(&std::fs::read(&p).unwrap()).into_owned()
+        };
+        out.push(format!(
+            "{rel} {:o} {} {}.{} {body:?}",
+            m.mode(),
+            m.len(),
+            m.mtime(),
+            m.mtime_nsec()
+        ));
+    }
+    out.sort();
+    out
+}
+
 pub const PROXY: &str = "network:\n  mode: proxy\n  allow:\n    - host: pypi.org\n";

@@ -284,6 +284,7 @@ async fn spaces(watched: &Arc<Vec<Watched>>) -> Result<Vec<Space>, String> {
     }
 }
 
+// TODO(#26): kebab-case the reason values here and in `stage_task` (`disk-floor`, …).
 async fn floor_task(s: Arc<Shared>, watched: Arc<Vec<Watched>>) {
     let floor = s.launcher.disk_floor;
     let mut tick = tokio::time::interval(FLOOR_POLL);

@@ -1,5 +1,6 @@
 //! Task 6c red-team rows that hold in every role, with real containers (rootless Podman):
-//! RT-NET-12 (socket families) and RT-FS-17 (no new namespaces).
+//! RT-NET-01 (no route out), RT-NET-08 (raw sockets and ICMP), RT-NET-12 (socket families) and
+//! RT-FS-17 (no new namespaces).
 //!
 //! The workspace comes from the launcher; the harness and inference containers from their argv
 //! builders, created and started with hermetic podman exactly as the argv says (their launchers
@@ -200,6 +201,95 @@ fn rt_net_12_socket_families_outside_the_role_list_fail() {
                 ],
             };
             check(b, &ip);
+        }
+        finish(&x, boxes).await;
+    });
+}
+
+/// ENETUNREACH: `--network=none` leaves only `lo`, so there is no route.
+const UNREACH: &str = "errno=101";
+
+/// Every role's only interface is `lo`.
+fn only_loopback(b: &Boxed) {
+    let (code, out) = exec_in(&b.container, &["ls", "/sys/class/net"]);
+    assert_eq!((code, out.trim()), (0, "lo"), "{:?}", b.role);
+}
+
+/// RT-NET-01: direct TCP and UDP to the internet fail in every role. Workspace and harness may
+/// open IP sockets (loopback only), so `connect` finds no route; inference may not open them.
+#[test]
+fn rt_net_01_direct_tcp_and_udp_find_no_route() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let mut boxes = Vec::new();
+        for role in ROLES {
+            boxes.push(start(&x, role).await);
+        }
+        for b in &boxes {
+            only_loopback(b);
+            let want = match b.role {
+                Role::Inference => SECCOMP,
+                Role::Workspace | Role::Harness => UNREACH,
+            };
+            check(
+                b,
+                &[
+                    ("connect 2 1 0 1.1.1.1 443", want),
+                    ("connect 2 2 0 8.8.8.8 53", want),
+                    ("connect 10 1 0 2606:4700:4700::1111 443", want),
+                    ("connect 10 2 0 2001:4860:4860::8888 53", want),
+                ],
+            );
+            let (code, out) = exec_in(&b.container, &["nc", "-w", "3", "1.1.1.1", "443"]);
+            assert_ne!(code, 0, "{:?}: busybox nc: {out}", b.role);
+        }
+        finish(&x, boxes).await;
+    });
+}
+
+/// RT-NET-08: no raw sockets (no role has `CAP_NET_RAW`) and no ICMP out: `ping` fails in every
+/// role, and an unprivileged ICMP ("ping") socket is refused with EACCES: the container's
+/// `net.ipv4.ping_group_range` does not include the sandbox's group. Each probe sends one echo
+/// request; the error code alone does not pass: if a socket is ever created, its send must fail
+/// with ENETUNREACH (no packet leaves).
+#[test]
+fn rt_net_08_raw_sockets_and_icmp_fail() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let mut boxes = Vec::new();
+        for role in ROLES {
+            boxes.push(start(&x, role).await);
+        }
+        for b in &boxes {
+            let (raw, icmp) = match b.role {
+                Role::Inference => ("socket errno=38", "socket errno=38"),
+                Role::Workspace | Role::Harness => ("socket errno=1", "socket errno=13"),
+            };
+            // Raw sockets must be refused at creation (the capability drop, not only
+            // `--network=none`); a ping socket may instead be created and fail to send.
+            let cases = [
+                ("send 2 3 1 1.1.1.1 0", raw, false),   // SOCK_RAW, IPPROTO_ICMP
+                ("send 2 3 255 1.1.1.1 0", raw, false), // SOCK_RAW, IPPROTO_RAW
+                ("send 10 3 58 2606:4700::1111 0", raw, false), // SOCK_RAW, ICMPv6
+                ("send 2 2 1 1.1.1.1 0", icmp, true),   // SOCK_DGRAM, IPPROTO_ICMP
+                ("send 10 2 58 2606:4700::1111 0", icmp, true), // SOCK_DGRAM, ICMPv6
+            ];
+            let calls: Vec<&str> = cases.iter().map(|(c, _, _)| *c).collect();
+            for ((call, got), (_, refused, may_send)) in probe(b, &calls).iter().zip(&cases) {
+                let failed_send = *may_send && got == "sendto errno=101";
+                assert!(
+                    got == refused || failed_send,
+                    "{:?}: probe {call}: {got} (want {refused}{})",
+                    b.role,
+                    if *may_send {
+                        ", or a send that fails"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            let (code, out) = exec_in(&b.container, &["ping", "-c", "1", "-W", "2", "1.1.1.1"]);
+            assert_ne!(code, 0, "{:?}: ping: {out}", b.role);
         }
         finish(&x, boxes).await;
     });

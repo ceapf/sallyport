@@ -7,10 +7,12 @@
 //! check.
 
 mod argv;
+mod changes;
 mod check;
 mod commands;
 mod dirs;
 mod disk;
+mod images;
 mod inside;
 mod launch;
 mod overlap;
@@ -22,6 +24,7 @@ mod types;
 mod watchdog;
 
 pub use argv::{harness_argv, inference_argv, workspace_argv};
+pub use changes::{Change, ChangeKind, ChangesError, staged_changes};
 pub use check::{Allowed, Grant, Source, check_argv};
 pub use dirs::{DirError, SessionDirs, check_runtime_dir};
 pub use disk::DiskFloor;

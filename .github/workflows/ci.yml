@@ -29,13 +29,14 @@ jobs:
       - run: cargo install cargo-nextest --locked --version "$CARGO_NEXTEST_VERSION"
       - name: verify cargo-nextest version
         run: cargo nextest --version | grep -Fw "$CARGO_NEXTEST_VERSION"
-      # Container tests (crates/sallyd/tests/{launch,roles}.rs) need rootless podman, their base
-      # image pulled by digest, and a C compiler for the red-team probe (tests/redteam/probe); the
-      # test images are built without a network. They never skip.
+      # Container tests (crates/sallyd/tests/*.rs) need rootless podman, their base image pulled
+      # by digest, a C compiler for the red-team probe (tests/redteam/probe) and strace (RT-SUP-02);
+      # the test images are built without a network. They never skip.
       - name: container test prerequisites
         run: |
           podman --version
           cc --version | head -n1
+          strace -V | head -n1
           test -n "$XDG_RUNTIME_DIR"
           podman info --format '{{.Host.CgroupsVersion}} {{.Host.OCIRuntime.Path}}'
           podman pull docker.io/library/alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
@@ -55,6 +56,7 @@ jobs:
         run: |
           podman --version
           cc --version | head -n1
+          strace -V | head -n1
           test -n "$XDG_RUNTIME_DIR"
           podman info --format '{{.Host.CgroupsVersion}} {{.Host.OCIRuntime.Path}}'
           podman pull docker.io/library/alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc

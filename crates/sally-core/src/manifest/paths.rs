@@ -98,6 +98,10 @@ struct Rule {
     label: String,
     /// The rule in words, when the path alone does not make it obvious.
     reason: Option<&'static str>,
+    /// Identities of the forms that exist (RT-FS-14: a bind alias has the same identity).
+    ids: Vec<DirId>,
+    /// Subtree rules: identities of the existing real ancestors, each with its path.
+    ancestors: Vec<(DirId, PathBuf)>,
 }
 
 /// The effective mount denylist for one validation run.
@@ -163,6 +167,37 @@ impl Denylist {
             })
         })
     }
+
+    /// Returns why a directory with identity `id` is refused, if it is: it is a rule's
+    /// directory, or an ancestor of a subtree rule's, under another path (a bind mount or a
+    /// second mount of the same filesystem; RT-FS-14). Aliases of directories *inside* a rule
+    /// are not detected: TODO(#28) (the same ancestry gap as the overlap rule's re-review M-2,
+    /// #17).
+    pub(crate) fn refusal_by_id(&self, id: DirId) -> Option<String> {
+        let why = |r: &Rule| r.reason.map_or_else(String::new, |w| format!(" — {w}"));
+        let same = self.rules.iter().find(|r| r.ids.contains(&id));
+        if let Some(r) = same {
+            return Some(format!("is the same directory as {}{}", r.label, why(r)));
+        }
+        self.rules.iter().find_map(|r| {
+            let (_, a) = r.ancestors.iter().find(|(i, _)| *i == id)?;
+            Some(format!(
+                "is the same directory as {}, which contains {}{}",
+                a.display(),
+                r.label,
+                why(r)
+            ))
+        })
+    }
+}
+
+/// The identity of the directory at `p` (symlinks followed), if it exists.
+fn dir_id(p: &Path) -> Option<DirId> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(p).ok().map(|m| DirId {
+        dev: m.dev(),
+        ino: m.ino(),
+    })
 }
 
 fn root_rule(p: &Path, label: &str) -> Rule {
@@ -174,6 +209,8 @@ fn subtree_rule(p: &Path, reason: &'static str) -> Rule {
 }
 
 fn rule(p: &Path, scope: Scope, label: Option<&str>, reason: Option<&'static str>) -> Rule {
+    // TODO(#28): a rule that is a dangling symlink contributes neither its target nor the
+    // target's ancestors.
     let lexical = normalize(p);
     let mut forms = vec![lexical.clone()];
     if let Ok(real) = std::fs::canonicalize(p)
@@ -182,11 +219,27 @@ fn rule(p: &Path, scope: Scope, label: Option<&str>, reason: Option<&'static str
         forms.push(real);
     }
     let label = label.map_or_else(|| lexical.display().to_string(), str::to_owned);
+    let mut ids: Vec<DirId> = forms.iter().filter_map(|f| dir_id(f)).collect();
+    ids.dedup();
+    let mut ancestors = Vec::new();
+    if scope == Scope::Subtree {
+        // Ancestors of every form: the real one where the rule exists, the lexical one (whose
+        // ancestors are resolved by `metadata`) where it does not yet.
+        for a in forms.iter().flat_map(|f| f.ancestors().skip(1)) {
+            if let Some(id) = dir_id(a)
+                && !ancestors.iter().any(|(i, _)| *i == id)
+            {
+                ancestors.push((id, a.to_owned()));
+            }
+        }
+    }
     Rule {
         forms,
         scope,
         label,
         reason,
+        ids,
+        ancestors,
     }
 }
 
@@ -297,13 +350,14 @@ pub(crate) fn check_mount_host(
         ));
     }
     // The root is not a symlink (checked above), so lstat describes the directory itself.
-    Ok((
-        real,
-        DirId {
-            dev: meta.dev(),
-            ino: meta.ino(),
-        },
-    ))
+    let id = DirId {
+        dev: meta.dev(),
+        ino: meta.ino(),
+    };
+    if let Some(why) = deny.refusal_by_id(id) {
+        return Err((Code::Denylisted, format!("{raw:?} {why} (denylisted)")));
+    }
+    Ok((real, id))
 }
 
 /// Guest paths: `/workspace/<seg>(/<seg>)*`, each segment `[A-Za-z0-9._-]`, not `.`/`..`.
@@ -438,6 +492,68 @@ mod tests {
             "/workspace/ä",
         ] {
             assert!(check_guest(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// A real home with `.ssh` and `.local`, removed on drop.
+    struct TmpHome(PathBuf);
+
+    impl TmpHome {
+        fn new(tag: &str) -> Self {
+            let root = std::env::temp_dir().join(format!("sp-ids-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            for d in ["home/.ssh", "home/.local/share", "home/code/x"] {
+                std::fs::create_dir_all(root.join(d)).unwrap();
+            }
+            Self(std::fs::canonicalize(root).unwrap())
+        }
+        fn home(&self) -> PathBuf {
+            self.0.join("home")
+        }
+        fn id(&self, rel: &str) -> DirId {
+            dir_id(&self.0.join(rel)).unwrap()
+        }
+    }
+
+    impl Drop for TmpHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// RT-FS-14: a root with the identity of a protected folder (a bind alias of it) is refused.
+    #[test]
+    fn the_identity_of_a_protected_folder_is_refused() {
+        let t = TmpHome::new("same");
+        let d = Denylist::new(&env(t.home().to_str().unwrap()), &[]);
+        let why = d.refusal_by_id(t.id("home/.ssh")).unwrap();
+        assert!(
+            why.contains("same directory as") && why.contains(".ssh"),
+            "{why}"
+        );
+        let why = d.refusal_by_id(t.id("home")).unwrap();
+        assert!(why.contains("the home directory root"), "{why}");
+    }
+
+    /// RT-FS-14: a root with the identity of an ancestor of a subtree rule (an alias of `~`'s
+    /// parent, or of `~/.local`) is refused: it contains the protected folder.
+    #[test]
+    fn the_identity_of_an_ancestor_of_a_protected_folder_is_refused() {
+        let t = TmpHome::new("anc");
+        let d = Denylist::new(&env(t.home().to_str().unwrap()), &[]);
+        for rel in ["home/.local", "home/.local/share", ""] {
+            let why = d.refusal_by_id(t.id(rel)).unwrap();
+            assert!(why.contains("which contains"), "{rel}: {why}");
+        }
+    }
+
+    /// Ordinary directories, inside or beside the home, keep their identities free.
+    #[test]
+    fn other_identities_are_allowed() {
+        let t = TmpHome::new("ok");
+        let d = Denylist::new(&env(t.home().to_str().unwrap()), &[]);
+        for rel in ["home/code", "home/code/x"] {
+            assert_eq!(d.refusal_by_id(t.id(rel)), None, "{rel}");
         }
     }
 

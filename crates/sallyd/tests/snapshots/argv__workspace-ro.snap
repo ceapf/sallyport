@@ -39,6 +39,8 @@ label=disable
 4
 --memory
 8589934592b
+--memory-swap
+8589934592b
 --init
 --env-host=false
 --hostname

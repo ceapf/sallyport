@@ -12,6 +12,7 @@ live in the docs below. Read them when a task touches their area, not all at onc
 | `docs/MANIFEST_SPEC.md` | touching the manifest, validator, or any enforcement point |
 | `docs/MILESTONES.md` | starting a milestone/task (only read the current milestone's section) |
 | `tests/redteam/REDTEAM_SUITE.md` | writing or changing any security test |
+| `docs/dev/PROBE_NOTES.md` | before probing Podman/kernel/busybox behaviour; add what you find |
 
 ## Security invariants — never violate, never "temporarily" relax
 
@@ -33,6 +34,9 @@ If a task seems to require breaking one of these, **stop and ask**. Do not imple
 ## Hard rules for this repo
 
 - Never weaken, skip, `#[ignore]`, or delete a red-team test to make CI green. If a test is wrong, fix the test *and* explain why in the PR body. A skipped RT test needs a tracked issue and an expiry date in the skip reason.
+  One approved exception (Checkpoint 3): `rt_fs_11_wsl_…` is `#[ignore = "requires WSL"]`, so
+  off WSL nextest lists it as skipped, never passed; `make redteam` runs it on WSL and fails if
+  it did not run. No other `rt_` test may carry `#[ignore]`.
 - Never add `unsafe`. Every crate has `#![forbid(unsafe_code)]`. If you believe it is unavoidable, stop and ask.
   One approved exception (Task 6c): the red-team syscall probe `tests/redteam/probe/probe.c`.
   It lives only in the red-team test tree, is built at test time, is never linked into or shipped
@@ -111,8 +115,12 @@ manually for the tasks marked opus). Subagents are the files in `.claude/agents/
 - Start every session with `/resume-session`; end with `/save-session`. One milestone *task* per session where possible; `/clear` between unrelated tasks.
 - Run `/context` (built-in) when the context feels heavy; never paste whole logs — `2>&1 | tail -60`. Use `cargo test -q -p <crate>` and `cargo clippy -q`.
 - Use `docs-lookup` (haiku) for API questions instead of fetching pages into the main context.
+- Save and stop at **30 %** of the context window (`/save-session`); the rest runs in a fresh
+  session.
 - Reviews run as subagents (separate context). One review per task, not per edit, plus one
   diff-only re-review when post-review fixes rewrite a security-core component.
+- Reviewer prompts ask, for each new `rt_` test, which control's removal makes it fail (a test
+  that still passes without its control is a finding).
 - Don't read `THREAT_MODEL.md`/`ARCHITECTURE.md` repeatedly — read the section you need once per session.
 
 ## Public repository rules
@@ -137,6 +145,10 @@ issues, comments and CI output.
   `gh pr view <N> --json statusCheckRollup --jq '[.statusCheckRollup[] | select(.name |
   IN("rust","coverage","deny","fuzz","zizmor","doctor-syntax","redteam"))] | (length == 7 and
   all(.[]; .conclusion == "SUCCESS"))'`. The names are the ruleset's required checks.
+- Every completion report also states the latest nightly mutation result, read from the run the
+  same way (never assumed), naming the command:
+  `gh run list --workflow nightly.yml --limit 1 --json conclusion,createdAt,databaseId --jq
+  '.[0] | "\(.conclusion) \(.createdAt) \(.databaseId)"'`.
 - Standing merge rule: you may merge PRs **you authored from branches in this repository** when CI
   is green, the required reviews have run with findings fixed or deferred by TODO, and the task is
   in the approved plan. Never merge a PR carrying a checkpoint deliverable until the maintainer

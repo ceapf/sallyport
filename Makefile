@@ -98,10 +98,16 @@ doctor:
 # Task 13 adds the harness and the remaining M1 rows. No GPU needed. RT-AG-09 needs cgroup v2:
 # without it the run fails, never skips (CLAUDE.md). An empty selection fails too.
 REDTEAM_FILTER := test(/(^|::)rt_/)
+REDTEAM_WSL_TEST := rt_fs_11_wsl_a_windows_executable_does_not_reach_windows
+REDTEAM_WSL_FILTER := test(=$(REDTEAM_WSL_TEST))
 redteam:
 	@v=$$(podman info --format '{{.Host.CgroupsVersion}}'); \
 	  [ "$$v" = v2 ] || { echo "redteam: cgroup v2 required (RT-AG-09), podman reports '$$v'"; exit 1; }
 	$(CARGO) nextest run --workspace --no-fail-fast --no-tests=fail -E '$(REDTEAM_FILTER)'
+	@# RT-FS-11's .exe part is the one approved ignored rt_ test: run on WSL, listed as skipped elsewhere.
+	@if [ -e /proc/sys/fs/binfmt_misc/WSLInterop ]; then \
+	  $(CARGO) nextest run --workspace --no-tests=fail --run-ignored only -E '$(REDTEAM_WSL_FILTER)'; \
+	else echo "redteam: not WSL: $(REDTEAM_WSL_TEST) skipped (ignored), not passed"; fi
 
 # GPU targets arrive with M3; until then they fail loudly rather than pass vacuously.
 redteam-gpu e2e-gpu:

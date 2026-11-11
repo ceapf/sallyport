@@ -110,6 +110,9 @@ pub enum LaunchError {
     /// `runtime.stage_size` on the state filesystem).
     #[error("not enough free disk space: {0}")]
     DiskSpace(String),
+    /// The pinned image is not in local storage (`images.rs`).
+    #[error("runtime.image: {0}")]
+    ImageMissing(String),
     /// A podman command failed.
     #[error("podman {verb}: {msg}")]
     Command {
@@ -148,6 +151,7 @@ impl LaunchError {
             Self::MountMismatch(_) => "mount-mismatch",
             Self::NotRunning(_) => "not-running",
             Self::DiskSpace(_) => "disk-floor",
+            Self::ImageMissing(_) => "digest-mismatch",
             Self::Command { .. } => "podman",
             Self::Audit(_) | Self::Unaudited { .. } => "audit",
             Self::Internal(_) => "internal",
@@ -513,8 +517,9 @@ impl Launcher {
         progress: &mut Progress,
     ) -> Result<(Running, Option<WatchPlan>), LaunchError> {
         let (runtime, scan, plan) = self.check_and_scan(req).await?;
+        let image = req.image();
+        self.image_present(image).await?;
         let argv = self.dirs_and_argv(req, runtime, &scan, progress).await?;
-        let m = req.manifest.manifest();
         let mounts: Vec<_> = req
             .manifest
             .mounts()
@@ -532,7 +537,7 @@ impl Launcher {
                 .decision("allow")
                 .args(json!({
                     "role": "workspace",
-                    "image": m.runtime.image.as_deref().unwrap_or(req.default_image.as_str()),
+                    "image": image,
                     "mounts": mounts,
                     "git_shields": shields,
                 })),
