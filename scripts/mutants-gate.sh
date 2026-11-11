@@ -8,9 +8,9 @@ set -euo pipefail
 
 code="${1:?usage: mutants-gate.sh <exit code> <mutants.out dir>}"
 out="${2:?usage: mutants-gate.sh <exit code> <mutants.out dir>}"
-summary="${GITHUB_STEP_SUMMARY:-/dev/stdout}"
 
-# cargo-mutants exit codes: 0 all caught, 2 missed mutants, 3 timeouts; anything else failed.
+# cargo-mutants exit codes: 0 all caught, 2 missed mutants, 3 timeouts (which outrank missed
+# mutants, so 3 can hide them: missed.txt decides); anything else failed.
 case "$code" in
   0 | 2 | 3) ;;
   *)
@@ -22,17 +22,32 @@ if [ ! -d "$out" ]; then
   echo "mutants-gate: $out does not exist" >&2
   exit 1
 fi
-missed="$(cat "$out/missed.txt" 2>/dev/null || true)"
-timeouts="$(cat "$out/timeout.txt" 2>/dev/null || true)"
+# cargo-mutants creates both lists at the start of a run; a missing one means the run, or a new
+# cargo-mutants version, did not produce what this gate reads.
+for f in missed.txt timeout.txt; do
+  if [ ! -f "$out/$f" ] || [ ! -r "$out/$f" ]; then
+    echo "mutants-gate: $out/$f is missing or unreadable" >&2
+    exit 1
+  fi
+done
+missed="$(cat "$out/missed.txt")"
+timeouts="$(cat "$out/timeout.txt")"
 
+report() {
+  echo "### Timed-out mutants (detected: each hangs a test)"
+  echo
+  echo '```'
+  echo "$timeouts"
+  echo '```'
+}
+# The list is information: failing to write it (no summary file, a closed stdout) never changes
+# the verdict.
 if [ -n "$timeouts" ]; then
-  {
-    echo "### Timed-out mutants (detected: each hangs a test)"
-    echo
-    echo '```'
-    echo "$timeouts"
-    echo '```'
-  } >>"$summary"
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    report >>"$GITHUB_STEP_SUMMARY" || true
+  else
+    report 2>/dev/null || true
+  fi
 fi
 if [ -n "$missed" ]; then
   echo "mutants-gate: missed mutants:" >&2
@@ -41,6 +56,10 @@ if [ -n "$missed" ]; then
 fi
 if [ "$code" -eq 2 ]; then
   echo "mutants-gate: cargo-mutants reported missed mutants but $out/missed.txt is empty" >&2
+  exit 1
+fi
+if [ "$code" -eq 3 ] && [ -z "$timeouts" ]; then
+  echo "mutants-gate: cargo-mutants reported timeouts but $out/timeout.txt is empty" >&2
   exit 1
 fi
 exit 0

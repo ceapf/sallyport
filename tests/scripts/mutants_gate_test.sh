@@ -34,6 +34,23 @@ expect 1 "exit 2 but nothing listed missed" 2 "" ""
 expect 1 "baseline failed" 4 "" ""
 expect 1 "usage error" 1 "" ""
 expect 1 "exit 0 but a mutant listed missed" 0 "$m1"$'\n' ""
+expect 1 "exit 3 but nothing listed timed out" 3 "" ""
+
+# Without GITHUB_STEP_SUMMARY the list goes to stdout, and a closed stdout does not fail a
+# timeouts-only run.
+rm -rf "$tmp/out" && mkdir -p "$tmp/out"
+: >"$tmp/out/missed.txt"
+printf '%s\n' "$t1" >"$tmp/out/timeout.txt"
+if ! (unset GITHUB_STEP_SUMMARY; bash "$gate" 3 "$tmp/out" 2>/dev/null) | grep -Fq "$t1"; then
+  echo "FAIL: without a summary file the timed-out mutant is not printed" >&2
+  fail=1
+fi
+rc=0
+(unset GITHUB_STEP_SUMMARY; bash "$gate" 3 "$tmp/out" >&- 2>/dev/null) || rc=$?
+if [ "$rc" -ne 0 ]; then
+  echo "FAIL: a timeouts-only run with stdout closed: exit $rc, want 0" >&2
+  fail=1
+fi
 
 # The summary lists each timed-out mutant.
 expect 0 "timeouts listed" 3 "" "$t1"$'\n'
@@ -41,6 +58,20 @@ if ! grep -Fq "$t1" "$tmp/summary"; then
   echo "FAIL: the summary does not list the timed-out mutant" >&2
   fail=1
 fi
+# Exit 3 can hide missed mutants (timeouts outrank them): without missed.txt, or without
+# timeout.txt, the gate fails rather than trusting the exit code.
+for gone in missed.txt timeout.txt; do
+  rm -rf "$tmp/out" && mkdir -p "$tmp/out"
+  : >"$tmp/out/missed.txt"
+  : >"$tmp/out/timeout.txt"
+  rm "$tmp/out/$gone"
+  rc=0
+  GITHUB_STEP_SUMMARY="$tmp/summary" bash "$gate" 3 "$tmp/out" >/dev/null 2>&1 || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    echo "FAIL: exit 3 without $gone passed" >&2
+    fail=1
+  fi
+done
 # A missing output directory (cargo-mutants never ran) fails.
 rc=0
 GITHUB_STEP_SUMMARY="$tmp/summary" bash "$gate" 0 "$tmp/nowhere" >/dev/null 2>&1 || rc=$?
