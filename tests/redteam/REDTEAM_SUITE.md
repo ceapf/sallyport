@@ -138,7 +138,7 @@ Fixture manifests: `fx-coding` (= `coding-agent.yaml` with mock hosts), `fx-brok
 
 | ID | Name | Attack | PASS condition | CI/GPU | M |
 |---|---|---|---|---|---|
-| RT-SUP-01 | Unpinned / mismatched image | manifest `runtime.image: ghcr.io/x/y:latest`; pinned digest that doesn't match the local image's digest; argv snapshot scan | refused `image_not_pinned` / `digest_mismatch`; argv never contains `--privileged`, `--cap-add`, `--network=host|bridge|pasta|slirp4netns`, `seccomp=unconfined`, `--userns=host`, non-GPU `--device` | CI | M1 |
+| RT-SUP-01 | Unpinned / mismatched image | manifest `runtime.image: ghcr.io/x/y:latest`; pinned digest that doesn't match the local image's digest; argv snapshot scan | refused `not-pinned` (validator) / `digest-mismatch` (launch); argv never contains `--privileged`, `--cap-add`, `--network=host|bridge|pasta|slirp4netns`, `seccomp=unconfined`, `--userns=host`, non-GPU `--device` | CI | M1 |
 | RT-SUP-04 | Hostile podman configuration | a `containers.conf` in the test `HOME` adds a volume, a capability and host networking; `mounts.conf` and `storage.conf` alongside | none of it reaches the launched container (no extra mount, `CapEff` 0, only `lo`); the generated OCI config passes the per-role verifier, and doctored configs are refused (`sandbox.config_mismatch`) | CI | M1 (Task 14, #15) |
 
 ## UI — Tauri
