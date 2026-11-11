@@ -42,11 +42,10 @@ exclude_re = [
   # Race only (rule ii): the `|` of the walk's `kind` in list and pin_parents (each becomes no
   # flags: plain O_RDONLY, without O_DIRECTORY or O_PATH). Each path opened is a directory the
   # same scan has just statx-ed (list) or already opened O_RDONLY|O_DIRECTORY in list
-  # (pin_parents: every shield's parent was listed to find it), and RESOLVE_NO_SYMLINKS refuses
-  # a symlink either way. A difference needs the entry replaced or its mode changed between
-  # those steps (a FIFO swapped in would then block the open). list re-checks the inode after
-  # its open; pin_parents pins what it opened, which the host and in-container re-checks then
-  # compare.
+  # (pin_parents: every shield's parent was listed to find it). A difference needs the entry
+  # replaced between those steps, and no live sandbox can write to a tree while it is scanned
+  # (the overlap rule refuses a launch whose mounts overlap a running session's). A swap after
+  # the scan is caught by the pin re-check (host and in-container) before the launch proceeds.
   '''crates/sallyd/src/sandbox/scan\.rs:\d+:\d+: replace \| with & in Walk<'a>::list$''',
   '''crates/sallyd/src/sandbox/scan\.rs:\d+:\d+: replace \| with & in Walk<'a>::pin_parents$''',
   # Clock instant only (rule ii): `now > until` -> `now >= until` differs only when the clock

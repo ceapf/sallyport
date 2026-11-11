@@ -3,7 +3,9 @@
 //!
 //! * `--listen 127.0.0.1:3128=/run/sallyport/net.sock` (repeatable): every accepted TCP
 //!   connection gets **its own** Unix connection; bytes are copied both ways, opaque, until
-//!   either side closes. Half-close is propagated.
+//!   either side closes. Half-close is propagated. Once every listener is bound, the shim writes
+//!   one line per listener to stderr, `sally-shim: listening on <addr>` (the bound address only,
+//!   never the socket path), so a caller can wait for readiness instead of polling.
 //! * `--stdio /run/sallyport/agent.sock`: stdin → socket, socket → stdout, for clients that
 //!   expect to spawn a stdio server.
 //!

@@ -56,3 +56,11 @@ line per fact, with where it was found. Check a note again before relying on it 
   `.git` before and after. (6c-2, FS-12)
 - The pre-commit guard blocks Windows user-profile paths in test files; use `C:\ProgramData`.
   (6c-2a)
+- Any 127/8 address binds on `lo` with no setup (Linux and WSL2); connects to it get source
+  `127.0.0.1`. A per-test loopback address gives a test a port no other test can take. (#23)
+- "Bind `:0`, close, re-bind" is not a free-port check in a multithreaded test binary: a listener
+  closed while a sibling test's child is forking stays LISTEN until that child execs, so the
+  port is still taken (and can accept your connect). Use a fixed port on a private address. (#23)
+- `accept()` reserves its descriptor number before blocking; `/proc/<pid>/fd` does not list it.
+  To force EMFILE, set the soft limit to the lowest free number (`prlimit --pid P --nofile=N:`
+  keeps the hard limit, so it can be raised again). (#36 shim)
