@@ -14,9 +14,8 @@
 //! 7. `podman start`, then confirm after a short grace that the container is running with the
 //!    pid that was checked (`start` succeeds even when the entry point exits at once).
 //!
-//! A session with `staged` mounts gets a watchdog task that measures their upper directories every
-//! [`STAGE_POLL`] and kills the container when they exceed `runtime.stage_size` (#14), auditing
-//! `session.resource_limit` first.
+//! A session whose sandbox can write to the host disk (`staged` mounts, `.git` overlays) gets a
+//! watchdog that kills it when those writes exceed `runtime.stage_size` (#14; `watchdog.rs`).
 //!
 //! The launch runs in its own task: a caller that goes away (a closed connection, an outer
 //! timeout) cannot leave a half-built session, and a finished launch nobody receives is stopped.
@@ -40,8 +39,8 @@ use super::inside::{Expect, Mismatch, check_in_container};
 use super::overlap::{ReserveError, Sessions, claims};
 use super::podman::{Podman, PodmanError};
 use super::scan::{LaunchScan, PinKind, ScanError, ScanLimits, scan_mounts};
-use super::stage::{STAGE_POLL, StageBounds, Verdict, measure};
 use super::types::{ArgvError, CheckedRuntime, CommonArgs, ImageRef, SessionPaths, UserIds};
+use super::watchdog::{StageWatch, Watchdog};
 
 /// Bytes of podman's stdout and stderr kept per command; the rest is read and dropped.
 const OUTPUT_CAP: usize = 64 * 1024;
@@ -175,7 +174,7 @@ async fn blocking<T: Send + 'static>(
 }
 
 /// Cuts free text for an audit entry at a character boundary.
-fn capped(s: &str) -> String {
+pub(super) fn capped(s: &str) -> String {
     if s.len() <= AUDIT_TEXT_CAP {
         return s.to_owned();
     }
@@ -203,44 +202,8 @@ pub struct Running {
     name: String,
     paths: SessionPaths,
     level: AuditLevel,
-    /// The `stage_size` watchdog, if the session has staged mounts; aborted on drop.
+    /// The `stage_size` watchdog, if the sandbox can write to the host disk; cancelled on drop.
     watchdog: Option<Watchdog>,
-}
-
-/// A watchdog task, aborted when its session's handle goes away.
-#[derive(Debug)]
-struct Watchdog(tokio::task::JoinHandle<()>);
-
-impl Drop for Watchdog {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-/// What the `stage_size` watchdog of one session measures.
-#[derive(Debug, Clone)]
-struct StageWatch {
-    /// `(mount index, upper directory)` of every staged mount.
-    stages: Vec<(usize, PathBuf)>,
-    /// `runtime.stage_size` in bytes.
-    limit: u64,
-}
-
-impl StageWatch {
-    fn of(req: &WorkspaceRequest) -> Option<Self> {
-        let stages: Vec<(usize, PathBuf)> = req
-            .manifest
-            .mounts()
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| m.mode == MountMode::Staged)
-            .map(|(i, _)| (i, req.paths.stage(i).upper))
-            .collect();
-        (!stages.is_empty()).then(|| Self {
-            stages,
-            limit: req.manifest.manifest().runtime.stage_size.bytes(),
-        })
-    }
 }
 
 impl Running {
@@ -301,6 +264,9 @@ pub struct Launcher {
     sessions: Arc<Sessions>,
     audit: Arc<dyn AuditSink>,
     limits: ScanLimits,
+    /// One stage watchdog walk at a time across all sessions, so a sandbox with a huge or deep
+    /// tree cannot multiply `sallyd`'s open fds or blocking threads (6c-1 review M2/M3).
+    pub(super) walks: tokio::sync::Semaphore,
 }
 
 impl std::fmt::Debug for Launcher {
@@ -332,10 +298,15 @@ impl Launcher {
             sessions: p.sessions,
             audit: p.audit,
             limits: p.limits,
+            walks: tokio::sync::Semaphore::new(1),
         })
     }
 
-    async fn audit(&self, entry: NewEntry, level: AuditLevel) -> Result<(), LaunchError> {
+    pub(super) async fn audit(
+        &self,
+        entry: NewEntry,
+        level: AuditLevel,
+    ) -> Result<(), LaunchError> {
         let sink = Arc::clone(&self.audit);
         tokio::task::spawn_blocking(move || sink.append(entry, level))
             .await
@@ -401,17 +372,23 @@ impl Launcher {
     ) -> Result<Running, LaunchError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let this = Arc::clone(self);
-        let watch = StageWatch::of(&req);
         tokio::spawn(async move {
-            let result = this.launch(req).await.map(|r| match watch {
-                Some(w) => this.watch(r, w),
-                None => r,
+            let result = this.launch(req).await.map(|(mut r, w)| {
+                r.watchdog = w.map(|w| {
+                    let sid = r.paths.id().as_str().to_owned();
+                    Watchdog::spawn(&this, sid, r.container.clone(), r.level, w)
+                });
+                r
             });
             if let Err(Ok(orphan)) = tx.send(result)
-                && let Err(e) = this.stop(orphan).await
+                && let Err(mut e) = this.stop(orphan).await
             {
-                // Nobody holds the handle any more: record it (the claims stay held until
-                // remove_orphans at the next start).
+                // Nobody holds the handle any more, but the container may still run: keep it
+                // bounded, and record it (the claims stay held until remove_orphans at the next
+                // start).
+                if let Some(w) = e.running.watchdog.take() {
+                    w.detach();
+                }
                 let entry = NewEntry::new(Actor::Sallyd, "sandbox.stop_failed")
                     .session(e.running.paths.id().as_str())
                     .decision("deny")
@@ -426,7 +403,10 @@ impl Launcher {
             .map_err(|_| LaunchError::Internal("the launch task ended without a result".into()))?
     }
 
-    async fn launch(&self, req: WorkspaceRequest) -> Result<Running, LaunchError> {
+    async fn launch(
+        &self,
+        req: WorkspaceRequest,
+    ) -> Result<(Running, Option<StageWatch>), LaunchError> {
         let level = req.manifest.manifest().audit.level;
         let sid = req.paths.id().as_str().to_owned();
         let v = Arc::clone(&req.manifest);
@@ -493,8 +473,9 @@ impl Launcher {
         req: &WorkspaceRequest,
         level: AuditLevel,
         progress: &mut Progress,
-    ) -> Result<Running, LaunchError> {
+    ) -> Result<(Running, Option<StageWatch>), LaunchError> {
         let (runtime, scan) = self.check_and_scan(req).await?;
+        let watch = StageWatch::of(&req.manifest, &req.paths, &scan);
         let argv = self.dirs_and_argv(req, runtime, &scan, progress).await?;
         let m = req.manifest.manifest();
         let mounts: Vec<_> = req
@@ -528,70 +509,14 @@ impl Launcher {
             .await?;
         let container = container_id(&out)?;
         self.checked_start(req, scan, &container).await?;
-        Ok(Running {
+        let running = Running {
             container,
             name,
             paths: req.paths.clone(),
             level,
             watchdog: None,
-        })
-    }
-
-    /// Starts the `stage_size` watchdog of a started session.
-    fn watch(self: &Arc<Self>, mut r: Running, w: StageWatch) -> Running {
-        let this = Arc::clone(self);
-        let (sid, container, level) = (
-            r.paths.id().as_str().to_owned(),
-            r.container.clone(),
-            r.level,
-        );
-        let task = tokio::spawn(async move { this.watchdog(sid, container, level, w).await });
-        r.watchdog = Some(Watchdog(task));
-        r
-    }
-
-    /// Measures every [`STAGE_POLL`] until the limit is exceeded (or the tree cannot be
-    /// measured: fail closed), then audits `session.resource_limit` and kills the container. The
-    /// kill happens even if the audit entry cannot be written. Teardown stays with
-    /// [`Launcher::stop`], which keeps the staged data.
-    async fn watchdog(&self, sid: String, container: String, level: AuditLevel, w: StageWatch) {
-        let first = w.stages.first().map_or(0, |s| s.0);
-        let (measured, mount, detail) = loop {
-            tokio::time::sleep(STAGE_POLL).await;
-            let stages = w.stages.clone();
-            let verdict = blocking(move || Ok(measure(&stages, w.limit, StageBounds::default())))
-                .await
-                .unwrap_or_else(|e| Verdict::Unmeasurable {
-                    mount: first,
-                    reason: e.to_string(),
-                });
-            match verdict {
-                Verdict::Within { .. } => {}
-                Verdict::Over { bytes, mount } => break (Some(bytes), mount, None),
-                Verdict::Unmeasurable { mount, reason } => break (None, mount, Some(reason)),
-            }
         };
-        let entry = NewEntry::new(Actor::Sallyd, "session.resource_limit")
-            .session(&sid)
-            .decision("deny")
-            .args(json!({
-                "role": "workspace",
-                "resource": "stage_size",
-                "limit": w.limit,
-                "measured": measured,
-                "mount": mount,
-                "detail": detail.as_deref().map(capped),
-            }));
-        let _ = self.audit(entry, level).await;
-        let kill = [
-            OsString::from("kill"),
-            "--signal".into(),
-            "KILL".into(),
-            container.as_str().into(),
-        ];
-        if self.run("kill", kill).await.is_err() {
-            let _ = self.remove_container(&container).await;
-        }
+        Ok((running, watch))
     }
 
     /// Step 2: hermetic podman and the runtime re-checked, then the launch scan.
@@ -746,7 +671,7 @@ impl Launcher {
     }
 
     /// `podman rm --force`, then confirms the container is gone.
-    async fn remove_container(&self, name: &str) -> Result<(), LaunchError> {
+    pub(super) async fn remove_container(&self, name: &str) -> Result<(), LaunchError> {
         let removed = self.run("rm", rm_args(name)).await;
         match self.container_exists(name).await? {
             false => Ok(()),
@@ -862,7 +787,7 @@ impl Launcher {
     }
 
     /// Runs one hermetic podman command; stdout on success.
-    async fn run(
+    pub(super) async fn run(
         &self,
         verb: &'static str,
         args: impl IntoIterator<Item = OsString>,

@@ -103,7 +103,8 @@ impl NewEntry {
         &self.event
     }
 
-    /// The arguments as given, before redaction (they are redacted when written).
+    /// The arguments as given, **before redaction** (they are redacted when written). For audit
+    /// sinks and tests; never log or display them (CLAUDE.md: no secret values in logs).
     #[must_use]
     pub fn arguments(&self) -> &Value {
         &self.args

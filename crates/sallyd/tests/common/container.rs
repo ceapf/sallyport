@@ -54,7 +54,9 @@ fn probe_binary(out: &Path) {
 /// Builds `localhost/<name>:6c` reproducibly and returns `localhost/<name>@sha256:…`. Each test
 /// process builds in its own directory: nextest runs each test in a process of its own, and the
 /// identical inputs give every process the same digest (`--timestamp 0`; without it, parallel
-/// builds re-tag the name and leave an earlier process's `name@digest` unresolvable).
+/// builds re-tag the name and leave an earlier process's `name@digest` unresolvable). That also
+/// relies on `cc -static` producing identical bytes for identical input, which gcc does today; a
+/// toolchain that embeds build ids or paths would break it.
 fn build(name: &str, entry: &str) -> String {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("{name}-image-{}", std::process::id()));
@@ -93,6 +95,11 @@ fn build(name: &str, entry: &str) -> String {
     );
     let _ = std::fs::remove_dir_all(&dir);
     let out = podman(&["image", "inspect", "--format", "{{.Digest}}", &tag]);
+    assert!(
+        out.status.success(),
+        "inspect: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     format!(
         "localhost/{name}@{}",
         String::from_utf8_lossy(&out.stdout).trim()
@@ -107,10 +114,12 @@ pub fn test_image() -> ImageRef {
     ImageRef::parse(r).unwrap()
 }
 
-/// As [`test_image`], but the entry exits at once with status 3.
+/// As [`test_image`], but the entry cannot be executed: its interpreter does not exist, so
+/// `execve` fails as soon as the container starts, with no shell start-up to race the launcher's
+/// grace period (6c-1 Rust review M4).
 pub fn exiting_image() -> ImageRef {
     static IMAGE: OnceLock<String> = OnceLock::new();
-    let r = IMAGE.get_or_init(|| build("sallyport-test-exit", "#!/bin/sh\nexit 3\n"));
+    let r = IMAGE.get_or_init(|| build("sallyport-test-exit", "#!/nonexistent/sh\nexit 3\n"));
     ImageRef::parse(r).unwrap()
 }
 

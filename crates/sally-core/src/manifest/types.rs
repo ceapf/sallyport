@@ -101,7 +101,8 @@ pub struct Runtime {
     pub tmp_size: ByteSize,
     /// Mount `/tmp` without `noexec`.
     pub tmp_exec: bool,
-    /// Limit on the session's staged upper directories together, 1MiB–1TiB. A watchdog in
+    /// Limit on what the sandbox writes to the host disk, 1MiB–1TiB: the upper directories of its
+    /// `staged` mounts and of the `.git` overlays of its `rw` mounts, together. A watchdog in
     /// `sallyd` kills a session that exceeds it and audits `session.resource_limit`.
     pub stage_size: ByteSize,
 }

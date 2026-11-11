@@ -129,9 +129,22 @@ fn a_mount_swapped_during_init_is_a_mismatch() {
     });
 }
 
+/// Waits up to 20 s for the container to be gone.
+async fn gone_within_deadline(container: &str) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        if !exists(container) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    false
+}
+
 /// RT-AG-09, `runtime.stage_size` (#14): a sandbox that writes past the limit into a staged
-/// mount is killed and `session.resource_limit` is audited first; a session within the limit
-/// keeps running. `stop` still tears the killed session down and keeps its staged data.
+/// mount is killed and `session.resource_limit` is audited first. Within the limit it keeps
+/// running, and so does another session (6c-1 security review L4). `stop` still tears the killed
+/// session down and keeps its staged data.
 #[test]
 fn rt_ag_09_writing_past_stage_size_kills_the_session() {
     rt().block_on(async {
@@ -145,6 +158,11 @@ fn rt_ag_09_writing_past_stage_size_kills_the_session() {
         );
         let v = x.f.load(&body);
         let small = x.launch(&v, "stage").await.unwrap();
+        let other = x.f.load(&format!(
+            "{}runtime:\n  stage_size: 4MiB\n",
+            mounts(&[mount("~/Documents/research", "/workspace/r", "staged")])
+        ));
+        let bystander = x.launch(&other, "bystander").await.unwrap();
         let (code, out) = exec(
             &small,
             "dd if=/dev/zero of=/workspace/o/ok bs=1024 count=1024",
@@ -154,31 +172,63 @@ fn rt_ag_09_writing_past_stage_size_kills_the_session() {
         assert!(exists(small.container()), "within the limit: still running");
         // The write itself may be cut short by the kill.
         let _ = exec(&small, "dd if=/dev/zero of=/workspace/o/big bs=1M count=16");
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        let mut killed = false;
-        while std::time::Instant::now() < deadline {
-            if !exists(small.container()) {
-                killed = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-        assert!(killed, "the watchdog killed the session");
+        assert!(
+            gone_within_deadline(small.container()).await,
+            "the watchdog killed the session"
+        );
         let limit = x.events.args("session.resource_limit").expect("audited");
         assert_eq!(limit["resource"], "stage_size", "{limit}");
         assert_eq!(limit["limit"], 4 << 20, "{limit}");
-        assert_eq!(limit["mount"], 1, "{limit}");
+        assert_eq!(limit["area"], "filesystem.mounts[1]", "{limit}");
         assert!(limit["measured"].as_u64().unwrap() > 4 << 20, "{limit}");
+        assert!(exists(bystander.container()), "the other session is alive");
         let paths = small.paths().clone();
         x.stop(small).await;
+        x.stop(bystander).await;
         assert!(
             paths.stage(1).upper.join("ok").exists(),
             "staged data is kept"
         );
         assert_eq!(
             x.events.list(),
-            ["sandbox.launch", "session.resource_limit", "sandbox.stop"]
+            [
+                "sandbox.launch",
+                "sandbox.launch",
+                "session.resource_limit",
+                "sandbox.stop",
+                "sandbox.stop"
+            ]
         );
+    });
+}
+
+/// RT-AG-09, `runtime.stage_size` through a `.git` overlay (6c-1 Rust review H2): an `rw` mount
+/// with no staged mount still cannot fill the host disk through `<mount>/.git`.
+#[test]
+fn rt_ag_09_writing_past_stage_size_into_a_git_overlay_kills_the_session() {
+    rt().block_on(async {
+        let x = Lx::new();
+        x.f.tree("code/myproject", &[".git"], &[]);
+        let v = x.f.load(&format!(
+            "{}runtime:\n  stage_size: 4MiB\n",
+            mounts(&[mount("~/code/myproject", "/workspace/p", "rw")])
+        ));
+        let r = x.launch(&v, "git-fill").await.unwrap();
+        let _ = exec(
+            &r,
+            "dd if=/dev/zero of=/workspace/p/.git/pack bs=1M count=16",
+        );
+        assert!(
+            gone_within_deadline(r.container()).await,
+            "the watchdog killed the session"
+        );
+        let limit = x.events.args("session.resource_limit").expect("audited");
+        assert_eq!(limit["area"], "filesystem.mounts[0]/.git", "{limit}");
+        assert!(
+            !x.f.root.join("home/code/myproject/.git/pack").exists(),
+            "the host .git is untouched"
+        );
+        x.stop(r).await;
     });
 }
 

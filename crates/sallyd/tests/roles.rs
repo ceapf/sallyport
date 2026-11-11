@@ -5,8 +5,9 @@
 //! builders, created and started with hermetic podman exactly as the argv says (their launchers
 //! arrive in Tasks 12 and M3). The probe is `tests/redteam/probe/probe.c`. Every refusal must be
 //! `ENOSYS` (38), the seccomp profiles' default action: the kernel never returns it for `socket`,
-//! `unshare`, `clone` or `clone3` itself, so the profile is what refused. The fixture is
-//! `common::container`; these tests never skip.
+//! `unshare`, `clone` or `clone3` itself, so the profile is what refused. That holds for
+//! `clone3` only from kernel 5.3 on, where the syscall exists; [`kernel_has_clone3`] checks it.
+//! The fixture is `common::container`; these tests never skip.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::os::unix::fs::PermissionsExt;
@@ -23,6 +24,19 @@ use common::*;
 
 /// The seccomp profiles' default errno (ENOSYS).
 const SECCOMP: &str = "errno=38";
+
+/// The host kernel is 5.3 or later, so `clone3` exists and only seccomp can answer ENOSYS.
+fn kernel_has_clone3() -> bool {
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap();
+    let mut parts = release.trim().split(['.', '-']);
+    let mut next = || {
+        parts
+            .next()
+            .and_then(|p| p.parse::<u32>().ok())
+            .unwrap_or(0)
+    };
+    (next(), next()) >= (5, 3)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Role {
@@ -196,6 +210,10 @@ fn rt_net_12_socket_families_outside_the_role_list_fail() {
 /// still works.
 #[test]
 fn rt_fs_17_no_role_creates_a_namespace() {
+    assert!(
+        kernel_has_clone3(),
+        "clone3 needs kernel >= 5.3, or its ENOSYS proves nothing"
+    );
     rt().block_on(async {
         let x = Lx::new();
         let mut boxes = Vec::new();
@@ -222,6 +240,11 @@ fn rt_fs_17_no_role_creates_a_namespace() {
             // The same through busybox, as an agent would try it.
             let (code, out) = exec_in(&b.container, &["unshare", "-U", "-r", "true"]);
             assert_ne!(code, 0, "{:?}: {out}", b.role);
+            assert!(
+                out.contains("Function not implemented"),
+                "{:?}: refused by the profile (ENOSYS): {out}",
+                b.role
+            );
         }
         finish(&x, boxes).await;
     });

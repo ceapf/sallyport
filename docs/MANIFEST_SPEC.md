@@ -35,7 +35,7 @@ runtime:                          # optional; the WORKSPACE container; defaults 
   timeout: 2h                     # session wall clock; 1m–24h
   tmp_size: 1GiB
   tmp_exec: false                 # mount /tmp noexec unless true
-  stage_size: 10GiB               # limit on all staged upper dirs together; exceeded = session killed
+  stage_size: 10GiB               # limit on staged + .git overlay writes together; exceeded = session killed
 
 model:
   ref: library://<name-or-sha256> | any   # required; `any` lets the user pick at launch
@@ -331,7 +331,7 @@ validation — otherwise `mount-changed`/`is-symlink` (RT-FS-06).
 | `runtime.cpus/memory/pids` | `sallyd::sandbox` → `podman run --cpus --memory --pids-limit` | launch | out of range → reject at validate |
 | `runtime.timeout` | `sallyd::session` timer → `podman kill` | runtime | session stopped, audit `session.timeout` |
 | `runtime.tmp_size/tmp_exec` | `podman run --tmpfs /tmp:…` | launch | — |
-| `runtime.stage_size` | `sallyd::sandbox` stage watchdog (allocated bytes of every staged upper dir, every 2 s; an unmeasurable tree counts as over) → `podman kill` | runtime | session killed, audit `session.resource_limit` (before the kill); staged data kept |
+| `runtime.stage_size` | `sallyd::sandbox` stage watchdog (allocated bytes of every staged and `.git` overlay upper dir, at least every 2 s; an unmeasurable tree counts as over) → `podman kill` + `rm` until gone | runtime | session killed, audit `session.resource_limit` (before the kill; `session.kill_failed` if the first kill fails); staged data kept |
 | `model.ref` | `sallyd::infer` resolves in library; refuses unverified/unknown | session start | error to UI |
 | `model.context/gpu_layers` | `sallyd::infer` → llama-server args, clamped by fit estimator | load | clamped, warning |
 | `filesystem.mounts[].host` | validator (realpath, denylist, is-dir, not-symlink) **and again** at launch: the launch scan re-opens the root without following symlinks and compares `st_dev:st_ino`, pins are re-checked before `podman init`, and bind mounts are compared inside the container after `init` (ARCHITECTURE §3.5) | validate + launch | reject / `sandbox.refuse` / `sandbox.mount_mismatch` |

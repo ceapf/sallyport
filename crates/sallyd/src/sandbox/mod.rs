@@ -17,6 +17,7 @@ mod profiles;
 mod scan;
 mod stage;
 mod types;
+mod watchdog;
 
 pub use argv::{harness_argv, inference_argv, workspace_argv};
 pub use check::{Allowed, Grant, Source, check_argv};
