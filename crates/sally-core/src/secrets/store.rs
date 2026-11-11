@@ -200,24 +200,8 @@ impl SecretStore {
         if len > MAX_STORE_BYTES {
             return Err(SecretsError::TooLarge);
         }
-        // One exact-size zeroized buffer, filled by hand: no reallocation and no std probe
-        // buffer on the stack, so no plaintext copies are left behind. One spare byte detects
-        // a file that grew after the fstat.
-        let mut buf = Zeroizing::new(vec![0u8; len.saturating_add(1)]);
-        let mut filled = 0usize;
-        let mut file = file;
-        while let Some(spare) = buf.get_mut(filled..).filter(|s| !s.is_empty()) {
-            let n = file.read(spare).map_err(io_err)?;
-            if n == 0 {
-                break;
-            }
-            filled = filled.saturating_add(n);
-        }
-        if filled > len {
-            return Err(perm(path, "changed while it was being read"));
-        }
-        let bytes = buf.get(..filled).ok_or(SecretsError::TooLarge)?;
-        Self::from_bytes(path.to_owned(), bytes)
+        let bytes = read_bounded(file, len, path)?;
+        Self::from_bytes(path.to_owned(), &bytes)
     }
 
     /// Builds a store from file bytes without touching the disk, applying every content rule
@@ -372,6 +356,33 @@ fn perm(path: &Path, msg: &str) -> SecretsError {
         path: path.display().to_string(),
         msg: msg.to_owned(),
     }
+}
+
+/// Reads the `len` bytes fstat reported. One exact-size zeroized buffer, filled by hand: no
+/// reallocation and no std probe buffer on the stack, so no plaintext copies are left behind.
+/// One spare byte detects a file that grew after the fstat.
+fn read_bounded(
+    mut file: File,
+    len: usize,
+    path: &Path,
+) -> Result<Zeroizing<Vec<u8>>, SecretsError> {
+    let mut buf = Zeroizing::new(vec![0u8; len.saturating_add(1)]);
+    let mut filled = 0usize;
+    while let Some(spare) = buf.get_mut(filled..).filter(|s| !s.is_empty()) {
+        let n = file.read(spare).map_err(|e| SecretsError::Io {
+            path: path.display().to_string(),
+            source: e,
+        })?;
+        if n == 0 {
+            break;
+        }
+        filled = filled.saturating_add(n);
+    }
+    if filled > len {
+        return Err(perm(path, "changed while it was being read"));
+    }
+    buf.truncate(filled);
+    Ok(buf)
 }
 
 fn parent_of(path: &Path) -> &Path {
