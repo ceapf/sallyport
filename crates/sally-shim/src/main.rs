@@ -51,6 +51,14 @@ fn run(mode: Mode) -> std::io::Result<()> {
             for spec in specs {
                 bound.push((bind(&spec)?, spec.socket));
             }
+            // Readiness, part of the binary's contract (crate docs): one line per listener, only
+            // after every bind succeeded, giving the bound address and never the socket path.
+            for (listener, _) in &bound {
+                say(&format!(
+                    "sally-shim: listening on {}",
+                    listener.local_addr()?
+                ));
+            }
             let limiter = Limiter::new(max_connections);
             let (tx, rx) = mpsc::channel();
             for (listener, socket) in bound {
