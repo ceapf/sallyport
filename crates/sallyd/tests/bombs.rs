@@ -100,6 +100,8 @@ fn rt_ag_09_a_memory_bomb_is_oom_killed_inside_the_container() {
         assert_eq!(read(&cg, "memory.swap.max").trim(), "0");
         let marker = std::env::current_dir().unwrap().join("oom");
         let _ = std::fs::remove_file(&marker);
+        let state = x.podman.hooks_dir().parent().unwrap().join("oom");
+        let _ = std::fs::remove_file(&state);
         let (_, out) = exec(
             &r,
             "awk 'BEGIN { s = \"x\"; while (1) s = s s }'; echo \"rc=$?\"",
@@ -118,6 +120,8 @@ fn rt_ag_09_a_memory_bomb_is_oom_killed_inside_the_container() {
             !marker.exists(),
             "conmon wrote into sallyd's working directory"
         );
+        // The control: the marker is written, into hermetic podman's state directory.
+        assert!(state.exists(), "conmon's oom marker in the state directory");
     });
 }
 

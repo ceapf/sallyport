@@ -90,8 +90,9 @@ pub fn staged_changes(
     Ok(out)
 }
 
-/// Most path bytes one listing keeps in memory: the sandbox chooses the names, and empty files
-/// cost almost nothing against `stage_size`, so the entry bound alone does not bound the memory.
+/// Most bytes one listing keeps in memory (path bytes plus a fixed per-entry cost): the sandbox
+/// chooses the names, and empty files cost almost nothing against `stage_size`, so the entry
+/// bound alone does not bound the memory.
 const MAX_LISTING_BYTES: u64 = 16 << 20;
 
 /// Entry count, listing size and deadline across all mounts of one listing.
@@ -114,9 +115,13 @@ impl Walk {
         }
     }
 
-    /// Accounts for one listed path; fails closed past `max_bytes`.
+    /// Accounts for one listed path, plus a fixed cost for its `Change` and allocation; fails
+    /// closed past `max_bytes`.
     fn keep(&mut self, path: &Path) -> Result<(), String> {
-        let len = u64::try_from(path.as_os_str().len()).unwrap_or(u64::MAX);
+        const PER_ENTRY: u64 = 64;
+        let len = u64::try_from(path.as_os_str().len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(PER_ENTRY);
         self.bytes = self.bytes.saturating_add(len);
         if self.bytes > self.max_bytes {
             return Err(format!(

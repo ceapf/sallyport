@@ -499,6 +499,11 @@ fn checker_requires_swap_equal_to_memory() {
         &allowed,
         "swap above memory",
     );
+    assert_forbidden(
+        &replacing(&a, "--memory-swap", &[&format!("--memory-swap={memory}")]),
+        &allowed,
+        "the = spelling",
+    );
     let spec = inference(&f, false, Some(ByteSize::from_bytes(2 << 30)));
     let inf = inference_argv(&f.common, &spec).unwrap();
     assert!(
@@ -509,6 +514,30 @@ fn checker_requires_swap_equal_to_memory() {
     let spec = inference(&f, false, None);
     let inf = inference_argv(&f.common, &spec).unwrap();
     assert!(!inf.iter().any(|x| x.starts_with("--memory")), "{inf:?}");
+    let ia = Allowed {
+        role: Role::Inference,
+        sources: vec![
+            Source {
+                path: spec.model.path().to_owned(),
+                guest: "/models/model.gguf".into(),
+                grant: Grant::Ro,
+            },
+            Source {
+                path: spec.socket_dir.clone(),
+                guest: "/run/sallyport".into(),
+                grant: Grant::Rw,
+            },
+        ],
+        scratch: None,
+        ..allowed.clone()
+    };
+    // The control: the same argv without the swap flag is accepted.
+    check_argv(&inf, &ia).unwrap();
+    assert_forbidden(
+        &with(&inf, &["--memory-swap", "1b"]),
+        &ia,
+        "swap without memory",
+    );
 }
 
 #[test]
