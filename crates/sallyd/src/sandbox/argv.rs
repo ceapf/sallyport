@@ -522,6 +522,19 @@ mod tests {
 
     use super::*;
 
+    /// Each character or segment that would change a `-v`/`--security-opt` argument's meaning
+    /// is refused on its own; the clean path is the control.
+    #[test]
+    fn path_args_refuse_every_separator_and_unclean_segment() {
+        assert_eq!(path_arg(Path::new("/a/b"), "p").unwrap(), "/a/b");
+        for bad in [
+            "/a:b", "/a,b", "/a\nb", "/a//b", "/a/./b", "/a/../b", "/a/b/", "a/b",
+        ] {
+            let e = path_arg(Path::new(bad), "p").unwrap_err();
+            assert!(matches!(e, ArgvError::Input(_)), "{bad:?}: {e:?}");
+        }
+    }
+
     /// The scanner is the only constructor of a [`GitScan`] outside this crate; the builder still
     /// re-validates every entry (defense in depth) and these are its refusals.
     #[test]

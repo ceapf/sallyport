@@ -538,6 +538,12 @@ fn checker_requires_swap_equal_to_memory() {
         &ia,
         "swap without memory",
     );
+    // Inference carries no hostname at all, not even the other roles' fixed one.
+    assert_forbidden(
+        &with(&inf, &["--hostname", "sandbox"]),
+        &ia,
+        "inference hostname",
+    );
 }
 
 #[test]
@@ -565,6 +571,8 @@ fn checker_refuses_wrong_values_of_allowed_options() {
         ("--pids-limit", &["--pids-limit", "-1"]),
         ("--cpus", &["--cpus", "x"]),
         ("--cpus", &["--cpus", "0.0"]),
+        ("--cpus", &["--cpus", "1.x"]),
+        ("--cpus", &["--cpus", "x.1"]),
         ("--memory", &["--memory", "1g"]),
         ("--memory", &["--memory", "0b"]),
         ("--ulimit", &["--ulimit", "core=1"]),

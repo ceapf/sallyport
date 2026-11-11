@@ -206,6 +206,45 @@ fn unapproved_shell_requires_acknowledgement() {
     assert_ok(&f.load("tools:\n  builtin: [shell]\n  shell: allow\n"));
 }
 
+/// What the summary says in each case the user must be able to tell apart: an approval that
+/// covers only some paths, a proxy with nothing to reach, a host anyone can register, shell
+/// without approval but with destructive commands gated, and an MCP argument that needs quoting.
+#[test]
+fn summary_wording_tells_each_case_apart() {
+    let f = Fixture::new();
+    let research = mount("~/Documents/research", "/workspace/r", "brokered");
+    let cases = [
+        (
+            format!(
+                "{research}      approve:\n        writes: [\"drafts/*.md\"]\ntools:\n  builtin: [fs_write]\n"
+            ),
+            "can write there; your approval is needed only for drafts/*.md",
+        ),
+        (
+            "network:\n  mode: proxy\n  allow: []\n".to_owned(),
+            "has no network access (proxy on, but no hosts allowed).",
+        ),
+        (
+            format!(
+                "{research}network:\n  mode: proxy\n  allow:\n    - host: \"*.github.io\"\n  acknowledge_unrestricted_egress: true\n"
+            ),
+            "can reach *.github.io (anyone can register these) on port 443",
+        ),
+        (
+            "tools:\n  builtin: [shell]\n  shell: allow\n".to_owned(),
+            "can run shell commands without approval (destructive ones need approval).",
+        ),
+        (
+            "tools:\n  mcp:\n    - {name: a, command: [srv, \"x`y\", 'say\"hi']}\n".to_owned(),
+            "srv \"x`y\" \"say\\\"hi\"",
+        ),
+    ];
+    for (body, want) in cases {
+        let s = summary(&f.load(&body).unwrap().manifest);
+        assert!(s.contains(want), "{want}\n---\n{s}");
+    }
+}
+
 #[test]
 fn needless_acknowledgement_is_an_error() {
     // B3: unnecessary entries are errors, so stale acknowledgements cannot linger.

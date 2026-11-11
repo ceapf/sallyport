@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use jiff::Timestamp;
 use proptest::prelude::*;
 use sally_core::audit::{
-    Actor, Appended, AuditError, AuditWriter, Clock, Detail, GENESIS_HASH, MAX_ARGS_BYTES,
-    NewEntry, Redactor, VerifyErrorKind, verify,
+    Actor, Appended, AuditError, AuditWriter, Clock, Detail, Entry, GENESIS_HASH, MAX_ARGS_BYTES,
+    MAX_LINE_BYTES, NewEntry, Redactor, VerifyErrorKind, parse_line, verify,
 };
 use sally_core::manifest::AuditLevel;
 use serde_json::json;
@@ -153,6 +153,70 @@ fn entries_are_chained_from_the_genesis_hash() {
     assert_eq!(
         (report.entries, report.last_seq, report.last_hash),
         (3, 3, prev)
+    );
+}
+
+/// A good entry, changed by `f`, then re-sealed: canonical, with a correct `hash`, so only the
+/// field rules can refuse it. `args_sha256` is recomputed unless `stale_args`.
+fn resealed(f: impl Fn(&mut Entry), stale_args: bool) -> Vec<u8> {
+    let s = Scratch::new("reseal");
+    let mut e = parse_line(lines(&filled(&s, 1))[0].as_bytes()).unwrap();
+    f(&mut e);
+    if !stale_args {
+        e.args_sha256 = sha256_hex(serde_json::to_string(&e.args).unwrap().as_bytes());
+    }
+    e.hash = e.compute_hash();
+    e.to_line().into_bytes()
+}
+
+/// Every field rule refuses on its own: a line that is canonical and correctly hashed is still
+/// refused for one bad field, and accepted for an unusual but valid one.
+#[test]
+fn each_field_rule_refuses_a_correctly_hashed_line() {
+    use VerifyErrorKind::{ArgsHashMismatch, Malformed};
+    let ts_long = |e: &mut Entry| e.ts.push('0');
+    let cases: Vec<(&str, Vec<u8>, Result<(), VerifyErrorKind>)> = vec![
+        ("control", resealed(|_| {}, false), Ok(())),
+        ("seq 0", resealed(|e| e.seq = 0, false), Err(Malformed)),
+        (
+            "ts not a time",
+            resealed(|e| e.ts = "x".into(), false),
+            Err(Malformed),
+        ),
+        (
+            "ts one digit long",
+            resealed(ts_long, false),
+            Err(Malformed),
+        ),
+        (
+            "decision with digits, _ . -",
+            resealed(|e| e.decision = Some("deny_2.x-y".into()), false),
+            Ok(()),
+        ),
+        // Two keys that are not the truncation marker: the args hash is still checked.
+        (
+            "not a marker",
+            resealed(|e| e.args = json!({ "truncated": false, "bytes": 1 }), true),
+            Err(ArgsHashMismatch),
+        ),
+    ];
+    for (what, line, want) in cases {
+        assert_eq!(parse_line(&line).map(|_| ()), want, "{what}");
+    }
+}
+
+/// The line bound is inclusive and restated here: 8 KiB passes the length check (and fails
+/// as JSON), one byte more is too long. Args are cut at 4 KiB.
+#[test]
+fn line_and_args_bounds_are_8_and_4_kib() {
+    assert_eq!((MAX_LINE_BYTES, MAX_ARGS_BYTES), (8192, 4096));
+    assert_eq!(
+        parse_line(&[b'x'; 8192]).map(|_| ()),
+        Err(VerifyErrorKind::Malformed)
+    );
+    assert_eq!(
+        parse_line(&[b'x'; 8193]).map(|_| ()),
+        Err(VerifyErrorKind::LineTooLong)
     );
 }
 
@@ -421,6 +485,51 @@ fn redactor_debug_hides_values_and_patterns() {
     let shown = format!("{r:?}");
     assert!(!shown.contains(&secret));
     assert!(!shown.contains(&secret[..12]));
+    // It still says what it holds: how many secrets, without them.
+    assert!(shown.starts_with("Redactor {"), "{shown}");
+    assert!(shown.contains("secrets: 1"), "{shown}");
+}
+
+/// Hits are merged only when they overlap: overlapping secrets go as one placeholder, adjacent
+/// or separate ones keep their own.
+#[test]
+fn overlapping_hits_merge_and_adjacent_ones_do_not() {
+    let r = Redactor::new([("A", "abcdef"), ("B", "defghi"), ("C", "uvw"), ("D", "xyz")]);
+    let cases = [
+        ("<abcdefghi>", "<[REDACTED:A]>"),
+        ("<uvwxyz>", "<[REDACTED:C][REDACTED:D]>"),
+        ("<uvw-xyz>", "<[REDACTED:C]-[REDACTED:D]>"),
+        ("<abcdef-defghi>", "<[REDACTED:A]-[REDACTED:B]>"),
+    ];
+    for (input, want) in cases {
+        assert_eq!(r.redact_str(input), want, "{input}");
+    }
+}
+
+/// Nesting is cut at depth 32, in arrays and objects alike: a leaf at depth 32 is redacted
+/// normally, one at depth 33 becomes the marker.
+#[test]
+fn values_are_kept_to_depth_32_and_cut_below() {
+    let r = Redactor::new([("S", "hunter2hunter2")]);
+    let nest = |depth: usize, object: bool| {
+        (0..depth).fold(json!("leaf"), |v, _| {
+            if object {
+                json!({ "k": v })
+            } else {
+                json!([v])
+            }
+        })
+    };
+    for object in [false, true] {
+        let kept = nest(32, object);
+        assert_eq!(r.redact_value(&kept), kept, "object: {object}");
+        let cut = r.redact_value(&nest(33, object));
+        assert!(
+            cut.to_string().contains("[REDACTED:too-deep]"),
+            "object: {object}"
+        );
+        assert!(!cut.to_string().contains("leaf"), "object: {object}");
+    }
 }
 
 #[test]
@@ -760,6 +869,60 @@ fn verify_errors_name_the_seq_and_never_echo_log_text() {
     let shown = format!("{e} | {e:?}");
     assert!(shown.contains("seq 2"), "{shown}");
     assert!(!shown.contains("canary-text-in-log"));
+    // The file and the 1-based line are named, so a person can find the entry.
+    assert_eq!(e.line, Some(2));
+    assert!(
+        e.to_string()
+            .starts_with("audit verification failed at seq 2 (audit-202601.jsonl line 2): "),
+        "{e}"
+    );
+}
+
+/// The line bound when reading is inclusive (8 KiB plus the newline is read whole and then
+/// parsed), and an unterminated tail longer than the bound is too long, not torn.
+#[test]
+fn verify_reads_a_line_of_exactly_8_kib_and_refuses_a_longer_tail() {
+    let cases: [(&[u8], VerifyErrorKind); 2] = [
+        (
+            &[b"x".repeat(8192).as_slice(), b"\n"].concat(),
+            VerifyErrorKind::Malformed,
+        ),
+        (&b"x".repeat(9000), VerifyErrorKind::LineTooLong),
+    ];
+    for (tail, want) in cases {
+        let s = Scratch::new("8kib");
+        let log = filled(&s, 1);
+        let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        std::io::Write::write_all(&mut f, tail).unwrap();
+        let e = verify(&s.dir()).unwrap_err();
+        assert_eq!(
+            (e.seq, e.kind, e.line),
+            (2, want, Some(2)),
+            "{} bytes",
+            tail.len()
+        );
+    }
+}
+
+/// Only the newest file may end in a torn line; in an older one it is damage.
+#[test]
+fn an_unterminated_line_in_an_older_file_is_malformed() {
+    let s = Scratch::new("torn-old");
+    let clock = TestClock::at(JAN);
+    let mut w = open(&s, &clock);
+    w.append(note("a.one"), AuditLevel::Full).unwrap();
+    w.append(note("a.two"), AuditLevel::Full).unwrap();
+    clock.set(FEB);
+    w.append(note("a.three"), AuditLevel::Full).unwrap();
+    drop(w);
+    let jan = s.dir().join("audit-202601.jsonl");
+    let data = std::fs::read(&jan).unwrap();
+    std::fs::write(&jan, &data[..data.len() - 1]).unwrap();
+    let e = verify(&s.dir()).unwrap_err();
+    assert_eq!(
+        (e.seq, e.kind, e.location.as_str(), e.line),
+        (2, VerifyErrorKind::Malformed, "audit-202601.jsonl", Some(2))
+    );
 }
 
 // ---- recovery -----------------------------------------------------------------------------
@@ -1233,4 +1396,151 @@ fn object_keys_are_written_in_sorted_order() {
         line.contains("\"args\":{\"alpha\":{\"b\":2,\"y\":1},\"zeta\":1}"),
         "{line}"
     );
+}
+
+// ---- writer: accessors, tip and open-time checks ------------------------------------------
+
+#[test]
+fn system_clock_reads_the_real_time() {
+    let drift = Timestamp::now().as_second() - sally_core::audit::SystemClock.now().as_second();
+    assert!(drift.abs() <= 5, "{drift}");
+}
+
+#[test]
+fn new_entry_exposes_its_event_and_unredacted_args() {
+    let e = note("tool.executed").args(json!({ "cmd": "ls" }));
+    assert_eq!(e.event(), "tool.executed");
+    assert_eq!(e.arguments(), &json!({ "cmd": "ls" }));
+}
+
+/// `tip` names the newest entry, and a clean reopen appends nothing (no recovery record).
+#[test]
+fn tip_is_the_newest_entry_and_a_clean_reopen_writes_nothing() {
+    let s = Scratch::new("tip");
+    let clock = TestClock::at(JAN);
+    let w = open(&s, &clock);
+    assert_eq!(w.tip(), (0, GENESIS_HASH));
+    let shown = format!("{w:?}");
+    assert!(
+        shown.starts_with("AuditWriter {") && shown.contains("tip_seq: 0"),
+        "{shown}"
+    );
+    drop(w);
+    let log = filled(&s, 2);
+    let last: serde_json::Value = serde_json::from_str(&lines(&log)[1]).unwrap();
+    let w = open(&s, &clock);
+    assert_eq!(w.tip(), (2, last["hash"].as_str().unwrap()));
+    drop(w);
+    assert_eq!(lines(&log).len(), 2);
+}
+
+/// The lock file and the log files are never opened through a symlink.
+#[test]
+fn open_refuses_a_symlinked_lock_or_log_file() {
+    for name in ["audit.lock", "audit-202601.jsonl"] {
+        let s = Scratch::new("symlinked");
+        let log = filled(&s, 1);
+        let target = s.dir().join("elsewhere");
+        let p = s.dir().join(name);
+        std::fs::rename(if name == "audit.lock" { &p } else { &log }, &target).unwrap();
+        symlink(&target, &p).unwrap();
+        let clock = TestClock::at(JAN);
+        assert!(
+            AuditWriter::open(&s.dir(), Box::new(clock)).is_err(),
+            "{name}"
+        );
+    }
+}
+
+fn corrupt_msg(s: &Scratch) -> &'static str {
+    match AuditWriter::open(&s.dir(), Box::new(TestClock::at(JAN))) {
+        Err(AuditError::Corrupt { msg, .. }) => msg,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The tail scan reads at most two line bounds plus two bytes (16386) from the end: a torn tail
+/// that fits with the newline before it is dropped; a longer one, or a complete last line over
+/// the bound, is refused as corrupt.
+#[test]
+fn the_tail_scan_is_bounded_at_two_lines() {
+    for (torn, ok) in [(16_385, true), (20_000, false)] {
+        let s = Scratch::new("tornlen");
+        let log = filled(&s, 3);
+        let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        std::io::Write::write_all(&mut f, &vec![b'x'; torn]).unwrap();
+        drop(f);
+        if ok {
+            drop(open(&s, &TestClock::at(JAN)));
+            verify(&s.dir()).unwrap();
+        } else {
+            assert_eq!(corrupt_msg(&s), "has a torn line longer than the limit");
+        }
+    }
+    let s = Scratch::new("longline");
+    let log = filled(&s, 1);
+    let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+    std::io::Write::write_all(&mut f, &[vec![b'x'; 20_000], vec![b'\n']].concat()).unwrap();
+    drop(f);
+    assert_eq!(corrupt_msg(&s), "has a line longer than the limit");
+    // A log far larger than the scan window reopens normally.
+    let s = Scratch::new("biglog");
+    filled(&s, 200);
+    let mut w = open(&s, &TestClock::at(JAN));
+    assert_eq!(w.tip().0, 200);
+    w.append(note("a.b"), AuditLevel::Full).unwrap();
+}
+
+/// A first write torn before any newline leaves no entry: the file is all torn bytes.
+#[test]
+fn a_file_holding_only_a_torn_first_entry_opens_empty() {
+    let s = Scratch::new("tornfirst");
+    drop(open(&s, &TestClock::at(JAN)));
+    let log = s.dir().join("audit-202601.jsonl");
+    std::fs::write(&log, b"{\"seq\":1,\"ts\":").unwrap();
+    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let w = open(&s, &TestClock::at(JAN));
+    // No entry survives the tear: whatever is written next starts the chain at genesis.
+    let mut w = w;
+    w.append(note("a.b"), AuditLevel::Full).unwrap();
+    drop(w);
+    let first: serde_json::Value = serde_json::from_str(&lines(&log)[0]).unwrap();
+    assert_eq!(
+        (first["seq"].as_u64(), first["prev_hash"].as_str()),
+        (Some(1), Some(GENESIS_HASH))
+    );
+    verify(&s.dir()).unwrap();
+}
+
+/// Only the newest file may end torn; an older one read because the newest is empty may not.
+#[test]
+fn an_older_file_ending_torn_is_corrupt_on_open() {
+    let s = Scratch::new("oldtorn");
+    let clock = TestClock::at(JAN);
+    let mut w = open(&s, &clock);
+    w.append(note("a.one"), AuditLevel::Full).unwrap();
+    w.append(note("a.two"), AuditLevel::Full).unwrap();
+    drop(w);
+    let jan = s.dir().join("audit-202601.jsonl");
+    let data = std::fs::read(&jan).unwrap();
+    std::fs::write(&jan, &data[..data.len() - 1]).unwrap();
+    let feb = s.dir().join("audit-202602.jsonl");
+    std::fs::write(&feb, b"").unwrap();
+    std::fs::set_permissions(&feb, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(corrupt_msg(&s), "does not end with a complete entry");
+}
+
+/// A missing head is recreated only for a log that is exactly one genesis entry: seq 1 that
+/// does not start from the genesis hash is a cut log.
+#[test]
+fn a_missing_head_is_recreated_only_for_a_genesis_entry() {
+    let s = Scratch::new("nohead");
+    let log = filled(&s, 1);
+    let mut e = parse_line(lines(&log)[0].as_bytes()).unwrap();
+    e.prev_hash = "1".repeat(64);
+    e.hash = e.compute_hash();
+    write_lines(&log, &[e.to_line()]);
+    std::fs::remove_file(s.dir().join("audit.head")).unwrap();
+    let r = AuditWriter::open(&s.dir(), Box::new(TestClock::at(JAN)));
+    assert!(matches!(r, Err(AuditError::HeadMissing)), "{r:?}");
 }
