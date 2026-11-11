@@ -1,5 +1,5 @@
 /*
- * Red-team syscall probe (RT-NET-12, RT-FS-17). Test-only: built at test time with
+ * Red-team syscall probe (RT-NET-01, RT-NET-08, RT-NET-12, RT-FS-17). Test-only: built at test time with
  * `cc -static`, copied into the throwaway test image, never linked into or shipped with any
  * Sallyport binary or release image (CLAUDE.md, exception to the no-unsafe rule). Keep it one
  * small file.
@@ -8,10 +8,14 @@
  *   probe unshare <flags>                     unshare(2)
  *   probe clone <flags>                       clone(2), fork-like; the child exits at once
  *   probe clone3 <flags>                      clone3(2), fork-like; the child exits at once
+ *   probe connect <family> <type> <protocol> <address> <port>
+ *                                             socket(2), then connect(2) to an IPv4 (family 2)
+ *                                             or IPv6 (family 10) literal; the first error wins
  *
  * Numbers are decimal or 0x-hex. Prints "ok" or "errno=<n>" and exits 0 or 1; usage errors exit 2.
  */
 #define _GNU_SOURCE
+#include <arpa/inet.h>
 #include <errno.h>
 #include <sched.h>
 #include <signal.h>
@@ -61,6 +65,30 @@ static long reap(long pid) {
     return pid;
 }
 
+/* socket(family, type, protocol), then connect to `addr`:`port`. */
+static long connect_to(char **a) {
+    int family = (int)num(a[0]);
+    struct sockaddr_in in4;
+    struct sockaddr_in6 in6;
+    memset(&in4, 0, sizeof in4);
+    memset(&in6, 0, sizeof in6);
+    in4.sin_family = AF_INET;
+    in6.sin6_family = AF_INET6;
+    in4.sin_port = in6.sin6_port = htons((uint16_t)num(a[4]));
+    int parsed = family == AF_INET ? inet_pton(AF_INET, a[3], &in4.sin_addr)
+                                   : inet_pton(AF_INET6, a[3], &in6.sin6_addr);
+    if ((family != AF_INET && family != AF_INET6) || parsed != 1) {
+        fprintf(stderr, "bad family or address: %s %s\n", a[0], a[3]);
+        exit(2);
+    }
+    long fd = socket(family, (int)num(a[1]), (int)num(a[2]));
+    if (fd < 0) {
+        return fd;
+    }
+    return family == AF_INET ? connect((int)fd, (struct sockaddr *)&in4, sizeof in4)
+                             : connect((int)fd, (struct sockaddr *)&in6, sizeof in6);
+}
+
 int main(int argc, char **argv) {
     if (argc == 5 && strcmp(argv[1], "socket") == 0) {
         long fd = socket((int)num(argv[2]), (int)num(argv[3]), (int)num(argv[4]));
@@ -80,6 +108,10 @@ int main(int argc, char **argv) {
         args.exit_signal = SIGCHLD;
         return report(reap(syscall(SYS_clone3, &args, sizeof args)));
     }
-    fprintf(stderr, "usage: probe socket <family> <type> <protocol> | unshare|clone|clone3 <flags>\n");
+    if (argc == 7 && strcmp(argv[1], "connect") == 0) {
+        return report(connect_to(argv + 2));
+    }
+    fprintf(stderr, "usage: probe socket <family> <type> <protocol> | unshare|clone|clone3 <flags>"
+                    " | connect <family> <type> <protocol> <address> <port>\n");
     return 2;
 }
