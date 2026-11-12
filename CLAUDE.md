@@ -161,6 +161,16 @@ manually for the tasks marked opus). Subagents are the files in `.claude/agents/
   after the first has merged, or stack the branch on it. Never sit idle waiting on a run that
   nothing depends on.
 
+## Working in two lanes
+
+Two sessions may work in two worktrees at once; container tests are run-scoped
+(`scripts/test-run.sh`), so both may run `make test`/`make redteam` side by side.
+- Each lane rebases on `main` before its push.
+- Merges still go one at a time.
+- A lane never touches the other lane's branch.
+- Shared files (`CLAUDE.md`, `REDTEAM_SUITE.md`, `.cargo/mutants.toml`, `Cargo.lock`): expect a
+  rebase conflict and resolve it by keeping both sides' entries.
+
 ## Public repository rules
 
 This repository is public. These rules hold for files, commit messages, PR titles and bodies,

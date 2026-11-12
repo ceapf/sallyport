@@ -29,6 +29,11 @@ line per fact, with where it was found. Check a note again before relying on it 
 - Rootless podman's `:O` overlays use the kernel overlay: whiteouts are 0/0 character devices,
   `rm -rf dir && mkdir dir` gives an opaque dir (`user.overlay.opaque`), `mv` of a host dir is
   copy + whiteout (EXDEV, no redirect_dir). (6c-2, FS-15)
+- `podman rmi <repo:tag>` on an image that has another tag only untags ("Untagged: …"); the
+  image stays, and `<repo>@<digest>` still resolves through the remaining tag. (8-prC, Q25)
+- `podman build` keeps intermediate layer images (`<none>` in `images -a`) unless
+  `--layers=false`. `ps --filter name=` is an unanchored regex: match names with `grep -E '^…'`.
+  (8-prC)
 
 ## Kernel and namespaces
 
