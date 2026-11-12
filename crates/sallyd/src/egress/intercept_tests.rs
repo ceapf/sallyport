@@ -1176,6 +1176,35 @@ async fn a_request_after_the_upstream_closed_is_never_forwarded_or_counted() {
     assert_eq!(close["end"], json!(end), "{out}");
 }
 
+/// Architect ruling R1 (b), the branch the pipelined test cannot reach on demand: an upstream
+/// connection that is gone before a request is audited gets the close entry and the 502, and
+/// the request is neither audited nor counted.
+#[tokio::test]
+async fn a_request_for_a_closed_upstream_connection_is_not_audited_or_counted() {
+    let r = rig(Opts::default());
+    let (near, _far) = duplex(1 << 10);
+    let (mut sender, conn) =
+        hyper::client::conn::http1::handshake::<_, Capped<Incoming>>(TokioIo::new(near))
+            .await
+            .unwrap();
+    drop(conn);
+    let auth = Authority {
+        host: HOST.to_owned(),
+        port: 443,
+    };
+    let used = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(93, 184, 215, 9)), 443);
+    let st = State::new(auth, used, Vec::new(), Arc::new(Activity::new()));
+    let reply = r.proxy.upstream_ready(&st, &mut sender).await;
+    let resp = reply.expect("a closed connection is not ready").unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(r.sink.events(), ["egress.close"]);
+    let close = r.sink.args("egress.close");
+    assert_eq!(
+        (close["end"].clone(), close["requests"].clone()),
+        (json!("upstream-closed"), json!(0))
+    );
+}
+
 /// A stop during the upstream TLS handshake ends the tunnel `session-stopped` at once, with no
 /// `200` and no reply (9a-2 review: the handshake was not raced against the stop).
 #[tokio::test]
