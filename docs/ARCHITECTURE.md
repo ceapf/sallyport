@@ -628,10 +628,24 @@ sallyport/
   `head-too-large`; no complete head within 10 s: closed without a reply (`head-timeout`); not
   HTTP/1.x: 400 `malformed`; any method but `CONNECT` (absolute-form included): 405
   `plain-http-unsupported`. The authority is `host:port` with the port required; IP literals
-  are refused in every spelling (`ip-literal`), userinfo is malformed. Then policy, the host's
-  own addresses, one lookup (5 s), the address filter over every address (any denied address
-  refuses the name), at most 3 pinned addresses tried (10 s each), `200`, and a tunnel with one
-  16 KiB buffer per direction and a 300 s idle limit shared by both directions.
+  are refused in every spelling (`ip-literal`), userinfo is malformed, and a host of one label
+  is malformed (the manifest validator refuses one too). The head is re-parsed only after the
+  first read, a read that brought a line end, or a full buffer, at most 128 times (more is
+  `head-too-large`), so a client sending a byte at a time costs no more than one sending a line
+  at a time. Then policy, the host's own addresses (a `/proc` file over 1 MiB, or unreadable,
+  refuses every connection as `ip-range-denied`), one lookup (5 s) of the absolute name
+  `host.` (no search list), the address filter over every address (any denied address refuses
+  the name; an answer of more than 64 addresses is `resolve-failed`, before duplicates are
+  dropped), at most 3 pinned addresses tried (10 s each), `200`, and a tunnel with one 16 KiB
+  buffer per direction and a 300 s idle limit shared by both directions.
+- **Proxy resource bounds** (Task 8). At most 64 `getaddrinfo` calls run at once across every
+  session; a lookup that finds no free slot is `resolve-failed` at once (never queued), and a
+  slot stays taken until its call returns, even after the 5 s timeout. Lookups and audit appends
+  use separate blocking threads, so stuck lookups never delay the audit log. Residual: one session
+  can hold every slot for about a resolver timeout (#47). Each session's accept loop holds at
+  most `max_connections + 64` accepted connections (the extra ones are answered 429); past that
+  it stops accepting until one ends. Residual: descriptors are not yet bounded across sessions
+  (#48).
 - **Egress audit events** (Task 8). Written at every `audit.level`, each before its effect:
   - `egress.allow` (decision `allow`), before the first dial and the `200`: `{host, port,
     addresses}` — the addresses that passed the filter, at most 16, in the order they are tried.

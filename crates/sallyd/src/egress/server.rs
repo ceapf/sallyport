@@ -38,6 +38,15 @@ pub const REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 pub const MAX_DIALS: usize = 3;
 /// Addresses kept from one lookup (all are filtered; architect Q9 bounds the audit entry).
 pub const MAX_ADDRS: usize = 16;
+/// Addresses one lookup may return at all (architect Q21). Checked on the raw answer, before
+/// duplicates are dropped and before the filter: a longer answer is `resolve-failed`. Every one of
+/// up to this many is filtered; only the first [`MAX_ADDRS`] distinct ones are kept.
+pub const MAX_ANSWER: usize = 64;
+/// Connections accepted past `max_connections` at one time, each only to be answered 429 (architect
+/// Q20). Beyond the sum, the accept loop stops accepting until one ends.
+// TODO(#48): raise RLIMIT_NOFILE and cap connections across sessions; one session at 1024 needs
+// about 1088 + 1024 descriptors.
+pub const ADMISSION_EXTRA: usize = 64;
 /// The reply that opens a tunnel.
 pub const ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
 /// `filter` value of a refusal made because the host's own addresses could not be read.
@@ -117,6 +126,18 @@ impl Limits {
             max_connections,
         }
     }
+
+    /// Accepted connections in flight at most: the cap plus [`ADMISSION_EXTRA`], within what a
+    /// semaphore can hold.
+    #[must_use]
+    pub fn in_flight(&self) -> usize {
+        permits(self.max_connections.saturating_add(ADMISSION_EXTRA))
+    }
+}
+
+/// `n`, clamped to what a [`Semaphore`] can hold.
+fn permits(n: usize) -> usize {
+    n.min(Semaphore::MAX_PERMITS)
 }
 
 /// What a session's proxy is built from.
@@ -194,7 +215,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
     #[must_use]
     pub fn new(p: Parts<R, D, H>) -> Self {
         Self {
-            slots: Arc::new(Semaphore::new(p.limits.max_connections)),
+            slots: Arc::new(Semaphore::new(permits(p.limits.max_connections))),
             policy: p.policy,
             resolver: p.resolver,
             dialer: p.dialer,
@@ -207,6 +228,12 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         }
     }
 
+    /// The session's limits.
+    #[must_use]
+    pub fn limits(&self) -> &Limits {
+        &self.limits
+    }
+
     /// Ends every connection: those still being checked close without a reply, open tunnels
     /// end with `session-stopped`. Connections served after this close at once.
     pub fn stop(&self) {
@@ -215,10 +242,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
 
     /// Resolves once [`Proxy::stop`] was called.
     fn stopped(&self) -> impl Future<Output = ()> + Send + 'static {
-        let mut rx = self.stop.subscribe();
-        async move {
-            let _ = rx.wait_for(|s| *s).await;
-        }
+        until_true(self.stop.subscribe())
     }
 
     /// Handles one client stream to its end. Client input never panics it; every refusal is
@@ -289,7 +313,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         })?;
         let lookup = self.resolver.resolve(&a.host, a.port);
         let found = match tokio::time::timeout(self.limits.resolve, lookup).await {
-            Ok(Ok(found)) if !found.is_empty() => found,
+            Ok(Ok(found)) if !found.is_empty() && found.len() <= MAX_ANSWER => found,
             _ => return Err(Reason::ResolveFailed.into()),
         };
         if found.iter().any(|s| addr::is_denied(s.ip(), &own)) {
@@ -328,6 +352,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
             }
         };
         let totals = self.tunnel(client, upstream, &c.rest).await;
+        // TODO(#49): log a close entry that could not be written.
         let _ = self.close(&c.auth, Some(used), totals).await;
     }
 
@@ -411,6 +436,12 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
     }
 }
 
+/// Resolves once `rx` holds `true`, or its sender is gone. Owns its receiver, so the future is
+/// `Send + 'static` and can be pinned before a `select!` loop.
+pub(crate) async fn until_true(mut rx: watch::Receiver<bool>) {
+    let _ = rx.wait_for(|s| *s).await.map(drop);
+}
+
 /// Writes the reply to `reason` within [`REPLY_TIMEOUT`], then closes the sending half.
 async fn write_reply<C: AsyncWrite + Unpin>(client: &mut C, reason: Reason) {
     let send = async {
@@ -475,7 +506,7 @@ fn close_args(a: &Authority, used: Option<SocketAddr>, t: Totals) -> Value {
 /// The reply to a refused request: status, the reason code as the body, `Connection: close`.
 /// The target is never echoed.
 #[must_use]
-pub fn reply(reason: Reason) -> String {
+pub(crate) fn reply(reason: Reason) -> String {
     let code = reason.as_str();
     let allow = if reason == Reason::PlainHttpUnsupported {
         "Allow: CONNECT\r\n"
@@ -512,25 +543,34 @@ fn phrase(status: u16) -> &'static str {
 /// The reason and the bytes received: [`Reason::HeadTooLarge`] past 8 KiB or 100 header lines,
 /// [`Reason::HeadTimeout`] when `limit` passes first, [`Reason::Malformed`] for a head that is not
 /// HTTP/1.x or a client that closes or fails before completing one.
-pub async fn read_head<S: AsyncRead + Unpin>(
+pub(crate) async fn read_head<S: AsyncRead + Unpin>(
     client: &mut S,
     buf: &mut [u8; MAX_HEAD],
     limit: Duration,
 ) -> Result<usize, (Reason, usize)> {
     let mut filled = 0;
     let reading = async {
+        let (mut fresh, mut parses) = (0..0, 0);
         loop {
-            match head::parse(buf.get(..filled).unwrap_or_default()) {
-                Parsed::Complete(_) => return Ok(()),
-                Parsed::TooLarge => return Err(Reason::HeadTooLarge),
-                Parsed::Malformed => return Err(Reason::Malformed),
-                Parsed::Partial => {}
+            let window = buf.get(..filled).unwrap_or_default();
+            if worth_parsing(window, &fresh) {
+                parses += 1;
+                if parses > MAX_PARSES {
+                    return Err(Reason::HeadTooLarge);
+                }
+                match head::parse(window) {
+                    Parsed::Complete(_) => return Ok(()),
+                    Parsed::TooLarge => return Err(Reason::HeadTooLarge),
+                    Parsed::Malformed => return Err(Reason::Malformed),
+                    Parsed::Partial => {}
+                }
             }
             let free = buf.get_mut(filled..).ok_or(Reason::HeadTooLarge)?;
             let n = client.read(free).await.map_err(|_| Reason::Malformed)?;
             if n == 0 {
                 return Err(Reason::Malformed);
             }
+            fresh = filled..filled + n;
             filled += n;
         }
     };
@@ -538,6 +578,25 @@ pub async fn read_head<S: AsyncRead + Unpin>(
         .await
         .unwrap_or(Err(Reason::HeadTimeout));
     got.map(|()| filled).map_err(|r| (r, filled))
+}
+
+/// Parses of one request head at most (Rust review M2). The head is parsed after the first read,
+/// after a read that brought a line end, and when the buffer is full, so parsing costs at most
+/// this many passes over 8 KiB, not one per byte. A head has at most 102 lines (request line, 100
+/// headers, blank line); a client that needs more parses than this is refused as too large.
+pub const MAX_PARSES: usize = 128;
+
+/// Whether the head in `window` could have changed state with the bytes at `fresh`: the first
+/// read (garbage is refused at once), a read with a line end (the head may now be complete), or
+/// a full buffer (it is now too large). Bytes in the middle of a line change nothing.
+fn worth_parsing(window: &[u8], fresh: &std::ops::Range<usize>) -> bool {
+    let first = fresh.start == 0;
+    let full = window.len() >= MAX_HEAD;
+    first
+        || full
+        || window
+            .get(fresh.clone())
+            .is_some_and(|b| b.contains(&b'\n'))
 }
 
 #[cfg(test)]

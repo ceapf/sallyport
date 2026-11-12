@@ -22,7 +22,8 @@ pub struct Authority {
 pub enum AuthorityError {
     /// The host is an IP address (dotted, integer, hex, octal, or IPv6, bracketed or not).
     IpLiteral,
-    /// Anything else: no port, a bad port, userinfo, illegal characters, empty labels.
+    /// Anything else: no port, a bad port, userinfo, illegal characters, empty labels, a host
+    /// of one label.
     Malformed,
 }
 
@@ -53,6 +54,9 @@ pub fn parse(target: &str) -> Result<Authority, AuthorityError> {
     let lower = host.to_ascii_lowercase();
     let host = lower.strip_suffix('.').unwrap_or(&lower);
     match parse_hostname(host) {
+        // One label (`localhost`, `intranet`) is never a public name: refused before policy,
+        // so no `*` rule can reach /etc/hosts or a resolver search list.
+        Ok(host) if !host.contains('.') => Err(AuthorityError::Malformed),
         Ok(host) => Ok(Authority { host, port }),
         Err(HostError::IpLiteral) => Err(AuthorityError::IpLiteral),
         Err(_) => Err(AuthorityError::Malformed),
@@ -148,6 +152,11 @@ mod tests {
             "*.mock.test:443",
             "mock_test:443",
             "mock.tést:443",
+            // One label: never looked up (a search list or /etc/hosts could answer it).
+            "localhost:443",
+            "intranet:443",
+            "intranet.:443",
+            "LOCALHOST.:443",
             ":443",
             "",
             long_label.as_str(),

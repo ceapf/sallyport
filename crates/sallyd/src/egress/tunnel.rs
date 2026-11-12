@@ -92,6 +92,8 @@ where
         if n == 0 {
             return w.shutdown().await;
         }
+        // Activity twice: when bytes arrive, and when a write that waited on a slow reader
+        // completes, so a long blocked write is not mistaken for an idle tunnel.
         act.touch();
         w.write_all(buf.get(..n).unwrap_or_default()).await?;
         count.fetch_add(u64::try_from(n).unwrap_or(u64::MAX), Ordering::Relaxed);
@@ -112,7 +114,7 @@ async fn idle_out(act: &Activity, idle: Duration) {
 
 /// Runs the tunnel between `client` and `upstream` until both directions finished, either side
 /// failed, nothing moved for `idle`, or `stop` resolved.
-pub async fn run<C, U>(
+pub(crate) async fn run<C, U>(
     client: C,
     upstream: U,
     idle: Duration,

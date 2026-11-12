@@ -25,7 +25,7 @@ pub enum HostAddrsError {
 ///
 /// # Errors
 /// [`HostAddrsError`]; the caller refuses the connection.
-pub fn parse(fib_trie: &str, if_inet6: Option<&str>) -> Result<Vec<IpAddr>, HostAddrsError> {
+pub(crate) fn parse(fib_trie: &str, if_inet6: Option<&str>) -> Result<Vec<IpAddr>, HostAddrsError> {
     let mut out: Vec<IpAddr> = Vec::new();
     for ip in local_v4(fib_trie) {
         push(&mut out, IpAddr::V4(ip));

@@ -435,6 +435,35 @@ async fn every_address_is_filtered_but_only_sixteen_are_kept() {
 }
 
 #[tokio::test]
+async fn an_answer_over_sixty_four_addresses_fails_before_dedupe_and_filter() {
+    let full: Vec<IpAddr> = (1..=64).map(public).collect();
+    let mut over_by_loopback = full.clone();
+    over_by_loopback.push(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    let rig = Setup {
+        resolver: FakeResolver::default()
+            .with("a.mock.test", vec![full])
+            .with("b.mock.test", vec![over_by_loopback])
+            .with("c.mock.test", vec![vec![public(1); MAX_ANSWER + 1]]),
+        ..Setup::default()
+    }
+    .rig();
+    let got = rig.send(&connect("a.mock.test:443")).await;
+    assert!(got.starts_with("HTTP/1.1 200 "), "{got}");
+    assert_eq!(rig.dials().len(), 1);
+    for target in ["b.mock.test:443", "c.mock.test:443"] {
+        let got = rig.send(&connect(target)).await;
+        assert_eq!(got, reply(Reason::ResolveFailed), "{target}");
+    }
+    assert_eq!(rig.dials().len(), 1, "nothing more was dialled");
+    let rows = rig.sink.entries.lock().unwrap();
+    let reasons: Vec<&Value> = rows.iter().map(|(_, _, a)| &a["reason"]).collect();
+    assert_eq!(
+        reasons.iter().filter(|r| **r == "resolve-failed").count(),
+        2
+    );
+}
+
+#[tokio::test]
 async fn stopping_ends_checks_without_a_reply_and_tunnels_with_session_stopped() {
     let rig = Setup::default().rig();
     let (mut open, server) = duplex(4096);
@@ -771,6 +800,32 @@ fn the_limits_are_pinned() {
         }
     );
     assert_eq!(MAX_DIALS, 3);
+    assert_eq!((MAX_ADDRS, MAX_ANSWER, ADMISSION_EXTRA), (16, 64, 64));
+}
+
+#[test]
+fn the_in_flight_bound_is_the_cap_plus_sixty_four_and_never_overflows() {
+    assert_eq!(Limits::new(8).in_flight(), 72);
+    assert_eq!(Limits::new(0).in_flight(), 64);
+    assert_eq!(Limits::new(usize::MAX).in_flight(), Semaphore::MAX_PERMITS);
+    assert_eq!(
+        Limits::new(Semaphore::MAX_PERMITS - 64).in_flight(),
+        Semaphore::MAX_PERMITS
+    );
+    assert_eq!(
+        Limits::new(Semaphore::MAX_PERMITS - 65).in_flight(),
+        Semaphore::MAX_PERMITS - 1
+    );
+}
+
+#[test]
+fn a_huge_connection_cap_does_not_panic() {
+    let rig = Setup {
+        max: usize::MAX,
+        ..Setup::default()
+    }
+    .rig();
+    assert_eq!(rig.proxy.limits().max_connections, usize::MAX);
 }
 
 // read_head on its own.
@@ -797,6 +852,74 @@ async fn a_head_sent_in_pieces_is_read_with_what_follows_it() {
     let head_len = b"CONNECT mock.test:443 HTTP/1.1\r\n\r\n".len();
     assert!(filled >= head_len);
     assert_eq!(&buf[..head_len], b"CONNECT mock.test:443 HTTP/1.1\r\n\r\n");
+}
+
+/// Writes `parts` one at a time, yielding between them so each arrives as its own read.
+fn trickle(mut client: DuplexStream, parts: Vec<Vec<u8>>) -> tokio::task::JoinHandle<DuplexStream> {
+    tokio::spawn(async move {
+        for p in parts {
+            if client.write_all(&p).await.is_err() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        client
+    })
+}
+
+#[tokio::test]
+async fn a_long_line_sent_byte_by_byte_completes() {
+    // Bytes without a line end are not re-parsed (Rust review M2), so they do not use up the
+    // parse budget: 1 000 one-byte reads, then the line end.
+    let (client, mut proxy) = duplex(64);
+    let mut parts = vec![b"CONNECT mock.test:443 HTTP/1.1\r\nX-Pad: ".to_vec()];
+    parts.extend((0..1000).map(|_| b"a".to_vec()));
+    parts.push(b"\r\n\r\n".to_vec());
+    let sender = trickle(client, parts);
+    let mut buf = [0u8; MAX_HEAD];
+    let filled = read_head(&mut proxy, &mut buf, HEAD_TIMEOUT).await;
+    assert!(filled.is_ok(), "{filled:?}");
+    drop(sender.await.unwrap());
+}
+
+#[tokio::test]
+async fn more_line_ends_than_a_head_can_have_are_too_large() {
+    // Blank lines before the request line are skipped by the parser, so without a budget each
+    // one-byte line end would re-parse the whole buffer until the timeout.
+    let (client, mut proxy) = duplex(64);
+    let parts: Vec<Vec<u8>> = (0..=MAX_PARSES).map(|_| b"\n".to_vec()).collect();
+    let sender = trickle(client, parts);
+    let mut buf = [0u8; MAX_HEAD];
+    let got = read_head(&mut proxy, &mut buf, HEAD_TIMEOUT).await;
+    assert!(
+        matches!(got, Err((Reason::HeadTooLarge, n)) if n < MAX_PARSES + 2),
+        "{got:?}"
+    );
+    drop(sender.await.unwrap());
+    assert_eq!(MAX_PARSES, 128);
+}
+
+#[tokio::test]
+async fn a_full_buffer_without_a_line_end_is_too_large() {
+    let (client, mut proxy) = duplex(64);
+    let mut parts = vec![b"CONNECT mock.test:443 HTTP/1.1\r\nX: ".to_vec()];
+    parts.extend((0..MAX_HEAD / 64 + 1).map(|_| vec![b'a'; 64]));
+    let sender = trickle(client, parts);
+    let mut buf = [0u8; MAX_HEAD];
+    let got = read_head(&mut proxy, &mut buf, HEAD_TIMEOUT).await;
+    assert_eq!(got, Err((Reason::HeadTooLarge, MAX_HEAD)));
+    drop(proxy);
+    let _ = sender.await;
+}
+
+#[tokio::test]
+async fn garbage_in_a_large_first_read_is_malformed_at_once() {
+    let (mut client, mut proxy) = duplex(MAX_HEAD);
+    client.write_all(&[0x16; 512]).await.unwrap();
+    let mut buf = [0u8; MAX_HEAD];
+    let got = read_head(&mut proxy, &mut buf, SHORT).await;
+    assert_eq!(got, Err((Reason::Malformed, 512)));
+    drop(client);
 }
 
 #[tokio::test]
