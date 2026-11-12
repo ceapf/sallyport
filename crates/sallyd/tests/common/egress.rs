@@ -253,10 +253,11 @@ pub fn canary(name: &str) -> String {
     format!("SALLY_CANARY_{name}_{}", "c0ffee".repeat(4))
 }
 
-/// The production secrets store file, 0600 in a 0700 directory, holding [`canary`] for each of
+/// The production secrets store file, 0600 in a 0700 directory of its own (`egress-secrets`,
+/// so no test that makes its own `secrets` directory collides), holding [`canary`] for each of
 /// [`STORED`] (architect D12: container tests use the production source).
 pub fn canary_store(dir: &Path) -> std::path::PathBuf {
-    let sub = dir.join("secrets");
+    let sub = dir.join("egress-secrets");
     std::fs::create_dir_all(&sub).unwrap();
     std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o700)).unwrap();
     let path = sub.join("secrets.toml");
