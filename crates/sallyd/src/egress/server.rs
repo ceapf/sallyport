@@ -540,7 +540,8 @@ fn phrase(status: u16) -> &'static str {
 /// tunnel).
 ///
 /// # Errors
-/// The reason and the bytes received: [`Reason::HeadTooLarge`] past 8 KiB or 100 header lines,
+/// The reason and the bytes received: [`Reason::HeadTooLarge`] past 8 KiB, 100 header lines or
+/// [`MAX_PARSES`] parses,
 /// [`Reason::HeadTimeout`] when `limit` passes first, [`Reason::Malformed`] for a head that is not
 /// HTTP/1.x or a client that closes or fails before completing one.
 pub(crate) async fn read_head<S: AsyncRead + Unpin>(

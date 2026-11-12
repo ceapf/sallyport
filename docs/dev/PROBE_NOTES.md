@@ -69,9 +69,11 @@ line per fact, with where it was found. Check a note again before relying on it 
   `/proc/self/fd/<dir fd>/<name>` of an `O_PATH` directory works and keeps the name short.
 - glibc 2.39, `hosts: files dns` (strace of `getent ahosts`): `localhost` is answered from
   `/etc/hosts` with no packet sent. The absolute `localhost.` is **not** matched by the files
-  backend; it goes out as a DNS query to the resolv.conf server. So the proxy's absolute lookups
-  (`host.`) never read `/etc/hosts`, and a hermetic test may only resolve the relative
-  `localhost` through real `getaddrinfo` (Task 8, `egress/net.rs`).
+  backend; it goes out as a DNS query to the resolv.conf server. Other NSS sources may still
+  answer a dotted name (systemd-resolved reads `/etc/hosts`; nss-myhostname, nss-mdns), so the
+  absolute lookup only removes the search list: the address filter stays the control. A
+  hermetic test may only resolve the relative `localhost` through real `getaddrinfo`, and only
+  where `files` comes first and `/etc/hosts` names it (Task 8, `egress/net.rs`).
 
 ## Test writing
 

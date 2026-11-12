@@ -53,10 +53,9 @@ pub fn parse(target: &str) -> Result<Authority, AuthorityError> {
     }
     let lower = host.to_ascii_lowercase();
     let host = lower.strip_suffix('.').unwrap_or(&lower);
+    // `parse_hostname` also refuses a host of one label (`localhost`, `intranet`): malformed
+    // before policy, so no `*` rule can reach a resolver search list (architect Q18).
     match parse_hostname(host) {
-        // One label (`localhost`, `intranet`) is never a public name: refused before policy,
-        // so no `*` rule can reach /etc/hosts or a resolver search list.
-        Ok(host) if !host.contains('.') => Err(AuthorityError::Malformed),
         Ok(host) => Ok(Authority { host, port }),
         Err(HostError::IpLiteral) => Err(AuthorityError::IpLiteral),
         Err(_) => Err(AuthorityError::Malformed),

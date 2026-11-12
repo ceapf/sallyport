@@ -179,6 +179,8 @@ fn shim_binary() -> Vec<u8> {
         // A plain release build even under coverage or a wrapper (Rust review L11).
         .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("CARGO_BUILD_RUSTFLAGS")
+        .env_remove("CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS")
         .env_remove("RUSTC_WRAPPER")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .status()

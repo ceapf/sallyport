@@ -338,8 +338,8 @@ fn rt_net_09_oversized_heads_slow_clients_and_too_many_connections_are_limited()
         .1;
         let took = t0.elapsed();
         assert!(drip.is_empty(), "{drip:?}");
-        // Closed at about 10 s, well before the 17 s drip ends (20 s leaves room for a slow host).
-        assert!(took >= Duration::from_secs(9) && took < Duration::from_secs(20), "{took:?}");
+        // Closed at about 10 s, before the 17 s drip would have ended on its own.
+        assert!(took >= Duration::from_secs(9) && took < Duration::from_secs(17), "{took:?}");
         assert_eq!(refusals(&lx, "egress.limit")[2]["reason"], json!("head-timeout"));
         // Two held tunnels fill max_connections: the third is refused at accept.
         let held = exec(
@@ -430,13 +430,18 @@ async fn a_thousand_open_tunnels() {
     handle.shutdown().await;
 }
 
-/// 40 connections against a cap of 32: the 8 over it are answered 429 at accept.
+/// 1 000 connections against a cap of 32: 968 are answered 429 at accept. Past 32 + 64 accepted
+/// at once the accept loop waits (architect Q20), so the flood also runs through that bound and
+/// the listen backlog.
 async fn over_the_cap_is_429() {
     let dir = Scratch::new("rt-net-09-cap");
     let events = Arc::new(common::container::Events::default());
     let (handle, sock) = listen(&dir, 32, Arc::clone(&events));
     let mut clients = Vec::new();
-    for _ in 0..40 {
+    for i in 0..1000 {
+        if i % 16 == 0 {
+            tokio::task::yield_now().await;
+        }
         let mut c = tokio::net::UnixStream::connect(&sock).await.unwrap();
         // A connection over the cap is answered and closed at accept, maybe before this write.
         let _ = c
@@ -454,13 +459,13 @@ async fn over_the_cap_is_429() {
             other => panic!("{}", String::from_utf8_lossy(other)),
         }
     }
-    assert_eq!((ok, limited), (32, 8));
+    assert_eq!((ok, limited), (32, 968));
     let limits = events
         .list()
         .iter()
         .filter(|e| *e == "egress.limit")
         .count();
-    assert_eq!(limits, 8);
+    assert_eq!(limits, 968);
     drop(clients);
     handle.shutdown().await;
 }
@@ -572,6 +577,7 @@ fn rt_net_10_replacing_the_shim_gains_nothing() {
              for pid in $(shims); do kill $pid && echo killed=$pid; done; sleep 0.5; \
              echo left=$(shims | wc -l); \
              (nc -l -p 3128 > /dev/null 2>/tmp/own-listener &); sleep 0.5; cat /tmp/own-listener; \
+             grep -qsE ':0C38 0+:0000 0A' /proc/net/tcp /proc/net/tcp6 && echo own=listening; \
              timeout 5 nc -w 2 1.1.1.1 443 < /dev/null; echo direct=$?",
         )
         .await;
@@ -581,6 +587,7 @@ fn rt_net_10_replacing_the_shim_gains_nothing() {
         assert_eq!(out.matches("killed=").count(), 1, "{out}");
         assert!(out.contains("left=0"), "{out}");
         assert!(!out.contains("Address in use"), "{out}");
+        assert!(out.contains("own=listening"), "our own listener holds 3128: {out}");
         assert!(!out.contains("direct=0"), "a direct connection succeeded: {out}");
         // Talk to net.sock directly: the shim binary as the attacker's dumb relay (architect Q14).
         let stdio = |req: &str| {

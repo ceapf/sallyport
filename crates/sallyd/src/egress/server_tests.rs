@@ -854,62 +854,58 @@ async fn a_head_sent_in_pieces_is_read_with_what_follows_it() {
     assert_eq!(&buf[..head_len], b"CONNECT mock.test:443 HTTP/1.1\r\n\r\n");
 }
 
-/// Writes `parts` one at a time, yielding between them so each arrives as its own read.
-fn trickle(mut client: DuplexStream, parts: Vec<Vec<u8>>) -> tokio::task::JoinHandle<DuplexStream> {
-    tokio::spawn(async move {
-        for p in parts {
-            if client.write_all(&p).await.is_err() {
-                break;
+/// A client whose every read returns exactly one of its chunks (or what fits of it), then EOF:
+/// each chunk is its own read whatever the scheduler does.
+struct Chunks(std::collections::VecDeque<Vec<u8>>);
+
+impl AsyncRead for Chunks {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        if let Some(c) = self.0.pop_front() {
+            let n = c.len().min(buf.remaining());
+            buf.put_slice(&c[..n]);
+            if n < c.len() {
+                self.0.push_front(c[n..].to_vec());
             }
-            tokio::task::yield_now().await;
         }
-        client
-    })
+        std::task::Poll::Ready(Ok(()))
+    }
 }
 
 #[tokio::test]
 async fn a_long_line_sent_byte_by_byte_completes() {
     // Bytes without a line end are not re-parsed (Rust review M2), so they do not use up the
     // parse budget: 1 000 one-byte reads, then the line end.
-    let (client, mut proxy) = duplex(64);
     let mut parts = vec![b"CONNECT mock.test:443 HTTP/1.1\r\nX-Pad: ".to_vec()];
     parts.extend((0..1000).map(|_| b"a".to_vec()));
     parts.push(b"\r\n\r\n".to_vec());
-    let sender = trickle(client, parts);
     let mut buf = [0u8; MAX_HEAD];
-    let filled = read_head(&mut proxy, &mut buf, HEAD_TIMEOUT).await;
+    let filled = read_head(&mut Chunks(parts.into()), &mut buf, HEAD_TIMEOUT).await;
     assert!(filled.is_ok(), "{filled:?}");
-    drop(sender.await.unwrap());
 }
 
 #[tokio::test]
 async fn more_line_ends_than_a_head_can_have_are_too_large() {
     // Blank lines before the request line are skipped by the parser, so without a budget each
-    // one-byte line end would re-parse the whole buffer until the timeout.
-    let (client, mut proxy) = duplex(64);
+    // one-byte line end would re-parse the whole buffer until the timeout. Parse 1 is of the
+    // empty buffer, parse k after k - 1 bytes: parse 129 (over the budget) comes at 128 bytes.
     let parts: Vec<Vec<u8>> = (0..=MAX_PARSES).map(|_| b"\n".to_vec()).collect();
-    let sender = trickle(client, parts);
     let mut buf = [0u8; MAX_HEAD];
-    let got = read_head(&mut proxy, &mut buf, HEAD_TIMEOUT).await;
-    assert!(
-        matches!(got, Err((Reason::HeadTooLarge, n)) if n < MAX_PARSES + 2),
-        "{got:?}"
-    );
-    drop(sender.await.unwrap());
+    let got = read_head(&mut Chunks(parts.into()), &mut buf, HEAD_TIMEOUT).await;
+    assert_eq!(got, Err((Reason::HeadTooLarge, MAX_PARSES)));
     assert_eq!(MAX_PARSES, 128);
 }
 
 #[tokio::test]
 async fn a_full_buffer_without_a_line_end_is_too_large() {
-    let (client, mut proxy) = duplex(64);
     let mut parts = vec![b"CONNECT mock.test:443 HTTP/1.1\r\nX: ".to_vec()];
     parts.extend((0..MAX_HEAD / 64 + 1).map(|_| vec![b'a'; 64]));
-    let sender = trickle(client, parts);
     let mut buf = [0u8; MAX_HEAD];
-    let got = read_head(&mut proxy, &mut buf, HEAD_TIMEOUT).await;
+    let got = read_head(&mut Chunks(parts.into()), &mut buf, HEAD_TIMEOUT).await;
     assert_eq!(got, Err((Reason::HeadTooLarge, MAX_HEAD)));
-    drop(proxy);
-    let _ = sender.await;
 }
 
 #[tokio::test]

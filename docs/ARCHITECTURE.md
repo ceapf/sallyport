@@ -641,7 +641,9 @@ sallyport/
 - **Proxy resource bounds** (Task 8). At most 64 `getaddrinfo` calls run at once across every
   session; a lookup that finds no free slot is `resolve-failed` at once (never queued), and a
   slot stays taken until its call returns, even after the 5 s timeout. Lookups and audit appends
-  use separate blocking threads, so stuck lookups never delay the audit log. Residual: one session
+  share tokio's blocking pool, so stuck lookups take at most 64 of its threads and never delay
+  the audit log while the pool is larger (the daemon's runtime must keep it so: #47). One
+  resolver serves every session. Residual: one session
   can hold every slot for about a resolver timeout (#47). Each session's accept loop holds at
   most `max_connections + 64` accepted connections (the extra ones are answered 429); past that
   it stops accepting until one ends. Residual: descriptors are not yet bounded across sessions

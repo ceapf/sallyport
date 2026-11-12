@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use rustix::fs::{Mode, OFlags};
 use sally_core::manifest::{AuditLevel, ValidatedManifest};
 use tokio::net::{TcpStream, UnixListener, UnixStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
@@ -38,8 +39,11 @@ pub type Lookup = Arc<dyn Fn(&str, u16) -> io::Result<Vec<SocketAddr>> + Send + 
 
 /// Name lookups off the runtime, at most as many at once as `slots` holds. A lookup that finds no
 /// free slot fails at once and never queues; a slot stays taken until its blocking call returns,
-/// even after the caller gave up. Lookups and audit appends use separate blocking threads, so a
-/// stuck resolver never holds up the audit log.
+/// even after the caller gave up. Lookups and audit appends share tokio's blocking pool: stuck
+/// lookups take at most `slots` of its threads, so the audit log is never held up while the pool
+/// is larger than that (tokio's default is 512).
+// TODO(#47): the daemon's runtime builder must keep `max_blocking_threads` well above
+// MAX_LOOKUPS, and its test must use that builder.
 #[derive(Clone)]
 pub struct SystemResolver {
     slots: Arc<Semaphore>,
@@ -176,9 +180,8 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(io::ErrorKind::InvalidInput.into());
     };
-    let flags =
-        rustix::fs::OFlags::PATH | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::NOFOLLOW;
-    let dir = sally_core::fd::open(parent, flags, rustix::fs::Mode::empty())?;
+    let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW;
+    let dir = sally_core::fd::open(parent, flags, Mode::empty())?;
     let short = Path::new("/proc/self/fd")
         .join(std::os::fd::AsRawFd::as_raw_fd(&dir).to_string())
         .join(name);
@@ -325,7 +328,9 @@ pub struct Egress<R, D, H> {
     pub host: Arc<H>,
 }
 
-/// The production starter.
+/// The production starter. Build it once and share it by every session: each
+/// [`SystemResolver::default`] has its own [`MAX_LOOKUPS`] slots, so the bound is global only
+/// while one resolver serves them all.
 pub type SystemEgress = Egress<SystemResolver, TcpDialer, ProcHostAddrs>;
 
 impl<R: Resolver, D: Dialer, H: HostAddrs> EgressStarter for Egress<R, D, H> {
@@ -387,6 +392,7 @@ mod tests {
         body.push_str(&" ".repeat(pad));
         std::fs::write(&exact, body).unwrap();
         assert!(p(&exact, &missing).read().is_ok());
+        assert_eq!(MAX_PROC_BYTES, 1 << 20, "the documented 1 MiB");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -414,6 +420,19 @@ mod tests {
         // Hermetic: glibc answers the relative name `localhost` from /etc/hosts ("files" comes
         // first). The absolute `localhost.` is not matched there and would go to DNS, so this test
         // never asks for it (docs/dev/PROBE_NOTES.md).
+        // Fail loudly rather than send a query where that does not hold.
+        let nss = std::fs::read_to_string("/etc/nsswitch.conf").unwrap_or_default();
+        let hosts_line = nss.lines().find(|l| l.trim_start().starts_with("hosts:"));
+        let first = hosts_line.and_then(|l| l.split_whitespace().nth(1));
+        assert_eq!(first, Some("files"), "nsswitch hosts must list files first");
+        let hosts = std::fs::read_to_string("/etc/hosts").unwrap();
+        assert!(
+            hosts.lines().any(|l| {
+                let l = l.split('#').next().unwrap_or_default();
+                l.split_whitespace().skip(1).any(|n| n == "localhost")
+            }),
+            "/etc/hosts must name localhost"
+        );
         let got = getaddrinfo("localhost", 443).unwrap();
         assert!(!got.is_empty());
         assert!(
@@ -425,6 +444,14 @@ mod tests {
     #[test]
     fn names_are_looked_up_absolute() {
         assert_eq!(absolute("a.mock.test"), "a.mock.test.");
+    }
+
+    /// Opens its gate on drop.
+    struct Opener(Arc<Gate>);
+    impl Drop for Opener {
+        fn drop(&mut self) {
+            self.0.release();
+        }
     }
 
     /// A blocking-call seam: counts entries and holds each call until opened.
@@ -445,6 +472,12 @@ mod tests {
         fn release(&self) {
             *self.open.lock().unwrap() = true;
             self.cv.notify_all();
+        }
+        /// A gate that opens when the returned guard drops, so a failing assertion releases the
+        /// parked blocking threads instead of hanging the runtime's shutdown (Rust re-review M1).
+        fn shut() -> (Arc<Self>, Opener) {
+            let g = Arc::new(Self::default());
+            (Arc::clone(&g), Opener(g))
         }
         fn entered(&self) -> usize {
             self.entered.load(std::sync::atomic::Ordering::SeqCst)
@@ -512,7 +545,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_slot_stays_taken_until_the_lookup_returns_even_after_a_timeout() {
-        let gate = Arc::new(Gate::default());
+        let (gate, _open) = Gate::shut();
         let r = gated(2, Some(Arc::clone(&gate)), Arc::default());
         let gave_up =
             tokio::time::timeout(Duration::from_millis(50), r.resolve("a.mock.test", 443)).await;
@@ -529,7 +562,7 @@ mod tests {
 
     #[tokio::test]
     async fn audit_entries_are_written_while_every_lookup_slot_is_stuck() {
-        let gate = Arc::new(Gate::default());
+        let (gate, _open) = Gate::shut();
         let resolver = Arc::new(gated(MAX_LOOKUPS, Some(Arc::clone(&gate)), Arc::default()));
         let stuck: Vec<_> = (0..MAX_LOOKUPS)
             .map(|_| {
@@ -569,7 +602,7 @@ mod tests {
     async fn past_the_in_flight_bound_nothing_more_is_accepted_until_one_ends() {
         let dir = scratch("inflight");
         let sock = dir.join("net.sock");
-        let gate = Arc::new(Gate::default());
+        let (gate, _open) = Gate::shut();
         let audit = Arc::new(Ends {
             gate: Some(Arc::clone(&gate)),
             ..Ends::default()
@@ -693,12 +726,26 @@ mod tests {
         let ft = std::fs::metadata(&long).unwrap().file_type();
         assert!(std::os::unix::fs::FileTypeExt::is_socket(&ft));
         assert!(rt.block_on(async { bind(Path::new("/")) }).is_err());
+        // The link points at an empty directory, so following it would succeed.
+        let target = dir.join("target");
+        std::fs::create_dir(&target).unwrap();
         let link = dir.join("link");
-        std::os::unix::fs::symlink(&deep, &link).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
         assert!(
             rt.block_on(async { bind(&link.join("net.sock")) }).is_err(),
             "a symlinked parent is refused"
         );
+        assert!(!target.join("net.sock").exists());
+        // Write and search but no read: an O_PATH open works where a plain O_RDONLY one would
+        // fail with EACCES (root ignores the mode, so the check needs a non-root user).
+        if !rustix::process::geteuid().is_root() {
+            let wx = dir.join("wx");
+            std::fs::create_dir(&wx).unwrap();
+            std::fs::set_permissions(&wx, std::fs::Permissions::from_mode(0o300)).unwrap();
+            let got = rt.block_on(async { bind(&wx.join("net.sock")) });
+            std::fs::set_permissions(&wx, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(got.is_ok(), "a parent without read permission: {got:?}");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
