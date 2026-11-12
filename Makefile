@@ -33,20 +33,27 @@ forbid-unsafe:
 	@! grep -rnE '\bunsafe\b' crates --include='*.rs' | grep -vE '^[^:]+:[0-9]+:[[:space:]]*(//|#!\[forbid\(unsafe_code\)\])' \
 	  || { echo "unsafe keyword found"; exit 1; }
 
+# Every command that starts containers runs through scripts/test-run.sh: a fresh run id, then
+# only that run's containers and test image tags are removed; a container left after a passing
+# run fails it (exit 3). Two worktrees can test at once (Task 8 PR C). An ad-hoc `cargo test`
+# keeps its images cached as `localhost/sallyport-test*:local-<hash>`, never swept.
+TEST_RUN := bash scripts/test-run.sh
+
 test: test-scripts shim-check
-	$(CARGO) test -q --workspace
+	$(TEST_RUN) $(CARGO) test -q --workspace
 
 # Shell-script tests (doctor's --redact filter, the commit trailer check, the mutation and
-# coverage gates).
+# coverage gates, the test-run sweep).
 test-scripts:
 	bash tests/scripts/redact_test.sh
 	bash tests/scripts/check_trailers_test.sh
 	bash tests/scripts/mutants_gate_test.sh
 	bash tests/scripts/coverage_gate_test.sh
+	bash tests/scripts/test_run_test.sh
 
 # CI runner (AMENDMENTS-01 §15). nextest skips doctests, so they run separately.
 nextest:
-	$(CARGO) nextest run --workspace --no-fail-fast
+	$(TEST_RUN) $(CARGO) nextest run --workspace --no-fail-fast
 	$(CARGO) test -q --workspace --doc
 
 # Line-coverage gates (CLAUDE.md): sally-core >= 90%; sallyd egress >= 85% over the whole module
@@ -149,10 +156,10 @@ REDTEAM_WSL_FILTER := test(=$(REDTEAM_WSL_TEST))
 redteam:
 	@v=$$(podman info --format '{{.Host.CgroupsVersion}}'); \
 	  [ "$$v" = v2 ] || { echo "redteam: cgroup v2 required (RT-AG-09), podman reports '$$v'"; exit 1; }
-	$(CARGO) nextest run --workspace --no-fail-fast --no-tests=fail -E '$(REDTEAM_FILTER)'
+	$(TEST_RUN) $(CARGO) nextest run --workspace --no-fail-fast --no-tests=fail -E '$(REDTEAM_FILTER)'
 	@# RT-FS-11's .exe part is the one approved ignored rt_ test: run on WSL, listed as skipped elsewhere.
 	@if [ -e /proc/sys/fs/binfmt_misc/WSLInterop ]; then \
-	  $(CARGO) nextest run --workspace --no-tests=fail --run-ignored only -E '$(REDTEAM_WSL_FILTER)'; \
+	  $(TEST_RUN) $(CARGO) nextest run --workspace --no-tests=fail --run-ignored only -E '$(REDTEAM_WSL_FILTER)'; \
 	else echo "redteam: not WSL: $(REDTEAM_WSL_TEST) skipped (ignored), not passed"; fi
 
 # GPU targets arrive with M3; until then they fail loudly rather than pass vacuously.
