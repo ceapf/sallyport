@@ -130,9 +130,27 @@ pub struct Running {
     /// The egress listener (`network.mode: proxy`); aborted on drop.
     egress: Option<EgressHandle>,
     exec_gate: Arc<tokio::sync::Mutex<()>>,
+    /// The container's init: its pid and its `/proc/<pid>` directory, opened right after the
+    /// mount check on that pid. Lookups through the fd fail once that process is gone, even if
+    /// the pid is reused (architect ruling Q29).
+    init_pid: u32,
+    init_dir: Arc<rustix::fd::OwnedFd>,
 }
 
 impl Running {
+    /// The container init's host pid.
+    #[must_use]
+    pub fn init_pid(&self) -> u32 {
+        self.init_pid
+    }
+
+    /// The container init's `/proc/<pid>` directory (`O_PATH`), for the tools' view of the
+    /// workspace (`tools::fs`, `tools::exec`).
+    #[must_use]
+    pub fn init_dir(&self) -> Arc<rustix::fd::OwnedFd> {
+        Arc::clone(&self.init_dir)
+    }
+
     /// The session's exec gate. The disk watchdog holds it while the container is frozen for a
     /// measurement, so a new `podman exec` never meets a paused container. An exec holds it only
     /// while starting: a running exec process is in the container's cgroup and freezes with it.
@@ -398,14 +416,17 @@ impl Launcher {
             .run("create", argv.into_iter().map(OsString::from))
             .await?;
         let container = container_id(&out)?;
-        if let Err(e) = self.checked_start(req, scan, &container).await {
-            // The container may have run long enough to open a tunnel: stop the listener in
-            // order, so every `egress.allow` gets its `egress.close`.
-            if let Some(h) = egress {
-                h.shutdown().await;
+        let (init_pid, init_dir) = match self.checked_start(req, scan, &container).await {
+            Ok(init) => init,
+            Err(e) => {
+                // The container may have run long enough to open a tunnel: stop the listener
+                // in order, so every `egress.allow` gets its `egress.close`.
+                if let Some(h) = egress {
+                    h.shutdown().await;
+                }
+                return Err(e);
             }
-            return Err(e);
-        }
+        };
         let running = Running {
             container,
             name,
@@ -414,6 +435,8 @@ impl Launcher {
             watchdog: None,
             egress,
             exec_gate: Arc::new(tokio::sync::Mutex::new(())),
+            init_pid,
+            init_dir: Arc::new(init_dir),
         };
         Ok((running, plan))
     }
@@ -509,13 +532,14 @@ impl Launcher {
         )?)
     }
 
-    /// Steps 5 (after create) to 7.
+    /// Steps 5 (after create) to 7; the init's pid and `/proc/<pid>` directory, opened right
+    /// after the mount check on that pid (step 7 confirms the container still runs as it).
     async fn checked_start(
         &self,
         req: &WorkspaceRequest,
         scan: LaunchScan,
         container: &str,
-    ) -> Result<(), LaunchError> {
+    ) -> Result<(u32, rustix::fd::OwnedFd), LaunchError> {
         let v = Arc::clone(&req.manifest);
         let expect: Vec<Expect> = scan
             .pins()
@@ -531,12 +555,27 @@ impl Launcher {
         self.run("init", [OsString::from("init"), container.into()])
             .await?;
         let pid = self.init_pid(container).await?;
-        blocking(move || check_in_container(pid, &expect).map_err(LaunchError::MountMismatch))
-            .await?;
+        let dir = blocking(move || {
+            // Opened first: the fd then names the process whose mounts are checked next.
+            let p = format!("/proc/{pid}");
+            let dir = sally_core::fd::open(
+                p.as_str(),
+                rustix::fs::OFlags::PATH | rustix::fs::OFlags::DIRECTORY,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(|e| LaunchError::Command {
+                verb: "init",
+                msg: format!("cannot open {p}: {e}"),
+            })?;
+            check_in_container(pid, &expect).map_err(LaunchError::MountMismatch)?;
+            Ok(dir)
+        })
+        .await?;
         self.run("start", [OsString::from("start"), container.into()])
             .await?;
         tokio::time::sleep(START_GRACE).await;
-        self.confirm_running(container, pid).await
+        self.confirm_running(container, pid).await?;
+        Ok((pid, dir))
     }
 
     /// Step 7: the container still runs, as the process whose mounts were checked. A container

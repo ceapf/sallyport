@@ -12,6 +12,9 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+# Already in the tree through pem and serde-saphyr: strict canonical decode of fs_write's
+# `content_b64` and encode of fs_read results (Task 11; no new crate).
+base64 = { version = "0.23.1", default-features = false, features = ["alloc"] }
 httparse = "1.10.1"
 # llm.sock: the HTTP/1.1 server (Task 7 decision 7; architect Q10). Task 9a-2 (architect Q32):
 # also the client, for HTTP/1.1 inside intercepted tunnels. http1 only; no http2.
