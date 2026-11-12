@@ -555,6 +555,8 @@ impl Lx {
             paths: self.paths(tag),
             manifest: Arc::new(v.clone()),
             default_image: test_image(),
+            // A watchdog panic is not what these tests watch; nobody reads the reports.
+            crash: sallyd::rpc::listen::CrashReporter::channel().0,
         }
     }
 

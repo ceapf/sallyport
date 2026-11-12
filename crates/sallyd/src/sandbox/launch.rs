@@ -48,6 +48,7 @@ use super::podman::{Podman, PodmanError};
 use super::scan::{LaunchScan, PinKind, ScanLimits, scan_mounts};
 use super::types::{CheckedRuntime, CommonArgs, ImageRef, SessionPaths, UserIds};
 use super::watchdog::{Target, WatchPlan, Watchdog, watch_plan};
+use crate::daemon::crash::CrashReporter;
 
 mod error;
 mod teardown;
@@ -190,6 +191,9 @@ pub struct WorkspaceRequest {
     pub manifest: Arc<ValidatedManifest>,
     /// The bundled workspace image, used when the manifest names none.
     pub default_image: ImageRef,
+    /// The session's crash reporter: a panic in its disk watchdog is reported here (architect
+    /// Q47).
+    pub crash: CrashReporter,
 }
 
 /// Where a launcher's collaborators come from.
@@ -291,6 +295,7 @@ impl Launcher {
     ) -> Result<Running, LaunchError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let this = Arc::clone(self);
+        let crash = req.crash.clone();
         tokio::spawn(async move {
             let result = this.launch(req).await.map(|(mut r, plan)| {
                 r.watchdog = plan.map(|plan| {
@@ -300,7 +305,7 @@ impl Launcher {
                         level: r.level,
                         exec_gate: Arc::clone(&r.exec_gate),
                     };
-                    Watchdog::spawn(&this, target, plan)
+                    Watchdog::spawn(&this, target, plan, &crash)
                 });
                 r
             });

@@ -391,6 +391,7 @@ async fn session(lx: &Lx, tag: &str) -> Running {
         paths: lx.paths(tag),
         manifest: Arc::new(lx.f.load(MANIFEST)),
         default_image: net_image(),
+        crash: sallyd::rpc::listen::CrashReporter::channel().0,
     };
     let r = lx.launcher.launch_workspace(req).await.expect("launch");
     for _ in 0..100 {

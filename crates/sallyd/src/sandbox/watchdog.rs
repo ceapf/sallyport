@@ -32,6 +32,7 @@ use super::launch::{LaunchError, Launcher, capped};
 use super::scan::LaunchScan;
 use super::stage::{Area, StageBounds, Verdict, measure};
 use super::types::SessionPaths;
+use crate::daemon::crash::CrashReporter;
 
 /// How often the floor task reads free space.
 pub(super) const FLOOR_POLL: Duration = Duration::from_millis(250);
@@ -224,13 +225,19 @@ impl Shared {
 /// A running watchdog. Dropping it stops both tasks and any walk in progress.
 #[derive(Debug)]
 pub(super) struct Watchdog {
-    tasks: Vec<tokio::task::JoinHandle<()>>,
+    tasks: Vec<tokio::task::AbortHandle>,
     cancel: Arc<AtomicBool>,
 }
 
 impl Watchdog {
-    /// Starts the watchdog of a started session.
-    pub(super) fn spawn(launcher: &Arc<Launcher>, target: Target, plan: WatchPlan) -> Self {
+    /// Starts the watchdog of a started session; a panic in either task is reported to `crash`
+    /// as `watchdog` (architect Q47).
+    pub(super) fn spawn(
+        launcher: &Arc<Launcher>,
+        target: Target,
+        plan: WatchPlan,
+        crash: &CrashReporter,
+    ) -> Self {
         let cancel = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(Shared {
             launcher: Arc::clone(launcher),
@@ -246,12 +253,12 @@ impl Watchdog {
                 (watch, Mutex::new(account))
             }),
         });
-        let mut tasks = vec![tokio::spawn(floor_task(
-            Arc::clone(&shared),
-            Arc::new(plan.watched),
-        ))];
+        let mut tasks = vec![crash.spawn(
+            "watchdog",
+            floor_task(Arc::clone(&shared), Arc::new(plan.watched)),
+        )];
         if shared.stage.is_some() {
-            tasks.push(tokio::spawn(stage_task(shared)));
+            tasks.push(crash.spawn("watchdog", stage_task(shared)));
         }
         Self { tasks, cancel }
     }

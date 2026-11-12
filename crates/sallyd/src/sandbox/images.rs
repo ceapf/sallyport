@@ -156,6 +156,7 @@ mod tests {
                 .manifest,
             ),
             default_image: ImageRef::parse(&default).unwrap(),
+            crash: crate::daemon::crash::CrashReporter::channel().0,
         };
         let named = request(&format!("runtime:\n  image: {custom}\n"));
         assert_eq!(named.image(), custom);
