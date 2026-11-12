@@ -20,6 +20,8 @@ use super::policy::Policy;
 use super::server::{Dialer, HostAddrs, Limits, Parts, Proxy, Resolver};
 use crate::sandbox::AuditSink;
 
+/// File name of the egress socket in the workspace socket directory (ARCHITECTURE §3.1).
+pub const NET_SOCK: &str = "net.sock";
 /// Largest `/proc` file read for the host's addresses; more refuses the connection.
 pub const MAX_PROC_BYTES: u64 = 1024 * 1024;
 /// Pause after a failed `accept` (EMFILE and the like) before the next one.
@@ -105,11 +107,22 @@ fn read_bounded(path: &Path) -> io::Result<String> {
 
 /// Binds the session's `net.sock` at `path`, owner-only (the directory is 0700 already).
 ///
+/// The bind goes through `/proc/self/fd/<dir>/<name>` of the opened parent directory, so a deep
+/// runtime directory or a long session id can never exceed `sun_path` (107 bytes).
+///
 /// # Errors
-/// The bind or chmod error.
+/// `InvalidInput` for a path without a parent or file name; the open, bind or chmod error.
 pub fn bind(path: &Path) -> io::Result<UnixListener> {
-    let l = std::os::unix::net::UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(io::ErrorKind::InvalidInput.into());
+    };
+    let flags = rustix::fs::OFlags::PATH | rustix::fs::OFlags::DIRECTORY;
+    let dir = sally_core::fd::open(parent, flags, rustix::fs::Mode::empty())?;
+    let short = Path::new("/proc/self/fd")
+        .join(std::os::fd::AsRawFd::as_raw_fd(&dir).to_string())
+        .join(name);
+    let l = std::os::unix::net::UnixListener::bind(&short)?;
+    std::fs::set_permissions(&short, std::fs::Permissions::from_mode(0o600))?;
     l.set_nonblocking(true)?;
     UnixListener::from_std(l)
 }
@@ -343,6 +356,14 @@ mod tests {
             rt.block_on(async { bind(&sock) }).is_err(),
             "an existing path is refused"
         );
+        let deep = dir.join("d".repeat(120));
+        std::fs::create_dir_all(&deep).unwrap();
+        let long = deep.join("net.sock");
+        assert!(long.as_os_str().len() > 108);
+        let _l2 = rt.block_on(async { bind(&long) }).unwrap();
+        let ft = std::fs::metadata(&long).unwrap().file_type();
+        assert!(std::os::unix::fs::FileTypeExt::is_socket(&ft));
+        assert!(rt.block_on(async { bind(Path::new("/")) }).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

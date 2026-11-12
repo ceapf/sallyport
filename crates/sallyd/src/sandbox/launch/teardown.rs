@@ -139,8 +139,14 @@ impl Launcher {
         if let Err(error) = removed {
             return Err(Box::new(StopError { running: r, error }));
         }
-        // The container is gone: nothing left to watch.
+        // The container is gone: nothing left to watch, and no client left for the proxy. Its
+        // open tunnels end with `session-stopped` before the socket directory goes. Until here a
+        // failed stop hands the handle back alive, so the policy holds while the container may
+        // still exist (architect Q7).
         drop(r.watchdog.take());
+        if let Some(egress) = r.egress.take() {
+            egress.shutdown().await;
+        }
         let cleaned = self.remove_dirs(&r.paths, true).await;
         self.sessions.release(&sid);
         audited
