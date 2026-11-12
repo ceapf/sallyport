@@ -712,26 +712,48 @@ async fn a_large_call_is_recorded_without_its_values() {
 async fn the_worst_case_call_entry_stays_under_the_writer_cap() {
     let (agent, _, sink) = setup();
     let mut c = start(&agent);
-    let ugly = |n: usize, tail: char| {
-        let mut s = "\u{1}".repeat(n);
-        s.push(tail);
-        s
-    };
+    // The longer lifecycle name.
+    c.call(&bare(
+        0,
+        "initialize",
+        json!({"protocolVersion": "2025-11-25", "capabilities": {}}),
+    ))
+    .await;
+    // Each named key: 64 shown bytes that escape to `\xNN`, then filler for the longest
+    // `…(+N)` tails one frame allows (two of six digits, the rest of five and four). They sort
+    // first; the unnamed extra keys sort after them.
+    let shown = "\u{1}".repeat(crate::rpc::record::LOGGED_BYTES);
     let mut arguments = Map::new();
-    for i in 0..LOGGED_KEYS + 4 {
-        let tail = char::from(b'a' + u8::try_from(i).unwrap());
-        arguments.insert(ugly(100, tail), json!(1));
+    for (i, filler) in [
+        100_000, 100_000, 10_000, 10_000, 10_000, 10_000, 10_000, 1_000,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let tag = char::from(b'a' + u8::try_from(i).unwrap());
+        arguments.insert(format!("{shown}{tag}{}", "f".repeat(filler)), json!(1));
+    }
+    for i in 0..4 {
+        arguments.insert(format!("z{i}"), json!(1));
     }
     let id = "\u{1}".repeat(crate::rpc::message::MAX_ID_BYTES);
     let name = "\u{1}".repeat(crate::rpc::mcp::MAX_TOOL_NAME);
     let msg = json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
-                     "params": {"_meta": meta(), "name": name, "arguments": arguments}});
+                     "params": {"name": name, "arguments": arguments}});
+    assert!(serde_json::to_vec(&msg).unwrap().len() < MAX_FRAME);
     let r = c.call(&msg).await;
     assert!(r.get("result").is_some(), "{r}");
     let args = sink.last("rpc.request");
     assert_eq!(args["argument_keys"].as_array().unwrap().len(), LOGGED_KEYS);
     assert_eq!(args["argument_count"], json!(LOGGED_KEYS + 4));
+    assert_eq!(args["lifecycle"], json!("legacy"));
     assert!(args["tool"].as_str().unwrap().starts_with("\\x01"));
+    assert!(
+        args["argument_keys"][0]
+            .as_str()
+            .unwrap()
+            .ends_with("…(+100001)")
+    );
     let size = serde_json::to_vec(&args).unwrap().len();
     assert!(
         size <= sally_core::audit::MAX_ARGS_BYTES - 512,

@@ -399,7 +399,6 @@ fn lock<V>(m: &Mutex<V>) -> std::sync::MutexGuard<'_, V> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// An id as an audit entry shows it: a number as is, a string escaped and cut.
 /// The `rpc.request` arguments of a `tools/call` (architect ruling Q16): which tool, and the
 /// shape of its arguments, never their values. The handler's own entry carries each tool's
 /// fields (ARCHITECTURE §4.3) before its effect. Bounded so the writer never truncates it: at
@@ -422,6 +421,7 @@ fn call_args(id: &Id, era: Era, name: &str, arguments: &Map<String, Value>) -> V
     })
 }
 
+/// An id as an audit entry shows it: a number as is, a string escaped and cut.
 fn logged_id(id: &Id) -> Value {
     match id {
         Id::Num(n) => Value::from(*n),

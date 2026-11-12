@@ -792,7 +792,11 @@ sallyport/
     most 8 keys, each escaped and cut). Argument values are never recorded by the rpc layer: the
     tool handler's own entry carries each tool's fields of §4.3 before the effect (#62). The
     entry is bounded so the writer never truncates it, with 512 bytes to spare because
-    redaction can lengthen a string (`[REDACTED:NAME]`). A tool's entry with no completion
+    redaction can lengthen a string (`[REDACTED:NAME]`). Residual: a peer that already knew a
+    stored secret value could repeat it in the id, tool name and keys until redaction pushes
+    the entry past the cap and the writer truncates it; SI-3 never gives a sandbox a secret
+    value, `args_sha256` still covers the whole entry, and the handler's entry names the tool
+    (#62). A tool's entry with no completion
     entry before the session's stop entry means the call was interrupted by teardown.
   - `rpc.deny` (decision `deny`): `{reason, method?, id?}`; on `control.sock` also `{socket:
     "control"}`; a failed peer check is `{reason: "peer-uid", uid}`. Reasons: `parse-error`,
