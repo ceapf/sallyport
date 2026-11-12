@@ -568,7 +568,7 @@ impl Launcher {
                 verb: "init",
                 msg: format!("cannot open {p}: {e}"),
             })?;
-            check_in_container(pid, &expect).map_err(LaunchError::MountMismatch)?;
+            check_in_container(&dir, &expect).map_err(LaunchError::MountMismatch)?;
             Ok(dir)
         })
         .await?;
