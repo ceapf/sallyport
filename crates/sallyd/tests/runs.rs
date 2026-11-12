@@ -109,6 +109,38 @@ fn a_lock_file_is_never_truncated_or_reached_through_a_symlink() {
     std::fs::remove_dir_all(&d).unwrap();
 }
 
+/// The disk-free lock's bound (maintainer, 9a-2 part 4): a test waits for a held lock at most
+/// its bound, then fails naming the lock; once the holder lets go, it gets the lock.
+#[test]
+fn a_bounded_lock_fails_naming_the_lock_once_its_wait_runs_out() {
+    let d = scratch("bounded");
+    let path = lock_dir_in(&d).join("disk-free.lock");
+    let holder = open_lock(&path);
+    rustix::fs::flock(&holder, rustix::fs::FlockOperation::LockShared).unwrap();
+    let wait = std::time::Duration::from_millis(300);
+    let started = std::time::Instant::now();
+    // On a thread with an outer bound: a lock without its own bound fails here, never hangs.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let p = path.clone();
+    std::thread::spawn(move || {
+        let r = std::panic::catch_unwind(|| lock_exclusive_within(&p, wait, "a test"));
+        let _ = tx.send(r.map(drop));
+    });
+    let err = rx
+        .recv_timeout(10 * wait)
+        .expect("the bounded lock returned within its wait")
+        .unwrap_err();
+    assert!(started.elapsed() >= wait);
+    let msg = err.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(
+        msg.contains("disk-free.lock") && msg.contains("a test"),
+        "{msg}"
+    );
+    drop(holder);
+    drop(lock_exclusive_within(&path, wait, "a test"));
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
 #[test]
 fn a_lock_directory_open_to_others_or_a_symlink_is_refused() {
     let d = scratch("loose");

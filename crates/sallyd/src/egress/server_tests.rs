@@ -555,9 +555,19 @@ async fn stopping_while_dialling_writes_a_close_without_a_reply() {
     let proxy = Arc::clone(&rig.proxy);
     let task = tokio::spawn(async move { proxy.serve(server).await });
     client.write_all(&connect("a.mock.test:443")).await.unwrap();
-    while rig.dials().is_empty() {
-        // The dial hangs until the stop, so a finished task means the CONNECT was refused.
-        assert!(!task.is_finished(), "refused before the dial");
+    // The dial hangs until the stop, so any entry but `egress.allow`, or a finished task, means
+    // the CONNECT was refused. Not the task alone: a refused connection drains first (#71), and
+    // the paused clock never runs out its drain while this loop keeps the runtime busy. Capped,
+    // so a mutant that never dials fails here instead of hanging.
+    for spins in 0.. {
+        if !rig.dials().is_empty() {
+            break;
+        }
+        let refused = rig.sink.events().iter().any(|e| e != "egress.allow");
+        assert!(
+            !task.is_finished() && !refused && spins < 100_000,
+            "refused before the dial"
+        );
         tokio::task::yield_now().await;
     }
     rig.proxy.stop();
@@ -743,6 +753,81 @@ async fn connections_over_the_cap_get_429_without_being_read() {
     assert!(again.starts_with("HTTP/1.1 200 "), "{again}");
 }
 
+/// #71: a client still sending a 100 KiB request line when the proxy refuses it. The proxy
+/// answers, stops writing, and reads on (bounded) before it closes, so the client's sending never
+/// fails: through the shim, a failed send tore down the TCP side before the reply was relayed.
+#[tokio::test]
+async fn a_refused_client_still_sending_its_head_keeps_sending_and_gets_its_reply() {
+    let rig = Setup::default().rig();
+    let (client, server) = duplex(16 * 1024);
+    let proxy = Arc::clone(&rig.proxy);
+    let task = tokio::spawn(async move { proxy.serve(server).await });
+    let mut req = b"CONNECT a.mock.test:443".to_vec();
+    req.resize(100 * 1024, b'a');
+    req.extend_from_slice(b" HTTP/1.1\r\n\r\n");
+    let (mut rd, mut wr) = tokio::io::split(client);
+    let sending = tokio::spawn(async move {
+        let sent = wr.write_all(&req).await;
+        let _ = wr.shutdown().await;
+        sent
+    });
+    let mut out = Vec::new();
+    rd.read_to_end(&mut out).await.unwrap();
+    assert!(sending.await.unwrap().is_ok(), "the client's send failed");
+    task.await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&out), reply(Reason::HeadTooLarge));
+}
+
+/// #71's drain is bounded: a client that sends on without end, or keeps the connection open and
+/// silent, is closed after [`DRAIN_BYTES`] or [`DRAIN_TIMEOUT`].
+#[tokio::test(start_paused = true)]
+async fn the_drain_after_a_reply_is_bounded_in_bytes_and_in_time() {
+    let rig = Setup::default().rig();
+    let mut head = b"CONNECT a.mock.test:443 HTTP/1.1\r\nX: ".to_vec();
+    head.resize(MAX_HEAD + 100, b'a');
+
+    // Endless: the proxy reads at most MAX_HEAD + DRAIN_BYTES, then the client's send fails.
+    let (client, server) = duplex(16 * 1024);
+    let proxy = Arc::clone(&rig.proxy);
+    let task = tokio::spawn(async move { proxy.serve(server).await });
+    let (mut rd, mut wr) = tokio::io::split(client);
+    let reading = tokio::spawn(async move {
+        let mut out = Vec::new();
+        let _ = rd.read_to_end(&mut out).await;
+        out
+    });
+    let chunk = vec![b'a'; 8 * 1024];
+    let mut sent = 0u64;
+    wr.write_all(&head).await.unwrap();
+    // Capped, so a drain without its byte bound fails the assertion instead of hanging.
+    while sent < 64 * DRAIN_BYTES && wr.write_all(&chunk).await.is_ok() {
+        sent += 8 * 1024;
+    }
+    drop(wr);
+    task.await.unwrap();
+    let limit = DRAIN_BYTES + 2 * 16 * 1024;
+    assert!(sent <= limit, "{sent} > {limit}");
+    assert_eq!(
+        String::from_utf8_lossy(&reading.await.unwrap()),
+        reply(Reason::HeadTooLarge)
+    );
+
+    // Silent and open: closed after DRAIN_TIMEOUT.
+    let (mut client, server) = duplex(MAX_HEAD * 4);
+    let proxy = Arc::clone(&rig.proxy);
+    let task = tokio::spawn(async move { proxy.serve(server).await });
+    client.write_all(&head).await.unwrap();
+    let mut got = vec![0u8; reply(Reason::HeadTooLarge).len()];
+    client.read_exact(&mut got).await.unwrap();
+    let t0 = tokio::time::Instant::now();
+    tokio::time::timeout(2 * DRAIN_TIMEOUT, task)
+        .await
+        .expect("a silent client is closed after DRAIN_TIMEOUT")
+        .unwrap();
+    assert_eq!(t0.elapsed(), DRAIN_TIMEOUT);
+    drop(client);
+}
+
 #[tokio::test]
 async fn an_oversized_head_is_431_and_a_limit_entry_with_its_size() {
     let rig = Setup::default().rig();
@@ -866,6 +951,13 @@ fn the_limits_are_pinned() {
     assert_eq!(MAX_RESPONSE_HEAD, 64 * 1024);
     assert_eq!(MAX_DIALS, 3);
     assert_eq!((MAX_ADDRS, MAX_ANSWER, ADMISSION_EXTRA), (16, 64, 64));
+    assert_eq!(
+        (DRAIN_BYTES, DRAIN_TIMEOUT),
+        (256 * 1024, Duration::from_secs(1))
+    );
+    // A reply written after the stop (429, connect-failed, a pre-`200` 502) finishes and drains
+    // within the grace the stop gives (architect ruling on the #71 drain, Q3).
+    assert!(REPLY_TIMEOUT + DRAIN_TIMEOUT < crate::egress::net::STOP_GRACE);
 }
 
 #[test]

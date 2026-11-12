@@ -231,7 +231,7 @@ fn relay_connection(
 
 /// Copies `from` → `to` with a fixed buffer. On EOF it half-closes `to` (so the peer sees the
 /// end of the request but can still answer); on an error it closes both streams, which wakes the
-/// other direction.
+/// other direction. TODO(#76): that close can cut a reply the other direction is still relaying.
 fn copy_half(from: &dyn Half, to: &dyn Half) {
     let mut buf = [0u8; BUF_BYTES];
     loop {

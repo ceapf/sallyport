@@ -147,9 +147,59 @@ pub fn open_lock(path: &Path) -> std::fs::File {
         .unwrap_or_else(|e| panic!("lock {}: {e}", path.display()))
 }
 
+/// How long a disk-floor test waits for the [`disk_free_lock`] (maintainer, 9a-2 part 4).
+pub const DISK_FREE_WAIT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
+/// The `disk-free` lock, exclusive. A local mutation run holds it shared for its whole length
+/// (`scripts/disk-lock.sh`): its tree copies and builds move the free space that the disk-floor
+/// writer tests set their floor against. Those tests take it exclusively, before the I/O lock.
+/// Past [`DISK_FREE_WAIT`] the test fails naming the lock. Back-to-back mutation runs in both
+/// lanes can starve it (shared holders win over a polling exclusive one); that ends in the same
+/// named failure, never a hang.
+pub fn disk_free_lock() -> std::fs::File {
+    lock_exclusive_within(
+        &lock_path("disk-free"),
+        DISK_FREE_WAIT,
+        "a local mutation run (scripts/disk-lock.sh) in either lane",
+    )
+}
+
+/// An exclusive `flock` on `path`, waited for at most `wait`. While it waits it says so once on
+/// stderr, naming the lock and its likely `holder`; past `wait` it panics with the same names.
+pub fn lock_exclusive_within(
+    path: &Path,
+    wait: std::time::Duration,
+    holder: &str,
+) -> std::fs::File {
+    let f = open_lock(path);
+    let started = std::time::Instant::now();
+    let mut told = false;
+    loop {
+        match rustix::fs::flock(&f, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => return f,
+            Err(rustix::io::Errno::WOULDBLOCK) => {}
+            Err(e) => panic!("lock {}: {e}", path.display()),
+        }
+        assert!(
+            started.elapsed() < wait,
+            "the lock {} was not free within {wait:?}; likely holder: {holder}",
+            path.display()
+        );
+        if !told {
+            eprintln!(
+                "waiting up to {wait:?} for the lock {}; likely holder: {holder}",
+                path.display()
+            );
+            told = true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 /// An exclusive or shared `flock` on [`lock_path`]`(name)`, held until the file is dropped. It
-/// works across worktrees, nextest's processes and `cargo test`'s threads alike. Order: the I/O
-/// lock before the image lock; `build` never takes the I/O lock.
+/// works across worktrees, nextest's processes and `cargo test`'s threads alike. Order: the
+/// disk-free lock ([`disk_free_lock`]), then the I/O lock, then the image lock; `build` never
+/// takes the I/O lock.
 pub fn lock(name: &str, exclusive: bool) -> std::fs::File {
     let f = open_lock(&lock_path(name));
     let op = if exclusive {

@@ -198,6 +198,18 @@ tests in `egress/intercept_tests.rs` where the behaviour matters to the proxy.
   buffer part of the first head before the upstream hangs up; `select!`'s random branch order
   otherwise makes it pass or fail by chance (10 of 30). (9a-2 RQ1)
 
+## Replies through sally-shim (#71)
+
+- On Linux loopback TCP a reset does **not** discard a reply the client already received: a
+  server that read 8 KiB, answered and closed on 0.1–20 MiB of unread request still had its
+  reply read 60 of 60 times. The kernel is not where RT-NET-09's 431 went.
+- Through the shim it is lost: when `sallyd` closes on a client still sending, the shim's
+  client→socket thread gets `EPIPE`, and `copy_half` shuts down **both** directions of the TCP
+  stream, racing the socket→client thread that is relaying the reply. A Unix-socket server that
+  answers and closes, behind the real `sally-shim` in a private network namespace (`unshare
+  -rn`), 100 KiB request line: 21 of 200 replies empty. With a bounded drain after the reply
+  (read until EOF, 256 KiB or 1 s): 0 of 200. The fix is the drain in `write_reply`.
+
 ## Test writing
 
 - `dd of=<name>` while a renamer cycles names loses data when `mv` replaces a re-created name;

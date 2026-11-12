@@ -369,7 +369,7 @@ validation — otherwise `mount-changed`/`is-symlink` (RT-FS-06).
 | `network.mode` | `none` → no shim, no `net.sock`; `proxy` → shim started, `net.sock` mounted, proxy env set | launch | — |
 | `network.allow[]` | `sallyd::egress::policy` on every CONNECT request (v1 has no absolute-form forwarding: 405 `plain-http-unsupported`) | each connection | HTTP 403, audit `egress.deny` |
 | `network.acknowledge_unrestricted_egress` | validator | validate | reject if `*` without ack |
-| `network.max_connections` | `sallyd::egress::server` admission, decided at accept before any byte is read | each connection | 429 `too-many-connections`, audit `egress.limit` |
+| `network.max_connections` | `sallyd::egress::server` admission, decided and audited at accept before any byte is read; after the 429 is written the proxy discards, unparsed, what the client still sends (at most 256 KiB, at most 1 s), then closes | each connection | 429 `too-many-connections`, audit `egress.limit` |
 | `network.max_request_bytes`/`max_response_bytes` | `sallyd::egress::server::intercept` body caps (Task 9a-2: intercepted requests only; a spliced tunnel is opaque; body bytes after chunk decoding, per message) | each intercepted request and response | 413 request / 502 response, audit `egress.limit` |
 | `secrets[].name` | validator checks store; `sallyd::egress::inject` | validate + each matching request | reject if missing |
 | `secrets[].inject.host` | validator (exact host, must be allowed) + inject | validate + request | reject |
