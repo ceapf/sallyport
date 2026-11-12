@@ -36,22 +36,27 @@ forbid-unsafe:
 test: test-scripts shim-check
 	$(CARGO) test -q --workspace
 
-# Shell-script tests (doctor's --redact filter, the commit trailer check, the mutation gate).
+# Shell-script tests (doctor's --redact filter, the commit trailer check, the mutation and
+# coverage gates).
 test-scripts:
 	bash tests/scripts/redact_test.sh
 	bash tests/scripts/check_trailers_test.sh
 	bash tests/scripts/mutants_gate_test.sh
+	bash tests/scripts/coverage_gate_test.sh
 
 # CI runner (AMENDMENTS-01 §15). nextest skips doctests, so they run separately.
 nextest:
 	$(CARGO) nextest run --workspace --no-fail-fast
 	$(CARGO) test -q --workspace --doc
 
-# Line-coverage gates (CLAUDE.md): sally-core >= 90%. sallyd policy/approvals/egress (>= 85%) join
-# when those modules exist.
+# Line-coverage gates (CLAUDE.md): sally-core >= 90%; sallyd egress >= 85% over the whole module
+# directory, lib tests only (architect ruling Q16, Task 8). Approvals join when they exist.
 COV_MIN_CORE ?= 90
+COV_MIN_EGRESS ?= 85
 coverage:
 	$(CARGO) llvm-cov -q -p sally-core --summary-only --fail-under-lines $(COV_MIN_CORE)
+	$(CARGO) llvm-cov -q -p sallyd --lib --json --summary-only --output-path target/cov-sallyd.json
+	bash scripts/coverage-gate.sh $(COV_MIN_EGRESS) target/cov-sallyd.json /crates/sallyd/src/egress/
 
 # Mutation testing over the deny paths, zero survivors (AMENDMENTS-01 §15): a surviving mutant in
 # a deny path is an untested control. egress::policy, approvals and tools::fs join as they land.
@@ -79,7 +84,8 @@ MUTANTS_WIDE_CORE := $(addprefix crates/sally-core/src/,manifest/image.rs manife
 MUTANTS_WIDE_SALLYD := $(addprefix crates/sallyd/src/sandbox/,argv.rs check.rs types.rs profiles.rs \
                        overlap.rs scan.rs images.rs changes.rs dirs.rs podman.rs disk.rs stage.rs \
                        launch/error.rs) \
-                       $(addprefix crates/sallyd/src/egress/,addr.rs authority.rs head.rs policy.rs server.rs)
+                       $(addprefix crates/sallyd/src/egress/,addr.rs authority.rs head.rs policy.rs server.rs \
+                       hostaddrs.rs tunnel.rs)
 MUTANTS_WIDE_SHIM := $(addprefix crates/sally-shim/src/,args.rs relay.rs)
 MUTANTS_WIDE_TESTS_CORE :=
 MUTANTS_WIDE_TESTS_SALLYD := --lib --test=argv --test=scan
