@@ -437,8 +437,10 @@ const SEARCH_MARK: &str = "sp-rt-sec-10-search";
 /// `/proc/*/cmdline` (but the search's own) that holds key material or `ca_line`;
 /// `unreadable <path>` for an environment it may not read. Key material: a PEM private-key armor
 /// line (the bare label is a string in libcrypto), and the PKCS#8 P-256 prefix in base64 and in
-/// DER. `/dev/shm` is read-only in both sandboxes, so nothing can be planted there; the script
-/// says so if that ever changes (the test then fails until a plant there is added).
+/// DER. A `/proc` hit is labelled `<planted>` for the two planted processes and `<pid N>` for any
+/// other, so a real leak never merges with the positive control (security re-review M1).
+/// `/dev/shm` is read-only in both sandboxes, so nothing can be planted there; the script says so
+/// if that ever changes (a tripwire: the test then fails until a plant there is added).
 fn search_script(planted_pem: &str, planted_b64: &str, ca_line: &str) -> String {
     format!(
         "set -u\n\
@@ -447,20 +449,25 @@ fn search_script(planted_pem: &str, planted_b64: &str, ca_line: &str) -> String 
            && echo '/dev/shm is writable: plant there as a positive control'\n\
          printf '%s' '{planted_b64}' | base64 -d > /tmp/planted.der\n\
          env SP_PLANTED='{planted_b64}' sleep 120 </dev/null >/dev/null 2>&1 &\n\
+         planted_env=$!\n\
          sh -c 'sleep 120; :' planted '{planted_b64}' </dev/null >/dev/null 2>&1 &\n\
+         planted_cmd=$!\n\
          sleep 1\n\
          der=\"$(printf '{KEY_DER_OCTAL}')\"\n\
          set -- -e '{SEARCH_MARK}' -e 'PRIVATE KEY-----' -e '{KEY_B64}' -e \"$der\" -e '{ca_line}'\n\
          find / \\( -path /proc -o -path /sys -o -path /dev \\) -prune -o -type f -print0 2>/dev/null \
            | xargs -0 grep -l -a -F \"$@\" 2>/dev/null\n\
          find /dev/shm -type f -print0 2>/dev/null | xargs -0 grep -l -a -F \"$@\" 2>/dev/null\n\
+         label() {{ p=${{1#/proc/}}; p=${{p%%/*}}; \
+           if [ \"$p\" = \"$planted_env\" ] || [ \"$p\" = \"$planted_cmd\" ]; \
+           then echo '<planted>'; else echo \"<pid $p>\"; fi; }}\n\
          for e in /proc/[0-9]*/environ; do\n\
            if [ -e \"$e\" ] && ! [ -r \"$e\" ]; then echo \"unreadable $e\"; fi\n\
-           grep -l -a -F \"$@\" \"$e\" 2>/dev/null | sed 's|/[0-9]*/environ$|/<pid>/environ|'\n\
+           if grep -q -a -F \"$@\" \"$e\" 2>/dev/null; then echo \"/proc/$(label $e)/environ\"; fi\n\
          done\n\
          for c in /proc/[0-9]*/cmdline; do\n\
            if grep -q -a -F -e '{SEARCH_MARK}' \"$c\" 2>/dev/null; then continue; fi\n\
-           grep -l -a -F \"$@\" \"$c\" 2>/dev/null | sed 's|/[0-9]*/cmdline$|/<pid>/cmdline|'\n\
+           if grep -q -a -F \"$@\" \"$c\" 2>/dev/null; then echo \"/proc/$(label $c)/cmdline\"; fi\n\
          done\n\
          exit 0\n"
     )
@@ -477,9 +484,9 @@ fn found(out: &str) -> Vec<String> {
 /// (`SessionTls`), and the CA files go to the workspace socket directory only
 /// (`ca::write_files`; `harness_argv` binds the harness directory alone, SI-2). (That the CA key
 /// is dropped after minting, Q38 (f), is not observable from a container; the 9a-1 unit tests
-/// hold it.) Planting a key in either container is found (positive control) in every place
-/// searched, so a key written anywhere the sandbox can read fails the test; so does a CA file in
-/// the harness.
+/// hold it.) Planting a key in either container is found (positive control) in files, an
+/// environment and a command line (`/dev/shm` has a tripwire instead, see `search_script`), so a
+/// key written anywhere the sandbox can read fails the test; so does a CA file in the harness.
 #[test]
 fn rt_sec_10_no_private_key_reaches_a_container_and_the_harness_gets_no_ca_file() {
     rt().block_on(async {
@@ -510,8 +517,8 @@ fn rt_sec_10_no_private_key_reaches_a_container_and_the_harness_gets_no_ca_file(
         assert_eq!(
             found(&out),
             [
-                "/proc/<pid>/cmdline",
-                "/proc/<pid>/environ",
+                "/proc/<planted>/cmdline",
+                "/proc/<planted>/environ",
                 &format!("/run/sallyport/{BUNDLE_FILE}"),
                 &format!("/run/sallyport/{CA_FILE}"),
                 "/tmp/planted.der",
@@ -540,8 +547,8 @@ fn rt_sec_10_no_private_key_reaches_a_container_and_the_harness_gets_no_ca_file(
         assert_eq!(
             found(&out),
             [
-                "/proc/<pid>/cmdline",
-                "/proc/<pid>/environ",
+                "/proc/<planted>/cmdline",
+                "/proc/<planted>/environ",
                 "/tmp/planted.der",
                 "/tmp/planted.pem"
             ],
