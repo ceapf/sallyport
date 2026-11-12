@@ -293,12 +293,13 @@ fn workspace_env(a: &mut Argv, v: &ValidatedManifest) {
         }
         a.env("NO_PROXY", "");
         a.env("no_proxy", "");
-        if !m.secrets.is_empty() {
-            for var in CA_BUNDLE_VARS {
-                a.env(var, CA_BUNDLE);
-            }
-            a.env("NODE_EXTRA_CA_CERTS", SESSION_CA);
+    }
+    // The same condition under which the launcher writes the two files (architect Q38 (g)).
+    if crate::egress::ca::wanted(m) {
+        for var in CA_BUNDLE_VARS {
+            a.env(var, CA_BUNDLE);
         }
+        a.env("NODE_EXTRA_CA_CERTS", SESSION_CA);
     }
     let exposed: BTreeSet<&str> = m
         .secrets

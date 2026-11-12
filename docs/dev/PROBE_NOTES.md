@@ -80,6 +80,22 @@ line per fact, with where it was found. Check a note again before relying on it 
   hermetic test may only resolve the relative `localhost` through real `getaddrinfo`, and only
   where `files` comes first and `/etc/hosts` names it (Task 8, `egress/net.rs`).
 
+## X.509 name constraints (session CA)
+
+- rcgen 0.14 (`ring`) emits `basicConstraints` CA:TRUE pathlen:0 and `nameConstraints`, both
+  critical, with `keyUsage` keyCertSign only. (AMENDMENTS-01 §11 item 4; Task 9a)
+- A permitted `dNSName` `host` also permits every subdomain of `host` (RFC 5280): OpenSSL 3.0.13
+  (`openssl verify`, Python `ssl`) and rustls-webpki 0.103 accept a leaf for `a.host`. A leaf
+  for an unlisted name fails with "permitted subtree violation" / `NameConstraintViolation`.
+- Adding an excluded `dNSName` `.host` (leading dot) refuses the subdomains while `host` itself
+  still verifies, in OpenSSL 3.0.13, Python `ssl` and rustls-webpki 0.103 alike. GnuTLS (git on
+  Debian/Ubuntu) was not tested: no `certtool` on the dev host.
+- Path length 0 on the trust anchor: OpenSSL 3.0.13 refuses root → second CA → leaf ("path
+  length constraint exceeded"); rustls-webpki 0.103 accepts it, because a webpki trust anchor
+  keeps only subject, key and name constraints. Its name constraints still bind the whole
+  chain. So pathlen 0 binds OpenSSL clients (curl, Python, git, Node) only; prove it with
+  OpenSSL, never with a rustls verifier.
+
 ## Test writing
 
 - `dd of=<name>` while a renamer cycles names loses data when `mv` replaces a re-created name;

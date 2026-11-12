@@ -154,6 +154,7 @@ struct Setup {
     sink: Sink,
     max: usize,
     grants: Vec<String>,
+    interception: Option<Interception>,
 }
 
 impl Default for Setup {
@@ -167,6 +168,7 @@ impl Default for Setup {
             sink: Sink::default(),
             max: 8,
             grants: vec![],
+            interception: None,
         }
     }
 }
@@ -189,6 +191,7 @@ impl Setup {
             session: "s-1".into(),
             level: AuditLevel::default(),
             limits: Limits::new(self.max),
+            interception: self.interception,
         }));
         Rig {
             proxy,
@@ -348,6 +351,35 @@ async fn a_grant_host_is_refused_before_any_lookup() {
     let got = rig.send(&connect("a.mock.test:443")).await;
     assert_eq!(got, reply(Reason::GrantHostUnavailable));
     assert_eq!(rig.lookups(), 0);
+}
+
+/// Task 9a-1: the proxy holds the session CA, but grant hosts stay refused until 9a-2.
+#[tokio::test]
+async fn a_proxy_with_a_session_ca_still_refuses_grant_hosts() {
+    use crate::egress::ca::{SessionTls, Validity};
+    use crate::egress::roots::Roots;
+    let v = Validity::for_session(std::time::SystemTime::now(), Duration::from_secs(60)).unwrap();
+    let interception = Interception {
+        tls: SessionTls::mint(&["a.mock.test".to_owned()], v).unwrap(),
+        roots: Roots {
+            store: Arc::new(rustls::RootCertStore::empty()),
+            pem: String::new(),
+            skipped: 0,
+            path: "/roots.pem".into(),
+        },
+    };
+    let rig = Setup {
+        grants: vec!["a.mock.test".into()],
+        interception: Some(interception),
+        ..Setup::default()
+    }
+    .rig();
+    let held = rig.proxy.interception().unwrap();
+    assert_eq!(held.tls.leaves[0].host, "a.mock.test");
+    let got = rig.send(&connect("a.mock.test:443")).await;
+    assert_eq!(got, reply(Reason::GrantHostUnavailable));
+    assert_eq!(rig.lookups(), 0);
+    assert!(Setup::default().rig().proxy.interception().is_none());
 }
 
 #[tokio::test]

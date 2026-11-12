@@ -664,6 +664,32 @@ sallyport/
     `ip-literal`, `ip-range-denied`, `grant-host-unavailable`; 502 `resolve-failed`,
     `connect-failed`; 405 `plain-http-unsupported`; 429 `too-many-connections`; 431
     `head-too-large`; `head-timeout` (no reply); 400 `malformed`. Replies never echo the target.
+- **Session CA** (Task 9a-1, `egress::ca`; architect Q38). Made at launch for a session in proxy
+  mode with at least one secret grant (`ca::wanted`, the same condition that sets the CA
+  variables in the workspace argv). ECDSA P-256; `basicConstraints` CA:true, pathlen 0;
+  `keyUsage` keyCertSign only; EKU serverAuth; critical `nameConstraints` permitting `dNSName` =
+  each grant host and excluding `dNSName` `.<host>` (its subdomains; left out where another grant
+  host lies beneath it, e.g. `github.com` beside `api.github.com`), `0.0.0.0/0` and `::/0`.
+  Validity: launch time, rounded down to the second, to that + `runtime.timeout` + 5 min. One leaf
+  per grant host is minted at launch (one SAN, EKU serverAuth, digitalSignature, not a CA, its
+  own P-256 key, the CA's validity); then the CA key is dropped, so no later leaf can be signed.
+  Leaf keys stay in `sallyd` memory as `Secret` for the life of the session's proxy. Before the
+  container is created, `session-ca.pem` (the CA) and `ca-bundle.pem` (the session's trust roots
+  re-encoded, then the CA) are written into the workspace socket directory, mounted read-only at
+  `/run/sallyport`: new files only (`O_EXCL`, `O_NOFOLLOW`, close-on-exec), mode 0444. The
+  harness directory never gets them. Pathlen 0 binds OpenSSL clients; rustls-webpki ignores a
+  trust anchor's path length (name constraints still bind it; `docs/dev/PROBE_NOTES.md`).
+- **Upstream trust roots** (Task 9a-1, `egress::roots`; architect Q31). Read per session at launch
+  from the first file that exists of `/etc/ssl/certs/ca-certificates.crt`,
+  `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/cert.pem`,
+  `/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem`; `SSL_CERT_FILE`/`SSL_CERT_DIR` are not
+  honoured. The file is opened non-blocking and must be a regular file (after symlinks), owned by
+  root, not group- or other-writable, and at most 4 MiB; a file that exists but fails a check is
+  an error, never skipped. Certificates the verifier cannot use are skipped and counted; none
+  usable is an error. Any error refuses the launch (`sandbox.refuse` reason `trust-roots`; a CA or
+  file failure is `session-ca`). One load feeds the upstream verifier and `ca-bundle.pem`. The
+  file list and owner are constructor arguments of the egress starter (Task 8 decision 10);
+  production passes these. Doctor V17 applies the same checks.
 - **Approval rendering**: escape all C0/C1 controls and `\x1b`, strip Unicode bidi overrides
   (U+202A–U+202E, U+2066–U+2069), NFC-normalize, cap at 2 000 chars with an explicit
   `… (+N bytes, sha256 …)` tail. Paths shown as *host realpath* **and** guest path.

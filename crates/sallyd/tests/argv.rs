@@ -85,6 +85,31 @@ fn snapshot_workspace_all_modes_secrets_and_custom_image() {
     insta::assert_snapshot!("workspace-all-modes-secrets", f.redact(&a));
 }
 
+/// The CA variables are set exactly when the launcher writes the two CA files (`ca::wanted`,
+/// architect Q38 (g)), and name the files it writes.
+#[test]
+fn ca_variables_follow_the_session_ca_condition_and_name_its_files() {
+    use sallyd::egress::ca::{BUNDLE_FILE, CA_FILE, wanted};
+    let f = Fx::new();
+    let grant = "secrets:\n  - name: GITHUB_TOKEN\n    inject: {host: api.github.com, \
+                 header: Authorization, format: \"Bearer {value}\"}\n";
+    let allow = "network:\n  mode: proxy\n  allow:\n    - host: api.github.com\n";
+    let cases = [
+        (format!("{allow}{grant}"), true),
+        (allow.to_owned(), false),
+        (String::new(), false),
+    ];
+    for (body, expect) in cases {
+        let v = f.load(&body);
+        assert_eq!(wanted(v.manifest()), expect, "{body}");
+        let a = workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), &ws_image()).unwrap();
+        let bundle = format!("SSL_CERT_FILE=/run/sallyport/{BUNDLE_FILE}");
+        let node = format!("NODE_EXTRA_CA_CERTS=/run/sallyport/{CA_FILE}");
+        assert_eq!(a.contains(&bundle), expect, "{body}: {a:?}");
+        assert_eq!(a.contains(&node), expect, "{body}: {a:?}");
+    }
+}
+
 // ---- snapshots: harness and inference -------------------------------------------------------
 
 #[test]

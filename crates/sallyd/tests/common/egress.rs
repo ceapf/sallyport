@@ -105,11 +105,12 @@ impl HostAddrs for Owned {
 /// The starter the fixtures hand the launcher.
 pub type FakeEgress = Egress<Names, Upstream, Owned>;
 
-/// A starter with no names, an echo upstream and no own addresses.
+/// A starter with no names, an echo upstream, no own addresses and the system trust roots.
 pub fn fake_egress() -> Arc<FakeEgress> {
     Arc::new(Egress {
         resolver: Arc::new(Names::default()),
         dialer: Arc::new(Upstream::default()),
         host: Arc::new(Owned::default()),
+        roots: sallyd::egress::roots::BundleFiles::default(),
     })
 }

@@ -3,6 +3,7 @@
 use sally_core::audit::AuditError;
 
 use super::Running;
+use crate::egress::net::EgressError;
 use crate::sandbox::dirs::DirError;
 use crate::sandbox::inside::Mismatch;
 use crate::sandbox::overlap::ReserveError;
@@ -67,9 +68,10 @@ pub enum LaunchError {
     /// A background task failed.
     #[error("internal: {0}")]
     Internal(String),
-    /// The session's egress listener (`net.sock`) could not be started.
-    #[error("network: net.sock: {0}")]
-    Egress(#[source] std::io::Error),
+    /// The session's egress could not be set up: trust roots, session CA, CA files, or the
+    /// `net.sock` listener.
+    #[error("network: {0}")]
+    Egress(#[source] EgressError),
 }
 
 impl LaunchError {
@@ -90,7 +92,9 @@ impl LaunchError {
             Self::Command { .. } => "podman",
             Self::Audit(_) | Self::Unaudited { .. } => "audit",
             Self::Internal(_) => "internal",
-            Self::Egress(_) => "egress-listener",
+            Self::Egress(EgressError::Listener(_)) => "egress-listener",
+            Self::Egress(EgressError::Roots(_)) => "trust-roots",
+            Self::Egress(EgressError::Ca(_) | EgressError::Files(_)) => "session-ca",
         }
     }
 }

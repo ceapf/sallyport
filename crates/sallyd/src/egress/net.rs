@@ -8,7 +8,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use rustix::fs::{Mode, OFlags};
 use sally_core::manifest::{AuditLevel, ValidatedManifest};
@@ -16,9 +16,11 @@ use tokio::net::{TcpStream, UnixListener, UnixStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
+use super::ca::{self, CaError, SessionTls, Validity};
 use super::hostaddrs;
 use super::policy::Policy;
-use super::server::{Dialer, HostAddrs, Limits, Parts, Proxy, Resolver, until_true};
+use super::roots::{BundleFiles, RootsError};
+use super::server::{Dialer, HostAddrs, Interception, Limits, Parts, Proxy, Resolver, until_true};
 use crate::sandbox::AuditSink;
 
 /// File name of the egress socket in the workspace socket directory (ARCHITECTURE §3.1).
@@ -290,6 +292,12 @@ pub struct SessionEgress {
     pub level: AuditLevel,
     /// The audit log.
     pub audit: Arc<dyn AuditSink>,
+    /// Whether the session gets a session CA ([`ca::wanted`]).
+    pub ca: bool,
+    /// `runtime.timeout`: the CA is valid this long plus [`ca::GRACE`].
+    pub timeout: Duration,
+    /// The CA, its leaves and the upstream roots, once [`EgressStarter::prepare`] made them.
+    pub interception: Option<Interception>,
 }
 
 impl SessionEgress {
@@ -303,13 +311,43 @@ impl SessionEgress {
             session: session.to_owned(),
             level: m.audit.level,
             audit,
+            ca: ca::wanted(m),
+            timeout: Duration::from_secs(m.runtime.timeout.as_secs()),
+            interception: None,
         }
     }
 }
 
+/// Why a session's egress could not be set up. Each refuses the launch.
+#[derive(Debug, thiserror::Error)]
+pub enum EgressError {
+    /// No upstream trust roots.
+    #[error(transparent)]
+    Roots(#[from] RootsError),
+    /// The session CA could not be made.
+    #[error(transparent)]
+    Ca(#[from] CaError),
+    /// `ca-bundle.pem` or `session-ca.pem` could not be written.
+    #[error("CA files: {0}")]
+    Files(#[source] io::Error),
+    /// `net.sock` could not be bound.
+    #[error("net.sock: {0}")]
+    Listener(#[source] io::Error),
+}
+
 /// Starts a session's listener. Dyn-compatible, so the launcher holds `Arc<dyn EgressStarter>`;
-/// the resolver, dialer and host addresses behind it are constructor arguments (decision 10).
+/// the resolver, dialer, host addresses and trust roots behind it are constructor arguments
+/// (decision 10; Task 9a decision 6).
 pub trait EgressStarter: Send + Sync {
+    /// For a session with a session CA ([`SessionEgress::ca`]): loads the upstream trust roots,
+    /// mints the CA and its leaves, and writes `ca-bundle.pem` and `session-ca.pem` into `dir`
+    /// (the workspace socket directory), before the container exists. Blocking: the launcher runs
+    /// it off the runtime. Other sessions pass through unchanged.
+    ///
+    /// # Errors
+    /// [`EgressError::Roots`], [`EgressError::Ca`] or [`EgressError::Files`].
+    fn prepare(&self, dir: &Path, s: SessionEgress) -> Result<SessionEgress, EgressError>;
+
     /// Binds `sock` and serves it for the session.
     ///
     /// # Errors
@@ -317,7 +355,8 @@ pub trait EgressStarter: Send + Sync {
     fn start(&self, sock: &Path, s: SessionEgress) -> io::Result<EgressHandle>;
 }
 
-/// The starter over a resolver, a dialer and a host-address source, shared by every session.
+/// The starter over a resolver, a dialer, a host-address source and the trust-root files, shared
+/// by every session.
 #[derive(Debug, Default)]
 pub struct Egress<R, D, H> {
     /// Name lookups.
@@ -326,6 +365,9 @@ pub struct Egress<R, D, H> {
     pub dialer: Arc<D>,
     /// The host's own addresses.
     pub host: Arc<H>,
+    /// Where the upstream trust roots are read from, per session ([`BundleFiles::default`] in
+    /// production).
+    pub roots: BundleFiles,
 }
 
 /// The production starter. Build it once and share it by every session: each
@@ -334,6 +376,18 @@ pub struct Egress<R, D, H> {
 pub type SystemEgress = Egress<SystemResolver, TcpDialer, ProcHostAddrs>;
 
 impl<R: Resolver, D: Dialer, H: HostAddrs> EgressStarter for Egress<R, D, H> {
+    fn prepare(&self, dir: &Path, mut s: SessionEgress) -> Result<SessionEgress, EgressError> {
+        if !s.ca {
+            return Ok(s);
+        }
+        let roots = self.roots.load()?;
+        let validity = Validity::for_session(SystemTime::now(), s.timeout)?;
+        let tls = SessionTls::mint(s.policy.grant_hosts(), validity)?;
+        ca::write_files(dir, &tls, &roots.pem).map_err(EgressError::Files)?;
+        s.interception = Some(Interception { tls, roots });
+        Ok(s)
+    }
+
     fn start(&self, sock: &Path, s: SessionEgress) -> io::Result<EgressHandle> {
         let listener = bind(sock)?;
         let proxy = Proxy::new(Parts {
@@ -345,6 +399,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> EgressStarter for Egress<R, D, H> {
             session: s.session,
             level: s.level,
             limits: Limits::new(s.max_connections),
+            interception: s.interception,
         });
         Ok(serve(listener, Arc::new(proxy)))
     }
@@ -673,6 +728,7 @@ mod tests {
             resolver,
             dialer: Arc::new(Echo),
             host: Arc::new(NoneOwned),
+            roots: BundleFiles::default(),
         };
         let rule = super::super::policy::Rule {
             host: parse_host_pattern("a.mock.test").unwrap(),
@@ -687,6 +743,9 @@ mod tests {
                     session: "s-1".into(),
                     level: AuditLevel::default(),
                     audit: audit as Arc<dyn AuditSink>,
+                    ca: false,
+                    timeout: Duration::from_secs(60),
+                    interception: None,
                 },
             )
             .unwrap()
@@ -852,3 +911,7 @@ mod tests {
         dir
     }
 }
+
+#[cfg(test)]
+#[path = "net_ca_tests.rs"]
+mod ca_tests;
