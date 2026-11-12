@@ -398,7 +398,14 @@ impl Launcher {
             .run("create", argv.into_iter().map(OsString::from))
             .await?;
         let container = container_id(&out)?;
-        self.checked_start(req, scan, &container).await?;
+        if let Err(e) = self.checked_start(req, scan, &container).await {
+            // The container may have run long enough to open a tunnel: stop the listener in
+            // order, so every `egress.allow` gets its `egress.close`.
+            if let Some(h) = egress {
+                h.shutdown().await;
+            }
+            return Err(e);
+        }
         let running = Running {
             container,
             name,

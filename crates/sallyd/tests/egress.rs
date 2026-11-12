@@ -83,10 +83,13 @@ fn rt_net_02_a_denied_name_is_never_resolved_inside_or_by_the_host() {
         let lx = Lx::new();
         let r = session(&lx, NET, "n02").await;
         let canary = format!("c{:x}.attacker.test", std::process::id());
+        // A name that exists fails too: the failure is the missing network, not NXDOMAIN.
         for cmd in [
             format!("nslookup {canary}"),
             format!("nslookup {canary} 8.8.8.8"),
             format!("getent hosts {canary}"),
+            "nslookup example.org 8.8.8.8".to_owned(),
+            "getent hosts example.org".to_owned(),
         ] {
             let (code, _) = exec(&r, &format!("timeout 10 {cmd}")).await;
             assert_ne!(code, 0, "{cmd} resolved inside the sandbox");
@@ -172,28 +175,42 @@ fn rt_net_05_only_the_request_target_decides_and_ip_literals_are_refused() {
                 "400",
                 "mock.test@evil.test:443",
             ),
-            (connect(&format!("{one}:443")), "403", "1.1.1.1:443"),
-            (connect("16843009:443"), "403", "16843009:443"),
-            (connect("0x01010101:443"), "403", "0x01010101:443"),
-            (
-                connect(&format!("[::ffff:{one}]:443")),
-                "403",
-                "[::ffff:1.1.1.1]:443",
-            ),
         ];
         for (req, want, _) in &cases {
             let got = via_shim(&r, req).await;
             assert_eq!(status(&got), *want, "{req}: {got}");
             assert!(!got.contains("evil"), "the reply echoes the target: {got}");
         }
-        let logged: Vec<serde_json::Value> = refusals(&lx, "egress.deny")
+        lx.stop(r).await;
+        // The literals under `*`: nothing but the IP-literal check can refuse them here.
+        let any = "network:\n  mode: proxy\n  acknowledge_unrestricted_egress: true\n  allow:\n    \
+                   - host: \"*\"\n";
+        let r = session(&lx, any, "n05any").await;
+        let literals = [
+            format!("{one}:443"),
+            "16843009:443".to_owned(),
+            "0x01010101:443".to_owned(),
+            "0X01010101.:443".to_owned(),
+            "017700000001:443".to_owned(),
+            format!("[::ffff:{one}]:443"),
+            "[::1]:443".to_owned(),
+        ];
+        for target in &literals {
+            let got = via_shim(&r, &connect(target)).await;
+            assert_eq!(status(&got), "403", "{target}: {got}");
+            assert!(got.ends_with("ip-literal\n"), "{target}: {got}");
+        }
+        let denied = refusals(&lx, "egress.deny");
+        let logged: Vec<serde_json::Value> = denied.iter().map(|a| a["target"].clone()).collect();
+        let want: Vec<serde_json::Value> = cases
             .iter()
-            .map(|a| a["target"].clone())
+            .map(|(_, _, t)| json!(t))
+            .chain(literals.iter().map(|t| json!(t)))
             .collect();
-        let want: Vec<serde_json::Value> = cases.iter().map(|(_, _, t)| json!(t)).collect();
         assert_eq!(logged, want);
-        let ip = refusals(&lx, "egress.deny")[4]["reason"].clone();
-        assert_eq!(ip, json!("ip-literal"));
+        for d in denied.iter().skip(cases.len()) {
+            assert_eq!(d["reason"], json!("ip-literal"), "{d}");
+        }
         assert!(lx.egress.resolver.lookups().is_empty());
         assert!(lx.egress.dialer.dials().is_empty());
         lx.stop(r).await;

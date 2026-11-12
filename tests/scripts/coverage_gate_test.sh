@@ -40,6 +40,9 @@ expect 1 "one point over the coverage fails" 86 /crates/sallyd/src/egress/
 expect 1 "no matching file fails" 85 /crates/sallyd/src/approvals/
 summary "$tmp/s.json" /r/crates/sallyd/src/egress/a.rs 100 84
 expect 1 "one line under fails" 85 /crates/sallyd/src/egress/
+summary "$tmp/s.json" /r/crates/sallyd/src/egress/a.rs 100 84 \
+  /r/crates/sallyd/src/egress/a_tests.rs 900 900
+expect 1 "test files do not lift the figure" 85 /crates/sallyd/src/egress/
 summary "$tmp/s.json" /r/crates/sallyd/src/egress/a.rs 0 0
 expect 1 "matching files without lines fail" 85 /crates/sallyd/src/egress/
 rc=0

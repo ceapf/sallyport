@@ -26,6 +26,13 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(a) = authority::parse(text) {
         assert_ne!(a.port, 0, "port 0 accepted");
         assert!(a.host.parse::<std::net::IpAddr>().is_err(), "IP literal accepted");
+        // inet_aton spellings (decimal, octal, hex, 1-4 parts) end in a numeric label. A bare
+        // `0x` is not one: glibc and musl both need a digit after it.
+        let last = a.host.rsplit('.').next().unwrap_or_default();
+        let hex = last
+            .strip_prefix("0x")
+            .is_some_and(|h| !h.is_empty() && h.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(!last.bytes().all(|b| b.is_ascii_digit()) && !hex, "numeric last label accepted");
         let again = authority::parse(&format!("{}:{}", a.host, a.port));
         assert_eq!(again.as_ref(), Ok(&a), "authority is not canonical");
     }
