@@ -808,6 +808,7 @@ dependencies = [
  "libfuzzer-sys",
  "sally-core",
  "sallyd",
+ "serde_json",
 ]
 
 [[package]]
