@@ -45,13 +45,29 @@ fn redteam_tls() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/redteam/tls")
 }
 
-/// A fresh directory for one test's files under `CARGO_TARGET_TMPDIR`.
-fn scratch(name: &str) -> PathBuf {
+/// A fresh directory for one test's files under `CARGO_TARGET_TMPDIR`, removed when dropped
+/// (also when the test fails).
+struct Scratch(PathBuf);
+
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn scratch(name: &str) -> Scratch {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("rt-sec-10-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    dir
+    Scratch(dir)
 }
 
 /// One chain to verify: the leaf first, then intermediates; the leaf's key; the name.
@@ -411,25 +427,40 @@ fn planted_b64(key: &KeyPair) -> String {
     pem.lines().filter(|l| !l.starts_with("-----")).collect()
 }
 
-/// A shell script that plants a throwaway key (a PEM file, its DER, a process environment) and
-/// prints every file outside `/proc`, `/sys` and `/dev`, and every `/proc/*/environ`, that holds
-/// key material or `ca_line`; `unreadable <path>` for an environment it may not read. Key
-/// material: a PEM private-key armor line (the bare label is a string in libcrypto), and the
-/// PKCS#8 P-256 prefix in base64 and in DER.
+/// Carried in the argv of the search's own processes (its `sh -c` and every `grep` it runs),
+/// whose command lines hold the patterns; a command line carrying it is skipped.
+const SEARCH_MARK: &str = "sp-rt-sec-10-search";
+
+/// A shell script that plants a throwaway key (a PEM file and its DER under `/tmp`, a process
+/// environment, a process command line) and prints every file outside
+/// `/proc`, `/sys` and `/dev`, every file in `/dev/shm`, and every `/proc/*/environ` and
+/// `/proc/*/cmdline` (but the search's own) that holds key material or `ca_line`;
+/// `unreadable <path>` for an environment it may not read. Key material: a PEM private-key armor
+/// line (the bare label is a string in libcrypto), and the PKCS#8 P-256 prefix in base64 and in
+/// DER. `/dev/shm` is read-only in both sandboxes, so nothing can be planted there; the script
+/// says so if that ever changes (the test then fails until a plant there is added).
 fn search_script(planted_pem: &str, planted_b64: &str, ca_line: &str) -> String {
     format!(
         "set -u\n\
          printf '%s' '{planted_pem}' > /tmp/planted.pem\n\
+         ( printf '%s' '{planted_pem}' > /dev/shm/planted.pem ) 2>/dev/null \
+           && echo '/dev/shm is writable: plant there as a positive control'\n\
          printf '%s' '{planted_b64}' | base64 -d > /tmp/planted.der\n\
          env SP_PLANTED='{planted_b64}' sleep 120 </dev/null >/dev/null 2>&1 &\n\
+         sh -c 'sleep 120; :' planted '{planted_b64}' </dev/null >/dev/null 2>&1 &\n\
          sleep 1\n\
          der=\"$(printf '{KEY_DER_OCTAL}')\"\n\
-         set -- -e 'PRIVATE KEY-----' -e '{KEY_B64}' -e \"$der\" -e '{ca_line}'\n\
+         set -- -e '{SEARCH_MARK}' -e 'PRIVATE KEY-----' -e '{KEY_B64}' -e \"$der\" -e '{ca_line}'\n\
          find / \\( -path /proc -o -path /sys -o -path /dev \\) -prune -o -type f -print0 2>/dev/null \
            | xargs -0 grep -l -a -F \"$@\" 2>/dev/null\n\
+         find /dev/shm -type f -print0 2>/dev/null | xargs -0 grep -l -a -F \"$@\" 2>/dev/null\n\
          for e in /proc/[0-9]*/environ; do\n\
            if [ -e \"$e\" ] && ! [ -r \"$e\" ]; then echo \"unreadable $e\"; fi\n\
            grep -l -a -F \"$@\" \"$e\" 2>/dev/null | sed 's|/[0-9]*/environ$|/<pid>/environ|'\n\
+         done\n\
+         for c in /proc/[0-9]*/cmdline; do\n\
+           if grep -q -a -F -e '{SEARCH_MARK}' \"$c\" 2>/dev/null; then continue; fi\n\
+           grep -l -a -F \"$@\" \"$c\" 2>/dev/null | sed 's|/[0-9]*/cmdline$|/<pid>/cmdline|'\n\
          done\n\
          exit 0\n"
     )
@@ -442,11 +473,13 @@ fn found(out: &str) -> Vec<String> {
     v
 }
 
-/// RT-SEC-10, key reach and the live leg. Controls: the leaf keys and the CA key live only in
-/// `sallyd` (`SessionTls`; the CA key is dropped after minting, Q38 (f)) and the CA files go to
-/// the workspace socket directory only (`ca::write_files`; `harness_argv` binds the harness
-/// directory alone, SI-2). Planting a key in either container is found (positive control), so
-/// a key written anywhere the sandbox can read fails the test; so does a CA file in the harness.
+/// RT-SEC-10, key reach and the live leg. Controls: the leaf keys live only in `sallyd`
+/// (`SessionTls`), and the CA files go to the workspace socket directory only
+/// (`ca::write_files`; `harness_argv` binds the harness directory alone, SI-2). (That the CA key
+/// is dropped after minting, Q38 (f), is not observable from a container; the 9a-1 unit tests
+/// hold it.) Planting a key in either container is found (positive control) in every place
+/// searched, so a key written anywhere the sandbox can read fails the test; so does a CA file in
+/// the harness.
 #[test]
 fn rt_sec_10_no_private_key_reaches_a_container_and_the_harness_gets_no_ca_file() {
     rt().block_on(async {
@@ -477,6 +510,7 @@ fn rt_sec_10_no_private_key_reaches_a_container_and_the_harness_gets_no_ca_file(
         assert_eq!(
             found(&out),
             [
+                "/proc/<pid>/cmdline",
                 "/proc/<pid>/environ",
                 &format!("/run/sallyport/{BUNDLE_FILE}"),
                 &format!("/run/sallyport/{CA_FILE}"),
@@ -506,6 +540,7 @@ fn rt_sec_10_no_private_key_reaches_a_container_and_the_harness_gets_no_ca_file(
         assert_eq!(
             found(&out),
             [
+                "/proc/<pid>/cmdline",
                 "/proc/<pid>/environ",
                 "/tmp/planted.der",
                 "/tmp/planted.pem"
