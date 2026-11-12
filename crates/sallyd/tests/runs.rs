@@ -3,6 +3,8 @@
 //! that serialize disk-heavy work are per user, not per target directory.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
@@ -18,19 +20,41 @@ fn scratch(tag: &str) -> PathBuf {
     d
 }
 
+fn is_run_id(id: &str) -> bool {
+    id.len() == 8
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
 #[test]
 fn the_run_id_is_eight_lowercase_alphanumerics_and_follows_the_wrapper() {
     let id = run_id();
-    assert_eq!(id.len(), 8, "{id}");
-    assert!(
-        id.bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()),
-        "{id}"
-    );
+    assert!(is_run_id(id), "{id}");
     if let Ok(set) = std::env::var("SALLYPORT_TEST_RUN") {
         assert_eq!(id, set, "the wrapper's id is the run id");
     }
     assert_eq!(id, run_id(), "one id per process");
+    assert!(is_run_id(&random_run_id()));
+}
+
+/// Set: the wrapper's value wins, verbatim. Unset: a random id. Malformed, or not UTF-8: an
+/// error (a panic in `run_id`), never a fallback the wrapper could not sweep.
+#[test]
+fn the_wrapper_value_wins_and_a_malformed_one_is_an_error() {
+    use std::env::VarError;
+    let never = || -> String { panic!("random id used for a set variable") };
+    assert_eq!(
+        resolve_run_id(Ok("a1b2c3d4".into()), never).unwrap(),
+        "a1b2c3d4"
+    );
+    assert_eq!(
+        resolve_run_id(Err(VarError::NotPresent), || "zz".into()).unwrap(),
+        "zz"
+    );
+    assert!(resolve_run_id(Ok("ABC".into()), never).is_err());
+    let raw = OsString::from_vec(vec![b'a', 0xff, b'b', b'c', b'd', b'e', b'f', b'g']);
+    assert!(resolve_run_id(Err(VarError::NotUnicode(raw)), never).is_err());
 }
 
 #[test]
@@ -57,48 +81,49 @@ fn every_container_name_carries_the_run_id() {
 #[test]
 fn locks_live_in_the_user_runtime_directory_not_the_worktree() {
     let xdg = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
-    let p = lock_path("runs-probe");
-    assert_eq!(p, xdg.join("sallyport-test/runs-probe.lock"));
+    let name = format!("runs-probe-{}", std::process::id());
+    let p = lock_path(&name);
+    assert_eq!(p, xdg.join(format!("sallyport-test/{name}.lock")));
     assert!(!p.starts_with(env!("CARGO_TARGET_TMPDIR")));
-    let held = lock("runs-probe", false);
+    let held = lock(&name, false);
     let mode = std::fs::metadata(p.parent().unwrap())
         .unwrap()
         .permissions()
         .mode();
     assert_eq!(mode & 0o777, 0o700);
     drop(held);
+    std::fs::remove_file(&p).unwrap();
 }
 
+/// Created 0700 when missing; an existing lock file keeps its bytes; a symlink at the lock path
+/// is not followed.
 #[test]
-fn a_lock_file_is_never_truncated() {
+fn a_lock_file_is_never_truncated_or_reached_through_a_symlink() {
     let d = scratch("trunc");
     let dir = lock_dir_in(&d);
     std::fs::write(dir.join("t.lock"), "keep").unwrap();
     drop(open_lock(&dir.join("t.lock")));
     assert_eq!(std::fs::read_to_string(dir.join("t.lock")).unwrap(), "keep");
+    std::os::unix::fs::symlink(dir.join("t.lock"), dir.join("l.lock")).unwrap();
+    assert!(std::panic::catch_unwind(|| open_lock(&dir.join("l.lock"))).is_err());
+    std::fs::remove_dir_all(&d).unwrap();
 }
 
 #[test]
 fn a_lock_directory_open_to_others_or_a_symlink_is_refused() {
     let d = scratch("loose");
-    std::fs::create_dir(d.join("sallyport-test")).unwrap();
-    std::fs::set_permissions(
-        d.join("sallyport-test"),
-        std::fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
+    let planted = d.join("sallyport-test");
+    std::fs::create_dir(&planted).unwrap();
+    std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert!(
         std::panic::catch_unwind(|| lock_dir_in(&d)).is_err(),
         "0755 accepted"
     );
 
+    // A private directory, but reached through a symlink.
+    std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o700)).unwrap();
     let e = scratch("link");
-    std::os::unix::fs::symlink(&d, e.join("sallyport-test")).unwrap();
-    std::fs::set_permissions(
-        d.join("sallyport-test"),
-        std::fs::Permissions::from_mode(0o700),
-    )
-    .unwrap();
+    std::os::unix::fs::symlink(&planted, e.join("sallyport-test")).unwrap();
     assert!(
         std::panic::catch_unwind(|| lock_dir_in(&e)).is_err(),
         "symlink accepted"
@@ -115,32 +140,19 @@ fn a_lock_directory_open_to_others_or_a_symlink_is_refused() {
     }
 }
 
-/// The test image's tag carries this run's id (ad hoc: `local`), and the digest the tests use is
-/// that tag's image.
+/// The test image is built under this run's tag (ad hoc: `local`), and the digest the tests use
+/// is that tag's image.
 #[test]
 fn the_test_image_is_tagged_for_this_run() {
-    let image = test_image();
-    let tags = podman(&["images", "--format", "{{.Repository}}:{{.Tag}}"]);
-    let tags = String::from_utf8_lossy(&tags.stdout);
-    let prefix = format!("localhost/sallyport-test:{}-", image_run());
+    let digest = test_image().as_str().split_once('@').unwrap().1.to_owned();
+    let tag = test_image_tag();
+    let key = tag
+        .strip_prefix(&format!("localhost/sallyport-test:{}-", image_run()))
+        .unwrap_or_else(|| panic!("{tag}"));
     assert!(
-        tags.lines().any(|t| t.starts_with(&prefix)),
-        "{prefix} in {tags}"
+        key.len() == 16 && key.bytes().all(|b| b.is_ascii_hexdigit()),
+        "{tag}"
     );
-    let digest = image.as_str().split_once('@').unwrap().1;
-    let ids = podman(&[
-        "image",
-        "inspect",
-        "--format",
-        "{{.Digest}}",
-        &tag_of(&tags, &prefix),
-    ]);
-    assert_eq!(String::from_utf8_lossy(&ids.stdout).trim(), digest);
-}
-
-fn tag_of(tags: &str, prefix: &str) -> String {
-    tags.lines()
-        .find(|t| t.starts_with(prefix))
-        .unwrap()
-        .to_owned()
+    let out = podman(&["image", "inspect", "--format", "{{.Digest}}", tag]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), digest);
 }

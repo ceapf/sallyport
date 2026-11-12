@@ -19,8 +19,8 @@ s="$STUB"
 echo "$*" >>"$s/log"
 drop() { if grep -qxF "$2" "$s/stuck"; then exit 1; fi; grep -vxF "$2" "$s/$1" >"$s/$1.n" || true; mv "$s/$1.n" "$s/$1"; }
 case "$1" in
-  ps) cat "$s/containers" ;;
-  images) cat "$s/images" ;;
+  ps) [ ! -e "$s/psfail" ] || exit 125; cat "$s/containers" ;;
+  images) [ ! -e "$s/imgfail" ] || exit 125; cat "$s/images" ;;
   rm) drop containers "${*: -1}" ;;
   rmi) drop images "${*: -1}" ;;
   *) exit 2 ;;
@@ -57,12 +57,18 @@ no_rmi_flags() { ! grep -qE '^rmi .*(-f|--force)|prune|--filter' "$tmp/s/log"; }
 
 # Clean success: exit 0, the run's image tags untagged, nobody else's names touched.
 go "echo \"id=\$SALLYPORT_TEST_RUN\" >\"\$STUB/id\"; $own_img
-    echo \"sp-ws-t\${SALLYPORT_TEST_RUN}0-1-0-a\" >>\"\$STUB/containers\""
+    echo \"sp-ws-t\${SALLYPORT_TEST_RUN}0-1-0-a\" >>\"\$STUB/containers\"
+    echo \"xsp-ws-t\${SALLYPORT_TEST_RUN}-1-0-a\" >>\"\$STUB/containers\"
+    echo \"evil/localhost/sallyport-test:\${SALLYPORT_TEST_RUN}-0123456789abcdef\" >>\"\$STUB/images\"
+    echo \"localhost/sallyport-test:\${SALLYPORT_TEST_RUN}-0123456789abcdef0\" >>\"\$STUB/images\""
 check "clean success exits 0 (got $rc)" test "$rc" -eq 0
 check "a name extending the run id is not this run's" grep -qE '^sp-ws-t[a-z0-9]{8}0-1-0-a$' "$tmp/s/containers"
+check "a container name is matched from its start" grep -qE '^xsp-ws-t[a-z0-9]{8}-1-0-a$' "$tmp/s/containers"
+check "an image name is matched from its start" grep -qE '^evil/localhost/' "$tmp/s/images"
+check "an image tag is matched to its end" grep -qE ':[a-z0-9]{8}-0123456789abcdef0$' "$tmp/s/images"
 check "a fresh 8-char run id replaces the inherited one" grep -qxE 'id=[a-z0-9]{8}' "$tmp/s/id"
 check "the inherited id is not used" test "$(cat "$tmp/s/id")" != "id=inherit0"
-check "own image tags removed" bash -c "! grep -q 'sallyport-test.*:$(cut -d= -f2 "$tmp/s/id")-0123' '$tmp/s/images'"
+check "own image tags removed" bash -c "! grep -qE '^localhost/sallyport-test(-net)?:$(cut -d= -f2 "$tmp/s/id")-0123456789abcdef\$' '$tmp/s/images'"
 check "a tag outside the anchored shape is kept" grep -q ':.*-x$' "$tmp/s/images"
 check "other runs untouched (success)" untouched
 check "no forced, filtered or pruning removal" no_rmi_flags
@@ -90,7 +96,27 @@ go "$own"' kill -TERM $PPID; sleep 5'
 check "a terminated run exits non-zero (got $rc)" test "$rc" -ne 0
 check "a terminated run still sweeps" bash -c "test \$(grep -c '^sp-ws-t' '$tmp/s/containers') -eq 2"
 
-# The lock directory must be private.
+# Interrupted with INT: the whole command is stopped, grandchildren included, so nothing is
+# created after the sweep (security review M1).
+go "$own"' (sleep 2; echo late >>"$STUB/containers") & kill -INT $PPID; wait'
+sleep 3
+check "an interrupted run exits non-zero (got $rc)" test "$rc" -ne 0
+check "an interrupted run stops its grandchildren" bash -c "! grep -qx late '$tmp/s/containers'"
+check "an interrupted run still sweeps" bash -c "test \$(grep -c '^sp-ws-t' '$tmp/s/containers') -eq 2"
+
+# A listing podman cannot give fails closed, never reads as "nothing left" (security review M2).
+for f in psfail imgfail; do
+  go "touch \"\$STUB/$f\""
+  check "a failed podman listing ($f) exits non-zero (got $rc)" test "$rc" -ne 0
+  go "$own touch \"\$STUB/$f\"; exit 7"
+  check "a failed listing ($f) keeps a failed command's status (got $rc)" test "$rc" -eq 7
+done
+
+# The lock directory and XDG_RUNTIME_DIR itself must be private.
+chmod 755 "$tmp/xdg"
+go "$own_img"
+check "a group/other-accessible XDG_RUNTIME_DIR is refused (got $rc)" test "$rc" -ne 0
+chmod 700 "$tmp/xdg"
 chmod 755 "$tmp/xdg/sallyport-test" 2>/dev/null || mkdir -m 755 "$tmp/xdg/sallyport-test"
 go "$own_img"
 check "a group/other-accessible lock directory is refused (got $rc)" test "$rc" -ne 0

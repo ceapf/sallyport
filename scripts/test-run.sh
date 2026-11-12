@@ -19,14 +19,19 @@ set -euo pipefail
 [ $# -ge 1 ] || { echo "usage: test-run.sh <command...>" >&2; exit 2; }
 podman="${SALLYPORT_PODMAN:-podman}"
 
-# The machine-wide lock directory the fixture uses too (architect Q23): private, ours, real.
+# The per-user lock directory the fixture uses too (architect Q23): it and XDG_RUNTIME_DIR are
+# real directories owned by this user with no group or other access, so nobody else can plant
+# a file or link at the lock path (the `9>>` below follows a link; only this user could make one).
+private_dir() {
+  [ ! -L "$1" ] && [ -d "$1" ] && [ "$(stat -c %u "$1")" = "$(id -u)" ] &&
+    [ $((8#$(stat -c %a "$1") & 8#077)) -eq 0 ]
+}
 [[ "${XDG_RUNTIME_DIR:-}" == /* ]] || { echo "test-run: XDG_RUNTIME_DIR must be absolute" >&2; exit 2; }
 locks="$XDG_RUNTIME_DIR/sallyport-test"
-mkdir -p -m 700 "$locks"
-if [ -L "$locks" ] || [ "$(stat -c '%u %a' "$locks")" != "$(id -u) 700" ]; then
-  echo "test-run: $locks must be a directory owned by this user with mode 0700" >&2
+private_dir "$XDG_RUNTIME_DIR" && mkdir -p -m 700 "$locks" && private_dir "$locks" || {
+  echo "test-run: XDG_RUNTIME_DIR and $locks must be directories owned by this user, mode 0700" >&2
   exit 2
-fi
+}
 
 alphabet=abcdefghijklmnopqrstuvwxyz0123456789
 id=
@@ -35,40 +40,54 @@ for b in $(od -An -N8 -tu1 /dev/urandom); do id+="${alphabet:b%36:1}"; done
 export SALLYPORT_TEST_RUN="$id"
 echo "test-run: run $id"
 
-own_containers() {
-  "$podman" ps --all --format '{{.Names}}' | grep -E "^sp-(ws|h|infer)-t${id}-" || true
+# mine <regex> <podman args...>: the matching lines of a podman listing. A failed listing fails
+# (exit 5): it never reads as "nothing left" (security review M2). grep's "no match" is empty.
+mine() {
+  local re="$1" out
+  shift
+  out="$("$podman" "$@")" || { echo "test-run: podman $1 failed" >&2; return 5; }
+  printf '%s\n' "$out" | grep -E "$re" || [ $? -eq 1 ]
 }
+own_containers() { mine "^sp-(ws|h|infer)-t${id}-" ps --all --format '{{.Names}}'; }
 own_images() {
-  "$podman" images --format '{{.Repository}}:{{.Tag}}' |
-    grep -E "^localhost/sallyport-test(-net|-exit)?:${id}-[0-9a-f]{16}\$" || true
+  mine "^localhost/sallyport-test(-net|-exit)?:${id}-[0-9a-f]{16}\$" \
+    images --format '{{.Repository}}:{{.Tag}}'
 }
+
+# worse <status> <rc>: the command's own failure wins; otherwise rc. Callers write `return $?`:
+# sweep runs in the EXIT trap, where a bare `return` gives the status from before the trap.
+worse() { if [ "$1" -ne 0 ]; then return "$1"; fi; return "$2"; }
 
 swept=0
 sweep() { # <command status>; prints nothing on a clean run
   [ "$swept" -eq 0 ] || return 0
   swept=1
-  local status="$1" left names
-  left="$(own_containers)"
-  for names in $left; do
-    "$podman" rm --force --time 0 "$names" >/dev/null 2>&1 || true
-  done
-  (
+  local status="$1" left still n
+  left="$(own_containers)" || { worse "$status" 5; return $?; }
+  while IFS= read -r n; do
+    [ -z "$n" ] || "$podman" rm --force --time 0 "$n" >/dev/null 2>&1 || true
+  done <<<"$left"
+  # Untag under the image lock, so it never interleaves with another run's build.
+  if ! (
     flock 9
-    for names in $(own_images); do
-      "$podman" rmi "$names" >/dev/null 2>&1 || echo "test-run: could not untag $names" >&2
-    done
-  ) 9>>"$locks/test-image.lock"
-  if [ -n "$(own_containers)" ]; then
-    echo "test-run: containers still present after the sweep:" >&2
-    own_containers >&2
-    [ "$status" -ne 0 ] && return "$status"
-    return 4
+    imgs="$(own_images)" || exit 5
+    while IFS= read -r n; do
+      [ -z "$n" ] || "$podman" rmi "$n" >/dev/null 2>&1 || echo "test-run: could not untag $n" >&2
+    done <<<"$imgs"
+  ) 9>>"$locks/test-image.lock"; then
+    worse "$status" 5
+    return $?
+  fi
+  still="$(own_containers)" || { worse "$status" 5; return $?; }
+  if [ -n "$still" ]; then
+    printf 'test-run: containers still present after the sweep:\n%s\n' "$still" >&2
+    worse "$status" 4
+    return $?
   fi
   if [ -n "$left" ]; then
-    echo "test-run: containers left behind (removed):" >&2
-    printf '%s\n' "$left" >&2
-    [ "$status" -ne 0 ] && return "$status"
-    return 3
+    printf 'test-run: containers left behind (removed):\n%s\n' "$left" >&2
+    worse "$status" 3
+    return $?
   fi
   return "$status"
 }
@@ -80,16 +99,22 @@ finish() {
   sweep "$rc" || rc=$?
   exit "$rc"
 }
-on_signal() { # stop the command first, so it creates nothing after the sweep
-  [ -z "$child" ] || { kill -TERM "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; }
+# Stop the whole command first (its process group: cargo, the test binaries, their children), so
+# nothing is created after the sweep (security review M1).
+on_signal() {
+  [ -z "$child" ] || { kill -TERM -- "-$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; }
   exit "$1"
 }
 trap finish EXIT
 trap 'on_signal 130' INT
 trap 'on_signal 143' TERM
 
+# Job control: the command gets its own process group, with SIGINT not ignored (a non-interactive
+# shell starts background jobs with INT and QUIT ignored).
+set -m
 "$@" &
 child=$!
+set +m
 status=0
 wait "$child" || status=$?
 child=
