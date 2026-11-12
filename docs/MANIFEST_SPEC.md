@@ -213,7 +213,9 @@ tools: `fs_read`/`fs_list` on any mode, `fs_write`/`fs_delete` on `rw` and `brok
 - host: api.github.com            # exact hostname, or "*.example.com" (subdomains only), or "*"
   ports: [443]                    # default [443]; 80 enables plain http upstream
 ```
-Hosts are written canonically (lowercase ASCII/punycode, no trailing dot) or rejected. A
+Hosts are written canonically (lowercase ASCII/punycode, no trailing dot) or rejected. An exact
+host (here and in `secrets[].inject.host`) has at least two labels: `localhost` or `intranet`
+is rejected, since the proxy refuses such names and looks every name up absolute. A
 wildcard over a suffix where anyone can register hosts (`*.github.io`, `*.s3.amazonaws.com`,
 `*.workers.dev`, `*.r2.dev`, `*.ngrok-free.app`, … — one maintained constant,
 `host::SHARED_SUFFIXES`; TODO(v2) derive it from the Public Suffix List) counts as unrestricted and needs

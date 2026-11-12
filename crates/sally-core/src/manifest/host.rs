@@ -113,6 +113,10 @@ pub enum HostError {
 }
 
 const MAX_HOST_LEN: usize = 253;
+/// Why a host of one label is refused: the egress proxy refuses it as malformed and looks names
+/// up absolute, so no rule naming one could ever be reached (issue #46).
+const ONE_LABEL: &str =
+    "a host of one label (\"localhost\", \"intranet\") is never reachable through the proxy";
 const MAX_LABEL_LEN: usize = 63;
 
 /// Parses an exact hostname. Wildcards are refused with [`HostError::Wildcard`].
@@ -123,8 +127,17 @@ pub fn parse_hostname(s: &str) -> Result<String, HostError> {
     if s.contains('*') {
         return Err(HostError::Wildcard);
     }
-    check_hostname(s)?;
+    check_exact(s)?;
     Ok(s.to_owned())
+}
+
+/// A full hostname of at least two labels.
+fn check_exact(s: &str) -> Result<(), HostError> {
+    check_hostname(s)?;
+    if !s.contains('.') {
+        return Err(HostError::Invalid(ONE_LABEL));
+    }
+    Ok(())
 }
 
 /// Parses an allow-rule host: exact, `*.base` (base needs at least two labels), or `*`.
@@ -152,7 +165,7 @@ pub fn parse_host_pattern(s: &str) -> Result<HostPattern, HostError> {
             "\"*\" is only allowed alone or as a leading \"*.\"",
         ));
     }
-    check_hostname(s)?;
+    check_exact(s)?;
     Ok(HostPattern::Exact(s.to_owned()))
 }
 
@@ -331,6 +344,19 @@ mod tests {
             parse_hostname("api.github.com"),
             Ok("api.github.com".into())
         );
+    }
+
+    #[test]
+    fn a_host_of_one_label_is_refused() {
+        let want: Result<(), _> = Err(HostError::Invalid(ONE_LABEL));
+        for h in ["localhost", "intranet", "a", "x-1"] {
+            assert_eq!(parse_hostname(h).map(|_| ()), want, "{h}");
+            assert_eq!(parse_host_pattern(h).map(|_| ()), want, "{h}");
+        }
+        assert!(parse_hostname("a.b").is_ok());
+        assert!(parse_host_pattern("a.b").is_ok());
+        // `*.com` keeps its own, more specific message.
+        assert_ne!(parse_host_pattern("*.com").map(|_| ()), want);
     }
 
     #[test]
