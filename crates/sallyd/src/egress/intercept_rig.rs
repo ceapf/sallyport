@@ -12,8 +12,9 @@ use sally_core::manifest::{AuditLevel, parse_host_pattern};
 use tokio::io::DuplexStream;
 
 use super::*;
+use crate::egress::ca::SessionTls;
 use crate::egress::policy::{Grant, Policy, Rule};
-use crate::egress::server::Parts;
+use crate::egress::server::{Interception, Parts};
 use crate::sandbox::AuditSink;
 
 pub(super) const HOST: &str = "a.mock.test";

@@ -22,8 +22,7 @@ use hyper::body::{Body, Bytes, Frame, Incoming, SizeHint};
 use hyper::http::{HeaderValue, Method, Request, Response, StatusCode, Version, header};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
-use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
-use rustls::sign::{CertifiedKey, SingleCertAndKey};
+use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ServerConfig};
 use sally_core::audit::NewEntry;
 use serde_json::{Value, json};
@@ -32,17 +31,14 @@ use tokio::time::Instant;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use super::super::authority::{Authority, escape_target};
-use super::super::ca::{CaError, Leaf, SessionTls};
 use super::super::head::MAX_HEAD;
 use super::super::meter::{BodyEnd, BoxError, Capped, Counts, Meter, OnEnd};
 use super::super::policy::Reason;
 use super::super::rewrite;
-use super::super::roots::Roots;
 use super::super::tunnel::{Activity, End, Totals};
+use super::intercept_tls::HostTls;
 use super::{Cleared, Dialer, ESTABLISHED, HostAddrs, Proxy, REPLY_TIMEOUT, Resolver, write_reply};
 
-/// The only ALPN protocol offered either way (decision 4).
-const HTTP_1_1: &[u8] = b"http/1.1";
 /// Largest upstream response head (architect Q45); more is `response-too-large`.
 pub const MAX_RESPONSE_HEAD: usize = 64 * 1024;
 /// Header lines a head may have, either way.
@@ -56,95 +52,6 @@ const MAX_HEADERS: usize = 100;
 /// [`MAX_HEAD`] or [`MAX_RESPONSE_HEAD`].
 const REQUEST_READ: usize = 1024;
 const RESPONSE_READ: usize = 4096;
-
-// TODO(#73): move the TLS setup (`Interception`, `HostTls`, `certified`, `tls_error`) to
-// `intercept_tls.rs` as the first commit of Task 9a-3.
-
-/// What the proxy intercepts grant hosts with (Task 9a): the session CA's leaves and the upstream
-/// trust roots, and the TLS configurations built from them. It holds no secret store and no
-/// credential (architect Q27 (1)).
-#[derive(Debug)]
-pub struct Interception {
-    /// The session CA and one leaf per grant host; the CA key is already gone.
-    pub tls: SessionTls,
-    /// The upstream verifier's roots.
-    pub roots: Roots,
-    upstream: Arc<ClientConfig>,
-    servers: Vec<(String, Arc<ServerConfig>)>,
-}
-
-impl Interception {
-    /// Builds the upstream client configuration (rustls defaults: TLS 1.2 and 1.3, the given
-    /// roots, ALPN `http/1.1`) and one server configuration per leaf.
-    ///
-    /// # Errors
-    /// [`CaError::Generate`] when rustls refuses a configuration or a leaf.
-    pub fn new(tls: SessionTls, roots: Roots) -> Result<Self, CaError> {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let mut upstream = ClientConfig::builder_with_provider(Arc::clone(&provider))
-            .with_safe_default_protocol_versions()
-            .map_err(tls_error)?
-            .with_root_certificates(Arc::clone(&roots.store))
-            .with_no_client_auth();
-        upstream.alpn_protocols = vec![HTTP_1_1.to_vec()];
-        let mut servers = Vec::with_capacity(tls.leaves.len());
-        for leaf in &tls.leaves {
-            let mut cfg = ServerConfig::builder_with_provider(Arc::clone(&provider))
-                .with_safe_default_protocol_versions()
-                .map_err(tls_error)?
-                .with_no_client_auth()
-                .with_cert_resolver(Arc::new(SingleCertAndKey::from(certified(leaf)?)));
-            cfg.alpn_protocols = vec![HTTP_1_1.to_vec()];
-            servers.push((leaf.host.clone(), Arc::new(cfg)));
-        }
-        Ok(Self {
-            tls,
-            roots,
-            upstream: Arc::new(upstream),
-            servers,
-        })
-    }
-
-    /// The server configuration presenting `host`'s leaf, if the session CA made one.
-    #[must_use]
-    pub fn server(&self, host: &str) -> Option<Arc<ServerConfig>> {
-        self.servers
-            .iter()
-            .find(|(h, _)| h == host)
-            .map(|(_, c)| Arc::clone(c))
-    }
-
-    /// What intercepting `host` takes, if the session CA made its leaf.
-    pub(super) fn host_tls(&self, host: &str) -> Option<HostTls> {
-        Some(HostTls {
-            server: self.server(host)?,
-            upstream: Arc::clone(&self.upstream),
-        })
-    }
-}
-
-/// The TLS configurations a cleared grant host is intercepted with: its leaf toward the client,
-/// the verifying client configuration toward the upstream.
-pub(super) struct HostTls {
-    server: Arc<ServerConfig>,
-    upstream: Arc<ClientConfig>,
-}
-
-/// The leaf and its signing key, read from the leaf's DER key in place (architect ruling R7):
-/// the proxy makes no copy of the key bytes of its own; the only plain copy outside ring is the
-/// leaf's `Secret`, wiped when the session ends. ring's parsed key and rustls's objects built
-/// from it are freed, not wiped (THREAT_MODEL, Session CA limits (3); TODO(#69)).
-fn certified(leaf: &Leaf) -> Result<CertifiedKey, CaError> {
-    let der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf.key.expose().as_slice()));
-    let key = rustls::crypto::ring::sign::any_supported_type(&der).map_err(tls_error)?;
-    let ck = CertifiedKey::new(vec![leaf.cert.clone()], key);
-    ck.keys_match().map_err(tls_error)?;
-    Ok(ck)
-}
-
-fn tls_error(e: rustls::Error) -> CaError {
-    CaError::Generate(e.to_string())
-}
 
 /// What an intercepted tunnel's `egress.close` adds: its requests and their status classes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

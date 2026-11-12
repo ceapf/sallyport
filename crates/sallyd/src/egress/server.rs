@@ -156,7 +156,10 @@ fn permits(n: usize) -> usize {
 
 #[path = "intercept.rs"]
 mod intercept;
-pub use intercept::{Interception, MAX_RESPONSE_HEAD, Summary};
+#[path = "intercept_tls.rs"]
+mod intercept_tls;
+pub use intercept::{MAX_RESPONSE_HEAD, Summary};
+pub use intercept_tls::Interception;
 
 /// What a session's proxy is built from.
 pub struct Parts<R, D, H> {
@@ -230,7 +233,7 @@ struct Cleared {
     auth: Authority,
     pinned: Vec<SocketAddr>,
     /// For a grant host, the TLS configurations to intercept it with; `None` splices.
-    intercept: Option<intercept::HostTls>,
+    intercept: Option<intercept_tls::HostTls>,
     rest: Vec<u8>,
 }
 
@@ -343,7 +346,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
     async fn check(
         &self,
         a: &Authority,
-    ) -> Result<(Vec<SocketAddr>, Option<intercept::HostTls>), Refusal> {
+    ) -> Result<(Vec<SocketAddr>, Option<intercept_tls::HostTls>), Refusal> {
         let tls = match self.policy.decide(a)? {
             Route::Splice => None,
             Route::Intercept => Some(
