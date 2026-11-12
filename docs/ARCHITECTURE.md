@@ -857,10 +857,12 @@ sallyport/
   - `approval.withdraw` (harness for a cancel, sallyd for a closed connection; `deny`): `{id,
     call, reason}`; `id` is null when the cancel or close came before the call reached the
     queue (it is kept until the call ends, so that call is never shown). A wait dropped by
-    teardown leaves the queue at once with no entry. A decision or withdraw that has taken its
-    prompt finishes in its own task, so a dropped caller loses no entry; a `deny_all_session`
-    latches only after its own entry is written. A panic under the queue's lock latches the
-    session.
+    teardown leaves the queue at once with no entry. Only live calls (begun, not yet ended)
+    keep a withdraw, so the harness cannot grow that state. Decisions of a session run one at
+    a time; one that has taken its prompt finishes in its own task, so a dropped caller loses no
+    entry. A `deny_all_session` latches only after its own entry is written (if that write
+    fails, nothing is latched and the client is told `audit-failed`). A panic under the queue's
+    lock latches the session.
   - `approval.deny` (sallyd): action fields and `reason` (`approval-flood`, `session-denied`,
     `no-approver`, `id-unavailable`).
   - `approval.flood` (sallyd): `{max_pending}`, once per episode.

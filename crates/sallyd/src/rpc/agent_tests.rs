@@ -24,6 +24,8 @@ struct Fake {
     numbers: Mutex<Vec<u64>>,
     /// The withdrawals it was told about.
     withdrawn: Mutex<Vec<(u64, Withdraw)>>,
+    /// Calls begun.
+    begun: AtomicUsize,
 }
 
 /// Counts a call's end, also when it is dropped mid-way.
@@ -63,6 +65,11 @@ impl ToolHandler for Arc<Fake> {
             is_error: false,
             text: format!("ran {name}"),
         })
+    }
+
+    fn begin(&self) -> u64 {
+        // Odd numbers from 101, so a test can tell them from any count the server keeps.
+        101 + 2 * self.begun.fetch_add(1, Ordering::SeqCst) as u64
     }
 
     async fn withdraw(&self, call: u64, why: Withdraw) {
@@ -430,7 +437,7 @@ async fn a_cancel_suppresses_the_reply_but_never_stops_the_handler() {
     // The handler was told, by the broker's call number, after the entry (#54).
     assert_eq!(
         fake.withdrawn.lock().unwrap().as_slice(),
-        [(0, Withdraw::Cancel)]
+        [(101, Withdraw::Cancel)]
     );
     fake.release.notify_one();
     // The handler ran to its end; its reply never comes; the slot comes back only now.
@@ -461,7 +468,7 @@ async fn a_closed_connection_still_lets_its_calls_finish() {
     // Its prompt, if any, is withdrawn: nobody is left to receive the result.
     assert_eq!(
         fake.withdrawn.lock().unwrap().as_slice(),
-        [(0, Withdraw::Closed)]
+        [(101, Withdraw::Closed)]
     );
     fake.release.notify_one();
     tokio::time::timeout(Duration::from_secs(5), c.server)
@@ -495,13 +502,13 @@ async fn a_closed_connection_withdraws_only_its_unfinished_calls() {
     let _ = c.call(&req(3, "tools/list", json!({}))).await;
     assert_eq!(
         fake.withdrawn.lock().unwrap().as_slice(),
-        [(1, Withdraw::Cancel)]
+        [(103, Withdraw::Cancel)]
     );
     fake.release.notify_one();
 }
 
 #[tokio::test]
-async fn call_numbers_are_unique_across_a_sessions_connections() {
+async fn each_call_begins_once_and_runs_under_the_number_it_was_given() {
     let (agent, fake, _) = setup();
     let mut a = start(&agent);
     let mut b = start(&agent);
@@ -509,7 +516,16 @@ async fn call_numbers_are_unique_across_a_sessions_connections() {
     let _ = a.call(&call(1, "echo")).await;
     let _ = b.call(&call(1, "echo")).await;
     let _ = a.call(&call(1, "echo")).await;
-    assert_eq!(fake.numbers.lock().unwrap().as_slice(), [0, 1, 2]);
+    assert_eq!(fake.numbers.lock().unwrap().as_slice(), [101, 103, 105]);
+    // A refused call (a reused in-flight id) never begins.
+    a.send(&call(9, "block")).await;
+    while fake.calls.load(Ordering::SeqCst) < 4 {
+        tokio::task::yield_now().await;
+    }
+    let dup = a.call(&call(9, "echo")).await;
+    assert_eq!(dup["error"]["code"], json!(INVALID_REQUEST));
+    assert_eq!(fake.begun.load(Ordering::SeqCst), 4);
+    fake.release.notify_one();
 }
 
 #[tokio::test]

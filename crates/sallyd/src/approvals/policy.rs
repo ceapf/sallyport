@@ -109,10 +109,20 @@ impl Policy {
             },
             Action::FsWrite { target, .. } => self.file(target, |g| &g.writes),
             Action::FsDelete { target } => self.file(target, |g| &g.deletes),
-            Action::Fetch { method, body, .. } => {
-                // HTTP methods are case-sensitive: only these exact spellings, with no body,
-                // are reads; a body is a way out whatever the method.
-                if (method == "GET" || method == "HEAD") && body.is_empty() {
+            Action::Fetch {
+                method,
+                body,
+                headers,
+                ..
+            } => {
+                // HTTP methods are case-sensitive: only these exact spellings are reads, and only
+                // with no body and no header that turns them into something else.
+                let read = (method == "GET" || method == "HEAD")
+                    && body.is_empty()
+                    && !headers
+                        .iter()
+                        .any(|(n, _)| WRITE_HEADERS.iter().any(|w| n.eq_ignore_ascii_case(w)));
+                if read {
                     Need::Run
                 } else {
                     match self.fetch_writes {
@@ -150,6 +160,16 @@ impl Policy {
         }
     }
 }
+
+/// Request headers that make a GET or HEAD a write: method overrides many servers honour, and
+/// body framing on a request that has no body.
+const WRITE_HEADERS: [&str; 5] = [
+    "x-http-method-override",
+    "x-http-method",
+    "x-method-override",
+    "content-length",
+    "transfer-encoding",
+];
 
 /// A canonical path relative to a mount: not empty, not absolute, no empty, `.` or `..`
 /// segment, at most [`glob::MAX_PATH`] bytes.
@@ -444,6 +464,30 @@ mod tests {
             };
             assert_eq!(need(&p, &with_body), Need::Ask, "{m}");
         }
+        // A read with a header that makes it a write.
+        for h in WRITE_HEADERS
+            .iter()
+            .map(|h| h.to_ascii_uppercase())
+            .chain(["X-Http-Method-Override".to_owned()])
+        {
+            let a = Action::Fetch {
+                method: "GET".to_owned(),
+                url: "https://h/".to_owned(),
+                headers: vec![
+                    ("Accept".to_owned(), "*/*".to_owned()),
+                    (h.clone(), "DELETE".to_owned()),
+                ],
+                body: Payload::new(vec![]),
+            };
+            assert_eq!(need(&p, &a), Need::Ask, "{h}");
+        }
+        let plain = Action::Fetch {
+            method: "HEAD".to_owned(),
+            url: "https://h/".to_owned(),
+            headers: vec![("Accept".to_owned(), "*/*".to_owned())],
+            body: Payload::new(vec![]),
+        };
+        assert_eq!(need(&p, &plain), Need::Run);
         p.fetch_writes = FetchWrites::Allow;
         assert_eq!(need(&p, &fetch("POST")), Need::Run);
         assert_eq!(need(&p, &fetch("GET")), Need::Run);

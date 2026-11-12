@@ -29,6 +29,9 @@ pub struct Sink {
     pub fail_next: std::sync::atomic::AtomicUsize,
     /// When non-zero: every append fails once this many rows are recorded.
     pub fail_from: std::sync::atomic::AtomicUsize,
+    /// While set, appends wait (an audit write that takes a while).
+    held: Mutex<bool>,
+    unheld: std::sync::Condvar,
 }
 
 impl AuditSink for Sink {
@@ -38,6 +41,11 @@ impl AuditSink for Sink {
             .fail_next
             .try_update(SeqCst, SeqCst, |n| n.checked_sub(1))
             .is_ok();
+        let mut held = self.held.lock().unwrap();
+        while *held {
+            held = self.unheld.wait(held).unwrap();
+        }
+        drop(held);
         let from = self.fail_from.load(SeqCst);
         let full = from > 0 && self.rows.lock().unwrap().len() >= from;
         if once || full || self.fail.load(SeqCst) {
@@ -69,6 +77,12 @@ impl Sink {
             .rev()
             .find(|r| r.event == event)
             .map_or(Value::Null, |r| r.args.clone())
+    }
+
+    /// Makes appends wait (`true`) or lets them through (`false`).
+    pub fn hold(&self, on: bool) {
+        *self.held.lock().unwrap() = on;
+        self.unheld.notify_all();
     }
 
     pub fn set_failing(&self, fail: bool) {

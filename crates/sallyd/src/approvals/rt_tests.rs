@@ -113,6 +113,8 @@ impl Approver for Shown {
 struct Fx {
     agent: std::sync::Arc<Agent<Gated<std::sync::Arc<Recording>>>>,
     desk: Desk,
+    /// A handle on the handler's gate, to see what it keeps.
+    gate: queue::Gate,
     exec: std::sync::Arc<Recording>,
     shown: std::sync::Arc<Shown>,
     sink: std::sync::Arc<Sink>,
@@ -147,11 +149,12 @@ fn fx(timeout: Duration, max_pending: usize) -> Fx {
         Some(approver),
     );
     let exec = std::sync::Arc::new(Recording::default());
-    let handler = Gated::new(gate, std::sync::Arc::clone(&exec));
+    let handler = Gated::new(gate.clone(), std::sync::Arc::clone(&exec));
     let agent = std::sync::Arc::new(Agent::new(handler, rec));
     Fx {
         agent,
         desk,
+        gate,
         exec,
         shown,
         sink,
@@ -233,7 +236,7 @@ async fn until(what: &str, mut cond: impl FnMut() -> bool) {
 /// A cancel (or a closed connection) that lands while the call is still being prepared, before
 /// it reaches the queue: the call is never shown and never runs (#54; reviews of Task 10).
 #[tokio::test]
-async fn a_cancel_during_preparation_keeps_the_call_from_ever_being_shown() {
+async fn rt_ag_02_c_a_cancel_during_preparation_keeps_the_call_from_ever_being_shown() {
     let f = fx(Duration::from_secs(300), 5);
     let mut c = open(&f);
     c.send(&call(
@@ -248,10 +251,8 @@ async fn a_cancel_during_preparation_keeps_the_call_from_ever_being_shown() {
                    "params": {"requestId": 1}}),
     )
     .await;
-    until("cancel recorded", || {
-        f.sink.events().iter().any(|e| e == "rpc.cancel")
-    })
-    .await;
+    // The gate holds the withdraw for the live call before the preparation ends.
+    until("withdraw kept", || f.gate.kept() == (1, 1)).await;
     f.exec.release.notify_one();
     until("withdraw written", || {
         f.sink.events().iter().any(|e| e == "approval.withdraw")
@@ -264,15 +265,38 @@ async fn a_cancel_during_preparation_keeps_the_call_from_ever_being_shown() {
     );
     assert!(f.shown.prompts.lock().unwrap().is_empty());
     assert!(ran(&f).is_empty());
+    // When the call ends, nothing is kept for it.
+    until("call ended", || f.gate.kept() == (0, 0)).await;
     // The connection still works, and a later call with the same id is asked normally.
     c.send(&touch(1)).await;
     let p = shown(&f, 1).await;
     f.desk.decide(&p.id, Decision::Deny, ME).await.unwrap();
     assert_eq!(text(&c.recv().await), "denied: denied");
+    assert_eq!(f.gate.kept(), (0, 0));
+}
+
+/// A cancel that comes after its call has ended is not kept (a harness cannot grow the map).
+#[tokio::test]
+async fn a_cancel_for_a_call_that_has_ended_leaves_nothing_behind() {
+    let f = fx(Duration::from_secs(300), 5);
+    let mut c = open(&f);
+    let cancel = |id| json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": id}});
+    for id in 1..20 {
+        c.send(&call(id, "nope", json!({}))).await;
+        c.send(&cancel(id)).await;
+    }
+    c.send(&call(99, "nope", json!({}))).await;
+    loop {
+        let r = c.recv().await;
+        if r["id"] == 99 {
+            break;
+        }
+    }
+    until("all ended", || f.gate.kept() == (0, 0)).await;
 }
 
 #[tokio::test]
-async fn a_close_during_preparation_keeps_the_call_from_ever_being_shown() {
+async fn rt_ag_02_c_a_close_during_preparation_keeps_the_call_from_ever_being_shown() {
     let f = fx(Duration::from_secs(300), 5);
     let mut c = open(&f);
     c.send(&call(
@@ -283,8 +307,8 @@ async fn a_close_during_preparation_keeps_the_call_from_ever_being_shown() {
     .await;
     until("preparing", || f.exec.prepared.load(Ordering::SeqCst) == 1).await;
     c.w.shutdown().await.unwrap();
-    // The close is seen (the call keeps its slot) before the preparation ends.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The close is seen and the withdraw kept before the preparation ends.
+    until("withdraw kept", || f.gate.kept() == (1, 1)).await;
     f.exec.release.notify_one();
     until("withdraw written", || {
         f.sink.events().iter().any(|e| e == "approval.withdraw")
@@ -293,6 +317,7 @@ async fn a_close_during_preparation_keeps_the_call_from_ever_being_shown() {
     assert_eq!(f.sink.last("approval.withdraw")["reason"], "closed");
     assert!(f.shown.prompts.lock().unwrap().is_empty());
     assert!(ran(&f).is_empty());
+    until("call ended", || f.gate.kept() == (0, 0)).await;
 }
 
 fn ran(f: &Fx) -> Vec<Bound> {

@@ -82,6 +82,10 @@ impl<E: Executor> ToolHandler for Gated<E> {
         self.exec.tools()
     }
 
+    fn begin(&self) -> u64 {
+        self.gate.begin()
+    }
+
     async fn call(
         &self,
         call: u64,

@@ -437,26 +437,86 @@ async fn a_withdraw_that_cannot_be_written_is_unrecorded() {
 #[tokio::test]
 async fn a_withdraw_before_the_call_reaches_the_queue_keeps_it_from_being_shown() {
     let f = fx(5);
-    // Another call's withdraw changes nothing for this one.
-    f.gate.withdraw(8, Withdraw::Closed).await;
-    f.gate.withdraw(9, Withdraw::Cancel).await;
-    let r = f.gate.admit(shell(9, &["ls"]), None, None).await;
+    let (other, call) = (f.gate.begin(), f.gate.begin());
+    assert_ne!(other, call);
+    // Another call's withdraw changes nothing for this one; the first cause is the one kept.
+    f.gate.withdraw(other, Withdraw::Closed).await;
+    f.gate.withdraw(call, Withdraw::Cancel).await;
+    f.gate.withdraw(call, Withdraw::Closed).await;
+    assert_eq!(f.gate.kept(), (2, 2));
+    let r = f.gate.admit(shell(call, &["ls"]), None, None).await;
     assert_eq!(r, Err(Refusal::Denied("withdrawn")));
     let w = f.sink.last("approval.withdraw");
     assert_eq!(
         (w["call"].as_u64(), w["reason"].as_str()),
-        (Some(9), Some("cancel"))
+        (Some(call), Some("cancel"))
     );
     assert!(w["id"].is_null());
     assert!(f.sink.rows().last().unwrap().debug.contains("Harness"));
     assert!(f.fake.requested.lock().unwrap().is_empty());
-    // Once the call ends, its number is forgotten.
-    f.gate.forget(9);
-    let (id, h) = asking(&f, shell(9, &["ls"])).await;
+    // Once the calls end, nothing is kept.
+    f.gate.forget(call);
+    f.gate.forget(other);
+    assert_eq!(f.gate.kept(), (0, 0));
+}
+
+#[tokio::test]
+async fn a_withdraw_for_a_call_that_ended_or_never_began_is_not_kept() {
+    let f = fx(5);
+    // Never begun: a harness cannot grow the map with made-up or finished calls.
+    for n in 1000..1100 {
+        f.gate.withdraw(n, Withdraw::Cancel).await;
+    }
+    assert_eq!(f.gate.kept(), (0, 0));
+    let call = f.gate.begin();
+    f.gate.forget(call);
+    f.gate.withdraw(call, Withdraw::Cancel).await;
+    assert_eq!(f.gate.kept(), (0, 0));
+    // An ended call's number asks normally if it ever came again (it does not: numbers are
+    // never reused), so nothing stale can deny a later call.
+    let (id, h) = asking(&f, shell(call, &["ls"])).await;
     f.desk.decide(&id, Decision::Deny, ME).await.unwrap();
     let _ = h.await;
-    f.gate.forget(8);
-    assert!(f.gate.inner.state().withdrawn.is_empty());
+}
+
+#[tokio::test]
+async fn a_withdraw_on_a_queued_prompt_keeps_its_first_cause() {
+    let f = fx(5);
+    let b = shell(5, &["ls"]);
+    let Ok((id, _, _rx)) = f.gate.inner.queue(&b, None, vec![]) else {
+        panic!("not queued");
+    };
+    f.gate.withdraw(5, Withdraw::Cancel).await;
+    f.gate.withdraw(5, Withdraw::Closed).await;
+    assert!(matches!(
+        f.gate.inner.announce(&id),
+        Err(NotQueued::Withdrawn(Withdraw::Cancel))
+    ));
+}
+
+/// The held append blocks a blocking-pool thread, never the runtime.
+#[tokio::test]
+async fn no_decision_slips_in_while_a_deny_all_session_is_written() {
+    let f = fx(5);
+    let (a, ha) = asking(&f, shell(1, &["a"])).await;
+    let (b, hb) = asking(&f, shell(2, &["b"])).await;
+    f.sink.hold(true);
+    let desk = f.desk.clone();
+    let all = tokio::spawn(async move { desk.decide(&a, Decision::DenyAllSession, ME).await });
+    until("a taken", || f.desk.list().len() == 1).await;
+    let desk = f.desk.clone();
+    let bb = b.clone();
+    let approve = tokio::spawn(async move { desk.decide(&bb, Decision::Approve, ME).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !approve.is_finished(),
+        "an approval ran during a deny_all_session"
+    );
+    f.sink.hold(false);
+    assert_eq!(all.await.unwrap(), Ok(()));
+    assert_eq!(approve.await.unwrap(), Err(DecideError::UnknownId));
+    assert_eq!(ha.await.unwrap(), Err(Refusal::Denied("denied")));
+    assert_eq!(hb.await.unwrap(), Err(Refusal::Denied("session-denied")));
 }
 
 #[tokio::test]
@@ -466,10 +526,10 @@ async fn a_withdraw_before_the_prompt_is_shown_keeps_its_reason() {
     let Ok((id, _, _rx)) = f.gate.inner.queue(&b, None, vec![]) else {
         panic!("not queued");
     };
-    f.gate.withdraw(5, Withdraw::Cancel).await;
+    f.gate.withdraw(5, Withdraw::Closed).await;
     assert!(matches!(
         f.gate.inner.announce(&id),
-        Err(NotQueued::Withdrawn(Withdraw::Cancel))
+        Err(NotQueued::Withdrawn(Withdraw::Closed))
     ));
     assert!(f.desk.list().is_empty());
     assert!(f.fake.requested.lock().unwrap().is_empty());

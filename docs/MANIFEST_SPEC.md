@@ -378,7 +378,7 @@ validation — otherwise `mount-changed`/`is-symlink` (RT-FS-06).
 | `tools.builtin` | `sallyd::tools` dispatch table per session | each `tools/call` on `agent.sock` | `isError: true`, `denied: <code>`, audit `tool.deny` |
 | `tools.shell` | `sallyd::tools::shell` → `podman exec` after policy | each shell call | deny / pending / run |
 | `tools.destructive_requires_approval` | pattern tagger in `tools::shell` (Task 11, #66), its verdict an input to `sallyd::approvals` | each shell call in `allow` mode | pending if tagged, or if no tagger ran |
-| `tools.fetch_writes` | `sallyd::tools::fetch` → `sallyd::approvals` | each non-GET/HEAD fetch, and each GET/HEAD with a body | pending if `approve` |
+| `tools.fetch_writes` | `sallyd::tools::fetch` → `sallyd::approvals` | each non-GET/HEAD fetch, and each GET/HEAD with a body, a method-override header (`X-HTTP-Method-Override`, `X-HTTP-Method`, `X-Method-Override`) or body framing (`Content-Length`, `Transfer-Encoding`) | pending if `approve` |
 | `tools.acknowledge_unapproved` | validator (`ack.rs`); launch audit `manifest.acknowledged_risk` | validate + launch | reject if needed and unset |
 | `tools.mcp[]` | env-name filter in validator; broker MCP gateway (M4) | validate + each relayed call | reject secret-like env; pending if `approve: always` |
 | `[data-can-leave]` | validator warning + `summary()` first line + UI | validate | warning (never blocks) |

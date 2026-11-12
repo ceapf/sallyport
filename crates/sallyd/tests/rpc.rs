@@ -43,6 +43,10 @@ impl ToolHandler for Echo {
         }]
     }
 
+    fn begin(&self) -> u64 {
+        0
+    }
+
     async fn withdraw(&self, _: u64, _: sallyd::rpc::agent::Withdraw) {}
 
     async fn call(

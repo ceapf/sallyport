@@ -103,7 +103,8 @@ fn note_text(n: &str) -> String {
         } else {
             push_escaped(&mut unit, c);
         }
-        if out.len().saturating_add(unit.len()) > NOTE_CHARS {
+        // Room for the closing quote too: the quoted note is at most NOTE_CHARS.
+        if out.len().saturating_add(unit.len()).saturating_add(1) > NOTE_CHARS {
             break;
         }
         out.push_str(&unit);
@@ -429,14 +430,17 @@ mod tests {
         let raw = "n".repeat(NOTE_CHARS);
         let long = prompt(shell(&["ls"]), Some(&raw));
         let sha = hex(&Sha256::digest(raw.as_bytes()));
-        let shown = "n".repeat(NOTE_CHARS - 1);
+        let shown = "n".repeat(NOTE_CHARS - 2);
         assert_eq!(
             long.note.unwrap(),
-            format!("\"{shown}\"… (+1 bytes, sha256 {sha})")
+            format!("\"{shown}\"… (+2 bytes, sha256 {sha})")
         );
+        // Exactly NOTE_CHARS with both quotes: shown whole.
         let fits = "n".repeat(NOTE_CHARS - 2);
         let p = prompt(shell(&["ls"]), Some(&fits));
-        assert_eq!(p.note.unwrap(), format!("\"{fits}\""));
+        let note = p.note.unwrap();
+        assert_eq!(note, format!("\"{fits}\""));
+        assert_eq!(note.len(), NOTE_CHARS);
         // Only the shown part is escaped: a note of escapes stops at the bound.
         let p = prompt(shell(&["ls"]), Some(&"\x1b".repeat(100_000)));
         let note = p.note.unwrap();

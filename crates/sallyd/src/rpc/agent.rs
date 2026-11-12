@@ -14,8 +14,8 @@
 //! - Every allowed request is recorded (`rpc.request`) before it is served; `tools/call` records
 //!   the tool and the shape of its arguments (never their values, architect ruling Q16) before
 //!   the handler runs. A failed append closes the connection without a reply or a dispatch.
-//! - Each `tools/call` gets the broker's call number, unique in the session; approvals bind it,
-//!   never the harness's id (architect ruling Q19).
+//! - Each `tools/call` gets the broker's call number from the handler, unique in the session;
+//!   approvals bind it, never the harness's id (architect ruling Q19).
 //! - A cancel or a closed connection never drops a call: it runs to its end (so its own audit
 //!   entries are written) and only its reply is suppressed; a prompt it waits on is withdrawn
 //!   through the handler (#54; ruling Q27). Its in-flight slot is held until it returns. A call
@@ -26,7 +26,6 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -79,8 +78,11 @@ pub const LOGGED_KEYS: usize = 8;
 pub trait ToolHandler: Send + Sync + 'static {
     /// The session's tools, as `tools/list` returns them.
     fn tools(&self) -> Vec<Tool>;
-    /// Runs one call. `call` is the broker's number for it, unique in the session (the
-    /// harness's JSON-RPC id is unique only per connection; architect ruling Q19). It must write
+    /// A new call starts: its number, unique in the session (the harness's JSON-RPC id is
+    /// unique only per connection; architect ruling Q19). Called before the call is spawned, so
+    /// a withdraw that arrives before it runs is kept; [`call`](Self::call) ends it.
+    fn begin(&self) -> u64;
+    /// Runs one call. `call` is the number [`begin`](Self::begin) gave it. It must write
     /// its own effect entry (each tool's fields, ARCHITECTURE §4.3) before the effect or the
     /// denial reply, at every `audit.level`: the `rpc.request` entry carries no argument values.
     /// `None` means an entry could not be written: nothing ran, and no reply is sent.
@@ -111,8 +113,6 @@ pub struct Agent<T> {
     rate: Mutex<Rate>,
     in_flight: Arc<Semaphore>,
     stop: watch::Sender<bool>,
-    /// The next call number of the session.
-    calls: AtomicU64,
 }
 
 /// A `tools/call` in flight on one connection.
@@ -144,7 +144,6 @@ impl<T: ToolHandler> Agent<T> {
             rate: Mutex::new(Rate::new(RATE, BURST)),
             in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
             stop: watch::Sender::new(false),
-            calls: AtomicU64::new(0),
         }
     }
 
@@ -312,7 +311,7 @@ impl<T: ToolHandler> Agent<T> {
         if !self.record.append(entry).await {
             return false;
         }
-        let call = self.calls.fetch_add(1, Ordering::Relaxed);
+        let call = self.handler.begin();
         let flight = InFlight {
             call,
             cancelled: false,

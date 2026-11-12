@@ -27,7 +27,8 @@
 //! - **Poison.** A panic while the queue's lock is held latches the session: every later prompt
 //!   is denied.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -182,7 +183,9 @@ struct Entry {
 
 struct State {
     pending: Vec<Entry>,
-    /// Calls withdrawn before they reached the queue, until they end ([`Gate::forget`]).
+    /// Calls begun and not yet ended ([`Gate::begin`] to [`Gate::forget`]).
+    live: HashSet<u64>,
+    /// Live calls withdrawn before they reached the queue (so at most the live ones).
     withdrawn: HashMap<u64, Withdraw>,
     latched: bool,
     flooding: bool,
@@ -196,6 +199,11 @@ struct Inner {
     session: String,
     approver: Option<Arc<dyn Approver>>,
     state: Mutex<State>,
+    /// The next call number of the session.
+    calls: AtomicU64,
+    /// Held by one decision from its take to its last entry, so a `deny_all_session` covers
+    /// every prompt shown before it latches and no other decision slips in meanwhile.
+    deciding: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Why a call does not queue.
@@ -237,11 +245,14 @@ pub fn new(
         approver,
         state: Mutex::new(State {
             pending: Vec::new(),
+            live: HashSet::new(),
             withdrawn: HashMap::new(),
             latched: false,
             flooding: false,
             rate: Rate::every(REFILL, burst),
         }),
+        calls: AtomicU64::new(0),
+        deciding: Arc::new(tokio::sync::Mutex::new(())),
     });
     (
         Gate {
@@ -364,14 +375,19 @@ impl Gate {
     pub async fn withdraw(&self, call: u64, why: Withdraw) {
         let taken = {
             let mut st = self.inner.state();
+            // The first cause is the one recorded (a cancel, then the connection closing).
             match st.pending.iter().position(|e| e.call == call) {
                 None => {
-                    st.withdrawn.insert(call, why);
+                    // Only a call still running can reach the queue later; one that ended is
+                    // not remembered, so the map stays bounded by the calls in flight.
+                    if st.live.contains(&call) {
+                        st.withdrawn.entry(call).or_insert(why);
+                    }
                     return;
                 }
                 Some(i) if st.pending.get(i).is_some_and(|e| !e.announced) => {
                     if let Some(e) = st.pending.get_mut(i) {
-                        e.withdrawn = Some(why);
+                        e.withdrawn.get_or_insert(why);
                     }
                     return;
                 }
@@ -396,9 +412,26 @@ impl Gate {
         let _ = task.await;
     }
 
-    /// The call ended: a withdraw kept for it is no longer needed.
+    /// A new call: its number, unique in the session, and live until [`forget`](Self::forget).
+    #[must_use]
+    pub fn begin(&self) -> u64 {
+        let call = self.inner.calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.state().live.insert(call);
+        call
+    }
+
+    /// The call ended: it is no longer live, and a withdraw kept for it is dropped.
     pub fn forget(&self, call: u64) {
-        self.inner.state().withdrawn.remove(&call);
+        let mut st = self.inner.state();
+        st.live.remove(&call);
+        st.withdrawn.remove(&call);
+    }
+
+    /// How many calls are live and how many withdraws are kept (tests).
+    #[cfg(test)]
+    pub(crate) fn kept(&self) -> (usize, usize) {
+        let st = self.inner.state();
+        (st.live.len(), st.withdrawn.len())
     }
 }
 
@@ -424,7 +457,9 @@ impl Desk {
     /// `UnknownId` (audited) for an id that is not waiting; `Unrecorded` if an entry failed.
     pub async fn decide(&self, id: &str, d: Decision, client: Client) -> Result<(), DecideError> {
         let inner = Arc::clone(&self.inner);
+        let turn = Arc::clone(&inner.deciding).lock_owned().await;
         let Some(first) = inner.take(id) else {
+            drop(turn);
             let args = json!({
                 "id": escape(id.as_bytes()), "reason": "unknown-id", "client": who(client),
             });
@@ -438,7 +473,11 @@ impl Desk {
                 Err(DecideError::Unrecorded)
             };
         };
-        let task = tokio::spawn(async move { inner.finish(first, d, client).await });
+        let task = tokio::spawn(async move {
+            let result = inner.finish(first, d, client).await;
+            drop(turn);
+            result
+        });
         task.await.unwrap_or(Err(DecideError::Unrecorded))
     }
 }
@@ -644,20 +683,20 @@ impl Inner {
             // A decision or withdraw took it first and is being written: its answer is coming.
             return rx.await.unwrap_or(Answer::Unrecorded);
         };
+        // Closed at once, so a teardown during the append leaves no stale prompt.
+        if let Some(a) = &self.approver {
+            a.closed(&e.id);
+        }
         let args = json!({"id": e.id, "call": e.call, "reason": "timeout"});
         let entry = self
             .record
             .entry(Actor::Sallyd, "approval.expire", Some("deny"))
             .args(args);
-        let answer = if self.record.append(entry).await {
+        if self.record.append(entry).await {
             Answer::Deny("timeout")
         } else {
             Answer::Unrecorded
-        };
-        if let Some(a) = &self.approver {
-            a.closed(&e.id);
         }
-        answer
     }
 
     /// Sends `answer` to the asker of a taken, shown entry and tells the approver it is gone.
