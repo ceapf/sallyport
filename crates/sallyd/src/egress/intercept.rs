@@ -110,6 +110,21 @@ impl Interception {
             .find(|(h, _)| h == host)
             .map(|(_, c)| Arc::clone(c))
     }
+
+    /// What intercepting `host` takes, if the session CA made its leaf.
+    pub(super) fn host_tls(&self, host: &str) -> Option<HostTls> {
+        Some(HostTls {
+            server: self.server(host)?,
+            upstream: Arc::clone(&self.upstream),
+        })
+    }
+}
+
+/// The TLS configurations a cleared grant host is intercepted with: its leaf toward the client,
+/// the verifying client configuration toward the upstream.
+pub(super) struct HostTls {
+    server: Arc<ServerConfig>,
+    upstream: Arc<ClientConfig>,
 }
 
 /// The leaf and its signing key, read from the leaf's DER key in place (architect ruling R7):
@@ -345,17 +360,16 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         &self,
         mut client: C,
         c: Cleared,
+        host_tls: HostTls,
         upstream: D::Stream,
         used: SocketAddr,
     ) where
         C: AsyncRead + AsyncWrite + Unpin + Send,
     {
-        let (Some(ic), host) = (self.interception.as_ref(), c.auth.host.clone()) else {
-            return; // check() refused this already (grant-host-unavailable)
-        };
-        let Some(server) = ic.server(&host) else {
-            return;
-        };
+        let HostTls {
+            server,
+            upstream: client_cfg,
+        } = host_tls;
         let act = Arc::new(Activity::new());
         let upstream = Meter::new(
             upstream,
@@ -363,32 +377,40 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
             Counts::default(),
             Some(Arc::clone(&act)),
         );
-        let connector = TlsConnector::from(Arc::clone(&ic.upstream));
         let handshake = async {
-            let name = ServerName::try_from(host.clone()).ok()?;
-            connector.connect(name, upstream).await.ok()
-        };
-        let tls = tokio::time::timeout(self.limits.connect, handshake)
-            .await
-            .ok()
-            .flatten();
-        let Some(tls) = tls else {
-            let none = Totals {
-                up: 0,
-                down: 0,
-                end: End::UpstreamTlsFailed,
-            };
-            if self
-                .close_with(&c.auth, Some(used), none, Some(Summary::default()))
+            let name = ServerName::try_from(c.auth.host.clone()).ok()?;
+            TlsConnector::from(client_cfg)
+                .connect(name, upstream)
                 .await
-            {
-                write_reply(&mut client, Reason::UpstreamTlsFailed).await;
+                .ok()
+        };
+        let tls = tokio::select! {
+            biased;
+            () = self.stopped() => Err(End::SessionStopped),
+            t = tokio::time::timeout(self.limits.connect, handshake) => {
+                t.ok().flatten().ok_or(End::UpstreamTlsFailed)
             }
-            return;
+        };
+        let tls = match tls {
+            Ok(tls) => tls,
+            Err(end) => {
+                let none = Totals {
+                    up: 0,
+                    down: 0,
+                    end,
+                };
+                let closed = self
+                    .close_with(&c.auth, Some(used), none, Some(Summary::default()))
+                    .await;
+                if closed && end == End::UpstreamTlsFailed {
+                    write_reply(&mut client, Reason::UpstreamTlsFailed).await;
+                }
+                return;
+            }
         };
         let opened = tokio::time::timeout(REPLY_TIMEOUT, client.write_all(ESTABLISHED)).await;
         let st = Arc::new(State {
-            grants: self.policy.grant_headers(&host),
+            grants: self.policy.grant_headers(&c.auth.host),
             auth: c.auth,
             used,
             raw: Counts::default(),
@@ -678,6 +700,10 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
     }
 
     /// The upstream closed before a response head: `egress.close` first, then the 502 (Q43).
+    ///
+    /// Cancellation: `closed` is set before the first await, so `intercept` never writes a second
+    /// close entry; the append itself is spawned on this future's first poll and finishes even if
+    /// the tunnel's future is dropped (a stop) while it runs.
     async fn upstream_closed(&self, st: &State) -> Result<Response<Out>, BoxError> {
         st.set_end(End::UpstreamClosed);
         st.closed.store(true, Ordering::Relaxed);

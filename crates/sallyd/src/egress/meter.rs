@@ -68,7 +68,8 @@ impl<S> Meter<S> {
     /// Hands at most `n` bytes (at least one) to each read. Defense in depth: hyper 1.12 checks
     /// its head-size limit on complete heads too, so this is not what bounds a head; should a
     /// hyper version check only partial heads, it bounds how far one read can carry a head past
-    /// that limit (architect, Task 9a-2 part 2).
+    /// that limit (architect, Task 9a-2 part 2). Replayed bytes ignore it: the proxy sets it
+    /// only on streams it builds with an empty `replay`.
     #[must_use]
     pub fn max_read(self, n: usize) -> Self {
         Self {
@@ -184,9 +185,9 @@ impl<B> Capped<B> {
         }
     }
 
-    /// Payload bytes forwarded so far.
-    #[must_use]
-    pub fn seen(&self) -> u64 {
+    /// Payload bytes forwarded so far (tests only: the proxy acts on the end, not the count).
+    #[cfg(test)]
+    fn seen(&self) -> u64 {
         self.seen
     }
 

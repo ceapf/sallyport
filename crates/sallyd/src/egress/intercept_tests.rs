@@ -193,10 +193,15 @@ struct Upstream {
     dials: Arc<Mutex<usize>>,
     /// Upstream connections that saw the proxy's side end.
     ended: Arc<Mutex<usize>>,
+    /// Never answers the TLS handshake.
+    stall: bool,
 }
 
 impl Upstream {
     async fn answer(&self, far: DuplexStream) {
+        if self.stall {
+            std::future::pending::<()>().await;
+        }
         let Ok(mut tls) = tokio_rustls::TlsAcceptor::from(Arc::clone(&self.tls))
             .accept(far)
             .await
@@ -302,6 +307,7 @@ struct Opts {
     limits: Limits,
     upstream_name: &'static str,
     fail_on: Option<&'static str>,
+    stall: bool,
 }
 
 impl Default for Opts {
@@ -317,6 +323,7 @@ impl Default for Opts {
             },
             upstream_name: HOST,
             fail_on: None,
+            stall: false,
         }
     }
 }
@@ -348,6 +355,7 @@ fn rig(o: Opts) -> Rig {
         seen: Arc::default(),
         dials: Arc::default(),
         ended: Arc::default(),
+        stall: o.stall,
     };
     let (seen, dials, ended) = (
         Arc::clone(&up.seen),
@@ -1166,6 +1174,37 @@ async fn a_request_after_the_upstream_closed_is_never_forwarded_or_counted() {
         "closed"
     };
     assert_eq!(close["end"], json!(end), "{out}");
+}
+
+/// A stop during the upstream TLS handshake ends the tunnel `session-stopped` at once, with no
+/// `200` and no reply (9a-2 review: the handshake was not raced against the stop).
+#[tokio::test]
+async fn stopping_the_session_during_the_upstream_handshake_ends_session_stopped() {
+    let r = rig(Opts {
+        stall: true,
+        limits: Limits {
+            connect: Duration::from_secs(30),
+            ..Limits::new(8)
+        },
+        ..Opts::default()
+    });
+    let (mut c, s) = duplex(1 << 16);
+    let proxy = Arc::clone(&r.proxy);
+    let task = tokio::spawn(async move { proxy.serve(s).await });
+    c.write_all(format!("CONNECT {HOST}:443 HTTP/1.1\r\nHost: {HOST}:443\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    until("the upstream is dialled", || *r.dials.lock().unwrap() > 0).await;
+    r.proxy.stop();
+    let out = drain(&mut c).await;
+    join(task).await;
+    assert!(out.is_empty(), "{out}");
+    assert_eq!(r.sink.events(), ["egress.allow", "egress.close"]);
+    let close = r.sink.args("egress.close");
+    assert_eq!(
+        (close["end"].clone(), close["connected"].clone()),
+        (json!("session-stopped"), json!(true))
+    );
 }
 
 /// Architect Q28: upstream verification before the `200`; failure is audited, then 502.

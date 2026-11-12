@@ -223,7 +223,8 @@ impl From<Reason> for Refusal {
 struct Cleared {
     auth: Authority,
     pinned: Vec<SocketAddr>,
-    route: Route,
+    /// For a grant host, the TLS configurations to intercept it with; `None` splices.
+    intercept: Option<intercept::HostTls>,
     rest: Vec<u8>,
 }
 
@@ -315,10 +316,10 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
             Ok(auth) => self.check(&auth).await.map(|cleared| (auth, cleared)),
         };
         match checked {
-            Ok((auth, (pinned, route))) => Some(Cleared {
+            Ok((auth, (pinned, intercept))) => Some(Cleared {
                 auth,
                 pinned,
-                route,
+                intercept,
                 rest: window.get(h.len..).unwrap_or_default().to_vec(),
             }),
             Err(refusal) => {
@@ -329,13 +330,21 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
     }
 
     /// Policy (and, for a grant host, a session-CA leaf to present), the host's own addresses,
-    /// the one lookup, the address filter: the pinned addresses, in order, and the route.
-    async fn check(&self, a: &Authority) -> Result<(Vec<SocketAddr>, Route), Refusal> {
-        let route = self.policy.decide(a)?;
-        let leaf = self.interception.as_ref().and_then(|i| i.server(&a.host));
-        if route == Route::Intercept && leaf.is_none() {
-            return Err(Reason::GrantHostUnavailable.into());
-        }
+    /// the one lookup, the address filter: the pinned addresses, in order, and for a grant host
+    /// the TLS configurations to intercept it with.
+    async fn check(
+        &self,
+        a: &Authority,
+    ) -> Result<(Vec<SocketAddr>, Option<intercept::HostTls>), Refusal> {
+        let tls = match self.policy.decide(a)? {
+            Route::Splice => None,
+            Route::Intercept => Some(
+                self.interception
+                    .as_ref()
+                    .and_then(|i| i.host_tls(&a.host))
+                    .ok_or(Reason::GrantHostUnavailable)?,
+            ),
+        };
         let own = self.host.own().await.map_err(|_| Refusal {
             reason: Reason::IpRangeDenied,
             filter: Some(HOST_ADDRS_UNAVAILABLE),
@@ -348,14 +357,18 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         if found.iter().any(|s| addr::is_denied(s.ip(), &own)) {
             return Err(Reason::IpRangeDenied.into());
         }
-        Ok((pinned(&found, a.port), route))
+        Ok((pinned(&found, a.port), tls))
     }
 
     /// `egress.allow`, then the connect attempts, the tunnel and `egress.close`.
-    async fn connect<C: AsyncRead + AsyncWrite + Unpin + Send>(&self, mut client: C, c: Cleared) {
+    async fn connect<C: AsyncRead + AsyncWrite + Unpin + Send>(
+        &self,
+        mut client: C,
+        mut c: Cleared,
+    ) {
         let ips: Vec<String> = c.pinned.iter().map(|s| s.ip().to_string()).collect();
         let (host, port) = (&c.auth.host, c.auth.port);
-        let intercept = c.route == Route::Intercept;
+        let intercept = c.intercept.is_some();
         let allow = self
             .entry("egress.allow", Some("allow"))
             .args(json!({"host": host, "port": port, "addresses": ips, "intercept": intercept}));
@@ -383,8 +396,8 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
                 return;
             }
         };
-        if intercept {
-            self.intercept(client, c, upstream, used).await;
+        if let Some(tls) = c.intercept.take() {
+            self.intercept(client, c, tls, upstream, used).await;
             return;
         }
         let totals = self.tunnel(client, upstream, &c.rest).await;
