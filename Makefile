@@ -110,7 +110,8 @@ MUTANTS_WIDE_CORE := $(addprefix crates/sally-core/src/,manifest/image.rs manife
 MUTANTS_WIDE_SALLYD := $(addprefix crates/sallyd/src/sandbox/,argv.rs check.rs types.rs profiles.rs \
                        overlap.rs scan.rs images.rs changes.rs dirs.rs podman.rs disk.rs stage.rs \
                        launch/error.rs budget.rs) \
-                       $(addprefix crates/sallyd/src/daemon/,crash.rs) crates/sallyd/src/oplog.rs \
+                       $(addprefix crates/sallyd/src/daemon/,mod.rs crash.rs) crates/sallyd/src/oplog.rs \
+                       crates/sallyd/src/session/lookup.rs \
                        $(addprefix crates/sallyd/src/egress/,addr.rs authority.rs head.rs policy.rs server.rs \
                        hostaddrs.rs tunnel.rs net.rs ca.rs roots.rs rewrite.rs intercept.rs \
                        intercept_tls.rs intercept_report.rs meter.rs inject.rs redact.rs) \

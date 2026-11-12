@@ -89,8 +89,8 @@ container-free tests run: unit tests, all of sally-core's `tests/`, `sallyd` `ar
 - `make mutants-wide-{core,sallyd,shim}` (sharded): sally-core `manifest/{image,hostenv,parse,
   summary,units}.rs`, `secrets/{store,secret}.rs`, `audit/{entry,redact,verify,writer,layout}.rs`,
   `fsutil.rs`, `fd.rs`, `text.rs`; sallyd `sandbox/{argv,check,types,profiles,overlap,scan,images,
-  changes,dirs,podman,disk,stage,budget}.rs`, `sandbox/launch/error.rs`, `daemon/crash.rs`, `oplog.rs`,
-  `egress/{addr,authority,head,policy,server,
+  changes,dirs,podman,disk,stage,budget}.rs`, `sandbox/launch/error.rs`, `daemon/{mod,crash}.rs`,
+  `oplog.rs`, `session/lookup.rs`, `egress/{addr,authority,head,policy,server,
   hostaddrs,tunnel,net,ca,roots,rewrite,intercept,meter}.rs` (net.rs tests stay hermetic: nothing
   leaves the machine), `rpc/{agent,control,frame,json,listen,mcp,message,rate,record}.rs`,
   `llm/{body,head,io,reply,server}.rs`, `approvals/{action,glob,handler,policy,queue,render}.rs`,

@@ -9,4 +9,5 @@ pub mod llm;
 pub mod oplog;
 pub mod rpc;
 pub mod sandbox;
+pub mod session;
 pub mod tools;
