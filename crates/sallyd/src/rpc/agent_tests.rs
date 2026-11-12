@@ -469,34 +469,20 @@ async fn in_flight_calls_are_capped_per_session() {
     assert_eq!(e["error"]["data"]["reason"], json!("too-many-in-flight"));
     assert_eq!(fake.calls.load(Ordering::SeqCst), MAX_IN_FLIGHT);
     assert_eq!(denies(&sink), ["too-many-in-flight"]);
-    // One returns; one more may run.
+    // One returns, on whichever connection sent it; its slot is freed before its reply is
+    // queued, so one more call may run once the reply is in.
     fake.release.notify_one();
-    let _ = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if fake.done.load(Ordering::SeqCst) == 1 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await;
-    let mut ok = false;
-    for c in [&mut a, &mut b] {
-        if let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(200), c.recv_opt()).await {
-            ok = true;
-        }
-    }
-    assert!(ok, "the finished call was not answered");
+    let reply = tokio::select! {
+        r = a.recv() => r,
+        r = b.recv() => r,
+    };
+    let reply = reply.expect("the finished call was not answered");
+    assert_eq!(reply["result"]["content"][0]["text"], json!("ran block"));
+    assert_eq!(fake.done.load(Ordering::SeqCst), 1);
     let r = a.call(&call(200, "echo")).await;
     assert_eq!(r["result"]["content"][0]["text"], json!("ran echo"));
     for _ in 0..MAX_IN_FLIGHT {
         fake.release.notify_one();
-    }
-}
-
-impl Client {
-    async fn recv_opt(&mut self) -> Option<Value> {
-        self.recv().await
     }
 }
 
@@ -622,6 +608,18 @@ async fn rt_ag_08_a_foreign_session_id_reaches_only_its_own_session() {
             .all(|r| r.debug.contains("session: Some(\"sess-a\")"))
     );
     assert!(!rows.iter().any(|r| r.debug.contains("Some(\"sess-b\")")));
+}
+
+#[tokio::test]
+async fn the_server_stop_ends_a_live_connection() {
+    let (agent, _, _) = setup();
+    let c = start(&agent);
+    tokio::task::yield_now().await;
+    Server::stop(&*agent);
+    tokio::time::timeout(Duration::from_secs(5), c.server)
+        .await
+        .expect("stop left the connection open")
+        .unwrap();
 }
 
 #[tokio::test]

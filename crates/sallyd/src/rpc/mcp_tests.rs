@@ -8,6 +8,12 @@ fn obj(v: Value) -> Map<String, Value> {
     v.as_object().unwrap().clone()
 }
 
+#[test]
+fn the_codes_and_limits_are_the_ruled_values() {
+    assert_eq!((SERVER_LIMIT, UNSUPPORTED_VERSION), (-32000, -32022));
+    assert_eq!((MAX_TOOL_NAME, MAX_VERSION_BYTES), (128, 64));
+}
+
 fn modern() -> Value {
     json!({META_VERSION: MODERN, META_CAPABILITIES: {}})
 }

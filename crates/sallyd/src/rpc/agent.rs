@@ -1,4 +1,4 @@
-//! `agent.sock`: the MCP server the harness talks to (AMENDMENTS-01 §3.1; Task 7 decisions 3–5).
+//! `agent.sock`: the MCP server the harness talks to (ARCHITECTURE §4.2; Task 7 decisions 3–5).
 //! Every byte on it is untrusted.
 //!
 //! Per connection: read one frame (at most [`MAX_FRAME`]), wait for a rate token, parse it
@@ -54,8 +54,6 @@ pub const MAX_CONNECTIONS: usize = 8;
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Replies queued per connection before the reader waits for the writer.
 const OUTBOX: usize = 32;
-/// Read buffer per connection.
-const READ_BUFFER: usize = 16 * 1024;
 
 /// What `tools/call` dispatches to (Task 7 decision 4): the built-in tools (Task 11) behind
 /// policy and approvals (Task 10). It owns every decision about a tool, including unknown and
@@ -123,7 +121,7 @@ impl<T: ToolHandler> Agent<T> {
             out,
             tasks: JoinSet::new(),
         };
-        let mut reader = BufReader::with_capacity(READ_BUFFER, r);
+        let mut reader = BufReader::new(r);
         let stopped = until_true(self.stop.subscribe());
         tokio::pin!(stopped);
         loop {

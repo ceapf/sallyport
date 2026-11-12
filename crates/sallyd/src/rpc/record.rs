@@ -41,12 +41,6 @@ impl Recorder {
         }
     }
 
-    /// The session id the entries carry.
-    #[must_use]
-    pub fn session(&self) -> &str {
-        &self.session
-    }
-
     /// A new entry of this session (none for an empty session id: the control socket's).
     #[must_use]
     pub fn entry(&self, actor: Actor, event: &str, decision: Option<&str>) -> NewEntry {
@@ -94,6 +88,15 @@ pub fn escape(raw: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_names_the_session_and_level_only() {
+        let (_, rec) = crate::rpc::testkit::recorder("sess-a");
+        assert_eq!(
+            format!("{rec:?}"),
+            r#"Recorder { session: "sess-a", level: Full, .. }"#
+        );
+    }
 
     #[test]
     fn printable_text_is_kept() {

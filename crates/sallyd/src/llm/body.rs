@@ -1,4 +1,4 @@
-//! The chat-completion request body from the untrusted harness (AMENDMENTS-01 §3.2, Task 7
+//! The chat-completion request body from the untrusted harness (ARCHITECTURE §4.4, Task 7
 //! decision 1). Bounds first: the size and the nesting depth are checked on the raw bytes. Then
 //! every member, at every level, must be on the allowlist and of the right shape; anything else
 //! is refused with the path of the member. `n` must be 1, message content is text only, the
@@ -14,7 +14,7 @@ use serde_json::{Map, Value};
 use crate::rpc::json;
 use crate::rpc::message::too_deep;
 
-/// Largest body accepted (§3.2: 4 MiB).
+/// Largest body accepted (ARCHITECTURE §4.4: 4 MiB).
 pub const MAX_BODY: usize = 4 * 1024 * 1024;
 /// Deepest nesting accepted (tool parameter schemas nest).
 pub const MAX_DEPTH: usize = 64;
@@ -36,7 +36,7 @@ const ROLES: [&str; 5] = ["system", "developer", "user", "assistant", "tool"];
 /// Members of a message.
 // TODO(#55): M4 checks what the stock openai client replays (null refusal, annotations, …).
 const MESSAGE: [&str; 5] = ["role", "content", "name", "tool_calls", "tool_call_id"];
-/// Top-level members (§3.2).
+/// Top-level members (ARCHITECTURE §4.4).
 const TOP: [&str; 17] = [
     "model",
     "messages",

@@ -185,6 +185,23 @@ mod tests {
         assert_eq!(out, b"ok");
     }
 
+    #[tokio::test]
+    async fn a_flush_reaches_the_inner_stream() {
+        let (mut peer, inner) = tokio::io::duplex(64);
+        let gate = Gate::default();
+        gate.open();
+        let buffered = tokio::io::BufWriter::new(inner);
+        let mut io = Io::new(Vec::new(), buffered, gate, Duration::from_secs(1));
+        io.write_all(b"ok").await.unwrap();
+        io.flush().await.unwrap();
+        let mut b = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(5), peer.read_exact(&mut b))
+            .await
+            .expect("the flush stayed in the buffer")
+            .unwrap();
+        assert_eq!(&b, b"ok");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_write_the_peer_never_takes_times_out() {
         let (_peer, inner) = tokio::io::duplex(8);

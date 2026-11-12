@@ -278,4 +278,24 @@ mod tests {
         assert!(UnixStream::connect(&path).await.is_err());
         assert_eq!(p.served.load(Ordering::SeqCst), 0);
     }
+
+    #[tokio::test]
+    async fn a_dropped_handle_aborts_live_connections_at_once() {
+        let (d, l) = listener();
+        let p = Arc::new(Probe::default());
+        let h = spawn(l, Arc::clone(&p), 4, me());
+        let mut c = UnixStream::connect(d.path().join("s.sock")).await.unwrap();
+        c.write_all(b"x").await.unwrap();
+        let mut b = [0u8; 1];
+        c.read_exact(&mut b).await.unwrap();
+        // The probe holds the connection until the peer closes; dropping the handle aborts it
+        // without the orderly stop (which would wait for it).
+        drop(h);
+        let n = tokio::time::timeout(Duration::from_secs(5), c.read(&mut b))
+            .await
+            .expect("the connection outlived its handle")
+            .unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(p.stopped.load(Ordering::SeqCst), 0);
+    }
 }

@@ -1,5 +1,5 @@
 //! The broker's JSON-RPC surface (Task 7): newline-delimited JSON-RPC 2.0 over Unix stream
-//! sockets. `agent.sock` serves the MCP subset of AMENDMENTS-01 §3.1 to the untrusted harness.
+//! sockets. `agent.sock` serves the MCP subset of ARCHITECTURE §4.2 to the untrusted harness.
 
 pub mod agent;
 pub mod control;

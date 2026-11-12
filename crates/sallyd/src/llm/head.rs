@@ -97,6 +97,11 @@ mod tests {
     }
 
     #[test]
+    fn the_limits_are_the_ruled_values() {
+        assert_eq!((MAX_HEAD, MAX_HEADERS), (8192, 64));
+    }
+
+    #[test]
     fn a_request_head_parses() {
         let s = "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 12\r\n\r\nbody";
         let h = complete(s);

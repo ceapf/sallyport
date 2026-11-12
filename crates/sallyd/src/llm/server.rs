@@ -1,4 +1,4 @@
-//! The `llm.sock` server (AMENDMENTS-01 §3.2; Task 7 decisions 1, 2 and 5). HTTP/1.1 through
+//! The `llm.sock` server (ARCHITECTURE §4.4; Task 7 decisions 1, 2 and 5). HTTP/1.1 through
 //! hyper, one request per connection (keep-alive off).
 //!
 //! Per connection (architect rulings Q8, Q9): the broker reads the head itself (at most
@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use http_body_util::{BodyExt, LengthLimitError, Limited};
+use http_body_util::{BodyExt, Limited};
 use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -259,11 +259,11 @@ impl<B: Backend> Llm<B> {
             Limited::new(req.into_body(), body::MAX_BODY).collect(),
         )
         .await;
+        // The head check already refused a Content-Length over the cap, and hyper reads exactly
+        // that many bytes, so the limit is a second bound that a request never reaches: any
+        // error here is a body cut short, `body-error`.
         let bytes = match collected {
             Err(_) => return self.refused(&gate, 408, "body-timeout", None).await,
-            Ok(Err(e)) if e.downcast_ref::<LengthLimitError>().is_some() => {
-                return self.refused(&gate, 413, "body-too-large", None).await;
-            }
             Ok(Err(_)) => return self.refused(&gate, 400, "body-error", None).await,
             Ok(Ok(c)) => c.to_bytes(),
         };

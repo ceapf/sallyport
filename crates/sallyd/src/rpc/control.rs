@@ -154,7 +154,8 @@ async fn write<W: AsyncWrite + Unpin>(w: &mut W, line: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::rpc::testkit::recorder;
-    use tokio::io::AsyncBufReadExt;
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
     async fn exchange(lines: &[&[u8]]) -> (Vec<Value>, Vec<crate::rpc::testkit::Row>) {
         let (sink, rec) = recorder("");
@@ -181,6 +182,49 @@ mod tests {
     #[test]
     fn the_control_table_is_empty_until_task_12() {
         assert!(CONTROL_METHODS.is_empty());
+    }
+
+    #[test]
+    fn frames_are_capped_at_1_mib() {
+        assert_eq!(MAX_FRAME, 1_048_576);
+    }
+
+    #[tokio::test]
+    async fn stop_ends_a_live_connection() {
+        let (_, rec) = recorder("");
+        let control = Arc::new(Control::new(rec));
+        let (_client, server) = tokio::io::duplex(1024);
+        let task = tokio::spawn(Arc::clone(&control).serve_stream(server));
+        tokio::task::yield_now().await;
+        Server::stop(&*control);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("stop left the connection open")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_peer_with_another_uid_is_refused_and_recorded() {
+        let dir = std::env::temp_dir().join(format!("sp-control-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let (sink, rec) = recorder("");
+        let me = rustix::process::getuid().as_raw();
+        let h =
+            crate::rpc::listen::spawn(listener, Arc::new(Control::new(rec)), 1, me.wrapping_add(1));
+        let mut s = UnixStream::connect(&path).await.unwrap();
+        let _ = s.write_all(b"{}\n").await;
+        let mut out = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out)).await;
+        assert!(out.is_empty());
+        assert_eq!(
+            sink.last("rpc.deny"),
+            json!({"socket": "control", "reason": "peer-uid", "uid": me})
+        );
+        h.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

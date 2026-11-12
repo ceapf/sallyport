@@ -1,4 +1,4 @@
-//! `llm.sock`: the OpenAI-compatible endpoint the harness talks to (AMENDMENTS-01 §3.2, Task 7).
+//! `llm.sock`: the OpenAI-compatible endpoint the harness talks to (ARCHITECTURE §4.4, Task 7).
 
 pub mod body;
 pub mod head;

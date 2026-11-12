@@ -1,4 +1,4 @@
-//! The MCP subset `agent.sock` serves (AMENDMENTS-01 §3.1; Task 7 decision 3): pure decisions
+//! The MCP subset `agent.sock` serves (ARCHITECTURE §4.2; Task 7 decision 3): pure decisions
 //! over one parsed message. Which lifecycle a request belongs to, whether its method is on the
 //! allowlist, and the exact reply shapes of each lifecycle.
 //!
@@ -345,7 +345,7 @@ fn cut(s: &str, max: usize) -> String {
 }
 
 /// A built-in tool as `tools/list` describes it. Names and descriptions are static strings
-/// compiled into the broker (AMENDMENTS-01 §3.1): never manifest or user text.
+/// compiled into the broker (ARCHITECTURE §4.3): never manifest or user text.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tool {
     /// Its name on the wire.

@@ -643,3 +643,84 @@ async fn a_request_hyper_reads_differently_is_closed_unanswered_and_recorded() {
     assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
     assert!(!sink.events().contains(&"llm.request".to_owned()));
 }
+
+#[test]
+fn the_reply_cap_is_16_mib_and_a_close_names_itself() {
+    assert_eq!(MAX_RESPONSE, 16_777_216);
+    assert_eq!(Closed.to_string(), "closed");
+}
+
+#[tokio::test]
+async fn models_takes_an_empty_body_with_its_length_stated() {
+    let (llm, _, _) = setup();
+    let r = exchange(
+        &llm,
+        b"GET /v1/models HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&r), 200, "{r}");
+}
+
+#[tokio::test]
+async fn the_server_stop_ends_a_live_connection() {
+    let (llm, _, sink) = setup();
+    let (_client, server) = tokio::io::duplex(1024);
+    let task = tokio::spawn(Arc::clone(&llm).serve_stream(server));
+    tokio::task::yield_now().await;
+    Server::stop(&*llm);
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("stop left the connection open")
+        .unwrap();
+    assert!(sink.rows().is_empty());
+}
+
+/// Streams events of the given encoded sizes through [`pump`]; the `llm.response` arguments and
+/// what reached the peer.
+async fn pumped(sizes: &[usize]) -> (Value, Vec<Bytes>) {
+    let (sink, rec) = recorder("sess-a");
+    let (events_tx, events_rx) = mpsc::channel(sizes.len());
+    for &n in sizes {
+        let v = json!("x".repeat(n - 10));
+        assert_eq!(reply::event(&v).len(), n);
+        events_tx.send(v).await.unwrap();
+    }
+    drop(events_tx);
+    let (tx, mut rx) = mpsc::channel(4);
+    let task = tokio::spawn(pump(events_rx, tx, rec));
+    let mut out = Vec::new();
+    while let Some(b) = rx.recv().await {
+        out.push(b);
+    }
+    task.await.unwrap();
+    (sink.last("llm.response"), out)
+}
+
+#[tokio::test]
+async fn a_stream_of_exactly_the_cap_is_whole_and_one_byte_more_is_cut() {
+    let (resp, out) = pumped(&[MAX_RESPONSE]).await;
+    assert_eq!(
+        (resp["cut"].clone(), resp["events"].clone()),
+        (json!(false), json!(1))
+    );
+    assert_eq!(out.len(), 2);
+    assert_eq!(&out[1][..], reply::DONE);
+    let (resp, out) = pumped(&[MAX_RESPONSE - 20, 20]).await;
+    assert_eq!(
+        (resp["cut"].clone(), resp["bytes"].clone()),
+        (json!(false), json!(MAX_RESPONSE))
+    );
+    assert_eq!(out.len(), 3);
+    let (resp, out) = pumped(&[MAX_RESPONSE + 1]).await;
+    assert_eq!(
+        (resp["cut"].clone(), resp["events"].clone()),
+        (json!(true), json!(0))
+    );
+    assert!(out.is_empty(), "a cut stream ends without [DONE]");
+    let (resp, out) = pumped(&[MAX_RESPONSE - 20, 21]).await;
+    assert_eq!(
+        (resp["cut"].clone(), resp["bytes"].clone()),
+        (json!(true), json!(MAX_RESPONSE - 20))
+    );
+    assert_eq!(out.len(), 1);
+}

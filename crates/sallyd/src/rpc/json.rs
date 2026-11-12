@@ -94,6 +94,23 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// What the visitor says it expects, as serde shows it in an error.
+    struct Expecting;
+
+    impl fmt::Display for Expecting {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            StrictVisitor.expecting(f)
+        }
+    }
+
+    #[test]
+    fn the_visitor_names_what_it_expects_and_takes_owned_strings() {
+        assert_eq!(Expecting.to_string(), "JSON without repeated keys");
+        // serde_json hands a slice's strings over borrowed; an owned one is kept as is.
+        let v = StrictVisitor.visit_string::<serde_json::Error>("owned".to_owned());
+        assert_eq!(v.unwrap(), json!("owned"));
+    }
+
     #[test]
     fn values_parse_like_serde_json() {
         let text = r#"{"a":[1,-2,3.5,"s",true,false,null,{"b":{}}],"c":18446744073709551615}"#;

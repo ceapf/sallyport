@@ -4,6 +4,11 @@ use serde_json::{Value, json};
 
 use super::*;
 
+#[test]
+fn the_body_cap_is_4_mib() {
+    assert_eq!(MAX_BODY, 4_194_304);
+}
+
 const CONTEXT: u64 = 8192;
 
 fn base() -> Value {
