@@ -1,0 +1,706 @@
+//! The intercepted tunnel to a grant host (Task 9a-2; decisions 2–6, architect Q27–Q53).
+//!
+//! After `egress.allow` and the dial: upstream TLS (real verification against the session's
+//! trust roots, SNI = host, before the `200`; failure is `upstream-tls-failed`, Q28), the `200`,
+//! the client's TLS handshake with the host's session-CA leaf (ALPN `http/1.1` only), then HTTP/1.1
+//! exchanges through hyper: one upstream connection per tunnel, used for one request at a time,
+//! never replayed. Each request head is checked and rewritten by [`super::super::rewrite`],
+//! audited (`egress.request`) and forwarded; each response head is checked and its body streamed
+//! back under the response cap. Every refusal is audited before its reply and ends the tunnel.
+//!
+//! No secret reaches this module (Q27 (1)): the proxy holds the leaves' keys and header names
+//! only. Task 9a-3 adds injection here, constructible only together with response redaction.
+
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use hyper::body::{Body, Bytes, Frame, Incoming, SizeHint};
+use hyper::http::{HeaderValue, Method, Request, Response, StatusCode, Version, header};
+use hyper::service::service_fn;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+use rustls::{ClientConfig, ServerConfig};
+use sally_core::audit::NewEntry;
+use serde_json::{Value, json};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::time::Instant;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+use super::super::authority::{Authority, escape_target};
+use super::super::ca::{CaError, SessionTls};
+use super::super::head::MAX_HEAD;
+use super::super::meter::{BodyEnd, BoxError, Capped, Counts, Meter, OnEnd};
+use super::super::policy::Reason;
+use super::super::rewrite;
+use super::super::roots::Roots;
+use super::super::tunnel::{Activity, End, Totals};
+use super::{Cleared, Dialer, ESTABLISHED, HostAddrs, Proxy, REPLY_TIMEOUT, Resolver, write_reply};
+
+/// The only ALPN protocol offered either way (decision 4).
+const HTTP_1_1: &[u8] = b"http/1.1";
+/// Largest upstream response head (architect Q45); more is `response-too-large`.
+pub const MAX_RESPONSE_HEAD: usize = 64 * 1024;
+/// Header lines a head may have, either way.
+const MAX_HEADERS: usize = 100;
+/// Most plaintext bytes hyper gets per read, client side and upstream side. hyper checks its
+/// head limit (`max_header_size`, set this much below the bound) only between reads, so a head
+/// over [`MAX_HEAD`] or [`MAX_RESPONSE_HEAD`] is always refused, and one at most the bound minus
+/// this always passes.
+const REQUEST_READ: usize = 1024;
+const RESPONSE_READ: usize = 4096;
+
+/// What the proxy intercepts grant hosts with (Task 9a): the session CA's leaves and the upstream
+/// trust roots, and the TLS configurations built from them. It holds no secret store and no
+/// credential (architect Q27 (1)).
+#[derive(Debug)]
+pub struct Interception {
+    /// The session CA and one leaf per grant host; the CA key is already gone.
+    pub tls: SessionTls,
+    /// The upstream verifier's roots.
+    pub roots: Roots,
+    upstream: Arc<ClientConfig>,
+    servers: Vec<(String, Arc<ServerConfig>)>,
+}
+
+impl Interception {
+    /// Builds the upstream client configuration (rustls defaults: TLS 1.2 and 1.3, the given
+    /// roots, ALPN `http/1.1`) and one server configuration per leaf.
+    ///
+    /// # Errors
+    /// [`CaError::Generate`] when rustls refuses a configuration or a leaf.
+    pub fn new(tls: SessionTls, roots: Roots) -> Result<Self, CaError> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut upstream = ClientConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .map_err(tls_error)?
+            .with_root_certificates(Arc::clone(&roots.store))
+            .with_no_client_auth();
+        upstream.alpn_protocols = vec![HTTP_1_1.to_vec()];
+        let mut servers = Vec::with_capacity(tls.leaves.len());
+        for leaf in &tls.leaves {
+            let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf.key.expose().clone()));
+            let mut cfg = ServerConfig::builder_with_provider(Arc::clone(&provider))
+                .with_safe_default_protocol_versions()
+                .map_err(tls_error)?
+                .with_no_client_auth()
+                .with_single_cert(vec![leaf.cert.clone()], key)
+                .map_err(tls_error)?;
+            cfg.alpn_protocols = vec![HTTP_1_1.to_vec()];
+            servers.push((leaf.host.clone(), Arc::new(cfg)));
+        }
+        Ok(Self {
+            tls,
+            roots,
+            upstream: Arc::new(upstream),
+            servers,
+        })
+    }
+
+    /// The server configuration presenting `host`'s leaf, if the session CA made one.
+    #[must_use]
+    pub fn server(&self, host: &str) -> Option<Arc<ServerConfig>> {
+        self.servers
+            .iter()
+            .find(|(h, _)| h == host)
+            .map(|(_, c)| Arc::clone(c))
+    }
+}
+
+fn tls_error(e: rustls::Error) -> CaError {
+    CaError::Generate(e.to_string())
+}
+
+/// What an intercepted tunnel's `egress.close` adds: its requests and their status classes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Summary {
+    /// Requests forwarded upstream.
+    pub requests: u64,
+    /// Responses per status class, `1xx` to `5xx`.
+    pub statuses: [u64; 5],
+}
+
+impl Summary {
+    /// The `statuses` object: non-zero classes only.
+    #[must_use]
+    pub fn statuses_json(&self) -> Value {
+        let mut m = serde_json::Map::new();
+        for (i, n) in self.statuses.iter().enumerate() {
+            if *n > 0 {
+                m.insert(format!("{}xx", i + 1), json!(n));
+            }
+        }
+        Value::Object(m)
+    }
+}
+
+/// One intercepted tunnel's shared state.
+struct State {
+    auth: Authority,
+    used: SocketAddr,
+    grants: Vec<String>,
+    raw: Counts,
+    plain: Counts,
+    act: Arc<Activity>,
+    busy: AtomicBool,
+    /// Plaintext bytes read when the last exchange finished (architect Q53).
+    mark: AtomicU64,
+    request_over: AtomicBool,
+    requests: AtomicU64,
+    statuses: [AtomicU64; 5],
+    end: Mutex<Option<End>>,
+    closed: AtomicBool,
+}
+
+impl State {
+    fn begin(&self) {
+        self.act.touch();
+        self.busy.store(true, Ordering::Relaxed);
+    }
+
+    fn finish(&self) {
+        self.mark.store(self.plain.read(), Ordering::Relaxed);
+        self.busy.store(false, Ordering::Relaxed);
+    }
+
+    fn busy(&self) -> bool {
+        self.busy.load(Ordering::Relaxed)
+    }
+
+    /// Whether plaintext bytes arrived since the handshake or the last finished exchange.
+    fn head_started(&self) -> bool {
+        self.plain.read() > self.mark.load(Ordering::Relaxed)
+    }
+
+    /// Records how the tunnel ends; the first reason wins.
+    fn set_end(&self, end: End) {
+        if let Ok(mut e) = self.end.lock() {
+            e.get_or_insert(end);
+        }
+    }
+
+    fn end(&self) -> Option<End> {
+        self.end.lock().ok().and_then(|e| *e)
+    }
+
+    fn count(&self, status: StatusCode) {
+        let class = usize::from(status.as_u16() / 100).saturating_sub(1);
+        if let Some(n) = self.statuses.get(class) {
+            n.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn summary(&self) -> Summary {
+        let mut statuses = [0; 5];
+        for (out, n) in statuses.iter_mut().zip(&self.statuses) {
+            *out = n.load(Ordering::Relaxed);
+        }
+        Summary {
+            requests: self.requests.load(Ordering::Relaxed),
+            statuses,
+        }
+    }
+
+    fn totals(&self, end: End) -> Totals {
+        Totals {
+            up: self.raw.read(),
+            down: self.raw.written(),
+            end,
+        }
+    }
+}
+
+/// A response body: a refusal's text, or the upstream's body under the response cap.
+enum Out {
+    Reply(Option<Bytes>),
+    Upstream(Capped<Incoming>),
+}
+
+impl Body for Out {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        match self.get_mut() {
+            Self::Reply(b) => std::task::Poll::Ready(b.take().map(|b| Ok(Frame::data(b)))),
+            Self::Upstream(c) => std::pin::Pin::new(c).poll_frame(cx),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match self {
+            Self::Reply(b) => b.is_none(),
+            Self::Upstream(c) => c.is_end_stream(),
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        match self {
+            Self::Reply(b) => SizeHint::with_exact(
+                b.as_ref()
+                    .map_or(0, |b| u64::try_from(b.len()).unwrap_or(0)),
+            ),
+            Self::Upstream(c) => c.size_hint(),
+        }
+    }
+}
+
+/// The request body's end: past the cap, the exchange is answered 413 (Q35).
+struct RequestEnd(Arc<State>);
+
+impl OnEnd for RequestEnd {
+    fn ended(
+        &self,
+        how: Option<BodyEnd>,
+    ) -> Option<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>> {
+        if how == Some(BodyEnd::OverCap) {
+            self.0.request_over.store(true, Ordering::Relaxed);
+        }
+        None
+    }
+}
+
+/// The response body's end: complete (the exchange is over), past the cap (audited, then cut),
+/// or failed (the upstream closed mid-body: cut, Q43).
+struct ResponseEnd {
+    state: Arc<State>,
+    limit: Mutex<Option<(NewEntry, Arc<dyn crate::sandbox::AuditSink>)>>,
+    level: sally_core::manifest::AuditLevel,
+}
+
+impl OnEnd for ResponseEnd {
+    fn ended(
+        &self,
+        how: Option<BodyEnd>,
+    ) -> Option<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>> {
+        match how {
+            None | Some(BodyEnd::Complete) => {
+                self.state.finish();
+                None
+            }
+            Some(BodyEnd::Failed) => {
+                self.state.set_end(End::UpstreamClosed);
+                None
+            }
+            Some(BodyEnd::OverCap) => {
+                self.state.set_end(End::Limit);
+                let (entry, sink) = self.limit.lock().ok()?.take()?;
+                let level = self.level;
+                let h = tokio::task::spawn_blocking(move || sink.append(entry, level));
+                Some(Box::pin(async move {
+                    let _ = h.await;
+                }))
+            }
+        }
+    }
+}
+
+/// Aborts the upstream connection task when the tunnel ends.
+struct AbortOnDrop(tokio::task::JoinHandle<Result<(), hyper::Error>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
+    /// Upstream TLS, the `200`, the client's TLS and the exchanges, then `egress.close` (unless
+    /// an `upstream-closed` exchange already wrote it, Q43).
+    pub(super) async fn intercept<C>(
+        &self,
+        mut client: C,
+        c: Cleared,
+        upstream: D::Stream,
+        used: SocketAddr,
+    ) where
+        C: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        let (Some(ic), host) = (self.interception.as_ref(), c.auth.host.clone()) else {
+            return; // check() refused this already (grant-host-unavailable)
+        };
+        let Some(server) = ic.server(&host) else {
+            return;
+        };
+        let act = Arc::new(Activity::new());
+        let upstream = Meter::new(
+            upstream,
+            Vec::new(),
+            Counts::default(),
+            Some(Arc::clone(&act)),
+        );
+        let connector = TlsConnector::from(Arc::clone(&ic.upstream));
+        let handshake = async {
+            let name = ServerName::try_from(host.clone()).ok()?;
+            connector.connect(name, upstream).await.ok()
+        };
+        let tls = tokio::time::timeout(self.limits.connect, handshake)
+            .await
+            .ok()
+            .flatten();
+        let Some(tls) = tls else {
+            let none = Totals {
+                up: 0,
+                down: 0,
+                end: End::UpstreamTlsFailed,
+            };
+            if self
+                .close_with(&c.auth, Some(used), none, Some(Summary::default()))
+                .await
+            {
+                write_reply(&mut client, Reason::UpstreamTlsFailed).await;
+            }
+            return;
+        };
+        let opened = tokio::time::timeout(REPLY_TIMEOUT, client.write_all(ESTABLISHED)).await;
+        let st = Arc::new(State {
+            grants: self.policy.grant_headers(&host),
+            auth: c.auth,
+            used,
+            raw: Counts::default(),
+            plain: Counts::default(),
+            act: Arc::clone(&act),
+            busy: AtomicBool::new(false),
+            mark: AtomicU64::new(0),
+            request_over: AtomicBool::new(false),
+            requests: AtomicU64::new(0),
+            statuses: Default::default(),
+            end: Mutex::new(None),
+            closed: AtomicBool::new(false),
+        });
+        let end = if matches!(opened, Ok(Ok(()))) {
+            let raw = Meter::new(client, c.rest, st.raw.clone(), Some(act));
+            tokio::select! {
+                biased;
+                () = self.stopped() => End::SessionStopped,
+                e = self.exchanges(raw, tls, server, &st) => e,
+            }
+        } else {
+            End::Error
+        };
+        if !st.closed.load(Ordering::Relaxed) {
+            // TODO(#49): log a close entry that could not be written.
+            let _ = self
+                .close_with(&st.auth, Some(st.used), st.totals(end), Some(st.summary()))
+                .await;
+        }
+    }
+
+    /// The client's TLS handshake, then hyper on both sides until the tunnel ends.
+    async fn exchanges<C, U>(
+        &self,
+        raw: Meter<C>,
+        upstream: tokio_rustls::client::TlsStream<Meter<U>>,
+        server: Arc<ServerConfig>,
+        st: &Arc<State>,
+    ) -> End
+    where
+        C: AsyncRead + AsyncWrite + Unpin + Send,
+        U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let accept = TlsAcceptor::from(server).accept(raw);
+        let Ok(Ok(tls)) = tokio::time::timeout(self.limits.head, accept).await else {
+            return End::ClientTlsFailed;
+        };
+        let plain = Meter::new(tls, Vec::new(), st.plain.clone(), None).max_read(REQUEST_READ);
+        let upstream =
+            Meter::new(upstream, Vec::new(), Counts::default(), None).max_read(RESPONSE_READ);
+        let mut client_side = hyper::client::conn::http1::Builder::new();
+        client_side
+            .max_buf_size(MAX_RESPONSE_HEAD)
+            .max_header_size(MAX_RESPONSE_HEAD - RESPONSE_READ)
+            .max_headers(MAX_HEADERS);
+        let Ok((sender, conn)) = client_side.handshake(TokioIo::new(upstream)).await else {
+            return End::Error;
+        };
+        let mut conn = AbortOnDrop(tokio::spawn(conn));
+        let sender = tokio::sync::Mutex::new(sender);
+        let svc = service_fn(|req| self.exchange(req, st, &sender));
+        let mut server_side = hyper::server::conn::http1::Builder::new();
+        // Half-close as in a spliced tunnel: a client that shuts its sending side after the
+        // request still gets the response.
+        server_side
+            .half_close(true)
+            .timer(TokioTimer::new())
+            .header_read_timeout(self.limits.head)
+            .max_buf_size(MAX_HEAD)
+            .max_header_size(MAX_HEAD - REQUEST_READ)
+            .max_headers(MAX_HEADERS);
+        let served = server_side.serve_connection(TokioIo::new(plain), svc);
+        tokio::pin!(served);
+        let idle = idle_out(&st.act, self.limits.idle, st);
+        tokio::pin!(idle);
+        let mut upstream_open = true;
+        loop {
+            tokio::select! {
+                r = &mut served => return self.served(r, st).await,
+                _ = &mut conn.0, if upstream_open => {
+                    upstream_open = false;
+                    if !st.busy() {
+                        return st.end().unwrap_or(End::Closed);
+                    }
+                }
+                () = &mut idle => return End::IdleTimeout,
+            }
+        }
+    }
+
+    /// How the client side ended (Q53, and the item-5 mapping for heads hyper refused itself).
+    async fn served(&self, r: Result<(), hyper::Error>, st: &State) -> End {
+        if let Some(end) = st.end() {
+            return end;
+        }
+        let Err(e) = r else {
+            return End::Closed;
+        };
+        let (reason, end) = if e.is_timeout() {
+            if !st.head_started() {
+                return End::IdleTimeout;
+            }
+            (Reason::HeadTimeout, End::Limit)
+        } else if e.is_parse_too_large() {
+            (Reason::HeadTooLarge, End::Limit)
+        } else if e.is_parse() {
+            (Reason::Malformed, End::Refused)
+        } else {
+            return End::Error;
+        };
+        let event = if reason.is_limit() {
+            "egress.limit"
+        } else {
+            "egress.deny"
+        };
+        let args = json!({"reason": reason.as_str(), "host": st.auth.host, "port": st.auth.port});
+        let _ = self
+            .append(self.entry(event, Some("deny")).args(args))
+            .await;
+        end
+    }
+
+    /// One exchange: check, audit, forward, check the response, stream it back.
+    async fn exchange(
+        &self,
+        req: Request<Incoming>,
+        st: &Arc<State>,
+        sender: &tokio::sync::Mutex<hyper::client::conn::http1::SendRequest<Capped<Incoming>>>,
+    ) -> Result<Response<Out>, BoxError> {
+        st.begin();
+        let (parts, body) = req.into_parts();
+        let target = parts.uri.to_string();
+        let head = match rewrite::request(
+            parts.version,
+            &parts.uri,
+            &parts.headers,
+            &st.auth,
+            &st.grants,
+        ) {
+            Ok(h) => h,
+            Err(reason) => return self.refuse_inside(st, reason, &target, None).await,
+        };
+        if !rewrite::within(head.length, self.limits.max_request) {
+            return self
+                .refuse_inside(st, Reason::RequestTooLarge, &target, None)
+                .await;
+        }
+        let audited = self
+            .entry("egress.request", Some("allow"))
+            .args(request_args(&st.auth, &parts.method, &target));
+        if !self.append(audited).await {
+            st.set_end(End::Error);
+            return Err("audit append failed".into());
+        }
+        st.requests.fetch_add(1, Ordering::Relaxed);
+        let capped = Capped::new(
+            body,
+            self.limits.max_request,
+            Arc::new(RequestEnd(Arc::clone(st))),
+        );
+        let mut up = Request::new(capped);
+        *up.method_mut() = parts.method;
+        *up.uri_mut() = parts
+            .uri
+            .path_and_query()
+            .map_or_else(|| "/".parse(), |p| p.as_str().parse())?;
+        *up.version_mut() = Version::HTTP_11;
+        *up.headers_mut() = head.headers;
+        let sent = {
+            let mut s = sender.lock().await;
+            match s.ready().await {
+                Ok(()) => s.send_request(up).await,
+                Err(e) => Err(e),
+            }
+        };
+        match sent {
+            Ok(resp) => self.respond(st, resp, &target).await,
+            Err(e) if st.request_over.load(Ordering::Relaxed) => {
+                drop(e);
+                self.refuse_inside(st, Reason::RequestTooLarge, &target, None)
+                    .await
+            }
+            Err(e) if e.is_parse_too_large() => {
+                self.refuse_inside(st, Reason::ResponseTooLarge, &target, Some("head"))
+                    .await
+            }
+            Err(e) if e.is_parse() => {
+                self.refuse_inside(st, Reason::UpstreamMalformed, &target, None)
+                    .await
+            }
+            Err(_) => self.upstream_closed(st).await,
+        }
+    }
+
+    /// The response head: checked (Q30), its declared length against the cap (Q35), then the
+    /// body streamed back under the cap.
+    async fn respond(
+        &self,
+        st: &Arc<State>,
+        resp: Response<Incoming>,
+        target: &str,
+    ) -> Result<Response<Out>, BoxError> {
+        let (rp, body) = resp.into_parts();
+        let headers = match rewrite::response(rp.status, &rp.headers) {
+            Ok(h) => h,
+            Err(reason) => return self.refuse_inside(st, reason, target, None).await,
+        };
+        if !rewrite::within(
+            rewrite::declared_length(&rp.headers),
+            self.limits.max_response,
+        ) {
+            return self
+                .refuse_inside(st, Reason::ResponseTooLarge, target, Some("body"))
+                .await;
+        }
+        st.count(rp.status);
+        let over = self.entry("egress.limit", Some("deny")).args(inside_args(
+            &st.auth,
+            Reason::ResponseTooLarge,
+            target,
+            Some("body"),
+        ));
+        let on_end = ResponseEnd {
+            state: Arc::clone(st),
+            limit: Mutex::new(Some((over, Arc::clone(&self.audit)))),
+            level: self.level,
+        };
+        let mut out = Response::new(Out::Upstream(Capped::new(
+            body,
+            self.limits.max_response,
+            Arc::new(on_end),
+        )));
+        *out.status_mut() = rp.status;
+        *out.headers_mut() = headers;
+        Ok(out)
+    }
+
+    /// A refusal inside the tunnel: audited first (`egress.deny` or `egress.limit`), answered
+    /// with `Connection: close`, and the tunnel ends. A failed append closes without a reply.
+    async fn refuse_inside(
+        &self,
+        st: &State,
+        reason: Reason,
+        target: &str,
+        part: Option<&str>,
+    ) -> Result<Response<Out>, BoxError> {
+        let event = if reason.is_limit() {
+            "egress.limit"
+        } else {
+            "egress.deny"
+        };
+        let entry = self
+            .entry(event, Some("deny"))
+            .args(inside_args(&st.auth, reason, target, part));
+        if !self.append(entry).await {
+            st.set_end(End::Error);
+            return Err("audit append failed".into());
+        }
+        st.set_end(if reason.is_limit() {
+            End::Limit
+        } else {
+            End::Refused
+        });
+        Ok(reply_response(reason))
+    }
+
+    /// The upstream closed before a response head: `egress.close` first, then the 502 (Q43).
+    async fn upstream_closed(&self, st: &State) -> Result<Response<Out>, BoxError> {
+        st.set_end(End::UpstreamClosed);
+        st.closed.store(true, Ordering::Relaxed);
+        let t = st.totals(End::UpstreamClosed);
+        if !self
+            .close_with(&st.auth, Some(st.used), t, Some(st.summary()))
+            .await
+        {
+            return Err("audit append failed".into());
+        }
+        Ok(reply_response(Reason::UpstreamClosed))
+    }
+}
+
+/// Resolves once an exchange in flight moved nothing for `idle` (Q53: between exchanges the
+/// head timer governs).
+async fn idle_out(act: &Activity, idle: Duration, st: &State) {
+    loop {
+        let deadline = act.last() + idle;
+        let now = Instant::now();
+        if now >= deadline && st.busy() {
+            return;
+        }
+        let wake = if now >= deadline {
+            now + idle
+        } else {
+            deadline
+        };
+        tokio::time::sleep_until(wake).await;
+    }
+}
+
+/// The reply to a refusal inside the tunnel: as Task 8's [`super::reply`], closing the tunnel.
+fn reply_response(reason: Reason) -> Response<Out> {
+    let body = format!("{}\n", reason.as_str());
+    let mut r = Response::new(Out::Reply(Some(Bytes::from(body))));
+    *r.status_mut() = StatusCode::from_u16(reason.status()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let h = r.headers_mut();
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+    h.insert(header::CONNECTION, HeaderValue::from_static("close"));
+    r
+}
+
+/// Arguments of `egress.request` (Q34). Nothing is injected in Task 9a-2.
+fn request_args(a: &Authority, method: &Method, target: &str) -> Value {
+    let (method, _, _) = escape_target(method.as_str().as_bytes());
+    let (text, bytes, cut) = escape_target(target.as_bytes());
+    json!({
+        "host": a.host,
+        "port": a.port,
+        "method": method,
+        "target": text,
+        "target_bytes": bytes,
+        "target_cut": cut,
+        "injected": [],
+    })
+}
+
+/// Arguments of a refusal inside the tunnel (Q34): reason, host, port, escaped target.
+fn inside_args(a: &Authority, reason: Reason, target: &str, part: Option<&str>) -> Value {
+    let (text, bytes, cut) = escape_target(target.as_bytes());
+    let mut v = json!({
+        "reason": reason.as_str(),
+        "host": a.host,
+        "port": a.port,
+        "target": text,
+        "target_bytes": bytes,
+        "target_cut": cut,
+    });
+    if let (Some(obj), Some(p)) = (v.as_object_mut(), part) {
+        obj.insert("part".into(), json!(p));
+    }
+    v
+}
+
+#[cfg(test)]
+#[path = "intercept_tests.rs"]
+mod tests;

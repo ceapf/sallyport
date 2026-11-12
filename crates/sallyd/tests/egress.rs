@@ -593,6 +593,7 @@ fn listen(
             SessionEgress {
                 policy: Policy::new(vec![rule], vec![]),
                 max_connections,
+                body_caps: (1 << 20, 1 << 20),
                 session: "rt-net-09".into(),
                 level: sally_core::manifest::AuditLevel::default(),
                 audit,

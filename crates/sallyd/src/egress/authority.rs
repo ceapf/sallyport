@@ -62,6 +62,56 @@ pub fn parse(target: &str) -> Result<Authority, AuthorityError> {
     }
 }
 
+/// Why the `Host` header of an intercepted request is refused (architect Q29).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostHeaderError {
+    /// Not an authority by [`parse`]'s rules (IP literal, userinfo, bad port, not ASCII…): 400.
+    Malformed,
+    /// A usable authority, but not the CONNECT one: 421.
+    Mismatch,
+}
+
+/// Checks one `Host` header value of a request inside the tunnel to `connect`. It is normalized
+/// as a CONNECT target is (lower case, one trailing dot) and must name the same host. The port
+/// may be left out only when the CONNECT port is 443; otherwise it must be present and equal.
+///
+/// # Errors
+/// [`HostHeaderError`].
+pub fn host_header(value: &[u8], connect: &Authority) -> Result<(), HostHeaderError> {
+    let text = std::str::from_utf8(value).map_err(|_| HostHeaderError::Malformed)?;
+    let explicit = text.contains(':');
+    let parsed = if explicit {
+        parse(text)
+    } else {
+        parse(&format!("{text}:{HTTPS_PORT}"))
+    };
+    let auth = parsed.map_err(|_| HostHeaderError::Malformed)?;
+    let port_ok = if explicit {
+        auth.port == connect.port
+    } else {
+        connect.port == HTTPS_PORT
+    };
+    if auth.host == connect.host && port_ok {
+        Ok(())
+    } else {
+        Err(HostHeaderError::Mismatch)
+    }
+}
+
+/// The port an omitted `Host` port stands for.
+const HTTPS_PORT: u16 = 443;
+
+/// The `Host` header sent upstream, rebuilt from the CONNECT authority: `host`, plus `:port`
+/// unless the port is 443 (architect Q29).
+#[must_use]
+pub fn upstream_host(connect: &Authority) -> String {
+    if connect.port == HTTPS_PORT {
+        connect.host.clone()
+    } else {
+        format!("{}:{}", connect.host, connect.port)
+    }
+}
+
 /// Decimal digits only (no sign), 1..=65535. Empty and overlong strings fail the `u16` parse.
 fn parse_port(s: &str) -> Option<u16> {
     if !s.bytes().all(|b| b.is_ascii_digit()) {
@@ -163,6 +213,96 @@ mod tests {
         ] {
             assert_eq!(parse(t), Err(AuthorityError::Malformed), "{t:?}");
         }
+    }
+
+    fn connect(host: &str, port: u16) -> Authority {
+        Authority {
+            host: host.to_owned(),
+            port,
+        }
+    }
+
+    #[test]
+    fn a_host_header_naming_the_connect_authority_is_accepted() {
+        let at443 = connect("api.mock.test", 443);
+        for v in [
+            "api.mock.test",
+            "API.Mock.Test",
+            "api.mock.test.",
+            "api.mock.test:443",
+            "api.mock.test.:443",
+        ] {
+            assert_eq!(host_header(v.as_bytes(), &at443), Ok(()), "{v}");
+        }
+        let at8443 = connect("api.mock.test", 8443);
+        assert_eq!(host_header(b"api.mock.test:8443", &at8443), Ok(()));
+    }
+
+    #[test]
+    fn a_host_header_naming_anything_else_is_a_mismatch() {
+        let at443 = connect("api.mock.test", 443);
+        for v in [
+            "other.mock.test",
+            "mock.test",
+            "x.api.mock.test",
+            "api.mock.test:8443",
+        ] {
+            assert_eq!(
+                host_header(v.as_bytes(), &at443),
+                Err(HostHeaderError::Mismatch),
+                "{v}"
+            );
+        }
+        // Off 443 the port must be present and equal.
+        let at8443 = connect("api.mock.test", 8443);
+        for v in ["api.mock.test", "api.mock.test:443", "api.mock.test:8444"] {
+            assert_eq!(
+                host_header(v.as_bytes(), &at8443),
+                Err(HostHeaderError::Mismatch),
+                "{v}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unusable_host_header_is_malformed() {
+        let at443 = connect("api.mock.test", 443);
+        let dotted = format!("{}.{}.{}.{}", 1, 1, 1, 1);
+        for v in [
+            b"".as_slice(),
+            b"api.mock.test:",
+            b"api.mock.test:0",
+            b"api.mock.test:+443",
+            b"user@api.mock.test",
+            b"user:pw@api.mock.test:443",
+            b"[::1]",
+            b"[::1]:443",
+            dotted.as_bytes(),
+            b"api.mock.test..",
+            b"api mock.test",
+            b"api.mock.test\xff",
+            b"localhost",
+            b"*.mock.test",
+        ] {
+            assert_eq!(
+                host_header(v, &at443),
+                Err(HostHeaderError::Malformed),
+                "{:?}",
+                String::from_utf8_lossy(v)
+            );
+        }
+    }
+
+    #[test]
+    fn the_upstream_host_header_is_rebuilt_from_the_connect_authority() {
+        assert_eq!(
+            upstream_host(&connect("api.mock.test", 443)),
+            "api.mock.test"
+        );
+        assert_eq!(
+            upstream_host(&connect("api.mock.test", 8443)),
+            "api.mock.test:8443"
+        );
     }
 
     #[test]

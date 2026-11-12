@@ -8,7 +8,7 @@ use sally_core::audit::NewEntry;
 use sally_core::manifest::{AuditLevel, parse_host_pattern};
 
 use super::super::ca::{BUNDLE_FILE, CA_FILE, GRACE};
-use super::super::policy::Rule;
+use super::super::policy::{Grant, Rule};
 use super::super::server::{Dialer, HostAddrs, Resolver};
 use super::*;
 
@@ -107,8 +107,18 @@ fn session(ca: bool, grants: &[&str]) -> SessionEgress {
         ports: vec![443],
     };
     SessionEgress {
-        policy: Policy::new(vec![rule], grants.iter().map(|g| (*g).to_owned()).collect()),
+        policy: Policy::new(
+            vec![rule],
+            grants
+                .iter()
+                .map(|g| Grant {
+                    host: (*g).to_owned(),
+                    header: "Authorization".to_owned(),
+                })
+                .collect(),
+        ),
         max_connections: 4,
+        body_caps: (1 << 20, 1 << 20),
         session: "s-ca".into(),
         level: AuditLevel::default(),
         audit: Arc::new(Sink),

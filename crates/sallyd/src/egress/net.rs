@@ -286,6 +286,9 @@ pub struct SessionEgress {
     pub policy: Policy,
     /// `network.max_connections`.
     pub max_connections: usize,
+    /// `network.max_request_bytes` and `network.max_response_bytes`: body caps of each
+    /// intercepted request and response.
+    pub body_caps: (u64, u64),
     /// The session id.
     pub session: String,
     /// The session's audit level.
@@ -308,6 +311,10 @@ impl SessionEgress {
         Self {
             policy: Policy::from_manifest(v),
             max_connections: usize::try_from(m.network.max_connections).unwrap_or(usize::MAX),
+            body_caps: (
+                m.network.max_request_bytes.bytes(),
+                m.network.max_response_bytes.bytes(),
+            ),
             session: session.to_owned(),
             level: m.audit.level,
             audit,
@@ -382,9 +389,9 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> EgressStarter for Egress<R, D, H> {
         }
         let roots = self.roots.load()?;
         let validity = Validity::for_session(SystemTime::now(), s.timeout)?;
-        let tls = SessionTls::mint(s.policy.grant_hosts(), validity)?;
+        let tls = SessionTls::mint(&s.policy.grant_hosts(), validity)?;
         ca::write_files(dir, &tls, &roots.pem).map_err(EgressError::Files)?;
-        s.interception = Some(Interception { tls, roots });
+        s.interception = Some(Interception::new(tls, roots)?);
         Ok(s)
     }
 
@@ -398,7 +405,11 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> EgressStarter for Egress<R, D, H> {
             audit: s.audit,
             session: s.session,
             level: s.level,
-            limits: Limits::new(s.max_connections),
+            limits: Limits {
+                max_request: s.body_caps.0,
+                max_response: s.body_caps.1,
+                ..Limits::new(s.max_connections)
+            },
             interception: s.interception,
         });
         Ok(serve(listener, Arc::new(proxy)))
@@ -740,6 +751,7 @@ mod tests {
                 SessionEgress {
                     policy: Policy::new(vec![rule], vec![]),
                     max_connections,
+                    body_caps: (1 << 20, 1 << 20),
                     session: "s-1".into(),
                     level: AuditLevel::default(),
                     audit: audit as Arc<dyn AuditSink>,

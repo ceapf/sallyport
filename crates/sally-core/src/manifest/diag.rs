@@ -66,8 +66,9 @@ pub enum Code {
     /// A mount tree contains a Unix socket. Emitted by the bounded launch-time scan (sandbox
     /// driver), not by validation.
     SocketInMount,
-    /// A plain-HTTP request to a host with a secret grant. Emitted by the egress proxy (403);
-    /// credentials are injected only inside TLS the proxy terminates.
+    /// A plain-HTTP request to a host with a secret grant. No longer emitted: the egress proxy
+    /// refuses every plain-HTTP request 405 `plain-http-unsupported` before policy (Task 9a-2).
+    // TODO(#59): the maintainer decides whether this code and its gate row are deleted.
     InjectRequiresTls,
     /// Private data (a mount or secret) and an outward channel (an allow rule) coexist
     /// (warning; AMENDMENTS §5).

@@ -7,8 +7,10 @@ pub mod authority;
 pub mod ca;
 pub mod head;
 pub mod hostaddrs;
+pub mod meter;
 pub mod net;
 pub mod policy;
+pub mod rewrite;
 pub mod roots;
 #[cfg(test)]
 pub(crate) mod scratch;

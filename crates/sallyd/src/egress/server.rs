@@ -22,7 +22,7 @@ use tokio::sync::{Semaphore, watch};
 use super::addr;
 use super::authority::{self, Authority, AuthorityError, escape_target};
 use super::head::{self, MAX_HEAD, Parsed};
-use super::policy::{Policy, Reason};
+use super::policy::{Policy, Reason, Route};
 use super::tunnel::{self, End, IDLE_LIMIT, Totals};
 use crate::sandbox::AuditSink;
 
@@ -112,18 +112,26 @@ pub struct Limits {
     pub idle: Duration,
     /// Live connections (the manifest's `network.max_connections`).
     pub max_connections: usize,
+    /// Body bytes of one intercepted request at most (`network.max_request_bytes`).
+    pub max_request: u64,
+    /// Body bytes of one intercepted response at most (`network.max_response_bytes`).
+    pub max_response: u64,
 }
 
 impl Limits {
-    /// The documented limits, with the session's connection cap.
+    /// The documented limits, with the session's connection cap and the manifest's default
+    /// body caps.
     #[must_use]
     pub fn new(max_connections: usize) -> Self {
+        let net = sally_core::manifest::Network::default();
         Self {
             head: HEAD_TIMEOUT,
             resolve: RESOLVE_TIMEOUT,
             connect: CONNECT_TIMEOUT,
             idle: IDLE_LIMIT,
             max_connections,
+            max_request: net.max_request_bytes.bytes(),
+            max_response: net.max_response_bytes.bytes(),
         }
     }
 
@@ -140,15 +148,9 @@ fn permits(n: usize) -> usize {
     n.min(Semaphore::MAX_PERMITS)
 }
 
-/// What the proxy intercepts grant hosts with (Task 9a): the session CA's leaves and the upstream
-/// trust roots. It holds no secret store and no credential (architect Q27 (1)).
-#[derive(Debug)]
-pub struct Interception {
-    /// The session CA and one leaf per grant host; the CA key is already gone.
-    pub tls: super::ca::SessionTls,
-    /// The upstream verifier's roots.
-    pub roots: super::roots::Roots,
-}
+#[path = "intercept.rs"]
+mod intercept;
+pub use intercept::{Interception, MAX_RESPONSE_HEAD, Summary};
 
 /// What a session's proxy is built from.
 pub struct Parts<R, D, H> {
@@ -168,8 +170,8 @@ pub struct Parts<R, D, H> {
     pub level: AuditLevel,
     /// Limits.
     pub limits: Limits,
-    /// The session CA and trust roots of a session with secret grants; `None` otherwise.
-    // TODO(#45): Task 9a-2 serves grant hosts with it; until then they are refused.
+    /// The session CA and trust roots of a session with secret grants; `None` otherwise (grant
+    /// hosts are then refused `grant-host-unavailable`).
     pub interception: Option<Interception>,
 }
 
@@ -217,10 +219,11 @@ impl From<Reason> for Refusal {
     }
 }
 
-/// A request that passed every check: where it may go, and the bytes sent after its head.
+/// A request that passed every check: where it may go, how, and the bytes sent after its head.
 struct Cleared {
     auth: Authority,
     pinned: Vec<SocketAddr>,
+    route: Route,
     rest: Vec<u8>,
 }
 
@@ -309,12 +312,13 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
             _ if !h.connect => Err(Reason::PlainHttpUnsupported.into()),
             Err(AuthorityError::IpLiteral) => Err(Reason::IpLiteral.into()),
             Err(AuthorityError::Malformed) => Err(Reason::Malformed.into()),
-            Ok(auth) => self.check(&auth).await.map(|pinned| (auth, pinned)),
+            Ok(auth) => self.check(&auth).await.map(|cleared| (auth, cleared)),
         };
         match checked {
-            Ok((auth, pinned)) => Some(Cleared {
+            Ok((auth, (pinned, route))) => Some(Cleared {
                 auth,
                 pinned,
+                route,
                 rest: window.get(h.len..).unwrap_or_default().to_vec(),
             }),
             Err(refusal) => {
@@ -324,10 +328,14 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         }
     }
 
-    /// Policy, the host's own addresses, the one lookup, the address filter: the pinned
-    /// addresses, in order.
-    async fn check(&self, a: &Authority) -> Result<Vec<SocketAddr>, Refusal> {
-        self.policy.decide(a)?;
+    /// Policy (and, for a grant host, a session-CA leaf to present), the host's own addresses,
+    /// the one lookup, the address filter: the pinned addresses, in order, and the route.
+    async fn check(&self, a: &Authority) -> Result<(Vec<SocketAddr>, Route), Refusal> {
+        let route = self.policy.decide(a)?;
+        let leaf = self.interception.as_ref().and_then(|i| i.server(&a.host));
+        if route == Route::Intercept && leaf.is_none() {
+            return Err(Reason::GrantHostUnavailable.into());
+        }
         let own = self.host.own().await.map_err(|_| Refusal {
             reason: Reason::IpRangeDenied,
             filter: Some(HOST_ADDRS_UNAVAILABLE),
@@ -340,16 +348,17 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         if found.iter().any(|s| addr::is_denied(s.ip(), &own)) {
             return Err(Reason::IpRangeDenied.into());
         }
-        Ok(pinned(&found, a.port))
+        Ok((pinned(&found, a.port), route))
     }
 
     /// `egress.allow`, then the connect attempts, the tunnel and `egress.close`.
     async fn connect<C: AsyncRead + AsyncWrite + Unpin + Send>(&self, mut client: C, c: Cleared) {
         let ips: Vec<String> = c.pinned.iter().map(|s| s.ip().to_string()).collect();
         let (host, port) = (&c.auth.host, c.auth.port);
+        let intercept = c.route == Route::Intercept;
         let allow = self
             .entry("egress.allow", Some("allow"))
-            .args(json!({"host": host, "port": port, "addresses": ips}));
+            .args(json!({"host": host, "port": port, "addresses": ips, "intercept": intercept}));
         if !self.append(allow).await {
             return;
         }
@@ -366,15 +375,21 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
                     down: 0,
                     end,
                 };
-                if self.close(&c.auth, None, none).await && end == End::ConnectFailed {
+                let summary = intercept.then(Summary::default);
+                if self.close_with(&c.auth, None, none, summary).await && end == End::ConnectFailed
+                {
                     write_reply(&mut client, Reason::ConnectFailed).await;
                 }
                 return;
             }
         };
+        if intercept {
+            self.intercept(client, c, upstream, used).await;
+            return;
+        }
         let totals = self.tunnel(client, upstream, &c.rest).await;
         // TODO(#49): log a close entry that could not be written.
-        let _ = self.close(&c.auth, Some(used), totals).await;
+        let _ = self.close_with(&c.auth, Some(used), totals, None).await;
     }
 
     /// `200`, the bytes sent after the head, then the tunnel.
@@ -416,11 +431,18 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         None
     }
 
-    /// Appends `egress.close`; whether it was written.
-    async fn close(&self, a: &Authority, used: Option<SocketAddr>, t: Totals) -> bool {
+    /// Appends `egress.close`, with the request summary of an intercepted tunnel; whether it was
+    /// written.
+    async fn close_with(
+        &self,
+        a: &Authority,
+        used: Option<SocketAddr>,
+        t: Totals,
+        summary: Option<Summary>,
+    ) -> bool {
         self.append(
             self.entry("egress.close", None)
-                .args(close_args(a, used, t)),
+                .args(close_args(a, used, t, summary)),
         )
         .await
     }
@@ -508,8 +530,9 @@ fn refusal_args(r: Refusal, seen: Seen<'_>) -> Value {
 }
 
 /// Arguments of an `egress.close` entry: the address used (or `connected: false`), the byte
-/// counts and how it ended.
-fn close_args(a: &Authority, used: Option<SocketAddr>, t: Totals) -> Value {
+/// counts, how it ended, whether it was intercepted and, if so, its requests and status classes
+/// (architect Q34).
+fn close_args(a: &Authority, used: Option<SocketAddr>, t: Totals, s: Option<Summary>) -> Value {
     let mut v = json!({
         "host": a.host,
         "port": a.port,
@@ -517,9 +540,16 @@ fn close_args(a: &Authority, used: Option<SocketAddr>, t: Totals) -> Value {
         "bytes_up": t.up,
         "bytes_down": t.down,
         "end": t.end.as_str(),
+        "intercept": s.is_some(),
     });
-    if let (Some(obj), Some(used)) = (v.as_object_mut(), used) {
-        obj.insert("address".into(), json!(used.ip().to_string()));
+    if let Some(obj) = v.as_object_mut() {
+        if let Some(used) = used {
+            obj.insert("address".into(), json!(used.ip().to_string()));
+        }
+        if let Some(s) = s {
+            obj.insert("requests".into(), json!(s.requests));
+            obj.insert("statuses".into(), s.statuses_json());
+        }
     }
     v
 }
@@ -549,6 +579,8 @@ fn phrase(status: u16) -> &'static str {
         403 => "Forbidden",
         405 => "Method Not Allowed",
         408 => "Request Timeout",
+        413 => "Content Too Large",
+        421 => "Misdirected Request",
         429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
         502 => "Bad Gateway",
