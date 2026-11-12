@@ -24,6 +24,13 @@ fn serial() -> std::fs::File {
     io_lock(true)
 }
 
+/// The floor writer tests: the disk-free lock first (a mutation run in either lane frees and
+/// takes gigabytes and so moves their margin; architect ruling D1), then [`serial`].
+fn floor_serial() -> (std::fs::File, std::fs::File) {
+    let disk = disk_free_lock();
+    (disk, serial())
+}
+
 /// Bytes available to unprivileged users on the filesystem of the test fixtures.
 fn free_now() -> u64 {
     let s = rustix::fs::statvfs(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -88,7 +95,7 @@ async fn write_until_killed(r: &Running, path: &str, room: u64) {
 /// The floor kills an `rw` writer: mounts that had no limit at all before.
 #[test]
 fn rt_ag_09_a_full_speed_writer_in_an_rw_mount_is_stopped_by_the_floor() {
-    let _serial = serial();
+    let _serial = floor_serial();
     rt().block_on(async {
         let x = floor_below_free(512 * MIB);
         let v =
@@ -111,7 +118,7 @@ fn rt_ag_09_a_full_speed_writer_in_an_rw_mount_is_stopped_by_the_floor() {
 /// the margin after the launch (the floor reads the filesystem's own accounting).
 #[test]
 fn rt_ag_09_a_full_speed_writer_in_a_staged_mount_is_stopped_by_the_floor() {
-    let _serial = serial();
+    let _serial = floor_serial();
     rt().block_on(async {
         let x = floor_below_free(2048 * MIB);
         let v = x.f.load(&format!(
@@ -136,14 +143,17 @@ fn rt_ag_09_a_full_speed_writer_in_a_staged_mount_is_stopped_by_the_floor() {
     });
 }
 
-/// A launch is refused when the floor plus `stage_size` is not free.
+/// A launch is refused when the floor plus `stage_size` is not free. `stage_size` is the
+/// maximum, so no other process's freed space can admit this launch (architect ruling D1: with
+/// 1 GiB, 512 MiB freed elsewhere between the floor's reading and the launch admitted it, as a
+/// mutation run in the other lane deleting its tree copy did).
 #[test]
 fn a_launch_without_room_for_stage_size_above_the_floor_is_refused() {
     let _serial = serial();
     rt().block_on(async {
         let x = floor_below_free(512 * MIB);
         let v = x.f.load(&format!(
-            "{}runtime:\n  stage_size: 1GiB\n",
+            "{}runtime:\n  stage_size: 1TiB\n",
             mounts(&[mount("~/code/other", "/workspace/o", "staged")])
         ));
         let e = x.launch(&v, "no-room").await.unwrap_err();
@@ -203,7 +213,7 @@ fn rt_ag_09_rename_churn_does_not_evade_stage_size() {
 /// own growth keeps waking the other session's stage task, whose walks run alongside.
 #[test]
 fn rt_ag_09_a_busy_walk_does_not_delay_another_sessions_floor() {
-    let _serial = serial();
+    let _serial = floor_serial();
     rt().block_on(async {
         let x = floor_below_free(768 * MIB);
         let tree = x.f.load(&format!(

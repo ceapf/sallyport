@@ -50,6 +50,7 @@ test-scripts:
 	bash tests/scripts/mutants_gate_test.sh
 	bash tests/scripts/coverage_gate_test.sh
 	bash tests/scripts/test_run_test.sh
+	bash tests/scripts/disk_lock_test.sh
 	bash tests/scripts/disk_check_test.sh
 
 # CI runner (AMENDMENTS-01 §15). nextest skips doctests, so they run separately.
@@ -78,12 +79,16 @@ MUTANTS_FILES := crates/sally-core/src/manifest/validate/*.rs crates/sally-core/
                  crates/sally-core/src/manifest/host.rs crates/sally-core/src/config.rs
 # cargo-mutants copies the tree to $$TMPDIR; /tmp is denylisted for mounts, so the copy (and the
 # test fixtures under its target dir) must live elsewhere. Move the fixtures, not the wall.
+# Every mutation run holds the per-user `disk-free` lock shared (scripts/disk-lock.sh, architect
+# ruling D1): its copies and builds move the free space the disk-floor tests measure, so those
+# tests wait for it, in either lane. Never add --test=disk to a mutants test list.
 MUTANTS_TMP := $(CURDIR)/target/mutants-tmp
+DISK_LOCK := bash scripts/disk-lock.sh
 # The gate fails on missed mutants only; a timed-out mutant hangs a test, so it counts as
 # detected and goes to the job summary (maintainer ruling, #36; scripts/mutants-gate.sh).
 mutants:
 	mkdir -p $(MUTANTS_TMP)
-	TMPDIR=$(MUTANTS_TMP) cargo mutants --package sally-core --no-shuffle $(foreach f,$(MUTANTS_FILES),--file '$(f)'); \
+	TMPDIR=$(MUTANTS_TMP) $(DISK_LOCK) cargo mutants --package sally-core --no-shuffle $(foreach f,$(MUTANTS_FILES),--file '$(f)'); \
 	  bash scripts/mutants-gate.sh $$? mutants.out
 
 # The wider scope (CLAUDE.md "Mutation scope"): every other file whose security decisions can be
@@ -114,7 +119,7 @@ MUTANTS_WIDE_TESTS_SHIM := --lib --test=relay
 MUTANTS_SHARD ?=
 MUTANTS_OUT ?=
 # $(1) package, $(2) files, $(3) cargo test args
-mutants_wide = mkdir -p $(MUTANTS_TMP) && TMPDIR=$(MUTANTS_TMP) cargo mutants --package $(1) \
+mutants_wide = mkdir -p $(MUTANTS_TMP) && TMPDIR=$(MUTANTS_TMP) $(DISK_LOCK) cargo mutants --package $(1) \
   --no-shuffle $(if $(MUTANTS_SHARD),--shard $(MUTANTS_SHARD) --sharding round-robin) \
   $(if $(MUTANTS_OUT),--output $(MUTANTS_OUT)) $(foreach f,$(2),--file '$(f)') \
   $(foreach a,$(3),--cargo-test-arg=$(a)); \
