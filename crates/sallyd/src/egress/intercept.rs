@@ -187,6 +187,25 @@ struct State {
 }
 
 impl State {
+    fn new(auth: Authority, used: SocketAddr, grants: Vec<String>, act: Arc<Activity>) -> Self {
+        Self {
+            auth,
+            used,
+            grants,
+            raw: Counts::default(),
+            plain: Counts::default(),
+            act,
+            busy: AtomicBool::new(false),
+            mark: AtomicU64::new(0),
+            request_over: AtomicBool::new(false),
+            request_broken: AtomicBool::new(false),
+            requests: AtomicU64::new(0),
+            statuses: Default::default(),
+            end: Mutex::new(None),
+            closed: AtomicBool::new(false),
+        }
+    }
+
     fn begin(&self) {
         self.act.touch();
         self.busy.store(true, Ordering::Relaxed);
@@ -377,54 +396,13 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
             Counts::default(),
             Some(Arc::clone(&act)),
         );
-        let handshake = async {
-            let name = ServerName::try_from(c.auth.host.clone()).ok()?;
-            TlsConnector::from(client_cfg)
-                .connect(name, upstream)
-                .await
-                .ok()
-        };
-        let tls = tokio::select! {
-            biased;
-            () = self.stopped() => Err(End::SessionStopped),
-            t = tokio::time::timeout(self.limits.connect, handshake) => {
-                t.ok().flatten().ok_or(End::UpstreamTlsFailed)
-            }
-        };
-        let tls = match tls {
+        let tls = match self.upstream_tls(&c.auth.host, client_cfg, upstream).await {
             Ok(tls) => tls,
-            Err(end) => {
-                let none = Totals {
-                    up: 0,
-                    down: 0,
-                    end,
-                };
-                let closed = self
-                    .close_with(&c.auth, Some(used), none, Some(Summary::default()))
-                    .await;
-                if closed && end == End::UpstreamTlsFailed {
-                    write_reply(&mut client, Reason::UpstreamTlsFailed).await;
-                }
-                return;
-            }
+            Err(end) => return self.never_opened(client, &c.auth, used, end).await,
         };
         let opened = tokio::time::timeout(REPLY_TIMEOUT, client.write_all(ESTABLISHED)).await;
-        let st = Arc::new(State {
-            grants: self.policy.grant_headers(&c.auth.host),
-            auth: c.auth,
-            used,
-            raw: Counts::default(),
-            plain: Counts::default(),
-            act: Arc::clone(&act),
-            busy: AtomicBool::new(false),
-            mark: AtomicU64::new(0),
-            request_over: AtomicBool::new(false),
-            request_broken: AtomicBool::new(false),
-            requests: AtomicU64::new(0),
-            statuses: Default::default(),
-            end: Mutex::new(None),
-            closed: AtomicBool::new(false),
-        });
+        let grants = self.policy.grant_headers(&c.auth.host);
+        let st = Arc::new(State::new(c.auth, used, grants, Arc::clone(&act)));
         let end = if matches!(opened, Ok(Ok(()))) {
             let raw = Meter::new(client, c.rest, st.raw.clone(), Some(act));
             tokio::select! {
@@ -443,7 +421,55 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         }
     }
 
+    /// A tunnel that ended before its `200`: `egress.close` first, then (for
+    /// `upstream-tls-failed` only) the 502 (Q28).
+    async fn never_opened<C>(&self, mut client: C, auth: &Authority, used: SocketAddr, end: End)
+    where
+        C: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        let none = Totals {
+            up: 0,
+            down: 0,
+            end,
+        };
+        let closed = self
+            .close_with(auth, Some(used), none, Some(Summary::default()))
+            .await;
+        if closed && end == End::UpstreamTlsFailed {
+            write_reply(&mut client, Reason::UpstreamTlsFailed).await;
+        }
+    }
+
+    /// The upstream TLS handshake within `limits.connect` (real verification, SNI = `host`,
+    /// architect Q28), raced against the session stop.
+    async fn upstream_tls<U>(
+        &self,
+        host: &str,
+        cfg: Arc<ClientConfig>,
+        upstream: U,
+    ) -> Result<tokio_rustls::client::TlsStream<U>, End>
+    where
+        U: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        let handshake = async {
+            let name = ServerName::try_from(host.to_owned()).ok()?;
+            TlsConnector::from(cfg).connect(name, upstream).await.ok()
+        };
+        tokio::select! {
+            biased;
+            () = self.stopped() => Err(End::SessionStopped),
+            t = tokio::time::timeout(self.limits.connect, handshake) => {
+                t.ok().flatten().ok_or(End::UpstreamTlsFailed)
+            }
+        }
+    }
+
     /// The client's TLS handshake, then hyper on both sides until the tunnel ends.
+    ///
+    /// When the upstream connection ends (architect ruling R1), hyper's server finishes the
+    /// response in flight, if any, then closes: the client learns from that close, not from a
+    /// `Connection: close` header, and the end is `st.end()` or `closed`, never served()'s refusal
+    /// mapping. A request already read gets the upstream-closed 502 in `forward`, unforwarded.
     async fn exchanges<C, U>(
         &self,
         raw: Meter<C>,
@@ -455,19 +481,14 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         C: AsyncRead + AsyncWrite + Unpin + Send,
         U: AsyncRead + AsyncWrite + Unpin + Send,
     {
-        let accept = TlsAcceptor::from(server).accept(raw);
-        let Ok(Ok(tls)) = tokio::time::timeout(self.limits.head, accept).await else {
+        let accept = tokio::time::timeout(self.limits.head, TlsAcceptor::from(server).accept(raw));
+        let Ok(Ok(tls)) = accept.await else {
             return End::ClientTlsFailed;
         };
         let plain = Meter::new(tls, Vec::new(), st.plain.clone(), None).max_read(REQUEST_READ);
         let upstream =
             Meter::new(upstream, Vec::new(), Counts::default(), None).max_read(RESPONSE_READ);
-        let mut client_side = hyper::client::conn::http1::Builder::new();
-        client_side
-            .max_buf_size(MAX_RESPONSE_HEAD)
-            .max_header_size(MAX_RESPONSE_HEAD - RESPONSE_READ)
-            .max_headers(MAX_HEADERS);
-        let Ok((sender, conn)) = client_side.handshake(TokioIo::new(upstream)).await else {
+        let Ok((sender, conn)) = upstream_builder().handshake(TokioIo::new(upstream)).await else {
             return End::Error;
         };
         // Driven here, not spawned: the upstream connection and its TLS stream are dropped with
@@ -475,36 +496,19 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         tokio::pin!(conn);
         let sender = tokio::sync::Mutex::new(sender);
         let svc = service_fn(|req| self.exchange(req, st, &sender));
-        let mut server_side = hyper::server::conn::http1::Builder::new();
-        // Half-close as in a spliced tunnel: a client that shuts its sending side after the
-        // request still gets the response.
-        server_side
-            .half_close(true)
-            .timer(TokioTimer::new())
-            .header_read_timeout(self.limits.head)
-            .max_buf_size(MAX_HEAD)
-            .max_header_size(MAX_HEAD - REQUEST_READ)
-            .max_headers(MAX_HEADERS);
-        let served = server_side.serve_connection(TokioIo::new(plain), svc);
+        let served = client_builder(self.limits.head).serve_connection(TokioIo::new(plain), svc);
         tokio::pin!(served);
         let idle = idle_out(&st.act, self.limits.idle, st);
         tokio::pin!(idle);
         let mut upstream_open = true;
         loop {
             tokio::select! {
-                r = &mut served => {
-                    if upstream_open {
-                        return self.served(r, st).await;
-                    }
-                    // hyper's server ended because the upstream did: no refusal mapping.
-                    return st.end().unwrap_or(End::Closed);
-                }
+                r = &mut served => return match upstream_open {
+                    true => self.served(r, st).await,
+                    false => st.end().unwrap_or(End::Closed),
+                },
                 _ = &mut conn, if upstream_open => {
                     upstream_open = false;
-                    // The upstream connection is gone (architect ruling R1): hyper's server
-                    // finishes the response in flight, if any, then closes. The client learns
-                    // from that close, not from a `Connection: close` header. A request already
-                    // read gets the upstream-closed 502 in `exchange`, never forwarded.
                     served.as_mut().graceful_shutdown();
                 }
                 () = &mut idle => return End::IdleTimeout,
@@ -552,7 +556,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         &self,
         req: Request<Incoming>,
         st: &Arc<State>,
-        sender: &tokio::sync::Mutex<hyper::client::conn::http1::SendRequest<Capped<Incoming>>>,
+        sender: &Sender,
     ) -> Result<Response<Out>, BoxError> {
         st.begin();
         let (parts, body) = req.into_parts();
@@ -573,44 +577,79 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
                 .refuse_inside(st, Reason::RequestTooLarge, &target, None)
                 .await;
         }
-        // Held from `ready()` to `send_request`: a request is audited and counted only once the
-        // upstream connection is known to take it (architect ruling R1).
+        self.forward(st, sender, parts, body, head.headers, &target)
+            .await
+    }
+
+    /// Forwards a checked request. The sender lock is held from `ready()` to `send_request`: a
+    /// request is audited and counted only once the upstream connection is known to take it
+    /// (architect ruling R1).
+    async fn forward(
+        &self,
+        st: &Arc<State>,
+        sender: &Sender,
+        parts: hyper::http::request::Parts,
+        body: Incoming,
+        headers: hyper::http::HeaderMap,
+        target: &str,
+    ) -> Result<Response<Out>, BoxError> {
         let mut sender = sender.lock().await;
-        if sender.ready().await.is_err() {
-            return self.upstream_closed(st).await;
+        if let Some(reply) = self.upstream_ready(st, &mut sender).await {
+            return reply;
         }
         let audited = self
             .entry("egress.request", Some("allow"))
-            .args(request_args(&st.auth, &parts.method, &target));
+            .args(request_args(&st.auth, &parts.method, target));
         if !self.append(audited).await {
             st.set_end(End::Error);
             return Err("audit append failed".into());
         }
         st.requests.fetch_add(1, Ordering::Relaxed);
+        let capped = Capped::new(body, self.limits.max_request, self.request_end(st, target));
+        let up = upstream_request(capped, parts, headers)?;
+        let sent = sender.send_request(up).await;
+        drop(sender);
+        self.outcome(st, sent, target).await
+    }
+
+    /// Waits until the upstream connection takes a request. If it is gone, the request is
+    /// neither audited nor counted: the upstream-closed reply (close entry first) comes back
+    /// instead of `None`.
+    async fn upstream_ready(
+        &self,
+        st: &State,
+        sender: &mut hyper::client::conn::http1::SendRequest<Capped<Incoming>>,
+    ) -> Option<Result<Response<Out>, BoxError>> {
+        match sender.ready().await {
+            Ok(()) => None,
+            Err(_) => Some(self.upstream_closed(st).await),
+        }
+    }
+
+    /// The request body's end handler, holding its `egress.limit` entry (architect ruling R2).
+    fn request_end(&self, st: &Arc<State>, target: &str) -> Arc<RequestEnd> {
         let over = self.entry("egress.limit", Some("deny")).args(inside_args(
             &st.auth,
             Reason::RequestTooLarge,
-            &target,
+            target,
             None,
         ));
-        let on_end = RequestEnd {
+        Arc::new(RequestEnd {
             state: Arc::clone(st),
             limit: Mutex::new(Some((over, Arc::clone(&self.audit)))),
             level: self.level,
-        };
-        let capped = Capped::new(body, self.limits.max_request, Arc::new(on_end));
-        let mut up = Request::new(capped);
-        *up.method_mut() = parts.method;
-        *up.uri_mut() = parts
-            .uri
-            .path_and_query()
-            .map_or_else(|| "/".parse(), |p| p.as_str().parse())?;
-        *up.version_mut() = Version::HTTP_11;
-        *up.headers_mut() = head.headers;
-        let sent = sender.send_request(up).await;
-        drop(sender);
+        })
+    }
+
+    /// What the client gets once the upstream answered or the exchange failed.
+    async fn outcome(
+        &self,
+        st: &Arc<State>,
+        sent: Result<Response<Incoming>, hyper::Error>,
+        target: &str,
+    ) -> Result<Response<Out>, BoxError> {
         match sent {
-            Ok(resp) => self.respond(st, resp, &target).await,
+            Ok(resp) => self.respond(st, resp, target).await,
             // Already audited and marked `limit` by RequestEnd, before hyper saw the cut.
             Err(_) if st.request_over.load(Ordering::Relaxed) => {
                 Ok(reply_response(Reason::RequestTooLarge))
@@ -618,11 +657,11 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
             // The client broke off its body: the tunnel ends `closed`, nothing to answer.
             Err(e) if st.request_broken.load(Ordering::Relaxed) => Err(e.into()),
             Err(e) if e.is_parse_too_large() => {
-                self.refuse_inside(st, Reason::ResponseTooLarge, &target, Some("head"))
+                self.refuse_inside(st, Reason::ResponseTooLarge, target, Some("head"))
                     .await
             }
             Err(e) if e.is_parse() => {
-                self.refuse_inside(st, Reason::UpstreamMalformed, &target, None)
+                self.refuse_inside(st, Reason::UpstreamMalformed, target, None)
                     .await
             }
             Err(_) => self.upstream_closed(st).await,
@@ -738,6 +777,51 @@ fn idle_wake(now: Instant, last: Instant, idle: Duration, busy: bool) -> Option<
     } else {
         Some(now + idle)
     }
+}
+
+/// The upstream side of an intercepted tunnel, one request at a time.
+type Sender = tokio::sync::Mutex<hyper::client::conn::http1::SendRequest<Capped<Incoming>>>;
+
+/// The request sent upstream: the client's method, its origin-form target, HTTP/1.1, and the
+/// rewritten headers.
+fn upstream_request(
+    body: Capped<Incoming>,
+    parts: hyper::http::request::Parts,
+    headers: hyper::http::HeaderMap,
+) -> Result<Request<Capped<Incoming>>, BoxError> {
+    let mut up = Request::new(body);
+    *up.method_mut() = parts.method;
+    *up.uri_mut() = parts
+        .uri
+        .path_and_query()
+        .map_or_else(|| "/".parse(), |p| p.as_str().parse())?;
+    *up.version_mut() = Version::HTTP_11;
+    *up.headers_mut() = headers;
+    Ok(up)
+}
+
+/// hyper's client toward the upstream: response heads up to `MAX_RESPONSE_HEAD - RESPONSE_READ`
+/// bytes (exact) and `MAX_HEADERS` lines.
+fn upstream_builder() -> hyper::client::conn::http1::Builder {
+    let mut b = hyper::client::conn::http1::Builder::new();
+    b.max_buf_size(MAX_RESPONSE_HEAD)
+        .max_header_size(MAX_RESPONSE_HEAD - RESPONSE_READ)
+        .max_headers(MAX_HEADERS);
+    b
+}
+
+/// hyper's server toward the client: request heads up to `MAX_HEAD - REQUEST_READ` bytes (exact)
+/// and `MAX_HEADERS` lines, each awaited for at most `head`. Half-close as in a spliced tunnel: a
+/// client that shuts its sending side after the request still gets the response.
+fn client_builder(head: Duration) -> hyper::server::conn::http1::Builder {
+    let mut b = hyper::server::conn::http1::Builder::new();
+    b.half_close(true)
+        .timer(TokioTimer::new())
+        .header_read_timeout(head)
+        .max_buf_size(MAX_HEAD)
+        .max_header_size(MAX_HEAD - REQUEST_READ)
+        .max_headers(MAX_HEADERS);
+    b
 }
 
 /// The reply to a refusal inside the tunnel: as Task 8's [`super::reply`], closing the tunnel.
