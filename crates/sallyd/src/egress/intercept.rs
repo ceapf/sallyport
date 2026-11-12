@@ -23,6 +23,7 @@ use hyper::http::{HeaderValue, Method, Request, Response, StatusCode, Version, h
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+use rustls::sign::{CertifiedKey, SingleCertAndKey};
 use rustls::{ClientConfig, ServerConfig};
 use sally_core::audit::NewEntry;
 use serde_json::{Value, json};
@@ -31,7 +32,7 @@ use tokio::time::Instant;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use super::super::authority::{Authority, escape_target};
-use super::super::ca::{CaError, SessionTls};
+use super::super::ca::{CaError, Leaf, SessionTls};
 use super::super::head::MAX_HEAD;
 use super::super::meter::{BodyEnd, BoxError, Capped, Counts, Meter, OnEnd};
 use super::super::policy::Reason;
@@ -85,13 +86,11 @@ impl Interception {
         upstream.alpn_protocols = vec![HTTP_1_1.to_vec()];
         let mut servers = Vec::with_capacity(tls.leaves.len());
         for leaf in &tls.leaves {
-            let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf.key.expose().clone()));
             let mut cfg = ServerConfig::builder_with_provider(Arc::clone(&provider))
                 .with_safe_default_protocol_versions()
                 .map_err(tls_error)?
                 .with_no_client_auth()
-                .with_single_cert(vec![leaf.cert.clone()], key)
-                .map_err(tls_error)?;
+                .with_cert_resolver(Arc::new(SingleCertAndKey::from(certified(leaf)?)));
             cfg.alpn_protocols = vec![HTTP_1_1.to_vec()];
             servers.push((leaf.host.clone(), Arc::new(cfg)));
         }
@@ -111,6 +110,18 @@ impl Interception {
             .find(|(h, _)| h == host)
             .map(|(_, c)| Arc::clone(c))
     }
+}
+
+/// The leaf and its signing key, read from the leaf's DER key in place (architect ruling R7):
+/// the proxy makes no copy of the key bytes of its own; the only plain copy outside ring is the
+/// leaf's `Secret`, wiped when the session ends. ring's parsed key and rustls's objects built
+/// from it are freed, not wiped (THREAT_MODEL, Session CA limits (3); TODO(#69)).
+fn certified(leaf: &Leaf) -> Result<CertifiedKey, CaError> {
+    let der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf.key.expose().as_slice()));
+    let key = rustls::crypto::ring::sign::any_supported_type(&der).map_err(tls_error)?;
+    let ck = CertifiedKey::new(vec![leaf.cert.clone()], key);
+    ck.keys_match().map_err(tls_error)?;
+    Ok(ck)
 }
 
 fn tls_error(e: rustls::Error) -> CaError {

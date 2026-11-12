@@ -1412,6 +1412,28 @@ async fn an_intercepted_tunnel_on_another_allowed_port_names_it_in_host() {
     );
 }
 
+/// Architect ruling R7: each leaf's signer is built from its key in place, and a key that does
+/// not belong to its certificate is refused (as `with_single_cert` refused it before).
+#[test]
+fn a_leaf_whose_key_is_not_its_certificates_is_refused() {
+    let v = Validity::for_session(std::time::SystemTime::now(), Duration::from_secs(600)).unwrap();
+    let hosts = [HOST.to_owned(), "b.mock.test".to_owned()];
+    let roots = || crate::egress::roots::Roots {
+        store: Arc::new(RootCertStore::empty()),
+        pem: String::new(),
+        skipped: 0,
+        path: "/test-roots.pem".into(),
+    };
+    assert!(Interception::new(SessionTls::mint(&hosts, v).unwrap(), roots()).is_ok());
+    let mut swapped = SessionTls::mint(&hosts, v).unwrap();
+    let (a, b) = swapped.leaves.split_at_mut(1);
+    std::mem::swap(&mut a[0].key, &mut b[0].key);
+    assert!(matches!(
+        Interception::new(swapped, roots()),
+        Err(CaError::Generate(_))
+    ));
+}
+
 #[test]
 fn summaries_list_non_zero_status_classes_only() {
     let s = Summary {
