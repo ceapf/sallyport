@@ -67,6 +67,9 @@ pub enum LaunchError {
     /// A background task failed.
     #[error("internal: {0}")]
     Internal(String),
+    /// The session's egress listener (`net.sock`) could not be started.
+    #[error("network: net.sock: {0}")]
+    Egress(#[source] std::io::Error),
 }
 
 impl LaunchError {
@@ -87,6 +90,7 @@ impl LaunchError {
             Self::Command { .. } => "podman",
             Self::Audit(_) | Self::Unaudited { .. } => "audit",
             Self::Internal(_) => "internal",
+            Self::Egress(_) => "egress-listener",
         }
     }
 }

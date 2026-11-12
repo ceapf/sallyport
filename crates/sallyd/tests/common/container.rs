@@ -79,15 +79,15 @@ pub fn io_lock(exclusive: bool) -> std::fs::File {
 /// the build runs under a lock: a process finding the tag reuses it. So a tag never moves to
 /// another image, and an earlier process's `name@digest` always resolves (CI saw "image not
 /// known" when parallel builds re-tagged one name).
-fn build(name: &str, entry: &str) -> String {
+fn build(name: &str, entry: &str, shim: Option<&[u8]>) -> String {
     use std::hash::{Hash, Hasher};
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/redteam/probe/probe.c");
     let mut h = std::hash::DefaultHasher::new();
-    (BASE, entry, STAND_IN, std::fs::read(&src).unwrap()).hash(&mut h);
+    (BASE, entry, STAND_IN, std::fs::read(&src).unwrap(), shim).hash(&mut h);
     let tag = format!("localhost/{name}:{:016x}", h.finish());
     let _held = lock("test-image", true);
     if !podman(&["image", "exists", &tag]).status.success() {
-        build_image(&tag, entry);
+        build_image(&tag, entry, shim);
     }
     let out = podman(&["image", "inspect", "--format", "{{.Digest}}", &tag]);
     assert!(
@@ -104,19 +104,20 @@ fn build(name: &str, entry: &str) -> String {
 /// The `llama-server` stand-in: it idles.
 const STAND_IN: &str = "#!/bin/sh\nexec sleep 2147483647\n";
 
-fn build_image(tag: &str, entry: &str) {
+fn build_image(tag: &str, entry: &str, shim: Option<&[u8]>) {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("test-image-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("Containerfile"),
-        format!(
-            "FROM {BASE}\nCOPY entry /opt/sallyport/entry\nCOPY llama-server \
-             /usr/local/bin/llama-server\nCOPY probe {PROBE}\n"
-        ),
-    )
-    .unwrap();
+    let mut file = format!(
+        "FROM {BASE}\nCOPY entry /opt/sallyport/entry\nCOPY llama-server \
+         /usr/local/bin/llama-server\nCOPY probe {PROBE}\n"
+    );
+    if let Some(bytes) = shim {
+        executable(&dir.join("sally-shim"), bytes);
+        file.push_str(&format!("COPY sally-shim {SHIM}\n"));
+    }
+    std::fs::write(dir.join("Containerfile"), file).unwrap();
     executable(&dir.join("entry"), entry.as_bytes());
     executable(&dir.join("llama-server"), STAND_IN.as_bytes());
     probe_binary(&dir.join("probe"));
@@ -143,7 +144,64 @@ fn build_image(tag: &str, entry: &str) {
 /// idle, and the probe.
 pub fn test_image() -> ImageRef {
     static IMAGE: OnceLock<String> = OnceLock::new();
-    let r = IMAGE.get_or_init(|| build("sallyport-test", "#!/bin/sh\nexec sleep 2147483647\n"));
+    let r =
+        IMAGE.get_or_init(|| build("sallyport-test", "#!/bin/sh\nexec sleep 2147483647\n", None));
+    ImageRef::parse(r).unwrap()
+}
+
+/// Where the net image keeps the shim.
+pub const SHIM: &str = "/usr/local/bin/sally-shim";
+/// Where the net image's entry sends the shim's stderr (its readiness line).
+pub const SHIM_LOG: &str = "/tmp/shim.log";
+
+/// The static shim, built as `make shim` builds the shipped one. A missing musl target or a
+/// failed build fails the test (architect Q15).
+fn shim_binary() -> Vec<u8> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let target = "x86_64-unknown-linux-musl";
+    // Its own target directory: `cargo test` holds the workspace one's lock while tests run.
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("shim-build");
+    let status = Command::new(cargo)
+        .current_dir(&root)
+        .args([
+            "build",
+            "-q",
+            "--locked",
+            "--release",
+            "-p",
+            "sally-shim",
+            "--target",
+            target,
+        ])
+        .arg("--target-dir")
+        .arg(&dir)
+        // A plain release build even under coverage or a wrapper (Rust review L11).
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("CARGO_BUILD_RUSTFLAGS")
+        .env_remove("CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS")
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .status()
+        .expect("cargo must run");
+    assert!(status.success(), "building the musl sally-shim failed");
+    std::fs::read(dir.join(format!("{target}/release/sally-shim"))).unwrap()
+}
+
+/// `localhost/sallyport-test-net@sha256:…`: [`test_image`] plus the static shim, whose entry
+/// starts it with the normative argv (`--listen 127.0.0.1:3128=/run/sallyport/net.sock`, its
+/// stderr in [`SHIM_LOG`]) and then idles.
+pub fn net_image() -> ImageRef {
+    static IMAGE: OnceLock<String> = OnceLock::new();
+    let r = IMAGE.get_or_init(|| {
+        let entry = format!(
+            "#!/bin/sh\n{SHIM} --listen 127.0.0.1:3128=/run/sallyport/net.sock 2>{SHIM_LOG} &\n\
+             exec sleep 2147483647\n"
+        );
+        let shim = shim_binary();
+        build("sallyport-test-net", &entry, Some(&shim))
+    });
     ImageRef::parse(r).unwrap()
 }
 
@@ -152,7 +210,7 @@ pub fn test_image() -> ImageRef {
 /// grace period (6c-1 Rust review M4).
 pub fn exiting_image() -> ImageRef {
     static IMAGE: OnceLock<String> = OnceLock::new();
-    let r = IMAGE.get_or_init(|| build("sallyport-test-exit", "#!/nonexistent/sh\nexit 3\n"));
+    let r = IMAGE.get_or_init(|| build("sallyport-test-exit", "#!/nonexistent/sh\nexit 3\n", None));
     ImageRef::parse(r).unwrap()
 }
 
@@ -178,6 +236,11 @@ impl Events {
             .collect()
     }
 
+    /// Every entry's event name and arguments, oldest first.
+    pub fn all(&self) -> Vec<(String, serde_json::Value)> {
+        self.0.lock().unwrap().clone()
+    }
+
     /// The arguments of the last entry named `event`.
     pub fn args(&self, event: &str) -> Option<serde_json::Value> {
         self.0
@@ -197,6 +260,8 @@ pub struct Lx {
     pub runtime: CheckedRuntime,
     pub events: Arc<Events>,
     pub xdg: PathBuf,
+    /// The fake network side of every session's egress listener.
+    pub egress: Arc<super::egress::FakeEgress>,
     /// Prefix of every session id this fixture makes: `t<pid>-<n>`.
     pub scope: String,
     /// The shared I/O lock ([`io_lock`]); released after `Drop` has removed the containers.
@@ -285,6 +350,7 @@ impl Lx {
             .unwrap_or_else(|| resolve_podman(None, std::env::var_os("PATH").as_deref()).unwrap());
         let podman = Podman::setup(bin, &runtime, &state, &host).unwrap();
         let events = Arc::new(Events::default());
+        let egress = super::egress::fake_egress();
         let launcher = Launcher::new(LauncherParts {
             podman: podman.clone(),
             runtime: runtime.clone(),
@@ -294,6 +360,7 @@ impl Lx {
             audit: events.clone(),
             limits: ScanLimits::default(),
             disk_floor: floor,
+            egress: egress.clone(),
         });
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -304,6 +371,7 @@ impl Lx {
             runtime,
             events,
             xdg,
+            egress,
             scope: format!("t{}-{n}", std::process::id()),
             _io: io,
         }

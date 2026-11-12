@@ -161,7 +161,8 @@ G2 Access ~/.ssh/id_ed25519 from Z3
 ```
 G3 Send /workspace/secret.txt to attacker
 ├─ Direct TCP/UDP                                   [no interfaces → RT-NET-01]
-├─ DNS tunnelling                                   [no resolver, no interface; proxy resolves by name only → RT-NET-02]
+├─ DNS tunnelling                                   [no resolver, no interface; proxy resolves allowed names only → RT-NET-02]
+│                                                   [RESIDUAL: labels under a wildcard rule reach that domain's DNS; §6]
 ├─ ICMP / raw sockets                               [no interface, no CAP_NET_RAW → RT-NET-08]
 ├─ Via proxy to attacker.example                    [allowlist → RT-NET-03]
 ├─ Via proxy to allowlisted host, other port        [port allowlist → RT-NET-04]
@@ -254,6 +255,8 @@ G7 Make the machine unusable
 | Kernel exploit from Z2/Z3 escapes the container (WSL2 kernel 6.18; shared kernel) | No GPU-capable stronger isolation exists on WSL2 (`/dev/dxg` is unsupported by gVisor nvproxy; microVM GPU passthrough unavailable) | v2: gVisor for Z3 (systrap on WSL2, KVM on native Linux); native-Linux users get nvproxy for Z2 |
 | OCI runtime (crun) breakout, e.g. the `/proc`-write class | The runtime is in the TCB; a breakout lands as the user's UID, which owns the secrets store. Rootless mode probably blunts the known `/proc`-write breakouts, **but that is not a control**. Mitigations: Sallyport never uses the distro `crun` (release build, never security-patched); it passes `--runtime` to a pinned upstream crun ≥ 1.25.1 (`/proc` hardening), checksum- and signature-verified at install, and doctor V14 warns otherwise (AMENDMENTS-02 B5) | gVisor for the workspace and harness roles (M6 spike) |
 | Covert exfiltration through an allowlisted host | Any allowed destination can carry data | v2: egress DLP heuristics; per-session byte budgets (v1 logs counts) |
+| DNS-lookup exfiltration through a wildcard rule: with `*.example.com` (or `*`) allowed, a sandbox can encode data in the labels of `CONNECT <data>.example.com:443`; the host resolves the name, so the data reaches that domain's nameservers even when the connect fails | A wildcard grants every name under it by design; the lookup happens only after the policy allowed the name, and every attempt is audited (`egress.allow`/`egress.deny` with the name) | Prefer exact hosts; v2 per-session lookup budgets and label-entropy heuristics |
+| No LAN and no plain-HTTP access in v1: the address filter refuses every address that is not global unicast (IPv4 private, CGNAT, link-local, loopback, multicast, reserved; IPv6 outside `2000::/3`, and inside it `2001::/23` whole, `2001:db8::/32` and `3fff::/20`; mapped, NAT64 and 6to4 forms judged by their IPv4 address) and every address the host owns; the proxy accepts `CONNECT` only (anything else is 405) | A LAN service or a plain-HTTP mirror is the classic SSRF target; v1 gives up that use rather than carve exceptions. `2001::/23` holds both special-purpose and a few global blocks; it is denied whole on purpose | A per-manifest LAN allowance with its own acknowledgement (post-v1); plain HTTP only through the token proxy's interception (Task 9a) |
 | GPU driver attack surface exposed to a compromised `llama-server` via `/dev/dxg` | Inherent to GPU access | Native Linux + nvproxy; nothing on WSL2 |
 | Destructive-pattern matching is bypassable | It is a UX aid; the mount set is the boundary | Documented; `approve` is the recommended mode |
 | User approves a correctly rendered bad action | Human-in-the-loop is the design | Better risk tags, dry-run previews (v2) |

@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::args::ListenSpec;
+use crate::args::{ListenSpec, is_listen_ip};
 
 /// Copy buffer per direction, fixed at 16 KiB; changing it changes per-connection memory.
 /// Together with the kernel socket buffers this is all the data a connection can hold: a stalled
@@ -104,17 +104,17 @@ impl Drop for Slot {
     }
 }
 
-/// Binds the TCP listener for `spec`. Refuses anything but a loopback address, again (the
+/// Binds the TCP listener for `spec`. Refuses anything outside IPv4 loopback (127/8), again (the
 /// argument parser already does): inside the sandbox there is no network, but the shim must
 /// never be the thing that listens beyond localhost.
 ///
 /// # Errors
-/// `InvalidInput` for a non-loopback address; otherwise the bind error.
+/// `InvalidInput` for an address outside 127/8; otherwise the bind error.
 pub fn bind(spec: &ListenSpec) -> io::Result<TcpListener> {
-    if !spec.addr.ip().is_loopback() {
+    if !is_listen_ip(spec.addr.ip()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "listen address must be loopback",
+            "listen address must be IPv4 loopback (127/8)",
         ));
     }
     TcpListener::bind(spec.addr)

@@ -36,25 +36,31 @@ forbid-unsafe:
 test: test-scripts shim-check
 	$(CARGO) test -q --workspace
 
-# Shell-script tests (doctor's --redact filter, the commit trailer check, the mutation gate).
+# Shell-script tests (doctor's --redact filter, the commit trailer check, the mutation and
+# coverage gates).
 test-scripts:
 	bash tests/scripts/redact_test.sh
 	bash tests/scripts/check_trailers_test.sh
 	bash tests/scripts/mutants_gate_test.sh
+	bash tests/scripts/coverage_gate_test.sh
 
 # CI runner (AMENDMENTS-01 §15). nextest skips doctests, so they run separately.
 nextest:
 	$(CARGO) nextest run --workspace --no-fail-fast
 	$(CARGO) test -q --workspace --doc
 
-# Line-coverage gates (CLAUDE.md): sally-core >= 90%. sallyd policy/approvals/egress (>= 85%) join
-# when those modules exist.
+# Line-coverage gates (CLAUDE.md): sally-core >= 90%; sallyd egress >= 85% over the whole module
+# directory, lib tests only (architect ruling Q16, Task 8). Approvals join when they exist.
 COV_MIN_CORE ?= 90
+COV_MIN_EGRESS ?= 85
 coverage:
 	$(CARGO) llvm-cov -q -p sally-core --summary-only --fail-under-lines $(COV_MIN_CORE)
+	$(CARGO) llvm-cov -q -p sallyd --lib --json --summary-only --output-path target/cov-sallyd.json
+	bash scripts/coverage-gate.sh $(COV_MIN_EGRESS) target/cov-sallyd.json /crates/sallyd/src/egress/
 
 # Mutation testing over the deny paths, zero survivors (AMENDMENTS-01 §15): a surviving mutant in
-# a deny path is an untested control. egress::policy, approvals and tools::fs join as they land.
+# a deny path is an untested control. approvals and tools::fs join as they land; the egress modules
+# run in mutants-wide-sallyd below (architect ruling Q6, Task 8).
 MUTANTS_FILES := crates/sally-core/src/manifest/validate/*.rs crates/sally-core/src/manifest/paths.rs \
                  crates/sally-core/src/manifest/host.rs crates/sally-core/src/config.rs
 # cargo-mutants copies the tree to $$TMPDIR; /tmp is denylisted for mounts, so the copy (and the
@@ -70,7 +76,9 @@ mutants:
 # The wider scope (CLAUDE.md "Mutation scope"): every other file whose security decisions can be
 # tested without starting a container, zero survivors too. Per mutant only container-free tests
 # run: the crate's unit tests plus the integration binaries that start no container (sally-core's
-# all start none). Launch, teardown and the watchdog tasks stay with the rt_ tests.
+# all start none). Launch, teardown and the watchdog tasks stay with the rt_ tests. egress/net.rs is
+# in (architect Q22): its unit tests are hermetic (fakes, a loopback dialer, `localhost` from
+# /etc/hosts), so no mutant's run sends a packet off the machine.
 # MUTANTS_SHARD=k/n runs one round-robin shard; MUTANTS_OUT=<dir> moves mutants.out.
 MUTANTS_WIDE_CORE := $(addprefix crates/sally-core/src/,manifest/image.rs manifest/hostenv.rs \
                      manifest/parse.rs manifest/summary.rs manifest/units.rs secrets/store.rs \
@@ -78,7 +86,9 @@ MUTANTS_WIDE_CORE := $(addprefix crates/sally-core/src/,manifest/image.rs manife
                      audit/writer.rs audit/layout.rs fsutil.rs fd.rs)
 MUTANTS_WIDE_SALLYD := $(addprefix crates/sallyd/src/sandbox/,argv.rs check.rs types.rs profiles.rs \
                        overlap.rs scan.rs images.rs changes.rs dirs.rs podman.rs disk.rs stage.rs \
-                       launch/error.rs)
+                       launch/error.rs) \
+                       $(addprefix crates/sallyd/src/egress/,addr.rs authority.rs head.rs policy.rs server.rs \
+                       hostaddrs.rs tunnel.rs net.rs)
 MUTANTS_WIDE_SHIM := $(addprefix crates/sally-shim/src/,args.rs relay.rs)
 MUTANTS_WIDE_TESTS_CORE :=
 MUTANTS_WIDE_TESTS_SALLYD := --lib --test=argv --test=scan
@@ -103,7 +113,7 @@ zizmor:
 	zizmor --min-severity low .github/workflows
 
 # Fuzz smoke: 60 s per target (needs nightly + cargo-fuzz; CI pins both).
-FUZZ_TARGETS := manifest secrets audit_line
+FUZZ_TARGETS := manifest secrets audit_line egress_head
 FUZZ_SECS ?= 60
 CARGO_FUZZ_TOOLCHAIN ?= +nightly
 fuzz:

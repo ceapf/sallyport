@@ -5,7 +5,10 @@
 //! 2. re-check hermetic podman and the runtime; scan every mount (sockets, `.git` shields,
 //!    pins);
 //! 3. create the 0700 session directories and write the seccomp profiles; build and check the
-//!    argv (`create`, never `run`);
+//!    argv (`create`, never `run`); with `network.mode: proxy`, bind the session's `net.sock`
+//!    (0600) in the workspace socket directory and start its egress listener (Task 8, architect
+//!    Q7; `none` binds nothing). The listener lives in [`Running`]: `stop` shuts it down after
+//!    the container is gone, and a failed launch drops it;
 //! 4. audit `sandbox.launch` (SI-4: before anything is visible);
 //! 5. `podman create`; re-check every pin on the host; `podman init` (the runtime builds the
 //!    mounts but runs nothing);
@@ -29,8 +32,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sally_core::audit::{Actor, AuditError, AuditWriter, NewEntry};
-use sally_core::manifest::{AuditLevel, MountMode, ValidatedManifest};
+use sally_core::manifest::{AuditLevel, MountMode, NetworkMode, ValidatedManifest};
 use serde_json::json;
+
+use crate::egress::net::{EgressHandle, EgressStarter, NET_SOCK, SessionEgress};
 
 use super::argv::workspace_argv;
 use super::commands::container_id;
@@ -122,6 +127,8 @@ pub struct Running {
     level: AuditLevel,
     /// The disk watchdog, if the sandbox can write to the host disk; stopped on drop.
     watchdog: Option<Watchdog>,
+    /// The egress listener (`network.mode: proxy`); aborted on drop.
+    egress: Option<EgressHandle>,
     exec_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -183,6 +190,9 @@ pub struct LauncherParts {
     pub limits: ScanLimits,
     /// The free-space floor (`DiskFloor::default()` unless configured).
     pub disk_floor: DiskFloor,
+    /// Starts each proxy-mode session's egress listener ([`crate::egress::net::SystemEgress`] in
+    /// production; tests pass fakes through the same field).
+    pub egress: Arc<dyn EgressStarter>,
 }
 
 /// Launches and tears down sandboxes for one `sallyd`. Shared as `Arc<Launcher>`.
@@ -195,6 +205,7 @@ pub struct Launcher {
     audit: Arc<dyn AuditSink>,
     limits: ScanLimits,
     pub(super) disk_floor: DiskFloor,
+    egress: Arc<dyn EgressStarter>,
     /// One stage walk at a time across all sessions, so a sandbox with a huge or deep tree
     /// cannot multiply `sallyd`'s open fds or blocking threads (6c-1 review M2/M3).
     pub(super) walks: Arc<tokio::sync::Semaphore>,
@@ -230,6 +241,7 @@ impl Launcher {
             audit: p.audit,
             limits: p.limits,
             disk_floor: p.disk_floor,
+            egress: p.egress,
             walks: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
@@ -355,6 +367,7 @@ impl Launcher {
         let image = req.image();
         self.image_present(image).await?;
         let argv = self.dirs_and_argv(req, runtime, &scan, progress).await?;
+        let egress = self.start_egress(req)?;
         let mounts: Vec<_> = req
             .manifest
             .mounts()
@@ -385,16 +398,41 @@ impl Launcher {
             .run("create", argv.into_iter().map(OsString::from))
             .await?;
         let container = container_id(&out)?;
-        self.checked_start(req, scan, &container).await?;
+        if let Err(e) = self.checked_start(req, scan, &container).await {
+            // The container may have run long enough to open a tunnel: stop the listener in
+            // order, so every `egress.allow` gets its `egress.close`.
+            if let Some(h) = egress {
+                h.shutdown().await;
+            }
+            return Err(e);
+        }
         let running = Running {
             container,
             name,
             paths: req.paths.clone(),
             level,
             watchdog: None,
+            egress,
             exec_gate: Arc::new(tokio::sync::Mutex::new(())),
         };
         Ok((running, plan))
+    }
+
+    /// Step 3a: the session's egress listener on `net.sock`, for `network.mode: proxy` only.
+    fn start_egress(&self, req: &WorkspaceRequest) -> Result<Option<EgressHandle>, LaunchError> {
+        if req.manifest.manifest().network.mode != NetworkMode::Proxy {
+            return Ok(None);
+        }
+        let sock = req.paths.workspace_sockets().join(NET_SOCK);
+        let s = SessionEgress::from_manifest(
+            &req.manifest,
+            req.paths.id().as_str(),
+            Arc::clone(&self.audit),
+        );
+        self.egress
+            .start(&sock, s)
+            .map(Some)
+            .map_err(LaunchError::Egress)
     }
 
     /// Step 2: hermetic podman and the runtime re-checked, then the launch scan, then the
@@ -568,5 +606,12 @@ mod tests {
             assert!(matches!(e, LaunchError::NotRunning(_)), "{bad:?}");
             assert_eq!(e.reason(), "not-running");
         }
+    }
+
+    #[test]
+    fn a_listener_failure_has_its_own_reason() {
+        let e = LaunchError::Egress(std::io::ErrorKind::AddrInUse.into());
+        assert_eq!(e.reason(), "egress-listener");
+        assert!(e.to_string().starts_with("network: net.sock: "), "{e}");
     }
 }

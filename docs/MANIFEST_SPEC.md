@@ -87,8 +87,10 @@ policy:                           # reserved for v2 signed org policies; parsed 
 - `runtime.cpus` is a number with at most three decimals; NaN/infinity are parse errors.
 - Sizes are `<n>B|KiB|MiB|GiB|TiB` (decimal `GB` is an error); durations are `<n>s|m|h`.
 
-`audit.level: actions` keeps every decision record: one per tool call, egress connection (allow
-*and* deny, with host:port and byte counts), approval, launch, and model import. `full` adds
+`audit.level: actions` keeps every decision record: one per tool call, egress connection
+(`egress.allow` with host:port and the pinned addresses, `egress.deny`/`egress.limit` with the
+reason, `egress.close` with the address used and the byte counts; ARCHITECTURE §7 "Egress audit
+events"), approval, launch, and model import. `full` adds
 per-request lines for intercepted HTTP (method + path, never bodies), `fs_read` events, and
 inference metadata.
 
@@ -211,7 +213,9 @@ tools: `fs_read`/`fs_list` on any mode, `fs_write`/`fs_delete` on `rw` and `brok
 - host: api.github.com            # exact hostname, or "*.example.com" (subdomains only), or "*"
   ports: [443]                    # default [443]; 80 enables plain http upstream
 ```
-Hosts are written canonically (lowercase ASCII/punycode, no trailing dot) or rejected. A
+Hosts are written canonically (lowercase ASCII/punycode, no trailing dot) or rejected. An exact
+host (here and in `secrets[].inject.host`) has at least two labels: `localhost` or `intranet`
+is rejected, since the proxy refuses such names and looks every name up absolute. A
 wildcard over a suffix where anyone can register hosts (`*.github.io`, `*.s3.amazonaws.com`,
 `*.workers.dev`, `*.r2.dev`, `*.ngrok-free.app`, … — one maintained constant,
 `host::SHARED_SUFFIXES`; TODO(v2) derive it from the Public Suffix List) counts as unrestricted and needs
@@ -350,9 +354,10 @@ validation — otherwise `mount-changed`/`is-symlink` (RT-FS-06).
 | git metadata (AMENDMENTS-02 B2(a)) | validator (no writable mount inside `.git`); `.git` directories in `rw` mounts as overlays over session scratch, `.git` files bound read-only (argv builder, Task 6a; launch scan, Task 6b); broker `fs_write`/`fs_delete` | validate + launch + each call | reject / EROFS / `protected-path` |
 | `filesystem.deny` | validator adds to denylist | validate | reject |
 | `network.mode` | `none` → no shim, no `net.sock`; `proxy` → shim started, `net.sock` mounted, proxy env set | launch | — |
-| `network.allow[]` | `sallyd::egress::policy` on every CONNECT/absolute-form request | each connection | HTTP 403, audit `egress.deny` |
+| `network.allow[]` | `sallyd::egress::policy` on every CONNECT request (v1 has no absolute-form forwarding: 405 `plain-http-unsupported`) | each connection | HTTP 403, audit `egress.deny` |
 | `network.acknowledge_unrestricted_egress` | validator | validate | reject if `*` without ack |
-| `network.max_*` | `sallyd::egress` byte/connection counters | each request | 413/429, audit |
+| `network.max_connections` | `sallyd::egress::server` admission, decided at accept before any byte is read | each connection | 429 `too-many-connections`, audit `egress.limit` |
+| `network.max_request_bytes`/`max_response_bytes` | `sallyd::egress::inject` body caps (Task 9a, #45: intercepted requests only; a CONNECT tunnel is opaque) | each intercepted request | 413, audit |
 | `secrets[].name` | validator checks store; `sallyd::egress::inject` | validate + each matching request | reject if missing |
 | `secrets[].inject.host` | validator (exact host, must be allowed) + inject | validate + request | reject |
 | `secrets[].inject.header/format/basic_user` | validator + inject (TLS-terminated grant hosts only) | validate + request | reject; plain HTTP to a grant host → 403 `inject-requires-tls` |

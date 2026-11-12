@@ -110,6 +110,12 @@ impl NewEntry {
         &self.args
     }
 
+    /// The decision as given (`allow`, `deny`, …), if any.
+    #[must_use]
+    pub fn decision_value(&self) -> Option<&str> {
+        self.decision.as_deref()
+    }
+
     /// Sets the session id.
     #[must_use]
     pub fn session(mut self, session: impl Into<String>) -> Self {
@@ -687,6 +693,13 @@ mod tests {
                 assert!(matches!(got, Err(AuditError::InvalidEntry(_))));
             }
         }
+    }
+
+    #[test]
+    fn the_decision_reads_back_as_given() {
+        let e = NewEntry::new(Actor::Sallyd, "egress.close");
+        assert_eq!(e.decision_value(), None);
+        assert_eq!(e.decision("deny").decision_value(), Some("deny"));
     }
 
     /// Documents the bound: the largest entry the field validators accept serializes to well

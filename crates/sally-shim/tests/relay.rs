@@ -319,9 +319,9 @@ fn a_stalled_server_applies_backpressure_instead_of_buffering() {
 }
 
 #[test]
-fn bind_refuses_a_non_loopback_address() {
+fn bind_refuses_anything_outside_ipv4_loopback() {
     let s = Scratch::new("nonloop");
-    for a in ["0.0.0.0:0", "10.0.0.1:0", "[::]:0"] {
+    for a in ["0.0.0.0:0", "10.0.0.1:0", "[::]:0", "[::1]:0"] {
         let spec = ListenSpec {
             addr: a.parse().unwrap(),
             socket: s.sock(),

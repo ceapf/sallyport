@@ -2,7 +2,7 @@
 //! never resolves names, so every address is an IP literal.
 
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 /// Most `--listen` options accepted.
@@ -50,6 +50,14 @@ impl fmt::Display for ArgError {
 
 impl std::error::Error for ArgError {}
 
+/// Whether the shim may listen on `ip`: IPv4 loopback (127/8) only. IPv6, including
+/// `::1` and IPv4-mapped forms, is refused: the sandbox clients use `127.0.0.1`, and one
+/// address family is one less to reason about.
+#[must_use]
+pub fn is_listen_ip(ip: IpAddr) -> bool {
+    matches!(ip, IpAddr::V4(v4) if v4.is_loopback())
+}
+
 fn err<T>(msg: &str) -> Result<T, ArgError> {
     Err(ArgError(msg.to_owned()))
 }
@@ -57,8 +65,9 @@ fn err<T>(msg: &str) -> Result<T, ArgError> {
 /// Parses the arguments after the program name.
 ///
 /// # Errors
-/// [`ArgError`] for an unknown option, a missing value, a non-loopback or port-0 address, a
-/// relative or over-long socket path, a duplicate listener, or mixing `--stdio` with `--listen`.
+/// [`ArgError`] for an unknown option, a missing value, an address outside 127/8 or with
+/// port 0, a relative or over-long socket path, a duplicate listener, or mixing `--stdio` with
+/// `--listen`.
 pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Mode, ArgError> {
     let mut args = args.into_iter();
     let mut listens: Vec<ListenSpec> = Vec::new();
@@ -122,11 +131,8 @@ fn parse_listen(spec: &str) -> Result<ListenSpec, ArgError> {
     let Ok(addr) = addr.parse::<SocketAddr>() else {
         return err("--listen address must be an IP literal with a port, e.g. 127.0.0.1:3128");
     };
-    if matches!(addr, SocketAddr::V6(a) if a.scope_id() != 0) {
-        return err("--listen address must not carry an IPv6 scope");
-    }
-    if !addr.ip().is_loopback() {
-        return err("--listen address must be a loopback address");
+    if !is_listen_ip(addr.ip()) {
+        return err("--listen address must be IPv4 loopback (127/8)");
     }
     if addr.port() == 0 {
         return err("--listen port must not be 0");
@@ -164,7 +170,7 @@ mod tests {
             "--listen",
             "127.0.0.1:3128=/run/sallyport/net.sock",
             "--listen",
-            "[::1]:8080=/run/l.sock",
+            "127.0.0.1:8080=/run/l.sock",
         ])
         .unwrap();
         let Mode::Listen {
@@ -185,18 +191,28 @@ mod tests {
     }
 
     #[test]
-    fn every_loopback_ip_is_allowed_and_nothing_else() {
+    fn only_ipv4_loopback_is_allowed() {
         // Addresses are assembled at runtime: the repository's guard hooks reject IPv4 literals
         // outside a small allowlist, and these exercise ranges that are not on it.
         let other_loopback = format!("{}.{}.{}.{}:1", 127, 5, 5, 5);
-        for ok in ["127.0.0.1:1", other_loopback.as_str(), "[::1]:1"] {
+        let top_loopback = format!("{}.{}.{}.{}:1", 127, 255, 255, 254);
+        for ok in [
+            "127.0.0.1:1",
+            other_loopback.as_str(),
+            top_loopback.as_str(),
+        ] {
             assert!(parse(&["--listen", &format!("{ok}=/a")]).is_ok(), "{ok}");
         }
         let private = format!("{}.{}.{}.{}:1", 192, 168, 1, 1);
+        let next_to_loopback = format!("{}.{}.{}.{}:1", 128, 0, 0, 1);
+        let mapped = format!("[::ffff:{}.{}.{}.{}]:1", 127, 0, 0, 1);
         for bad in [
             "0.0.0.0:1",
             "10.0.0.1:1",
             private.as_str(),
+            next_to_loopback.as_str(),
+            "[::1]:1",
+            mapped.as_str(),
             "[::]:1",
             "localhost:1",
             "example.test:1",

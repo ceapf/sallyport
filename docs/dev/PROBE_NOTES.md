@@ -47,6 +47,33 @@ line per fact, with where it was found. Check a note again before relying on it 
 - `yes` exits 1 silently on ENOSPC; prove the error with a following `dd`. (6c-2, AG-09)
 - A busybox copy named `sh` treats `sh id -u` as a script path: use `sh -c 'id -u'`. (6c-2a)
 - `awk 'BEGIN { s = "x"; while (1) s = s s }'` is a reliable memory bomb (no python in the image).
+- Alpine's busybox `nc` has no `-U`: reach a Unix socket with `sally-shim --stdio <sock>`. The
+  image has `nslookup` and `getent` but no `/etc/resolv.conf`, `curl` or `python3`. (Task 8)
+- BusyBox 1.36.1 `pgrep -x NAME` compares the full `argv[0]`: a process started as
+  `/usr/local/bin/sally-shim` is not found by `pgrep -x sally-shim` (and `pkill -x` kills
+  nothing, silently). `pgrep -f` matches the calling `sh -c` too. Match `/proc/<pid>/comm`
+  exactly. A process killed in the net image stays a zombie (the entry `exec`s `sleep`, which
+  never reaps), so skip `State: Z` when checking it is gone. Its port is free at once. (Task 8,
+  RT-NET-10)
+
+## Host network state (/proc)
+
+- `/proc/net/fib_trie` lists each IPv4 address as a `|-- <ip>` leaf followed by `/<len> <scope>
+  <type>` lines; an address the host owns has `/32 host LOCAL`. The leaf `127.0.0.0` (of
+  127.0.0.0/8) carries `/8 host LOCAL` (the loopback route), `127.0.0.1` its own `/32 host LOCAL`; broadcast leaves
+  are `/32 link BROADCAST`. The table appears twice (`Main:` and `Local:`). About 1.3 KiB on WSL2.
+- `/proc/net/if_inet6`: one line per IPv6 address, 32 hex digits then index, prefix length,
+  scope, flags and the interface name. Absent when IPv6 is disabled. (Task 8, `egress/hostaddrs.rs`)
+- A Unix socket path over 107 bytes fails `bind` with `InvalidInput` ("path must be shorter than
+  SUN_LEN"); the test fixture's `CARGO_TARGET_TMPDIR` paths exceed it. Binding through
+  `/proc/self/fd/<dir fd>/<name>` of an `O_PATH` directory works and keeps the name short.
+- glibc 2.39, `hosts: files dns` (strace of `getent ahosts`): `localhost` is answered from
+  `/etc/hosts` with no packet sent. The absolute `localhost.` is **not** matched by the files
+  backend; it goes out as a DNS query to the resolv.conf server. Other NSS sources may still
+  answer a dotted name (systemd-resolved reads `/etc/hosts`; nss-myhostname, nss-mdns), so the
+  absolute lookup only removes the search list: the address filter stays the control. A
+  hermetic test may only resolve the relative `localhost` through real `getaddrinfo`, and only
+  where `files` comes first and `/etc/hosts` names it (Task 8, `egress/net.rs`).
 
 ## Test writing
 
