@@ -122,6 +122,7 @@ else
   printf 'T %-12s MISSING\n' node
 fi
 tool_line npm npm --version
+# Test prerequisite too: the tools lease test (architect Q40) holds a write lease with python3 -I.
 if have python3; then
   pv="$(python3 -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])')"
   if python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)'; then st=OK; else st=OLD; fi

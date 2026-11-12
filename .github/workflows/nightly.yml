@@ -32,8 +32,10 @@ jobs:
           path: mutants.out/
           if-no-files-found: ignore
   # The wider scope (CLAUDE.md "Mutation scope"), zero survivors too. Only container-free tests
-  # run per mutant, so no podman is needed. Shards are sized for about 30 minutes each, under the
-  # 60-minute target; the 90-minute timeout is headroom, not the budget.
+  # run per mutant, so no podman is needed. Each mutant rebuilds the crate and reruns its whole
+  # test set, about 27 s per mutant on these runners (#79), so the sallyd count sets the shards:
+  # 24 keeps each one near 45 minutes. The 90-minute timeout is headroom, not the budget. Some
+  # shards queue behind the concurrent-job limit; that is fine for a nightly.
   mutants-wide:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -43,10 +45,30 @@ jobs:
         include:
           - { set: core, shard: 0/2 }
           - { set: core, shard: 1/2 }
-          - { set: sallyd, shard: 0/4 }
-          - { set: sallyd, shard: 1/4 }
-          - { set: sallyd, shard: 2/4 }
-          - { set: sallyd, shard: 3/4 }
+          - { set: sallyd, shard: 0/24 }
+          - { set: sallyd, shard: 1/24 }
+          - { set: sallyd, shard: 2/24 }
+          - { set: sallyd, shard: 3/24 }
+          - { set: sallyd, shard: 4/24 }
+          - { set: sallyd, shard: 5/24 }
+          - { set: sallyd, shard: 6/24 }
+          - { set: sallyd, shard: 7/24 }
+          - { set: sallyd, shard: 8/24 }
+          - { set: sallyd, shard: 9/24 }
+          - { set: sallyd, shard: 10/24 }
+          - { set: sallyd, shard: 11/24 }
+          - { set: sallyd, shard: 12/24 }
+          - { set: sallyd, shard: 13/24 }
+          - { set: sallyd, shard: 14/24 }
+          - { set: sallyd, shard: 15/24 }
+          - { set: sallyd, shard: 16/24 }
+          - { set: sallyd, shard: 17/24 }
+          - { set: sallyd, shard: 18/24 }
+          - { set: sallyd, shard: 19/24 }
+          - { set: sallyd, shard: 20/24 }
+          - { set: sallyd, shard: 21/24 }
+          - { set: sallyd, shard: 22/24 }
+          - { set: sallyd, shard: 23/24 }
           - { set: shim, shard: 0/1 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

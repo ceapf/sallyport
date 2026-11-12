@@ -451,3 +451,14 @@ See `manifests/examples/`:
   `[data-can-leave]`.
 - `web-research.yaml` — search API key injected, unrestricted egress (acknowledged), a `brokered`
   notes directory whose writes need approval, no shell. `[data-can-leave]`.
+
+## 6. Known limitations
+
+- **No borrowed groups; ACL objects are owner-only** (architect ruling Q39, accepted by the
+  maintainer). The file tools act with the sandbox's permissions in every mount mode (§1,
+  Mount). The workspace runs as the user's `uid:gid` without supplementary groups. So a file or
+  folder reachable only through one of the user's other groups is refused `permission`, even for
+  a brokered write the user would approve. An object that carries a POSIX ACL, or whose ACL
+  cannot be read, is treated as open to its owner only. The ACL's named entries are not
+  honoured. In practice, brokered writes to group-shared folders are narrower than the user's own
+  access. Mount a folder the user owns, or one whose mode bits grant the access directly.
