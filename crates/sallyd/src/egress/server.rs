@@ -397,7 +397,10 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
             }
         };
         if let Some(tls) = c.intercept.take() {
-            self.intercept(client, c, tls, upstream, used).await;
+            // Boxed: inline, the intercepted tunnel's state (TLS sessions, hyper on both sides)
+            // would size every connection's future, spliced ones too (+14 KiB a tunnel,
+            // RT-NET-09).
+            Box::pin(self.intercept(client, c, tls, upstream, used)).await;
             return;
         }
         let totals = self.tunnel(client, upstream, &c.rest).await;
