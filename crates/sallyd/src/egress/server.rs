@@ -34,6 +34,12 @@ pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Time a reply may take to write; a client that does not read is closed (architect Q10).
 pub const REPLY_TIMEOUT: Duration = Duration::from_secs(2);
+/// After a reply, the proxy reads and discards what the client still sends, at most this many
+/// bytes, before it closes (#71): closing on a client still sending failed the client's send,
+/// and the shim then tore down its TCP side before the reply was relayed.
+pub const DRAIN_BYTES: u64 = 256 * 1024;
+/// ... and for at most this long.
+pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 /// Pinned addresses tried at most, in the resolver's order (decision 4).
 pub const MAX_DIALS: usize = 3;
 /// Addresses kept from one lookup (all are filtered; architect Q9 bounds the audit entry).
@@ -465,7 +471,12 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
 
     /// Audits a refusal, then replies (except `head-timeout`, which closes) and closes. When the
     /// entry cannot be written the connection closes without a reply.
-    async fn refuse<C: AsyncWrite + Unpin>(&self, client: &mut C, r: Refusal, seen: Seen<'_>) {
+    async fn refuse<C: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        client: &mut C,
+        r: Refusal,
+        seen: Seen<'_>,
+    ) {
         let event = if r.reason.is_limit() {
             "egress.limit"
         } else {
@@ -501,13 +512,21 @@ pub(crate) async fn until_true(mut rx: watch::Receiver<bool>) {
     let _ = rx.wait_for(|s| *s).await.map(drop);
 }
 
-/// Writes the reply to `reason` within [`REPLY_TIMEOUT`], then closes the sending half.
-async fn write_reply<C: AsyncWrite + Unpin>(client: &mut C, reason: Reason) {
+/// Writes the reply to `reason` within [`REPLY_TIMEOUT`] and closes the sending half; then, once
+/// the reply is out, discards what the client still sends until its end, [`DRAIN_BYTES`] or
+/// [`DRAIN_TIMEOUT`] (#71). `copy` buffers on the heap only while it drains, so no connection's
+/// future grows (RT-NET-09).
+async fn write_reply<C: AsyncRead + AsyncWrite + Unpin>(client: &mut C, reason: Reason) {
     let send = async {
         client.write_all(reply(reason).as_bytes()).await?;
         client.shutdown().await
     };
-    let _ = tokio::time::timeout(REPLY_TIMEOUT, send).await;
+    if !matches!(tokio::time::timeout(REPLY_TIMEOUT, send).await, Ok(Ok(()))) {
+        return;
+    }
+    let mut rest = (&mut *client).take(DRAIN_BYTES);
+    let mut sink = tokio::io::sink();
+    let _ = tokio::time::timeout(DRAIN_TIMEOUT, tokio::io::copy(&mut rest, &mut sink)).await;
 }
 
 /// The first [`MAX_ADDRS`] distinct resolved addresses with the requested port, order kept.
