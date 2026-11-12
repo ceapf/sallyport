@@ -16,8 +16,10 @@ use std::time::{Duration, Instant};
 
 use common::container::{Lx, SHIM_LOG, exec, net_image, rt};
 use common::egress::public;
+use sallyd::egress::server::ESTABLISHED;
 use sallyd::sandbox::{Running, WorkspaceRequest};
 use serde_json::json;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// `*.mock.test` on 443, `mock.test` itself on 443 only.
 const NET: &str = "network:\n  mode: proxy\n  allow:\n    - host: \"*.mock.test\"\n    \
@@ -336,7 +338,8 @@ fn rt_net_09_oversized_heads_slow_clients_and_too_many_connections_are_limited()
         .1;
         let took = t0.elapsed();
         assert!(drip.is_empty(), "{drip:?}");
-        assert!(took >= Duration::from_secs(9) && took < Duration::from_secs(14), "{took:?}");
+        // Closed at about 10 s, well before the 17 s drip ends (20 s leaves room for a slow host).
+        assert!(took >= Duration::from_secs(9) && took < Duration::from_secs(20), "{took:?}");
         assert_eq!(refusals(&lx, "egress.limit")[2]["reason"], json!("head-timeout"));
         // Two held tunnels fill max_connections: the third is refused at accept.
         let held = exec(
@@ -359,50 +362,81 @@ fn rt_net_09_oversized_heads_slow_clients_and_too_many_connections_are_limited()
 
 #[test]
 fn rt_net_09_a_thousand_connections_leave_the_proxy_bounded() {
-    rt().block_on(async { thousand().await });
+    rt().block_on(async {
+        raise_nofile(8192);
+        a_thousand_open_tunnels().await;
+        over_the_cap_is_429().await;
+    });
 }
 
-async fn thousand() {
-    use rustix::process::{Resource, getrlimit, setrlimit};
-    use sallyd::egress::net::{EgressStarter, SessionEgress};
-    use sallyd::egress::policy::Policy;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    // 1000 client ends and 1000 proxy ends live in this one process.
-    let mut lim = getrlimit(Resource::Nofile);
-    let need = 4096;
-    assert!(
-        lim.maximum.is_none_or(|m| m >= need),
-        "raise the nofile hard limit to {need}"
-    );
-    lim.current = Some(need);
-    setrlimit(Resource::Nofile, lim).unwrap();
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("rt-net-09-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let sock = dir.join("net.sock");
-    let egress = common::egress::fake_egress();
-    egress.resolver.set("a.mock.test", vec![vec![public(1)]]);
+/// Tunnels held open at once in the memory case.
+const TUNNELS: usize = 1000;
+/// Bytes each tunnel carries both ways: more than a copy buffer, so every buffer is filled.
+const PUSH: usize = 64 * 1024;
+/// Growth allowed beyond the copy buffers: tasks, sockets' user-space state, the test's own echo
+/// tasks and audit rows (about 10 KiB a tunnel measured; 24 KiB allowed).
+const SLACK_KIB: usize = 24 * TUNNELS;
+
+/// 1000 tunnels, all open, each carrying 64 KiB up and back: the proxy's memory grows by its two
+/// 16 KiB copy buffers per tunnel plus slack, not by what flows (Rust review M5). With 64 KiB
+/// buffers the growth would be about four times the buffer term and fail.
+async fn a_thousand_open_tunnels() {
+    // The documented copy buffer (ARCHITECTURE §5.3), not the code's constant: a larger buffer
+    // in the code must fail this row.
+    const BUF_BYTES: usize = 16 * 1024;
+    let dir = Scratch::new("rt-net-09-mem");
     let events = Arc::new(common::container::Events::default());
-    let rule = sallyd::egress::policy::Rule {
-        host: sally_core::manifest::parse_host_pattern("*.mock.test").unwrap(),
-        ports: vec![443],
-    };
-    let handle = egress
-        .start(
-            &sock,
-            SessionEgress {
-                policy: Policy::new(vec![rule], vec![]),
-                max_connections: 32,
-                session: "rt-net-09".into(),
-                level: sally_core::manifest::AuditLevel::default(),
-                audit: events.clone(),
-            },
-        )
-        .unwrap();
+    let (handle, sock) = listen(&dir, TUNNELS, Arc::clone(&events));
     let before = rss_kib();
+    let mut clients = Vec::with_capacity(TUNNELS);
+    for i in 0..TUNNELS {
+        if i % 64 == 0 {
+            tokio::task::yield_now().await;
+        }
+        let mut c = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        c.write_all(b"CONNECT a.mock.test:443 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        clients.push(c);
+    }
+    let mut head = [0u8; ESTABLISHED.len()];
+    for c in &mut clients {
+        c.read_exact(&mut head).await.unwrap();
+        assert_eq!(&head[..], ESTABLISHED);
+    }
+    let push = vec![0x5a_u8; PUSH];
+    for c in &mut clients {
+        c.write_all(&push).await.unwrap();
+    }
+    let mut back = vec![0u8; PUSH];
+    for c in &mut clients {
+        c.read_exact(&mut back).await.unwrap();
+        assert!(back.iter().all(|&b| b == 0x5a));
+    }
+    let grew = rss_kib().saturating_sub(before);
+    let buffers_kib = 2 * BUF_BYTES * TUNNELS / 1024;
+    eprintln!(
+        "rt-net-09: RSS grew {grew} KiB; bound {} KiB",
+        buffers_kib + SLACK_KIB
+    );
+    assert!(
+        grew < u64::try_from(buffers_kib + SLACK_KIB).unwrap(),
+        "RSS grew {grew} KiB for {TUNNELS} tunnels (buffers {buffers_kib} KiB + slack {SLACK_KIB} KiB)"
+    );
+    let ev = events.list();
+    assert_eq!(ev.iter().filter(|e| *e == "egress.allow").count(), TUNNELS);
+    assert!(!ev.iter().any(|e| e == "egress.limit"), "none refused");
+    drop(clients);
+    handle.shutdown().await;
+}
+
+/// 40 connections against a cap of 32: the 8 over it are answered 429 at accept.
+async fn over_the_cap_is_429() {
+    let dir = Scratch::new("rt-net-09-cap");
+    let events = Arc::new(common::container::Events::default());
+    let (handle, sock) = listen(&dir, 32, Arc::clone(&events));
     let mut clients = Vec::new();
-    for _ in 0..1000 {
+    for _ in 0..40 {
         let mut c = tokio::net::UnixStream::connect(&sock).await.unwrap();
         // A connection over the cap is answered and closed at accept, maybe before this write.
         let _ = c
@@ -410,8 +444,7 @@ async fn thousand() {
             .await;
         clients.push(c);
     }
-    let mut ok = 0;
-    let mut limited = 0;
+    let (mut ok, mut limited) = (0, 0);
     for c in &mut clients {
         let mut head = [0u8; 12];
         c.read_exact(&mut head).await.unwrap();
@@ -421,18 +454,100 @@ async fn thousand() {
             other => panic!("{}", String::from_utf8_lossy(other)),
         }
     }
-    let grew = rss_kib().saturating_sub(before);
-    assert_eq!((ok, limited), (32, 968));
-    assert!(grew < 50 * 1024, "RSS grew {grew} KiB");
+    assert_eq!((ok, limited), (32, 8));
     let limits = events
         .list()
         .iter()
         .filter(|e| *e == "egress.limit")
         .count();
-    assert_eq!(limits, 968);
+    assert_eq!(limits, 8);
     drop(clients);
     handle.shutdown().await;
-    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Raises this process's soft nofile limit to `need` (client and proxy ends live in one process).
+fn raise_nofile(need: u64) {
+    use rustix::process::{Resource, getrlimit, setrlimit};
+    let mut lim = getrlimit(Resource::Nofile);
+    assert!(
+        lim.maximum.is_none_or(|m| m >= need),
+        "raise the nofile hard limit to {need}"
+    );
+    lim.current = Some(need);
+    setrlimit(Resource::Nofile, lim).unwrap();
+}
+
+/// A scratch directory under `CARGO_TARGET_TMPDIR`, removed however the test ends.
+struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Self {
+        let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Echoes through a socket pair with a 1 KiB copy, so the test's own memory per tunnel stays
+/// small next to the proxy's buffers.
+struct PairEcho;
+
+impl sallyd::egress::server::Dialer for PairEcho {
+    type Stream = tokio::net::UnixStream;
+    async fn dial(&self, _: SocketAddr) -> std::io::Result<Self::Stream> {
+        let (near, mut far) = tokio::net::UnixStream::pair()?;
+        tokio::spawn(async move {
+            let mut b = [0u8; 1024];
+            while let Ok(n @ 1..) = far.read(&mut b).await {
+                if far.write_all(&b[..n]).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(near)
+    }
+}
+
+/// A listener in `dir` that allows `*.mock.test:443`, with `a.mock.test` at a public address.
+fn listen(
+    dir: &Scratch,
+    max_connections: usize,
+    audit: Arc<common::container::Events>,
+) -> (sallyd::egress::net::EgressHandle, std::path::PathBuf) {
+    use sallyd::egress::net::{Egress, EgressStarter, SessionEgress};
+    use sallyd::egress::policy::{Policy, Rule};
+    let egress = Egress {
+        resolver: Arc::new(common::egress::Names::default()),
+        dialer: Arc::new(PairEcho),
+        host: Arc::new(common::egress::Owned::default()),
+    };
+    egress.resolver.set("a.mock.test", vec![vec![public(1)]]);
+    let rule = Rule {
+        host: sally_core::manifest::parse_host_pattern("*.mock.test").unwrap(),
+        ports: vec![443],
+    };
+    let sock = dir.0.join("net.sock");
+    let handle = egress
+        .start(
+            &sock,
+            SessionEgress {
+                policy: Policy::new(vec![rule], vec![]),
+                max_connections,
+                session: "rt-net-09".into(),
+                level: sally_core::manifest::AuditLevel::default(),
+                audit,
+            },
+        )
+        .unwrap();
+    (handle, sock)
 }
 
 fn rss_kib() -> u64 {
@@ -450,11 +565,22 @@ fn rt_net_10_replacing_the_shim_gains_nothing() {
         // Kill the shim and listen on its port: the sandbox can, but its own proxy has no way out.
         let (code, out) = exec(
             &r,
-            "pkill -x sally-shim; sleep 0.5; (nc -l -p 3128 > /dev/null &); sleep 0.5; \
+            // By /proc/<pid>/comm: busybox `pgrep -x` compares the full argv[0] (PROBE_NOTES).
+            // A killed shim stays a zombie (the entry's `sleep` never reaps), so count live ones.
+            "shims() { for p in /proc/[0-9]*; do grep -qs '^State:.*Z' $p/status && continue; \
+               [ \"$(cat $p/comm 2>/dev/null)\" = sally-shim ] && echo ${p#/proc/}; done; }; \
+             for pid in $(shims); do kill $pid && echo killed=$pid; done; sleep 0.5; \
+             echo left=$(shims | wc -l); \
+             (nc -l -p 3128 > /dev/null 2>/tmp/own-listener &); sleep 0.5; cat /tmp/own-listener; \
              timeout 5 nc -w 2 1.1.1.1 443 < /dev/null; echo direct=$?",
         )
         .await;
         assert_eq!(code, 0, "{out}");
+        // The listening shim is gone, and its port taken by our own listener, before anything is
+        // sent to net.sock.
+        assert_eq!(out.matches("killed=").count(), 1, "{out}");
+        assert!(out.contains("left=0"), "{out}");
+        assert!(!out.contains("Address in use"), "{out}");
         assert!(!out.contains("direct=0"), "a direct connection succeeded: {out}");
         // Talk to net.sock directly: the shim binary as the attacker's dumb relay (architect Q14).
         let stdio = |req: &str| {

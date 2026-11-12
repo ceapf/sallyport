@@ -176,6 +176,11 @@ fn shim_binary() -> Vec<u8> {
         ])
         .arg("--target-dir")
         .arg(&dir)
+        // A plain release build even under coverage or a wrapper (Rust review L11).
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .status()
         .expect("cargo must run");
     assert!(status.success(), "building the musl sally-shim failed");
