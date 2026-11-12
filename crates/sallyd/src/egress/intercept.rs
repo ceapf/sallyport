@@ -152,6 +152,8 @@ struct State {
     /// Plaintext bytes read when the last exchange finished (architect Q53).
     mark: AtomicU64,
     request_over: AtomicBool,
+    /// The client's request body failed before its end (architect ruling R3).
+    request_broken: AtomicBool,
     requests: AtomicU64,
     statuses: [AtomicU64; 5],
     end: Mutex<Option<End>>,
@@ -254,18 +256,47 @@ impl Body for Out {
     }
 }
 
-/// The request body's end: past the cap, the exchange is answered 413 (Q35).
-struct RequestEnd(Arc<State>);
+/// An `egress.limit` entry a body's end appends, at most once.
+type HeldEntry = Mutex<Option<(NewEntry, Arc<dyn crate::sandbox::AuditSink>)>>;
+/// What [`OnEnd::ended`] returns: the work that must finish before the body reports its cut.
+type BeforeCut = Option<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>>;
+
+/// Appends the held entry (the first call only); the returned future finishes with the append.
+fn append_held(held: &HeldEntry, level: sally_core::manifest::AuditLevel) -> BeforeCut {
+    let (entry, sink) = held.lock().ok()?.take()?;
+    let h = tokio::task::spawn_blocking(move || sink.append(entry, level));
+    Some(Box::pin(async move {
+        // TODO(#49): log a limit entry that could not be written; the cut happens regardless.
+        let _ = h.await;
+    }))
+}
+
+/// The request body's end (Q35; architect rulings R2 and R3). Past the cap: the tunnel ends
+/// `limit` at once, and `egress.limit request-too-large` is appended before hyper's client sees
+/// the cut, whether or not a response head was already forwarded (the 413, when there is one,
+/// adds no second entry). A body the client broke off ends the tunnel `closed`: no entry, no
+/// reply.
+struct RequestEnd {
+    state: Arc<State>,
+    limit: HeldEntry,
+    level: sally_core::manifest::AuditLevel,
+}
 
 impl OnEnd for RequestEnd {
-    fn ended(
-        &self,
-        how: Option<BodyEnd>,
-    ) -> Option<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>> {
-        if how == Some(BodyEnd::OverCap) {
-            self.0.request_over.store(true, Ordering::Relaxed);
+    fn ended(&self, how: Option<BodyEnd>) -> BeforeCut {
+        match how {
+            Some(BodyEnd::OverCap) => {
+                self.state.request_over.store(true, Ordering::Relaxed);
+                self.state.set_end(End::Limit);
+                append_held(&self.limit, self.level)
+            }
+            Some(BodyEnd::Failed) => {
+                self.state.request_broken.store(true, Ordering::Relaxed);
+                self.state.set_end(End::Closed);
+                None
+            }
+            None | Some(BodyEnd::Complete) => None,
         }
-        None
     }
 }
 
@@ -273,15 +304,12 @@ impl OnEnd for RequestEnd {
 /// or failed (the upstream closed mid-body: cut, Q43).
 struct ResponseEnd {
     state: Arc<State>,
-    limit: Mutex<Option<(NewEntry, Arc<dyn crate::sandbox::AuditSink>)>>,
+    limit: HeldEntry,
     level: sally_core::manifest::AuditLevel,
 }
 
 impl OnEnd for ResponseEnd {
-    fn ended(
-        &self,
-        how: Option<BodyEnd>,
-    ) -> Option<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>> {
+    fn ended(&self, how: Option<BodyEnd>) -> BeforeCut {
         match how {
             None | Some(BodyEnd::Complete) => {
                 self.state.finish();
@@ -293,12 +321,7 @@ impl OnEnd for ResponseEnd {
             }
             Some(BodyEnd::OverCap) => {
                 self.state.set_end(End::Limit);
-                let (entry, sink) = self.limit.lock().ok()?.take()?;
-                let level = self.level;
-                let h = tokio::task::spawn_blocking(move || sink.append(entry, level));
-                Some(Box::pin(async move {
-                    let _ = h.await;
-                }))
+                append_held(&self.limit, self.level)
             }
         }
     }
@@ -363,6 +386,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
             busy: AtomicBool::new(false),
             mark: AtomicU64::new(0),
             request_over: AtomicBool::new(false),
+            request_broken: AtomicBool::new(false),
             requests: AtomicU64::new(0),
             statuses: Default::default(),
             end: Mutex::new(None),
@@ -464,6 +488,8 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
             (Reason::HeadTooLarge, End::Limit)
         } else if e.is_parse() {
             (Reason::Malformed, End::Refused)
+        } else if e.is_incomplete_message() {
+            return End::Closed; // the client closed mid-head or mid-body
         } else {
             return End::Error;
         };
@@ -514,11 +540,18 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
             return Err("audit append failed".into());
         }
         st.requests.fetch_add(1, Ordering::Relaxed);
-        let capped = Capped::new(
-            body,
-            self.limits.max_request,
-            Arc::new(RequestEnd(Arc::clone(st))),
-        );
+        let over = self.entry("egress.limit", Some("deny")).args(inside_args(
+            &st.auth,
+            Reason::RequestTooLarge,
+            &target,
+            None,
+        ));
+        let on_end = RequestEnd {
+            state: Arc::clone(st),
+            limit: Mutex::new(Some((over, Arc::clone(&self.audit)))),
+            level: self.level,
+        };
+        let capped = Capped::new(body, self.limits.max_request, Arc::new(on_end));
         let mut up = Request::new(capped);
         *up.method_mut() = parts.method;
         *up.uri_mut() = parts
@@ -536,11 +569,12 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         };
         match sent {
             Ok(resp) => self.respond(st, resp, &target).await,
-            Err(e) if st.request_over.load(Ordering::Relaxed) => {
-                drop(e);
-                self.refuse_inside(st, Reason::RequestTooLarge, &target, None)
-                    .await
+            // Already audited and marked `limit` by RequestEnd, before hyper saw the cut.
+            Err(_) if st.request_over.load(Ordering::Relaxed) => {
+                Ok(reply_response(Reason::RequestTooLarge))
             }
+            // The client broke off its body: the tunnel ends `closed`, nothing to answer.
+            Err(e) if st.request_broken.load(Ordering::Relaxed) => Err(e.into()),
             Err(e) if e.is_parse_too_large() => {
                 self.refuse_inside(st, Reason::ResponseTooLarge, &target, Some("head"))
                     .await

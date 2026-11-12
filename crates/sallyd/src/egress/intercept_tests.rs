@@ -60,6 +60,7 @@ fn canned(req: &str) -> Option<String> {
         }
         "/cl-list" => "HTTP/1.1 200 OK\r\nContent-Length: 6, 6\r\n\r\nSMUGGL".into(),
         // A length over the test cap (16) with no body: the answer to a HEAD, or a 304.
+        "/early" => "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n".into(),
         "/head-only" => "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n".into(),
         "/not-modified" => "HTTP/1.1 304 Not Modified\r\nContent-Length: 100\r\n\r\n".into(),
         "/bighead" => format!(
@@ -143,12 +144,15 @@ fn upstream_pki(name: &str) -> (CertificateDer<'static>, Arc<rustls::ServerConfi
     (ca_cert.der().clone(), Arc::new(cfg))
 }
 
-/// Reads one request (head and body, by `Content-Length` or chunked) from `s`.
+/// Reads one request (head and body, by `Content-Length` or chunked) from `s`. A request for
+/// `/early` is taken at its head: the mock answers before the body arrives.
 async fn read_request<S: AsyncRead + Unpin>(s: &mut S, buf: &mut Vec<u8>) -> Option<String> {
     loop {
         if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
             let head = String::from_utf8_lossy(&buf[..end + 4]).to_ascii_lowercase();
-            let body_end = if head.contains("transfer-encoding: chunked") {
+            let body_end = if head.starts_with("post /early ") {
+                Some(end + 4)
+            } else if head.contains("transfer-encoding: chunked") {
                 buf[end + 4..]
                     .windows(5)
                     .position(|w| w == b"0\r\n\r\n")
@@ -789,11 +793,98 @@ async fn a_chunked_request_crossing_the_cap_is_413() {
     );
     let out = r.talk(&raw).await;
     assert!(out.starts_with("HTTP/1.1 413 "), "{out}");
+    assert_one_request_limit(&r);
+}
+
+/// Exactly one `egress.limit request-too-large`, without `part`, and the tunnel ends `limit`
+/// (architect ruling R2).
+fn assert_one_request_limit(r: &Rig) {
+    let events = r.sink.events();
+    let limits = events.iter().filter(|e| *e == "egress.limit").count();
+    assert_eq!(limits, 1, "{events:?}");
+    let limit = r.sink.args("egress.limit");
     assert_eq!(
-        r.sink.args("egress.limit")["reason"],
-        json!("request-too-large")
+        (
+            limit["reason"].clone(),
+            limit["host"].clone(),
+            limit["port"].clone()
+        ),
+        (json!("request-too-large"), json!(HOST), json!(443))
     );
-    assert_eq!(r.sink.args("egress.close")["end"], json!("limit"));
+    assert!(
+        limit["target"].as_str().is_some_and(|t| t.starts_with('/')),
+        "{limit}"
+    );
+    assert!(
+        limit["target_bytes"].is_u64() && limit["target_cut"].is_boolean(),
+        "{limit}"
+    );
+    assert!(limit.get("part").is_none(), "{limit}");
+    assert_eq!(
+        r.sink.args("egress.close")["end"],
+        json!("limit"),
+        "{events:?}"
+    );
+}
+
+/// Architect ruling R2: the upstream answers before the body ends (here a 401 after the head),
+/// and the body then crosses the cap. The response head is already forwarded, so there is no
+/// 413; the crossing is still audited, once, and the tunnel ends `limit`.
+#[tokio::test]
+async fn a_request_body_crossing_the_cap_after_an_early_response_is_audited_once() {
+    let r = rig(Opts::default());
+    let (_, tls, task) = r.open(443).await;
+    let mut tls = tls.unwrap();
+    let head =
+        format!("POST /early HTTP/1.1\r\nHost: {HOST}\r\nTransfer-Encoding: chunked\r\n\r\n");
+    tls.write_all(head.as_bytes()).await.unwrap();
+    bounded("the early 401", async {
+        let mut got = Vec::new();
+        let mut b = [0u8; 1];
+        while !got.ends_with(b"\r\n\r\n") {
+            tls.read_exact(&mut b).await.unwrap();
+            got.push(b[0]);
+        }
+        assert!(
+            got.starts_with(b"HTTP/1.1 401 "),
+            "{}",
+            String::from_utf8_lossy(&got)
+        );
+    })
+    .await;
+    let body = format!("20\r\n{}\r\n0\r\n\r\n", "q".repeat(32));
+    let _ = tls.write_all(body.as_bytes()).await;
+    let _ = tls.shutdown().await;
+    let rest = drain(&mut tls).await;
+    join(task).await;
+    assert!(!rest.contains("413"), "{rest}");
+    assert_one_request_limit(&r);
+}
+
+/// Architect ruling R3, and hyper's incomplete-message mapping: a client that breaks off its own
+/// request body, or its head, ends the tunnel `closed`: no refusal entry, no reply, no 502.
+#[tokio::test]
+async fn a_client_that_breaks_off_its_request_ends_closed() {
+    let body_cut = format!(
+        "POST /echo HTTP/1.1\r\nHost: {HOST}\r\nContent-Length: 16\r\n\r\n{}",
+        "q".repeat(8)
+    );
+    for (raw, requests) in [(body_cut.as_str(), 1), ("GET /echo HT", 0)] {
+        let r = rig(Opts::default());
+        let out = r.talk(raw).await;
+        assert!(out.is_empty(), "{raw:?}: {out}");
+        let events = r.sink.events();
+        let expected: &[&str] = if requests == 1 {
+            &["egress.allow", "egress.request", "egress.close"]
+        } else {
+            &["egress.allow", "egress.close"]
+        };
+        assert_eq!(events, expected, "{raw:?}");
+        let close = r.sink.args("egress.close");
+        assert_eq!(close["end"], json!("closed"), "{raw:?}");
+        assert_eq!(close["requests"], json!(requests), "{raw:?}");
+        assert!(r.seen().is_empty(), "{raw:?}");
+    }
 }
 
 #[tokio::test]

@@ -784,7 +784,8 @@ sallyport/
     connected), bytes_up, bytes_down, end, intercept}`, plus `requests` and `statuses` (`{"2xx":
     n, …}`, non-zero classes only) when `intercept` is true; `end` is `closed`, `idle-timeout`,
     `error`, `session-stopped` or `connect-failed` (with `connected: false`, written before the
-    502), and for intercepted tunnels also `upstream-tls-failed` (written before the 502, no
+    502); `closed` also when the client aborts a request head or body (no refusal entry, no
+    reply); and for intercepted tunnels also `upstream-tls-failed` (written before the 502, no
     `200`), `client-tls-failed`, `refused`, `limit` or `upstream-closed` (written before the 502
     when no response head had arrived; the request is never replayed). For an intercepted tunnel
     `bytes_up`/`bytes_down` count the client's wire bytes, TLS framing included, so they are not
@@ -845,8 +846,8 @@ sallyport/
     deliveries.)
     Body caps are `network.max_request_bytes`/`max_response_bytes`, payload bytes per message
     after chunk decoding (at the cap passes): a declared request length over the cap is 413 with
-    nothing sent upstream, a chunked one crossing it aborts the exchange (413 if no response head
-    was forwarded); a declared response length (as hyper decoded it; none for HEAD, 204, 304) over
+    nothing sent upstream, a chunked one crossing it is audited (`egress.limit
+    request-too-large`, once), then aborted (413 if no response head was forwarded); a declared response length (as hyper decoded it; none for HEAD, 204, 304) over
     the cap is 502, a streamed one crossing it is
     audited, then cut without a final chunk. The response cap counts upstream bytes before
     redaction. hyper's head timer is `limits.head` (10 s) for every wait for a head, so an
