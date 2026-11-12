@@ -68,17 +68,28 @@ pub enum RootsError {
     },
 }
 
-/// The trust roots of one session.
-#[derive(Debug, Clone)]
+/// The trust roots of one session. `Debug` shows the file and the counts, never the bundle.
+#[derive(Clone)]
 pub struct Roots {
     /// The upstream verifier's anchors.
     pub store: Arc<RootCertStore>,
     /// The accepted certificates, PEM (LF line ends), in file order.
     pub pem: String,
     /// Certificates in the file that the verifier could not use.
+    // TODO(#56): audit the path and this count once interception uses the roots (Task 9a-2).
     pub skipped: usize,
     /// The file they came from.
     pub path: PathBuf,
+}
+
+impl std::fmt::Debug for Roots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Roots")
+            .field("path", &self.path)
+            .field("anchors", &self.store.len())
+            .field("skipped", &self.skipped)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The candidate bundle files and their required owner.
@@ -119,7 +130,9 @@ impl BundleFiles {
 }
 
 /// Opens `path` without blocking (a FIFO must not hang the launch), checks the opened file, and
-/// reads it within the cap.
+/// reads it within the cap. The open precedes the type check, so a device node at a candidate
+/// path would be opened (security review L3, accepted): placing one there takes root, which
+/// already controls the roots.
 fn read(path: &Path, owner: u32) -> Result<Vec<u8>, RootsError> {
     let io = |err: io::Error| RootsError::Io {
         path: path.to_owned(),

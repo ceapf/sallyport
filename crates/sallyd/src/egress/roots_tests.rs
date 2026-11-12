@@ -6,16 +6,8 @@ use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, PKCS_ECD
 
 use super::*;
 
-/// A fresh directory under `target/` for one test.
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::current_dir()
-        .unwrap()
-        .join("../../target/roots-unit")
-        .join(std::process::id().to_string())
-        .join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn scratch(name: &str) -> crate::egress::scratch::Scratch {
+    crate::egress::scratch::scratch("roots-unit", name)
 }
 
 fn uid() -> u32 {
@@ -74,6 +66,12 @@ fn usable_certificates_are_kept_reencoded_and_unusable_ones_counted() {
     assert_eq!(roots.path, f);
     assert_eq!(roots.pem, format!("{a}{b}"), "LF, accepted only, in order");
     assert!(!roots.pem.contains('\r') && !roots.pem.contains("comment"));
+    let shown = format!("{roots:?}");
+    assert!(shown.contains("anchors: 2, skipped: 1"), "{shown}");
+    assert!(
+        shown.contains("bundle.pem") && !shown.contains("BEGIN"),
+        "{shown}"
+    );
 }
 
 #[test]
@@ -112,10 +110,13 @@ fn a_candidate_that_exists_but_fails_is_an_error_never_skipped() {
     let dir = scratch("fails");
     let good = dir.join("good.pem");
     write(&good, &ca_pem("good"), 0o644);
-    let unreadable = dir.join("unreadable.pem");
-    write(&unreadable, &ca_pem("x"), 0o000);
-    let e = why(files(&[&unreadable, &good]).load());
-    assert!(e.contains(&unreadable.display().to_string()), "{e}");
+    // Root reads a 0o000 file anyway; the case means something only for other users.
+    if !rustix::process::geteuid().is_root() {
+        let unreadable = dir.join("unreadable.pem");
+        write(&unreadable, &ca_pem("x"), 0o000);
+        let e = why(files(&[&unreadable, &good]).load());
+        assert!(e.contains(&unreadable.display().to_string()), "{e}");
+    }
     let writable = dir.join("writable.pem");
     write(&writable, &ca_pem("x"), 0o666);
     assert!(why(files(&[&writable, &good]).load()).contains("writable"));
@@ -179,7 +180,18 @@ fn a_directory_or_a_fifo_is_refused_without_blocking() {
         0,
     )
     .unwrap();
-    assert!(why(files(&[&fifo]).load()).contains("not a regular file"));
+    // On a thread with a deadline: an open without O_NONBLOCK waits for a writer forever.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let candidates = files(&[&fifo]);
+    std::thread::spawn(move || {
+        let _ = tx.send(why(candidates.load()));
+    });
+    let Ok(got) = rx.recv_timeout(std::time::Duration::from_secs(5)) else {
+        // A reader is waiting, so this open returns at once and lets the stuck thread finish.
+        let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+        panic!("loading a FIFO blocked");
+    };
+    assert!(got.contains("not a regular file"), "{got}");
 }
 
 #[test]

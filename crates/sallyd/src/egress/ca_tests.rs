@@ -246,7 +246,12 @@ fn each_leaf_names_one_host_and_is_no_ca() {
             key.public_key_raw(),
             &*c.public_key().subject_public_key.data
         );
-        assert!(!format!("{leaf:?}").contains(&format!("{:?}", leaf.key.expose())));
+        let shown = format!("{leaf:?}");
+        assert!(!shown.contains(&format!("{:?}", leaf.key.expose())));
+        assert!(
+            shown.contains(&leaf.host) && shown.contains("Secret(<redacted>)"),
+            "{shown}"
+        );
     }
     let [a, b] = &tls.leaves[..] else {
         panic!("two leaves")
@@ -314,15 +319,8 @@ fn the_name_constraints_refuse_other_names_subdomains_and_addresses() {
     ));
 }
 
-fn scratch(name: &str) -> std::path::PathBuf {
-    let dir = std::env::current_dir()
-        .unwrap()
-        .join("../../target/ca-unit")
-        .join(std::process::id().to_string())
-        .join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn scratch(name: &str) -> crate::egress::scratch::Scratch {
+    crate::egress::scratch::scratch("ca-unit", name)
 }
 
 #[test]
@@ -348,12 +346,32 @@ fn the_ca_files_hold_the_ca_and_the_roots_then_the_ca_read_only() {
     assert_eq!(names.len(), 2, "{names:?}");
 }
 
+/// The directory is opened `O_PATH`: no read permission on it is needed (nor taken).
+#[test]
+fn the_files_are_written_into_a_directory_that_cannot_be_listed() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("unlistable");
+    let tls = SessionTls::mint(&hosts(&["mock.test"]), validity()).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+    let written = write_files(&dir, &tls, "");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    written.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.join(CA_FILE)).unwrap(),
+        tls.ca_pem
+    );
+}
+
 #[test]
 fn an_existing_name_or_a_symlinked_directory_is_refused() {
     let tls = SessionTls::mint(&hosts(&["mock.test"]), validity()).unwrap();
     let dir = scratch("exists");
     std::fs::write(dir.join(CA_FILE), "planted").unwrap();
-    assert!(write_files(&dir, &tls, "").is_err());
+    let e = write_files(&dir, &tls, "").unwrap_err().to_string();
+    assert!(
+        e.starts_with(&format!("{}: ", dir.join(CA_FILE).display())),
+        "{e}"
+    );
     assert_eq!(
         std::fs::read_to_string(dir.join(CA_FILE)).unwrap(),
         "planted"

@@ -246,26 +246,28 @@ impl SessionTls {
 
 /// Writes [`CA_FILE`] (the CA) and [`BUNDLE_FILE`] (`roots_pem`, then the CA) into `dir`, the
 /// workspace's socket directory, before the container starts (architect Q38 (g), (h)). Each is
-/// created new (an existing name, a symlink included, fails), mode 0444, through the
-/// `sally_core::fd` wrappers; `dir` itself may not be a symlink.
+/// created new (an existing name, a symlink included, fails), mode exactly 0444 whatever the
+/// umask, through the `sally_core::fd` wrappers; `dir` itself may not be a symlink.
 ///
 /// # Errors
-/// The open or write error.
+/// The open, chmod or write error, naming the path.
 pub fn write_files(dir: &Path, tls: &SessionTls, roots_pem: &str) -> io::Result<()> {
+    let named = |name: &str| {
+        let path = dir.join(name);
+        move |e: io::Error| io::Error::new(e.kind(), format!("{}: {e}", path.display()))
+    };
     let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW;
-    let dir = sally_core::fd::open(dir, flags, Mode::empty())?;
-    write_new(&dir, CA_FILE, tls.ca_pem.as_bytes())?;
-    write_new(
-        &dir,
-        BUNDLE_FILE,
-        format!("{roots_pem}{}", tls.ca_pem).as_bytes(),
-    )
+    let fd = sally_core::fd::open(dir, flags, Mode::empty()).map_err(|e| named("")(e.into()))?;
+    write_new(&fd, CA_FILE, tls.ca_pem.as_bytes()).map_err(named(CA_FILE))?;
+    let bundle = format!("{roots_pem}{}", tls.ca_pem);
+    write_new(&fd, BUNDLE_FILE, bundle.as_bytes()).map_err(named(BUNDLE_FILE))
 }
 
 fn write_new(dir: impl AsFd, name: &str, body: &[u8]) -> io::Result<()> {
     let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW;
     let mode = Mode::RUSR | Mode::RGRP | Mode::ROTH;
     let fd = sally_core::fd::openat(dir, name, flags, mode)?;
+    rustix::fs::fchmod(&fd, mode)?;
     std::fs::File::from(fd).write_all(body)
 }
 

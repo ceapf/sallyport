@@ -41,15 +41,38 @@ impl AuditSink for Sink {
     }
 }
 
-fn scratch(tag: &str) -> PathBuf {
-    let dir = std::env::current_dir()
-        .unwrap()
-        .join("../../target/net-ca-unit")
-        .join(std::process::id().to_string())
-        .join(tag);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn scratch(tag: &str) -> crate::egress::scratch::Scratch {
+    crate::egress::scratch::scratch("net-ca-unit", tag)
+}
+
+/// The settings carry the CA condition and the timeout the manifest gives.
+#[test]
+fn session_settings_carry_the_ca_condition_and_the_timeout() {
+    use sally_core::manifest::{HostEnv, load};
+    let dir = scratch("settings");
+    let env = HostEnv {
+        home: dir.to_path_buf(),
+        other_homes: Vec::new(),
+        xdg_config_home: None,
+        xdg_data_home: None,
+        xdg_runtime_dir: None,
+        podman_storage: Vec::new(),
+        nproc: 8,
+        mem_bytes: 16 << 30,
+    };
+    let head = "apiVersion: sallyport/v1\nkind: Manifest\nname: t\nmodel:\n  ref: any\n\
+                runtime:\n  timeout: 90m\nnetwork:\n  mode: proxy\n  allow:\n    - host: a.mock.test\n";
+    let grant = "secrets:\n  - name: GITHUB_TOKEN\n    inject: {host: a.mock.test, \
+                 header: Authorization, format: \"Bearer {value}\"}\n";
+    let names: std::collections::BTreeSet<String> = ["GITHUB_TOKEN".to_owned()].into();
+    for (body, ca) in [(format!("{head}{grant}"), true), (head.to_owned(), false)] {
+        let v = load(&body, &env, &names).unwrap().manifest;
+        let s = SessionEgress::from_manifest(&v, "s-x", Arc::new(Sink));
+        assert_eq!(s.ca, ca, "{body}");
+        assert_eq!(s.ca, ca::wanted(v.manifest()));
+        assert_eq!(s.timeout, Duration::from_secs(90 * 60));
+        assert!(s.interception.is_none());
+    }
 }
 
 /// A roots file owned by this user, holding one self-signed CA.
