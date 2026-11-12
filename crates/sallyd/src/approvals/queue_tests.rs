@@ -329,12 +329,15 @@ async fn an_approval_that_cannot_be_written_is_not_given() {
 async fn a_decision_whose_caller_is_dropped_still_completes() {
     let f = fx(5);
     let (id, h) = asking(&f, shell(1, &["ls"])).await;
-    // Poll decide once (it takes the prompt and hands the rest to its task), then drop it.
-    tokio::select! {
-        biased;
-        _ = f.desk.decide(&id, Decision::Deny, ME) => panic!("finished in one poll"),
-        () = tokio::task::yield_now() => {}
-    }
+    // The decision's entry cannot be written yet, so the caller is still waiting when dropped.
+    f.sink.hold(true);
+    let desk = f.desk.clone();
+    let d = id.clone();
+    let caller = tokio::spawn(async move { desk.decide(&d, Decision::Deny, ME).await });
+    until("prompt taken", || f.desk.list().is_empty()).await;
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    f.sink.hold(false);
     assert_eq!(h.await.unwrap(), Err(Refusal::Denied("denied")));
     assert_eq!(f.sink.last("approval.decide")["id"], id.as_str());
     assert!(f.fake.closed.lock().unwrap().contains(&id));
