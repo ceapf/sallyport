@@ -418,8 +418,8 @@ never on message text); the field path uses `a.b[0].c` form.
 | `data-can-leave` | private data and an outward channel coexist (warning) |
 | `inconsistent` / `risky` | warnings only |
 
-TODO(task 7): export `Code` through `sally-proto` (`ts-rs`) so the UI gets the code set as a
-generated type.
+TODO(#58): export `Code` through `sally-proto` (`ts-rs`) so the UI gets the code set as a
+generated type. Deferred from Task 7 to M5 (Task 7 ruling Q12).
 
 ## 5. Example manifests
 

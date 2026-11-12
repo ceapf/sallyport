@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use sally_core::manifest::{HostEnv, ValidatedManifest, load};
 pub mod container;
 pub mod egress;
+pub mod mock_model;
 
 use sallyd::sandbox::{
     CheckedRuntime, CommonArgs, ImageRef, LaunchScan, ScanLimits, SessionId, SessionPaths, UserIds,

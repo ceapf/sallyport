@@ -1,5 +1,5 @@
-//! Real-container fixture (rootless Podman) shared by `launch.rs` and `roles.rs`: the test
-//! images, a launcher with hermetic podman, and `podman exec`.
+//! Real-container fixture (rootless Podman) shared by `launch.rs`, `roles.rs` and `rpc.rs`: the
+//! test images, a launcher with hermetic podman, and `podman exec`.
 //!
 //! These tests never skip: without podman or the base image they fail. CI pulls the base image
 //! by digest first (`ci.yml`); the test images are built from it offline.
@@ -12,9 +12,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use sally_core::audit::{AuditError, NewEntry};
 use sally_core::manifest::{AuditLevel, ValidatedManifest};
 use sallyd::sandbox::{
-    AuditSink, CheckedRuntime, DiskFloor, ImageRef, LaunchError, Launcher, LauncherParts, Podman,
-    PodmanHost, Running, ScanLimits, SessionId, SessionPaths, Sessions, UserIds, WorkspaceRequest,
-    resolve_podman,
+    AuditSink, CheckedRuntime, CommonArgs, DiskFloor, ImageRef, LaunchError, Launcher,
+    LauncherParts, Podman, PodmanHost, Running, ScanLimits, SessionDirs, SessionId, SessionPaths,
+    Sessions, UserIds, WorkspaceRequest, resolve_podman,
 };
 
 use super::Fx;
@@ -513,6 +513,25 @@ impl Lx {
 
     pub async fn stop(&self, r: Running) {
         self.launcher.stop(r).await.unwrap();
+    }
+
+    /// The common argv inputs for a session's directories.
+    pub fn common_args(&self, dirs: &SessionDirs) -> CommonArgs {
+        CommonArgs {
+            runtime: self.runtime.clone(),
+            ids: ids(),
+            profiles: dirs.profiles().to_owned(),
+            hooks_dir: self.podman.hooks_dir(),
+            mounts_file: self.podman.mounts_file(),
+        }
+    }
+
+    /// `podman create <argv>` then `podman start`, both hermetic; the container id.
+    pub async fn create_and_start(&self, argv: Vec<String>) -> String {
+        let out = self.hermetic(&argv).await;
+        let id = out.lines().last().unwrap().to_owned();
+        self.hermetic(&["start".to_owned(), id.clone()]).await;
+        id
     }
 
     /// Runs hermetic podman with `args` (as the launcher would); stdout on success.
