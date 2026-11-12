@@ -150,7 +150,7 @@ async fn half_closed(half_close: bool) -> (String, bool) {
 /// With `half_close` off (hyper's default), the read EOF drops the service future mid-way: a
 /// half-closed peer gets nothing and the service never finishes. With it on (what `llm.sock`
 /// sets, architect ruling Q14), the service runs to its end and the peer gets the reply.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn half_close_decides_whether_a_half_closed_peer_is_served() {
     let (reply, finished) = half_closed(false).await;
     assert_eq!((reply.as_str(), finished), ("", false));
@@ -241,6 +241,25 @@ async fn hyper_never_reads_an_accepted_head_differently() {
         (format!("\r\n{MODELS}\r\n\r\n"), "ok", true),
         (
             format!("{CHAT}\r\nContent-Length:   2  \r\n\r\n{{}}"),
+            "ok",
+            true,
+        ),
+        // A zero-padded length; an upgrade request (never upgraded: the length still frames
+        // it); an `Expect` (the interim 100 is hyper's, written before the gate opens).
+        (
+            format!("{CHAT}\r\nContent-Length: 002\r\n\r\n{{}}"),
+            "ok",
+            true,
+        ),
+        (
+            format!(
+                "{CHAT}\r\nConnection: Upgrade\r\nUpgrade: h2c\r\nContent-Length: 2\r\n\r\n{{}}"
+            ),
+            "ok",
+            true,
+        ),
+        (
+            format!("{CHAT}\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\n{{}}"),
             "ok",
             true,
         ),

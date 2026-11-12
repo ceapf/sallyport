@@ -80,6 +80,10 @@ line per fact, with where it was found. Check a note again before relying on it 
   service runs to its end and the peer gets the reply, but a read EOF no longer cancels the
   service, so a peer that is gone is noticed only at the first write (#60). (Task 7,
   `hyper_never_answers_a_half_closed_peer`, `half_close_decides_whether_a_half_closed_peer_is_served`)
+- hyper writes the interim `100 Continue` for `Expect: 100-continue` when the service first
+  polls the body. On `llm.sock` that is before the request's entry, so the gate drops it: a
+  client that waits for the 100 sends its body after its own timeout (curl: 1 s) instead.
+  Nothing reaches the peer before the entry. (Task 7 security review)
 - Busybox `wget` (the test image) does not half-close: its requests through the shim are
   answered. (Task 7, `tests/rpc.rs`)
 

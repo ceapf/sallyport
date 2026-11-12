@@ -16,8 +16,19 @@ use crate::rpc::testkit::{Sink, recorder};
 struct Fake {
     calls: AtomicUsize,
     done: AtomicUsize,
+    /// Calls that ended, finished or dropped mid-way (`ended > done`: one was dropped).
+    ended: AtomicUsize,
     release: Notify,
     seen: Mutex<Vec<(String, Map<String, Value>)>>,
+}
+
+/// Counts a call's end, also when it is dropped mid-way.
+struct Ended(Arc<Fake>);
+
+impl Drop for Ended {
+    fn drop(&mut self) {
+        self.0.ended.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 impl ToolHandler for Arc<Fake> {
@@ -32,6 +43,7 @@ impl ToolHandler for Arc<Fake> {
     async fn call(&self, name: String, arguments: Map<String, Value>) -> ToolOutcome {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.seen.lock().unwrap().push((name.clone(), arguments));
+        let _ended = Ended(Arc::clone(self));
         if name == "block" {
             self.release.notified().await;
         }
@@ -149,7 +161,8 @@ async fn the_2026_lifecycle_lists_and_calls_tools() {
     let last = sink.last("rpc.request");
     assert_eq!(
         last,
-        json!({"method": "tools/call", "id": 3, "lifecycle": "2026", "tool": "echo", "arguments": {"a": 1}})
+        json!({"method": "tools/call", "id": 3, "lifecycle": "2026", "tool": "echo",
+               "argument_count": 1, "argument_keys": ["a"], "arguments_bytes": 7})
     );
     assert!(sink.rows()[0].debug.contains("\"sess-a\""));
 }
@@ -568,7 +581,10 @@ async fn the_rate_is_shared_by_a_sessions_connections() {
 
 /// RT-AG-08 (foreign-id clause, ruling Q4): each session's server serves only that session. A
 /// request on A's socket naming B's session id, in params, `_meta` or an extra member, reaches
-/// only A's handler, and every entry carries A's id.
+/// only A's handler, and every entry carries A's id. Nothing here routes by session id, so the
+/// controls this pins are the envelope's member check (message 3), `tools/call`'s parameter
+/// check (message 2) and the recorder's session stamping; B's server is built but not served.
+// TODO(#61): send through Task 12's session registry with B live.
 #[tokio::test]
 async fn rt_ag_08_a_foreign_session_id_reaches_only_its_own_session() {
     let (sink, rec_a) = recorder("sess-a");
@@ -661,6 +677,110 @@ async fn a_peer_with_another_uid_is_refused_and_recorded() {
         json!({"reason": "peer-uid", "uid": me})
     );
     h.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Architect ruling Q16: the request entry names the tool and the arguments' shape, never their
+/// values, so a large body neither lands in the log nor hides the tool behind the writer's
+/// truncation.
+#[tokio::test]
+async fn a_large_call_is_recorded_without_its_values() {
+    let (agent, fake, sink) = setup();
+    let mut c = start(&agent);
+    let secret_ish = "v".repeat(8 * 1024);
+    let r = c
+        .call(&req(
+            1,
+            "tools/call",
+            json!({"name": "echo", "arguments": {"path": "a.md", "content_b64": secret_ish}}),
+        ))
+        .await;
+    assert!(r.get("result").is_some(), "{r}");
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+    let args = sink.last("rpc.request");
+    assert_eq!(args["tool"], json!("echo"));
+    assert_eq!(args["argument_count"], json!(2));
+    assert_eq!(args["argument_keys"], json!(["content_b64", "path"]));
+    assert!(args["arguments_bytes"].as_u64().unwrap() > 8 * 1024);
+    assert!(!args.to_string().contains("vvvv"), "a value was logged");
+}
+
+/// Architect ruling Q16, the worst case: keys, id and tool name made of bytes that escape to
+/// `\xNN` each, and more keys than are named. The entry stays under the writer's cap with room
+/// for redaction to lengthen it, so the tool name is never truncated away.
+#[tokio::test]
+async fn the_worst_case_call_entry_stays_under_the_writer_cap() {
+    let (agent, _, sink) = setup();
+    let mut c = start(&agent);
+    let ugly = |n: usize, tail: char| {
+        let mut s = "\u{1}".repeat(n);
+        s.push(tail);
+        s
+    };
+    let mut arguments = Map::new();
+    for i in 0..LOGGED_KEYS + 4 {
+        let tail = char::from(b'a' + u8::try_from(i).unwrap());
+        arguments.insert(ugly(100, tail), json!(1));
+    }
+    let id = "\u{1}".repeat(crate::rpc::message::MAX_ID_BYTES);
+    let name = "\u{1}".repeat(crate::rpc::mcp::MAX_TOOL_NAME);
+    let msg = json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+                     "params": {"_meta": meta(), "name": name, "arguments": arguments}});
+    let r = c.call(&msg).await;
+    assert!(r.get("result").is_some(), "{r}");
+    let args = sink.last("rpc.request");
+    assert_eq!(args["argument_keys"].as_array().unwrap().len(), LOGGED_KEYS);
+    assert_eq!(args["argument_count"], json!(LOGGED_KEYS + 4));
+    assert!(args["tool"].as_str().unwrap().starts_with("\\x01"));
+    let size = serde_json::to_vec(&args).unwrap().len();
+    assert!(
+        size <= sally_core::audit::MAX_ARGS_BYTES - 512,
+        "{size} bytes"
+    );
+}
+
+/// Architect ruling Q17: session teardown drops in-flight calls. A dropped handle aborts a
+/// blocked call at once and frees its slot; an orderly shutdown waits STOP_GRACE first.
+#[tokio::test(start_paused = true)]
+async fn session_teardown_drops_in_flight_calls() {
+    let dir = std::env::temp_dir().join(format!("sp-agent-down-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir).unwrap();
+    let me = rustix::process::getuid().as_raw();
+    for orderly in [false, true] {
+        let path = dir.join(format!("agent-{orderly}.sock"));
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let (agent, fake, _) = setup();
+        let h = Arc::clone(&agent).listen(listener, me);
+        let mut s = UnixStream::connect(&path).await.unwrap();
+        let mut msg = serde_json::to_vec(&call(1, "block")).unwrap();
+        msg.push(b'\n');
+        s.write_all(&msg).await.unwrap();
+        while fake.calls.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(agent.in_flight.available_permits(), MAX_IN_FLIGHT - 1);
+        if orderly {
+            let down = tokio::spawn(h.shutdown());
+            tokio::time::sleep(listen::STOP_GRACE - Duration::from_millis(100)).await;
+            assert_eq!(
+                fake.ended.load(Ordering::SeqCst),
+                0,
+                "dropped before the grace"
+            );
+            down.await.unwrap();
+        } else {
+            drop(h);
+            tokio::task::yield_now().await;
+        }
+        // The abort is synchronous for the task tree, but give it a turn to unwind.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(fake.ended.load(Ordering::SeqCst), 1, "orderly: {orderly}");
+        assert_eq!(fake.done.load(Ordering::SeqCst), 0, "orderly: {orderly}");
+        assert_eq!(agent.in_flight.available_permits(), MAX_IN_FLIGHT);
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 

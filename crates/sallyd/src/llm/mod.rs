@@ -2,8 +2,8 @@
 
 pub mod body;
 pub mod head;
-pub mod io;
-pub mod reply;
+pub(crate) mod io;
+pub(crate) mod reply;
 pub mod server;
 
 #[cfg(test)]

@@ -30,7 +30,7 @@ pub trait Server: Send + Sync + 'static {
 
 /// The peer's UID, if the kernel reports it.
 #[must_use]
-pub fn peer_uid(stream: &UnixStream) -> Option<u32> {
+pub(crate) fn peer_uid(stream: &UnixStream) -> Option<u32> {
     rustix::net::sockopt::socket_peercred(stream)
         .ok()
         .map(|c| c.uid.as_raw())

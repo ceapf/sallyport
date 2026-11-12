@@ -3,8 +3,8 @@
 
 pub mod agent;
 pub mod control;
-pub mod frame;
-pub mod json;
+pub(crate) mod frame;
+pub(crate) mod json;
 pub mod listen;
 pub mod mcp;
 pub mod message;

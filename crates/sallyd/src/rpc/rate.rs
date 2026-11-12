@@ -29,7 +29,8 @@ impl Rate {
     }
 
     /// Takes one slot if the limit allows it now; whether it did.
-    pub fn allow(&mut self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn allow(&mut self) -> bool {
         self.take().is_ok()
     }
 

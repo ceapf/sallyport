@@ -444,8 +444,8 @@ hand-written in `sallyd::rpc`; no MCP SDK crate is in the TCB.
 | `notifications/initialized` | legacy only: ignored (recorded `rpc.request`) |
 | `ping` | legacy only: empty result |
 | `tools/list` | the session's tools with their JSON schemas; never a cursor (one is `-32602`) |
-| `tools/call` (`name`, `arguments`) | recorded `rpc.request` (tool and arguments, redacted by the audit writer), then dispatched to the tool handler (Task 11; approvals Task 10). Blocks until executed, denied or timed out (`approvals.timeout`); a denial is `isError: true` with text `denied: <code>`. Approval never round-trips through the sandbox |
-| `notifications/cancelled` (`requestId`, `reason?`) | both lifecycles: suppresses the reply of a matching in-flight call (recorded `rpc.cancel` first). The handler is never dropped and keeps its slot until it returns (#54: Task 10 withdraws a pending approval) |
+| `tools/call` (`name`, `arguments`) | recorded `rpc.request` (the tool and the arguments' shape, never their values), then dispatched to the tool handler (Task 11; approvals Task 10), whose own entry carries the tool's fields of §4.3 before the effect (#62). Blocks until executed, denied or timed out (`approvals.timeout`); a denial is `isError: true` with text `denied: <code>`. Approval never round-trips through the sandbox |
+| `notifications/cancelled` (`requestId`, `reason?`) | both lifecycles: suppresses the reply of a matching in-flight call (recorded `rpc.cancel` first). The handler is never dropped by a cancel or a closed connection and keeps its slot until it returns (#54: Task 10 withdraws a pending approval); session teardown aborts it (after `STOP_GRACE`, 2 s, or at once when the listener handle is dropped), so a handler is safe to drop at any await (#62) |
 
 Everything else → `-32601` + `rpc.deny`: resources, prompts, sampling, elicitation, roots,
 logging, subscriptions, tasks, and every control method. The server never sends a request of its
@@ -527,8 +527,9 @@ else `408`). Strict nested allowlist, duplicate keys refused:
   `tool_calls` only on assistant messages, `tool_call_id` only on tool messages; tool and
   function names match `[A-Za-z0-9_-]{1,64}`. `parameters` and `json_schema` are opaque JSON
   (#55).
-- The token limit: `0` or more than `model.context` is `400 token-limit`; absent, the backend is
-  given `model.context` as the bound (always explicit). The M3 fit estimator clamps further.
+- The token limit: more than `model.context` is `400 token-limit`, `0` is `400 bad-value`;
+  absent, the backend is given `model.context` as the bound (always explicit). The M3 fit
+  estimator clamps further.
 
 Refusals are answered `{"error": {"message", "type", "param", "code"}}` (OpenAI's shape) after
 their `llm.deny` entry. **Bounds per session:** 4 connections; 5 requests read per second with a
@@ -787,7 +788,12 @@ sallyport/
   connection closes. Bodies and model output are never logged, only counts and SHA-256; strings
   the peer chose (method, path, field, id) are escaped and cut at 64 bytes (`…(+N)`).
   - `rpc.request` (actor `harness`, decision `allow`): `{method, id, lifecycle}` (`2026` or
-    `legacy`); `tools/call` adds `{tool, arguments}` (redacted by the audit writer).
+    `legacy`); `tools/call` adds `{tool, argument_count, argument_keys, arguments_bytes}` (at
+    most 8 keys, each escaped and cut). Argument values are never recorded by the rpc layer: the
+    tool handler's own entry carries each tool's fields of §4.3 before the effect (#62). The
+    entry is bounded so the writer never truncates it, with 512 bytes to spare because
+    redaction can lengthen a string (`[REDACTED:NAME]`). A tool's entry with no completion
+    entry before the session's stop entry means the call was interrupted by teardown.
   - `rpc.deny` (decision `deny`): `{reason, method?, id?}`; on `control.sock` also `{socket:
     "control"}`; a failed peer check is `{reason: "peer-uid", uid}`. Reasons: `parse-error`,
     `too-deep`, `batch`, `not-object`, `bad-version`, `bad-id`, `bad-method`, `bad-params`,
@@ -804,9 +810,11 @@ sallyport/
     `missing-field`, `too-many`, `too-deep`, `non-text-part`, `n-must-be-1`, `token-limit`,
     `body-error`; 404 `not-found`; 408 `body-timeout`; 411 `length-required`; 413
     `body-too-large`; 431 `head-too-large`; no reply: `head-timeout`, `incomplete-head`,
-    `http-error`, `head-mismatch`, `peer-uid` (`{reason, uid}`).
+    `http-error`, `head-mismatch`, `audit-failed` (an earlier entry of the request could not be
+    written), `peer-uid` (`{reason, uid}`).
   - `llm.response` (detail): `{status, bytes, sha256}` before a whole reply; `{status, stream:
-    true, events, bytes, sha256, cut}` after a stream ends; `{status: 502, reason:
+    true, events, bytes, sha256, cut, peer_gone}` after a stream ends (a peer that is gone ends
+    it at once); `{status: 502, reason:
     "backend-error"}` before a backend failure is answered.
 - **Approval rendering**: escape all C0/C1 controls and `\x1b`, strip Unicode bidi overrides
   (U+202A–U+202E, U+2066–U+2069), NFC-normalize, cap at 2 000 chars with an explicit

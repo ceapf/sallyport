@@ -9,16 +9,17 @@
 //! and recorded `http-error`. Every decision is made on the broker's one parse: a request hyper
 //! reads differently ([`agrees`]) is closed unanswered and recorded `head-mismatch`. The service
 //! reads the body (at most [`body::MAX_BODY`], within [`BODY_TIMEOUT`]), checks it
-//! ([`body::check`]), records `llm.request`, and only then calls the backend. `llm.response` (detail) follows the reply, like `egress.close`. A failed append
-//! closes the connection without a reply or a backend call.
+//! ([`body::check`]), records `llm.request`, and only then calls the backend. `llm.response`
+//! (detail) follows the reply, like `egress.close`. A failed append closes the connection
+//! without a reply or a backend call (recorded `audit-failed` when the log takes it).
 //!
 //! The backend is a constructor argument (Task 7 decision 2). Until M3 none is wired in
 //! production; the scripted mock model lives in the test tree (architect ruling Q3).
 // TODO(#53): Task 12 wires no backend (llm.sock not served) until M3; never the test mock.
 
+use std::fmt::Write as _;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use http_body_util::{BodyExt, Limited};
@@ -96,13 +97,17 @@ enum Route {
     Chat,
 }
 
-/// The connection was closed without a reply (a failed append).
-#[derive(Debug)]
-struct Closed;
+/// The service closed the connection without a reply, and why: `audit-failed` (an entry could
+/// not be written) or `head-mismatch` (hyper read another request than the broker checked).
+#[derive(Debug, Clone, Copy)]
+struct Closed(&'static str);
+
+/// An entry could not be written.
+const AUDIT_FAILED: Closed = Closed("audit-failed");
 
 impl std::fmt::Display for Closed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("closed")
+        write!(f, "closed: {}", self.0)
     }
 }
 
@@ -153,9 +158,16 @@ impl<B: Backend> Llm<B> {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let mut buf = Vec::with_capacity(READ_CHUNK);
-        let h = match tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut stream, &mut buf)).await {
+        let read = tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut stream, &mut buf)).await;
+        if matches!(read, Ok(None)) && buf.is_empty() {
+            // Closed before a byte: no entry, so no token.
+            return;
+        }
+        // Every outcome below writes an entry, a refusal included: each takes a token first, so
+        // the session's log grows at the rate whatever the peer sends (RT-AUD-02).
+        self.throttle().await;
+        let h = match read {
             Err(_) => return self.refuse(&mut stream, None, "head-timeout", None).await,
-            Ok(None) if buf.is_empty() => return,
             Ok(None) => {
                 return self
                     .refuse(&mut stream, None, "incomplete-head", None)
@@ -172,7 +184,6 @@ impl<B: Backend> Llm<B> {
             Ok(Some(Parsed::Complete(h))) => h,
             Ok(Some(Parsed::Partial)) => return,
         };
-        self.throttle().await;
         let route = match (h.method.as_str(), h.path.as_str()) {
             ("GET", "/v1/models") => Route::Models,
             ("POST", "/v1/chat/completions") => Route::Chat,
@@ -202,22 +213,26 @@ impl<B: Backend> Llm<B> {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let gate = Gate::default();
-        let mismatch = Arc::new(AtomicBool::new(false));
+        let closed = Arc::new(OnceLock::new());
         let io = Io::new(prefix, stream, gate.clone(), WRITE_STALL);
-        let (me, g, h, m) = (
+        let (me, g, h, c) = (
             Arc::clone(&self),
             gate.clone(),
             Arc::new(h),
-            Arc::clone(&mismatch),
+            Arc::clone(&closed),
         );
         let svc = service_fn(move |req: hyper::Request<Incoming>| {
-            let (me, g, h, m) = (Arc::clone(&me), g.clone(), Arc::clone(&h), Arc::clone(&m));
+            let (me, g, h, c) = (Arc::clone(&me), g.clone(), Arc::clone(&h), Arc::clone(&c));
             async move {
-                if !agrees(&h, &req) {
-                    m.store(true, Ordering::SeqCst);
-                    return Err(Closed);
+                let served = if agrees(&h, &req) {
+                    me.request(req, route, g).await
+                } else {
+                    Err(Closed("head-mismatch"))
+                };
+                if let Err(Closed(why)) = served {
+                    let _ = c.set(why);
                 }
-                me.request(req, route, g).await
+                served
             }
         });
         // A peer that shuts its write side after its request is still answered (the shim passes
@@ -231,13 +246,9 @@ impl<B: Backend> Llm<B> {
             .serve_connection(TokioIo::new(io), svc)
             .await;
         if !gate.is_open() {
-            // hyper refused the request by itself, or read it differently from the broker; any
-            // reply it wrote was dropped by the gate.
-            let reason = if mismatch.load(Ordering::SeqCst) {
-                "head-mismatch"
-            } else {
-                "http-error"
-            };
+            // The service closed it (its reason), or hyper refused the request by itself
+            // (`http-error`); any reply hyper wrote was dropped by the gate.
+            let reason = closed.get().copied().unwrap_or("http-error");
             let _ = self.deny(reason, None, None, None).await;
         }
     }
@@ -335,7 +346,7 @@ impl<B: Backend> Llm<B> {
         field: Option<&str>,
     ) -> Result<hyper::Response<Out>, Closed> {
         if !self.deny(reason, Some(status), None, field).await {
-            return Err(Closed);
+            return Err(AUDIT_FAILED);
         }
         gate.open();
         Ok(reply::json_response(
@@ -392,7 +403,7 @@ impl<B: Backend> Llm<B> {
         if self.record.append(entry).await {
             Ok(())
         } else {
-            Err(Closed)
+            Err(AUDIT_FAILED)
         }
     }
 
@@ -473,8 +484,18 @@ async fn read_head<S: AsyncRead + Unpin>(stream: &mut S, buf: &mut Vec<u8>) -> O
 /// Forwards a backend stream as server-sent events (cut at [`MAX_RESPONSE`]), then records
 /// `llm.response`.
 async fn pump(mut rx: mpsc::Receiver<Value>, tx: mpsc::Sender<Bytes>, record: Recorder) {
-    let (mut hash, mut sent, mut events, mut cut) = (Sha256::new(), 0usize, 0usize, false);
-    while let Some(v) = rx.recv().await {
+    let (mut hash, mut sent, mut events) = (Sha256::new(), 0usize, 0usize);
+    let (mut cut, mut gone) = (false, false);
+    loop {
+        // A peer that is gone ends the stream at once, not at the backend's next event.
+        let next = tokio::select! {
+            v = rx.recv() => v,
+            () = tx.closed() => None,
+        };
+        let Some(v) = next else {
+            gone = tx.is_closed();
+            break;
+        };
         let e = reply::event(&v);
         if sent.saturating_add(e.len()) > MAX_RESPONSE {
             cut = true;
@@ -484,14 +505,18 @@ async fn pump(mut rx: mpsc::Receiver<Value>, tx: mpsc::Sender<Bytes>, record: Re
         sent = sent.saturating_add(e.len());
         events = events.saturating_add(1);
         if tx.send(e).await.is_err() {
+            gone = true;
             break;
         }
     }
-    if !cut {
+    if !cut && !gone {
         let _ = tx.send(Bytes::from_static(reply::DONE)).await;
     }
-    drop(tx);
-    let summary = json!({"stream": true, "events": events, "bytes": sent, "sha256": hex(&hash.finalize()), "cut": cut});
+    drop((tx, rx));
+    let summary = json!({
+        "stream": true, "events": events, "bytes": sent, "sha256": hex(&hash.finalize()),
+        "cut": cut, "peer_gone": gone,
+    });
     let _ = record.append(response(&record, 200, summary)).await;
 }
 
@@ -511,7 +536,13 @@ fn sha256_hex(data: &[u8]) -> String {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    bytes.iter().fold(
+        String::with_capacity(bytes.len().saturating_mul(2)),
+        |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        },
+    )
 }
 
 #[cfg(test)]

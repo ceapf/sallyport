@@ -3,6 +3,7 @@
 //! the peer chose (a method, a path, a field name, an id) are escaped and cut before they are
 //! written.
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use sally_core::audit::{Actor, NewEntry};
@@ -76,11 +77,11 @@ pub fn escape(raw: &[u8]) -> String {
         if (0x20..0x7f).contains(&b) && b != b'\\' && b != b'"' {
             out.push(char::from(b));
         } else {
-            out.push_str(&format!("\\x{b:02x}"));
+            let _ = write!(out, "\\x{b:02x}");
         }
     }
     if raw.len() > shown.len() {
-        out.push_str(&format!("…(+{})", raw.len() - shown.len()));
+        let _ = write!(out, "…(+{})", raw.len() - shown.len());
     }
     out
 }

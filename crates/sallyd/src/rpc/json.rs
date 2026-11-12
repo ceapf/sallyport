@@ -133,8 +133,9 @@ mod tests {
     fn a_repeated_key_is_refused_at_any_depth() {
         assert!(parse(br#"{"a":1,"a":2}"#).is_err());
         assert!(parse(br#"{"x":[{"a":1,"b":{"c":1,"c":1}}]}"#).is_err());
-        // Escapes that spell the same key are the same key.
-        assert!(parse(br#"{"a":1,"a":2}"#).is_err());
+        // Escapes that spell the same key are the same key (a backslash-u escape of `a`).
+        let escaped = [&br#"{"a":1,""#[..], b"\\", br#"u0061":2}"#].concat();
+        assert!(parse(&escaped).is_err());
         assert!(parse(br#"{"a":1,"A":2}"#).is_ok());
     }
 

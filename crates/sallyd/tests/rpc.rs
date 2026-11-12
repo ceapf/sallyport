@@ -135,7 +135,9 @@ fn meta() -> Value {
 }
 
 /// RT-FS-10 (Task 7 part), from inside the harness: `/run/sallyport` lists exactly the two
-/// sockets, each a socket the harness's user owns with mode 0600.
+/// sockets, each a socket the harness's user owns with mode 0600. This test binds them itself
+/// (with the production `bind`), so "exactly" holds partly by construction.
+// TODO(#61): bind through Task 12's session wiring, and add the ENOENT half of the row.
 async fn sockets_are_exactly_the_two(h: &Harness) {
     let (code, out) = sh(&h.container, "ls -A /run/sallyport").await;
     assert_eq!(code, 0, "{out}");
@@ -279,7 +281,7 @@ fn mock_model_scripts_parse_strictly() {
     for bad in [
         r#"{"content": "hi", "extra": 1}"#,
         r#"{"tool_calls": [{"name": "x"}]}"#,
-        r#"{"tool_calls": [{"name": "x", "arguments": [], }]}"#,
+        r#"{"tool_calls": [{"name": "x", "arguments": []}]}"#,
         r#"{"fail": false}"#,
         r#"{"nothing": 1}"#,
         "[]",

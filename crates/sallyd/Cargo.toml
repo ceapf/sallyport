@@ -16,7 +16,7 @@ httparse = "1.10.1"
 # llm.sock: the HTTP/1.1 server (Task 7 decision 7; architect Q10). Server and http1 only.
 http-body-util = "0.1.5"
 hyper = { version = "1.12.0", default-features = false, features = ["http1", "server"] }
-# TokioIo and TokioTimer for hyper on tokio streams (a hand-written adapter would need unsafe).
+# TokioIo for hyper on tokio streams (a hand-written adapter would need unsafe).
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
 pem = { version = "4.0.0", default-features = false, features = ["std"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring", "zeroize"] }

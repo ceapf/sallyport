@@ -63,7 +63,7 @@ fn setup() -> (Arc<Llm<Arc<Fake>>>, Arc<Fake>, Arc<Sink>) {
     setup_with(Fake::default())
 }
 
-/// Sends `raw`, half-closes, and returns everything the server wrote.
+/// Sends `raw`, keeps the write side open, and returns everything the server wrote.
 async fn exchange(llm: &Arc<Llm<Arc<Fake>>>, raw: &[u8]) -> String {
     let (mut client, server) = tokio::io::duplex(1 << 20);
     let task = tokio::spawn(Arc::clone(llm).serve_stream(server));
@@ -197,6 +197,8 @@ async fn rt_inf_05_other_endpoints_and_parts_never_reach_the_backend() {
         "POST /v1/chat/completions?x=1",
         "OPTIONS *",
         "GET /health",
+        "POST http://x/v1/chat/completions",
+        "CONNECT x:443",
     ] {
         let r = exchange(
             &llm,
@@ -224,16 +226,16 @@ async fn rt_inf_05_other_endpoints_and_parts_never_reach_the_backend() {
     );
     assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
     let d = denies(&sink);
-    assert_eq!(d.len(), 14);
+    assert_eq!(d.len(), 16);
     assert!(
-        d[..12]
+        d[..14]
             .iter()
             .all(|(r, s)| r == "not-found" && *s == json!(404))
     );
     let first = sink.rows()[0].args.clone();
     assert_eq!(first["path"], json!("/v1/completions"));
     assert_eq!(first["method"], json!("POST"));
-    assert_eq!(sink.rows()[13].args["field"], json!("n"));
+    assert_eq!(sink.rows()[15].args["field"], json!("n"));
 }
 
 /// RT-INF-03 on llm.sock (ruling Q4): unknown fields, a huge token limit, a 10 MiB body, `n:
@@ -458,6 +460,20 @@ async fn a_half_closed_client_with_a_short_body_is_refused() {
     assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
 }
 
+/// Bytes after the body (a pipelined second request) are never served: one request per
+/// connection, one backend call (security review).
+#[tokio::test]
+async fn a_pipelined_second_request_is_never_served() {
+    let (llm, fake, sink) = setup();
+    let mut raw = post(&chat(json!({})));
+    raw.extend_from_slice(&post(&chat(json!({}))));
+    let r = exchange(&llm, &raw).await;
+    assert_eq!(status(&r), 200, "{r}");
+    assert_eq!(r.matches("HTTP/1.1").count(), 1, "{r}");
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(sink.events(), ["llm.request", "llm.response"]);
+}
+
 /// A peer that closes both directions right after its request still ends the connection (its
 /// task returns, so its slot is free) and leaves its entry.
 #[tokio::test]
@@ -516,8 +532,9 @@ async fn a_failed_request_entry_means_no_backend_call_and_no_reply() {
     let r = exchange(&llm, &post(&chat(json!({})))).await;
     assert_eq!(r, "", "a reply went out without its entry");
     assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
-    // hyper's own answer was held back by the gate; the close is recorded afterwards.
-    assert_eq!(denies(&sink), [("http-error".to_owned(), Value::Null)]);
+    // hyper's own answer was held back by the gate; the close is recorded afterwards, as the
+    // failed append it was.
+    assert_eq!(denies(&sink), [("audit-failed".to_owned(), Value::Null)]);
     sink.set_failing(true);
     for raw in [
         &post(&chat(json!({"n": 2})))[..],
@@ -545,6 +562,30 @@ async fn requests_are_read_at_the_session_rate() {
         "{took:?}"
     );
     assert_eq!(sink.rows().len(), n as usize);
+}
+
+/// RT-AUD-02 on llm.sock: a flood of heads the broker refuses is read at the session rate too,
+/// so the refusals' entries grow at most at BURST + RATE per second.
+#[tokio::test(start_paused = true)]
+async fn rt_aud_02_a_flood_of_bad_heads_is_read_at_the_session_rate() {
+    let (llm, _, sink) = setup();
+    let started = tokio::time::Instant::now();
+    let n = 20u32;
+    for raw in [&b"GARBAGE\r\n\r\n"[..], b"GET /v1/models HTTP/1.0\r\n\r\n"]
+        .iter()
+        .cycle()
+        .take(n as usize)
+    {
+        let r = exchange(&llm, raw).await;
+        assert_eq!(status(&r), 400, "{r}");
+    }
+    let took = started.elapsed();
+    let expect = Duration::from_secs(u64::from((n - BURST) / RATE));
+    assert!(
+        took >= expect && took < expect + Duration::from_millis(100),
+        "{took:?}"
+    );
+    assert_eq!(denies(&sink).len(), n as usize);
 }
 
 #[tokio::test]
@@ -705,7 +746,7 @@ async fn a_request_hyper_reads_differently_is_closed_unanswered_and_recorded() {
 #[test]
 fn the_reply_cap_is_16_mib_and_a_close_names_itself() {
     assert_eq!(MAX_RESPONSE, 16_777_216);
-    assert_eq!(Closed.to_string(), "closed");
+    assert_eq!(AUDIT_FAILED.to_string(), "closed: audit-failed");
 }
 
 #[tokio::test]
@@ -752,6 +793,27 @@ async fn pumped(sizes: &[usize]) -> (Value, Vec<Bytes>) {
     }
     task.await.unwrap();
     (sink.last("llm.response"), out)
+}
+
+/// A peer that goes away while the backend is idle ends the stream at once (rust review L5):
+/// the pump does not wait for the backend's next event, and records the peer as gone.
+#[tokio::test]
+async fn a_stream_ends_when_its_peer_is_gone() {
+    let (sink, rec) = recorder("sess-a");
+    let (events_tx, events_rx) = mpsc::channel(1);
+    let (tx, rx) = mpsc::channel(4);
+    let task = tokio::spawn(pump(events_rx, tx, rec));
+    drop(rx);
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("the pump waited for the backend")
+        .unwrap();
+    let resp = sink.last("llm.response");
+    assert_eq!(
+        (resp["peer_gone"].clone(), resp["events"].clone()),
+        (json!(true), json!(0))
+    );
+    drop(events_tx);
 }
 
 #[tokio::test]

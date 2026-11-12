@@ -12,10 +12,12 @@
 //!   notifications are recorded and get no reply. An oversize frame is recorded, answered and
 //!   the connection closed.
 //! - Every allowed request is recorded (`rpc.request`) before it is served; `tools/call` records
-//!   the tool and its arguments before the handler runs. A failed append closes the connection
-//!   without a reply or a dispatch.
-//! - A cancel never stops a handler: the call runs to its end (so its own audit entries are
-//!   written) and only its reply is suppressed. Its in-flight slot is held until it returns.
+//!   the tool and the shape of its arguments (never their values, architect ruling Q16) before
+//!   the handler runs. A failed append closes the connection without a reply or a dispatch.
+//! - A cancel or a closed connection never drops a call: it runs to its end (so its own audit
+//!   entries are written) and only its reply is suppressed. Its in-flight slot is held until it
+//!   returns. Session teardown does drop calls: after [`listen::STOP_GRACE`]
+//!   (`Handle::shutdown`) or at once (the `Handle` dropped) (architect ruling Q17).
 //! - The broker never sends a request; replies are the only messages it writes.
 
 use std::collections::HashMap;
@@ -54,6 +56,8 @@ pub const MAX_CONNECTIONS: usize = 8;
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Replies queued per connection before the reader waits for the writer.
 const OUTBOX: usize = 32;
+/// Argument keys a `tools/call` entry names, at most (architect ruling Q16).
+pub const LOGGED_KEYS: usize = 8;
 
 /// What `tools/call` dispatches to (Task 7 decision 4): the built-in tools (Task 11) behind
 /// policy and approvals (Task 10). It owns every decision about a tool, including unknown and
@@ -61,8 +65,17 @@ const OUTBOX: usize = 32;
 pub trait ToolHandler: Send + Sync + 'static {
     /// The session's tools, as `tools/list` returns them.
     fn tools(&self) -> Vec<Tool>;
-    /// Runs one call to its end. It must audit its own effects; it is never dropped mid-way by
-    /// this server.
+    /// Runs one call. It must write its own effect entry (each tool's fields, ARCHITECTURE §4.3)
+    /// before the effect or the denial reply, at every `audit.level`: the `rpc.request` entry
+    /// carries no argument values.
+    ///
+    /// A cancel or a closed connection never drops a call. Session teardown does: after
+    /// [`listen::STOP_GRACE`] (`Handle::shutdown`) or at once (the `Handle` dropped). So a
+    /// handler must be safe to drop at any await. A drop before the effect starts means nothing
+    /// ran (a dropped approval wait is a deny); a drop after it started may leave the effect
+    /// finished with no completion entry (blocking work is not abortable), so the entry comes
+    /// first.
+    // TODO(#62): the Task 10/11 handlers meet this contract.
     fn call(
         &self,
         name: String,
@@ -150,7 +163,8 @@ impl<T: ToolHandler> Agent<T> {
                 break;
             }
         }
-        // Dispatched calls run to their end (ruling Q7); then the writer drains and closes.
+        // Dispatched calls run to their end, though the peer is gone (rulings Q7, Q17; only
+        // session teardown aborts them); then the writer drains and closes.
         let Conn { out, mut tasks, .. } = conn;
         drop(out);
         while tasks.join_next().await.is_some() {}
@@ -256,13 +270,7 @@ impl<T: ToolHandler> Agent<T> {
         let entry = self
             .record
             .entry(Actor::Harness, "rpc.request", Some("allow"))
-            .args(json!({
-                "method": "tools/call",
-                "id": logged_id(&id),
-                "lifecycle": era.as_str(),
-                "tool": escape(name.as_bytes()),
-                "arguments": Value::Object(arguments.clone()),
-            }));
+            .args(call_args(&id, era, &name, &arguments));
         if !self.record.append(entry).await {
             return false;
         }
@@ -300,7 +308,9 @@ impl<T: ToolHandler> Agent<T> {
     }
 
     /// Marks an in-flight call cancelled (its reply is then suppressed). Unknown or finished ids
-    /// are ignored.
+    /// are ignored. A call that finishes while the `rpc.cancel` entry is being written has its
+    /// reply queued already: the log then shows a cancel that came too late to suppress it,
+    /// which the cancellation spec allows (a cancel is best effort; the reply may still arrive).
     // TODO(#54): Task 10 withdraws a call's pending approval here, through the handler's API.
     async fn cancel(&self, request: &Id, conn: &Conn) -> bool {
         if lock(&conn.pending).get(request) != Some(&false) {
@@ -390,6 +400,28 @@ fn lock<V>(m: &Mutex<V>) -> std::sync::MutexGuard<'_, V> {
 }
 
 /// An id as an audit entry shows it: a number as is, a string escaped and cut.
+/// The `rpc.request` arguments of a `tools/call` (architect ruling Q16): which tool, and the
+/// shape of its arguments, never their values. The handler's own entry carries each tool's
+/// fields (ARCHITECTURE §4.3) before its effect. Bounded so the writer never truncates it: at
+/// most [`LOGGED_KEYS`] keys, each escaped and cut like every peer string.
+fn call_args(id: &Id, era: Era, name: &str, arguments: &Map<String, Value>) -> Value {
+    let keys: Vec<String> = arguments
+        .keys()
+        .take(LOGGED_KEYS)
+        .map(|k| escape(k.as_bytes()))
+        .collect();
+    let bytes = serde_json::to_vec(arguments).map_or(0, |b| b.len());
+    json!({
+        "method": "tools/call",
+        "id": logged_id(id),
+        "lifecycle": era.as_str(),
+        "tool": escape(name.as_bytes()),
+        "argument_count": arguments.len(),
+        "argument_keys": keys,
+        "arguments_bytes": bytes,
+    })
+}
+
 fn logged_id(id: &Id) -> Value {
     match id {
         Id::Num(n) => Value::from(*n),
@@ -399,7 +431,7 @@ fn logged_id(id: &Id) -> Value {
 
 /// A JSON-RPC error object with the stable reason in `data`.
 #[must_use]
-pub fn error_object(code: i64, reason: &str) -> Value {
+pub(crate) fn error_object(code: i64, reason: &str) -> Value {
     let message = match code {
         PARSE_ERROR => "Parse error",
         INVALID_REQUEST => "Invalid Request",
@@ -413,13 +445,13 @@ pub fn error_object(code: i64, reason: &str) -> Value {
 
 /// A success reply, as one line.
 #[must_use]
-pub fn success(id: &Id, result: Value) -> Vec<u8> {
+pub(crate) fn success(id: &Id, result: Value) -> Vec<u8> {
     line(&json!({"jsonrpc": "2.0", "id": id.to_value(), "result": result}))
 }
 
 /// An error reply, as one line; `id` is `null` when the request's could not be read.
 #[must_use]
-pub fn failure(id: Option<&Id>, error: Value) -> Vec<u8> {
+pub(crate) fn failure(id: Option<&Id>, error: Value) -> Vec<u8> {
     let id = id.map_or(Value::Null, Id::to_value);
     line(&json!({"jsonrpc": "2.0", "id": id, "error": error}))
 }
