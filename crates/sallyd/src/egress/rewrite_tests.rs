@@ -25,7 +25,12 @@ fn uri(s: &str) -> Uri {
 }
 
 fn req(pairs: &[(&str, &str)]) -> Result<Request, Reason> {
+    req_with(&Method::GET, pairs)
+}
+
+fn req_with(method: &Method, pairs: &[(&str, &str)]) -> Result<Request, Reason> {
     request(
+        method,
         Version::HTTP_11,
         &uri("/x?y=1"),
         &heads(pairs),
@@ -52,6 +57,7 @@ fn ordinary_headers_pass_and_host_is_rebuilt() {
     assert_eq!(out.headers.get_all("accept").iter().count(), 2);
     assert_eq!(out.length, None);
     let at8443 = request(
+        &Method::GET,
         Version::HTTP_11,
         &uri("/"),
         &heads(&[("host", "api.mock.test:8443")]),
@@ -111,14 +117,14 @@ fn only_origin_form_http_1_1_is_accepted() {
     let a = at("api.mock.test", 443);
     for target in ["http://api.mock.test/x", "api.mock.test:443", "*"] {
         assert_eq!(
-            request(Version::HTTP_11, &uri(target), &h, &a, &[]),
+            request(&Method::GET, Version::HTTP_11, &uri(target), &h, &a, &[]),
             Err(Reason::Malformed),
             "{target}"
         );
     }
     for v in [Version::HTTP_10, Version::HTTP_09, Version::HTTP_2] {
         assert_eq!(
-            request(v, &uri("/"), &h, &a, &[]),
+            request(&Method::GET, v, &uri("/"), &h, &a, &[]),
             Err(Reason::Malformed),
             "{v:?}"
         );
@@ -206,8 +212,45 @@ fn expect_is_absent_or_one_100_continue() {
     }
 }
 
+/// Architect ruling R6 (9a-2 review): ordinary methods pass; `TRACE` would echo the request
+/// (and, from 9a-3, an injected credential) back into the sandbox; `CONNECT` inside a tunnel is
+/// not a request this proxy forwards. Matched ASCII case-insensitively, since an upstream may be.
 #[test]
-fn checks_run_in_order_malformed_before_mismatch_before_upgrade() {
+fn trace_is_refused_and_connect_is_malformed() {
+    let host = [("host", "api.mock.test")];
+    for ok in [
+        "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "PROPFIND",
+    ] {
+        let m = Method::from_bytes(ok.as_bytes()).unwrap();
+        assert!(req_with(&m, &host).is_ok(), "{ok}");
+    }
+    for trace in ["TRACE", "trace", "Trace"] {
+        let m = Method::from_bytes(trace.as_bytes()).unwrap();
+        assert_eq!(req_with(&m, &host), Err(Reason::MethodRefused), "{trace}");
+    }
+    for connect in ["CONNECT", "connect"] {
+        let m = Method::from_bytes(connect.as_bytes()).unwrap();
+        assert_eq!(req_with(&m, &host), Err(Reason::Malformed), "{connect}");
+    }
+}
+
+#[test]
+fn checks_run_in_order_malformed_before_mismatch_before_method_before_upgrade() {
+    assert_eq!(
+        req_with(&Method::CONNECT, &[("host", "other.mock.test")]),
+        Err(Reason::Malformed)
+    );
+    assert_eq!(
+        req_with(&Method::TRACE, &[("host", "other.mock.test")]),
+        Err(Reason::HostMismatch)
+    );
+    assert_eq!(
+        req_with(
+            &Method::TRACE,
+            &[("host", "api.mock.test"), ("upgrade", "h2c")]
+        ),
+        Err(Reason::MethodRefused)
+    );
     assert_eq!(
         req(&[("host", "other.mock.test"), ("upgrade", "h2c")]),
         Err(Reason::HostMismatch)
@@ -222,24 +265,61 @@ fn checks_run_in_order_malformed_before_mismatch_before_upgrade() {
     );
 }
 
+/// The hop-by-hop headers every response loses (9a-2 review R4: this fixture used to carry both
+/// `Content-Length` and `Transfer-Encoding`, the ambiguous framing that is now refused).
+const HOP_BY_HOP: [(&str, &str); 7] = [
+    ("connection", "close, x-named"),
+    ("x-named", "1"),
+    ("keep-alive", "timeout=5"),
+    ("proxy-authenticate", "Basic"),
+    ("trailer", "x-t"),
+    ("te", "trailers"),
+    ("location", "https://other.mock.test/"),
+];
+
 #[test]
 fn identity_responses_pass_without_hop_by_hop_headers() {
-    let h = heads(&[
-        ("content-type", "text/plain"),
-        ("content-length", "5"),
-        ("connection", "close, x-named"),
-        ("x-named", "1"),
-        ("keep-alive", "timeout=5"),
-        ("proxy-authenticate", "Basic"),
-        ("trailer", "x-t"),
-        ("te", "trailers"),
-        ("transfer-encoding", "chunked"),
-        ("location", "https://other.mock.test/"),
-    ]);
-    let out = response(StatusCode::FOUND, &h).unwrap();
+    let mut by_length = vec![("content-type", "text/plain"), ("content-length", "5")];
+    by_length.extend_from_slice(&HOP_BY_HOP);
+    let out = response(StatusCode::FOUND, &heads(&by_length)).unwrap();
     assert_eq!(names(&out), ["content-type", "content-length", "location"]);
+    let mut chunked = vec![
+        ("content-type", "text/plain"),
+        ("transfer-encoding", "chunked"),
+    ];
+    chunked.extend_from_slice(&HOP_BY_HOP);
+    let out = response(StatusCode::FOUND, &heads(&chunked)).unwrap();
+    assert_eq!(names(&out), ["content-type", "location"]);
     let identity = heads(&[("content-encoding", "Identity")]);
     assert!(response(StatusCode::OK, &identity).is_ok());
+}
+
+/// Architect ruling R4 (9a-2 review): a response framed two ways, or with two lengths, is
+/// `upstream-malformed`; an encoding refusal comes first.
+#[test]
+fn ambiguous_response_framing_is_upstream_malformed() {
+    let bad: [&[(&str, &str)]; 6] = [
+        &[("transfer-encoding", "chunked"), ("content-length", "5")],
+        &[("content-length", "5"), ("content-length", "5")],
+        &[("content-length", "5"), ("content-length", "6")],
+        &[("content-length", "5, 5")],
+        &[("content-length", "+5")],
+        &[("content-length", "")],
+    ];
+    for h in bad {
+        assert_eq!(
+            response(StatusCode::OK, &heads(h)),
+            Err(Reason::UpstreamMalformed),
+            "{h:?}"
+        );
+    }
+    assert_eq!(
+        response(
+            StatusCode::OK,
+            &heads(&[("transfer-encoding", "gzip"), ("content-length", "5")])
+        ),
+        Err(Reason::UpstreamEncoded)
+    );
 }
 
 #[test]

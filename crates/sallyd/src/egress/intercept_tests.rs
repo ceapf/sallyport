@@ -48,6 +48,17 @@ fn canned(req: &str) -> Option<String> {
                 .into()
         }
         "/garbage" => "NOT HTTP AT ALL\r\n\r\n".into(),
+        // Framed two ways, or with two lengths (architect ruling R4).
+        "/te-cl" => "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 6\r\n\r\n\
+                     6\r\nSMUGGL\r\n0\r\n\r\n"
+            .into(),
+        "/cl-twice" => {
+            "HTTP/1.1 200 OK\r\nContent-Length: 6\r\nContent-Length: 6\r\n\r\nSMUGGL".into()
+        }
+        "/cl-differ" => {
+            "HTTP/1.1 200 OK\r\nContent-Length: 6\r\nContent-Length: 7\r\n\r\nSMUGGL".into()
+        }
+        "/cl-list" => "HTTP/1.1 200 OK\r\nContent-Length: 6, 6\r\n\r\nSMUGGL".into(),
         "/bighead" => format!(
             "HTTP/1.1 200 OK\r\nX-Big: {}\r\nContent-Length: 0\r\n\r\n",
             "a".repeat(MAX_RESPONSE_HEAD + 1)
@@ -611,6 +622,38 @@ async fn heads_the_proxy_cannot_forward_as_they_are_are_400() {
 async fn upgrades_are_refused_403() {
     let raw = get("/ws", "Connection: Upgrade\r\nUpgrade: websocket\r\n");
     refused_inside(&raw, "403", "egress.deny", "upgrade-refused").await;
+}
+
+/// Architect ruling R6: `TRACE` is refused 405, `CONNECT` inside a tunnel is malformed; neither
+/// reaches the upstream.
+#[tokio::test]
+async fn trace_and_connect_never_reach_the_upstream() {
+    let trace = format!("TRACE /echo HTTP/1.1\r\nHost: {HOST}\r\n\r\n");
+    refused_inside(&trace, "405", "egress.deny", "method-refused").await;
+    for target in [format!("{HOST}:443"), "/".to_owned()] {
+        let connect = format!("CONNECT {target} HTTP/1.1\r\nHost: {HOST}\r\n\r\n");
+        refused_inside(&connect, "400", "egress.deny", "malformed").await;
+    }
+}
+
+/// Architect ruling R4: a response framed two ways, or with two `Content-Length` lines, is 502
+/// `upstream-malformed` and none of its body reaches the client. Pins what hyper's client does
+/// with duplicate lengths: equal ones (two lines, or one `6, 6` list) reach `rewrite::response`
+/// and are refused there; differing ones fail hyper's own parse (the Q45 path).
+#[tokio::test]
+async fn an_ambiguously_framed_response_is_502_and_never_forwarded() {
+    for path in ["/te-cl", "/cl-twice", "/cl-differ", "/cl-list"] {
+        let r = rig(Opts::default());
+        let out = r.talk(&get(path, "")).await;
+        assert!(out.starts_with("HTTP/1.1 502 "), "{path}: {out}");
+        assert!(out.ends_with("upstream-malformed\n"), "{path}: {out}");
+        assert!(!out.contains("SMUGGL"), "{path}: {out}");
+        assert_eq!(
+            r.sink.args("egress.deny")["reason"],
+            json!("upstream-malformed"),
+            "{path}"
+        );
+    }
 }
 
 #[tokio::test]

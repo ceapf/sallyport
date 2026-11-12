@@ -8,7 +8,7 @@
 //! what the proxy adds.
 
 use hyper::http::header::{self, HeaderMap, HeaderName, HeaderValue};
-use hyper::http::{StatusCode, Uri, Version};
+use hyper::http::{Method, StatusCode, Uri, Version};
 
 use super::authority::{self, Authority, HostHeaderError};
 use super::policy::Reason;
@@ -56,20 +56,26 @@ pub struct Request {
 /// `grants` are the lower-case header names of the host's secret grants.
 ///
 /// # Errors
-/// [`Reason::Malformed`] (not HTTP/1.1, a target other than origin-form, no or several `Host`,
-/// bad framing, an `Expect` other than `100-continue`), [`Reason::HostMismatch`],
-/// [`Reason::UpgradeRefused`].
+/// In this order: [`Reason::Malformed`] for the request line (`CONNECT`, not HTTP/1.1, a target
+/// other than origin-form); [`Reason::Malformed`] or [`Reason::HostMismatch`] for `Host` (absent,
+/// several, or naming another authority); [`Reason::MethodRefused`] for `TRACE`;
+/// [`Reason::UpgradeRefused`]; [`Reason::Malformed`] for bad framing or an `Expect` other than
+/// `100-continue`. Methods match ASCII case-insensitively.
 pub fn request(
+    method: &Method,
     version: Version,
     uri: &Uri,
     headers: &HeaderMap,
     connect: &Authority,
     grants: &[String],
 ) -> Result<Request, Reason> {
-    if version != Version::HTTP_11 || !origin_form(uri) {
+    if is_method(method, &Method::CONNECT) || version != Version::HTTP_11 || !origin_form(uri) {
         return Err(Reason::Malformed);
     }
     check_host(headers, connect)?;
+    if is_method(method, &Method::TRACE) {
+        return Err(Reason::MethodRefused);
+    }
     if asks_upgrade(headers) {
         return Err(Reason::UpgradeRefused);
     }
@@ -97,9 +103,14 @@ pub fn request(
 
 /// Checks a response head from the upstream and builds the one sent to the client.
 ///
+/// The client always gets a head without `Transfer-Encoding`: hyper's server frames the body.
+///
 /// # Errors
 /// [`Reason::UpstreamEncoded`] for `101`, a `Content-Encoding` other than absent or one
-/// `identity`, or a `Transfer-Encoding` other than absent or one `chunked` (Q30).
+/// `identity`, or a `Transfer-Encoding` other than absent or one `chunked` (Q30); then
+/// [`Reason::UpstreamMalformed`] for `Transfer-Encoding` beside `Content-Length`, or a
+/// `Content-Length` other than one decimal value (two lines, or a list such as `6, 6`, which
+/// hyper accepts when the values agree: architect ruling R4, 9a-2 review).
 pub fn response(status: StatusCode, headers: &HeaderMap) -> Result<HeaderMap, Reason> {
     if status == StatusCode::SWITCHING_PROTOCOLS || headers.contains_key(header::UPGRADE) {
         return Err(Reason::UpstreamEncoded);
@@ -108,6 +119,11 @@ pub fn response(status: StatusCode, headers: &HeaderMap) -> Result<HeaderMap, Re
         || !at_most_one_equal(headers, &header::TRANSFER_ENCODING, "chunked")
     {
         return Err(Reason::UpstreamEncoded);
+    }
+    if headers.contains_key(header::CONTENT_LENGTH)
+        && (declared_length(headers).is_none() || headers.contains_key(header::TRANSFER_ENCODING))
+    {
+        return Err(Reason::UpstreamMalformed);
     }
     let named = connection_tokens(headers);
     let mut out = HeaderMap::with_capacity(headers.len());
@@ -147,6 +163,12 @@ fn origin_form(uri: &Uri) -> bool {
         && uri
             .path_and_query()
             .is_some_and(|p| p.as_str().starts_with('/'))
+}
+
+/// Whether `method` is `want`, ASCII case-insensitively (an upstream may treat `trace` as
+/// `TRACE`).
+fn is_method(method: &Method, want: &Method) -> bool {
+    method.as_str().eq_ignore_ascii_case(want.as_str())
 }
 
 /// Exactly one `Host`, naming the CONNECT authority (Q29).

@@ -617,7 +617,7 @@ sequenceDiagram
     E-->>P: 200 Connection Established (only after upstream verification)
     P->>E: TLS (session-CA leaf for api.github.com, ALPN http/1.1)
     P->>E: GET /user (HTTP/1.1)
-    E->>E: check head (origin-form, one Host = CONNECT authority, no Upgrade, framing)
+    E->>E: check head (origin-form, one Host = CONNECT authority, no TRACE, no Upgrade, framing)
     E->>E: drop hop-by-hop, Proxy-*, Accept-Encoding, every client Authorization; rebuild Host
     E->>E: audit egress.request {host, port, method, target, injected}
     Note over E: 9a-3: set Authorization from the secret (last), only with response redaction
@@ -794,7 +794,8 @@ sallyport/
     session-CA leaf for: never spliced), `upgrade-refused`; 502 `resolve-failed`,
     `connect-failed`, `upstream-tls-failed`, `upstream-encoded`, `upstream-malformed`,
     `upstream-closed`, `response-too-large`; 405 `plain-http-unsupported`; 413
-    `request-too-large`; 421 `host-mismatch`; 429 `too-many-connections`; 431 `head-too-large`;
+    `request-too-large`; 405 `method-refused` (`TRACE` inside a tunnel); 421 `host-mismatch`;
+    429 `too-many-connections`; 431 `head-too-large`;
     `head-timeout` (no reply); 400 `malformed`. Replies never echo the target; in-tunnel replies
     carry `Connection: close` and end the tunnel.
 - **Interception** (Task 9a-2, `egress::server::intercept`, `egress::rewrite`; lane decisions
@@ -805,10 +806,12 @@ sallyport/
   session-CA leaf, ALPN `http/1.1` only), then HTTP/1.1 through hyper: one upstream connection
   per tunnel, used for one request at a time, never pooled or replayed; an upstream close between
   requests ends the tunnel (`closed`).
-  - Request head rules, in order: (1) check as received — HTTP/1.1, origin-form target only
-    (absolute, authority and `*` forms are 400 `malformed`), exactly one `Host`, normalized
-    like a CONNECT target and naming the CONNECT host (port omitted only when the CONNECT port is
-    443), else 421 `host-mismatch` (400 if unparsable); any `Upgrade`, `HTTP2-Settings` or
+  - Request head rules, in order: (1) check as received — not `CONNECT`, HTTP/1.1, origin-form
+    target only (absolute, authority and `*` forms are 400 `malformed`), exactly one `Host`,
+    normalized like a CONNECT target and naming the CONNECT host (port omitted only when the
+    CONNECT port is 443), else 421 `host-mismatch` (400 if unparsable); `TRACE` is 405
+    `method-refused` (`egress.deny`: it would echo the request, and from 9a-3 its credential,
+    back into the sandbox); methods match ASCII case-insensitively; any `Upgrade`, `HTTP2-Settings` or
     `Connection: upgrade` is 403 `upgrade-refused`; `Transfer-Encoding` absent or one field that
     is case-insensitively `chunked`, never beside `Content-Length`, which is at most one decimal
     value; `Expect` absent or `100-continue`; (2) drop `Connection` and every header it names,
@@ -822,8 +825,10 @@ sallyport/
     Q51; such a request counts as chunked for the cap).
   - Response rules: `101`, any `Upgrade`, a `Content-Encoding` other than absent or one
     `identity`, or a `Transfer-Encoding` other than absent or one `chunked` is 502
-    `upstream-encoded` and the body is never forwarded (Q30); an unparsable head is 502
-    `upstream-malformed`. `Connection` and what it names, `Keep-Alive`, `Proxy-*`, `TE`,
+    `upstream-encoded` and the body is never forwarded (Q30); an unparsable head, a
+    `Transfer-Encoding` beside a `Content-Length`, or a `Content-Length` other than one decimal
+    value (two lines, or a list such as `6, 6`, which hyper's client accepts when the values agree)
+    is 502 `upstream-malformed`, body never forwarded (9a-2 review R4). `Connection` and what it names, `Keep-Alive`, `Proxy-*`, `TE`,
     `Trailer`, `Transfer-Encoding` and `Upgrade` are dropped. Redirects are returned, never
     followed. Trailers are never forwarded in either direction.
   - Limits: 100 headers either way. Head size, exact: a request head (request line and blank

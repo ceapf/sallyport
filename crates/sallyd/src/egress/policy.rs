@@ -42,6 +42,9 @@ pub enum Reason {
     HostMismatch,
     /// In an intercepted tunnel: the request asks for a protocol upgrade (decision 5).
     UpgradeRefused,
+    /// In an intercepted tunnel: the method is `TRACE`, which would echo the request back
+    /// (architect ruling R6, 9a-2 review).
+    MethodRefused,
     /// In an intercepted tunnel: the request body is over `network.max_request_bytes`.
     RequestTooLarge,
     /// In an intercepted tunnel: the response body is over `network.max_response_bytes`, or its
@@ -77,6 +80,7 @@ impl Reason {
             Self::Malformed => "malformed",
             Self::HostMismatch => "host-mismatch",
             Self::UpgradeRefused => "upgrade-refused",
+            Self::MethodRefused => "method-refused",
             Self::RequestTooLarge => "request-too-large",
             Self::ResponseTooLarge => "response-too-large",
             Self::UpstreamEncoded => "upstream-encoded",
@@ -104,7 +108,7 @@ impl Reason {
             | Self::UpstreamTlsFailed
             | Self::UpstreamClosed
             | Self::UpstreamMalformed => 502,
-            Self::PlainHttpUnsupported => 405,
+            Self::PlainHttpUnsupported | Self::MethodRefused => 405,
             Self::TooManyConnections => 429,
             Self::HeadTooLarge => 431,
             Self::HeadTimeout => 408,
@@ -419,6 +423,7 @@ mod tests {
             (Malformed, "malformed", 400, false),
             (HostMismatch, "host-mismatch", 421, false),
             (UpgradeRefused, "upgrade-refused", 403, false),
+            (MethodRefused, "method-refused", 405, false),
             (RequestTooLarge, "request-too-large", 413, true),
             (ResponseTooLarge, "response-too-large", 502, true),
             (UpstreamEncoded, "upstream-encoded", 502, false),

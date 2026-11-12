@@ -4,13 +4,16 @@
 //! Invariants: never panics. An accepted request head carries exactly one `Host`, equal to the
 //! one rebuilt from the CONNECT authority; no dropped header survives (hop-by-hop, `Proxy-*`,
 //! `Accept-Encoding`, `Expect`, the grant header, anything `Connection` names); never both
-//! framing headers (in fact neither: the proxy's client frames the body). An accepted response
-//! head has no hop-by-hop header, no `Proxy-*` and no framing header but `Content-Length`.
+//! framing headers (in fact neither: the proxy's client frames the body); never `TRACE` or
+//! `CONNECT`. An accepted response head has no hop-by-hop header, no `Proxy-*` and no framing
+//! header but at most one `Content-Length`, and its input was never framed two ways (`Content-
+//! Length` beside `Transfer-Encoding`, or a `Content-Length` other than one decimal value:
+//! architect ruling R4).
 #![no_main]
 #![forbid(unsafe_code)]
 
 use hyper::http::header::{HeaderMap, HeaderName, HeaderValue};
-use hyper::http::{StatusCode, Uri, Version};
+use hyper::http::{Method, StatusCode, Uri, Version};
 use libfuzzer_sys::fuzz_target;
 use sallyd::egress::authority::{self, Authority};
 use sallyd::egress::rewrite;
@@ -42,7 +45,10 @@ fn check_request(data: &[u8], connect: &Authority) {
     let Ok(httparse::Status::Complete(_)) = req.parse(data) else {
         return;
     };
-    let (Some(path), Some(minor)) = (req.path, req.version) else {
+    let (Some(method), Some(path), Some(minor)) = (req.method, req.path, req.version) else {
+        return;
+    };
+    let Ok(method) = Method::from_bytes(method.as_bytes()) else {
         return;
     };
     let Ok(uri) = path.parse::<Uri>() else {
@@ -52,9 +58,15 @@ fn check_request(data: &[u8], connect: &Authority) {
         return;
     };
     let version = if minor == 1 { Version::HTTP_11 } else { Version::HTTP_10 };
-    let Ok(out) = rewrite::request(version, &uri, &input, connect, &[GRANT.to_owned()]) else {
+    let Ok(out) = rewrite::request(&method, version, &uri, &input, connect, &[GRANT.to_owned()])
+    else {
         return;
     };
+    let m = method.as_str();
+    assert!(
+        !m.eq_ignore_ascii_case("TRACE") && !m.eq_ignore_ascii_case("CONNECT"),
+        "{m} accepted"
+    );
     let hosts: Vec<_> = out.headers.get_all("host").iter().collect();
     assert_eq!(hosts.len(), 1, "not exactly one Host");
     assert_eq!(hosts[0].as_bytes(), authority::upstream_host(connect).as_bytes());
@@ -91,6 +103,14 @@ fn check_response(data: &[u8]) {
         return;
     };
     assert_ne!(status, StatusCode::SWITCHING_PROTOCOLS);
+    let lengths: Vec<_> = input.get_all("content-length").iter().collect();
+    assert!(lengths.len() <= 1, "{} Content-Length accepted", lengths.len());
+    if let Some(cl) = lengths.first() {
+        assert!(!input.contains_key("transfer-encoding"), "Content-Length beside Transfer-Encoding");
+        let b = cl.as_bytes();
+        assert!(!b.is_empty() && b.iter().all(u8::is_ascii_digit), "Content-Length {cl:?} accepted");
+    }
+    assert!(out.get_all("content-length").iter().count() <= 1);
     for name in out.keys() {
         let n = name.as_str();
         assert!(

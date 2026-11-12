@@ -491,6 +491,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         let (parts, body) = req.into_parts();
         let target = parts.uri.to_string();
         let head = match rewrite::request(
+            &parts.method,
             parts.version,
             &parts.uri,
             &parts.headers,
