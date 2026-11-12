@@ -936,6 +936,43 @@ async fn a_failed_request_entry_closes_without_a_reply_or_an_upstream_request() 
     assert_eq!(r.sink.args("egress.close")["end"], json!("error"));
 }
 
+/// Architect ruling RQ2: a body-cap `egress.limit` that could not be written ends the tunnel
+/// `error` with no reply. The request side would otherwise answer 413 and end `limit` with no
+/// entry behind either.
+#[tokio::test]
+async fn a_failed_request_limit_entry_ends_error_without_a_413() {
+    let r = rig(Opts {
+        fail_on: Some("egress.limit"),
+        ..Opts::default()
+    });
+    let raw = format!(
+        "POST /echo HTTP/1.1\r\nHost: {HOST}\r\nTransfer-Encoding: chunked\r\n\r\n\
+         10\r\n{}\r\n1\r\nq\r\n0\r\n\r\n",
+        "q".repeat(16)
+    );
+    let out = r.talk(&raw).await;
+    assert!(!out.contains("413"), "{out}");
+    assert!(!r.sink.events().iter().any(|e| e == "egress.limit"));
+    assert_eq!(r.sink.args("egress.close")["end"], json!("error"));
+}
+
+/// Architect ruling RQ2, response side: the cut still happens, and the tunnel ends `error`.
+#[tokio::test]
+async fn a_failed_response_limit_entry_still_cuts_and_ends_error() {
+    let r = rig(Opts {
+        fail_on: Some("egress.limit"),
+        ..Opts::default()
+    });
+    let out = r.talk(&get("/chunks/17", "")).await;
+    assert!(!out.contains(&"c".repeat(17)), "{out}");
+    assert!(
+        !out.ends_with("0\r\n\r\n"),
+        "a cut sends no last chunk: {out}"
+    );
+    assert!(!r.sink.events().iter().any(|e| e == "egress.limit"));
+    assert_eq!(r.sink.args("egress.close")["end"], json!("error"));
+}
+
 /// Waits (bounded) until the mock upstream saw its connection end.
 async fn upstream_ends(r: &Rig) {
     until("the upstream connection closes with the tunnel", || {

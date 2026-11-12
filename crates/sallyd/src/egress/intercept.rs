@@ -57,6 +57,9 @@ const MAX_HEADERS: usize = 100;
 const REQUEST_READ: usize = 1024;
 const RESPONSE_READ: usize = 4096;
 
+// TODO(#73): move the TLS setup (`Interception`, `HostTls`, `certified`, `tls_error`) to
+// `intercept_tls.rs` as the first commit of Task 9a-3.
+
 /// What the proxy intercepts grant hosts with (Task 9a): the session CA's leaves and the upstream
 /// trust roots, and the TLS configurations built from them. It holds no secret store and no
 /// credential (architect Q27 (1)).
@@ -183,6 +186,8 @@ struct State {
     requests: AtomicU64,
     statuses: [AtomicU64; 5],
     end: Mutex<Option<End>>,
+    /// A body cap's `egress.limit` could not be written (architect ruling RQ2).
+    held_failed: AtomicBool,
     closed: AtomicBool,
 }
 
@@ -202,6 +207,7 @@ impl State {
             requests: AtomicU64::new(0),
             statuses: Default::default(),
             end: Mutex::new(None),
+            held_failed: AtomicBool::new(false),
             closed: AtomicBool::new(false),
         }
     }
@@ -232,7 +238,11 @@ impl State {
         }
     }
 
+    /// How the tunnel ends: `error` once a held entry failed (RQ2), else the first reason set.
     fn end(&self) -> Option<End> {
+        if self.held_failed.load(Ordering::Relaxed) {
+            return Some(End::Error);
+        }
         self.end.lock().ok().and_then(|e| *e)
     }
 
@@ -307,12 +317,21 @@ type HeldEntry = Mutex<Option<(NewEntry, Arc<dyn crate::sandbox::AuditSink>)>>;
 type BeforeCut = Option<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>>;
 
 /// Appends the held entry (the first call only); the returned future finishes with the append.
-fn append_held(held: &HeldEntry, level: sally_core::manifest::AuditLevel) -> BeforeCut {
+/// A failed or panicked append marks the tunnel's end `error` (architect ruling RQ2).
+fn append_held(
+    held: &HeldEntry,
+    level: sally_core::manifest::AuditLevel,
+    st: &Arc<State>,
+) -> BeforeCut {
     let (entry, sink) = held.lock().ok()?.take()?;
+    // TODO(#72): on a session stop this append may land after `egress.close`.
     let h = tokio::task::spawn_blocking(move || sink.append(entry, level));
+    let st = Arc::clone(st);
     Some(Box::pin(async move {
         // TODO(#49): log a limit entry that could not be written; the cut happens regardless.
-        let _ = h.await;
+        if !matches!(h.await, Ok(Ok(()))) {
+            st.held_failed.store(true, Ordering::Relaxed);
+        }
     }))
 }
 
@@ -333,7 +352,7 @@ impl OnEnd for RequestEnd {
             Some(BodyEnd::OverCap) => {
                 self.state.request_over.store(true, Ordering::Relaxed);
                 self.state.set_end(End::Limit);
-                append_held(&self.limit, self.level)
+                append_held(&self.limit, self.level, &self.state)
             }
             Some(BodyEnd::Failed) => {
                 self.state.request_broken.store(true, Ordering::Relaxed);
@@ -366,7 +385,7 @@ impl OnEnd for ResponseEnd {
             }
             Some(BodyEnd::OverCap) => {
                 self.state.set_end(End::Limit);
-                append_held(&self.limit, self.level)
+                append_held(&self.limit, self.level, &self.state)
             }
         }
     }
@@ -602,6 +621,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         let audited = self
             .entry("egress.request", Some("allow"))
             .args(request_args(&st.auth, &parts.method, target));
+        // TODO(#72): on a session stop this append may land after `egress.close`.
         if !self.append(audited).await {
             st.set_end(End::Error);
             return Err("audit append failed".into());
@@ -652,8 +672,12 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
     ) -> Result<Response<Out>, BoxError> {
         match sent {
             Ok(resp) => self.respond(st, resp, target).await,
-            // Already audited and marked `limit` by RequestEnd, before hyper saw the cut.
-            Err(_) if st.request_over.load(Ordering::Relaxed) => {
+            // Already audited and marked `limit` by RequestEnd, before hyper saw the cut; when
+            // that entry could not be written, no 413 (architect ruling RQ2).
+            Err(e) if st.request_over.load(Ordering::Relaxed) => {
+                if st.held_failed.load(Ordering::Relaxed) {
+                    return Err(e.into());
+                }
                 Ok(reply_response(Reason::RequestTooLarge))
             }
             // The client broke off its body: the tunnel ends `closed`, nothing to answer.

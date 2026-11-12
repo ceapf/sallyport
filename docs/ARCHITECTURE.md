@@ -785,7 +785,10 @@ sallyport/
     n, …}`, non-zero classes only) when `intercept` is true; `end` is `closed`, `idle-timeout`,
     `error`, `session-stopped` or `connect-failed` (with `connected: false`, written before the
     502); `closed` also when the client aborts a request head or body (no refusal entry, no
-    reply); and for intercepted tunnels also `upstream-tls-failed` (written before the 502, no
+    reply); `error` also when a refusal's entry could not be written (no reply; 9a-2 RQ2). On
+    a session stop, an entry whose append was already running (`egress.request`, a body-cap
+    `egress.limit`) may land after `egress.close`; no effect precedes its entry (9a-2 RQ4,
+    TODO(#72)). And for intercepted tunnels also `upstream-tls-failed` (written before the 502, no
     `200`), `client-tls-failed`, `refused`, `limit` or `upstream-closed` (written before the 502
     when no response head had arrived; the request is never replayed). For an intercepted tunnel
     `bytes_up`/`bytes_down` count the client's wire bytes, TLS framing included, so they are not
