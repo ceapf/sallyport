@@ -812,8 +812,8 @@ sallyport/
   - `egress.request` (decision `allow`, intercepted tunnels only), before the head goes
     upstream: `{host, port, method, target, target_bytes, target_cut, injected}`; method and
     target escaped and cut as below; `injected` lists `secret:NAME` for each grant set on the
-    request (Task 9a-3; never a value). The grant headers are set only after this entry is
-    written (architect D13).
+    request (Task 9a-3; never a value). The grant headers are built before this entry and set
+    only after it is written (architect D13, ruling Q4); a failed append drops them unsent.
   - `egress.deny` (decision `deny`), before the reply: `{reason, target, target_bytes,
     target_cut}` (the request-target escaped and cut at 256 bytes, never a header), or `{reason,
     head_bytes}` when no target was parsed; `filter: "host-addresses-unavailable"` when the
@@ -874,10 +874,10 @@ sallyport/
     is case-insensitively `chunked`, never beside `Content-Length`, which is at most one decimal
     value; `Expect` absent or `100-continue`; (2) drop `Connection` and every header it names,
     `Keep-Alive`, every `Proxy-*`, `TE`, `Trailer`, `Expect`, `Accept-Encoding`, `Range`,
-    `If-Range` (so an echoed secret cannot be fetched in pieces: decision 4), the client's
-    framing headers and every client copy of each grant header of the host; (3) rebuild `Host`
-    from the CONNECT authority; (4) once `egress.request` is written, set each of the host's
-    grant headers from the credentials, last (Task 9a-3, D13). hyper's client sets
+    `If-Range`, `Request-Range` (so an echoed secret cannot be fetched in pieces: decision 4),
+    the client's framing headers and every client copy of each grant header of the host; (3)
+    rebuild `Host` from the CONNECT authority; (4) once `egress.request` is written, set each of
+    the host's grant headers (built before the entry), last (Task 9a-3, D13, Q4). hyper's client sets
     the upstream framing itself; the proxy adds no `Via`, `Forwarded` or `X-Forwarded-*`. hyper's
     server resolves two framings before the proxy sees a head: with `Transfer-Encoding` and
     `Content-Length` it discards `Content-Length` and reads chunked; equal duplicate

@@ -10,10 +10,14 @@
 //! except a head hyper refuses itself (too large, unparsable): hyper answers first, and the entry
 //! follows when its connection future returns (architect Q45, a recorded deviation).
 //!
-//! Task 9a-3: the grant headers are set from the session's [`Credentials`] only after the
-//! request's `egress.request` entry is written (architect D13), and every response head and body
-//! goes through the credentials' redaction (decisions 2 and 3; architect D2, D4, D5). Secret
-//! values stay inside `Credentials` and the redaction; this module never reads one.
+//! Task 9a-3: the grant headers are built from the session's [`Credentials`] before the request's
+//! `egress.request` entry and set only after that entry is written (architect D13, ruling Q4),
+//! and every response head and body goes through the credentials' redaction (decisions 2 and 3;
+//! architect D2, D4, D5). Secret values stay inside `Credentials` and the redaction; this module
+//! never reads one.
+//!
+//! The file is long on purpose: one tunnel's state machine is kept together (architect Q3); its
+//! TLS setup moved out to `intercept_tls.rs` under #73.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

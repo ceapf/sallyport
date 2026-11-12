@@ -419,8 +419,12 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> EgressStarter for Egress<R, D, H> {
         let roots = self.roots.load()?;
         let validity = Validity::for_session(SystemTime::now(), s.timeout)?;
         let tls = SessionTls::mint(&s.policy.grant_hosts(), validity)?;
-        ca::write_files(dir, &tls, &roots.pem).map_err(EgressError::Files)?;
-        s.interception = Some(Interception::new(tls, roots, credentials)?);
+        // Built before anything is written: a session refused here leaves no file behind
+        // (security review L6).
+        let interception = Interception::new(tls, roots, credentials)?;
+        ca::write_files(dir, &interception.tls, &interception.roots.pem)
+            .map_err(EgressError::Files)?;
+        s.interception = Some(interception);
         Ok(s)
     }
 

@@ -15,9 +15,10 @@ use super::policy::Reason;
 
 /// Request headers dropped on the way upstream, besides `Connection`'s own tokens, every
 /// `Proxy-*` header and the grant headers (Q41). Framing (`Transfer-Encoding`, `Content-Length`)
-/// is dropped too: hyper's client frames the body it sends. `Range` and `If-Range` go too, so a
-/// secret an endpoint echoes cannot be fetched in pieces (Task 9a-3, decision 4).
-const REQUEST_DROPPED: [HeaderName; 12] = [
+/// is dropped too: hyper's client frames the body it sends. `Range`, `If-Range` and the legacy
+/// `Request-Range` go too, so a secret an endpoint echoes cannot be fetched in pieces (Task
+/// 9a-3, decision 4; security review L3).
+const REQUEST_DROPPED: [HeaderName; 13] = [
     header::CONNECTION,
     HeaderName::from_static("keep-alive"),
     header::TE,
@@ -30,6 +31,7 @@ const REQUEST_DROPPED: [HeaderName; 12] = [
     header::UPGRADE,
     header::RANGE,
     header::IF_RANGE,
+    HeaderName::from_static("request-range"),
 ];
 
 /// Response headers dropped on the way to the client, besides `Connection`'s own tokens and

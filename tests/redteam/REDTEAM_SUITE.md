@@ -102,7 +102,7 @@ Every PASS assertion is kept.
 | Row | Old | New | Lands |
 |---|---|---|---|
 | RT-SEC-03 | `GET http://…` through the proxy; `[REDACTED:GITHUB_TOKEN]` in the echo | `CONNECT` + TLS, `GET https://…`; a same-length filler beginning `[REDACTED:GITHUB_TOKEN]` (decision 2), body length checked (architect D1) | 9a-3 |
-| RT-SEC-04 | same | same; the client's copy is dropped from 9a-2 on, the grant's set after the audit entry (D13) | 9a-3 |
+| RT-SEC-04 | same | same; the client's copy is dropped from 9a-2 on, the grant's set after the audit entry (D13); the drop and the insert each suffice, so the test guards the pair and each has its own unit test (Q2) | 9a-3 |
 | RT-SEC-05 | `GET http://mock.test/redirect?to=…` | `GET https://mock.test/redirect` (the mock's own 302) | 9a-3 |
 | RT-SEC-06 | plain echo, `[REDACTED:GITHUB_TOKEN]` | over TLS; a same-length filler beginning the label, body length checked (decision 2, D1) | 9a-3 (raw value end to end; every form by the redactor's property test, D3); 9b RT-SEC-12 |
 | RT-SEC-06b | compressed echo | over TLS; any `Content-Encoding` (even `identity`) is refused `upstream-encoded` (Q30, tightened by decision 1, D6) | 9a-3 |

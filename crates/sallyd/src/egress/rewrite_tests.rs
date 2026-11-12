@@ -98,6 +98,7 @@ fn hop_by_hop_proxy_and_encoding_headers_are_dropped() {
         ("content-length", "3"),
         ("range", "bytes=0-3"),
         ("if-range", "\"etag\""),
+        ("request-range", "bytes=0-3"),
         ("x-kept", "1"),
     ])
     .unwrap();

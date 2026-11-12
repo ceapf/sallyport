@@ -32,11 +32,18 @@ fn auth_line(req: &str) -> String {
         .to_owned()
 }
 
+/// The bearer token of a request the mock received, or `""`.
+fn token(req: &str) -> String {
+    auth_line(req)
+        .split_once("Bearer ")
+        .map_or(String::new(), |(_, t)| t.to_owned())
+}
+
 /// Echoes the request's credential in a header and in a body split into three writes, one
 /// boundary inside the value (decision 3). Content-Length framed.
 fn echo_split(req: &str) -> Option<String> {
     let line = auth_line(req);
-    let token = line.split_once("Bearer ").map_or("", |(_, t)| t).to_owned();
+    let token = token(req);
     let (a, b) = token.split_at(token.len() / 2);
     let body = format!("{{\"seen\":\"{token}\"}}");
     Some(format!(
@@ -80,9 +87,7 @@ async fn an_echoed_credential_is_redacted_in_headers_and_across_body_writes() {
 #[tokio::test]
 async fn a_chunked_echo_split_inside_the_value_is_redacted() {
     let r = echoing(Arc::new(|req: &str| {
-        let token = auth_line(req)
-            .split_once("Bearer ")
-            .map_or(String::new(), |(_, t)| t.to_owned());
+        let token = token(req);
         let (a, b) = token.split_at(5);
         Some(format!(
             "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
@@ -117,9 +122,7 @@ async fn a_chunked_echo_split_inside_the_value_is_redacted() {
 #[tokio::test]
 async fn a_credential_in_a_response_header_name_is_refused_unforwarded() {
     let r = echoing(Arc::new(|req: &str| {
-        let token = auth_line(req)
-            .split_once("Bearer ")
-            .map_or(String::new(), |(_, t)| t.to_owned());
+        let token = token(req);
         Some(format!(
             "HTTP/1.1 200 OK\r\nX-{token}: 1\r\nContent-Length: 4\r\n\r\nbody"
         ))
@@ -147,9 +150,7 @@ async fn a_credential_in_a_response_header_name_is_refused_unforwarded() {
 #[tokio::test]
 async fn the_upstream_reason_phrase_is_replaced_by_the_canonical_one() {
     let r = echoing(Arc::new(|req: &str| {
-        let token = auth_line(req)
-            .split_once("Bearer ")
-            .map_or(String::new(), |(_, t)| t.to_owned());
+        let token = token(req);
         Some(format!(
             "HTTP/1.1 200 {token}\r\nContent-Length: 2\r\n\r\nok"
         ))
@@ -178,8 +179,9 @@ async fn no_audit_entry_of_an_injected_exchange_holds_a_form_of_the_value() {
     }
 }
 
-/// Architect D13: a request whose `egress.request` cannot be written is never sent, so the
-/// credential is never set on anything that leaves.
+/// A request whose `egress.request` cannot be written is never sent, so the credential leaves on
+/// nothing. This proves the refusal, not architect D13's order (header set after the entry):
+/// that order is held by `forward`'s structure and the `Prepared` type (ruling Q4).
 #[tokio::test]
 async fn a_failed_request_entry_sends_nothing_with_the_credential() {
     let r = rig(Opts {

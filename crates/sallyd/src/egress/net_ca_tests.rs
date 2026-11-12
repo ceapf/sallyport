@@ -426,6 +426,21 @@ fn a_planted_file_refuses_the_session() {
     );
 }
 
+/// Security review L6: the interception is built before the CA files are written, so a session
+/// whose leaves and credentials name different hosts leaves no file behind.
+#[test]
+fn a_refused_interception_writes_no_file() {
+    let dir = scratch("unmatched");
+    let ws = dir.join("ws");
+    std::fs::create_dir(&ws).unwrap();
+    let (roots, _) = roots_file(&dir);
+    let mut s = session(true, &["a.mock.test", "b.mock.test"]);
+    s.grants.truncate(1);
+    let e = starter(&dir, roots).prepare(&ws, s).err().unwrap();
+    assert!(matches!(e, EgressError::Ca(CaError::Unmatched)), "{e}");
+    assert!(entries(&ws).is_empty());
+}
+
 #[test]
 fn a_session_flagged_for_a_ca_without_grant_hosts_is_refused() {
     let dir = scratch("nohosts");

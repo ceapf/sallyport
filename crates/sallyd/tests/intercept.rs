@@ -330,7 +330,7 @@ fn mock3() -> String {
 
 const LABEL: &str = "[REDACTED:GITHUB_TOKEN]";
 
-/// RT-SEC-03: injection scope. Controls: `Credentials::set`, called with the tunnel's own host
+/// RT-SEC-03: injection scope. Controls: `Credentials::prepare`, called with the tunnel's own host
 /// (`intercept::forward`); the route decision (`Route::Splice` for `mock2.test`); the redaction
 /// of the response (`redact::Redacted`). Setting every grant on every host fails the mock2/mock3
 /// assertions; skipping the redaction fails the label assertion.
@@ -388,9 +388,13 @@ fn rt_sec_03_a_credential_reaches_only_its_own_grant_host() {
     });
 }
 
-/// RT-SEC-04: a client-supplied copy of the grant header. Controls: the grant-header drop in
-/// `rewrite::request` (architect Q40) and `Credentials::set`'s `insert` (one value). Without the
-/// drop, or with `append`, the upstream gets two `Authorization` lines.
+/// RT-SEC-04: a client-supplied copy of the grant header. Controls, a pair: the grant-header drop
+/// in `rewrite::request` (architect Q40) and `Prepared::apply`'s `insert` (one value). Each
+/// alone keeps the client's copy away, so this test fails only when both are removed (the drop
+/// gone and `insert` turned into `append`: two `Authorization` lines reach the upstream); each
+/// control has its own unit test (architect Q2): `rewrite_tests::
+/// every_client_copy_of_a_grant_header_is_dropped_in_any_case` and `inject_tests::
+/// a_grant_host_gets_its_rendered_header_replacing_any_client_copy`.
 #[test]
 fn rt_sec_04_a_client_copy_of_the_grant_header_never_reaches_the_grant_host() {
     rt().block_on(async {
@@ -443,8 +447,9 @@ fn rt_sec_04_a_client_copy_of_the_grant_header_never_reaches_the_grant_host() {
 }
 
 /// RT-SEC-05: a redirect is returned, never followed, and the client's own follow-up to the
-/// non-grant host carries no credential. Controls: the proxy never dials a `Location` (one
-/// upstream connection per tunnel, Q28) and `Credentials::set` by host.
+/// non-grant host carries no credential. Control: the proxy never dials a `Location` (one
+/// upstream connection per tunnel, Q28). The follow-up's tunnel is spliced, so no injection
+/// code runs on it at all.
 #[test]
 fn rt_sec_05_a_redirect_is_returned_unfollowed_and_its_target_gets_no_credential() {
     rt().block_on(async {
@@ -555,7 +560,7 @@ fn rt_sec_06b_compression_is_stripped_and_an_encoded_echo_is_refused() {
 
 /// RT-SEC-07 (Task 9a-3 leg; 9b greps every form): after injected and echoed exchanges on both
 /// grant hosts, no audit entry holds a canary, and each `egress.request` names its grant.
-/// Control: `request_args` builds `injected` from grant names (`Credentials::names`), and no
+/// Control: `request_args` builds `injected` from grant names (`Prepared::names`), and no
 /// entry is built from a header map or a body.
 #[test]
 fn rt_sec_07_no_audit_entry_holds_a_credential() {
@@ -625,8 +630,9 @@ fn rt_sec_07_no_audit_entry_holds_a_credential() {
 
 /// RT-SEC-11: `expose_env` gives the workspace the public placeholder only; the grant host's
 /// upstream gets the real credential in its place, the non-grant host at most the placeholder.
-/// Controls: the placeholder in `argv::PLACEHOLDER` (the only value `--env` can carry) and
-/// `Credentials::set` replacing the client's copy on the grant host.
+/// Controls: the placeholder in `argv::PLACEHOLDER` (the only value `--env` can carry), and on
+/// the grant host the pair of RT-SEC-04 (the grant-header drop and `Prepared::apply`'s
+/// `insert`): the replace half fails only when both of that pair are removed (architect Q2).
 #[test]
 fn rt_sec_11_the_workspace_holds_only_the_placeholder() {
     rt().block_on(async {

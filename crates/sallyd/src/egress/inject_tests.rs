@@ -198,6 +198,24 @@ fn a_rendered_value_too_long_to_redact_is_refused() {
     ));
 }
 
+/// Allow (Rust review H1): the largest value the store accepts, made of a character every
+/// percent-encoder escapes (three bytes each), still builds.
+#[test]
+fn the_largest_store_value_builds() {
+    use sally_core::secrets::MAX_VALUE_BYTES;
+    let s = spec("GH", "a.mock.test", "Authorization", "Bearer {value}");
+    let v = vec![("GH".to_owned(), Secret::new("!".repeat(MAX_VALUE_BYTES)))];
+    assert!(Credentials::new(&[s], v).is_ok());
+}
+
+/// The bound covers the longest form of the largest store value (its percent-encoding, three
+/// bytes per byte) plus the longest format the manifest accepts (1024 bytes).
+#[test]
+fn max_form_covers_the_longest_form_and_format() {
+    use sally_core::secrets::MAX_VALUE_BYTES;
+    assert!(3 * MAX_VALUE_BYTES + 1024 <= super::super::redact::MAX_FORM);
+}
+
 #[test]
 fn the_redaction_covers_every_secret_its_forms_and_each_rendered_value() {
     let specs = [

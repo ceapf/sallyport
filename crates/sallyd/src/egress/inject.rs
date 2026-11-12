@@ -6,7 +6,7 @@
 //! grant's header value is rendered once from its format and kept as a [`Secret`]; a
 //! `HeaderValue` (whose bytes cannot be wiped) is built per request, marked sensitive, and
 //! dropped with the request (architect D8). Everything here is wiped when the session's proxy
-//! drops. The audit path sees grant names only ([`Credentials::set`] returns `secret:NAME`).
+//! drops. The audit path sees grant names only ([`Prepared::names`] gives `secret:NAME`).
 
 use std::fmt;
 use std::path::PathBuf;
@@ -350,7 +350,7 @@ pub(crate) mod testing {
         let values = (0..hosts.len())
             .map(|i| (format!("T{i}"), Secret::new(value(i))))
             .collect();
-        Credentials::new(&specs, values).unwrap_or_else(|e| panic!("{e}"))
+        Credentials::new(&specs, values).expect("test grants are valid")
     }
 
     /// A source over fixed values.
