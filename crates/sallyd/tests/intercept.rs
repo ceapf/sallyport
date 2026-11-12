@@ -1,6 +1,6 @@
-//! Red-team rows RT-SEC-09 and RT-SEC-13 (Task 9a-2), and the secret-free parts of RT-SEC-04,
-//! 05 and 06b as plain-named tests (architect Q48: their `rt_sec_0x` forms, with every PASS
-//! assertion, land with injection in Task 9a-3).
+//! Red-team rows RT-SEC-09 and RT-SEC-13 (Task 9a-2; RT-SEC-10 is in `session_ca.rs`), and the
+//! secret-free parts of RT-SEC-04, 05 and 06b as plain-named tests (architect Q48: their
+//! `rt_sec_0x` forms, with every PASS assertion, land with injection in Task 9a-3).
 //!
 //! Each test launches a real workspace session with a secret grant on `mock.test` (launcher,
 //! session CA, CA files). TLS legs run host-side over the session's `net.sock`, the socket the
@@ -199,10 +199,17 @@ fn rt_sec_09_a_grant_host_gets_a_session_ca_leaf_and_any_other_host_its_own_chai
     });
 }
 
-/// RT-SEC-13 (Task 8 changed it: plain HTTP is refused for every host). Control: the 405 before
-/// policy in `Proxy::clear`. Without it the request would reach policy, a lookup and a dial.
+/// RT-SEC-13, rewritten with `inject-requires-tls` deleted (#59): plaintext never reaches a grant
+/// host, either way a client tries it.
+/// - Proxy-form `GET http://…`. Control: the 405 before policy in `Proxy::clear`. Without it the
+///   request would reach policy, a lookup and a dial.
+/// - `CONNECT` to the grant host, then plaintext where the TLS handshake belongs. Control: the
+///   client handshake in `intercept::exchanges`, before hyper serves anything. Without it the
+///   plaintext request would be parsed and forwarded (`egress.request`, the upstream sees it).
+///
+/// No credential can be attached on either path: nothing is forwarded at all.
 #[test]
-fn rt_sec_13_plain_http_to_a_grant_host_is_405_with_no_lookup_or_dial() {
+fn rt_sec_13_plain_http_to_a_grant_host_is_never_forwarded() {
     rt().block_on(async {
         let lx = Lx::new();
         let r = session(&lx, "sec13").await;
@@ -226,6 +233,37 @@ fn rt_sec_13_plain_http_to_a_grant_host_is_405_with_no_lookup_or_dial() {
         assert_eq!(deny.len(), 1, "{deny:?}");
         assert_eq!(deny[0]["reason"], json!("plain-http-unsupported"));
         assert_eq!(deny[0]["target"], json!("http://mock.test/echo-headers"));
+
+        let sock = lx.paths("sec13").workspace_sockets().join("net.sock");
+        let mut s = connect(&sock, "mock.test").await;
+        s.write_all(b"GET /echo-headers HTTP/1.1\r\nHost: mock.test\r\n\r\n")
+            .await
+            .unwrap();
+        let mut back = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(15), s.read_to_end(&mut back)).await;
+        assert!(matches!(read, Ok(Ok(_))), "the tunnel stayed open");
+        assert!(
+            !String::from_utf8_lossy(&back).contains("HTTP/"),
+            "an HTTP answer to plaintext: {back:?}"
+        );
+        assert!(
+            lx.egress.dialer.seen().is_empty(),
+            "the upstream saw a request"
+        );
+        // The failed handshake drops the client before the close entry is written.
+        let mut close = None;
+        for _ in 0..100 {
+            close = lx.events.args("egress.close");
+            if close.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let close = close.expect("egress.close");
+        let events = lx.events.list();
+        assert!(!events.iter().any(|e| e == "egress.request"), "{events:?}");
+        assert_eq!(close["end"], json!("client-tls-failed"), "{close}");
+        assert_eq!(close["requests"], json!(0), "{close}");
         lx.stop(r).await;
     });
 }
