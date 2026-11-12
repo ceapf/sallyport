@@ -129,7 +129,8 @@ fn check_glob_list(path: &str, list: &[String], d: &mut Diags) {
         d.error(path, Code::OutOfRange, format!("at most {MAX_GLOBS} globs"));
     }
     for (j, g) in list.iter().enumerate() {
-        if let Err(msg) = check_glob(g) {
+        if let Err(e) = check_glob(g) {
+            let msg = e.to_string();
             d.error(format!("{path}[{j}]"), Code::InvalidValue, msg);
         }
     }
@@ -152,21 +153,80 @@ fn is_git_dir(dir: &Path) -> bool {
         && kind("refs").is_some_and(|m| m.is_dir())
 }
 
-/// Globs are relative to the mount root and may not climb out of it.
-fn check_glob(g: &str) -> Result<(), String> {
+/// The syntax of an `approve` glob (MANIFEST_SPEC §1 Mount, "Glob syntax"; architect ruling
+/// Q20): relative to the mount root, never climbing out of it, and only `*`, `?` and whole-segment
+/// `**` as wildcards. Anything a user could read as another wildcard (classes, braces, escapes,
+/// negation) or as a directory shorthand (empty or `.` segments, a trailing `/`) is refused: the
+/// matcher would take it literally and silently ask less than the user meant. The broker's matcher
+/// uses this same check and treats a glob it refuses as `**`.
+///
+/// # Errors
+/// What is wrong with `g`, for the diagnostic.
+pub fn check_glob(g: &str) -> Result<(), GlobError> {
+    let own = || g.to_owned();
     if g.is_empty() || g.len() > MAX_GLOB_LEN {
-        return Err(format!("glob must be 1–{MAX_GLOB_LEN} bytes"));
+        return Err(GlobError::Length);
     }
     if g.starts_with('/') {
-        return Err(format!("{g:?} must be relative to the mount"));
+        return Err(GlobError::Absolute(own()));
     }
     if g.chars().any(char::is_control) {
-        return Err(format!("{g:?} contains a control character"));
+        return Err(GlobError::Control(own()));
     }
-    if g.split('/').any(|s| s == "..") {
-        return Err(format!("{g:?} contains \"..\""));
+    if g.ends_with('/') {
+        return Err(GlobError::TrailingSlash(own()));
+    }
+    if let Some(c) = g
+        .chars()
+        .find(|c| matches!(c, '[' | ']' | '{' | '}' | '\\'))
+    {
+        return Err(GlobError::Metachar(own(), c));
+    }
+    if g.starts_with('!') {
+        return Err(GlobError::Negated(own()));
+    }
+    for s in g.split('/') {
+        match s {
+            ".." => return Err(GlobError::Parent(own())),
+            "" | "." => return Err(GlobError::EmptySegment(own())),
+            "**" => {}
+            _ if s.contains("**") => return Err(GlobError::PartialDoubleStar(own())),
+            _ => {}
+        }
     }
     Ok(())
+}
+
+/// Why an `approve` glob is refused ([`check_glob`]).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum GlobError {
+    /// Empty or longer than the limit.
+    #[error("glob must be 1–{} bytes", MAX_GLOB_LEN)]
+    Length,
+    /// Starts with `/`.
+    #[error("{0:?} must be relative to the mount")]
+    Absolute(String),
+    /// Contains a control character.
+    #[error("{0:?} contains a control character")]
+    Control(String),
+    /// Ends with `/`.
+    #[error("{0:?} ends with \"/\"; use \"dir/**\" for a directory")]
+    TrailingSlash(String),
+    /// Contains a character other glob dialects treat as syntax.
+    #[error("{0:?} contains {1:?}; only *, ? and ** are wildcards")]
+    Metachar(String, char),
+    /// Starts with `!`.
+    #[error("{0:?} starts with \"!\"; globs cannot be negated")]
+    Negated(String),
+    /// Has a `..` segment.
+    #[error("{0:?} contains \"..\"")]
+    Parent(String),
+    /// Has an empty or `.` segment.
+    #[error("{0:?} contains an empty or \".\" segment")]
+    EmptySegment(String),
+    /// Has `**` inside a longer segment, where it would match within one segment only.
+    #[error("{0:?} has \"**\" inside a segment; it must be a whole segment, as in \"**/*.md\"")]
+    PartialDoubleStar(String),
 }
 
 /// Guests must be unique and non-nested (a nested mount shadows part of another). Hosts must not

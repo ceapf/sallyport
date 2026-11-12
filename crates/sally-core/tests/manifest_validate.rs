@@ -430,6 +430,32 @@ fn approve_globs() {
         "filesystem.mounts[0].approve.writes[0]",
         Code::InvalidValue,
     );
+    // Glob syntax (architect ruling Q20): no classes, braces, escapes or negation, no empty or
+    // `.` segments, no trailing `/`; each would silently match less than the user meant.
+    for bad in [
+        "[ab].md", "a]", "{a,b}", "a}", "a\\\\*", "!a", "a//b", "./a", "a/./b", "a/.", "notes/",
+        "**.md", "notes**", "a/b**c/d", "***",
+    ] {
+        assert_rejects(
+            &f.load(&brokered(&format!("[\"{bad}\"]"))),
+            "filesystem.mounts[0].approve.writes[0]",
+            Code::InvalidValue,
+        );
+    }
+    for good in [
+        "notes/**", "a!", ".hidden", "a/.b/c", "x?y", "**/*.md", "a..b", "**", "a/**/b", "*.*",
+    ] {
+        assert_ok(&f.load(&brokered(&format!("[\"{good}\"]"))));
+    }
+    // The diagnostic says what to write instead.
+    let msg = sally_core::manifest::check_glob("**.md")
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("\"**/*.md\""), "{msg}");
+    let msg = sally_core::manifest::check_glob("notes/")
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("\"dir/**\""), "{msg}");
     // Brokered without globs: everything needs approval (SI-5), so nothing to warn about.
     let r = f.load(&mount("~/Documents/research", "/workspace/r", "brokered"));
     assert_eq!(warnings(&r), vec![]);

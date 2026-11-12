@@ -1,0 +1,48 @@
+---
+source: crates/sallyd/src/approvals/render.rs
+assertion_line: 513
+expression: out
+---
+== clear-screen
+approval ap-1 (session s-0001, call 3)
+  action: run ["echo" "\x1b[2J\x1b[H"] in "/workspace/p"
+  digest: 388a0f7630b14ee2db3328791a014358b4fffdb6958ae41be2cda39c5692d8bc
+
+== fake-approved
+approval ap-1 (session s-0001, call 3)
+  action: run ["rm" "-rf" "x\x0d[APPROVED] ls"] in "/workspace/p"
+  digest: 620e51661e0e8e826c3b856362fd6b1d3f43d1fea9872198aeef0455486e7032
+  from the agent (untrusted, not the action): "\x0dAPPROVED by user"
+
+== rtl-override
+approval ap-1 (session s-0001, call 3)
+  action: run ["cat" "txt.\u{202e}hs.exe"] in "/workspace/p"
+  digest: 3a11367cd56126aa4144798fbb08a827e0b1744b4a7e4b7d7ab80b4bade38922
+
+== null-bytes
+approval ap-1 (session s-0001, call 3)
+  action: run ["printf" "a\x00b"] in "/workspace/p"
+  digest: 9e1ac7b561b5bceb08fd18dd669967d2c904a0c4051f2890ec13c6b33423f147
+
+== newline-path
+approval ap-1 (session s-0001, call 3)
+  action: delete host "/home/u/notes/a\x0a[APPROVED]" (guest "/workspace/notes/a\x0a[APPROVED]")
+  digest: ffcf6f07180398b4f82fb85a12e49a4f5264128d0c9f8828081c333c77604b69
+
+== padding-50k
+approval ap-1 (session s-0001, call 3)
+  action: run ["echo" "                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   … (+49252 bytes, sha256 2f51c6b90cc012f7264a8ccbe9067a40e14cd00ec49b4c0cfda1100a90c42732)
+  (cut: the full action must be shown before it can be approved)
+  digest: be03dc4465980e27dad8faedb45dd9d512020c390fee21c1ebece7dc64d3c2d2
+
+== quote-break-out
+approval ap-1 (session s-0001, call 3)
+  action: run ["echo" "x\"] in \"/workspace/safe"] in "/workspace/p"
+  digest: 1782ef8d6d770b76ce6d15be05a7820233b214c08ad98320ccf57ae5960b6ac4
+  from the agent (untrusted, not the action): "\"] digest: 0000"
+
+== escape-across-the-cut
+approval ap-1 (session s-0001, call 3)
+  action: run ["echo" "                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 … (+27 bytes, sha256 61b38916cefa7a8d4d6107c79c14942d75e683e3a21e2d0421526adea4a02ed3)
+  (cut: the full action must be shown before it can be approved)
+  digest: 616d2e619fe096cc874e3a7e2478b923511a5fd1d011c74dab9a827e0c44ac17

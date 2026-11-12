@@ -21,6 +21,7 @@ use super::paths::DirId;
 use super::types::{ApproveGlobs, Manifest, MountMode};
 
 pub(crate) use exposure::data_can_leave;
+pub use fs::{GlobError, check_glob};
 
 /// The set of secret names present in the secrets store. Validation only asks whether a name
 /// exists; it never sees values (SI-3).

@@ -14,10 +14,14 @@
 //! - Every allowed request is recorded (`rpc.request`) before it is served; `tools/call` records
 //!   the tool and the shape of its arguments (never their values, architect ruling Q16) before
 //!   the handler runs. A failed append closes the connection without a reply or a dispatch.
+//! - Each `tools/call` gets the broker's call number from the handler, unique in the session;
+//!   approvals bind it, never the harness's id (architect ruling Q19).
 //! - A cancel or a closed connection never drops a call: it runs to its end (so its own audit
-//!   entries are written) and only its reply is suppressed. Its in-flight slot is held until it
-//!   returns. Session teardown does drop calls: after [`listen::STOP_GRACE`]
-//!   (`Handle::shutdown`) or at once (the `Handle` dropped) (architect ruling Q17).
+//!   entries are written) and only its reply is suppressed; a prompt it waits on is withdrawn
+//!   through the handler (#54; ruling Q27). Its in-flight slot is held until it returns. A call
+//!   whose handler could not write an entry gets no reply. Session teardown does drop calls:
+//!   after [`listen::STOP_GRACE`] (`Handle::shutdown`) or at once (the `Handle` dropped)
+//!   (architect ruling Q17).
 //! - The broker never sends a request; replies are the only messages it writes.
 
 use std::collections::HashMap;
@@ -42,6 +46,15 @@ use super::message::{
 use super::rate::Rate;
 use super::record::{Recorder, escape};
 
+/// Why a call's prompt is withdrawn ([`ToolHandler::withdraw`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Withdraw {
+    /// `notifications/cancelled` named the call.
+    Cancel,
+    /// The connection that sent the call closed.
+    Closed,
+}
+
 /// Largest frame accepted (ARCHITECTURE §4: 256 KiB on the session socket).
 pub const MAX_FRAME: usize = 256 * 1024;
 /// `tools/call` requests running at once per session (architect Q8).
@@ -60,27 +73,37 @@ const OUTBOX: usize = 32;
 pub const LOGGED_KEYS: usize = 8;
 
 /// What `tools/call` dispatches to (Task 7 decision 4): the built-in tools (Task 11) behind
-/// policy and approvals (Task 10). It owns every decision about a tool, including unknown and
-/// ungranted names (`isError: true`, `denied: <code>`).
+/// policy and approvals ([`crate::approvals::Gated`], Task 10). It owns every decision about a
+/// tool, including unknown and ungranted names (`isError: true`, `denied: <code>`).
 pub trait ToolHandler: Send + Sync + 'static {
     /// The session's tools, as `tools/list` returns them.
     fn tools(&self) -> Vec<Tool>;
-    /// Runs one call. It must write its own effect entry (each tool's fields, ARCHITECTURE §4.3)
-    /// before the effect or the denial reply, at every `audit.level`: the `rpc.request` entry
-    /// carries no argument values.
+    /// A new call starts: its number, unique in the session (the harness's JSON-RPC id is
+    /// unique only per connection; architect ruling Q19). Called before the call is spawned, so
+    /// a withdraw that arrives before it runs is kept; [`call`](Self::call) ends it.
+    fn begin(&self) -> u64;
+    /// Runs one call. `call` is the number [`begin`](Self::begin) gave it. It must write
+    /// its own effect entry (each tool's fields, ARCHITECTURE §4.3) before the effect or the
+    /// denial reply, at every `audit.level`: the `rpc.request` entry carries no argument values.
+    /// `None` means an entry could not be written: nothing ran, and no reply is sent.
     ///
-    /// A cancel or a closed connection never drops a call. Session teardown does: after
+    /// A cancel or a closed connection never drops a call; it is told through
+    /// [`withdraw`](Self::withdraw). Session teardown does drop calls: after
     /// [`listen::STOP_GRACE`] (`Handle::shutdown`) or at once (the `Handle` dropped). So a
     /// handler must be safe to drop at any await. A drop before the effect starts means nothing
     /// ran (a dropped approval wait is a deny); a drop after it started may leave the effect
     /// finished with no completion entry (blocking work is not abortable), so the entry comes
     /// first.
-    // TODO(#62): the Task 10/11 handlers meet this contract.
+    // TODO(#62): Task 11's executors write their effect entries and are drop-safe.
     fn call(
         &self,
+        call: u64,
         name: String,
         arguments: Map<String, Value>,
-    ) -> impl Future<Output = ToolOutcome> + Send;
+    ) -> impl Future<Output = Option<ToolOutcome>> + Send;
+    /// The harness cancelled `call`, or the connection that sent it closed (#54): a prompt it
+    /// is waiting on is withdrawn.
+    fn withdraw(&self, call: u64, why: Withdraw) -> impl Future<Output = ()> + Send;
 }
 
 /// One session's `agent.sock` server.
@@ -92,12 +115,21 @@ pub struct Agent<T> {
     stop: watch::Sender<bool>,
 }
 
+/// A `tools/call` in flight on one connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InFlight {
+    /// The broker's call number.
+    call: u64,
+    /// A cancel named it: its reply is suppressed.
+    cancelled: bool,
+}
+
 /// One connection's state.
 struct Conn {
     /// The connection completed `initialize`.
     legacy: bool,
-    /// `tools/call` ids in flight, and whether each was cancelled.
-    pending: Arc<Mutex<HashMap<Id, bool>>>,
+    /// `tools/call` ids in flight.
+    pending: Arc<Mutex<HashMap<Id, InFlight>>>,
     out: mpsc::Sender<Vec<u8>>,
     tasks: JoinSet<()>,
 }
@@ -164,7 +196,12 @@ impl<T: ToolHandler> Agent<T> {
             }
         }
         // Dispatched calls run to their end, though the peer is gone (rulings Q7, Q17; only
-        // session teardown aborts them); then the writer drains and closes.
+        // session teardown aborts them), but a prompt one waits on is withdrawn: nobody is
+        // left to receive its result (architect ruling Q27). Then the writer drains and closes.
+        let open: Vec<u64> = lock(&conn.pending).values().map(|f| f.call).collect();
+        for call in open {
+            self.handler.withdraw(call, Withdraw::Closed).await;
+        }
         let Conn { out, mut tasks, .. } = conn;
         drop(out);
         while tasks.join_next().await.is_some() {}
@@ -274,17 +311,23 @@ impl<T: ToolHandler> Agent<T> {
         if !self.record.append(entry).await {
             return false;
         }
-        lock(&conn.pending).insert(id.clone(), false);
+        let call = self.handler.begin();
+        let flight = InFlight {
+            call,
+            cancelled: false,
+        };
+        lock(&conn.pending).insert(id.clone(), flight);
         let (handler, pending, out) = (
             Arc::clone(&self.handler),
             Arc::clone(&conn.pending),
             conn.out.clone(),
         );
         conn.tasks.spawn(async move {
-            let outcome = handler.call(name, arguments).await;
-            let cancelled = lock(&pending).remove(&id).unwrap_or(true);
+            let outcome = handler.call(call, name, arguments).await;
+            let cancelled = lock(&pending).remove(&id).is_none_or(|f| f.cancelled);
             drop(slot);
-            if !cancelled {
+            // `None`: an entry could not be written, so nothing ran and nothing is answered.
+            if let (false, Some(outcome)) = (cancelled, outcome) {
                 let _ = out
                     .send(success(&id, mcp::tools_call_result(era, &outcome)))
                     .await;
@@ -311,11 +354,15 @@ impl<T: ToolHandler> Agent<T> {
     /// are ignored. A call that finishes while the `rpc.cancel` entry is being written has its
     /// reply queued already: the log then shows a cancel that came too late to suppress it,
     /// which the cancellation spec allows (a cancel is best effort; the reply may still arrive).
-    // TODO(#54): Task 10 withdraws a call's pending approval here, through the handler's API.
+    /// After the entry, a prompt the call waits on is withdrawn through the handler (#54).
     async fn cancel(&self, request: &Id, conn: &Conn) -> bool {
-        if lock(&conn.pending).get(request) != Some(&false) {
+        let Some(call) = lock(&conn.pending)
+            .get(request)
+            .filter(|f| !f.cancelled)
+            .map(|f| f.call)
+        else {
             return true;
-        }
+        };
         let entry = self
             .record
             .entry(Actor::Harness, "rpc.cancel", None)
@@ -323,9 +370,10 @@ impl<T: ToolHandler> Agent<T> {
         if !self.record.append(entry).await {
             return false;
         }
-        if let Some(c) = lock(&conn.pending).get_mut(request) {
-            *c = true;
+        if let Some(f) = lock(&conn.pending).get_mut(request) {
+            f.cancelled = true;
         }
+        self.handler.withdraw(call, Withdraw::Cancel).await;
         true
     }
 
