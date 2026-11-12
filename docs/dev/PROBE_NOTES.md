@@ -6,6 +6,9 @@ line per fact, with where it was found. Check a note again before relying on it 
 
 ## Podman and crun
 
+- `/dev/shm` is read-only inside the workspace and harness containers (`sh: can't create
+  /dev/shm/…: Read-only file system`). (9a-2, RT-SEC-10)
+
 - A container's limits (`pids.max`, `memory.max`, `memory.swap.max`) sit in
   `/sys/fs/cgroup/<CgroupPath>/container`, not in the `libpod-<id>.scope` itself (that shows the
   host default). `<CgroupPath>` is `podman inspect --format '{{.State.CgroupPath}}'`. (6c-2, AG-09)
@@ -169,6 +172,18 @@ tests in `egress/intercept_tests.rs` where the behaviour matters to the proxy.
   61440, heads of 7168 / 61440 bytes pass and 7169 / 61441 are refused, whole or split (Task
   9a-2 part 2; part 1 had read it as checked between reads only). `Meter::max_read` stays as
   defense in depth.
+- The client accepts equal duplicate response `Content-Length`s, as two lines or one `6, 6`
+  list, and keeps every line in the `HeaderMap`; differing ones fail its parse
+  (`content_length_parse_all`, `headers.rs`). With `Transfer-Encoding: chunked` it reads chunked
+  and keeps the `Content-Length` header too. `rewrite::response` refuses all of these. (9a-2 R4)
+- The server never writes `Content-Length` on a 204 or 304 (`can_have_content_length`); a HEAD
+  answer keeps it. `Incoming::size_hint().exact()` on a client response is `Some(0)` for HEAD,
+  204 and 304, whatever the header says. (9a-2 R5)
+- Two requests pipelined behind a `Connection: close` response: in 15 of 15 runs the second was
+  never read (the tunnel closed after the first response), so the "upstream gone before the
+  entry" branch needs a direct test (`upstream_ready`). (9a-2 R1)
+- `SendRequest::ready()` errs once the client connection future is dropped, without any I/O. A
+  handshake over a `duplex` whose connection future is dropped gives a closed sender. (9a-2 R1)
 
 ## Test writing
 
