@@ -61,6 +61,32 @@ line per fact, with where it was found. Check a note again before relying on it 
   never reaps), so skip `State: Z` when checking it is gone. Its port is free at once. (Task 8,
   RT-NET-10)
 
+## hyper (1.12, HTTP/1 server)
+
+- hyper answers a head it refuses with its own `400` (malformed head, differing duplicate
+  `Content-Length`, a bad header line) or `431` (oversize head) and never calls the service: no
+  audit entry could precede that reply. `llm.sock` therefore reads and decides on the head
+  itself and gates hyper's writes. (Task 7, `llm/probe_tests.rs`)
+- hyper and the broker both parse with `httparse` 1.10's default request config: both accept
+  bare-LF line ends and a leading empty line, and both refuse obs-fold continuation lines,
+  whitespace before the colon and a bare CR. hyper accepts a repeated equal `Content-Length`
+  (the broker refuses it) and a `Transfer-Encoding: chunked` beside `Content-Length` (chunked
+  wins; the broker refuses it); it refuses `Transfer-Encoding: identity` with a 400. (Task 7,
+  `hyper_never_reads_an_accepted_head_differently`)
+- With `half_close` off (the default), hyper calls the service for a complete request whose
+  peer has already shut its write side, then drops the service future at the read EOF (a
+  service that waits never finishes) and the reply: the peer gets nothing. The shim passes a
+  client's half-close on, so `llm.sock` sets `half_close(true)` (architect ruling Q14): then the
+  service runs to its end and the peer gets the reply, but a read EOF no longer cancels the
+  service, so a peer that is gone is noticed only at the first write (#60). (Task 7,
+  `hyper_never_answers_a_half_closed_peer`, `half_close_decides_whether_a_half_closed_peer_is_served`)
+- hyper writes the interim `100 Continue` for `Expect: 100-continue` when the service first
+  polls the body. On `llm.sock` that is before the request's entry, so the gate drops it: a
+  client that waits for the 100 sends its body after its own timeout (curl: 1 s) instead.
+  Nothing reaches the peer before the entry. (Task 7 security review)
+- Busybox `wget` (the test image) does not half-close: its requests through the shim are
+  answered. (Task 7, `tests/rpc.rs`)
+
 ## Host network state (/proc)
 
 - `/proc/net/fib_trie` lists each IPv4 address as a `|-- <ip>` leaf followed by `/<len> <scope>

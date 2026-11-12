@@ -57,13 +57,16 @@ nextest:
 	$(CARGO) test -q --workspace --doc
 
 # Line-coverage gates (CLAUDE.md): sally-core >= 90%; sallyd egress >= 85% over the whole module
-# directory, lib tests only (architect ruling Q16, Task 8). Approvals join when they exist.
+# directory, lib tests only (architect ruling Q16, Task 8). rpc and llm are gated at the same
+# floor (architect ruling Q15, Task 7). Approvals join when they exist.
 COV_MIN_CORE ?= 90
 COV_MIN_EGRESS ?= 85
 coverage:
 	$(CARGO) llvm-cov -q -p sally-core --summary-only --fail-under-lines $(COV_MIN_CORE)
 	$(CARGO) llvm-cov -q -p sallyd --lib --json --summary-only --output-path target/cov-sallyd.json
 	bash scripts/coverage-gate.sh $(COV_MIN_EGRESS) target/cov-sallyd.json /crates/sallyd/src/egress/
+	bash scripts/coverage-gate.sh $(COV_MIN_EGRESS) target/cov-sallyd.json /crates/sallyd/src/rpc/
+	bash scripts/coverage-gate.sh $(COV_MIN_EGRESS) target/cov-sallyd.json /crates/sallyd/src/llm/
 
 # Mutation testing over the deny paths, zero survivors (AMENDMENTS-01 §15): a surviving mutant in
 # a deny path is an untested control. approvals and tools::fs join as they land; the egress modules
@@ -95,7 +98,10 @@ MUTANTS_WIDE_SALLYD := $(addprefix crates/sallyd/src/sandbox/,argv.rs check.rs t
                        overlap.rs scan.rs images.rs changes.rs dirs.rs podman.rs disk.rs stage.rs \
                        launch/error.rs) \
                        $(addprefix crates/sallyd/src/egress/,addr.rs authority.rs head.rs policy.rs server.rs \
-                       hostaddrs.rs tunnel.rs net.rs ca.rs roots.rs)
+                       hostaddrs.rs tunnel.rs net.rs ca.rs roots.rs) \
+                       $(addprefix crates/sallyd/src/rpc/,agent.rs control.rs frame.rs json.rs listen.rs mcp.rs \
+                       message.rs rate.rs record.rs) \
+                       $(addprefix crates/sallyd/src/llm/,body.rs head.rs io.rs reply.rs server.rs)
 MUTANTS_WIDE_SHIM := $(addprefix crates/sally-shim/src/,args.rs relay.rs)
 MUTANTS_WIDE_TESTS_CORE :=
 MUTANTS_WIDE_TESTS_SALLYD := --lib --test=argv --test=scan
@@ -120,7 +126,7 @@ zizmor:
 	zizmor --min-severity low .github/workflows
 
 # Fuzz smoke: 60 s per target (needs nightly + cargo-fuzz; CI pins both).
-FUZZ_TARGETS := manifest secrets audit_line egress_head
+FUZZ_TARGETS := manifest secrets audit_line egress_head jsonrpc_message llm_request
 FUZZ_SECS ?= 60
 CARGO_FUZZ_TOOLCHAIN ?= +nightly
 fuzz:

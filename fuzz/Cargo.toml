@@ -46,3 +46,17 @@ path = "fuzz_targets/audit_line.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "jsonrpc_message"
+path = "fuzz_targets/jsonrpc_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "llm_request"
+path = "fuzz_targets/llm_request.rs"
+test = false
+doc = false
+bench = false

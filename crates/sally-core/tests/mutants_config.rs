@@ -474,6 +474,7 @@ fn every_cited_proof_test_exists() {
             "crates/sally-core/src/audit",
             "crates/sally-core/src/secrets",
             "crates/sallyd/src/sandbox",
+            "crates/sallyd/src/rpc",
         ];
         let found = dirs
             .iter()

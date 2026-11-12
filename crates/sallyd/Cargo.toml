@@ -13,14 +13,24 @@ workspace = true
 
 [dependencies]
 httparse = "1.10.1"
+# llm.sock: the HTTP/1.1 server (Task 7 decision 7; architect Q10). Server and http1 only.
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", default-features = false, features = ["http1", "server"] }
+# TokioIo for hyper on tokio streams (a hand-written adapter would need unsafe).
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
 pem = { version = "4.0.0", default-features = false, features = ["std"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring", "zeroize"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = { version = "1.16.0", features = ["std"] }
 time = { version = "0.3.55", default-features = false }
-rustix = { version = "1.1.6", default-features = false, features = ["fs", "process", "std"] }
+# `net`: SO_PEERCRED for the peer-UID check on every broker socket (architect Q1).
+rustix = { version = "1.1.6", default-features = false, features = ["fs", "net", "process", "std"] }
 sally-core = { path = "../sally-core", version = "0.1.0" }
+# Already in the tree through serde_json; used directly for the duplicate-key-refusing parse.
+serde = "1.0.229"
 serde_json = "1.0.154"
+# Already in the tree through sally-core: the sha256 of llm.sock bodies in audit entries.
+sha2 = "0.11.1"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", default-features = false, features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
 

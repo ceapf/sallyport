@@ -15,8 +15,7 @@ use std::os::unix::fs::PermissionsExt;
 
 use sally_core::manifest::Cpus;
 use sallyd::sandbox::{
-    CommonArgs, InferenceSpec, Running, SessionDirs, SessionId, VerifiedModel, harness_argv,
-    inference_argv,
+    InferenceSpec, Running, SessionDirs, SessionId, VerifiedModel, harness_argv, inference_argv,
 };
 
 mod common;
@@ -56,24 +55,6 @@ struct Boxed {
     running: Option<Running>,
 }
 
-fn common_args(x: &Lx, dirs: &SessionDirs) -> CommonArgs {
-    CommonArgs {
-        runtime: x.runtime.clone(),
-        ids: ids(),
-        profiles: dirs.profiles().to_owned(),
-        hooks_dir: x.podman.hooks_dir(),
-        mounts_file: x.podman.mounts_file(),
-    }
-}
-
-/// `podman create <argv>` then `podman start`, both hermetic.
-async fn create_and_start(x: &Lx, argv: Vec<String>) -> String {
-    let out = x.hermetic(&argv).await;
-    let id = out.lines().last().unwrap().to_owned();
-    x.hermetic(&["start".to_owned(), id.clone()]).await;
-    id
-}
-
 async fn start(x: &Lx, role: Role) -> Boxed {
     let tag = format!("{role:?}").to_lowercase();
     let v = x.f.load("");
@@ -87,8 +68,8 @@ async fn start(x: &Lx, role: Role) -> Boxed {
         }
         Role::Harness => {
             let dirs = SessionDirs::create(&paths, &x.xdg, &[], 0).unwrap();
-            let argv = harness_argv(&common_args(x, &dirs), &paths, &v, &test_image()).unwrap();
-            (create_and_start(x, argv).await, None)
+            let argv = harness_argv(&x.common_args(&dirs), &paths, &v, &test_image()).unwrap();
+            (x.create_and_start(argv).await, None)
         }
         Role::Inference => {
             let dirs = SessionDirs::create(&paths, &x.xdg, &[], 0).unwrap();
@@ -111,8 +92,8 @@ async fn start(x: &Lx, role: Role) -> Boxed {
                 cpus: Cpus::from_millis(1000),
                 memory: None,
             };
-            let argv = inference_argv(&common_args(x, &dirs), &spec).unwrap();
-            (create_and_start(x, argv).await, None)
+            let argv = inference_argv(&x.common_args(&dirs), &spec).unwrap();
+            (x.create_and_start(argv).await, None)
         }
     };
     Boxed {

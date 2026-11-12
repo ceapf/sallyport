@@ -59,4 +59,7 @@ exclude_re = [
   # rt_sup_02_a_missing_digest_is_refused_without_an_outbound_connection ("image not known").
   'crates/sallyd/src/sandbox/images\.rs:\d+:\d+: replace Launcher::image_present -> Result<\(\), LaunchError> with Ok\(\(\)\)$',
   'crates/sallyd/src/sandbox/images\.rs:\d+:\d+: delete ! in Launcher::image_present$',
+  # Same value (rule i): `Value::default()` is `Value::Null`, which is what visit_unit returns
+  # (architect ruling Q13, Task 7). Proof: json.rs `null_parses_to_the_default_value`.
+  '''crates/sallyd/src/rpc/json\.rs:\d+:\d+: replace <impl Visitor<'de> for StrictVisitor>::visit_unit -> Result<Value, E> with Ok\(Default::default\(\)\)$''',
 ]

@@ -45,25 +45,10 @@ gh, pip, SDKs) work unmodified and never see a token.
 
 **Removed:** `infer.complete`, dotted `tools.list`/`tools.call`, `ui.*`, `audit.note`, `session.info`, `sallyport_sdk`, harness-spawned MCP servers.
 
-### 3.1 `agent.sock` — MCP, tools only
-The broker is an MCP server. Framing: newline-delimited JSON-RPC 2.0 (MCP stdio framing) over the Unix stream. Clients that expect to spawn a stdio server use `sally-shim --stdio /run/sallyport/agent.sock`.
+### 3.1–3.2 Folded
 
-- Serve **both** lifecycles: the current stateless revision (2026-07-28: no handshake, per-request version/capabilities in `_meta`, `server/discover`, results carry `resultType`) **and** the legacy `initialize` handshake for clients on 2025-11-25 or earlier.
-- Method allowlist, everything else → method-not-found + audit `rpc.deny`: `server/discover`, `initialize`, `notifications/initialized`, `ping`, `tools/list`, `tools/call`, `notifications/cancelled`. No resources, prompts, sampling, elicitation, roots, logging, subscriptions, tasks. No JSON-RPC batches.
-- **This revision is recent.** Before coding, read the 2026-07-28 changelog and schema on modelcontextprotocol.io for exact field names, `resultType` values and error codes. Do not code message shapes from memory. Hand-roll this subset in `sallyd::rpc` (bounded parser, 256 KiB frames); do not add an MCP SDK crate to the TCB.
-- Built-in tool names on the wire and in manifests (function-name safe): `fs_read`, `fs_list`, `fs_write`, `fs_delete`, `shell`, `fetch`. Tool descriptions are static strings compiled into the broker; never interpolate manifest or user text into them.
-- `tools/call` **blocks** until executed, denied, or `approvals.timeout`. Denials return `isError: true` with text `denied: <stable-code>`. Approval never round-trips through the sandbox.
-
-| Tool | Executes | Policy |
-|---|---|---|
-| `fs_read`, `fs_list` | broker, `openat2` on the host path of any mount | size caps; audited at `audit.level: full` |
-| `fs_write`, `fs_delete` | broker, `openat2` | `ro` → denied; `rw` → allowed, audited (path, bytes, sha256); `brokered` → approve globs; protected paths (§6.3) always denied |
-| `shell` | `podman exec` in the **workspace** container | `tools.shell` deny / approve / allow (+ destructive tags) |
-| `fetch` | broker egress path (same policy and injection as the proxy) | non-GET/HEAD per `tools.fetch_writes` |
-| `<server>__<tool>` | relayed to a declared MCP server (§3.4) | per-server `approve` |
-
-### 3.2 `llm.sock` — OpenAI-compatible HTTP
-HTTP/1.1 server in the broker (hyper on a `UnixListener`). Allowlist: `POST /v1/chat/completions` (stream and non-stream), `GET /v1/models`. Everything else → 404 + audit `llm.deny`. Body field allowlist: `model` (ignored; the session's model is used), `messages`, `tools`, `tool_choice`, `parallel_tool_calls`, `temperature`, `top_p`, `max_tokens`, `max_completion_tokens`, `stop`, `seed`, `stream`, `stream_options`, `response_format`, `presence_penalty`, `frequency_penalty`, `n` (must be 1). Message content parts: text only (reject image/audio/file parts in v1). Caps as before (4 MiB body, `max_tokens` ≤ manifest). The harness sees `OPENAI_BASE_URL=http://127.0.0.1:8080/v1` and `OPENAI_API_KEY=sallyport` (dummy).
+§3.1 (`agent.sock`, the MCP subset and the tool table) and §3.2 (`llm.sock`) are folded into
+`ARCHITECTURE.md` §4.2–§4.4 (Task 7).
 
 ### 3.3 Shim, stdio, task
 - `sally-shim` becomes a generic relay, still std-only and static: `--listen 127.0.0.1:3128=/run/sallyport/net.sock` (workspace), `--listen 127.0.0.1:8080=/run/sallyport/llm.sock` (harness), `--stdio <sock>`.
@@ -129,6 +114,8 @@ Budget: this adds roughly half a week to M1 and is about neutral afterwards. The
 
 ## 10. New red-team rows (add to `REDTEAM_SUITE.md`; all CI)
 
+RT-AG-11 to RT-AG-14 and RT-INF-05 are folded into `REDTEAM_SUITE.md` (Task 7).
+
 | ID | Attack | PASS | M |
 |---|---|---|---|
 | RT-SEC-09 | CONNECT to a grant host and to an allowed non-grant host; inspect the presented chain | grant host: leaf from session CA; non-grant host: upstream's own chain, never the session CA | M1 |
@@ -136,17 +123,12 @@ Budget: this adds roughly half a week to M1 and is about neutral afterwards. The
 | RT-SEC-11 | `expose_env` set; dump env; call grant host and non-grant host | env holds only the placeholder; upstream of grant host receives the real credential; non-grant host receives at most the placeholder | M1 |
 | RT-SEC-12 | Upstream echoes the token split across chunks, base64 and percent-encoded | all forms redacted | M1 |
 | RT-SEC-13 | `http://` request to a grant host | 403 `inject-requires-tls`; mock sees no credential | M1 |
-| RT-AG-11 | From the harness container: look for `/workspace`, `net.sock`, any route; then perform 20 random file/command operations through tools | no mounts, no egress; host-side changes == audit entries, one for one | M1 |
-| RT-AG-12 | From the workspace container: reach `llm.sock`/`agent.sock`/`127.0.0.1:8080` | absent / refused | M1 |
-| RT-AG-13 | MCP surface abuse: resources, prompts, sampling, logging, unknown methods, batches, 1 MiB frames; plus `tools/list` via both lifecycles | all rejected with `rpc.deny`; both lifecycles work | M1 |
-| RT-AG-14 | `fetch` POST with a mount present; MCP tool call with `approve: always` | pending until approved; denied on timeout | M1 / M4 |
 | RT-FS-12 | Write `.git/hooks/pre-commit` and a `core.fsmonitor` line, via shell and via `fs_write`; then run `git status` on the host in the harness | both writes refused; host canary not executed | M1 |
 | RT-FS-13 | Mount tree contains a Unix socket | launch refused `socket-in-mount` | M1 |
 | RT-FS-14 | Mount a bind-mount alias of a protected folder | refused (`st_dev`/`st_ino` match) | M1 |
 | RT-AG-08b | Second session mounts a directory a live session holds in a different mode | launch refused | M1 |
 | RT-SUP-02 | Manifest names a digest not present locally | refused; `strace` shows no outbound connect | M1 |
 | RT-SUP-03 | Inference image flag snapshot and argv scan | `--help` flags equal the snapshot; argv has `-m`, none of the forbidden flags | M3 |
-| RT-INF-05 | `/v1/completions`, `/models/load`, `/props`, `/slots`, `/tokenize`, image parts, `n: 5` on `llm.sock` | 404/400; inference container never sees them | M3 |
 | RT-MDL-10 | GGUF with a 1 MiB template; GGUF whose template injects exfil instructions | first refused; second: inspect shows template + hash, every resulting action denied by policy | M2 / M4 |
 | RT-CLI-01 | Sandbox prints ESC, CSI, OSC 52, OSC 8 | neutralized in line mode | M1 |
 

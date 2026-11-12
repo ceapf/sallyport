@@ -3,4 +3,6 @@
 #![warn(missing_docs)]
 
 pub mod egress;
+pub mod llm;
+pub mod rpc;
 pub mod sandbox;

@@ -347,6 +347,7 @@ validation — otherwise `mount-changed`/`is-symlink` (RT-FS-06).
 | (no field) free-space floor, `max(4 GiB, 5 %)` | `sallyd::sandbox` disk watchdog: `fstatfs` every 250 ms of every filesystem the sandbox can write to (state, `rw` mount roots) | launch + runtime | below the floor: session killed, audit `session.resource_limit` reason `disk_floor`; launch refused `disk-floor` |
 | `model.ref` | `sallyd::infer` resolves in library; refuses unverified/unknown | session start | error to UI |
 | `model.context/gpu_layers` | `sallyd::infer` → llama-server args, clamped by fit estimator | load | clamped, warning |
+| `model.context` (token limit) | `sallyd::llm` (`body::check`): a request's `max_tokens` / `max_completion_tokens` above it is refused (and 0 always is); absent, the backend is given `model.context` as the bound. The M3 fit estimator clamps further | each `llm.sock` request | 400 `token-limit` (0: `bad-value`) + audit `llm.deny` |
 | `filesystem.mounts[].host` | validator (realpath, denylist, is-dir, not-symlink) **and again** at launch: the launch scan re-opens the root without following symlinks and compares `st_dev:st_ino`, pins are re-checked before `podman init`, and bind mounts are compared inside the container after `init` (ARCHITECTURE §3.5) | validate + launch | reject / `sandbox.refuse` / `sandbox.mount_mismatch` |
 | `filesystem.mounts[].guest` | validator (`/workspace/…`, no `..`, unique) | validate | reject |
 | `filesystem.mounts[].mode` | workspace `podman run` (`sallyd::sandbox::workspace_argv`): bind `ro`/`rw` with `nosuid,nodev,bind` (non-recursive); `brokered` → `ro` + broker `fs_*`; `staged` → `:O` overlay with upper/work in session scratch | launch + each `fs_*` call | EROFS in workspace; `fs_write`/`fs_delete` denied on `ro` and `staged` |
@@ -418,8 +419,8 @@ never on message text); the field path uses `a.b[0].c` form.
 | `data-can-leave` | private data and an outward channel coexist (warning) |
 | `inconsistent` / `risky` | warnings only |
 
-TODO(task 7): export `Code` through `sally-proto` (`ts-rs`) so the UI gets the code set as a
-generated type.
+TODO(#58): export `Code` through `sally-proto` (`ts-rs`) so the UI gets the code set as a
+generated type. Deferred from Task 7 to M5 (Task 7 ruling Q12).
 
 ## 5. Example manifests
 
