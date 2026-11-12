@@ -821,6 +821,16 @@ fn replies_carry_the_status_phrase_and_reason_only() {
         (HeadTooLarge, "431 Request Header Fields Too Large"),
         (HeadTimeout, "408 Request Timeout"),
         (Malformed, "400 Bad Request"),
+        // The in-tunnel reasons (Task 9a-2, architect Q42).
+        (HostMismatch, "421 Misdirected Request"),
+        (UpgradeRefused, "403 Forbidden"),
+        (MethodRefused, "405 Method Not Allowed"),
+        (RequestTooLarge, "413 Content Too Large"),
+        (ResponseTooLarge, "502 Bad Gateway"),
+        (UpstreamEncoded, "502 Bad Gateway"),
+        (UpstreamTlsFailed, "502 Bad Gateway"),
+        (UpstreamClosed, "502 Bad Gateway"),
+        (UpstreamMalformed, "502 Bad Gateway"),
     ];
     for (r, status) in table {
         let code = r.as_str();
