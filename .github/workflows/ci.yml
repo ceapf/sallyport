@@ -39,9 +39,16 @@ jobs:
         run: cargo nextest --version | grep -Fw "$CARGO_NEXTEST_VERSION"
       # Container tests (crates/sallyd/tests/*.rs) need rootless podman, their base image pulled
       # by digest, a C compiler for the red-team probe (tests/redteam/probe) and strace (RT-SUP-02);
-      # the test images are built without a network. They never skip.
+      # the test images are built without a network. They never skip. RT-SEC-10 verifies with
+      # OpenSSL, Python ssl, GnuTLS certtool and Go crypto/x509 (offline; architect Q46).
       - name: container test prerequisites
         run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends gnutls-bin golang-go
+          certtool --version | head -n1
+          command -v go && go version
+          openssl version
+          python3 --version
           podman --version
           cc --version | head -n1
           strace -V | head -n1
@@ -74,6 +81,12 @@ jobs:
         run: cargo nextest --version | grep -Fw "$CARGO_NEXTEST_VERSION"
       - name: red-team prerequisites
         run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends gnutls-bin golang-go
+          certtool --version | head -n1
+          command -v go && go version
+          openssl version
+          python3 --version
           podman --version
           cc --version | head -n1
           strace -V | head -n1

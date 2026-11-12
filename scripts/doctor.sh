@@ -129,6 +129,10 @@ if have python3; then
 else
   printf 'T %-12s MISSING\n' python3
 fi
+# RT-SEC-10's verifiers besides rustls (OpenSSL, Python ssl, GnuTLS, Go); a missing one fails it.
+tool_line openssl openssl version
+tool_line certtool certtool --version
+tool_line go go version
 tool_line rustup rustup --version
 tool_line cargo cargo --version
 tool_line rustc rustc --version
