@@ -20,12 +20,24 @@ impl Rate {
     /// `rate` requests per second on average, `burst` at once. Both are at least 1.
     #[must_use]
     pub fn new(rate: u32, burst: u32) -> Self {
-        let interval = Duration::from_secs(1) / rate.max(1);
+        Self::every(Duration::from_secs(1) / rate.max(1), burst)
+    }
+
+    /// One request per `interval` on average (at least 1 ns), `burst` (at least 1) at once.
+    #[must_use]
+    pub fn every(interval: Duration, burst: u32) -> Self {
+        let interval = interval.max(Duration::from_nanos(1));
         Self {
             interval,
             tolerance: interval.saturating_mul(burst.max(1).saturating_sub(1)),
             tat: Instant::now(),
         }
+    }
+
+    /// Whether every slot of the burst is free now.
+    #[must_use]
+    pub fn full(&self) -> bool {
+        self.tat <= Instant::now()
     }
 
     /// Takes one slot if the limit allows it now; whether it did.
@@ -108,6 +120,32 @@ mod tests {
         assert_eq!(r.take(), Err(Duration::from_millis(60)));
         tokio::time::advance(Duration::from_millis(60)).await;
         assert_eq!(r.take(), Ok(()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_slot_per_interval_with_a_burst() {
+        let mut r = Rate::every(Duration::from_secs(2), 3);
+        assert!(r.full());
+        assert_eq!(burst(&mut r), 3);
+        assert!(!r.full());
+        tokio::time::advance(Duration::from_millis(1999)).await;
+        assert!(!r.allow());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(r.allow());
+        // Full again once every slot has come back: three intervals after the last take.
+        tokio::time::advance(Duration::from_millis(5999)).await;
+        assert!(!r.full());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(r.full());
+        assert_eq!(burst(&mut r), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_interval_or_burst_still_limits() {
+        let mut r = Rate::every(Duration::ZERO, 0);
+        assert_eq!(burst(&mut r), 1);
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        assert!(r.allow());
     }
 
     #[tokio::test(start_paused = true)]

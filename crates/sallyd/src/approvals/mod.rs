@@ -3,3 +3,4 @@
 pub mod action;
 pub mod glob;
 pub mod policy;
+pub mod render;
