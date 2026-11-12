@@ -104,15 +104,19 @@ fn a_form_longer_than_the_bound_is_refused_naming_the_secret() {
 
 #[test]
 fn a_held_buffer_grows_by_replacing_itself() {
-    let mut held = Vec::with_capacity(4);
+    let mut held = Zeroizing::new(Vec::with_capacity(4));
     append_wiped(&mut held, b"abc");
     assert_eq!(held.capacity(), 4);
     append_wiped(&mut held, b"de");
-    assert_eq!(held, b"abcde");
+    assert_eq!(held.as_slice(), b"abcde");
     assert_eq!(held.capacity(), 8);
     append_wiped(&mut held, b"0123456789abcdef");
     assert_eq!(held.len(), 21);
     assert_eq!(held.capacity(), 21);
+    // An exact fit keeps the buffer.
+    let mut exact = Zeroizing::new(Vec::with_capacity(4));
+    append_wiped(&mut exact, b"abcd");
+    assert_eq!((exact.as_slice(), exact.capacity()), (&b"abcd"[..], 4));
 }
 
 #[test]
@@ -256,9 +260,36 @@ fn a_redacted_body_counts_held_bytes_in_its_size_hint() {
     assert!(matches!(f, Poll::Ready(Some(Ok(_)))));
     assert_eq!(b.stream.held(), 9);
     assert_eq!(b.size_hint().exact(), Some(9));
-    let mut lower_only = SizeHint::new();
-    lower_only.set_lower(3);
-    assert_eq!(lower_only.upper(), None);
+}
+
+/// A body of unknown length (a lower bound only) keeps an open upper bound.
+#[test]
+fn a_redacted_body_of_unknown_length_hints_a_lower_bound_only() {
+    struct Open(Frames);
+    impl Body for Open {
+        type Data = Bytes;
+        type Error = BoxError;
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+            Pin::new(&mut self.get_mut().0).poll_frame(cx)
+        }
+        fn size_hint(&self) -> SizeHint {
+            let mut h = SizeHint::new();
+            h.set_lower(self.0.size_hint().lower());
+            h
+        }
+    }
+    let r = redaction(&[("A", &["0123456789"])]);
+    let mut b = Redacted::new(Open(Frames(vec![data("abc"), data("defghijkl")])), &r);
+    let waker = std::task::Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    assert_eq!((b.size_hint().lower(), b.size_hint().upper()), (12, None));
+    let _ = Pin::new(&mut b).poll_frame(&mut cx);
+    // "abc" + "defghijkl": 12 in, 9 held, 3 emitted; the inner has nothing left.
+    assert_eq!(b.stream.held(), 9);
+    assert_eq!((b.size_hint().lower(), b.size_hint().upper()), (9, None));
 }
 
 #[test]
@@ -379,9 +410,54 @@ fn a_redacted_value_keeps_the_bytes_outside_its_runs() {
 #[test]
 fn debug_output_names_labels_but_never_a_form() {
     let r = redaction(&[("A", &["verysecretvalue"])]);
-    let d = format!("{r:?} {:?}", r.stream());
+    let mut s = r.stream();
+    let _ = s.push(b"xxverysecret");
+    let d = format!("{r:?}");
     assert!(d.contains("[REDACTED:A]"));
-    assert!(!d.contains("verysecretvalue"));
+    let ds = format!("{s:?}");
+    assert!(ds.contains("Stream") && ds.contains("held: 12"), "{ds}");
+    assert!(!d.contains("verysecretvalue") && !ds.contains("verysecret"));
+}
+
+/// An independent redaction of `body` (decision 2, architect D1), written plainly: every byte an
+/// occurrence of a form covers becomes filler; a run takes the label of the longest form that
+/// starts at its first byte (the first given on a tie), then `*`.
+fn reference(secrets: &[(String, Vec<Vec<u8>>)], body: &[u8]) -> Vec<u8> {
+    let forms: Vec<(&str, &[u8])> = secrets
+        .iter()
+        .flat_map(|(n, fs)| fs.iter().map(move |f| (n.as_str(), f.as_slice())))
+        .filter(|(_, f)| !f.is_empty())
+        .collect();
+    let mut covered = vec![false; body.len()];
+    for (_, f) in &forms {
+        for s in 0..body.len() {
+            if body[s..].starts_with(f) {
+                covered[s..s + f.len()].fill(true);
+            }
+        }
+    }
+    let mut out = body.to_vec();
+    let mut i = 0;
+    while i < body.len() {
+        if !covered[i] {
+            i += 1;
+            continue;
+        }
+        let mut best: Option<(usize, &str)> = None;
+        for (n, f) in &forms {
+            if body[i..].starts_with(f) && best.is_none_or(|(len, _)| f.len() > len) {
+                best = Some((f.len(), n));
+            }
+        }
+        let label = format!("[REDACTED:{}]", best.map_or("", |b| b.1));
+        let mut k = 0;
+        while i < body.len() && covered[i] {
+            out[i] = label.as_bytes().get(k).copied().unwrap_or(b'*');
+            i += 1;
+            k += 1;
+        }
+    }
+    out
 }
 
 fn occurs(hay: &[u8], needle: &[u8]) -> bool {
@@ -474,6 +550,8 @@ proptest! {
         let out = split_run(&r, &body, &cuts);
         prop_assert_eq!(out.len(), body.len());
         prop_assert_eq!(&out, &r.bytes(&body));
+        let plain: Vec<Vec<u8>> = forms.iter().map(|f| f.expose().as_bytes().to_vec()).collect();
+        prop_assert_eq!(&out, &reference(&[("S".to_owned(), plain)], &body));
         for f in &forms {
             prop_assert!(!occurs(&out, f.expose().as_bytes()));
         }
@@ -485,7 +563,7 @@ proptest! {
     }
 
     /// Decision 7: for any split of any response, no covered form survives, the length never
-    /// changes, and the result equals the one-shot redaction.
+    /// changes, and the result equals the one-shot redaction and an independent one.
     #[test]
     fn no_form_survives_any_split((secrets, body, cuts) in case()) {
         let r = Arc::new(Redaction::new(
@@ -498,6 +576,11 @@ proptest! {
         prop_assert_eq!(whole.len(), body.len());
         let out = split_run(&r, &body, &cuts);
         prop_assert_eq!(&out, &whole);
+        let plain: Vec<(String, Vec<Vec<u8>>)> = secrets
+            .iter()
+            .map(|(n, f)| (n.clone(), f.iter().map(|x| x.as_bytes().to_vec()).collect()))
+            .collect();
+        prop_assert_eq!(&out, &reference(&plain, &body));
         for (_, forms) in &secrets {
             for f in forms {
                 prop_assert!(!occurs(&out, f.as_bytes()), "{f} survived");

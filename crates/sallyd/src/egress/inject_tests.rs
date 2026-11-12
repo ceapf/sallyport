@@ -45,13 +45,21 @@ fn a_grant_host_gets_its_rendered_header_replacing_any_client_copy() {
         HeaderValue::from_static("Bearer two"),
     );
     h.insert(header::ACCEPT, HeaderValue::from_static("*/*"));
-    c.set("a.mock.test", &mut h);
+    // Architect Q2: this test alone tells `insert` from `append` (RT-SEC-04 guards the pair).
+    assert_eq!(set(&c, "a.mock.test", &mut h), ["secret:GH"]);
     let all: Vec<_> = h.get_all(header::AUTHORIZATION).iter().collect();
     assert_eq!(all.len(), 1);
     assert_eq!(all[0], format!("Bearer {}", value("GH")).as_str());
     assert!(all[0].is_sensitive());
     assert_eq!(h.get(header::ACCEPT).unwrap(), "*/*");
-    assert_eq!(c.names("a.mock.test"), ["secret:GH"]);
+}
+
+/// Prepares `host`'s grant headers, applies them to `h`, and returns the names it reported.
+fn set(c: &Credentials, host: &str, h: &mut HeaderMap) -> Vec<String> {
+    let p = c.prepare(host);
+    let names = p.names().to_vec();
+    p.apply(h);
+    names
 }
 
 #[test]
@@ -59,29 +67,40 @@ fn another_grants_credential_is_never_set_on_this_host() {
     let specs = [bearer("GH", "a.mock.test"), bearer("OTHER", "b.mock.test")];
     let c = Credentials::new(&specs, values(&["GH", "OTHER"])).unwrap();
     let mut h = HeaderMap::new();
-    c.set("b.mock.test", &mut h);
+    assert_eq!(set(&c, "b.mock.test", &mut h), ["secret:OTHER"]);
     assert_eq!(
         h.get(header::AUTHORIZATION).unwrap(),
         format!("Bearer {}", value("OTHER")).as_str()
     );
     let mut none = HeaderMap::new();
-    c.set("c.mock.test", &mut none);
+    assert!(set(&c, "c.mock.test", &mut none).is_empty());
     assert!(none.is_empty());
-    assert!(c.names("c.mock.test").is_empty());
-    assert_eq!(c.names("b.mock.test"), ["secret:OTHER"]);
 }
 
+/// Architect ruling Q4: the names `egress.request` reports are exactly the headers set, in order;
+/// a prepared set shows its names and never a value.
 #[test]
-fn a_host_with_two_grants_gets_both_headers_in_order() {
+fn a_host_with_two_grants_gets_both_headers_and_reports_them_in_order() {
     let specs = [
         bearer("GH", "a.mock.test"),
         spec("KEY", "a.mock.test", "X-Api-Key", "{value}"),
     ];
     let c = Credentials::new(&specs, values(&["GH", "KEY"])).unwrap();
+    let p = c.prepare("a.mock.test");
+    let shown = format!("{p:?}");
+    assert!(
+        shown.contains("secret:GH") && shown.contains("secret:KEY"),
+        "{shown}"
+    );
+    assert!(!shown.contains(&value("GH")) && !shown.contains(&value("KEY")));
     let mut h = HeaderMap::new();
-    c.set("a.mock.test", &mut h);
+    let names = p.names().to_vec();
+    p.apply(&mut h);
+    let set_order: Vec<&str> = h.keys().map(|k| k.as_str()).collect();
+    assert_eq!(set_order, ["authorization", "x-api-key"]);
+    assert_eq!(names, ["secret:GH", "secret:KEY"]);
     assert_eq!(h.get("x-api-key").unwrap(), value("KEY").as_str());
-    assert_eq!(c.names("a.mock.test"), ["secret:GH", "secret:KEY"]);
+    assert!(h.get("x-api-key").unwrap().is_sensitive());
     assert_eq!(c.hosts(), ["a.mock.test"]);
 }
 
@@ -129,7 +148,7 @@ fn a_format_without_exactly_one_value_placeholder_is_refused() {
         let s = spec("GH", "a.mock.test", "Authorization", f);
         let c = Credentials::new(&[s], values(&["GH"])).unwrap();
         let mut h = HeaderMap::new();
-        c.set("a.mock.test", &mut h);
+        let _ = set(&c, "a.mock.test", &mut h);
         let want = f.replace("{value}", &value("GH"));
         assert_eq!(h.get(header::AUTHORIZATION).unwrap(), want.as_str(), "{f}");
     }

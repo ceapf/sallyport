@@ -12,9 +12,11 @@
 //! [`Stream`] does the same over a body that arrives in pieces: it holds back the last
 //! `longest - 1` bytes (decision 3), the most an occurrence that is not yet complete can have
 //! arrived of, and emits a byte only once no later occurrence can cover it. Its output is the
-//! same for every split of the same input ([`Redaction::bytes`] is the one-shot form). The bytes
-//! it holds may be part of a secret: they are wiped when the stream drops, and a growing buffer
-//! wipes the one it replaces.
+//! same for every split of the same input ([`Redaction::bytes`] is the one-shot form). Each push
+//! scans only the windows that end in the new piece: an occurrence wholly inside the bytes held
+//! before was marked by an earlier push. The bytes it holds may be part of a secret: they are
+//! wiped when the stream drops, and a growing buffer wipes the one it replaces.
+#![deny(clippy::indexing_slicing)]
 
 use std::cmp::Reverse;
 use std::fmt;
@@ -25,12 +27,19 @@ use std::task::{Context, Poll, ready};
 use hyper::body::{Body, Bytes, Frame, SizeHint};
 use hyper::http::header::{HeaderMap, HeaderValue};
 use sally_core::secrets::Secret;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::meter::BoxError;
 
 /// Fills a covered run past its label.
 const PAD: u8 = b'*';
+/// A held byte no occurrence covers.
+const UNCOVERED: u32 = 0;
+/// A held byte some occurrence covers, none starting at it. Otherwise a mark is `k + 1` for the
+/// best-ranked form `k` that starts at the byte: the forms are sorted by architect D1's rank
+/// (longer first, then the order given), so the lowest `k` wins. Only a run's first byte needs
+/// its label, and every occurrence covering that byte starts at it.
+const COVERED: u32 = u32::MAX;
 /// The longest form a redaction accepts: a store value is at most 8 KiB, its longest form (the
 /// percent-encoding) three times that, and the injected header value adds its format's text.
 pub const MAX_FORM: usize = 32 * 1024;
@@ -71,6 +80,11 @@ impl Redaction {
     /// # Errors
     /// [`TooLong`] when a form is longer than [`MAX_FORM`].
     pub fn new(secrets: Vec<(String, Vec<Secret<Vec<u8>>>)>) -> Result<Self, TooLong> {
+        Self::from_forms(secrets)
+    }
+
+    /// [`Self::new`]'s work, in a function cargo-mutants mutates (it leaves `new` alone).
+    fn from_forms(secrets: Vec<(String, Vec<Secret<Vec<u8>>>)>) -> Result<Self, TooLong> {
         let mut forms = Vec::new();
         let mut labels = Vec::with_capacity(secrets.len());
         for (label, (name, list)) in secrets.into_iter().enumerate() {
@@ -84,11 +98,9 @@ impl Redaction {
             }
             labels.push(format!("[REDACTED:{name}]"));
         }
-        let longest = forms
-            .iter()
-            .map(|f| f.bytes.expose().len())
-            .max()
-            .unwrap_or(0);
+        // Architect D1's rank: the longer form first, then the order given (a stable sort).
+        forms.sort_by_key(|f| Reverse(f.bytes.expose().len()));
+        let longest = forms.first().map_or(0, |f| f.bytes.expose().len());
         Ok(Self {
             forms,
             labels,
@@ -122,7 +134,7 @@ impl Redaction {
     pub fn stream(self: &Arc<Self>) -> Stream {
         Stream {
             redaction: Arc::clone(self),
-            held: Vec::new(),
+            held: Zeroizing::new(Vec::new()),
             marks: Vec::new(),
             base: 0,
             run: None,
@@ -139,23 +151,36 @@ impl Redaction {
             .unwrap_or(PAD)
     }
 
-    /// The label of form `form`.
-    fn label(&self, form: usize) -> usize {
-        self.forms.get(form).map_or(0, |f| f.label)
+    /// The label of the run that starts at a byte marked `mark` (form `mark - 1` starts there).
+    fn label(&self, mark: u32) -> usize {
+        usize::try_from(mark.wrapping_sub(1))
+            .ok()
+            .and_then(|k| self.forms.get(k))
+            .map_or(0, |f| f.label)
     }
 }
 
-/// The occurrence that starts a byte's run, ordered as architect D1 ranks them: its stream
-/// offset, then the longer form, then the form given first.
-type Mark = Option<(u64, Reverse<usize>, usize)>;
+/// The mark of form `k` starting at a byte.
+fn rank(k: usize) -> u32 {
+    u32::try_from(k)
+        .ok()
+        .and_then(|k| k.checked_add(1))
+        .filter(|m| *m != COVERED)
+        .unwrap_or(COVERED)
+}
+
+/// A start mark `new` merged into a byte's mark `old`: the best-ranked start wins.
+fn best(old: u32, new: u32) -> u32 {
+    if old == UNCOVERED { new } else { old.min(new) }
+}
 
 /// One body's redaction, fed in pieces.
 pub struct Stream {
     redaction: Arc<Redaction>,
-    /// Bytes not yet emitted, as received.
-    held: Vec<u8>,
-    /// Per held byte: covered, and by which occurrence.
-    marks: Vec<Mark>,
+    /// Bytes not yet emitted, as received; wiped on drop.
+    held: Zeroizing<Vec<u8>>,
+    /// Per held byte: [`UNCOVERED`], [`COVERED`], or the start mark of the best form there.
+    marks: Vec<u32>,
     /// The stream offset of `held[0]`.
     base: u64,
     /// The run the last emitted byte belongs to: its label and the next byte's offset in it.
@@ -173,23 +198,20 @@ impl fmt::Debug for Stream {
     }
 }
 
-impl Drop for Stream {
-    fn drop(&mut self) {
-        self.held.zeroize();
-    }
-}
-
 impl Stream {
     /// Takes the next piece; returns the bytes no later occurrence can cover, redacted.
+    #[must_use]
     pub fn push(&mut self, piece: &[u8]) -> Vec<u8> {
+        let before = self.held.len();
         append_wiped(&mut self.held, piece);
-        self.marks.resize(self.held.len(), None);
-        self.mark();
+        self.marks.resize(self.held.len(), UNCOVERED);
+        self.mark(before);
         let keep = self.redaction.longest.saturating_sub(1);
         self.emit(self.held.len().saturating_sub(keep))
     }
 
     /// The end of the body: everything still held, redacted.
+    #[must_use]
     pub fn finish(&mut self) -> Vec<u8> {
         self.emit(self.held.len())
     }
@@ -212,18 +234,27 @@ impl Stream {
         self.marks.clear();
     }
 
-    /// Marks every byte of `held` that an occurrence lying wholly inside it covers.
-    fn mark(&mut self) {
-        for (i, form) in self.redaction.forms.iter().enumerate() {
+    /// Marks every byte that an occurrence lying wholly inside `held` and ending after its first
+    /// `before` bytes covers (the others were marked by earlier pushes).
+    fn mark(&mut self, before: usize) {
+        for (k, form) in self.redaction.forms.iter().enumerate() {
             let needle = form.bytes.expose().as_slice();
-            for (start, window) in self.held.windows(needle.len()).enumerate() {
-                if window == needle {
-                    let at = self
-                        .base
-                        .saturating_add(u64::try_from(start).unwrap_or(u64::MAX));
-                    let this = (at, Reverse(needle.len()), i);
-                    for m in self.marks.iter_mut().skip(start).take(needle.len()) {
-                        *m = first(*m, this);
+            let from = before.saturating_sub(needle.len().saturating_sub(1));
+            let Some(tail) = self.held.get(from..) else {
+                continue;
+            };
+            for (j, window) in tail.windows(needle.len()).enumerate() {
+                if window != needle {
+                    continue;
+                }
+                let start = from.saturating_add(j);
+                if let Some(m) = self.marks.get_mut(start) {
+                    *m = best(*m, rank(k));
+                }
+                let rest = self.marks.iter_mut().skip(start.saturating_add(1));
+                for m in rest.take(needle.len().saturating_sub(1)) {
+                    if *m == UNCOVERED {
+                        *m = COVERED;
                     }
                 }
             }
@@ -234,20 +265,17 @@ impl Stream {
     fn emit(&mut self, n: usize) -> Vec<u8> {
         let mut out = Vec::with_capacity(n);
         for (i, (byte, mark)) in self.held.iter().zip(&self.marks).take(n).enumerate() {
-            match mark {
-                None => {
-                    self.run = None;
-                    out.push(*byte);
-                }
-                Some((_, _, form)) => {
-                    let pos = self
-                        .base
-                        .saturating_add(u64::try_from(i).unwrap_or(u64::MAX));
-                    self.first.get_or_insert(pos);
-                    let (label, at) = self.run.unwrap_or((self.redaction.label(*form), 0));
-                    out.push(self.redaction.filler(label, at));
-                    self.run = Some((label, at.saturating_add(1)));
-                }
+            if *mark == UNCOVERED {
+                self.run = None;
+                out.push(*byte);
+            } else {
+                let pos = self
+                    .base
+                    .saturating_add(u64::try_from(i).unwrap_or(u64::MAX));
+                self.first.get_or_insert(pos);
+                let (label, at) = self.run.unwrap_or((self.redaction.label(*mark), 0));
+                out.push(self.redaction.filler(label, at));
+                self.run = Some((label, at.saturating_add(1)));
             }
         }
         self.held.drain(..n);
@@ -375,22 +403,15 @@ pub fn headers(r: &Arc<Redaction>, headers: &HeaderMap) -> Result<HeaderMap, Ech
     Ok(out)
 }
 
-/// The occurrence ranked first of `old` and `new`.
-fn first(old: Mark, new: (u64, Reverse<usize>, usize)) -> Mark {
-    match old {
-        Some(o) if o <= new => Some(o),
-        _ => Some(new),
-    }
-}
-
-/// Appends `piece` to `held`; a buffer too small is replaced by a larger one and wiped, so no
-/// copy of held bytes is left behind in freed memory.
-fn append_wiped(held: &mut Vec<u8>, piece: &[u8]) {
+/// Appends `piece` to `held`; a buffer too small is replaced by a larger one and the old one is
+/// wiped as it drops, so no copy of held bytes is left behind in freed memory.
+fn append_wiped(held: &mut Zeroizing<Vec<u8>>, piece: &[u8]) {
     let need = held.len().saturating_add(piece.len());
     if need > held.capacity() {
-        let mut grown = Vec::with_capacity(need.max(held.capacity().saturating_mul(2)));
+        let mut grown = Zeroizing::new(Vec::with_capacity(
+            need.max(held.capacity().saturating_mul(2)),
+        ));
         grown.extend_from_slice(held);
-        held.zeroize();
         *held = grown;
     }
     held.extend_from_slice(piece);

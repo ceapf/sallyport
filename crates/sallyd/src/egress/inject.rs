@@ -163,6 +163,14 @@ impl Credentials {
         specs: &[Spec],
         values: Vec<(String, Secret<String>)>,
     ) -> Result<Self, CredentialsError> {
+        Self::build(specs, values)
+    }
+
+    /// [`Self::new`]'s work, in a function cargo-mutants mutates (it leaves `new` alone).
+    fn build(
+        specs: &[Spec],
+        values: Vec<(String, Secret<String>)>,
+    ) -> Result<Self, CredentialsError> {
         let mut injections: Vec<Injection> = Vec::with_capacity(specs.len());
         for s in specs {
             let value = values
@@ -218,24 +226,53 @@ impl Credentials {
         &self.redaction
     }
 
-    /// The `injected` list of `egress.request` for `host`: `secret:NAME` per grant, in order.
+    /// The grant headers of one request to `host`: built before its `egress.request` entry (whose
+    /// `injected` is [`Prepared::names`]) and set by [`Prepared::apply`] once that entry is
+    /// written (architect D13, ruling Q4). A failed append drops it unused.
     #[must_use]
-    pub fn names(&self, host: &str) -> Vec<String> {
-        self.injections
-            .iter()
-            .filter(|i| i.host == host)
-            .map(|i| format!("secret:{}", i.secret))
-            .collect()
-    }
-
-    /// Sets each of `host`'s grant headers in `headers`, replacing any value there, as a
-    /// sensitive value built for this request only.
-    pub fn set(&self, host: &str, headers: &mut HeaderMap) {
+    pub fn prepare(&self, host: &str) -> Prepared {
+        let mut names = Vec::new();
+        let mut pairs = Vec::new();
         for i in self.injections.iter().filter(|i| i.host == host) {
+            // Cannot fail: `new` refused a value that is no header value. Skipping is fail-safe:
+            // nothing is sent and nothing is reported as injected.
             if let Ok(mut v) = HeaderValue::from_str(i.value.expose()) {
                 v.set_sensitive(true);
-                headers.insert(i.header.clone(), v);
+                names.push(format!("secret:{}", i.secret));
+                pairs.push((i.header.clone(), v));
             }
+        }
+        Prepared { names, pairs }
+    }
+}
+
+/// One request's grant headers, sensitive values built for it alone (architect D8). Consumed by
+/// [`Prepared::apply`]; no `Clone`, no `Default`; `Debug` prints the names only.
+pub struct Prepared {
+    names: Vec<String>,
+    pairs: Vec<(HeaderName, HeaderValue)>,
+}
+
+impl fmt::Debug for Prepared {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Prepared")
+            .field("names", &self.names)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Prepared {
+    /// The `injected` list of `egress.request`: `secret:NAME` for each header this sets, in order.
+    #[must_use]
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    /// Sets each header in `headers`, replacing every value there (the client's copies were
+    /// dropped already: architect Q40; this is the second guard).
+    pub fn apply(self, headers: &mut HeaderMap) {
+        for (name, value) in self.pairs {
+            headers.insert(name, value);
         }
     }
 }

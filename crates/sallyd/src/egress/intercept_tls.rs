@@ -42,11 +42,7 @@ impl Interception {
     /// [`CaError::Unmatched`] when the leaves and the credentials name different hosts;
     /// [`CaError::Generate`] when rustls refuses a configuration or a leaf.
     pub fn new(tls: SessionTls, roots: Roots, credentials: Credentials) -> Result<Self, CaError> {
-        let leaves: BTreeSet<&str> = tls.leaves.iter().map(|l| l.host.as_str()).collect();
-        let granted: BTreeSet<&str> = credentials.hosts().into_iter().collect();
-        if leaves != granted {
-            return Err(CaError::Unmatched);
-        }
+        hosts_match(&tls, &credentials)?;
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut upstream = ClientConfig::builder_with_provider(Arc::clone(&provider))
             .with_safe_default_protocol_versions()
@@ -104,6 +100,18 @@ pub(super) struct HostTls {
     pub(super) server: Arc<ServerConfig>,
     pub(super) upstream: Arc<ClientConfig>,
     pub(super) credentials: Arc<Credentials>,
+}
+
+/// Every leaf host has a credential and every credential a leaf (architect D10). Outside
+/// `Interception::new`, so cargo-mutants mutates it.
+fn hosts_match(tls: &SessionTls, credentials: &Credentials) -> Result<(), CaError> {
+    let leaves: BTreeSet<&str> = tls.leaves.iter().map(|l| l.host.as_str()).collect();
+    let granted: BTreeSet<&str> = credentials.hosts().into_iter().collect();
+    if leaves == granted {
+        Ok(())
+    } else {
+        Err(CaError::Unmatched)
+    }
 }
 
 /// The leaf and its signing key, read from the leaf's DER key in place (architect ruling R7):

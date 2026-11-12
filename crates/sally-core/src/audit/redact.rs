@@ -15,6 +15,7 @@ use std::borrow::Cow;
 use std::fmt;
 
 use serde_json::{Map, Value};
+use zeroize::Zeroizing;
 
 use crate::secrets::Secret;
 
@@ -180,7 +181,9 @@ pub fn secret_forms(value: &str) -> Vec<Secret<String>> {
         .collect()
 }
 
-/// Every form of a secret worth redacting.
+/// Every form of a secret worth redacting. Every intermediate that holds the secret or an
+/// encoding of it is sized up front (so it never reallocates and leaves a copy behind) and wiped
+/// when dropped; a form already in the list is dropped, wiped, too (Task 9a-3 review M1).
 fn forms(bytes: &[u8], raw: &str) -> Vec<String> {
     let mut out = vec![raw.to_owned()];
     // Percent-encoding as real encoders produce it: both hex cases, `+` for space (forms), and
@@ -189,23 +192,29 @@ fn forms(bytes: &[u8], raw: &str) -> Vec<String> {
     for safe in [&b""[..], b"/", b"!'()*"] {
         for plus_space in [false, true] {
             for upper in [true, false] {
-                let pct = percent_encode(bytes, upper, plus_space, safe);
-                if !out.contains(&pct) {
-                    out.push(pct);
+                let mut pct = percent_encode(bytes, upper, plus_space, safe);
+                if !out.contains(&*pct) {
+                    out.push(std::mem::take(&mut *pct));
                 }
             }
         }
     }
-    // The secret as it appears inside a JSON string (quotes and backslashes escaped).
-    if let Ok(json) = serde_json::to_string(raw)
-        && let Some(inner) = json.strip_prefix('"').and_then(|j| j.strip_suffix('"'))
+    // The secret as it appears inside a JSON string (quotes and backslashes escaped): at most
+    // six bytes per input byte (`\u00XX`) plus the quotes.
+    let mut json = Zeroizing::new(Vec::with_capacity(
+        bytes.len().saturating_mul(6).saturating_add(2),
+    ));
+    if serde_json::to_writer(&mut *json, raw).is_ok()
+        && let Ok(text) = std::str::from_utf8(&json)
+        && let Some(inner) = text.strip_prefix('"').and_then(|j| j.strip_suffix('"'))
         && !out.iter().any(|o| o == inner)
     {
         out.push(inner.to_owned());
     }
     for alphabet in [STANDARD, URL_SAFE] {
         for lead in 0..3usize {
-            let mut data = vec![0u8; lead];
+            let mut data = Zeroizing::new(Vec::with_capacity(lead.saturating_add(bytes.len())));
+            data.resize(lead, 0);
             data.extend_from_slice(bytes);
             let encoded = base64_no_pad(&data, alphabet);
             // Characters wholly inside the secret's bits: from the first char that starts at
@@ -224,8 +233,11 @@ fn forms(bytes: &[u8], raw: &str) -> Vec<String> {
     out
 }
 
-fn base64_no_pad(data: &[u8], alphabet: &[u8; 64]) -> String {
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+/// Base64 without padding, in a buffer sized for it and wiped on drop.
+fn base64_no_pad(data: &[u8], alphabet: &[u8; 64]) -> Zeroizing<String> {
+    let mut out = Zeroizing::new(String::with_capacity(
+        data.len().div_ceil(3).saturating_mul(4),
+    ));
     for chunk in data.chunks(3) {
         let byte = |i: usize| chunk.get(i).copied().unwrap_or(0);
         let n = u32::from_be_bytes([0, byte(0), byte(1), byte(2)]);
@@ -240,17 +252,24 @@ fn base64_no_pad(data: &[u8], alphabet: &[u8; 64]) -> String {
 
 /// RFC 3986 unreserved characters and `safe` kept, everything else `%XX` (a space is `+` when
 /// `plus_space`, as in `application/x-www-form-urlencoded`).
-fn percent_encode(bytes: &[u8], upper: bool, plus_space: bool, safe: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len());
+/// The result is sized for the worst case (every byte `%XX`) and wiped on drop.
+fn percent_encode(bytes: &[u8], upper: bool, plus_space: bool, safe: &[u8]) -> Zeroizing<String> {
+    let digits: &[u8; 16] = if upper {
+        b"0123456789ABCDEF"
+    } else {
+        b"0123456789abcdef"
+    };
+    let hex = |n: u8| char::from(digits.get(usize::from(n & 15)).copied().unwrap_or(b'0'));
+    let mut out = Zeroizing::new(String::with_capacity(bytes.len().saturating_mul(3)));
     for &b in bytes {
         if b.is_ascii_alphanumeric() || b"-._~".contains(&b) || safe.contains(&b) {
             out.push(char::from(b));
         } else if plus_space && b == b' ' {
             out.push('+');
-        } else if upper {
-            out.push_str(&format!("%{b:02X}"));
         } else {
-            out.push_str(&format!("%{b:02x}"));
+            out.push('%');
+            out.push(hex(b >> 4));
+            out.push(hex(b));
         }
     }
     out

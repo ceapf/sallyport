@@ -74,6 +74,18 @@ fn session_settings_carry_the_ca_condition_and_the_timeout() {
         assert_eq!(s.ca, ca::wanted(v.manifest()));
         assert_eq!(s.timeout, Duration::from_secs(90 * 60));
         assert!(s.interception.is_none());
+        // Task 9a-3: the grants as the proxy needs them, names and text only.
+        let want = if ca {
+            vec![Spec {
+                name: "GITHUB_TOKEN".into(),
+                host: "a.mock.test".into(),
+                header: "Authorization".into(),
+                format: "Bearer {value}".into(),
+            }]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(s.grants, want, "{body}");
     }
 }
 
@@ -222,9 +234,9 @@ fn a_session_with_a_ca_gets_its_files_leaves_and_roots() {
     // Task 9a-3: the credentials hold each grant's value from the store, and nothing more.
     let c = i.credentials();
     assert_eq!(c.hosts(), ["b.mock.test", "a.mock.test"]);
-    assert_eq!(c.names("b.mock.test"), ["secret:G0", "secret:G2"]);
+    assert_eq!(c.prepare("b.mock.test").names(), ["secret:G0", "secret:G2"]);
     let mut h = hyper::http::HeaderMap::new();
-    c.set("a.mock.test", &mut h);
+    c.prepare("a.mock.test").apply(&mut h);
     assert_eq!(
         h.get("x-key-1").unwrap(),
         format!("Bearer {}", value(1)).as_str()

@@ -530,8 +530,9 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
 
     /// Forwards a checked request. The sender lock is held from `ready()` to `send_request`: a
     /// request is audited and counted only once the upstream connection is known to take it
-    /// (architect ruling R1). The grant headers are set only after its `egress.request` entry is
-    /// written, right before the request is built (architect D13).
+    /// (architect ruling R1). The grant headers are built before its `egress.request` entry
+    /// (which names exactly them) and set only once that entry is written, right before the
+    /// request is built (architect D13, ruling Q4); a failed append drops them unsent.
     async fn forward(
         &self,
         st: &Arc<State>,
@@ -545,17 +546,22 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         if let Some(reply) = self.upstream_ready(st, &mut sender).await {
             return reply;
         }
-        let injected = st.credentials.names(&st.auth.host);
+        let grants = st.credentials.prepare(&st.auth.host);
         let audited = self
             .entry("egress.request", Some("allow"))
-            .args(request_args(&st.auth, &parts.method, target, &injected));
+            .args(request_args(
+                &st.auth,
+                &parts.method,
+                target,
+                grants.names(),
+            ));
         // TODO(#72): on a session stop this append may land after `egress.close`.
         if !self.append(audited).await {
             st.set_end(End::Error);
             return Err("audit append failed".into());
         }
         st.requests.fetch_add(1, Ordering::Relaxed);
-        st.credentials.set(&st.auth.host, &mut headers);
+        grants.apply(&mut headers);
         let capped = Capped::new(body, self.limits.max_request, self.request_end(st, target));
         let up = upstream_request(capped, parts, headers)?;
         let sent = sender.send_request(up).await;
