@@ -556,6 +556,8 @@ async fn stopping_while_dialling_writes_a_close_without_a_reply() {
     let task = tokio::spawn(async move { proxy.serve(server).await });
     client.write_all(&connect("a.mock.test:443")).await.unwrap();
     while rig.dials().is_empty() {
+        // The dial hangs until the stop, so a finished task means the CONNECT was refused.
+        assert!(!task.is_finished(), "refused before the dial");
         tokio::task::yield_now().await;
     }
     rig.proxy.stop();

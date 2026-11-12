@@ -34,6 +34,8 @@ fn canned(req: &str) -> Option<String> {
     };
     Some(match path {
         "/close" => return None,
+        // Read, never answered, never closed.
+        "/hang" => String::new(),
         "/redirect" => {
             "HTTP/1.1 302 Found\r\nLocation: https://b.mock.test/\r\nContent-Length: 0\r\n\r\n"
                 .into()
@@ -57,6 +59,18 @@ fn canned(req: &str) -> Option<String> {
         "/trailer" => "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: X-Late\r\n\r\n\
                        2\r\nok\r\n0\r\nX-Late: trailer-value\r\n\r\n"
             .into(),
+        p if p.starts_with("/head/") => {
+            let n: usize = p.trim_start_matches("/head/").parse().unwrap();
+            sized_head("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n", n)
+        }
+        // As `/head/`, sent in two writes: all but the last 100 bytes, then the rest
+        // (see `split_at`).
+        p if p.starts_with("/splithead/") => {
+            let n: usize = p.trim_start_matches("/splithead/").parse().unwrap();
+            let head = sized_head("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n", n);
+            let at = split_at(n);
+            format!("{}{PAUSE}{}", &head[..at], &head[at..])
+        }
         p if p.starts_with("/len/") => {
             let n: usize = p.trim_start_matches("/len/").parse().unwrap();
             ok(&"b".repeat(n))
@@ -70,6 +84,23 @@ fn canned(req: &str) -> Option<String> {
         }
         _ => ok("ok"),
     })
+}
+
+/// In a mock response, where the mock flushes and pauses before writing on.
+const PAUSE: &str = "\u{0}pause\u{0}";
+
+/// Where to split a head of `total` bytes: all but its last 100 bytes, then the rest, so the
+/// head completes in a short read instead of a run of full ones (the cut must not depend on
+/// where reads end).
+fn split_at(total: usize) -> usize {
+    total.saturating_sub(100)
+}
+
+/// `start` (a first line and headers) plus one filler header and the blank line: exactly `total`
+/// bytes.
+fn sized_head(start: &str, total: usize) -> String {
+    let base = start.len() + "X-Big: \r\n\r\n".len();
+    format!("{start}X-Big: {}\r\n\r\n", "a".repeat(total - base))
 }
 
 /// A CA and a leaf for `name`, as an upstream would have.
@@ -134,6 +165,35 @@ struct Upstream {
     handler: Handler,
     seen: Arc<Mutex<Vec<String>>>,
     dials: Arc<Mutex<usize>>,
+    /// Upstream connections that saw the proxy's side end.
+    ended: Arc<Mutex<usize>>,
+}
+
+impl Upstream {
+    async fn answer(&self, far: DuplexStream) {
+        let Ok(mut tls) = tokio_rustls::TlsAcceptor::from(Arc::clone(&self.tls))
+            .accept(far)
+            .await
+        else {
+            return;
+        };
+        let mut buf = Vec::new();
+        while let Some(req) = read_request(&mut tls, &mut buf).await {
+            self.seen.lock().unwrap().push(req.clone());
+            let Some(resp) = (self.handler)(&req) else {
+                return;
+            };
+            for (i, part) in resp.split(PAUSE).enumerate() {
+                if i > 0 {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                if tls.write_all(part.as_bytes()).await.is_err() || tls.flush().await.is_err() {
+                    return;
+                }
+            }
+        }
+        *self.ended.lock().unwrap() += 1;
+    }
 }
 
 impl Dialer for Upstream {
@@ -142,21 +202,7 @@ impl Dialer for Upstream {
         *self.dials.lock().unwrap() += 1;
         let (near, far) = duplex(1 << 20);
         let up = self.clone();
-        tokio::spawn(async move {
-            let Ok(mut tls) = tokio_rustls::TlsAcceptor::from(up.tls).accept(far).await else {
-                return;
-            };
-            let mut buf = Vec::new();
-            while let Some(req) = read_request(&mut tls, &mut buf).await {
-                up.seen.lock().unwrap().push(req.clone());
-                let Some(resp) = (up.handler)(&req) else {
-                    return;
-                };
-                if tls.write_all(resp.as_bytes()).await.is_err() || tls.flush().await.is_err() {
-                    return;
-                }
-            }
-        });
+        tokio::spawn(async move { up.answer(far).await });
         Ok(near)
     }
 }
@@ -221,6 +267,7 @@ struct Rig {
     sink: Arc<Sink>,
     seen: Arc<Mutex<Vec<String>>>,
     dials: Arc<Mutex<usize>>,
+    ended: Arc<Mutex<usize>>,
     session_ca: CertificateDer<'static>,
 }
 
@@ -274,8 +321,13 @@ fn rig(o: Opts) -> Rig {
         handler: o.handler,
         seen: Arc::default(),
         dials: Arc::default(),
+        ended: Arc::default(),
     };
-    let (seen, dials) = (Arc::clone(&up.seen), Arc::clone(&up.dials));
+    let (seen, dials, ended) = (
+        Arc::clone(&up.seen),
+        Arc::clone(&up.dials),
+        Arc::clone(&up.ended),
+    );
     let sink = Arc::new(Sink {
         fail_on: o.fail_on,
         ..Sink::default()
@@ -296,6 +348,7 @@ fn rig(o: Opts) -> Rig {
         sink,
         seen,
         dials,
+        ended,
         session_ca,
     }
 }
@@ -348,9 +401,21 @@ impl Rig {
     /// Sends `raw` inside the tunnel, closes the sending half, returns what came back (a cut
     /// ends the read early; what arrived is kept).
     async fn talk(&self, raw: &str) -> String {
+        self.talk_split(raw, raw.len()).await
+    }
+
+    /// As [`Self::talk`], with `raw` sent in two writes split at `at`, 50 ms apart.
+    async fn talk_split(&self, raw: &str, at: usize) -> String {
         let (head, tls, task) = self.open(443).await;
         let mut tls = tls.unwrap_or_else(|| panic!("not opened: {head}"));
-        tls.write_all(raw.as_bytes()).await.unwrap();
+        let (first, rest) = raw.as_bytes().split_at(at);
+        tls.write_all(first).await.unwrap();
+        if !rest.is_empty() {
+            tls.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // A refusal may already have closed the tunnel; its reply is still read below.
+            let _ = tls.write_all(rest).await;
+        }
         let _ = tls.shutdown().await;
         let out = drain(&mut tls).await;
         task.await.unwrap();
@@ -545,7 +610,13 @@ async fn a_streamed_response_one_over_the_cap_is_cut_after_its_audit_entry() {
     assert!(out.ends_with("0\r\n\r\n"), "{out}");
     let r = rig(Opts::default());
     let out = r.talk(&get("/chunks/17", "")).await;
-    assert!(out.starts_with("HTTP/1.1 200 OK\r\n"), "{out}");
+    // When the over-cap chunk is already there as hyper writes the head, hyper drops the
+    // unflushed head with the cut: the client sees the head or nothing, never the body.
+    assert!(
+        out.is_empty() || out.starts_with("HTTP/1.1 200 OK\r\n"),
+        "{out}"
+    );
+    assert!(!out.contains(&"c".repeat(17)), "{out}");
     assert!(
         !out.ends_with("0\r\n\r\n"),
         "a cut sends no last chunk: {out}"
@@ -644,22 +715,37 @@ async fn ambiguous_client_framing_never_reaches_the_upstream() {
         assert_eq!(framing, 1, "{up}");
         assert!(up.contains("abc"), "{up}");
     }
+    for cl in ["Content-Length: 3, 3", "Content-Length: +3"] {
+        refused_framing(cl).await;
+    }
+}
+
+/// Architect ruling (9a-2 part 2): re-framing after a full parse is safe only while the upstream
+/// sees one unambiguous framing, so differing duplicate lengths are refused, never resolved.
+#[tokio::test]
+async fn differing_duplicate_content_lengths_are_refused() {
     for cl in [
         "Content-Length: 3\r\nContent-Length: 4",
-        "Content-Length: 3, 3",
-        "Content-Length: +3",
+        "Content-Length: 4\r\nContent-Length: 3",
+        "Content-Length: 3, 4",
+        "Content-Length: 3\r\nContent-Length: 3x",
     ] {
-        let r = rig(Opts::default());
-        let out = r
-            .talk(&format!(
-                "POST /echo HTTP/1.1\r\nHost: {HOST}\r\n{cl}\r\n\r\nabcd"
-            ))
-            .await;
-        assert!(out.starts_with("HTTP/1.1 400 "), "{cl}: {out}");
-        assert!(r.seen().is_empty(), "{cl}");
-        assert_eq!(r.sink.args("egress.deny")["reason"], json!("malformed"));
-        assert_eq!(r.sink.args("egress.close")["end"], json!("refused"));
+        refused_framing(cl).await;
     }
+}
+
+/// A POST with `cl` as its length headers is answered 400 `malformed` and never forwarded.
+async fn refused_framing(cl: &str) {
+    let r = rig(Opts::default());
+    let out = r
+        .talk(&format!(
+            "POST /echo HTTP/1.1\r\nHost: {HOST}\r\n{cl}\r\n\r\nabcd"
+        ))
+        .await;
+    assert!(out.starts_with("HTTP/1.1 400 "), "{cl}: {out}");
+    assert!(r.seen().is_empty(), "{cl}");
+    assert_eq!(r.sink.args("egress.deny")["reason"], json!("malformed"));
+    assert_eq!(r.sink.args("egress.close")["end"], json!("refused"));
 }
 
 #[tokio::test]
@@ -686,6 +772,76 @@ async fn a_request_head_under_its_guaranteed_size_passes() {
         "{}",
         &out[..out.len().min(80)]
     );
+}
+
+/// The request head cut (ARCHITECTURE §7, architect 9a-2 part 2): exact at `MAX_HEAD -
+/// REQUEST_READ` (7168 bytes, request line and blank line included), whole or split, up to and
+/// past the 8 KiB buffer backstop. A refusal is hyper's own 431 (Q45): audited, nothing
+/// forwarded, the tunnel ended.
+#[tokio::test]
+async fn request_heads_pass_up_to_7168_bytes_and_are_refused_from_7169() {
+    let start = format!("GET /x HTTP/1.1\r\nHost: {HOST}\r\n");
+    let cut = MAX_HEAD - REQUEST_READ;
+    for total in [cut - 1, cut] {
+        for at in [total, split_at(total)] {
+            let r = rig(Opts::default());
+            let out = r.talk_split(&sized_head(&start, total), at).await;
+            assert!(out.starts_with("HTTP/1.1 200 "), "{total} at {at}");
+        }
+    }
+    for total in [
+        cut + 1,
+        cut + 100,
+        MAX_HEAD,
+        MAX_HEAD + 1,
+        MAX_HEAD + REQUEST_READ,
+    ] {
+        for at in [total, split_at(total)] {
+            let r = rig(Opts::default());
+            let out = r.talk_split(&sized_head(&start, total), at).await;
+            assert!(out.starts_with("HTTP/1.1 431 "), "{total} at {at}: {out}");
+            assert!(r.seen().is_empty(), "{total} at {at}");
+            assert_eq!(
+                r.sink.args("egress.limit")["reason"],
+                json!("head-too-large")
+            );
+            assert_eq!(r.sink.args("egress.close")["end"], json!("limit"));
+        }
+    }
+}
+
+/// The response head cut: exact at `MAX_RESPONSE_HEAD - RESPONSE_READ` (61440 bytes), whole or
+/// split, up to and past the 64 KiB buffer backstop.
+#[tokio::test]
+async fn response_heads_pass_up_to_61440_bytes_and_are_refused_from_61441() {
+    let cut = MAX_RESPONSE_HEAD - RESPONSE_READ;
+    for total in [cut - 1, cut] {
+        for path in ["/head", "/splithead"] {
+            let r = rig(Opts::default());
+            let out = r.talk(&get(&format!("{path}/{total}"), "")).await;
+            assert!(out.starts_with("HTTP/1.1 200 "), "{path} {total}");
+        }
+    }
+    let over = [
+        cut + 1,
+        cut + 100,
+        MAX_RESPONSE_HEAD,
+        MAX_RESPONSE_HEAD + 1,
+        MAX_RESPONSE_HEAD + RESPONSE_READ,
+    ];
+    for total in over {
+        for path in ["/head", "/splithead"] {
+            let r = rig(Opts::default());
+            let out = r.talk(&get(&format!("{path}/{total}"), "")).await;
+            assert!(out.starts_with("HTTP/1.1 502 "), "{path} {total}: {out}");
+            let limit = r.sink.args("egress.limit");
+            assert_eq!(
+                (limit["reason"].clone(), limit["part"].clone()),
+                (json!("response-too-large"), json!("head")),
+                "{path} {total}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -825,10 +981,72 @@ async fn an_exchange_idle_past_the_limit_ends_idle_timeout() {
         ..Opts::default()
     });
     let started = Instant::now();
-    let out = r.talk(&get("/echo", "")).await;
+    // Nothing else ends this tunnel (no head is awaited mid-exchange), so a missing idle limit
+    // would hang: bound the wait.
+    let out = tokio::time::timeout(Duration::from_secs(5), r.talk(&get("/echo", "")))
+        .await
+        .expect("the idle limit ends a stalled exchange");
     assert!(out.contains("short"), "{out}");
     assert!(started.elapsed() < Duration::from_secs(5));
     assert_eq!(r.sink.args("egress.close")["end"], json!("idle-timeout"));
+    // The upstream connection goes with the tunnel, though its response never finished.
+    upstream_ends(&r).await;
+}
+
+#[test]
+fn the_idle_watch_fires_only_in_flight_and_never_spins() {
+    let last = Instant::now();
+    let idle = Duration::from_secs(300);
+    let before = last + Duration::from_secs(1);
+    let at = last + idle;
+    let after = at + Duration::from_secs(7);
+    for busy in [true, false] {
+        assert_eq!(idle_wake(before, last, idle, busy), Some(at));
+    }
+    assert_eq!(idle_wake(at, last, idle, true), None);
+    assert_eq!(idle_wake(after, last, idle, true), None);
+    assert_eq!(idle_wake(at, last, idle, false), Some(at + idle));
+    assert_eq!(idle_wake(after, last, idle, false), Some(after + idle));
+}
+
+#[test]
+fn a_refusal_body_ends_once_its_text_is_taken() {
+    assert!(Out::Reply(None).is_end_stream());
+    assert!(!Out::Reply(Some(Bytes::from_static(b"x"))).is_end_stream());
+}
+
+/// Architect Q53: between exchanges only the head timer runs; the idle limit (shorter here)
+/// does not end a keep-alive tunnel.
+#[tokio::test]
+async fn the_idle_limit_does_not_run_between_exchanges() {
+    let r = rig(Opts {
+        limits: Limits {
+            head: Duration::from_secs(2),
+            idle: Duration::from_millis(100),
+            max_request: 16,
+            max_response: 16,
+            ..Limits::new(8)
+        },
+        ..Opts::default()
+    });
+    let (_, tls, task) = r.open(443).await;
+    let mut tls = tls.unwrap();
+    for _ in 0..2 {
+        tls.write_all(get("/echo", "").as_bytes()).await.unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            assert_eq!(tls.read(&mut byte).await.unwrap(), 1, "tunnel ended early");
+            head.push(byte[0]);
+        }
+        let mut body = [0u8; 2];
+        tls.read_exact(&mut body).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+    let _ = tls.shutdown().await;
+    let _ = drain(&mut tls).await;
+    task.await.unwrap();
+    assert_eq!(r.sink.args("egress.close")["requests"], json!(2));
 }
 
 #[tokio::test]
@@ -843,23 +1061,55 @@ async fn a_failed_request_entry_closes_without_a_reply_or_an_upstream_request() 
     assert_eq!(r.sink.args("egress.close")["end"], json!("error"));
 }
 
+/// Waits (bounded) until the mock upstream saw its connection end.
+async fn upstream_ends(r: &Rig) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while *r.ended.lock().unwrap() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the upstream connection is closed when the tunnel ends");
+}
+
+/// A stop ends the tunnel `session-stopped`, and the upstream connection goes with it (it is
+/// driven inside the tunnel's future, never spawned): while a request waits for a head the
+/// upstream never sends, and between exchanges on an idle keep-alive connection.
 #[tokio::test]
 async fn stopping_the_session_ends_an_intercepted_tunnel() {
-    let r = rig(Opts {
-        limits: Limits {
-            head: Duration::from_secs(30),
-            max_request: 16,
-            max_response: 16,
-            ..Limits::new(8)
-        },
-        ..Opts::default()
-    });
-    let (_, tls, task) = r.open(443).await;
-    let mut tls = tls.unwrap();
-    r.proxy.stop();
-    let _ = drain(&mut tls).await;
-    task.await.unwrap();
-    assert_eq!(r.sink.args("egress.close")["end"], json!("session-stopped"));
+    for in_flight in [true, false] {
+        let r = rig(Opts {
+            limits: Limits {
+                head: Duration::from_secs(30),
+                max_request: 16,
+                max_response: 16,
+                ..Limits::new(8)
+            },
+            ..Opts::default()
+        });
+        let (_, tls, task) = r.open(443).await;
+        let mut tls = tls.unwrap();
+        if in_flight {
+            tls.write_all(get("/hang", "").as_bytes()).await.unwrap();
+            while r.seen().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        } else {
+            tls.write_all(get("/echo", "").as_bytes()).await.unwrap();
+            let mut got = Vec::new();
+            let mut b = [0u8; 1];
+            while !got.ends_with(b"\r\n\r\nok") {
+                tls.read_exact(&mut b).await.unwrap();
+                got.push(b[0]);
+            }
+        }
+        r.proxy.stop();
+        let _ = drain(&mut tls).await;
+        task.await.unwrap();
+        let close = r.sink.args("egress.close");
+        assert_eq!(close["end"], json!("session-stopped"), "{in_flight}");
+        upstream_ends(&r).await;
+    }
 }
 
 #[tokio::test]

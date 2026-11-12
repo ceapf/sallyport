@@ -19,10 +19,14 @@ async fn a_meter_replays_first_then_counts_both_ways() {
         Some(Arc::clone(&act)),
     );
     far.write_all(b" world").await.unwrap();
+    // End each side's writing, so a meter that skips the replay or drops the bytes it is given
+    // leaves a read at end-of-stream, which fails here instead of waiting.
+    far.shutdown().await.unwrap();
     let mut got = [0u8; 11];
     m.read_exact(&mut got).await.unwrap();
     assert_eq!(&got, b"hello world");
     m.write_all(b"back").await.unwrap();
+    m.shutdown().await.unwrap();
     let mut back = [0u8; 4];
     far.read_exact(&mut back).await.unwrap();
     assert_eq!((counts.read(), counts.written()), (11, 4));
@@ -30,7 +34,9 @@ async fn a_meter_replays_first_then_counts_both_ways() {
 
 #[tokio::test]
 async fn a_small_read_takes_the_replay_in_pieces() {
-    let (inner, _far) = duplex(64);
+    // The far side is gone: only the replay has bytes, so skipping it reads end-of-stream.
+    let (inner, far) = duplex(64);
+    drop(far);
     let counts = Counts::default();
     let mut m = Meter::new(inner, b"abc".to_vec(), counts.clone(), None);
     let mut one = [0u8; 2];
@@ -157,4 +163,62 @@ async fn a_failing_inner_body_is_reported_and_a_dropped_one_says_so() {
     );
     drop(early);
     assert_eq!(*rec.0.lock().unwrap(), [Some(BodyEnd::Failed), None]);
+}
+
+/// A stream that records the flushes and shutdowns it is asked for.
+struct Spy(Arc<Mutex<Vec<&'static str>>>);
+
+impl AsyncRead for Spy {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        _: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for Spy {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.0.lock().unwrap().push("write");
+        Poll::Ready(Ok(data.len()))
+    }
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.0.lock().unwrap().push("flush");
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.0.lock().unwrap().push("shutdown");
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// A TLS stream under a meter buffers records until it is flushed, and the client learns of a
+/// half-close only through shutdown: both must reach the wrapped stream.
+#[tokio::test]
+async fn flush_and_shutdown_reach_the_wrapped_stream() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut m = Meter::new(Spy(Arc::clone(&log)), Vec::new(), Counts::default(), None);
+    m.write_all(b"x").await.unwrap();
+    m.flush().await.unwrap();
+    m.shutdown().await.unwrap();
+    assert_eq!(*log.lock().unwrap(), ["write", "flush", "shutdown"]);
+}
+
+/// hyper sends no body (and may reuse the connection at once) for a body that says it ended.
+#[test]
+fn a_capped_body_ends_exactly_when_its_inner_body_does() {
+    let rec: Arc<dyn OnEnd> = Arc::new(Record::default());
+    let empty = Capped::new(http_body_util::Empty::<Bytes>::new(), 5, Arc::clone(&rec));
+    assert!(empty.is_end_stream());
+    let full = Capped::new(
+        http_body_util::Full::new(Bytes::from_static(b"abc")),
+        5,
+        Arc::clone(&rec),
+    );
+    assert!(!full.is_end_stream());
 }
