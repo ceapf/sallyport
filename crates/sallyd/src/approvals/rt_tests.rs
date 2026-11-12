@@ -1,7 +1,8 @@
 //! Red-team rows RT-AG-02, -03 and the fetch half of -14, proven at the gate (architect ruling
 //! Q18): a real `agent.sock` server serves the production [`Gated`] handler, decisions go
-//! through the [`Desk`], and a recording executor stands in for Task 11's. The container
-//! clauses (a file absent or created by the real shell, a fetch seen upstream) are #66.
+//! through the [`Desk`], and a recording executor stands in for Task 11's. The shell clauses
+//! with the real executor (a file absent or created) are `tests/tools.rs`; the fetch seen
+//! upstream is #75.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use std::sync::Mutex as StdMutex;
@@ -24,7 +25,7 @@ use crate::rpc::testkit::{Sink, recorder};
 const ME: Client = Client { uid: 1000, pid: 7 };
 
 /// Stands in for Task 11's executors: builds actions from arguments and records what it runs.
-// TODO(#66): the real shell and fetch executors re-run the container clauses of these rows.
+// TODO(#75): the fetch executor re-runs RT-AG-14's fetch half on the wire.
 #[derive(Default)]
 struct Recording {
     ran: StdMutex<Vec<Bound>>,

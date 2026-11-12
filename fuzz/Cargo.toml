@@ -70,3 +70,17 @@ path = "fuzz_targets/egress_rewrite.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "tool_path"
+path = "fuzz_targets/tool_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proc_stat"
+path = "fuzz_targets/proc_stat.rs"
+test = false
+doc = false
+bench = false

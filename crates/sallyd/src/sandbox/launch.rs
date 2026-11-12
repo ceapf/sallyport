@@ -154,7 +154,8 @@ impl Running {
     /// The session's exec gate. The disk watchdog holds it while the container is frozen for a
     /// measurement, so a new `podman exec` never meets a paused container. An exec holds it only
     /// while starting: a running exec process is in the container's cgroup and freezes with it.
-    /// TODO(#24): the shell tool (Task 11) follows that contract and gets an RT case.
+    /// `tools::exec` follows that contract (#24; RT-AG-09 in `tests/tools.rs`); the file tools
+    /// hold it for a whole write or delete in the workspace's view (architect ruling Q29).
     #[must_use]
     pub fn exec_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
         Arc::clone(&self.exec_gate)
