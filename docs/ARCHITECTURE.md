@@ -601,27 +601,35 @@ sequenceDiagram
     D-->>H: tools/call result {exit, output}
 ```
 
-### 5.3 Egress with credential injection
+### 5.3 Egress to a grant host (interception; Task 9a)
 ```mermaid
 sequenceDiagram
-    participant P as pip / fetch tool / curl (Z3)
-    participant S as sally-shim (Z3)
+    participant P as git / pip / curl (workspace)
+    participant S as sally-shim (workspace)
     participant E as egress proxy (sallyd)
     participant X as api.github.com
-    P->>S: GET http://api.github.com/user  (HTTP_PROXY=127.0.0.1:3128)
+    P->>S: CONNECT api.github.com:443  (HTTPS_PROXY=127.0.0.1:3128)
     S->>E: new UDS connection, bytes copied
-    E->>E: parse request-target → authority api.github.com:80→443 rule? allowed ✓
-    E->>E: secrets map has api.github.com → inject "Authorization: Bearer ****"; strip client Authorization; strip Accept-Encoding
-    E->>E: resolve → filter (no loopback/private) → pin IP
-    E->>X: TLS (rustls, SNI api.github.com) GET /user
-    X-->>E: 200 body
-    E->>E: redact any occurrence of the secret value; do not follow 3xx
-    E-->>S: response
-    S-->>P: response
-    E->>E: audit egress.close {host, port, address, bytes_up, bytes_down, end} (egress.allow {host, port, addresses, injected: GITHUB_TOKEN} was written before the connect; §7)
+    E->>E: authority → policy: allowed, grant host → route Intercept
+    E->>E: resolve → filter (no loopback/private/own) → pin IPs
+    E->>E: audit egress.allow {host, port, addresses, intercept: true}
+    E->>X: TCP to a pinned IP, TLS (rustls, SNI api.github.com, session trust roots)
+    E-->>P: 200 Connection Established (only after upstream verification)
+    P->>E: TLS (session-CA leaf for api.github.com, ALPN http/1.1)
+    P->>E: GET /user (HTTP/1.1)
+    E->>E: check head (origin-form, one Host = CONNECT authority, no Upgrade, framing)
+    E->>E: drop hop-by-hop, Proxy-*, Accept-Encoding, every client Authorization; rebuild Host
+    E->>E: audit egress.request {host, port, method, target, injected}
+    Note over E: 9a-3: set Authorization from the secret (last), only with response redaction
+    E->>X: GET /user (same upstream connection for the next request)
+    X-->>E: 200 + body (identity, plain or chunked)
+    E->>E: check response head (no Content-Encoding, no 101); cap the body; never follow 3xx
+    E-->>P: response (9a-3: redacted)
+    E->>E: audit egress.close {host, port, address, bytes_up, bytes_down, end, intercept, requests, statuses}
 ```
-For `CONNECT host:443` (TLS from the client) the proxy applies policy and splices bytes; no
-injection is possible or attempted.
+An allowed host without a grant is spliced: after `egress.allow {…, intercept: false}` and the
+`200`, the proxy copies bytes and never sees the plaintext. Plain-HTTP requests are refused 405
+`plain-http-unsupported` before policy (Task 8), grant host or not.
 
 ### 5.4 Session start
 `sessions.create` → validate manifest (again) → resolve model → `infer.load` if needed (Z2 up,
@@ -754,20 +762,84 @@ sallyport/
   (#48).
 - **Egress audit events** (Task 8). Written at every `audit.level`, each before its effect:
   - `egress.allow` (decision `allow`), before the first dial and the `200`: `{host, port,
-    addresses}` — the addresses that passed the filter, at most 16, in the order they are tried.
+    addresses, intercept}` — the addresses that passed the filter, at most 16, in the order they
+    are tried; `intercept` is true for a grant host (Task 9a-2).
+  - `egress.request` (decision `allow`, intercepted tunnels only), before the head goes
+    upstream: `{host, port, method, target, target_bytes, target_cut, injected}`; method and
+    target escaped and cut as below; `injected` lists `secret:NAME` (empty until Task 9a-3).
   - `egress.deny` (decision `deny`), before the reply: `{reason, target, target_bytes,
     target_cut}` (the request-target escaped and cut at 256 bytes, never a header), or `{reason,
     head_bytes}` when no target was parsed; `filter: "host-addresses-unavailable"` when the
     host's own addresses could not be read.
   - `egress.limit` (decision `deny`): as `egress.deny`, for `too-many-connections` (decided at
-    accept: `{reason}` only), `head-too-large` and `head-timeout`.
+    accept: `{reason}` only), `head-too-large`, `head-timeout`, `request-too-large` and
+    `response-too-large`.
+  - Inside an intercepted tunnel a refusal carries `{reason, host, port, target, target_bytes,
+    target_cut}` (`response-too-large` adds `part: "head" | "body"`) and is written before the
+    reply or the cut. Where hyper answers by itself before the proxy sees the head (a head over
+    its bound, or garbled), the entry is `{reason, host, port}` (`head-too-large` as
+    `egress.limit`, anything else `malformed` as `egress.deny`) and is written after hyper's own
+    400/431, whose body is not the reason code (architect Q45).
   - `egress.close` (no decision): `{host, port, connected, address (the one used, only when
-    connected), bytes_up, bytes_down, end}`; `end` is `closed`, `idle-timeout`, `error`,
-    `session-stopped` or `connect-failed` (with `connected: false`, written before the 502).
+    connected), bytes_up, bytes_down, end, intercept}`, plus `requests` and `statuses` (`{"2xx":
+    n, …}`, non-zero classes only) when `intercept` is true; `end` is `closed`, `idle-timeout`,
+    `error`, `session-stopped` or `connect-failed` (with `connected: false`, written before the
+    502), and for intercepted tunnels also `upstream-tls-failed` (written before the 502, no
+    `200`), `client-tls-failed`, `refused`, `limit` or `upstream-closed` (written before the 502
+    when no response head had arrived; the request is never replayed). For an intercepted tunnel
+    `bytes_up`/`bytes_down` count the client's wire bytes, TLS framing included, so they are not
+    comparable with `max_request_bytes`/`max_response_bytes` (architect Q44).
   - Reasons (reply body and `reason`): 403 `host-not-allowed`, `port-not-allowed`,
-    `ip-literal`, `ip-range-denied`, `grant-host-unavailable`; 502 `resolve-failed`,
-    `connect-failed`; 405 `plain-http-unsupported`; 429 `too-many-connections`; 431
-    `head-too-large`; `head-timeout` (no reply); 400 `malformed`. Replies never echo the target.
+    `ip-literal`, `ip-range-denied`, `grant-host-unavailable` (a grant host the proxy holds no
+    session-CA leaf for: never spliced), `upgrade-refused`; 502 `resolve-failed`,
+    `connect-failed`, `upstream-tls-failed`, `upstream-encoded`, `upstream-malformed`,
+    `upstream-closed`, `response-too-large`; 405 `plain-http-unsupported`; 413
+    `request-too-large`; 421 `host-mismatch`; 429 `too-many-connections`; 431 `head-too-large`;
+    `head-timeout` (no reply); 400 `malformed`. Replies never echo the target; in-tunnel replies
+    carry `Connection: close` and end the tunnel.
+- **Interception** (Task 9a-2, `egress::server::intercept`, `egress::rewrite`; lane decisions
+  2–6, architect Q27–Q53). Only grant hosts are intercepted, on every allowed port. Order:
+  `egress.allow`, dial, upstream TLS within `limits.connect` (rustls with the session's trust
+  roots, SNI = host, ALPN `http/1.1`, TLS 1.2 and 1.3; failure is `upstream-tls-failed` with
+  no retry on another address), `200`, the client's TLS within `limits.head` (the host's
+  session-CA leaf, ALPN `http/1.1` only), then HTTP/1.1 through hyper: one upstream connection
+  per tunnel, used for one request at a time, never pooled or replayed; an upstream close between
+  requests ends the tunnel (`closed`).
+  - Request head rules, in order: (1) check as received — HTTP/1.1, origin-form target only
+    (absolute, authority and `*` forms are 400 `malformed`), exactly one `Host`, normalized
+    like a CONNECT target and naming the CONNECT host (port omitted only when the CONNECT port is
+    443), else 421 `host-mismatch` (400 if unparsable); any `Upgrade`, `HTTP2-Settings` or
+    `Connection: upgrade` is 403 `upgrade-refused`; `Transfer-Encoding` absent or one field that
+    is case-insensitively `chunked`, never beside `Content-Length`, which is at most one decimal
+    value; `Expect` absent or `100-continue`; (2) drop `Connection` and every header it names,
+    `Keep-Alive`, every `Proxy-*`, `TE`, `Trailer`, `Expect`, `Accept-Encoding`, the client's
+    framing headers and every client copy of each grant header of the host; (3) rebuild `Host`
+    from the CONNECT authority; (4) Task 9a-3 sets the injected header last. hyper's client sets
+    the upstream framing itself; the proxy adds no `Via`, `Forwarded` or `X-Forwarded-*`. hyper's
+    server resolves two framings before the proxy sees a head: with `Transfer-Encoding` and
+    `Content-Length` it discards `Content-Length` and reads chunked; equal duplicate
+    `Content-Length` values merge; unequal or malformed ones it answers 400 itself (architect
+    Q51; such a request counts as chunked for the cap).
+  - Response rules: `101`, any `Upgrade`, a `Content-Encoding` other than absent or one
+    `identity`, or a `Transfer-Encoding` other than absent or one `chunked` is 502
+    `upstream-encoded` and the body is never forwarded (Q30); an unparsable head is 502
+    `upstream-malformed`. `Connection` and what it names, `Keep-Alive`, `Proxy-*`, `TE`,
+    `Trailer`, `Transfer-Encoding` and `Upgrade` are dropped. Redirects are returned, never
+    followed. Trailers are never forwarded in either direction.
+  - Limits: request heads at most 8 KiB and 100 headers, response heads at most 64 KiB and 100
+    headers. hyper checks a head's size only between reads, so the proxy hands it at most 1 KiB
+    (client side) and 4 KiB (upstream side) per read and sets hyper's limit that far below the
+    bound: a head over the bound is always refused and one up to 7 KiB / 60 KiB always passes.
+    Body caps are `network.max_request_bytes`/`max_response_bytes`, payload bytes per message
+    after chunk decoding (at the cap passes): a declared request length over the cap is 413 with
+    nothing sent upstream, a chunked one crossing it aborts the exchange (413 if no response head
+    was forwarded); a declared response length over the cap is 502, a streamed one crossing it is
+    audited, then cut without a final chunk. The response cap counts upstream bytes before
+    redaction. hyper's head timer is `limits.head` (10 s) for every wait for a head, so an
+    intercepted tunnel's keep-alive idle is 10 s: it ends `idle-timeout` with no entry when no
+    plaintext byte arrived since the handshake or the last response, and `egress.limit
+    head-timeout` (end `limit`) when a head had started (Q53). The 300 s idle limit applies only
+    within an exchange (request body, response wait, response body).
 - **Session CA** (Task 9a-1, `egress::ca`; architect Q38). Made at launch for a session in proxy
   mode with at least one secret grant (`ca::wanted`, the same condition that sets the CA
   variables in the workspace argv). ECDSA P-256; `basicConstraints` CA:true, pathlen 0;

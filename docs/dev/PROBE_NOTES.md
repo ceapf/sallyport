@@ -122,6 +122,28 @@ line per fact, with where it was found. Check a note again before relying on it 
   chain. So pathlen 0 binds OpenSSL clients (curl, Python, git, Node) only; prove it with
   OpenSSL, never with a rustls verifier.
 
+## hyper 1.12 HTTP/1 (intercepted tunnels)
+
+Raw bytes into `server::conn::http1` over a duplex (Task 9a-2; architect Q51–Q53). Committed as
+tests in `egress/intercept_tests.rs` where the behaviour matters to the proxy.
+- `Transfer-Encoding: chunked` with `Content-Length`: the service sees only `transfer-encoding`;
+  hyper drops `Content-Length` and reads the body chunked.
+- `Content-Length` twice with the same value: merged into one. Different values, `1, 1` and
+  `+1`: hyper answers 400 itself (`Parse(Header(ContentLengthInvalid))` on the conn future).
+- `Transfer-Encoding: gzip` (no final chunked): 400 by hyper. `gzip, chunked`, `Chunked` and two
+  `chunked` lines reach the service unchanged.
+- Absolute-form, `*`, `CONNECT` inside the connection, HTTP/1.0, no `Host` and two `Host` all
+  reach the service. obs-fold is 400, 101 headers and a 9 KiB head are 431, all by hyper.
+- `header_read_timeout` needs `.timer(TokioTimer)`. It runs from when hyper starts waiting for
+  a head: before the first byte and during keep-alive idle too, not from the head's first byte.
+  Expiry is `Error::is_timeout()` with no reply.
+- `half_close` defaults to false: a client that shuts its sending side right after a request
+  gets no response. The proxy sets it true (a spliced tunnel carries half-close too).
+- `max_buf_size` and `max_header_size` are checked only after a read leaves the head incomplete,
+  and one read can fill all spare buffer capacity, so a head can pass well over the limit (a
+  65.5 KiB response head passed `max_buf_size(64 KiB)`). Bound it by capping each read below
+  hyper (`Meter::max_read`) and setting `max_header_size` that far under the bound.
+
 ## Test writing
 
 - `dd of=<name>` while a renamer cycles names loses data when `mv` replaces a re-created name;
