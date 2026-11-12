@@ -82,7 +82,8 @@ flowchart LR
 | `sally-core::hf` | HF Hub API client (search, repo files with LFS sha256, Range fetch of GGUF header), resumable downloader to quarantine | no (but handles untrusted bytes → bounded) |
 | `sally-core::library` | SQLite index of blobs; content-addressed store; immutability (`chmod 0444`) | yes |
 | `sallyd::sandbox` | Build `podman run` argv from manifest + profile; mount prep (realpath re-check, socket dirs); launch/exec/kill/wait; image digest check | **yes** |
-| `sallyd::rpc` | Two listeners: `control.sock` (trusted methods) and per-session `agent.sock` (restricted methods); NDJSON framing; `SO_PEERCRED` UID check; request size limits | **yes** |
+| `sallyd::rpc` | `control.sock` (trusted methods, §4.1) and per-session `agent.sock` (the MCP subset, §4.2); bounded NDJSON framing, duplicate-key-refusing JSON, per-session rate and connection caps, `SO_PEERCRED` UID check before a byte is read, an audit entry before every reply | **yes** |
+| `sallyd::llm` | Per-session `llm.sock` (§4.4): HTTP/1.1 through hyper; the broker reads and decides on the head itself and gates hyper's writes; strict body allowlist; the model backend is a constructor argument (M3 wires the engine) | **yes** |
 | `sallyd::session` | Lifecycle: validate → ensure inference loaded → create socket dir → launch agent → wire → monitor → teardown (always, even on panic — `Drop` guard) | yes |
 | `sallyd::infer` | Pool of at most one loaded model (v1); start/stop inference container; forward OpenAI-compatible requests over `infer.sock`; validate request JSON (allowed fields, size caps); stream back | yes |
 | `sallyd::tools::{fs,fetch,shell}` | Brokered tools with policy + approvals | **yes** |
@@ -403,8 +404,11 @@ Every podman command has its output capped at 64 KiB per stream and is killed af
 ## 4. Broker API
 
 Transport: JSON-RPC 2.0, newline-delimited JSON over Unix stream sockets. Max frame 1 MiB
-(control) / 256 KiB (agent) except `infer.complete` bodies (4 MiB). Notifications stream events.
-Errors use JSON-RPC codes plus `data.reason`.
+(control) / 256 KiB (agent); `llm.sock` is HTTP/1.1 instead (§4.4, 4 MiB bodies). Notifications
+stream events. Errors use JSON-RPC codes plus `data.reason`. Every socket checks the peer's UID
+(`SO_PEERCRED`) before it reads a byte: the expected UID is `sallyd`'s own, which under
+`--userns=keep-id` is also the sandbox user's (§7); a mismatch is closed and recorded `rpc.deny` /
+`llm.deny` with reason `peer-uid`. Every refusal that sends a reply has its own entry first.
 
 ### 4.1 `control.sock` — trusted clients (CLI, Tauri)
 
@@ -423,33 +427,115 @@ Errors use JSON-RPC codes plus `data.reason`.
 | `secrets.set` (name, value) / `secrets.list` (names only) / `secrets.remove` | store; values are write-only |
 | `audit.tail` (filter, follow) / `audit.verify` | log |
 
+Until Task 12 fills the table, every method is `-32601` and recorded `rpc.deny {socket:
+control}`; no control method resolves on the session socket's table (a unit test holds that).
+
 ### 4.2 `agent.sock` — untrusted client (the harness). **Method table is a strict allowlist.**
+
+The broker is an MCP server for tools only (Task 7; MCP specification 2026-07-28 and its schema,
+read 2026-11-11). Framing is MCP's stdio framing: one JSON-RPC message per line. Clients that
+spawn a stdio server run `sally-shim --stdio /run/sallyport/agent.sock`. The subset is
+hand-written in `sallyd::rpc`; no MCP SDK crate is in the TCB.
 
 | Method | Behavior |
 |---|---|
-| `session.info` | task text, manifest summary, tool list, model name |
-| `infer.complete` (OpenAI chat-completion body) | validated (allowed fields, max tokens ≤ manifest, size cap) and forwarded to Z2; streamed back as `infer.delta` notifications then `infer.done` |
-| `tools.list` | tools granted by manifest, with JSON schemas |
-| `tools.call` (name, args) | dispatch → policy → (approval) → execute → result. Returns `{status: "ok"\|"denied"\|"pending", approval_id?}`; on pending, a later notification `tools.result` carries the outcome |
-| `ui.post` (text) / `ui.next_input` (blocking, timeout) | converse with the user through the UI/CLI |
-| `audit.note` (text ≤ 4 KiB) | harness may annotate its own trail (rate-limited) |
+| `server/discover` | 2026 only: supported versions, `serverInfo`, `capabilities: {tools: {}}` |
+| `initialize` | legacy only: starts the legacy lifecycle on this connection |
+| `notifications/initialized` | legacy only: ignored (recorded `rpc.request`) |
+| `ping` | legacy only: empty result |
+| `tools/list` | the session's tools with their JSON schemas; never a cursor (one is `-32602`) |
+| `tools/call` (`name`, `arguments`) | recorded `rpc.request` (tool and arguments, redacted by the audit writer), then dispatched to the tool handler (Task 11; approvals Task 10). Blocks until executed, denied or timed out (`approvals.timeout`); a denial is `isError: true` with text `denied: <code>`. Approval never round-trips through the sandbox |
+| `notifications/cancelled` (`requestId`, `reason?`) | both lifecycles: suppresses the reply of a matching in-flight call (recorded `rpc.cancel` first). The handler is never dropped and keeps its slot until it returns (#54: Task 10 withdraws a pending approval) |
 
-Everything else → `-32601`. The `net.sock` stream channel is not JSON-RPC; it carries raw proxy
-connections from the shim.
+Everything else → `-32601` + `rpc.deny`: resources, prompts, sampling, elicitation, roots,
+logging, subscriptions, tasks, and every control method. The server never sends a request of its
+own. A batch is `-32600` with `id: null`; a client response is dropped; a notification it cannot
+classify is dropped; each of these is recorded `rpc.deny`.
+
+**Lifecycles.** Each request is classified on its own:
+
+| | 2026-07-28 (stateless) | Legacy (2025-11-25, 2025-06-18, 2025-03-26) |
+|---|---|---|
+| Recognised by | `params._meta` carries both `io.modelcontextprotocol/protocolVersion` and `…/clientCapabilities` | a request without those keys, on a connection that completed `initialize` |
+| Version | must be `2026-07-28`, else `-32022` (`data.supported` lists every version) | the client's version echoed if listed, else `2025-11-25` offered; a second `initialize` is `-32600` |
+| `server/discover` | served | `-32601` (`wrong-lifecycle`) |
+| `ping`, `notifications/initialized` | `-32601` / dropped, each recorded `rpc.deny` | served / ignored |
+| Results | carry `resultType: "complete"`; `tools/list` adds `ttlMs: 0` and `cacheScope: "private"` (the tool table is per session) | no `resultType`, `ttlMs` or `cacheScope` |
+
+A request with one 2026 key but not the other, or with neither on a connection that did not
+`initialize`, is `-32602` — never a fallback to the other lifecycle.
+
+**Bounds** (each a named constant with a boundary test): frames 256 KiB (an oversize frame is
+recorded, then the connection closes); nesting depth 64; ids ≤ 128 bytes; method names ≤ 64
+bytes; tool names 1–128 bytes; duplicate JSON keys refused. Per session: 8 connections (the
+listener stops accepting at the cap), 16 `tools/call` in flight (the 17th is `-32000`
+`too-many-in-flight`, recorded first), a reused in-flight id `-32600`, and 20 requests read per
+second with a burst of 40. Over the rate the broker stops reading (backpressure): requests are
+slowed, never dropped unrecorded. A reply the peer does not take within 10 s closes the
+connection.
+
+The `net.sock` stream channel is not JSON-RPC; it carries raw proxy connections from the shim.
 
 ### 4.3 Built-in tools (brokered)
 
-| Tool | Args | Policy |
-|---|---|---|
-| `fs.list` | `{path}` | path must resolve inside a mount; `ro\|rw\|brokered` all allowed |
-| `fs.read` | `{path, offset?, len?}` | same; size cap |
-| `fs.write` | `{path, content_b64}` | `brokered` mounts only (rw mounts: write directly in the sandbox); `approve.writes` globs → pending |
-| `fs.delete` | `{path}` | `brokered` only; `approve.deletes` globs → pending |
-| `fetch` | `{url, method?, headers?, body?}` | goes through the same egress policy + injection as the proxy; response capped and redacted |
-| `shell` | `{cmd: [..], cwd?}` | `deny` → denied; `approve` → pending; `allow` → run unless destructive-tagged; executes via `podman exec` **inside the same Z3 container**, output streamed, capped |
+Names on the wire and in manifests are function-name safe. Tool descriptions are static strings
+compiled into the broker; manifest or user text is never interpolated into them.
 
-All `fs.*` paths are resolved relative to the mount's pinned `O_PATH` fd with
+| Tool | Args | Executes | Policy |
+|---|---|---|---|
+| `fs_list` | `{path}` | broker, `openat2` on the host path of any mount | path must resolve inside a mount; `ro\|rw\|brokered` all allowed; audited at `audit.level: full` |
+| `fs_read` | `{path, offset?, len?}` | broker, `openat2` | same; size cap |
+| `fs_write` | `{path, content_b64}` | broker, `openat2` | `ro` → denied; `rw` → allowed, audited (path, bytes, sha256); `brokered` → `approve.writes` globs → pending; protected paths always denied |
+| `fs_delete` | `{path}` | broker, `openat2` | as `fs_write`, with `approve.deletes` |
+| `fetch` | `{url, method?, headers?, body?}` | broker egress path | same egress policy and injection as the proxy; non-GET/HEAD per `tools.fetch_writes`; response capped and redacted |
+| `shell` | `{cmd: [..], cwd?}` | `podman exec` in the **workspace** container | `tools.shell` deny / approve / allow (+ destructive tags); output streamed, capped |
+| `<server>__<tool>` | the server's schema | relayed to a declared MCP server (M4) | per-server `approve` |
+
+All `fs_*` paths are resolved relative to the mount's pinned `O_PATH` fd with
 `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)`.
+
+### 4.4 `llm.sock` — OpenAI-compatible HTTP (the harness)
+
+HTTP/1.1 in the broker (hyper on the session's Unix listener), one request per connection. The
+harness reaches it through the shim at `OPENAI_BASE_URL=http://127.0.0.1:8080/v1` with
+`OPENAI_API_KEY=sallyport` (a dummy).
+
+| Route | Behavior |
+|---|---|
+| `POST /v1/chat/completions` | body checked, recorded `llm.request`, then answered by the backend; `stream: true` → server-sent events, then `data: [DONE]` |
+| `GET /v1/models` | the session's model only |
+| anything else | `404` + `llm.deny` (`not-found`) |
+
+**The head.** The broker reads the request head itself (≤ 8 KiB, ≤ 64 headers, within 10 s),
+because hyper answers a head it refuses with its own 400/431, which would be a reply with no
+entry before it (`docs/dev/PROBE_NOTES.md`). Every allow or deny decision is made on this one
+parse: HTTP/1.1 only, one `Content-Length` (digits only; a repeat, even an equal one, is
+refused), no `Transfer-Encoding`, the exact route. hyper then serves the replayed bytes, and the
+service checks that hyper read the same method, request-target, version and body length; any
+difference is closed unanswered and recorded `head-mismatch`. hyper's writes stay gated until
+the request has its entry, so anything it answers by itself is dropped and recorded
+`http-error`.
+
+**The body** (≤ 4 MiB; a larger `Content-Length` is `413` before a byte is read; within 30 s,
+else `408`). Strict nested allowlist, duplicate keys refused:
+
+- Top level: `model` (ignored and dropped: the backend never sees it), `messages`, `tools`,
+  `tool_choice`, `parallel_tool_calls`, `temperature`, `top_p`, `max_tokens` /
+  `max_completion_tokens` (one at most), `stop`, `seed`, `stream`, `stream_options`,
+  `response_format`, `presence_penalty`, `frequency_penalty`, `n` (must be 1).
+- Message content: text parts only (an image, audio or file part is `400 non-text-part`).
+  `tool_calls` only on assistant messages, `tool_call_id` only on tool messages; tool and
+  function names match `[A-Za-z0-9_-]{1,64}`. `parameters` and `json_schema` are opaque JSON
+  (#55).
+- The token limit: `0` or more than `model.context` is `400 token-limit`; absent, the backend is
+  given `model.context` as the bound (always explicit). The M3 fit estimator clamps further.
+
+Refusals are answered `{"error": {"message", "type", "param", "code"}}` (OpenAI's shape) after
+their `llm.deny` entry. **Bounds per session:** 4 connections; 5 requests read per second with a
+burst of 10 (backpressure, as on `agent.sock`); a streamed reply is cut at 16 MiB (no
+`[DONE]`; `llm.response` says `cut: true`); a write stalled for 10 s fails the connection. The backend is a constructor argument:
+until M3 none is wired in production (#53), and the scripted mock model exists only in the test
+tree.
 
 ## 5. Data flows
 
@@ -690,6 +776,33 @@ sallyport/
   file failure is `session-ca`). One load feeds the upstream verifier and `ca-bundle.pem`. The
   file list and owner are constructor arguments of the egress starter (Task 8 decision 10);
   production passes these. Doctor V17 applies the same checks.
+- **RPC and LLM audit events** (Task 7). All are written at every `audit.level` except
+  `llm.response`, which is detail (`Detail::Full`, dropped at `actions`). Each is appended off the
+  runtime before the reply it covers; a failed append means no dispatch, no reply, and the
+  connection closes. Bodies and model output are never logged, only counts and SHA-256; strings
+  the peer chose (method, path, field, id) are escaped and cut at 64 bytes (`…(+N)`).
+  - `rpc.request` (actor `harness`, decision `allow`): `{method, id, lifecycle}` (`2026` or
+    `legacy`); `tools/call` adds `{tool, arguments}` (redacted by the audit writer).
+  - `rpc.deny` (decision `deny`): `{reason, method?, id?}`; on `control.sock` also `{socket:
+    "control"}`; a failed peer check is `{reason: "peer-uid", uid}`. Reasons: `parse-error`,
+    `too-deep`, `batch`, `not-object`, `bad-version`, `bad-id`, `bad-method`, `bad-params`,
+    `bad-shape`, `frame-too-large`, `unexpected-response`, `method-not-found`,
+    `wrong-lifecycle`, `missing-protocol-version`, `bad-meta`, `unsupported-protocol-version`,
+    `second-initialize`, `duplicate-id`, `too-many-in-flight`, `peer-uid`.
+  - `rpc.cancel` (actor `harness`): `{id}`, only for a cancel that matches an in-flight call,
+    before its reply is suppressed.
+  - `llm.request` (actor `harness`, decision `allow`): `{path}` for `/v1/models`; for a chat
+    `{path, stream, messages, bytes, sha256, max_tokens}` (the bound the backend was given).
+  - `llm.deny` (decision `deny`): `{reason, status, method?, path?, field?}` (`status` null when
+    the connection closes unanswered). Reasons: 400 `malformed`, `http-version`,
+    `transfer-encoding`, `content-length`, `unexpected-body`, `unknown-field`, `bad-value`,
+    `missing-field`, `too-many`, `too-deep`, `non-text-part`, `n-must-be-1`, `token-limit`,
+    `body-error`; 404 `not-found`; 408 `body-timeout`; 411 `length-required`; 413
+    `body-too-large`; 431 `head-too-large`; no reply: `head-timeout`, `incomplete-head`,
+    `http-error`, `head-mismatch`, `peer-uid` (`{reason, uid}`).
+  - `llm.response` (detail): `{status, bytes, sha256}` before a whole reply; `{status, stream:
+    true, events, bytes, sha256, cut}` after a stream ends; `{status: 502, reason:
+    "backend-error"}` before a backend failure is answered.
 - **Approval rendering**: escape all C0/C1 controls and `\x1b`, strip Unicode bidi overrides
   (U+202A–U+202E, U+2066–U+2069), NFC-normalize, cap at 2 000 chars with an explicit
   `… (+N bytes, sha256 …)` tail. Paths shown as *host realpath* **and** guest path.
