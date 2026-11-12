@@ -35,7 +35,7 @@ use sally_core::audit::{Actor, AuditError, AuditWriter, NewEntry};
 use sally_core::manifest::{AuditLevel, MountMode, NetworkMode, ValidatedManifest};
 use serde_json::json;
 
-use crate::egress::net::{EgressHandle, EgressStarter, NET_SOCK, SessionEgress};
+use crate::egress::net::{EgressError, EgressHandle, EgressStarter, NET_SOCK, SessionEgress};
 
 use super::argv::workspace_argv;
 use super::commands::container_id;
@@ -367,7 +367,7 @@ impl Launcher {
         let image = req.image();
         self.image_present(image).await?;
         let argv = self.dirs_and_argv(req, runtime, &scan, progress).await?;
-        let egress = self.start_egress(req)?;
+        let egress = self.start_egress(req).await?;
         let mounts: Vec<_> = req
             .manifest
             .mounts()
@@ -418,21 +418,29 @@ impl Launcher {
         Ok((running, plan))
     }
 
-    /// Step 3a: the session's egress listener on `net.sock`, for `network.mode: proxy` only.
-    fn start_egress(&self, req: &WorkspaceRequest) -> Result<Option<EgressHandle>, LaunchError> {
+    /// Step 3a: the session's egress listener on `net.sock`, for `network.mode: proxy` only. A
+    /// session with secret grants first gets its session CA and the two CA files (off the
+    /// runtime: the trust roots are read from disk), before the container exists.
+    async fn start_egress(
+        &self,
+        req: &WorkspaceRequest,
+    ) -> Result<Option<EgressHandle>, LaunchError> {
         if req.manifest.manifest().network.mode != NetworkMode::Proxy {
             return Ok(None);
         }
-        let sock = req.paths.workspace_sockets().join(NET_SOCK);
+        let dir = req.paths.workspace_sockets();
+        let sock = dir.join(NET_SOCK);
         let s = SessionEgress::from_manifest(
             &req.manifest,
             req.paths.id().as_str(),
             Arc::clone(&self.audit),
         );
+        let egress = Arc::clone(&self.egress);
+        let s = blocking(move || egress.prepare(&dir, s).map_err(LaunchError::Egress)).await?;
         self.egress
             .start(&sock, s)
             .map(Some)
-            .map_err(LaunchError::Egress)
+            .map_err(|e| LaunchError::Egress(EgressError::Listener(e)))
     }
 
     /// Step 2: hermetic podman and the runtime re-checked, then the launch scan, then the
@@ -610,8 +618,29 @@ mod tests {
 
     #[test]
     fn a_listener_failure_has_its_own_reason() {
-        let e = LaunchError::Egress(std::io::ErrorKind::AddrInUse.into());
+        let e = LaunchError::Egress(EgressError::Listener(std::io::ErrorKind::AddrInUse.into()));
         assert_eq!(e.reason(), "egress-listener");
         assert!(e.to_string().starts_with("network: net.sock: "), "{e}");
+    }
+
+    #[test]
+    fn missing_trust_roots_and_a_failed_session_ca_have_their_own_reasons() {
+        use crate::egress::ca::CaError;
+        use crate::egress::roots::RootsError;
+        let roots = LaunchError::Egress(RootsError::NotFound("/x".into()).into());
+        assert_eq!(roots.reason(), "trust-roots");
+        assert!(
+            roots.to_string().starts_with("network: trust roots: "),
+            "{roots}"
+        );
+        let ca = LaunchError::Egress(CaError::NoHosts.into());
+        assert_eq!(ca.reason(), "session-ca");
+        let files =
+            LaunchError::Egress(EgressError::Files(std::io::ErrorKind::AlreadyExists.into()));
+        assert_eq!(files.reason(), "session-ca");
+        assert!(
+            files.to_string().starts_with("network: CA files: "),
+            "{files}"
+        );
     }
 }

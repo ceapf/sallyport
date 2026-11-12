@@ -95,7 +95,7 @@ MUTANTS_WIDE_SALLYD := $(addprefix crates/sallyd/src/sandbox/,argv.rs check.rs t
                        overlap.rs scan.rs images.rs changes.rs dirs.rs podman.rs disk.rs stage.rs \
                        launch/error.rs) \
                        $(addprefix crates/sallyd/src/egress/,addr.rs authority.rs head.rs policy.rs server.rs \
-                       hostaddrs.rs tunnel.rs net.rs)
+                       hostaddrs.rs tunnel.rs net.rs ca.rs roots.rs)
 MUTANTS_WIDE_SHIM := $(addprefix crates/sally-shim/src/,args.rs relay.rs)
 MUTANTS_WIDE_TESTS_CORE :=
 MUTANTS_WIDE_TESTS_SALLYD := --lib --test=argv --test=scan

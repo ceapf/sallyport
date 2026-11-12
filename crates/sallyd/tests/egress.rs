@@ -111,6 +111,52 @@ fn rt_net_02_a_denied_name_is_never_resolved_inside_or_by_the_host() {
     });
 }
 
+/// Task 9a-1 (architect Q38 (g), (h)): a session with a secret grant finds `ca-bundle.pem` and
+/// `session-ca.pem` beside `net.sock`, read-only and equal to the host copies; the harness socket
+/// directory never gets them; a session without secrets gets neither. The grant host itself is
+/// still refused until Task 9a-2.
+#[test]
+fn the_session_ca_files_reach_the_workspace_read_only_and_only_with_secrets() {
+    use sallyd::egress::ca::{BUNDLE_FILE, CA_FILE};
+    use sha2::{Digest, Sha256};
+    rt().block_on(async {
+        let lx = Lx::new();
+        let grant = "secrets:\n  - name: GITHUB_TOKEN\n    inject: {host: mock.test, \
+                     header: Authorization, format: \"Bearer {value}\"}\n";
+        let r = session(&lx, &format!("{NET}{grant}"), "ca1").await;
+        let (_, ls) = exec(&r, "ls -A /run/sallyport | tr '\\n' ' '").await;
+        assert_eq!(ls.trim(), "ca-bundle.pem net.sock session-ca.pem", "{ls}");
+        let host = lx.paths("ca1").workspace_sockets();
+        for f in [BUNDLE_FILE, CA_FILE] {
+            let want = hex(&Sha256::digest(std::fs::read(host.join(f)).unwrap()));
+            let (_, got) = exec(&r, &format!("sha256sum /run/sallyport/{f}")).await;
+            assert!(got.starts_with(&want), "{f}: {got} vs {want}");
+        }
+        let (code, out) = exec(
+            &r,
+            "echo x > /run/sallyport/ca-bundle.pem; echo x > /run/sallyport/new; echo $?",
+        )
+        .await;
+        assert!(out.lines().any(|l| l.trim() == "1"), "{code} {out}");
+        assert_eq!(out.matches("Read-only file system").count(), 2, "{out}");
+        let harness = lx.paths("ca1").harness_sockets();
+        for f in [BUNDLE_FILE, CA_FILE] {
+            assert!(!harness.join(f).exists(), "{f} in the harness directory");
+        }
+        let still = via_shim(&r, &connect("mock.test:443")).await;
+        assert!(still.contains("grant-host-unavailable"), "{still}");
+        lx.stop(r).await;
+        let r = session(&lx, NET, "ca0").await;
+        let (_, ls) = exec(&r, "ls -A /run/sallyport").await;
+        assert_eq!(ls.trim(), "net.sock", "{ls}");
+        lx.stop(r).await;
+    });
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 #[test]
 fn rt_net_03_a_host_off_the_list_is_refused_and_the_upstream_sees_nothing() {
     rt().block_on(async {
@@ -533,6 +579,7 @@ fn listen(
         resolver: Arc::new(common::egress::Names::default()),
         dialer: Arc::new(PairEcho),
         host: Arc::new(common::egress::Owned::default()),
+        roots: sallyd::egress::roots::BundleFiles::default(),
     };
     egress.resolver.set("a.mock.test", vec![vec![public(1)]]);
     let rule = Rule {
@@ -549,6 +596,9 @@ fn listen(
                 session: "rt-net-09".into(),
                 level: sally_core::manifest::AuditLevel::default(),
                 audit,
+                ca: false,
+                timeout: std::time::Duration::from_secs(60),
+                interception: None,
             },
         )
         .unwrap();

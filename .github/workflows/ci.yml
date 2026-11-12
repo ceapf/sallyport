@@ -24,6 +24,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Each container launch needs the disk floor plus runtime.stage_size free (14 GiB with the
+      # defaults the tests use); this job's clippy and nextest builds leave less than that on a
+      # stock runner. The preinstalled SDKs removed here are unused by this repository.
+      - name: free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          df -h /
       # No caches at all: nothing restored from a cache (build output or tool binary) decides a
       # security gate. Tools are built from crates.io with --locked at a pinned version.
       - run: cargo install cargo-nextest --locked --version "$CARGO_NEXTEST_VERSION"
@@ -49,6 +57,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Same disk need as the rust job (floor + stage_size per launch).
+      - name: free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          df -h /
       - run: cargo install cargo-nextest --locked --version "$CARGO_NEXTEST_VERSION"
       - name: verify cargo-nextest version
         run: cargo nextest --version | grep -Fw "$CARGO_NEXTEST_VERSION"

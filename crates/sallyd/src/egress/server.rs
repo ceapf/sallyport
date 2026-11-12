@@ -140,6 +140,16 @@ fn permits(n: usize) -> usize {
     n.min(Semaphore::MAX_PERMITS)
 }
 
+/// What the proxy intercepts grant hosts with (Task 9a): the session CA's leaves and the upstream
+/// trust roots. It holds no secret store and no credential (architect Q27 (1)).
+#[derive(Debug)]
+pub struct Interception {
+    /// The session CA and one leaf per grant host; the CA key is already gone.
+    pub tls: super::ca::SessionTls,
+    /// The upstream verifier's roots.
+    pub roots: super::roots::Roots,
+}
+
 /// What a session's proxy is built from.
 pub struct Parts<R, D, H> {
     /// The session's policy.
@@ -158,6 +168,9 @@ pub struct Parts<R, D, H> {
     pub level: AuditLevel,
     /// Limits.
     pub limits: Limits,
+    /// The session CA and trust roots of a session with secret grants; `None` otherwise.
+    // TODO(#45): Task 9a-2 serves grant hosts with it; until then they are refused.
+    pub interception: Option<Interception>,
 }
 
 /// One session's proxy. Shared as `Arc<Proxy<…>>`; [`Proxy::serve`] runs once per accepted
@@ -171,6 +184,7 @@ pub struct Proxy<R, D, H> {
     session: String,
     level: AuditLevel,
     limits: Limits,
+    interception: Option<Interception>,
     slots: Arc<Semaphore>,
     stop: watch::Sender<bool>,
 }
@@ -224,6 +238,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
             session: p.session,
             level: p.level,
             limits: p.limits,
+            interception: p.interception,
             stop: watch::Sender::new(false),
         }
     }
@@ -232,6 +247,12 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
     #[must_use]
     pub fn limits(&self) -> &Limits {
         &self.limits
+    }
+
+    /// The session CA and trust roots, for a session with secret grants.
+    #[must_use]
+    pub fn interception(&self) -> Option<&Interception> {
+        self.interception.as_ref()
     }
 
     /// Ends every connection: those still being checked close without a reply, open tunnels

@@ -134,6 +134,13 @@ impl Policy {
         Self::new(rules, grant_hosts)
     }
 
+    /// The injection hosts of the session's secret grants, normalized, in manifest order (a host
+    /// may repeat).
+    #[must_use]
+    pub fn grant_hosts(&self) -> &[String] {
+        &self.grant_hosts
+    }
+
     /// Decides on `a` before anything is resolved.
     ///
     /// # Errors

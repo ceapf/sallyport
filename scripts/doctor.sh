@@ -2,7 +2,8 @@
 # scripts/doctor.sh — Sallyport host preflight.
 #
 # Verifies the load-bearing assumptions V1–V12 from docs/00_DECISIONS.md, V13–V16 from
-# docs/AMENDMENTS-01.md §11 / AMENDMENTS-02 B5, plus the developer toolchain. Prints one status
+# docs/AMENDMENTS-01.md §11 / AMENDMENTS-02 B5, V17 (the token proxy's trust roots, Task 9a), plus
+# the developer toolchain. Prints one status
 # line per check:
 #
 #     V<n> PASS|FAIL|WARN|UNVERIFIED — <one-line evidence>
@@ -532,6 +533,36 @@ if have runsc; then
   report V16 PASS "runsc: $(runsc --version 2>&1 | head -n 1)" ""
 else
   report V16 WARN "runsc absent (informational; needed only for the M6 gVisor spike)" ""
+fi
+
+# ---------------------------------------------------------------------------------------------
+# V17 — system CA bundle for the token proxy (Task 9a, architect Q31). The same rule as
+# crates/sallyd/src/egress/roots.rs: the first bundle that exists is used, and must be a regular
+# file (after symlinks), owned by root, not group- or other-writable, at most 4 MiB. A session
+# with secret grants is refused without it; other sessions do not need it (so a WARN).
+ca_found=""
+for ca in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem \
+          /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem; do
+  [ -e "$ca" ] || continue
+  ca_found="$ca"
+  break
+done
+if [ -z "$ca_found" ]; then
+  report V17 WARN "no system CA bundle found: sessions with secret grants will be refused" ""
+else
+  ca_stat="$(stat -L -c '%F %u %a %s' "$ca_found" 2>&1)"
+  read -r ca_t1 ca_t2 ca_uid ca_mode ca_size <<<"$ca_stat"
+  if [ "$ca_t1 $ca_t2" != "regular file" ]; then
+    report V17 WARN "$ca_found is not a regular file: secret sessions will be refused" "$ca_stat"
+  elif [ "$ca_uid" != 0 ]; then
+    report V17 WARN "$ca_found is not owned by root: secret sessions will be refused" "$ca_stat"
+  elif (( (8#$ca_mode & 8#022) != 0 )); then
+    report V17 WARN "$ca_found is group- or other-writable: secret sessions will be refused" "$ca_stat"
+  elif [ "$ca_size" -gt 4194304 ]; then
+    report V17 WARN "$ca_found is larger than 4 MiB: secret sessions will be refused" "$ca_stat"
+  else
+    report V17 PASS "system CA bundle $ca_found (root-owned, mode $ca_mode, $ca_size bytes)" ""
+  fi
 fi
 
 echo
