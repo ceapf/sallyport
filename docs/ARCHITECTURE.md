@@ -4,7 +4,7 @@
 
 | Layer | Choice | Notes |
 |---|---|---|
-| Broker, sandbox orchestration, model validation, proxies, CLI | **Rust** (`tokio`, `hyper` 1.x + `rustls`, `rustix` for `openat2`, `rusqlite`, `serde`, `schemars`, `clap`, `tracing`) | Memory safety exactly where untrusted bytes are parsed. `#![forbid(unsafe_code)]` in every crate. |
+| Broker, sandbox orchestration, model validation, proxies, CLI | **Rust** (`tokio`, `hyper` 1.x + `rustls`, `rustix` for `openat2`, `rusqlite`, `serde`, `schemars`, `clap`, `tracing`; `sallyd`'s own log is the in-tree `sallyd::oplog`, §2.1) | Memory safety exactly where untrusted bytes are parsed. `#![forbid(unsafe_code)]` in every crate. |
 | Desktop shell + UI | **Tauri v2** + React + TypeScript (Vite) | Kept. The Rust side of Tauri is a *thin client* of `sallyd`; the webview gets no fs/shell plugins. |
 | Inference | **llama.cpp `llama-server`** in our own CUDA image | Kept. Pinned commit, built with `-DCMAKE_CUDA_ARCHITECTURES="86;89;120"`, CUDA 12.9. Prebuilt images lack sm_120. |
 | Sandboxing | **Podman rootless + crun**, GPU via CDI | See THREAT_MODEL §6 for why not gVisor/microVM on WSL2 in v1. |
@@ -85,6 +85,8 @@ flowchart LR
 | `sallyd::rpc` | `control.sock` (trusted methods, §4.1) and per-session `agent.sock` (the MCP subset, §4.2); bounded NDJSON framing, duplicate-key-refusing JSON, per-session rate and connection caps, `SO_PEERCRED` UID check before a byte is read, an audit entry before every reply | **yes** |
 | `sallyd::llm` | Per-session `llm.sock` (§4.4): HTTP/1.1 through hyper; the broker reads and decides on the head itself and gates hyper's writes; strict body allowlist; the model backend is a constructor argument (M3 wires the engine) | **yes** |
 | `sallyd::session` | Lifecycle: validate → ensure inference loaded → create socket dir → launch agent → wire → monitor → teardown (always, even on panic — `Drop` guard) | yes |
+| `sallyd::daemon` | Startup (Task 12, architect Q42): umask 077, no core dumps, non-dumpable, refuse root and set-id, the `$XDG_RUNTIME_DIR/sallyport` fd checked and `flock`ed for life (one `sallyd` per user), `NOFILE` raised; the crash reporter that turns a session task's panic into `session.crash` (Q47) | **yes** |
+| `sallyd::oplog` | The operational log on stderr (Q43): in-tree, no `tracing` subscriber. Diagnostics only, after the audit entry; each value redacted, escaped (`sally-core::text`) and capped at 4 KiB, the line at 16 KiB; a bounded queue and a writer thread, so logging never blocks. Never manifests, argv, bodies, model output or environment | yes |
 | `sallyd::infer` | Pool of at most one loaded model (v1); start/stop inference container; forward OpenAI-compatible requests over `infer.sock`; validate request JSON (allowed fields, size caps); stream back | yes |
 | `sallyd::tools` | The built-in tools as the approvals `Executor` (§4.3, Task 11): `path` (guest path → mount + canonical rel), `args`, `fs` (openat2 beneath a checked root: the host pin for `brokered`/`ro`, the workspace's own view through the container init's `/proc/<pid>/root` for `rw`/`staged`), `tag` (destructive tagger), `shell` + `exec` (`podman exec` runner; finds, limits and kills the call's processes through pidfds), `procs`. `fetch` follows (#75) | **yes** |
 | `sallyd::approvals` | Queue, canonicalization, rendering sanitization, single-use IDs, timeout, flood control, notifications to UI/CLI | **yes** |
