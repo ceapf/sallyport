@@ -32,7 +32,8 @@ pub use types::{
 };
 pub use units::{ByteSize, Cpus, Duration, GpuLayers};
 pub use validate::{
-    EgressRule, ResolvedMount, SecretCatalog, Validated, ValidatedManifest, load, validate,
+    EgressRule, ResolvedMount, SecretCatalog, Validated, ValidatedManifest, check_glob, load,
+    validate,
 };
 
 /// JSON Schema for [`Manifest`], for the UI editor. Generated from the same types the parser

@@ -152,8 +152,16 @@ fn is_git_dir(dir: &Path) -> bool {
         && kind("refs").is_some_and(|m| m.is_dir())
 }
 
-/// Globs are relative to the mount root and may not climb out of it.
-fn check_glob(g: &str) -> Result<(), String> {
+/// The syntax of an `approve` glob (MANIFEST_SPEC §1 Mount, "Glob syntax"; architect ruling
+/// Q20): relative to the mount root, never climbing out of it, and only `*`, `?` and whole-segment
+/// `**` as wildcards. Anything a user could read as another wildcard (classes, braces, escapes,
+/// negation) or as a directory shorthand (empty or `.` segments, a trailing `/`) is refused: the
+/// matcher would take it literally and silently ask less than the user meant. The broker's matcher
+/// uses this same check and treats a glob it refuses as `**`.
+///
+/// # Errors
+/// What is wrong with `g`, for the diagnostic.
+pub fn check_glob(g: &str) -> Result<(), String> {
     if g.is_empty() || g.len() > MAX_GLOB_LEN {
         return Err(format!("glob must be 1–{MAX_GLOB_LEN} bytes"));
     }
@@ -163,8 +171,28 @@ fn check_glob(g: &str) -> Result<(), String> {
     if g.chars().any(char::is_control) {
         return Err(format!("{g:?} contains a control character"));
     }
-    if g.split('/').any(|s| s == "..") {
-        return Err(format!("{g:?} contains \"..\""));
+    if g.ends_with('/') {
+        return Err(format!(
+            "{g:?} ends with \"/\"; use \"dir/**\" for a directory"
+        ));
+    }
+    if let Some(c) = g
+        .chars()
+        .find(|c| matches!(c, '[' | ']' | '{' | '}' | '\\'))
+    {
+        return Err(format!(
+            "{g:?} contains {c:?}; only *, ? and ** are wildcards"
+        ));
+    }
+    if g.starts_with('!') {
+        return Err(format!("{g:?} starts with \"!\"; globs cannot be negated"));
+    }
+    for s in g.split('/') {
+        match s {
+            ".." => return Err(format!("{g:?} contains \"..\"")),
+            "" | "." => return Err(format!("{g:?} contains an empty or \".\" segment")),
+            _ => {}
+        }
     }
     Ok(())
 }
