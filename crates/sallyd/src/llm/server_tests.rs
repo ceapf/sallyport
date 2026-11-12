@@ -1,0 +1,472 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use serde_json::json;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use super::*;
+use crate::rpc::testkit::{Sink, recorder};
+
+const CONTEXT: u64 = 4096;
+
+/// A backend that answers at once and remembers what it was given.
+#[derive(Default)]
+struct Fake {
+    calls: AtomicUsize,
+    seen: Mutex<Vec<Chat>>,
+    fail: bool,
+}
+
+impl Backend for Arc<Fake> {
+    async fn complete(&self, chat: Chat) -> Result<Reply, BackendError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let stream = chat.stream;
+        self.seen.lock().unwrap().push(chat);
+        if self.fail {
+            return Err(BackendError);
+        }
+        if !stream {
+            return Ok(Reply::Whole(
+                json!({"object": "chat.completion", "choices": [
+                    {"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}
+                ]}),
+            ));
+        }
+        let (tx, rx) = mpsc::channel(4);
+        tokio::spawn(async move {
+            for t in ["a", "b"] {
+                let _ = tx
+                    .send(json!({"choices": [{"delta": {"content": t}}]}))
+                    .await;
+            }
+        });
+        Ok(Reply::Stream(rx))
+    }
+}
+
+fn setup_with(fake: Fake) -> (Arc<Llm<Arc<Fake>>>, Arc<Fake>, Arc<Sink>) {
+    let fake = Arc::new(fake);
+    let (sink, rec) = recorder("sess-a");
+    let settings = Settings {
+        model: "local-model".into(),
+        context: CONTEXT,
+    };
+    (
+        Arc::new(Llm::new(Arc::clone(&fake), rec, settings)),
+        fake,
+        sink,
+    )
+}
+
+fn setup() -> (Arc<Llm<Arc<Fake>>>, Arc<Fake>, Arc<Sink>) {
+    setup_with(Fake::default())
+}
+
+/// Sends `raw`, half-closes, and returns everything the server wrote.
+async fn exchange(llm: &Arc<Llm<Arc<Fake>>>, raw: &[u8]) -> String {
+    let (mut client, server) = tokio::io::duplex(1 << 20);
+    let task = tokio::spawn(Arc::clone(llm).serve_stream(server));
+    client.write_all(raw).await.unwrap();
+    let mut out = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), client.read_to_end(&mut out))
+        .await
+        .expect("no end of reply")
+        .unwrap();
+    task.await.unwrap();
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn post(body: &str) -> Vec<u8> {
+    format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+fn chat(extra: Value) -> String {
+    let mut b = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]});
+    for (k, v) in extra.as_object().unwrap() {
+        b[k] = v.clone();
+    }
+    b.to_string()
+}
+
+fn status(reply: &str) -> u16 {
+    reply.get(9..12).and_then(|s| s.parse().ok()).unwrap_or(0)
+}
+
+fn body(reply: &str) -> Value {
+    let start = reply.find("\r\n\r\n").unwrap() + 4;
+    serde_json::from_str(&reply[start..]).unwrap()
+}
+
+fn denies(sink: &Sink) -> Vec<(String, Value)> {
+    sink.rows()
+        .into_iter()
+        .filter(|r| r.event == "llm.deny")
+        .map(|r| {
+            (
+                r.args["reason"].as_str().unwrap().to_owned(),
+                r.args["status"].clone(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn models_names_the_sessions_model() {
+    let (llm, fake, sink) = setup();
+    let r = exchange(&llm, b"GET /v1/models HTTP/1.1\r\nHost: x\r\n\r\n").await;
+    assert_eq!(status(&r), 200);
+    assert_eq!(body(&r)["data"][0]["id"], json!("local-model"));
+    assert_eq!(sink.events(), ["llm.request"]);
+    assert_eq!(sink.last("llm.request"), json!({"path": "/v1/models"}));
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_chat_request_is_checked_recorded_then_answered() {
+    let (llm, fake, sink) = setup();
+    let b = chat(json!({}));
+    let r = exchange(&llm, &post(&b)).await;
+    assert_eq!(status(&r), 200, "{r}");
+    assert_eq!(body(&r)["choices"][0]["message"]["content"], json!("hi"));
+    assert_eq!(sink.events(), ["llm.request", "llm.response"]);
+    let req = sink.last("llm.request");
+    assert_eq!(req["messages"], json!(1));
+    assert_eq!(req["stream"], json!(false));
+    assert_eq!(req["bytes"], json!(b.len()));
+    assert_eq!(req["sha256"].as_str().unwrap().len(), 64);
+    // No limit asked for: the backend gets the context as its bound (ruling Q2).
+    assert_eq!(req["max_tokens"], json!(CONTEXT));
+    let seen = fake.seen.lock().unwrap();
+    assert_eq!(seen[0].max_tokens, CONTEXT);
+    // The model the harness named never reaches the backend (Task 7 decision 1).
+    assert!(!seen[0].body.contains_key("model"));
+    let resp = sink.rows()[1].clone();
+    assert!(resp.debug.contains("detail: Full"));
+    assert_eq!(resp.args["status"], json!(200));
+}
+
+#[tokio::test]
+async fn a_streamed_reply_is_server_sent_events_then_done() {
+    let (llm, _, sink) = setup();
+    let r = exchange(&llm, &post(&chat(json!({"stream": true})))).await;
+    assert_eq!(status(&r), 200);
+    assert!(r.contains("text/event-stream"), "{r}");
+    let a = r
+        .find(r#"data: {"choices":[{"delta":{"content":"a"}}]}"#)
+        .unwrap();
+    let b = r
+        .find(r#"data: {"choices":[{"delta":{"content":"b"}}]}"#)
+        .unwrap();
+    let done = r.find("data: [DONE]").unwrap();
+    assert!(a < b && b < done);
+    // The response entry follows the stream.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while sink.events().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let resp = sink.last("llm.response");
+    assert_eq!(
+        (resp["events"].clone(), resp["cut"].clone()),
+        (json!(2), json!(false))
+    );
+}
+
+/// RT-INF-05 (llm.sock half): endpoints other than the two served are 404 and recorded; image
+/// parts and `n: 5` are 400; the backend sees none of them.
+#[tokio::test]
+async fn rt_inf_05_other_endpoints_and_parts_never_reach_the_backend() {
+    let (llm, fake, sink) = setup();
+    for target in [
+        "POST /v1/completions",
+        "POST /models/load",
+        "GET /props",
+        "GET /slots",
+        "POST /tokenize",
+        "POST /v1/embeddings",
+        "GET /v1/chat/completions",
+        "POST /v1/models",
+        "POST /v1/chat/completions/",
+        "POST /v1/chat/completions?x=1",
+        "OPTIONS *",
+        "GET /health",
+    ] {
+        let r = exchange(
+            &llm,
+            format!("{target} HTTP/1.1\r\nContent-Length: 2\r\n\r\n{{}}").as_bytes(),
+        )
+        .await;
+        assert_eq!(status(&r), 404, "{target}: {r}");
+    }
+    let image = json!({"messages": [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+    ]}]});
+    let r = exchange(&llm, &post(&image.to_string())).await;
+    assert_eq!(
+        (status(&r), body(&r)["error"]["code"].clone()),
+        (400, json!("non-text-part"))
+    );
+    assert_eq!(
+        body(&r)["error"]["param"],
+        json!("messages[0].content[0].type")
+    );
+    let r = exchange(&llm, &post(&chat(json!({"n": 5})))).await;
+    assert_eq!(
+        (status(&r), body(&r)["error"]["code"].clone()),
+        (400, json!("n-must-be-1"))
+    );
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+    let d = denies(&sink);
+    assert_eq!(d.len(), 14);
+    assert!(
+        d[..12]
+            .iter()
+            .all(|(r, s)| r == "not-found" && *s == json!(404))
+    );
+    let first = sink.rows()[0].args.clone();
+    assert_eq!(first["path"], json!("/v1/completions"));
+    assert_eq!(first["method"], json!("POST"));
+    assert_eq!(sink.rows()[13].args["field"], json!("n"));
+}
+
+/// RT-INF-03 on llm.sock (ruling Q4): unknown fields, a huge token limit, a 10 MiB body, `n:
+/// 100`, `logit_bias`; and a path-like `model`, which is dropped (Task 7 decision 1) so the
+/// backend never sees it.
+#[tokio::test]
+async fn rt_inf_03_request_validation_on_llm_sock() {
+    let (llm, fake, sink) = setup();
+    for (extra, code) in [
+        (json!({"logit_bias": {"1": 100}}), "unknown-field"),
+        (json!({"logprobs": true}), "unknown-field"),
+        (json!({"max_tokens": 1_000_000_000u64}), "token-limit"),
+        (json!({"max_tokens": CONTEXT + 1}), "token-limit"),
+        (json!({"n": 100}), "n-must-be-1"),
+    ] {
+        let r = exchange(&llm, &post(&chat(extra.clone()))).await;
+        assert_eq!(
+            (status(&r), body(&r)["error"]["code"].clone()),
+            (400, json!(code)),
+            "{extra}"
+        );
+    }
+    // 10 MiB: refused from its Content-Length, before a byte of it is read.
+    let big = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+        10 * 1024 * 1024
+    );
+    let r = exchange(&llm, big.as_bytes()).await;
+    assert_eq!(status(&r), 413);
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        denies(&sink).last().unwrap(),
+        &("body-too-large".to_owned(), json!(413))
+    );
+    let r = exchange(
+        &llm,
+        &post(&chat(json!({"model": "../../models/other.gguf"}))),
+    )
+    .await;
+    assert_eq!(status(&r), 200);
+    let seen = fake.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert!(!seen[0].body.contains_key("model"));
+}
+
+#[tokio::test]
+async fn a_body_over_the_cap_is_refused_while_read() {
+    // A Content-Length at the cap passes the head check; the body reader enforces it too.
+    let (llm, fake, _) = setup();
+    let mut b = chat(json!({}));
+    b.push_str(&" ".repeat(body::MAX_BODY - b.len()));
+    let r = exchange(&llm, &post(&b)).await;
+    assert_eq!(status(&r), 200);
+    let over = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+        body::MAX_BODY + 1
+    );
+    let r = exchange(&llm, over.as_bytes()).await;
+    assert_eq!(status(&r), 413);
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn heads_the_broker_refuses_are_answered_by_it() {
+    let (llm, fake, sink) = setup();
+    for (raw, code, reason) in [
+        (&b"GARBAGE\r\n\r\n"[..], 400, "malformed"),
+        (b"GET /v1/models HTTP/1.0\r\n\r\n", 400, "http-version"),
+        (
+            b"POST /v1/chat/completions HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+            400,
+            "transfer-encoding",
+        ),
+        (
+            b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n",
+            400,
+            "content-length",
+        ),
+        (
+            b"POST /v1/chat/completions HTTP/1.1\r\n\r\n",
+            411,
+            "length-required",
+        ),
+        (
+            b"GET /v1/models HTTP/1.1\r\nContent-Length: 1\r\n\r\nx",
+            400,
+            "unexpected-body",
+        ),
+    ] {
+        let r = exchange(&llm, raw).await;
+        assert_eq!(status(&r), code, "{r}");
+        assert_eq!(body(&r)["error"]["code"], json!(reason));
+        assert!(r.contains("Connection: close"));
+    }
+    let mut big = b"GET /v1/models HTTP/1.1\r\n".to_vec();
+    big.extend_from_slice(format!("X: {}\r\n\r\n", "a".repeat(head::MAX_HEAD)).as_bytes());
+    let r = exchange(&llm, &big).await;
+    assert_eq!(status(&r), 431);
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(denies(&sink).len(), 7);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_slow_head_is_closed_unanswered_and_recorded() {
+    let (llm, _, sink) = setup();
+    let (mut client, server) = tokio::io::duplex(1024);
+    let task = tokio::spawn(Arc::clone(&llm).serve_stream(server));
+    client.write_all(b"GET /v1/mod").await.unwrap();
+    let mut out = Vec::new();
+    client.read_to_end(&mut out).await.unwrap();
+    task.await.unwrap();
+    assert!(out.is_empty());
+    assert_eq!(denies(&sink), [("head-timeout".to_owned(), Value::Null)]);
+}
+
+#[tokio::test]
+async fn an_empty_connection_leaves_no_entry_and_a_cut_head_does() {
+    let (llm, _, sink) = setup();
+    assert_eq!(exchange_closed(&llm, b"").await, "");
+    assert!(sink.rows().is_empty());
+    assert_eq!(exchange_closed(&llm, b"GET /v1/mo").await, "");
+    assert_eq!(denies(&sink), [("incomplete-head".to_owned(), Value::Null)]);
+}
+
+async fn exchange_closed(llm: &Arc<Llm<Arc<Fake>>>, raw: &[u8]) -> String {
+    let (mut client, server) = tokio::io::duplex(1024);
+    let task = tokio::spawn(Arc::clone(llm).serve_stream(server));
+    client.write_all(raw).await.unwrap();
+    client.shutdown().await.unwrap();
+    let mut out = Vec::new();
+    client.read_to_end(&mut out).await.unwrap();
+    task.await.unwrap();
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_slow_body_is_refused_after_its_timeout() {
+    let (llm, fake, sink) = setup();
+    let (mut client, server) = tokio::io::duplex(1 << 16);
+    let task = tokio::spawn(Arc::clone(&llm).serve_stream(server));
+    client
+        .write_all(
+            b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 100\r\n\r\n{\"messages\"",
+        )
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    client.read_to_end(&mut out).await.unwrap();
+    task.await.unwrap();
+    assert_eq!(status(&String::from_utf8_lossy(&out)), 408);
+    assert_eq!(denies(&sink), [("body-timeout".to_owned(), json!(408))]);
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_backend_failure_is_a_recorded_502() {
+    let (llm, _, sink) = setup_with(Fake {
+        fail: true,
+        ..Fake::default()
+    });
+    let r = exchange(&llm, &post(&chat(json!({})))).await;
+    assert_eq!(status(&r), 502);
+    assert_eq!(body(&r)["error"]["type"], json!("server_error"));
+    assert_eq!(sink.events(), ["llm.request", "llm.response"]);
+    assert_eq!(sink.last("llm.response")["status"], json!(502));
+}
+
+#[tokio::test]
+async fn a_failed_request_entry_means_no_backend_call_and_no_reply() {
+    let (llm, fake, sink) = setup();
+    sink.fail_next.store(1, Ordering::SeqCst);
+    let r = exchange(&llm, &post(&chat(json!({})))).await;
+    assert_eq!(r, "", "a reply went out without its entry");
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+    // hyper's own answer was held back by the gate; the close is recorded afterwards.
+    assert_eq!(denies(&sink), [("http-error".to_owned(), Value::Null)]);
+    sink.set_failing(true);
+    for raw in [
+        &post(&chat(json!({"n": 2})))[..],
+        b"GET /nope HTTP/1.1\r\n\r\n",
+        b"GET /v1/models HTTP/1.1\r\n\r\n",
+    ] {
+        assert_eq!(exchange(&llm, raw).await, "");
+    }
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn requests_are_read_at_the_session_rate() {
+    let (llm, _, sink) = setup();
+    let started = tokio::time::Instant::now();
+    let n = 20u32;
+    for _ in 0..n {
+        exchange(&llm, b"GET /v1/models HTTP/1.1\r\n\r\n").await;
+    }
+    // BURST at once, then RATE per second: (20 − 10) / 5 = 2 s.
+    let took = started.elapsed();
+    let expect = Duration::from_secs(u64::from((n - BURST) / RATE));
+    assert!(
+        took >= expect && took < expect + Duration::from_millis(100),
+        "{took:?}"
+    );
+    assert_eq!(sink.rows().len(), n as usize);
+}
+
+#[tokio::test]
+async fn a_peer_with_another_uid_is_refused_and_recorded() {
+    let dir = std::env::temp_dir().join(format!("sp-llm-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("llm.sock");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let (llm, _, sink) = setup();
+    let me = rustix::process::getuid().as_raw();
+    let h = Arc::clone(&llm).listen(listener, me.wrapping_add(1));
+    let mut s = UnixStream::connect(&path).await.unwrap();
+    let _ = s.write_all(b"GET /v1/models HTTP/1.1\r\n\r\n").await;
+    let mut out = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out)).await;
+    assert!(out.is_empty());
+    assert_eq!(
+        sink.last("llm.deny"),
+        json!({"reason": "peer-uid", "uid": me})
+    );
+    h.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn hashes_are_lowercase_hex() {
+    assert_eq!(
+        sha256_hex(b"abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    assert_eq!(hex(&[0, 255, 16]), "00ff10");
+}
