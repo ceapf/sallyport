@@ -177,7 +177,17 @@ tools: `fs_read`/`fs_list` on any mode, `fs_write`/`fs_delete` on `rw` and `brok
 - `brokered`: bind mount **read-only**; `fs_write`/`fs_delete` are performed by the broker on the
   host under `openat2` confinement and apply the `approve` globs. Use for "the agent may propose
   edits to my notes". Omitted globs mean `["**"]`; an explicit empty list is a `risky` warning
-  when the matching tool is enabled. Globs are relative, no `..`.
+  when the matching tool is enabled. Glob syntax below.
+- **Glob syntax** (`approve.writes`/`approve.deletes`; architect ruling Q20, Task 10). A glob is
+  matched segment by segment against the target's canonical path relative to the mount: `**` as
+  a whole segment matches zero or more segments (`notes/**` covers `notes` and everything under
+  it); `*` matches any run of characters inside one segment, dotfiles included; `?` matches one
+  character; every other character is literal, and case matters. Any match means the operation
+  asks. The validator refuses (`invalid-value`) anything that would silently match less than it
+  seems to: an absolute glob, `..`, `.` or empty segments, a trailing `/` (write `dir/**`),
+  `[ ] { } \`, a leading `!`, control characters, and more than 256 bytes. Residual: on a
+  case-folding or normalizing file system a narrowed glob can match less than the file system
+  resolves; the default `["**"]` cannot.
 - **Git metadata** (AMENDMENTS-02 B2(a), replacing the read-only hooks/config overlays of
   AMENDMENTS-01 §6.3). In an `rw` mount, every `.git` directory found by the launch scan is
   mounted as an overlay whose upper directory is session scratch, discarded at teardown, and
@@ -351,7 +361,7 @@ validation — otherwise `mount-changed`/`is-symlink` (RT-FS-06).
 | `filesystem.mounts[].host` | validator (realpath, denylist, is-dir, not-symlink) **and again** at launch: the launch scan re-opens the root without following symlinks and compares `st_dev:st_ino`, pins are re-checked before `podman init`, and bind mounts are compared inside the container after `init` (ARCHITECTURE §3.5) | validate + launch | reject / `sandbox.refuse` / `sandbox.mount_mismatch` |
 | `filesystem.mounts[].guest` | validator (`/workspace/…`, no `..`, unique) | validate | reject |
 | `filesystem.mounts[].mode` | workspace `podman run` (`sallyd::sandbox::workspace_argv`): bind `ro`/`rw` with `nosuid,nodev,bind` (non-recursive); `brokered` → `ro` + broker `fs_*`; `staged` → `:O` overlay with upper/work in session scratch | launch + each `fs_*` call | EROFS in workspace; `fs_write`/`fs_delete` denied on `ro` and `staged` |
-| `filesystem.mounts[].approve` | `sallyd::approvals` glob match on canonical relative path; omitted = `["**"]` | each brokered write/delete | pending → approve/deny |
+| `filesystem.mounts[].approve` | validator (glob syntax, §1 Mount) + `sallyd::approvals` glob match on canonical relative path; omitted = `["**"]` | validate + each brokered write/delete | reject; pending → approve/deny |
 | git metadata (AMENDMENTS-02 B2(a)) | validator (no writable mount inside `.git`); `.git` directories in `rw` mounts as overlays over session scratch, `.git` files bound read-only (argv builder, Task 6a; launch scan, Task 6b); broker `fs_write`/`fs_delete` | validate + launch + each call | reject / EROFS / `protected-path` |
 | `filesystem.deny` | validator adds to denylist | validate | reject |
 | `network.mode` | `none` → no shim, no `net.sock`; `proxy` → shim started, `net.sock` mounted, proxy env set | launch | — |
@@ -365,12 +375,12 @@ validation — otherwise `mount-changed`/`is-symlink` (RT-FS-06).
 | `secrets[].expose_env` | validator (name rule) + workspace `--env NAME=sallyport-placeholder` | validate + launch | reject |
 | `tools.builtin` | `sallyd::tools` dispatch table per session | each `tools/call` on `agent.sock` | `isError: true`, `denied: <code>`, audit `tool.deny` |
 | `tools.shell` | `sallyd::tools::shell` → `podman exec` after policy | each shell call | deny / pending / run |
-| `tools.destructive_requires_approval` | pattern tagger in `tools::shell` | each shell call in `allow` mode | pending if tagged |
+| `tools.destructive_requires_approval` | pattern tagger in `tools::shell` (Task 11, #66), its verdict an input to `sallyd::approvals` | each shell call in `allow` mode | pending if tagged, or if no tagger ran |
 | `tools.fetch_writes` | `sallyd::tools::fetch` | each non-GET/HEAD fetch | pending if `approve` |
 | `tools.acknowledge_unapproved` | validator (`ack.rs`); launch audit `manifest.acknowledged_risk` | validate + launch | reject if needed and unset |
 | `tools.mcp[]` | env-name filter in validator; broker MCP gateway (M4) | validate + each relayed call | reject secret-like env; pending if `approve: always` |
 | `[data-can-leave]` | validator warning + `summary()` first line + UI | validate | warning (never blocks) |
-| `approvals.timeout/max_pending` | `sallyd::approvals` | each request | expire → deny; flood → auto-deny + `approval.flood` |
+| `approvals.timeout/max_pending` | `sallyd::approvals`; new prompts also limited to one per 2 s, burst `max_pending` (ARCHITECTURE §4.2) | each request | expire → deny; over either bound → `denied: approval-flood`, one `approval.deny` each + one `approval.flood` per episode |
 | `audit.level` | `sally-core::audit` filter | each event | — |
 | `policy.*` | parsed, ignored (v1) | — | — |
 

@@ -430,6 +430,15 @@ stream events. Errors use JSON-RPC codes plus `data.reason`. Every socket checks
 Until Task 12 fills the table, every method is `-32601` and recorded `rpc.deny {socket:
 control}`; no control method resolves on the session socket's table (a unit test holds that).
 
+**Approvals** (Task 10; `sallyd::approvals`). Only a host client on this socket answers; the
+session's tool handler holds the asking half (`Gate`) and never the answering half (`Desk`), and
+Task 12 serves `approvals.*` from the `Desk` with the client taken from `SO_PEERCRED` (#65).
+`approve` runs that one action once. `deny_all_session` needs a pending id (a stale one is
+`unknown-id` and sets nothing); it denies that request and every pending one, each with its own
+entry, and latches the session: every later prompt is denied `session-denied` unasked, while
+actions that need no approval still run. It cannot be undone. There is no "allow for this
+session". With no client attached, every prompt is denied `no-approver`.
+
 ### 4.2 `agent.sock` — untrusted client (the harness). **Method table is a strict allowlist.**
 
 The broker is an MCP server for tools only (Task 7; MCP specification 2026-07-28 and its schema,
@@ -444,8 +453,8 @@ hand-written in `sallyd::rpc`; no MCP SDK crate is in the TCB.
 | `notifications/initialized` | legacy only: ignored (recorded `rpc.request`) |
 | `ping` | legacy only: empty result |
 | `tools/list` | the session's tools with their JSON schemas; never a cursor (one is `-32602`) |
-| `tools/call` (`name`, `arguments`) | recorded `rpc.request` (the tool and the arguments' shape, never their values), then dispatched to the tool handler (Task 11; approvals Task 10), whose own entry carries the tool's fields of §4.3 before the effect (#62). Blocks until executed, denied or timed out (`approvals.timeout`); a denial is `isError: true` with text `denied: <code>`. Approval never round-trips through the sandbox |
-| `notifications/cancelled` (`requestId`, `reason?`) | both lifecycles: suppresses the reply of a matching in-flight call (recorded `rpc.cancel` first). The handler is never dropped by a cancel or a closed connection and keeps its slot until it returns (#54: Task 10 withdraws a pending approval); session teardown aborts it (after `STOP_GRACE`, 2 s, or at once when the listener handle is dropped), so a handler is safe to drop at any await (#62) |
+| `tools/call` (`name`, `arguments`) | recorded `rpc.request` (the tool and the arguments' shape, never their values), then dispatched with the broker's call number (unique in the session; the harness's id is only display text) to the gated handler: the executor (Task 11) builds the action that will run, the approvals gate admits it (policy; a prompt bound to the action's digest), and the executor runs only the resulting ticket, writing its effect entry first (#62). Blocks until executed, denied or timed out (`approvals.timeout`); a denial is `isError: true` with text `denied: <code>`; a call whose entry could not be written gets no reply. Approval never round-trips through the sandbox |
+| `notifications/cancelled` (`requestId`, `reason?`) | both lifecycles: suppresses the reply of a matching in-flight call (recorded `rpc.cancel` first) and withdraws a prompt it waits on (`approval.withdraw`); a closed connection withdraws its calls' prompts the same way. The handler is never dropped by a cancel or a closed connection and keeps its slot until it returns; session teardown aborts it (after `STOP_GRACE`, 2 s, or at once when the listener handle is dropped), so a handler is safe to drop at any await (#62) |
 
 Everything else → `-32601` + `rpc.deny`: resources, prompts, sampling, elicitation, roots,
 logging, subscriptions, tasks, and every control method. The server never sends a request of its
@@ -472,7 +481,11 @@ listener stops accepting at the cap), 16 `tools/call` in flight (the 17th is `-3
 `too-many-in-flight`, recorded first), a reused in-flight id `-32600`, and 20 requests read per
 second with a burst of 40. Over the rate the broker stops reading (backpressure): requests are
 slowed, never dropped unrecorded. A reply the peer does not take within 10 s closes the
-connection.
+connection. Prompts: at most `approvals.max_pending` wait at once, and new ones come at most one
+per 2 s with a burst of `max_pending` (`approvals::queue::REFILL`, tunable); a call over either
+bound is denied `approval-flood` with its own `approval.deny` entry, and each flood episode (until
+the queue is empty and the rate full again) writes one `approval.flood`. With 16 calls in flight
+at most, a `max_pending` above 16 is never reached.
 
 The `net.sock` stream channel is not JSON-RPC; it carries raw proxy connections from the shim.
 
@@ -577,16 +590,15 @@ sequenceDiagram
     participant D as sallyd
     participant U as user (UI/CLI)
     participant C as podman exec (Z3)
-    H->>D: tools.call shell {cmd:["rm","-rf","build/"]}
-    D->>D: manifest.tools.shell == approve → canonicalize → audit tool.pending
-    D-->>H: {status: pending, approval_id}
-    D-->>U: approval.requested {id, rendered (escaped), risk_tags:[destructive]}
-    U->>D: approvals.decide(id, approve)
-    D->>D: id single-use ✓, not expired ✓, args from *broker's* stored copy
-    D->>C: podman exec sp-agent-<id> rm -rf build/
+    H->>D: tools/call shell {cmd:["rm","-rf","build/"]} (blocks)
+    D->>D: call number n; action = argv as it will run; tools.shell == approve → audit tool.pending
+    D-->>U: approval.requested {id, action (escaped), digest, risk_tags}
+    U->>D: approvals.decide(id, approve) over control.sock
+    D->>D: id taken once ✓ → audit approval.decide {client} → ticket = the broker's own copy
+    D->>D: effect entry (Task 11, #62)
+    D->>C: podman exec … rm -rf build/ (from the ticket)
     C-->>D: exit code, stdout/err (capped)
-    D->>D: audit tool.executed
-    D-->>H: tools.result {approval_id, exit, output}
+    D-->>H: tools/call result {exit, output}
 ```
 
 ### 5.3 Egress with credential injection
@@ -820,9 +832,33 @@ sallyport/
     true, events, bytes, sha256, cut, peer_gone}` after a stream ends (a peer that is gone ends
     it at once); `{status: 502, reason:
     "backend-error"}` before a backend failure is answered.
-- **Approval rendering**: escape all C0/C1 controls and `\x1b`, strip Unicode bidi overrides
-  (U+202A–U+202E, U+2066–U+2069), NFC-normalize, cap at 2 000 chars with an explicit
-  `… (+N bytes, sha256 …)` tail. Paths shown as *host realpath* **and** guest path.
+- **Approval rendering** (`approvals::render`; architect ruling Q21, Task 10): the broker builds
+  the text from the action itself. Printable ASCII is shown as is except `\` (`\\`); every other
+  ASCII byte is `\xNN` and every other character `\u{…}`, so controls, ESC/CSI/OSC, bidi and
+  zero-width marks, combining marks and homoglyphs are all visible. Nothing is stripped or
+  normalized: what is shown is what runs (readable non-ASCII is M5, #67). argv elements and paths
+  are quoted (`"` escaped). The action is cut at 2 000 chars, never inside an escape, with an
+  explicit `… (+N bytes, sha256 …)` tail, and travels whole (`full`) for a reveal; a client must
+  not take "approve" on a cut prompt before showing the whole text. Paths are shown as *host
+  realpath* **and** guest path. Model text (a reason) is a separate one-line field, cut at 500
+  chars and labelled untrusted; it is never part of the action.
+- **Approval events** (Task 10; each before the effect, the prompt or the reply it covers; a
+  failed append runs nothing and answers nothing). Action fields are `{call, tool, action
+  (≤ 1 024 chars), action_sha256}`, where `action_sha256` is the digest the approval binds
+  (session, call number and every byte that runs):
+  - `tool.pending` (harness, `pending`): action fields, `id`, `note_bytes`/`note_sha256` (never
+    the note).
+  - `approval.decide` (user, `approve|deny|deny_all_session`): action fields, `id`, `client
+    {uid, pid}`, `via` (the id whose `deny_all_session` took it); `refuse` with `reason:
+    unknown-id` for an id that is not waiting.
+  - `approval.expire` (sallyd, `deny`): `{id, call, reason: timeout}`.
+  - `approval.withdraw` (harness for a cancel, sallyd for a closed connection; `deny`): `{id,
+    call, reason}`. A wait dropped by teardown leaves the queue at once with no entry.
+  - `approval.deny` (sallyd): action fields and `reason` (`approval-flood`, `session-denied`,
+    `no-approver`, `id-unavailable`).
+  - `approval.flood` (sallyd): `{max_pending}`, once per episode.
+  - `tool.deny` (sallyd): action fields (or `{call, tool}` when no action could be built) and
+    `code`.
 - **Audit entry**: `{seq, ts, session, actor: user|harness|sallyd, event, decision, args
   (redacted, ≤ 4 KiB), args_sha256, prev_hash, hash}` with `hash = sha256(prev_hash ||
   canonical_json(entry_without_hash))`; canonical JSON is compact with the fields in that order
@@ -861,14 +897,14 @@ upstream release binaries checked against committed SHA-256 sums):
 |---|---|
 | `rust` | `make fmt clippy forbid-unsafe nextest` (cargo-nextest, plus doctests) |
 | `deny` | `cargo deny check` for the workspace and `fuzz/` |
-| `coverage` | `make coverage`: cargo-llvm-cov, `sally-core` ≥ 90 % lines; every file under `sallyd/src/egress/` ≥ 85 % together (lib tests, `scripts/coverage-gate.sh`); approvals join when they exist |
+| `coverage` | `make coverage`: cargo-llvm-cov, `sally-core` ≥ 90 % lines; each of `sallyd/src/{egress,rpc,llm,approvals}/` ≥ 85 % over its files together (lib tests, `scripts/coverage-gate.sh`) |
 | `fuzz` | 60 s per cargo-fuzz target on a pinned nightly |
 | `zizmor` | GitHub Actions static analysis, offline, no findings at `low` or above |
 | `doctor-syntax` | `bash -n scripts/doctor.sh` |
 
 Nightly (`nightly.yml`): `make mutants`, cargo-mutants over the deny paths
-(`manifest::validate`, `paths`, `host`, `config` today; `approvals`, `tools::fs` as they land;
-the egress modules run in the wide job, `make mutants-wide-sallyd`) with a **zero-survivor gate**: a surviving mutant in a deny path is an untested
+(`manifest::validate`, `paths`, `host`, `config` today; `tools::fs` as it lands; the egress,
+rpc, llm and approvals modules run in the wide job, `make mutants-wide-sallyd`) with a **zero-survivor gate**: a surviving mutant in a deny path is an untested
 control. cargo-mutants runs with `TMPDIR` under `target/` because `/tmp` is denylisted.
 
 Dev-dependencies: `insta` (summary and diagnostic snapshots; review changes with

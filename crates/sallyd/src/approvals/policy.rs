@@ -95,7 +95,7 @@ impl Policy {
             Action::Mcp { .. } => None,
         };
         if builtin.is_some_and(|t| !self.builtin.contains(&t)) {
-            return Need::Deny("tool-not-granted");
+            return Need::Deny("tool_not_granted");
         }
         match action {
             Action::Shell { .. } => match self.shell {
@@ -287,16 +287,16 @@ mod tests {
     fn an_ungranted_tool_is_denied_before_anything_asks() {
         let mut p = policy();
         p.builtin.clear();
-        assert_eq!(need(&p, &shell()), Need::Deny("tool-not-granted"));
+        assert_eq!(need(&p, &shell()), Need::Deny("tool_not_granted"));
         assert_eq!(
             need(&p, &write("/workspace/all", "x")),
-            Need::Deny("tool-not-granted")
+            Need::Deny("tool_not_granted")
         );
         assert_eq!(
             need(&p, &delete("/workspace/all", "x")),
-            Need::Deny("tool-not-granted")
+            Need::Deny("tool_not_granted")
         );
-        assert_eq!(need(&p, &fetch("POST")), Need::Deny("tool-not-granted"));
+        assert_eq!(need(&p, &fetch("POST")), Need::Deny("tool_not_granted"));
         // MCP tools are granted by declaring the server, not by tools.builtin.
         assert_eq!(need(&p, &mcp("gh")), Need::Ask);
         // Granting one tool grants only it.
@@ -304,7 +304,7 @@ mod tests {
         assert_eq!(need(&p, &write("/workspace/all", "x")), Need::Ask);
         assert_eq!(
             need(&p, &delete("/workspace/all", "x")),
-            Need::Deny("tool-not-granted")
+            Need::Deny("tool_not_granted")
         );
     }
 

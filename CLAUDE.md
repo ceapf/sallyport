@@ -71,7 +71,7 @@ If a task seems to require breaking one of these, **stop and ask**. Do not imple
 2. Implement the minimum. 3. Refactor. 4. `make lint test`.
 - Every SI has at least one RT test. Every enforcement point in `MANIFEST_SPEC.md §3` has a unit test for allow *and* deny.
 - `make redteam` runs without a GPU (mock inference). `make redteam-gpu` and `make e2e-gpu` are local-only.
-- Coverage targets: `sally-core` ≥ 90% lines; `sallyd` policy/approvals/egress ≥ 85%; UI components ≥ 70%.
+- Coverage targets: `sally-core` ≥ 90% lines; `sallyd` ≥ 85% for each of its policy, approvals, egress, rpc and llm modules; UI components ≥ 70%.
 - Snapshot-test the `podman run` argv for each profile.
 
 ### Mutation scope ("zero survivors" means these files)
@@ -89,7 +89,7 @@ container-free tests run: unit tests, all of sally-core's `tests/`, `sallyd` `ar
   podman,disk,stage}.rs`, `sandbox/launch/error.rs`, `egress/{addr,authority,head,policy,server,
   hostaddrs,tunnel,net,ca,roots}.rs` (net.rs tests stay hermetic: nothing leaves the machine),
   `rpc/{agent,control,frame,json,listen,mcp,message,rate,record}.rs`,
-  `llm/{body,head,io,reply,server}.rs`;
+  `llm/{body,head,io,reply,server}.rs`, `approvals/{action,glob,handler,policy,queue,render}.rs`;
   sally-shim `args.rs`, `relay.rs`.
 
 ## Agent / model routing (ECC)

@@ -480,7 +480,7 @@ async fn a_refusal_that_cannot_be_written_sends_no_reply() {
     let out = h.call(0, "shell".to_owned(), Map::new()).await;
     assert_eq!(out.unwrap().text, "denied: bad-arguments");
     let out = h.call(1, "shell".to_owned(), ls()).await;
-    assert_eq!(out.unwrap().text, "denied: tool-not-granted");
+    assert_eq!(out.unwrap().text, "denied: tool_not_granted");
     // Not written: nothing is answered and nothing runs.
     let h = handler(true);
     assert_eq!(h.call(2, "nope".to_owned(), Map::new()).await, None);
