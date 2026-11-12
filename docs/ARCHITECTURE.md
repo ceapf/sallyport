@@ -812,7 +812,9 @@ sallyport/
   requests ends the tunnel (`closed`). When the upstream connection ends, a response in flight is
   still delivered whole, then the tunnel closes (`closed`) without waiting for the client; a
   request that arrives after the upstream closed is not forwarded and not counted: `egress.close
-  upstream-closed`, then 502 (9a-2 review R1).
+  upstream-closed`, then 502 (9a-2 review R1). A head that hyper refuses after the upstream ended
+  (too large, garbled, or stalled once started) is still audited and ends the tunnel `limit` or
+  `refused`, as it would with the upstream up (R1 amended, 9a-2 RQ1).
   - Request head rules, in order: (1) check as received — not `CONNECT`, HTTP/1.1, origin-form
     target only (absolute, authority and `*` forms are 400 `malformed`), exactly one `Host`,
     normalized like a CONNECT target and naming the CONNECT host (port omitted only when the

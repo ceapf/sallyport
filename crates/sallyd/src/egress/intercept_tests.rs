@@ -729,6 +729,85 @@ async fn a_request_for_a_closed_upstream_connection_is_not_audited_or_counted() 
     );
 }
 
+/// Architect ruling RQ1 (R1 amended): the upstream hangs up while the tunnel's first head is
+/// still arriving. hyper's graceful shutdown drops a partial head only after a finished exchange
+/// (`KA::Idle`), or when nothing is in its read buffer yet; a first head it holds part of is read
+/// to its end, and a head hyper refuses is still audited. `first` is sent and buffered, the
+/// upstream hangs up, then `rest` (if any) follows.
+async fn head_after_upstream_hangup(
+    head: Duration,
+    first: &str,
+    rest: Option<&str>,
+) -> (Rig, String) {
+    let hangup = Arc::new(tokio::sync::Notify::new());
+    let r = rig(Opts {
+        hangup: Some(Arc::clone(&hangup)),
+        limits: Limits {
+            head,
+            max_request: 16,
+            max_response: 16,
+            ..Limits::new(8)
+        },
+        ..Opts::default()
+    });
+    let (_, tls, task) = r.open(443).await;
+    let mut tls = tls.unwrap();
+    tls.write_all(first.as_bytes()).await.unwrap();
+    tls.flush().await.unwrap();
+    // Lets hyper buffer `first`: with an empty read buffer the hangup closes the tunnel unread.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    hangup.notify_one();
+    until("the upstream hangs up", || *r.ended.lock().unwrap() > 0).await;
+    // Lets the tunnel's select loop see the upstream connection end before the head does.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    if let Some(rest) = rest {
+        let _ = tls.write_all(rest.as_bytes()).await;
+        let _ = tls.shutdown().await;
+    }
+    let out = drain(&mut tls).await;
+    join(task).await;
+    assert!(r.seen().is_empty());
+    assert!(!r.sink.events().iter().any(|e| e == "egress.request"));
+    (r, out)
+}
+
+#[tokio::test]
+async fn an_oversized_head_after_the_upstream_hung_up_is_still_a_limit() {
+    let first = format!("GET /x HTTP/1.1\r\nHost: {HOST}\r\n");
+    let rest = format!("X-Big: {}\r\n\r\n", "a".repeat(9000));
+    let (r, _) = head_after_upstream_hangup(Duration::from_secs(30), &first, Some(&rest)).await;
+    assert_eq!(
+        r.sink.args("egress.limit")["reason"],
+        json!("head-too-large")
+    );
+    assert_eq!(r.sink.args("egress.close")["end"], json!("limit"));
+}
+
+#[tokio::test]
+async fn a_garbled_head_after_the_upstream_hung_up_is_still_refused() {
+    let first = format!("GET /x HTTP/1.1\r\nHost: {HOST}\r\n");
+    let (r, out) =
+        head_after_upstream_hangup(Duration::from_secs(30), &first, Some("no colon\r\n\r\n")).await;
+    let why = format!(
+        "{:?} {} {out:?}",
+        r.sink.events(),
+        r.sink.args("egress.close")
+    );
+    assert_eq!(
+        r.sink.args("egress.deny")["reason"],
+        json!("malformed"),
+        "{why}"
+    );
+    assert_eq!(r.sink.args("egress.close")["end"], json!("refused"));
+}
+
+#[tokio::test]
+async fn a_head_stalled_after_the_upstream_hung_up_is_still_a_limit() {
+    let (r, _) = head_after_upstream_hangup(Duration::from_secs(1), "GET /echo HT", None).await;
+    assert_eq!(r.sink.args("egress.limit")["reason"], json!("head-timeout"));
+    assert_eq!(r.sink.args("egress.close")["end"], json!("limit"));
+}
+
 /// A stop during the upstream TLS handshake ends the tunnel `session-stopped` at once, with no
 /// `200` and no reply (9a-2 review: the handshake was not raced against the stop).
 #[tokio::test]

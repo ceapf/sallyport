@@ -188,10 +188,12 @@ pub(super) struct Upstream {
     handler: Handler,
     seen: Arc<Mutex<Vec<String>>>,
     dials: Arc<Mutex<usize>>,
-    /// Upstream connections that saw the proxy's side end.
+    /// Upstream connections that saw the proxy's side end, or hung up themselves.
     ended: Arc<Mutex<usize>>,
     /// Never answers the TLS handshake.
     stall: bool,
+    /// When notified, closes (`close_notify`) without having read a request.
+    hangup: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl Upstream {
@@ -205,6 +207,12 @@ impl Upstream {
         else {
             return;
         };
+        if let Some(hangup) = &self.hangup {
+            hangup.notified().await;
+            let _ = tls.shutdown().await;
+            *self.ended.lock().unwrap() += 1;
+            return;
+        }
         let mut buf = Vec::new();
         while let Some(req) = read_request(&mut tls, &mut buf).await {
             self.seen.lock().unwrap().push(req.clone());
@@ -310,6 +318,7 @@ pub(super) struct Opts {
     pub(super) upstream_name: &'static str,
     pub(super) fail_on: Option<&'static str>,
     pub(super) stall: bool,
+    pub(super) hangup: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl Default for Opts {
@@ -326,6 +335,7 @@ impl Default for Opts {
             upstream_name: HOST,
             fail_on: None,
             stall: false,
+            hangup: None,
         }
     }
 }
@@ -358,6 +368,7 @@ pub(super) fn rig(o: Opts) -> Rig {
         dials: Arc::default(),
         ended: Arc::default(),
         stall: o.stall,
+        hangup: o.hangup,
     };
     let (seen, dials, ended) = (
         Arc::clone(&up.seen),

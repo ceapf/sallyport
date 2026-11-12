@@ -487,8 +487,9 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
     ///
     /// When the upstream connection ends (architect ruling R1), hyper's server finishes the
     /// response in flight, if any, then closes: the client learns from that close, not from a
-    /// `Connection: close` header, and the end is `st.end()` or `closed`, never served()'s refusal
-    /// mapping. A request already read gets the upstream-closed 502 in `forward`, unforwarded.
+    /// `Connection: close` header. A request already read gets the upstream-closed 502 in
+    /// `forward`, unforwarded. A head hyper refuses after the upstream ended is still audited and
+    /// ends `limit` or `refused` through [`Self::served`] (R1 amended, architect ruling RQ1).
     async fn exchanges<C, U>(
         &self,
         raw: Meter<C>,
@@ -524,10 +525,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         tokio::pin!(idle);
         loop {
             tokio::select! {
-                r = &mut served => return match conn {
-                    Some(_) => self.served(r, st).await,
-                    None => st.end().unwrap_or(End::Closed),
-                },
+                r = &mut served => return self.served(r, st).await,
                 _ = async { conn.as_mut()?.await.ok() }, if conn.is_some() => {
                     conn = None;
                     served.as_mut().graceful_shutdown();

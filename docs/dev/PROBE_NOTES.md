@@ -190,6 +190,13 @@ tests in `egress/intercept_tests.rs` where the behaviour matters to the proxy.
   connection future when it completes. (9a-2 rust re-review H1, reviewer's probe)
 - A response for which the server disabled keep-alive mid-exchange (`graceful_shutdown`) carries
   hyper's own `connection: close`, and a pipelined request behind it is never read. (9a-2 H1)
+- `graceful_shutdown` on the server keeps reading a head it holds part of only on the
+  connection's **first** request (`KA::Busy` until a head parses, `conn.rs`). It closes at once
+  when the keep-alive state is `Idle` (a partial head after a finished exchange is dropped) or
+  when nothing has reached hyper's read buffer yet (`dispatch.rs` `disable_keep_alive`, even if
+  bytes wait in the transport). A test of a head refused after the upstream ended must let hyper
+  buffer part of the first head before the upstream hangs up; `select!`'s random branch order
+  otherwise makes it pass or fail by chance (10 of 30). (9a-2 RQ1)
 
 ## Test writing
 
