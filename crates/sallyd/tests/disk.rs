@@ -166,6 +166,34 @@ fn a_launch_without_room_for_stage_size_above_the_floor_is_refused() {
     });
 }
 
+/// A launch is refused when the configured floor alone is above the free space (architect ruling
+/// on the D1 follow-up, Q2). The test above fails if `stage_size` does not reach admission, this
+/// one if the configured floor does not; their sum is unit-tested in
+/// `launch_needs_the_floor_plus_stage_size_and_kills_below_the_floor`. Both are 1 TiB away from
+/// admission, so no other process's freed space admits them and no disk-free lock is needed.
+/// Known limit: on a filesystem over 95 % full the default floor would refuse this launch too.
+#[test]
+fn a_launch_below_the_configured_floor_is_refused() {
+    let _serial = serial();
+    rt().block_on(async {
+        let x = Lx::with_floor(DiskFloor {
+            min_bytes: free_now().saturating_add(1 << 40),
+            percent: 0,
+        });
+        let v = x.f.load(&format!(
+            "{}runtime:\n  stage_size: 1MiB\n",
+            mounts(&[mount("~/code/other", "/workspace/o", "staged")])
+        ));
+        let e = x.launch(&v, "below-floor").await.unwrap_err();
+        assert!(matches!(e, LaunchError::DiskSpace(_)), "{e}");
+        assert_eq!(x.events.list(), ["sandbox.refuse"]);
+        assert_eq!(
+            x.events.args("sandbox.refuse").unwrap()["reason"],
+            "disk-floor"
+        );
+    });
+}
+
 /// The re-review's HIGH: renaming files in a loop, within a directory and across directories,
 /// does not hide data from `stage_size`. The walk runs on the frozen container.
 #[test]

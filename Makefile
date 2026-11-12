@@ -81,7 +81,10 @@ MUTANTS_FILES := crates/sally-core/src/manifest/validate/*.rs crates/sally-core/
 # test fixtures under its target dir) must live elsewhere. Move the fixtures, not the wall.
 # Every mutation run holds the per-user `disk-free` lock shared (scripts/disk-lock.sh, architect
 # ruling D1): its copies and builds move the free space the disk-floor tests measure, so those
-# tests wait for it, in either lane. Never add --test=disk to a mutants test list.
+# tests wait for it, in either lane. Never add --test=disk to a mutants test list. Run local
+# mutation runs only through these targets, with a file override (e.g. `make mutants-wide-sallyd
+# MUTANTS_WIDE_SALLYD=<file>`); never bare `cargo mutants`: it skips the disk-free lock and the
+# TMPDIR move.
 MUTANTS_TMP := $(CURDIR)/target/mutants-tmp
 DISK_LOCK := bash scripts/disk-lock.sh
 # The gate fails on missed mutants only; a timed-out mutant hangs a test, so it counts as

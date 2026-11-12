@@ -119,8 +119,17 @@ fn a_bounded_lock_fails_naming_the_lock_once_its_wait_runs_out() {
     rustix::fs::flock(&holder, rustix::fs::FlockOperation::LockShared).unwrap();
     let wait = std::time::Duration::from_millis(300);
     let started = std::time::Instant::now();
-    let err =
-        std::panic::catch_unwind(|| lock_exclusive_within(&path, wait, "a test")).unwrap_err();
+    // On a thread with an outer bound: a lock without its own bound fails here, never hangs.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let p = path.clone();
+    std::thread::spawn(move || {
+        let r = std::panic::catch_unwind(|| lock_exclusive_within(&p, wait, "a test"));
+        let _ = tx.send(r.map(drop));
+    });
+    let err = rx
+        .recv_timeout(10 * wait)
+        .expect("the bounded lock returned within its wait")
+        .unwrap_err();
     assert!(started.elapsed() >= wait);
     let msg = err.downcast_ref::<String>().cloned().unwrap_or_default();
     assert!(

@@ -153,7 +153,9 @@ pub const DISK_FREE_WAIT: std::time::Duration = std::time::Duration::from_secs(2
 /// The `disk-free` lock, exclusive. A local mutation run holds it shared for its whole length
 /// (`scripts/disk-lock.sh`): its tree copies and builds move the free space that the disk-floor
 /// writer tests set their floor against. Those tests take it exclusively, before the I/O lock.
-/// Past [`DISK_FREE_WAIT`] the test fails naming the lock.
+/// Past [`DISK_FREE_WAIT`] the test fails naming the lock. Back-to-back mutation runs in both
+/// lanes can starve it (shared holders win over a polling exclusive one); that ends in the same
+/// named failure, never a hang.
 pub fn disk_free_lock() -> std::fs::File {
     lock_exclusive_within(
         &lock_path("disk-free"),
