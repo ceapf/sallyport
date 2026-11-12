@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod approvals;
 pub mod egress;
 pub mod llm;
 pub mod rpc;
