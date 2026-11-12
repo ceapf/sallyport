@@ -7,3 +7,4 @@ pub mod authority;
 pub mod head;
 pub mod policy;
 pub mod server;
+pub mod tunnel;

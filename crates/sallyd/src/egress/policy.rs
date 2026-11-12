@@ -23,6 +23,8 @@ pub enum Reason {
     IpRangeDenied,
     /// The name did not resolve (or not in time).
     ResolveFailed,
+    /// Every pinned address refused the connection or did not answer in time.
+    ConnectFailed,
     /// Not a CONNECT request (v1 has no plain-HTTP forwarding).
     PlainHttpUnsupported,
     /// The host has a secret grant; served only once the token proxy exists (Task 9a).
@@ -47,6 +49,7 @@ impl Reason {
             Self::IpLiteral => "ip-literal",
             Self::IpRangeDenied => "ip-range-denied",
             Self::ResolveFailed => "resolve-failed",
+            Self::ConnectFailed => "connect-failed",
             Self::PlainHttpUnsupported => "plain-http-unsupported",
             Self::GrantHostUnavailable => "grant-host-unavailable",
             Self::TooManyConnections => "too-many-connections",
@@ -66,7 +69,7 @@ impl Reason {
             | Self::IpLiteral
             | Self::IpRangeDenied
             | Self::GrantHostUnavailable => 403,
-            Self::ResolveFailed => 502,
+            Self::ResolveFailed | Self::ConnectFailed => 502,
             Self::PlainHttpUnsupported => 405,
             Self::TooManyConnections => 429,
             Self::HeadTooLarge => 431,
@@ -226,6 +229,7 @@ mod tests {
             (IpLiteral, "ip-literal", 403, false),
             (IpRangeDenied, "ip-range-denied", 403, false),
             (ResolveFailed, "resolve-failed", 502, false),
+            (ConnectFailed, "connect-failed", 502, false),
             (PlainHttpUnsupported, "plain-http-unsupported", 405, false),
             (GrantHostUnavailable, "grant-host-unavailable", 403, false),
             (TooManyConnections, "too-many-connections", 429, true),
