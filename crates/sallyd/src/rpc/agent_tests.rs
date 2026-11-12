@@ -753,7 +753,8 @@ async fn a_peer_with_another_uid_is_refused_and_recorded() {
     let listener = tokio::net::UnixListener::bind(&path).unwrap();
     let (agent, fake, sink) = setup();
     let me = rustix::process::getuid().as_raw();
-    let h = Arc::clone(&agent).listen(listener, me.wrapping_add(1));
+    let (crash, _crashes) = crate::rpc::listen::CrashReporter::channel();
+    let h = Arc::clone(&agent).listen(listener, me.wrapping_add(1), crash);
     let mut s = UnixStream::connect(&path).await.unwrap();
     let msg = serde_json::to_vec(&call(1, "echo")).unwrap();
     let _ = s.write_all(&msg).await;
@@ -870,7 +871,8 @@ async fn session_teardown_drops_in_flight_calls() {
         let path = dir.join(format!("agent-{orderly}.sock"));
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         let (agent, fake, _) = setup();
-        let h = Arc::clone(&agent).listen(listener, me);
+        let (crash, _crashes) = crate::rpc::listen::CrashReporter::channel();
+        let h = Arc::clone(&agent).listen(listener, me, crash);
         let mut s = UnixStream::connect(&path).await.unwrap();
         let mut msg = serde_json::to_vec(&call(1, "block")).unwrap();
         msg.push(b'\n');

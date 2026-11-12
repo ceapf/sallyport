@@ -147,9 +147,15 @@ impl<T: ToolHandler> Agent<T> {
         }
     }
 
-    /// Serves `listener` (the session's `agent.sock`) for peers with `uid`.
-    pub fn listen(self: Arc<Self>, listener: tokio::net::UnixListener, uid: u32) -> listen::Handle {
-        listen::spawn(listener, self, MAX_CONNECTIONS, uid)
+    /// Serves `listener` (the session's `agent.sock`) for peers with `uid`; a panicking
+    /// connection is reported to the session's `crash` reporter.
+    pub fn listen(
+        self: Arc<Self>,
+        listener: tokio::net::UnixListener,
+        uid: u32,
+        crash: listen::CrashReporter,
+    ) -> listen::Handle {
+        listen::spawn(listener, self, MAX_CONNECTIONS, uid, "agent.sock", crash)
     }
 
     /// Serves one stream to its end.

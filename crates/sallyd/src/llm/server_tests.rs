@@ -597,7 +597,8 @@ async fn a_peer_with_another_uid_is_refused_and_recorded() {
     let listener = tokio::net::UnixListener::bind(&path).unwrap();
     let (llm, _, sink) = setup();
     let me = rustix::process::getuid().as_raw();
-    let h = Arc::clone(&llm).listen(listener, me.wrapping_add(1));
+    let (crash, _crashes) = crate::rpc::listen::CrashReporter::channel();
+    let h = Arc::clone(&llm).listen(listener, me.wrapping_add(1), crash);
     let mut s = UnixStream::connect(&path).await.unwrap();
     let _ = s.write_all(b"GET /v1/models HTTP/1.1\r\n\r\n").await;
     let mut out = Vec::new();

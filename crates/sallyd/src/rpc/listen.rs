@@ -13,6 +13,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
+pub use crate::daemon::crash::CrashReporter;
+
 /// Time the accept loop waits after a failed accept (EMFILE and similar).
 pub const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 /// Time [`Handle::shutdown`] waits for open connections to finish after stop.
@@ -66,8 +68,16 @@ impl Drop for Handle {
 }
 
 /// Runs the accept loop of `listener` for `server`: one task per connection, at most `max` at
-/// once, each checked against `uid` before the server sees it.
-pub fn spawn<S: Server>(listener: UnixListener, server: Arc<S>, max: usize, uid: u32) -> Handle {
+/// once, each checked against `uid` before the server sees it. A connection task that panics is
+/// reported to `crash` as `task` (architect Q47); the session's registry then ends the session.
+pub fn spawn<S: Server>(
+    listener: UnixListener,
+    server: Arc<S>,
+    max: usize,
+    uid: u32,
+    task: &'static str,
+    crash: CrashReporter,
+) -> Handle {
     let (stop, stopping) = watch::channel(false);
     let slots = Arc::new(Semaphore::new(max.min(Semaphore::MAX_PERMITS)));
     let task = tokio::spawn(async move {
@@ -78,7 +88,11 @@ pub fn spawn<S: Server>(listener: UnixListener, server: Arc<S>, max: usize, uid:
             tokio::select! {
                 biased;
                 () = &mut stopped => break,
-                Some(_) = conns.join_next(), if !conns.is_empty() => {}
+                Some(r) = conns.join_next(), if !conns.is_empty() => {
+                    if let Err(e) = r {
+                        crash.joined(task, e);
+                    }
+                }
                 admitted = admit(&slots, &listener) => match admitted {
                     Ok((slot, stream)) => {
                         let s = Arc::clone(&server);
@@ -96,7 +110,11 @@ pub fn spawn<S: Server>(listener: UnixListener, server: Arc<S>, max: usize, uid:
         }
         drop(listener);
         server.stop();
-        while conns.join_next().await.is_some() {}
+        while let Some(r) = conns.join_next().await {
+            if let Err(e) = r {
+                crash.joined(task, e);
+            }
+        }
     });
     Handle {
         stop,
@@ -211,6 +229,11 @@ mod tests {
         (c, ok)
     }
 
+    /// The loop with a crash reporter nobody reads (the tests below check no crash).
+    fn spawn<S: Server>(l: UnixListener, s: Arc<S>, max: usize, uid: u32) -> Handle {
+        super::spawn(l, s, max, uid, "test", CrashReporter::channel().0)
+    }
+
     #[tokio::test]
     async fn the_owner_is_served() {
         let (d, l) = listener();
@@ -264,6 +287,54 @@ mod tests {
         .unwrap();
         assert_eq!(p.peak.load(Ordering::SeqCst), 2);
         h.shutdown().await;
+    }
+
+    /// A server that panics on every connection.
+    struct Bomb;
+
+    impl Server for Bomb {
+        async fn serve(self: Arc<Self>, _: UnixStream) {
+            panic!("handler bug");
+        }
+        async fn refuse_peer(self: Arc<Self>, _: Option<u32>) {}
+        fn stop(&self) {}
+    }
+
+    /// Architect Q47: a connection task's panic reaches the session's crash reporter, named
+    /// after the socket; the loop keeps accepting until the registry stops it.
+    #[tokio::test]
+    async fn a_panicking_connection_is_reported_as_a_crash() {
+        let (d, l) = listener();
+        let (crash, mut crashes) = CrashReporter::channel();
+        let h = super::spawn(l, Arc::new(Bomb), 4, me(), "agent.sock", crash);
+        let path = d.path().join("s.sock");
+        let _c = UnixStream::connect(&path).await.unwrap();
+        let c = tokio::time::timeout(Duration::from_secs(5), crashes.recv())
+            .await
+            .expect("no crash reported")
+            .unwrap();
+        assert_eq!(c.task, "agent.sock");
+        assert_eq!(c.payload, "handler bug");
+        assert!(UnixStream::connect(&path).await.is_ok());
+        h.shutdown().await;
+    }
+
+    /// An ended or aborted connection is no crash.
+    #[tokio::test]
+    async fn an_ordinary_end_is_not_a_crash() {
+        let (d, l) = listener();
+        let (crash, mut crashes) = CrashReporter::channel();
+        let p = Arc::new(Probe::default());
+        let h = super::spawn(l, Arc::clone(&p), 4, me(), "agent.sock", crash);
+        let (c, ok) = echo(&d.path().join("s.sock")).await;
+        assert!(ok);
+        drop(c);
+        let (_live, _) = echo(&d.path().join("s.sock")).await;
+        drop(h);
+        let got = tokio::time::timeout(Duration::from_secs(5), crashes.recv())
+            .await
+            .expect("the reporter outlived the loop");
+        assert_eq!(got, None);
     }
 
     #[tokio::test]

@@ -135,9 +135,15 @@ impl<B: Backend> Llm<B> {
         }
     }
 
-    /// Serves `listener` (the session's `llm.sock`) for peers with `uid`.
-    pub fn listen(self: Arc<Self>, listener: tokio::net::UnixListener, uid: u32) -> listen::Handle {
-        listen::spawn(listener, self, MAX_CONNECTIONS, uid)
+    /// Serves `listener` (the session's `llm.sock`) for peers with `uid`; a panicking connection
+    /// is reported to the session's `crash` reporter.
+    pub fn listen(
+        self: Arc<Self>,
+        listener: tokio::net::UnixListener,
+        uid: u32,
+        crash: listen::CrashReporter,
+    ) -> listen::Handle {
+        listen::spawn(listener, self, MAX_CONNECTIONS, uid, "llm.sock", crash)
     }
 
     /// Serves one connection to its end, or until the server stops.
