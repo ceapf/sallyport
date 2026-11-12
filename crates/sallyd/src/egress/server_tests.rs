@@ -555,9 +555,19 @@ async fn stopping_while_dialling_writes_a_close_without_a_reply() {
     let proxy = Arc::clone(&rig.proxy);
     let task = tokio::spawn(async move { proxy.serve(server).await });
     client.write_all(&connect("a.mock.test:443")).await.unwrap();
-    while rig.dials().is_empty() {
-        // The dial hangs until the stop, so a finished task means the CONNECT was refused.
-        assert!(!task.is_finished(), "refused before the dial");
+    // The dial hangs until the stop, so any entry but `egress.allow`, or a finished task, means
+    // the CONNECT was refused. Not the task alone: a refused connection drains first (#71), and
+    // the paused clock never runs out its drain while this loop keeps the runtime busy. Capped,
+    // so a mutant that never dials fails here instead of hanging.
+    for spins in 0.. {
+        if !rig.dials().is_empty() {
+            break;
+        }
+        let refused = rig.sink.events().iter().any(|e| e != "egress.allow");
+        assert!(
+            !task.is_finished() && !refused && spins < 100_000,
+            "refused before the dial"
+        );
         tokio::task::yield_now().await;
     }
     rig.proxy.stop();
