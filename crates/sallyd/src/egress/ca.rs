@@ -60,6 +60,9 @@ pub enum CaError {
     /// Certificate generation failed.
     #[error("session CA: {0}")]
     Generate(String),
+    /// The leaves and the credentials name different hosts (Task 9a-3, architect D10).
+    #[error("session CA: the leaves and the credentials name different hosts")]
+    Unmatched,
 }
 
 impl From<rcgen::Error> for CaError {

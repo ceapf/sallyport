@@ -3,6 +3,7 @@
 use sally_core::audit::AuditError;
 
 use super::Running;
+use crate::egress::inject::CredentialsError;
 use crate::egress::net::EgressError;
 use crate::sandbox::dirs::DirError;
 use crate::sandbox::inside::Mismatch;
@@ -95,6 +96,19 @@ impl LaunchError {
             Self::Egress(EgressError::Listener(_)) => "egress-listener",
             Self::Egress(EgressError::Roots(_)) => "trust-roots",
             Self::Egress(EgressError::Ca(_) | EgressError::Files(_)) => "session-ca",
+            Self::Egress(EgressError::Store(_)) => "secret-store",
+            Self::Egress(EgressError::Credentials(CredentialsError::Missing(_))) => {
+                "secret-missing"
+            }
+            Self::Egress(EgressError::Credentials(CredentialsError::Basic(_))) => {
+                "basic-unsupported"
+            }
+            Self::Egress(EgressError::Credentials(
+                CredentialsError::Format(_)
+                | CredentialsError::Duplicate { .. }
+                | CredentialsError::Header(_)
+                | CredentialsError::TooLong(_),
+            )) => "secret-grant",
         }
     }
 }

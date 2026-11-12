@@ -87,8 +87,9 @@ container-free tests run: unit tests, all of sally-core's `tests/`, `sallyd` `ar
   summary,units}.rs`, `secrets/{store,secret}.rs`, `audit/{entry,redact,verify,writer,layout}.rs`,
   `fsutil.rs`, `fd.rs`; sallyd `sandbox/{argv,check,types,profiles,overlap,scan,images,changes,dirs,
   podman,disk,stage}.rs`, `sandbox/launch/error.rs`, `egress/{addr,authority,head,policy,server,
-  hostaddrs,tunnel,net,ca,roots,rewrite,intercept,intercept_tls,meter}.rs` (net.rs tests stay
-  hermetic: nothing leaves the machine), `rpc/{agent,control,frame,json,listen,mcp,message,rate,record}.rs`,
+  hostaddrs,tunnel,net,ca,roots,rewrite,intercept,intercept_tls,meter,inject,redact}.rs` (net.rs
+  tests stay hermetic: nothing leaves the machine),
+  `rpc/{agent,control,frame,json,listen,mcp,message,rate,record}.rs`,
   `llm/{body,head,io,reply,server}.rs`, `approvals/{action,glob,handler,policy,queue,render}.rs`,
   `tools/{args,path,tag,fs,shell,procs,mod,dac}.rs`; sally-shim `args.rs`, `relay.rs`.
 

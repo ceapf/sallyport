@@ -1,4 +1,5 @@
-//! [`EgressStarter::prepare`]: the session CA, its files and the trust roots (Task 9a-1).
+//! [`EgressStarter::prepare`]: the session CA, its files and the trust roots (Task 9a-1), and
+//! the credentials from the secrets store (Task 9a-3).
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
 use std::os::unix::fs::PermissionsExt;
@@ -8,6 +9,7 @@ use sally_core::audit::NewEntry;
 use sally_core::manifest::{AuditLevel, parse_host_pattern};
 
 use super::super::ca::{BUNDLE_FILE, CA_FILE, GRACE};
+use super::super::inject::StoreFile;
 use super::super::policy::{Grant, Rule};
 use super::super::server::{Dialer, HostAddrs, Resolver};
 use super::*;
@@ -92,16 +94,60 @@ fn roots_file(dir: &Path) -> (BundleFiles, String) {
     (files, pem)
 }
 
-fn starter(roots: BundleFiles) -> Egress<Nothing, Nothing, Nothing> {
+/// The value grant `i` holds in the test store, assembled at runtime.
+fn value(i: usize) -> String {
+    format!("store-{i}-{}", "s".repeat(24))
+}
+
+/// A 0600 secrets store in `dir/store/` holding `G0` .. `G{n-1}` (the production format and
+/// checks).
+fn store(dir: &Path, n: usize) -> PathBuf {
+    let sub = dir.join("store");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = sub.join("secrets.toml");
+    let mut s = sally_core::secrets::SecretStore::empty(path.clone());
+    for i in 0..n {
+        s.set(&format!("G{i}"), value(i)).unwrap();
+    }
+    s.save().unwrap();
+    path
+}
+
+/// The production starter over `roots` and the secrets store at `secrets`.
+fn starter_with(roots: BundleFiles, secrets: PathBuf) -> Egress<Nothing, Nothing, Nothing> {
     Egress {
         resolver: Arc::new(Nothing),
         dialer: Arc::new(Nothing),
         host: Arc::new(Nothing),
         roots,
+        secrets: Arc::new(StoreFile { path: secrets }),
+    }
+}
+
+/// A starter whose store in `dir` holds a value for each of the first eight grants.
+fn starter(dir: &Path, roots: BundleFiles) -> Egress<Nothing, Nothing, Nothing> {
+    starter_with(roots, store(dir, 8))
+}
+
+/// Grant `i` of `grants`: secret `G{i}`, header `X-Key-{i}`, `Bearer {value}`.
+fn spec(i: usize, host: &str) -> Spec {
+    Spec {
+        name: format!("G{i}"),
+        host: host.to_owned(),
+        header: format!("X-Key-{i}"),
+        format: "Bearer {value}".into(),
     }
 }
 
 fn session(ca: bool, grants: &[&str]) -> SessionEgress {
+    session_of(
+        ca,
+        grants.iter().enumerate().map(|(i, h)| spec(i, h)).collect(),
+    )
+}
+
+fn session_of(ca: bool, specs: Vec<Spec>) -> SessionEgress {
     let rule = Rule {
         host: parse_host_pattern("*.mock.test").unwrap(),
         ports: vec![443],
@@ -109,11 +155,11 @@ fn session(ca: bool, grants: &[&str]) -> SessionEgress {
     SessionEgress {
         policy: Policy::new(
             vec![rule],
-            grants
+            specs
                 .iter()
                 .map(|g| Grant {
-                    host: (*g).to_owned(),
-                    header: "Authorization".to_owned(),
+                    host: g.host.clone(),
+                    header: g.header.clone(),
                 })
                 .collect(),
         ),
@@ -124,6 +170,7 @@ fn session(ca: bool, grants: &[&str]) -> SessionEgress {
         audit: Arc::new(Sink),
         ca,
         timeout: Duration::from_secs(3600),
+        grants: specs,
         interception: None,
     }
 }
@@ -144,7 +191,13 @@ fn a_session_without_a_ca_passes_through_and_nothing_is_read_or_written() {
         paths: vec![dir.join("no-roots.pem")],
         owner: 0,
     };
-    let s = starter(missing).prepare(&dir, session(false, &[])).unwrap();
+    // A store the starter would refuse (0644): a session without a CA never opens it.
+    let st = scratch("none-store");
+    let path = store(&st, 1);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let s = starter_with(missing, path)
+        .prepare(&dir, session(false, &[]))
+        .unwrap();
     assert!(s.interception.is_none());
     assert!(entries(&dir).is_empty());
 }
@@ -160,10 +213,24 @@ fn a_session_with_a_ca_gets_its_files_leaves_and_roots() {
         .unwrap()
         .as_secs();
     let grants = ["b.mock.test", "a.mock.test", "b.mock.test"];
-    let s = starter(roots).prepare(&ws, session(true, &grants)).unwrap();
+    let s = starter(&dir, roots)
+        .prepare(&ws, session(true, &grants))
+        .unwrap();
     let i = s.interception.as_ref().unwrap();
     let hosts: Vec<&str> = i.tls.leaves.iter().map(|l| l.host.as_str()).collect();
     assert_eq!(hosts, ["a.mock.test", "b.mock.test"]);
+    // Task 9a-3: the credentials hold each grant's value from the store, and nothing more.
+    let c = i.credentials();
+    assert_eq!(c.hosts(), ["b.mock.test", "a.mock.test"]);
+    assert_eq!(c.names("b.mock.test"), ["secret:G0", "secret:G2"]);
+    let mut h = hyper::http::HeaderMap::new();
+    c.set("a.mock.test", &mut h);
+    assert_eq!(
+        h.get("x-key-1").unwrap(),
+        format!("Bearer {}", value(1)).as_str()
+    );
+    assert_eq!(c.redaction().scan(value(2).as_bytes()).1, Some(0));
+    assert_eq!(c.redaction().scan(value(3).as_bytes()).1, None);
     assert_eq!(i.roots.store.len(), 1);
     assert_eq!(i.roots.pem, root_pem);
     let v = i.tls.validity;
@@ -190,12 +257,143 @@ fn without_trust_roots_the_session_is_refused_before_anything_is_written() {
         paths: vec![dir.join("no-roots.pem")],
         owner: 0,
     };
-    let e = starter(missing)
+    let st = scratch("noroots-store");
+    let e = starter(&st, missing)
         .prepare(&dir, session(true, &["a.mock.test"]))
         .err()
         .unwrap();
     assert!(matches!(e, EgressError::Roots(_)), "{e}");
     assert!(entries(&dir).is_empty());
+}
+
+/// Architect D7 (MANIFEST_SPEC §3 `secrets[].name`): a grant whose secret left the store refuses
+/// the session by name, before the trust roots are read or anything is written.
+#[test]
+fn a_secret_missing_from_the_store_refuses_the_session_before_anything_else() {
+    let dir = scratch("missing");
+    let missing_roots = BundleFiles {
+        paths: vec![dir.join("no-roots.pem")],
+        owner: 0,
+    };
+    let st = scratch("missing-store");
+    let e = starter_with(missing_roots, store(&st, 1))
+        .prepare(&dir, session(true, &["a.mock.test", "b.mock.test"]))
+        .err()
+        .unwrap();
+    assert!(
+        matches!(&e, EgressError::Credentials(CredentialsError::Missing(n)) if n == "G1"),
+        "{e}"
+    );
+    assert!(entries(&dir).is_empty());
+    // Allow: with both values in the store the same session passes this step.
+    let (roots, _) = roots_file(&st);
+    let ws = dir.join("ws");
+    std::fs::create_dir(&ws).unwrap();
+    assert!(
+        starter_with(roots, store(&st, 2))
+            .prepare(&ws, session(true, &["a.mock.test", "b.mock.test"]))
+            .is_ok()
+    );
+}
+
+/// Architect D7: a store that cannot be read (here: mode 0644) refuses the session.
+#[test]
+fn an_unreadable_store_refuses_the_session() {
+    let dir = scratch("badstore");
+    let path = store(&dir, 1);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let (roots, _) = roots_file(&dir);
+    let ws = dir.join("ws");
+    std::fs::create_dir(&ws).unwrap();
+    let e = starter_with(roots, path)
+        .prepare(&ws, session(true, &["a.mock.test"]))
+        .err()
+        .unwrap();
+    assert!(matches!(e, EgressError::Store(_)), "{e}");
+    assert!(!e.to_string().contains(&value(0)));
+    assert!(entries(&ws).is_empty());
+}
+
+/// Architect D11: a `{basic}` grant refuses the session before the store is opened (here the
+/// store is unreadable, so opening it would fail differently).
+#[test]
+fn a_basic_grant_is_refused_before_the_store_is_opened() {
+    let dir = scratch("basic");
+    let path = store(&dir, 2);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let (roots, _) = roots_file(&dir);
+    let mut specs = vec![spec(0, "a.mock.test"), spec(1, "b.mock.test")];
+    specs[1].format = "Basic {basic}".into();
+    let e = starter_with(roots, path)
+        .prepare(&dir, session_of(true, specs))
+        .err()
+        .unwrap();
+    assert!(
+        matches!(&e, EgressError::Credentials(CredentialsError::Basic(n)) if n == "G1"),
+        "{e}"
+    );
+}
+
+/// Decision 5 (architect D8): the credentials live with the session's proxy and are gone (their
+/// `Secret`s wiped on drop) once the listener has shut down.
+#[tokio::test]
+async fn the_credentials_are_dropped_when_the_session_listener_shuts_down() {
+    let dir = scratch("weak");
+    let (roots, _) = roots_file(&dir);
+    let s = starter(&dir, roots)
+        .prepare(&dir, session(true, &["a.mock.test"]))
+        .unwrap();
+    let weak = Arc::downgrade(s.interception.as_ref().unwrap().credentials());
+    let sock = dir.join("n.sock");
+    let (roots, _) = roots_file(&dir);
+    let handle = starter(&dir, roots).start(&sock, s).unwrap();
+    assert!(weak.upgrade().is_some(), "held while the session runs");
+    handle.shutdown().await;
+    assert!(
+        weak.upgrade().is_none(),
+        "the credentials outlived the session"
+    );
+}
+
+/// Each secret is asked for once, whatever the number of its grants, and only the grants'.
+#[test]
+fn the_source_is_asked_for_the_grants_names_once_each() {
+    #[derive(Debug, Default)]
+    struct Asked(std::sync::Mutex<Vec<Vec<String>>>);
+    impl SecretSource for Asked {
+        fn load(
+            &self,
+            names: &[String],
+        ) -> Result<
+            Vec<(String, sally_core::secrets::Secret<String>)>,
+            sally_core::secrets::SecretsError,
+        > {
+            self.0.lock().unwrap().push(names.to_vec());
+            Ok(names
+                .iter()
+                .map(|n| {
+                    (
+                        n.clone(),
+                        sally_core::secrets::Secret::new(format!("{n}-{}", "q".repeat(20))),
+                    )
+                })
+                .collect())
+        }
+    }
+    let dir = scratch("asked");
+    let (roots, _) = roots_file(&dir);
+    let asked = Arc::new(Asked::default());
+    let starter = Egress {
+        resolver: Arc::new(Nothing),
+        dialer: Arc::new(Nothing),
+        host: Arc::new(Nothing),
+        roots,
+        secrets: Arc::clone(&asked) as Arc<dyn SecretSource>,
+    };
+    let mut specs = vec![spec(0, "a.mock.test"), spec(1, "b.mock.test")];
+    specs[1].name = "G0".into();
+    starter.prepare(&dir, session_of(true, specs)).unwrap();
+    assert_eq!(*asked.0.lock().unwrap(), [vec!["G0".to_owned()]]);
 }
 
 #[test]
@@ -205,7 +403,7 @@ fn a_planted_file_refuses_the_session() {
     std::fs::create_dir(&ws).unwrap();
     std::fs::write(ws.join(CA_FILE), "planted").unwrap();
     let (roots, _) = roots_file(&dir);
-    let e = starter(roots)
+    let e = starter(&dir, roots)
         .prepare(&ws, session(true, &["a.mock.test"]))
         .err()
         .unwrap();
@@ -222,7 +420,7 @@ fn a_session_flagged_for_a_ca_without_grant_hosts_is_refused() {
     let ws = dir.join("ws");
     std::fs::create_dir(&ws).unwrap();
     let (roots, _) = roots_file(&dir);
-    let e = starter(roots)
+    let e = starter(&dir, roots)
         .prepare(&ws, session(true, &[]))
         .err()
         .unwrap();

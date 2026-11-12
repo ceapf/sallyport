@@ -96,6 +96,8 @@ fn hop_by_hop_proxy_and_encoding_headers_are_dropped() {
         ("expect", "100-continue"),
         ("accept-encoding", "gzip"),
         ("content-length", "3"),
+        ("range", "bytes=0-3"),
+        ("if-range", "\"etag\""),
         ("x-kept", "1"),
     ])
     .unwrap();
@@ -290,8 +292,6 @@ fn identity_responses_pass_without_hop_by_hop_headers() {
     chunked.extend_from_slice(&HOP_BY_HOP);
     let out = response(StatusCode::FOUND, &heads(&chunked)).unwrap();
     assert_eq!(names(&out), ["content-type", "location"]);
-    let identity = heads(&[("content-encoding", "Identity")]);
-    assert!(response(StatusCode::OK, &identity).is_ok());
 }
 
 /// Architect ruling R4 (9a-2 review): a response framed two ways, or with two lengths, is
@@ -328,8 +328,12 @@ fn encoded_or_upgraded_responses_are_refused() {
         response(StatusCode::SWITCHING_PROTOCOLS, &HeaderMap::new()),
         Err(Reason::UpstreamEncoded)
     );
-    let bad: [&[(&str, &str)]; 6] = [
+    // Task 9a-3 (decision 1, architect D6): any Content-Encoding at all, even `identity`.
+    let bad: [&[(&str, &str)]; 9] = [
         &[("content-encoding", "gzip")],
+        &[("content-encoding", "identity")],
+        &[("content-encoding", "Identity")],
+        &[("content-encoding", "")],
         &[("content-encoding", "identity, gzip")],
         &[
             ("content-encoding", "identity"),

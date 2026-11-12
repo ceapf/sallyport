@@ -164,6 +164,219 @@ fn a_run_crossing_an_emit_boundary_keeps_its_label_offset() {
 }
 
 #[test]
+fn a_scan_reports_the_first_covered_byte_even_when_the_filler_matches_it() {
+    let r = redaction(&[("A", &["[REDsecret"])]);
+    // The first three filler bytes equal the original ones; the scan still reports them.
+    assert_eq!(r.scan(b"ab[REDsecret"), (b"ab[REDACTED:".to_vec(), Some(2)));
+    assert_eq!(r.scan(b"nothing here"), (b"nothing here".to_vec(), None));
+    let mut s = r.stream();
+    let _ = s.push(b"0123456789");
+    let _ = s.push(b"[REDsecret");
+    let _ = s.finish();
+    assert_eq!(s.first_covered(), Some(10));
+}
+
+/// A body over a vector of frames, with a size hint of what is left.
+struct Frames(Vec<Result<Frame<Bytes>, BoxError>>);
+
+impl Body for Frames {
+    type Data = Bytes;
+    type Error = BoxError;
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        let v = &mut self.get_mut().0;
+        Poll::Ready(if v.is_empty() {
+            None
+        } else {
+            Some(v.remove(0))
+        })
+    }
+    fn is_end_stream(&self) -> bool {
+        self.0.is_empty()
+    }
+    fn size_hint(&self) -> SizeHint {
+        let n: usize = self
+            .0
+            .iter()
+            .filter_map(|f| f.as_ref().ok()?.data_ref().map(Bytes::len))
+            .sum();
+        SizeHint::with_exact(n as u64)
+    }
+}
+
+fn data(s: &str) -> Result<Frame<Bytes>, BoxError> {
+    Ok(Frame::data(Bytes::from(s.to_owned())))
+}
+
+/// Polls `b` to its end: each frame's bytes, or the error's text.
+fn drain(mut b: Redacted<Frames>) -> (Vec<String>, Option<String>) {
+    let waker = std::task::Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    let mut out = Vec::new();
+    loop {
+        match Pin::new(&mut b).poll_frame(&mut cx) {
+            Poll::Ready(Some(Ok(f))) => out.push(text(&f.into_data().unwrap())),
+            Poll::Ready(Some(Err(e))) => {
+                assert!(b.is_end_stream());
+                return (out, Some(e.to_string()));
+            }
+            Poll::Ready(None) => {
+                assert!(b.is_end_stream());
+                assert_eq!(b.size_hint().exact(), Some(0));
+                return (out, None);
+            }
+            Poll::Pending => unreachable!("frames are always ready"),
+        }
+    }
+}
+
+#[test]
+fn a_redacted_body_streams_holds_back_and_flushes_at_its_end() {
+    let r = redaction(&[("A", &["0123456789"])]);
+    let frames = vec![data("abcdef01234"), data("56789xyz")];
+    let b = Redacted::new(Frames(frames), &r);
+    assert!(!b.is_end_stream());
+    assert_eq!(b.size_hint().exact(), Some(19));
+    let (out, err) = drain(b);
+    assert_eq!(err, None);
+    // 11 bytes in, 9 held: "ab"; then 17 held, 9 kept: "cdef[RED"; then the rest at the end.
+    assert_eq!(out, ["ab", "cdef[RED", "ACTED:xyz"]);
+}
+
+#[test]
+fn a_redacted_body_counts_held_bytes_in_its_size_hint() {
+    let r = redaction(&[("A", &["0123456789"])]);
+    let mut b = Redacted::new(Frames(vec![data("abcdef"), data("ghij")]), &r);
+    let waker = std::task::Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    // The first frame is all held: the body polls on to the second, which emits one byte.
+    let f = Pin::new(&mut b).poll_frame(&mut cx);
+    assert!(matches!(f, Poll::Ready(Some(Ok(_)))));
+    assert_eq!(b.stream.held(), 9);
+    assert_eq!(b.size_hint().exact(), Some(9));
+    let mut lower_only = SizeHint::new();
+    lower_only.set_lower(3);
+    assert_eq!(lower_only.upper(), None);
+}
+
+#[test]
+fn a_redacted_body_drops_trailers_and_discards_held_bytes_on_an_error() {
+    let r = redaction(&[("A", &["0123456789"])]);
+    let mut trailers = hyper::HeaderMap::new();
+    trailers.insert("x-t", "0123456789".parse().unwrap());
+    let frames = vec![
+        data("abcdefghij"),
+        Ok(Frame::trailers(trailers)),
+        Err("cut".into()),
+        data("never"),
+    ];
+    let (out, err) = drain(Redacted::new(Frames(frames), &r));
+    assert_eq!(out, ["a"]);
+    assert_eq!(err.as_deref(), Some("cut"));
+}
+
+#[test]
+fn an_empty_body_is_at_its_end_before_it_is_polled() {
+    let r = redaction(&[("A", &["0123456789"])]);
+    let b = Redacted::new(Frames(vec![]), &r);
+    assert!(b.is_end_stream());
+    assert_eq!(b.size_hint().exact(), Some(0));
+    // An ended inner body with bytes still held is not at its end.
+    let mut b = Redacted::new(Frames(vec![data("0123")]), &r);
+    let waker = std::task::Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    let _ = Pin::new(&mut b.inner).poll_frame(&mut cx);
+    let _ = b.stream.push(b"0123");
+    assert!(b.inner.is_end_stream());
+    assert!(!b.is_end_stream());
+    assert_eq!(b.size_hint().exact(), Some(4));
+}
+
+#[test]
+fn a_redacted_body_of_held_bytes_only_ends_with_them() {
+    let r = redaction(&[("A", &["0123456789"])]);
+    let (out, err) = drain(Redacted::new(Frames(vec![data("0123")]), &r));
+    assert_eq!((out, err), (vec!["0123".to_owned()], None));
+    let (out, err) = drain(Redacted::new(Frames(vec![]), &r));
+    assert_eq!((out, err), (Vec::<String>::new(), None));
+}
+
+#[test]
+fn a_discarded_stream_holds_nothing() {
+    let r = redaction(&[("A", &["0123456789"])]);
+    let mut s = r.stream();
+    let _ = s.push(b"01234");
+    assert_eq!(s.held(), 5);
+    s.discard();
+    assert_eq!(s.held(), 0);
+    assert_eq!(s.finish(), b"");
+}
+
+fn header_map(pairs: &[(&str, &str)]) -> HeaderMap {
+    let mut h = HeaderMap::new();
+    for (n, v) in pairs {
+        h.append(
+            hyper::http::HeaderName::from_bytes(n.as_bytes()).unwrap(),
+            HeaderValue::from_str(v).unwrap(),
+        );
+    }
+    h
+}
+
+#[test]
+fn header_values_are_redacted_in_place_and_others_kept() {
+    let r = redaction(&[("GITHUB_TOKEN", &[TOKEN])]);
+    let h = header_map(&[
+        ("x-echo", &format!("Bearer {TOKEN}")),
+        ("x-echo", "second"),
+        ("content-type", "text/plain"),
+    ]);
+    let out = headers(&r, &h).unwrap();
+    let echoes: Vec<_> = out.get_all("x-echo").iter().collect();
+    assert_eq!(echoes.len(), 2);
+    let first = echoes[0].to_str().unwrap();
+    assert!(
+        first.starts_with("Bearer [REDACTED:GITHUB_TOKEN]*"),
+        "{first}"
+    );
+    assert_eq!(first.len(), "Bearer ".len() + TOKEN.len());
+    assert_eq!(echoes[1], "second");
+    assert_eq!(out.get("content-type").unwrap(), "text/plain");
+}
+
+#[test]
+fn a_form_in_a_header_name_or_across_its_separator_is_refused() {
+    let r = redaction(&[("A", &["leakedvalue"]), ("B", &["k: vvvvvvvvv"])]);
+    // In the name.
+    assert_eq!(
+        headers(&r, &header_map(&[("x-leakedvalue", "1")])),
+        Err(Echoed)
+    );
+    // Across the `: ` (the store allows `: ` inside a value).
+    assert_eq!(
+        headers(&r, &header_map(&[("x-k", "vvvvvvvvv")])),
+        Err(Echoed)
+    );
+    // Starting right after the separator: redacted, not refused.
+    let out = headers(&r, &header_map(&[("x", "leakedvalue")])).unwrap();
+    assert_eq!(out.get("x").unwrap(), "[REDACTED:A");
+}
+
+/// The filler is visible ASCII and the bytes outside a run are the upstream's own, so a redacted
+/// value stays a header value, obs-text included; the `Echoed` arm for one that is not is
+/// defense in depth (architect D5).
+#[test]
+fn a_redacted_value_keeps_the_bytes_outside_its_runs() {
+    let r = redaction(&[("A", &["abcdefghij"])]);
+    let mut h = HeaderMap::new();
+    h.insert("x", HeaderValue::from_bytes(b"\xffabcdefghij\x80").unwrap());
+    let out = headers(&r, &h).unwrap();
+    assert_eq!(out.get("x").unwrap().as_bytes(), b"\xff[REDACTED:\x80");
+}
+
+#[test]
 fn debug_output_names_labels_but_never_a_form() {
     let r = redaction(&[("A", &["verysecretvalue"])]);
     let d = format!("{r:?} {:?}", r.stream());

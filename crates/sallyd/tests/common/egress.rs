@@ -229,14 +229,40 @@ impl HostAddrs for Owned {
 /// The starter the fixtures hand the launcher.
 pub type FakeEgress = Egress<Names, Upstream, Owned>;
 
-/// A starter with no names, the echo and TLS upstreams, no own addresses, and as trust roots
-/// the test CA only: written to `dir/upstream-ca.pem` (0644, owned by the test user, the owner
-/// the starter is built to require; production passes the system bundle and uid 0).
+/// The secrets the fixtures' store holds (the names the test manifests grant).
+pub const STORED: [&str; 2] = ["GITHUB_TOKEN", "MOCK3_TOKEN"];
+
+/// The canary value the fixtures' store holds for `name`: assembled at runtime, so no
+/// credential-shaped literal is in the tree; `CANARY` makes it easy to grep for (RT-SEC-07).
+pub fn canary(name: &str) -> String {
+    format!("SALLY_CANARY_{name}_{}", "c0ffee".repeat(4))
+}
+
+/// The production secrets store file, 0600 in a 0700 directory, holding [`canary`] for each of
+/// [`STORED`] (architect D12: container tests use the production source).
+pub fn canary_store(dir: &Path) -> std::path::PathBuf {
+    let sub = dir.join("secrets");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = sub.join("secrets.toml");
+    let mut store = sally_core::secrets::SecretStore::empty(path.clone());
+    for name in STORED {
+        store.set(name, canary(name)).unwrap();
+    }
+    store.save().unwrap();
+    path
+}
+
+/// A starter with no names, the echo and TLS upstreams, no own addresses, as trust roots the
+/// test CA only: written to `dir/upstream-ca.pem` (0644, owned by the test user, the owner the
+/// starter is built to require; production passes the system bundle and uid 0), and as secrets
+/// source the production store file at [`canary_store`].
 pub fn fake_egress(dir: &Path) -> Arc<FakeEgress> {
     let pki = Pki::new();
     let roots = dir.join("upstream-ca.pem");
     std::fs::write(&roots, &pki.ca_pem).unwrap();
     std::fs::set_permissions(&roots, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let secrets = canary_store(dir);
     Arc::new(Egress {
         resolver: Arc::new(Names::default()),
         dialer: Arc::new(Upstream {
@@ -249,5 +275,6 @@ pub fn fake_egress(dir: &Path) -> Arc<FakeEgress> {
             paths: vec![roots],
             owner: rustix::process::getuid().as_raw(),
         },
+        secrets: Arc::new(sallyd::egress::inject::StoreFile { path: secrets }),
     })
 }

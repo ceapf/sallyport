@@ -10,8 +10,10 @@
 //! except a head hyper refuses itself (too large, unparsable): hyper answers first, and the entry
 //! follows when its connection future returns (architect Q45, a recorded deviation).
 //!
-//! No secret reaches this module (Q27 (1)): the proxy holds the leaves' keys and header names
-//! only. Task 9a-3 adds injection here, constructible only together with response redaction.
+//! Task 9a-3: the grant headers are set from the session's [`Credentials`] only after the
+//! request's `egress.request` entry is written (architect D13), and every response head and body
+//! goes through the credentials' redaction (decisions 2 and 3; architect D2, D4, D5). Secret
+//! values stay inside `Credentials` and the redaction; this module never reads one.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -32,8 +34,10 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use super::super::authority::{Authority, escape_target};
 use super::super::head::MAX_HEAD;
+use super::super::inject::Credentials;
 use super::super::meter::{BodyEnd, BoxError, Capped, Counts, Meter, OnEnd};
 use super::super::policy::Reason;
+use super::super::redact::{self, Redacted};
 use super::super::rewrite;
 use super::super::tunnel::{Activity, End, Totals};
 use super::intercept_tls::HostTls;
@@ -80,7 +84,10 @@ impl Summary {
 struct State {
     auth: Authority,
     used: SocketAddr,
+    /// The header names of the host's grants: every client copy is dropped (Q40).
     grants: Vec<String>,
+    /// The session's credentials and their redaction.
+    credentials: Arc<Credentials>,
     raw: Counts,
     plain: Counts,
     act: Arc<Activity>,
@@ -99,11 +106,18 @@ struct State {
 }
 
 impl State {
-    fn new(auth: Authority, used: SocketAddr, grants: Vec<String>, act: Arc<Activity>) -> Self {
+    fn new(
+        auth: Authority,
+        used: SocketAddr,
+        grants: Vec<String>,
+        credentials: Arc<Credentials>,
+        act: Arc<Activity>,
+    ) -> Self {
         Self {
             auth,
             used,
             grants,
+            credentials,
             raw: Counts::default(),
             plain: Counts::default(),
             act,
@@ -180,10 +194,10 @@ impl State {
     }
 }
 
-/// A response body: a refusal's text, or the upstream's body under the response cap.
+/// A response body: a refusal's text, or the upstream's body under the response cap, redacted.
 enum Out {
     Reply(Option<Bytes>),
-    Upstream(Capped<Incoming>),
+    Upstream(Redacted<Capped<Incoming>>),
 }
 
 impl Body for Out {
@@ -314,6 +328,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         let HostTls {
             server,
             upstream: client_cfg,
+            credentials,
         } = host_tls;
         let act = Arc::new(Activity::new());
         let upstream = Meter::new(
@@ -328,7 +343,13 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         };
         let opened = tokio::time::timeout(REPLY_TIMEOUT, client.write_all(ESTABLISHED)).await;
         let grants = self.policy.grant_headers(&c.auth.host);
-        let st = Arc::new(State::new(c.auth, used, grants, Arc::clone(&act)));
+        let st = Arc::new(State::new(
+            c.auth,
+            used,
+            grants,
+            credentials,
+            Arc::clone(&act),
+        ));
         let end = if matches!(opened, Ok(Ok(()))) {
             let raw = Meter::new(client, c.rest, st.raw.clone(), Some(act));
             tokio::select! {
@@ -509,29 +530,32 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
 
     /// Forwards a checked request. The sender lock is held from `ready()` to `send_request`: a
     /// request is audited and counted only once the upstream connection is known to take it
-    /// (architect ruling R1).
+    /// (architect ruling R1). The grant headers are set only after its `egress.request` entry is
+    /// written, right before the request is built (architect D13).
     async fn forward(
         &self,
         st: &Arc<State>,
         sender: &Sender,
         parts: hyper::http::request::Parts,
         body: Incoming,
-        headers: hyper::http::HeaderMap,
+        mut headers: hyper::http::HeaderMap,
         target: &str,
     ) -> Result<Response<Out>, BoxError> {
         let mut sender = sender.lock().await;
         if let Some(reply) = self.upstream_ready(st, &mut sender).await {
             return reply;
         }
+        let injected = st.credentials.names(&st.auth.host);
         let audited = self
             .entry("egress.request", Some("allow"))
-            .args(request_args(&st.auth, &parts.method, target));
+            .args(request_args(&st.auth, &parts.method, target, &injected));
         // TODO(#72): on a session stop this append may land after `egress.close`.
         if !self.append(audited).await {
             st.set_end(End::Error);
             return Err("audit append failed".into());
         }
         st.requests.fetch_add(1, Ordering::Relaxed);
+        st.credentials.set(&st.auth.host, &mut headers);
         let capped = Capped::new(body, self.limits.max_request, self.request_end(st, target));
         let up = upstream_request(capped, parts, headers)?;
         let sent = sender.send_request(up).await;
@@ -599,9 +623,11 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         }
     }
 
-    /// The response head: checked (Q30), its declared length against the cap (Q35), then the
-    /// body streamed back under the cap. The declared length is the one hyper decoded (none for
-    /// HEAD, 204 or 304, whatever their `Content-Length` says: architect ruling R5).
+    /// The response head: checked (Q30), its headers redacted (architect D5), its declared length
+    /// against the cap (Q35), then the body streamed back under the cap and redacted (decisions
+    /// 2 and 3). The declared length is the one hyper decoded (none for HEAD, 204 or 304,
+    /// whatever their `Content-Length` says: architect ruling R5). The upstream's reason phrase
+    /// is never forwarded: the client gets hyper's canonical one.
     async fn respond(
         &self,
         st: &Arc<State>,
@@ -612,6 +638,12 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         let headers = match rewrite::response(rp.status, &rp.headers) {
             Ok(h) => h,
             Err(reason) => return self.refuse_inside(st, reason, target, None).await,
+        };
+        let redaction = st.credentials.redaction();
+        let Ok(headers) = redact::headers(redaction, &headers) else {
+            return self
+                .refuse_inside(st, Reason::UpstreamEchoedSecret, target, None)
+                .await;
         };
         if !rewrite::within(body.size_hint().exact(), self.limits.max_response) {
             return self
@@ -630,11 +662,8 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
             limit: Mutex::new(Some((over, Arc::clone(&self.audit)))),
             level: self.level,
         };
-        let mut out = Response::new(Out::Upstream(Capped::new(
-            body,
-            self.limits.max_response,
-            Arc::new(on_end),
-        )));
+        let capped = Capped::new(body, self.limits.max_response, Arc::new(on_end));
+        let mut out = Response::new(Out::Upstream(Redacted::new(capped, redaction)));
         *out.status_mut() = rp.status;
         *out.headers_mut() = headers;
         Ok(out)
@@ -766,8 +795,9 @@ fn reply_response(reason: Reason) -> Response<Out> {
     r
 }
 
-/// Arguments of `egress.request` (Q34). Nothing is injected in Task 9a-2.
-fn request_args(a: &Authority, method: &Method, target: &str) -> Value {
+/// Arguments of `egress.request` (Q34): `injected` lists the grants set on the request as
+/// `secret:NAME`, never a value (Task 9a-3, architect D9, D13).
+fn request_args(a: &Authority, method: &Method, target: &str, injected: &[String]) -> Value {
     let (method, _, _) = escape_target(method.as_str().as_bytes());
     let (text, bytes, cut) = escape_target(target.as_bytes());
     json!({
@@ -777,7 +807,7 @@ fn request_args(a: &Authority, method: &Method, target: &str) -> Value {
         "target": text,
         "target_bytes": bytes,
         "target_cut": cut,
-        "injected": [],
+        "injected": injected,
     })
 }
 

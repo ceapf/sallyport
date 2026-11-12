@@ -112,7 +112,7 @@ MUTANTS_WIDE_SALLYD := $(addprefix crates/sallyd/src/sandbox/,argv.rs check.rs t
                        launch/error.rs) \
                        $(addprefix crates/sallyd/src/egress/,addr.rs authority.rs head.rs policy.rs server.rs \
                        hostaddrs.rs tunnel.rs net.rs ca.rs roots.rs rewrite.rs intercept.rs \
-                       intercept_tls.rs meter.rs) \
+                       intercept_tls.rs meter.rs inject.rs redact.rs) \
                        $(addprefix crates/sallyd/src/rpc/,agent.rs control.rs frame.rs json.rs listen.rs mcp.rs \
                        message.rs rate.rs record.rs) \
                        $(addprefix crates/sallyd/src/llm/,body.rs head.rs io.rs reply.rs server.rs) \

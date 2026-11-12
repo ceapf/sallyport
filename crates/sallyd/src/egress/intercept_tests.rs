@@ -14,6 +14,9 @@ use crate::egress::ca::Validity;
 mod rig;
 use rig::*;
 
+#[path = "intercept_inject_tests.rs"]
+mod inject;
+
 #[tokio::test]
 async fn a_grant_host_is_intercepted_rewritten_forwarded_and_audited_in_order() {
     let r = rig(Opts::default());
@@ -34,7 +37,8 @@ async fn a_grant_host_is_intercepted_rewritten_forwarded_and_audited_in_order() 
     assert!(up.contains("host: a.mock.test\r\n"), "{up}");
     assert!(up.contains("x-kept: yes\r\n"), "{up}");
     for gone in [
-        "authorization",
+        "attacker",
+        "bearer two",
         "accept-encoding",
         "proxy-",
         "x-hop",
@@ -42,6 +46,15 @@ async fn a_grant_host_is_intercepted_rewritten_forwarded_and_audited_in_order() 
     ] {
         assert!(!up.contains(gone), "{gone} reached the upstream: {up}");
     }
+    // Task 9a-3: exactly one Authorization, the grant's, set last (after Host).
+    assert_eq!(up.matches("authorization:").count(), 1, "{up}");
+    assert!(
+        up.contains(&format!(
+            "host: a.mock.test\r\nauthorization: bearer {}\r\n",
+            value(0)
+        )),
+        "{up}"
+    );
     assert_eq!(
         r.sink.events(),
         ["egress.allow", "egress.request", "egress.close"]
@@ -50,7 +63,7 @@ async fn a_grant_host_is_intercepted_rewritten_forwarded_and_audited_in_order() 
     assert_eq!(
         r.sink.args("egress.request"),
         json!({"host": HOST, "port": 443, "method": "GET", "target": "/echo",
-               "target_bytes": 5, "target_cut": false, "injected": []})
+               "target_bytes": 5, "target_cut": false, "injected": ["secret:T0"]})
     );
     let close = r.sink.args("egress.close");
     assert_eq!(close["intercept"], json!(true));
@@ -410,7 +423,8 @@ async fn request_trailers_and_client_framing_never_reach_the_upstream() {
     let out = r.talk(&raw).await;
     assert!(out.starts_with("HTTP/1.1 200 "), "{out}");
     let up = r.seen()[0].to_ascii_lowercase();
-    assert!(!up.contains("authorization"), "{up}");
+    assert!(!up.contains("bearer late"), "{up}");
+    assert_eq!(up.matches("authorization:").count(), 1, "{up}");
     assert!(up.contains("abc"), "{up}");
 }
 
@@ -717,7 +731,13 @@ async fn a_request_for_a_closed_upstream_connection_is_not_audited_or_counted() 
         port: 443,
     };
     let used = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(93, 184, 215, 9)), 443);
-    let st = State::new(auth, used, Vec::new(), Arc::new(Activity::new()));
+    let st = State::new(
+        auth,
+        used,
+        Vec::new(),
+        Arc::new(credentials(&[HOST])),
+        Arc::new(Activity::new()),
+    );
     let reply = r.proxy.upstream_ready(&st, &mut sender).await;
     let resp = reply.expect("a closed connection is not ready").unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
@@ -937,7 +957,10 @@ async fn an_exchange_idle_past_the_limit_ends_idle_timeout() {
     let out = tokio::time::timeout(Duration::from_secs(5), r.talk(&get("/echo", "")))
         .await
         .expect("the idle limit ends a stalled exchange");
-    assert!(out.contains("short"), "{out}");
+    // Task 9a-3 (architect D2): the head is forwarded; the five body bytes are fewer than the
+    // redaction holds back, so they wait for more and go, wiped, with the tunnel.
+    assert!(out.starts_with("HTTP/1.1 200 OK\r\n"), "{out}");
+    assert!(out.ends_with("\r\n\r\n"), "{out}");
     assert!(started.elapsed() < Duration::from_secs(5));
     assert_eq!(r.sink.args("egress.close")["end"], json!("idle-timeout"));
     // The upstream connection goes with the tunnel, though its response never finished.

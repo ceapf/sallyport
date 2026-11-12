@@ -18,6 +18,7 @@ use tokio::task::{JoinHandle, JoinSet};
 
 use super::ca::{self, CaError, SessionTls, Validity};
 use super::hostaddrs;
+use super::inject::{Credentials, CredentialsError, SecretSource, Spec};
 use super::policy::Policy;
 use super::roots::{BundleFiles, RootsError};
 use super::server::{Dialer, HostAddrs, Interception, Limits, Parts, Proxy, Resolver, until_true};
@@ -299,7 +300,10 @@ pub struct SessionEgress {
     pub ca: bool,
     /// `runtime.timeout`: the CA is valid this long plus [`ca::GRACE`].
     pub timeout: Duration,
-    /// The CA, its leaves and the upstream roots, once [`EgressStarter::prepare`] made them.
+    /// The secret grants: names, hosts, headers and formats, no value.
+    pub grants: Vec<Spec>,
+    /// The CA, its leaves, the upstream roots and the credentials, once
+    /// [`EgressStarter::prepare`] made them.
     pub interception: Option<Interception>,
 }
 
@@ -320,6 +324,7 @@ impl SessionEgress {
             audit,
             ca: ca::wanted(m),
             timeout: Duration::from_secs(m.runtime.timeout.as_secs()),
+            grants: Spec::from_manifest(v),
             interception: None,
         }
     }
@@ -340,19 +345,29 @@ pub enum EgressError {
     /// `net.sock` could not be bound.
     #[error("net.sock: {0}")]
     Listener(#[source] io::Error),
+    /// The secrets store could not be read (Task 9a-3, architect D7).
+    #[error("secrets store: {0}")]
+    Store(#[source] sally_core::secrets::SecretsError),
+    /// The grants' credentials could not be built: a secret missing from the store, a `{basic}`
+    /// grant (Task 9b), or a grant that cannot be injected.
+    #[error(transparent)]
+    Credentials(#[from] CredentialsError),
 }
 
 /// Starts a session's listener. Dyn-compatible, so the launcher holds `Arc<dyn EgressStarter>`;
 /// the resolver, dialer, host addresses and trust roots behind it are constructor arguments
 /// (decision 10; Task 9a decision 6).
 pub trait EgressStarter: Send + Sync {
-    /// For a session with a session CA ([`SessionEgress::ca`]): loads the upstream trust roots,
-    /// mints the CA and its leaves, and writes `ca-bundle.pem` and `session-ca.pem` into `dir`
-    /// (the workspace socket directory), before the container exists. Blocking: the launcher runs
-    /// it off the runtime. Other sessions pass through unchanged.
+    /// For a session with a session CA ([`SessionEgress::ca`]): refuses a `{basic}` grant (before
+    /// the store is opened), reads the grants' values from the secrets source and builds the
+    /// credentials, loads the upstream trust roots, mints the CA and its leaves, and writes
+    /// `ca-bundle.pem` and `session-ca.pem` into `dir` (the workspace socket directory), before
+    /// the container exists. Blocking: the launcher runs it off the runtime. Other sessions pass
+    /// through unchanged.
     ///
     /// # Errors
-    /// [`EgressError::Roots`], [`EgressError::Ca`] or [`EgressError::Files`].
+    /// [`EgressError::Credentials`], [`EgressError::Store`], [`EgressError::Roots`],
+    /// [`EgressError::Ca`] or [`EgressError::Files`].
     fn prepare(&self, dir: &Path, s: SessionEgress) -> Result<SessionEgress, EgressError>;
 
     /// Binds `sock` and serves it for the session.
@@ -362,9 +377,10 @@ pub trait EgressStarter: Send + Sync {
     fn start(&self, sock: &Path, s: SessionEgress) -> io::Result<EgressHandle>;
 }
 
-/// The starter over a resolver, a dialer, a host-address source and the trust-root files, shared
-/// by every session.
-#[derive(Debug, Default)]
+/// The starter over a resolver, a dialer, a host-address source, the trust-root files and the
+/// secrets source, shared by every session. No `Default`: a secrets source is always named
+/// (architect D7).
+#[derive(Debug)]
 pub struct Egress<R, D, H> {
     /// Name lookups.
     pub resolver: Arc<R>,
@@ -375,6 +391,8 @@ pub struct Egress<R, D, H> {
     /// Where the upstream trust roots are read from, per session ([`BundleFiles::default`] in
     /// production).
     pub roots: BundleFiles,
+    /// Where secret values come from, per session ([`super::inject::StoreFile`] in production).
+    pub secrets: Arc<dyn SecretSource>,
 }
 
 /// The production starter. Build it once and share it by every session: each
@@ -387,11 +405,22 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> EgressStarter for Egress<R, D, H> {
         if !s.ca {
             return Ok(s);
         }
+        if let Some(g) = s.grants.iter().find(|g| g.is_basic()) {
+            return Err(CredentialsError::Basic(g.name.clone()).into());
+        }
+        let mut names: Vec<String> = Vec::new();
+        for g in &s.grants {
+            if !names.contains(&g.name) {
+                names.push(g.name.clone());
+            }
+        }
+        let values = self.secrets.load(&names).map_err(EgressError::Store)?;
+        let credentials = Credentials::new(&s.grants, values)?;
         let roots = self.roots.load()?;
         let validity = Validity::for_session(SystemTime::now(), s.timeout)?;
         let tls = SessionTls::mint(&s.policy.grant_hosts(), validity)?;
         ca::write_files(dir, &tls, &roots.pem).map_err(EgressError::Files)?;
-        s.interception = Some(Interception::new(tls, roots)?);
+        s.interception = Some(Interception::new(tls, roots, credentials)?);
         Ok(s)
     }
 
@@ -740,6 +769,7 @@ mod tests {
             dialer: Arc::new(Echo),
             host: Arc::new(NoneOwned),
             roots: BundleFiles::default(),
+            secrets: Arc::new(crate::egress::inject::testing::Fixed::default()),
         };
         let rule = super::super::policy::Rule {
             host: parse_host_pattern("a.mock.test").unwrap(),
@@ -757,6 +787,7 @@ mod tests {
                     audit: audit as Arc<dyn AuditSink>,
                     ca: false,
                     timeout: Duration::from_secs(60),
+                    grants: Vec::new(),
                     interception: None,
                 },
             )

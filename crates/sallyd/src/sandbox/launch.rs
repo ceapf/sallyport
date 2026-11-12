@@ -663,6 +663,40 @@ mod tests {
         assert!(e.to_string().starts_with("network: net.sock: "), "{e}");
     }
 
+    /// Task 9a-3 (architect D7, D11): each refusal of a session's credentials names its cause.
+    #[test]
+    fn a_missing_secret_an_unreadable_store_and_a_basic_grant_have_their_own_reasons() {
+        use crate::egress::inject::CredentialsError;
+        use sally_core::secrets::SecretsError;
+        let missing = LaunchError::Egress(CredentialsError::Missing("GH".into()).into());
+        assert_eq!(missing.reason(), "secret-missing");
+        assert_eq!(
+            missing.to_string(),
+            "network: secret GH: not in the secrets store"
+        );
+        let store = LaunchError::Egress(EgressError::Store(SecretsError::TooLarge));
+        assert_eq!(store.reason(), "secret-store");
+        assert!(
+            store.to_string().starts_with("network: secrets store: "),
+            "{store}"
+        );
+        let basic = LaunchError::Egress(CredentialsError::Basic("GH".into()).into());
+        assert_eq!(basic.reason(), "basic-unsupported");
+        for other in [
+            CredentialsError::Format("GH".into()),
+            CredentialsError::Header("GH".into()),
+            CredentialsError::Duplicate {
+                host: "a.mock.test".into(),
+                header: "authorization".into(),
+            },
+            CredentialsError::TooLong(crate::egress::redact::TooLong("GH".into())),
+        ] {
+            assert_eq!(LaunchError::Egress(other.into()).reason(), "secret-grant");
+        }
+        let unmatched = LaunchError::Egress(crate::egress::ca::CaError::Unmatched.into());
+        assert_eq!(unmatched.reason(), "session-ca");
+    }
+
     #[test]
     fn missing_trust_roots_and_a_failed_session_ca_have_their_own_reasons() {
         use crate::egress::ca::CaError;

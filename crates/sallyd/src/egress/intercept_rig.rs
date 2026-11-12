@@ -13,6 +13,7 @@ use tokio::io::DuplexStream;
 
 use super::*;
 use crate::egress::ca::SessionTls;
+pub(super) use crate::egress::inject::testing::{credentials, value};
 use crate::egress::policy::{Grant, Policy, Rule};
 use crate::egress::server::{Interception, Parts};
 use crate::sandbox::AuditSink;
@@ -389,7 +390,7 @@ pub(super) fn rig(o: Opts) -> Rig {
         session: "s-i".into(),
         level: AuditLevel::default(),
         limits: o.limits,
-        interception: Some(Interception::new(tls, roots).unwrap()),
+        interception: Some(Interception::new(tls, roots, credentials(&[HOST])).unwrap()),
     }));
     Rig {
         proxy,

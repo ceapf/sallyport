@@ -6,6 +6,7 @@
 //! session's upstream trust roots, ALPN `http/1.1`. The session CA is never an upstream trust
 //! anchor.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -13,14 +14,15 @@ use rustls::sign::{CertifiedKey, SingleCertAndKey};
 use rustls::{ClientConfig, ServerConfig};
 
 use super::super::ca::{CaError, Leaf, SessionTls};
+use super::super::inject::Credentials;
 use super::super::roots::Roots;
 
 /// The only ALPN protocol offered either way (decision 4).
 const HTTP_1_1: &[u8] = b"http/1.1";
 
-/// What the proxy intercepts grant hosts with (Task 9a): the session CA's leaves and the upstream
-/// trust roots, and the TLS configurations built from them. It holds no secret store and no
-/// credential (architect Q27 (1)).
+/// What the proxy intercepts grant hosts with (Task 9a): the session CA's leaves, the upstream
+/// trust roots, the TLS configurations built from them, and the grants' credentials with their
+/// redaction (Task 9a-3). Every leaf host has a credential and every credential a leaf.
 #[derive(Debug)]
 pub struct Interception {
     /// The session CA and one leaf per grant host; the CA key is already gone.
@@ -29,15 +31,22 @@ pub struct Interception {
     pub roots: Roots,
     upstream: Arc<ClientConfig>,
     servers: Vec<(String, Arc<ServerConfig>)>,
+    credentials: Arc<Credentials>,
 }
 
 impl Interception {
     /// Builds the upstream client configuration (rustls defaults: TLS 1.2 and 1.3, the given
-    /// roots, ALPN `http/1.1`) and one server configuration per leaf.
+    /// roots, ALPN `http/1.1`) and one server configuration per leaf, and takes the credentials.
     ///
     /// # Errors
+    /// [`CaError::Unmatched`] when the leaves and the credentials name different hosts;
     /// [`CaError::Generate`] when rustls refuses a configuration or a leaf.
-    pub fn new(tls: SessionTls, roots: Roots) -> Result<Self, CaError> {
+    pub fn new(tls: SessionTls, roots: Roots, credentials: Credentials) -> Result<Self, CaError> {
+        let leaves: BTreeSet<&str> = tls.leaves.iter().map(|l| l.host.as_str()).collect();
+        let granted: BTreeSet<&str> = credentials.hosts().into_iter().collect();
+        if leaves != granted {
+            return Err(CaError::Unmatched);
+        }
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut upstream = ClientConfig::builder_with_provider(Arc::clone(&provider))
             .with_safe_default_protocol_versions()
@@ -60,7 +69,14 @@ impl Interception {
             roots,
             upstream: Arc::new(upstream),
             servers,
+            credentials: Arc::new(credentials),
         })
+    }
+
+    /// The credentials and their redaction; a weak handle shows when they are gone.
+    #[must_use]
+    pub fn credentials(&self) -> &Arc<Credentials> {
+        &self.credentials
     }
 
     /// The server configuration presenting `host`'s leaf, if the session CA made one.
@@ -77,15 +93,17 @@ impl Interception {
         Some(HostTls {
             server: self.server(host)?,
             upstream: Arc::clone(&self.upstream),
+            credentials: Arc::clone(&self.credentials),
         })
     }
 }
 
-/// The TLS configurations a cleared grant host is intercepted with: its leaf toward the client,
-/// the verifying client configuration toward the upstream.
+/// What a cleared grant host is intercepted with: its leaf toward the client, the verifying
+/// client configuration toward the upstream, and the session's credentials.
 pub(super) struct HostTls {
     pub(super) server: Arc<ServerConfig>,
     pub(super) upstream: Arc<ClientConfig>,
+    pub(super) credentials: Arc<Credentials>,
 }
 
 /// The leaf and its signing key, read from the leaf's DER key in place (architect ruling R7):
@@ -113,6 +131,33 @@ mod tests {
 
     use super::*;
     use crate::egress::ca::Validity;
+    use crate::egress::inject::testing::credentials;
+
+    fn mint(hosts: &[&str]) -> SessionTls {
+        let v = Validity::for_session(SystemTime::now(), Duration::from_secs(600)).unwrap();
+        let hosts: Vec<String> = hosts.iter().map(|h| (*h).to_owned()).collect();
+        SessionTls::mint(&hosts, v).unwrap()
+    }
+
+    /// Architect D10: every leaf host has a credential and every credential a leaf.
+    #[test]
+    fn leaves_and_credentials_must_name_the_same_hosts() {
+        let both = ["a.mock.test", "b.mock.test"];
+        let i = Interception::new(mint(&both), roots(), credentials(&both)).unwrap();
+        assert_eq!(i.credentials().hosts(), both);
+        assert!(i.host_tls("a.mock.test").is_some());
+        assert!(i.host_tls("c.mock.test").is_none());
+        for (leaves, granted) in [
+            (&both[..], &both[..1]),
+            (&both[..1], &both[..]),
+            (&["a.mock.test"][..], &["c.mock.test"][..]),
+        ] {
+            assert!(matches!(
+                Interception::new(mint(leaves), roots(), credentials(granted)),
+                Err(CaError::Unmatched)
+            ));
+        }
+    }
 
     fn roots() -> Roots {
         Roots {
@@ -127,14 +172,13 @@ mod tests {
     /// does not belong to its certificate is refused (as `with_single_cert` refused it before).
     #[test]
     fn a_leaf_whose_key_is_not_its_certificates_is_refused() {
-        let v = Validity::for_session(SystemTime::now(), Duration::from_secs(600)).unwrap();
-        let hosts = ["a.mock.test".to_owned(), "b.mock.test".to_owned()];
-        assert!(Interception::new(SessionTls::mint(&hosts, v).unwrap(), roots()).is_ok());
-        let mut swapped = SessionTls::mint(&hosts, v).unwrap();
+        let hosts = ["a.mock.test", "b.mock.test"];
+        assert!(Interception::new(mint(&hosts), roots(), credentials(&hosts)).is_ok());
+        let mut swapped = mint(&hosts);
         let (a, b) = swapped.leaves.split_at_mut(1);
         std::mem::swap(&mut a[0].key, &mut b[0].key);
         assert!(matches!(
-            Interception::new(swapped, roots()),
+            Interception::new(swapped, roots(), credentials(&hosts)),
             Err(CaError::Generate(_))
         ));
     }

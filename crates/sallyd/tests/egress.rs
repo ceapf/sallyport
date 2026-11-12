@@ -586,6 +586,9 @@ fn listen(
         dialer: Arc::new(PairEcho),
         host: Arc::new(common::egress::Owned::default()),
         roots: sallyd::egress::roots::BundleFiles::default(),
+        secrets: Arc::new(sallyd::egress::inject::StoreFile {
+            path: common::egress::canary_store(&dir.0),
+        }),
     };
     egress.resolver.set("a.mock.test", vec![vec![public(1)]]);
     let rule = Rule {
@@ -605,6 +608,7 @@ fn listen(
                 audit,
                 ca: false,
                 timeout: std::time::Duration::from_secs(60),
+                grants: Vec::new(),
                 interception: None,
             },
         )

@@ -59,6 +59,9 @@ pub enum Reason {
     UpstreamClosed,
     /// The upstream's response head is not HTTP/1.x (architect Q45).
     UpstreamMalformed,
+    /// A form of a session secret reaches into a response header's name, or its redacted value
+    /// is no header value (Task 9a-3, architect D5): nothing is forwarded.
+    UpstreamEchoedSecret,
 }
 
 impl Reason {
@@ -87,6 +90,7 @@ impl Reason {
             Self::UpstreamTlsFailed => "upstream-tls-failed",
             Self::UpstreamClosed => "upstream-closed",
             Self::UpstreamMalformed => "upstream-malformed",
+            Self::UpstreamEchoedSecret => "upstream-echoed-secret",
         }
     }
 
@@ -107,7 +111,8 @@ impl Reason {
             | Self::UpstreamEncoded
             | Self::UpstreamTlsFailed
             | Self::UpstreamClosed
-            | Self::UpstreamMalformed => 502,
+            | Self::UpstreamMalformed
+            | Self::UpstreamEchoedSecret => 502,
             Self::PlainHttpUnsupported | Self::MethodRefused => 405,
             Self::TooManyConnections => 429,
             Self::HeadTooLarge => 431,
@@ -430,6 +435,7 @@ mod tests {
             (UpstreamTlsFailed, "upstream-tls-failed", 502, false),
             (UpstreamClosed, "upstream-closed", 502, false),
             (UpstreamMalformed, "upstream-malformed", 502, false),
+            (UpstreamEchoedSecret, "upstream-echoed-secret", 502, false),
         ];
         for (r, s, status, limit) in table {
             assert_eq!((r.as_str(), r.status(), r.is_limit()), (s, status, limit));

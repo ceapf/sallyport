@@ -18,10 +18,16 @@
 
 use std::cmp::Reverse;
 use std::fmt;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll, ready};
 
+use hyper::body::{Body, Bytes, Frame, SizeHint};
+use hyper::http::header::{HeaderMap, HeaderValue};
 use sally_core::secrets::Secret;
 use zeroize::Zeroize;
+
+use super::meter::BoxError;
 
 /// Fills a covered run past its label.
 const PAD: u8 = b'*';
@@ -99,10 +105,16 @@ impl Redaction {
     /// `data` with every covered byte replaced.
     #[must_use]
     pub fn bytes(self: &Arc<Self>, data: &[u8]) -> Vec<u8> {
+        self.scan(data).0
+    }
+
+    /// `data` with every covered byte replaced, and the offset of the first covered byte.
+    #[must_use]
+    pub fn scan(self: &Arc<Self>, data: &[u8]) -> (Vec<u8>, Option<u64>) {
         let mut s = self.stream();
         let mut out = s.push(data);
         out.extend(s.finish());
-        out
+        (out, s.first_covered())
     }
 
     /// A stream over one body.
@@ -114,6 +126,7 @@ impl Redaction {
             marks: Vec::new(),
             base: 0,
             run: None,
+            first: None,
         }
     }
 
@@ -147,6 +160,8 @@ pub struct Stream {
     base: u64,
     /// The run the last emitted byte belongs to: its label and the next byte's offset in it.
     run: Option<(usize, usize)>,
+    /// The stream offset of the first covered byte emitted.
+    first: Option<u64>,
 }
 
 impl fmt::Debug for Stream {
@@ -179,6 +194,24 @@ impl Stream {
         self.emit(self.held.len())
     }
 
+    /// The stream offset of the first covered byte emitted so far.
+    #[must_use]
+    pub const fn first_covered(&self) -> Option<u64> {
+        self.first
+    }
+
+    /// Bytes held back, not yet emitted.
+    #[must_use]
+    pub fn held(&self) -> usize {
+        self.held.len()
+    }
+
+    /// Drops everything held, wiped: the body failed or was cut, so nothing more is emitted.
+    pub fn discard(&mut self) {
+        self.held.zeroize();
+        self.marks.clear();
+    }
+
     /// Marks every byte of `held` that an occurrence lying wholly inside it covers.
     fn mark(&mut self) {
         for (i, form) in self.redaction.forms.iter().enumerate() {
@@ -200,13 +233,17 @@ impl Stream {
     /// Emits the first `n` held bytes, covered ones as filler.
     fn emit(&mut self, n: usize) -> Vec<u8> {
         let mut out = Vec::with_capacity(n);
-        for (byte, mark) in self.held.iter().zip(&self.marks).take(n) {
+        for (i, (byte, mark)) in self.held.iter().zip(&self.marks).take(n).enumerate() {
             match mark {
                 None => {
                     self.run = None;
                     out.push(*byte);
                 }
                 Some((_, _, form)) => {
+                    let pos = self
+                        .base
+                        .saturating_add(u64::try_from(i).unwrap_or(u64::MAX));
+                    self.first.get_or_insert(pos);
                     let (label, at) = self.run.unwrap_or((self.redaction.label(*form), 0));
                     out.push(self.redaction.filler(label, at));
                     self.run = Some((label, at.saturating_add(1)));
@@ -220,6 +257,122 @@ impl Stream {
             .saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
         out
     }
+}
+
+/// A response body redacted as it streams (architect D2). It wraps the capped body, so the cap
+/// counts upstream bytes. Data frames pass through the [`Stream`]; any other frame is dropped. A
+/// complete end flushes what is held; an error (the body failed or was cut at its cap) discards
+/// it, wiped, and passes the error on.
+pub struct Redacted<B> {
+    inner: B,
+    stream: Stream,
+    done: bool,
+}
+
+impl<B> Redacted<B> {
+    /// Redacts `inner` with `redaction`.
+    pub fn new(inner: B, redaction: &Arc<Redaction>) -> Self {
+        Self {
+            inner,
+            stream: redaction.stream(),
+            done: false,
+        }
+    }
+}
+
+impl<B> Body for Redacted<B>
+where
+    B: Body<Data = Bytes, Error = BoxError> + Unpin,
+{
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        let this = self.get_mut();
+        while !this.done {
+            match ready!(Pin::new(&mut this.inner).poll_frame(cx)) {
+                Some(Ok(frame)) => {
+                    let Ok(data) = frame.into_data() else {
+                        continue;
+                    };
+                    let out = this.stream.push(&data);
+                    if !out.is_empty() {
+                        return Poll::Ready(Some(Ok(Frame::data(Bytes::from(out)))));
+                    }
+                }
+                Some(Err(e)) => {
+                    this.done = true;
+                    this.stream.discard();
+                    return Poll::Ready(Some(Err(e)));
+                }
+                None => {
+                    this.done = true;
+                    let out = this.stream.finish();
+                    if !out.is_empty() {
+                        return Poll::Ready(Some(Ok(Frame::data(Bytes::from(out)))));
+                    }
+                }
+            }
+        }
+        Poll::Ready(None)
+    }
+
+    /// Ended, or nothing more can come: the inner body is at its end and nothing is held (an
+    /// empty body, such as a 304's, is then known empty before it is polled, as hyper needs).
+    fn is_end_stream(&self) -> bool {
+        self.done || (self.stream.held() == 0 && self.inner.is_end_stream())
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        if self.is_end_stream() {
+            return SizeHint::with_exact(0);
+        }
+        let inner = self.inner.size_hint();
+        let held = u64::try_from(self.stream.held()).unwrap_or(u64::MAX);
+        let mut hint = SizeHint::new();
+        hint.set_lower(inner.lower().saturating_add(held));
+        if let Some(upper) = inner.upper() {
+            hint.set_upper(upper.saturating_add(held));
+        }
+        hint
+    }
+}
+
+/// A form of a session secret reaches into a header line's name or its `: ` separator, or the
+/// redacted value is no header value (architect D5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("a response header echoes a secret where it cannot be redacted")]
+pub struct Echoed;
+
+/// The response headers with every value redacted, each header scanned as the line hyper writes
+/// (`name: value`, the name lower-cased), so a form that straddles the name and the value is
+/// found (architect D5).
+///
+/// # Errors
+/// [`Echoed`] when a covered byte lies in a name or its separator, or a redacted value is no
+/// header value.
+pub fn headers(r: &Arc<Redaction>, headers: &HeaderMap) -> Result<HeaderMap, Echoed> {
+    let mut out = HeaderMap::with_capacity(headers.len());
+    for (name, value) in headers {
+        let lead = name.as_str().len().saturating_add(2);
+        let mut line = Vec::with_capacity(lead.saturating_add(value.len()));
+        line.extend_from_slice(name.as_str().as_bytes());
+        line.extend_from_slice(b": ");
+        line.extend_from_slice(value.as_bytes());
+        let (redacted, first) = r.scan(&line);
+        line.zeroize();
+        let v = match first {
+            None => value.clone(),
+            Some(at) if at < u64::try_from(lead).unwrap_or(u64::MAX) => return Err(Echoed),
+            Some(_) => HeaderValue::from_bytes(redacted.get(lead..).unwrap_or_default())
+                .map_err(|_| Echoed)?,
+        };
+        out.append(name.clone(), v);
+    }
+    Ok(out)
 }
 
 /// The occurrence ranked first of `old` and `new`.

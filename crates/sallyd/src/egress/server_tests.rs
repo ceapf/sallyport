@@ -385,7 +385,14 @@ async fn a_grant_host_without_its_own_leaf_is_refused() {
     let tls = SessionTls::mint(&["b.mock.test".to_owned()], v).unwrap();
     let rig = Setup {
         grants: vec!["a.mock.test".into(), "b.mock.test".into()],
-        interception: Some(Interception::new(tls, roots).unwrap()),
+        interception: Some(
+            Interception::new(
+                tls,
+                roots,
+                crate::egress::inject::testing::credentials(&["b.mock.test"]),
+            )
+            .unwrap(),
+        ),
         ..Setup::default()
     }
     .rig();
