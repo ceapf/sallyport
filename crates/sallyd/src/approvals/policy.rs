@@ -7,7 +7,10 @@
 //! are not sorted into safe and dangerous (maintainer's Task 10 decision 5). Under `shell: allow`
 //! with `destructive_requires_approval`, the destructive tag is an input: `tools::shell`'s tagger
 //! (Task 11) supplies it, and without a tag the command asks. Protected paths are refused by
-//! `tools::fs` (Task 11, #19) before it builds the action.
+//! `tools::fs` (Task 11, #19) before it builds the action. Reads and listings run on every known
+//! mount and are never asked (architect ruling Q28); writes and deletes run on `rw` and `staged`
+//! (maintainer's Task 11 decision 1, ruling Q31), ask on `brokered` where a glob matches, and are
+//! denied on `ro`.
 
 use sally_core::manifest::{
     ApproveGlobs, BuiltinTool, FetchWrites, McpApproval, MountMode, ShellPolicy, ValidatedManifest,
@@ -89,6 +92,8 @@ impl Policy {
     pub fn need(&self, action: &Action, destructive: Option<bool>) -> Need {
         let builtin = match action {
             Action::Shell { .. } => Some(BuiltinTool::Shell),
+            Action::FsRead { .. } => Some(BuiltinTool::FsRead),
+            Action::FsList { .. } => Some(BuiltinTool::FsList),
             Action::FsWrite { .. } => Some(BuiltinTool::FsWrite),
             Action::FsDelete { .. } => Some(BuiltinTool::FsDelete),
             Action::Fetch { .. } => Some(BuiltinTool::Fetch),
@@ -107,6 +112,8 @@ impl Policy {
                     Some(true) | None => Need::Ask,
                 },
             },
+            Action::FsRead { target, .. } => self.read(target, false),
+            Action::FsList { target } => self.read(target, true),
             Action::FsWrite { target, .. } => self.file(target, |g| &g.writes),
             Action::FsDelete { target } => self.file(target, |g| &g.deletes),
             Action::Fetch {
@@ -139,6 +146,19 @@ impl Policy {
         }
     }
 
+    /// A read or listing: any known mount, a canonical path (the mount root only for a
+    /// listing); never asked (architect ruling Q28).
+    fn read(&self, t: &Target, root_ok: bool) -> Need {
+        if !self.mounts.iter().any(|m| m.guest == t.mount) {
+            return Need::Deny("unknown-mount");
+        }
+        if (root_ok && t.rel.is_empty()) || canonical(&t.rel) {
+            Need::Run
+        } else {
+            Need::Deny("bad-path")
+        }
+    }
+
     fn file(&self, t: &Target, globs: impl Fn(&ApproveGlobs) -> &Vec<String>) -> Need {
         // The globs match canonical paths only; anything else could match less than it should.
         if !canonical(&t.rel) {
@@ -148,8 +168,10 @@ impl Policy {
             return Need::Deny("unknown-mount");
         };
         match m.mode {
-            MountMode::Ro | MountMode::Staged => Need::Deny("read-only"),
-            MountMode::Rw => Need::Run,
+            MountMode::Ro => Need::Deny("read-only"),
+            // Staged writes land in the session's overlay inside the workspace (maintainer's
+            // Task 11 decision 1, architect ruling Q31).
+            MountMode::Rw | MountMode::Staged => Need::Run,
             MountMode::Brokered => {
                 if glob::any_matches(globs(&m.approve), &t.rel) {
                     Need::Ask
@@ -415,16 +437,23 @@ mod tests {
         assert_eq!(need(&p, &delete("/workspace/notes", "a.md")), Need::Run);
     }
 
+    // Maintainer's Task 11 decision 1 (architect ruling Q31): writes and deletes on a staged
+    // mount run inside the workspace's overlay and run like rw; until Task 11 they were denied.
     #[test]
-    fn rw_runs_and_ro_staged_and_unknown_mounts_are_denied() {
+    fn rw_and_staged_run_and_ro_and_unknown_mounts_are_denied() {
         let p = policy();
-        for a in [write("/workspace/rw", "x"), delete("/workspace/rw", "x")] {
-            assert_eq!(need(&p, &a), Need::Run);
+        for m in ["/workspace/rw", "/workspace/st"] {
+            assert_eq!(need(&p, &write(m, "x")), Need::Run, "{m}");
+            assert_eq!(need(&p, &delete(m, "x")), Need::Run, "{m}");
         }
-        for m in ["/workspace/ro", "/workspace/st"] {
-            assert_eq!(need(&p, &write(m, "x")), Need::Deny("read-only"));
-            assert_eq!(need(&p, &delete(m, "x")), Need::Deny("read-only"));
-        }
+        assert_eq!(
+            need(&p, &write("/workspace/ro", "x")),
+            Need::Deny("read-only")
+        );
+        assert_eq!(
+            need(&p, &delete("/workspace/ro", "x")),
+            Need::Deny("read-only")
+        );
         assert_eq!(
             need(&p, &write("/workspace/nope", "x")),
             Need::Deny("unknown-mount")
@@ -520,6 +549,72 @@ mod tests {
                 Need::Deny("bad-path")
             );
         }
+    }
+
+    fn read(mount: &str, rel: &str) -> Action {
+        Action::FsRead {
+            target: target(mount, rel),
+            offset: 0,
+            len: 1,
+        }
+    }
+
+    fn list(mount: &str, rel: &str) -> Action {
+        Action::FsList {
+            target: target(mount, rel),
+        }
+    }
+
+    // Architect ruling Q28: reads and listings run on every known mount and are never asked;
+    // the grant comes first, then the mount, then the path.
+    #[test]
+    fn reads_and_listings_run_on_every_mode_and_are_never_asked() {
+        let mut p = policy();
+        p.builtin.extend([BuiltinTool::FsRead, BuiltinTool::FsList]);
+        for m in [
+            "/workspace/ro",
+            "/workspace/rw",
+            "/workspace/st",
+            "/workspace/all",
+            "/workspace/notes",
+        ] {
+            assert_eq!(need(&p, &read(m, "a.md")), Need::Run, "{m}");
+            assert_eq!(need(&p, &list(m, "d")), Need::Run, "{m}");
+            assert_eq!(need(&p, &list(m, "")), Need::Run, "{m}");
+            assert_eq!(need(&p, &read(m, "")), Need::Deny("bad-path"), "{m}");
+            for bad in ["/a", "a/", "a//b", "./a", "a/..", "../a"] {
+                assert_eq!(need(&p, &read(m, bad)), Need::Deny("bad-path"), "{bad}");
+                assert_eq!(need(&p, &list(m, bad)), Need::Deny("bad-path"), "{bad}");
+            }
+        }
+        let too_long = "a".repeat(glob::MAX_PATH + 1);
+        assert_eq!(
+            need(&p, &read("/workspace/rw", &too_long)),
+            Need::Deny("bad-path")
+        );
+        // An unknown mount comes before a bad path.
+        assert_eq!(
+            need(&p, &read("/workspace/nope", "")),
+            Need::Deny("unknown-mount")
+        );
+        assert_eq!(
+            need(&p, &list("/workspace/nope", "a")),
+            Need::Deny("unknown-mount")
+        );
+        // The grant comes first, and one tool grants only itself.
+        p.builtin.retain(|t| *t != BuiltinTool::FsList);
+        assert_eq!(need(&p, &read("/workspace/rw", "a")), Need::Run);
+        assert_eq!(
+            need(&p, &list("/workspace/nope", "../x")),
+            Need::Deny("tool_not_granted")
+        );
+        p.builtin.retain(|t| *t != BuiltinTool::FsRead);
+        assert_eq!(
+            need(&p, &read("/workspace/rw", "a")),
+            Need::Deny("tool_not_granted")
+        );
+        p.builtin.push(BuiltinTool::FsList);
+        assert_eq!(need(&p, &list("/workspace/rw", "a")), Need::Run);
     }
 
     #[test]

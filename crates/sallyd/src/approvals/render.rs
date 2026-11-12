@@ -130,6 +130,12 @@ pub fn action_text(a: &Action) -> String {
             let args: Vec<String> = argv.iter().map(|x| quoted(x)).collect();
             format!("run [{}] in {}", args.join(" "), quoted(cwd))
         }
+        Action::FsRead {
+            target,
+            offset,
+            len,
+        } => format!("read at most {len} bytes at {offset} of {}", place(target)),
+        Action::FsList { target } => format!("list {}", place(target)),
         Action::FsWrite { target, content } => format!(
             "write {} bytes (sha256 {}) to {}",
             content.len(),
@@ -333,6 +339,22 @@ mod tests {
         assert_eq!(
             action_text(&d),
             "delete host \"/home/u/notes/x\" (guest \"/workspace/notes/x\")"
+        );
+        let r = Action::FsRead {
+            target: target("x"),
+            offset: 7,
+            len: 9,
+        };
+        assert_eq!(
+            action_text(&r),
+            "read at most 9 bytes at 7 of host \"/home/u/notes/x\" (guest \"/workspace/notes/x\")"
+        );
+        let l = Action::FsList {
+            target: target("x"),
+        };
+        assert_eq!(
+            action_text(&l),
+            "list host \"/home/u/notes/x\" (guest \"/workspace/notes/x\")"
         );
     }
 

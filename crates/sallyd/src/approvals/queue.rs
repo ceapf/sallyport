@@ -753,8 +753,9 @@ fn withdraw_by(why: Withdraw) -> (Actor, &'static str) {
     }
 }
 
-/// The bounded action fields of an audit entry (architect ruling Q24), from a bound action.
-fn fields(b: &Bound) -> Value {
+/// The bounded action fields of an audit entry (architect ruling Q24), from a bound action; the
+/// tools' own entries (`tool.run`, `tool.read`, `tool.result`) start from them too.
+pub(crate) fn fields(b: &Bound) -> Value {
     let text = render::action_text(&b.action);
     action_fields(b.call, &b.action.tool(), &text, &b.digest())
 }

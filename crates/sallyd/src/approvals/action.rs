@@ -71,6 +71,20 @@ pub enum Action {
         /// Guest working directory.
         cwd: String,
     },
+    /// `fs_read` on a mount: never asked (architect ruling Q28), but bound like every action.
+    FsRead {
+        /// The target.
+        target: Target,
+        /// First byte read.
+        offset: u64,
+        /// At most this many bytes.
+        len: u64,
+    },
+    /// `fs_list` on a mount; the only action whose target may be the mount root (empty `rel`).
+    FsList {
+        /// The directory.
+        target: Target,
+    },
     /// `fs_write` on a mount.
     FsWrite {
         /// The target.
@@ -110,7 +124,8 @@ pub enum Action {
 pub struct Target {
     /// The mount's guest root (`/workspace/notes`).
     pub mount: String,
-    /// The canonical path relative to the mount (no leading `/`, no `.`/`..`/empty segments).
+    /// The canonical path relative to the mount (no leading `/`, no `.`/`..`/empty segments;
+    /// empty only for the mount root of an `fs_list`).
     pub rel: String,
     /// The host realpath of the target.
     pub host: String,
@@ -120,7 +135,11 @@ impl Target {
     /// The guest path of the target.
     #[must_use]
     pub fn guest(&self) -> String {
-        format!("{}/{}", self.mount, self.rel)
+        if self.rel.is_empty() {
+            self.mount.clone()
+        } else {
+            format!("{}/{}", self.mount, self.rel)
+        }
     }
 }
 
@@ -130,6 +149,8 @@ impl Action {
     pub fn tool(&self) -> String {
         match self {
             Self::Shell { .. } => "shell".to_owned(),
+            Self::FsRead { .. } => "fs_read".to_owned(),
+            Self::FsList { .. } => "fs_list".to_owned(),
             Self::FsWrite { .. } => "fs_write".to_owned(),
             Self::FsDelete { .. } => "fs_delete".to_owned(),
             Self::Fetch { .. } => "fetch".to_owned(),
@@ -142,6 +163,14 @@ impl Action {
     pub fn canonical(&self) -> Value {
         match self {
             Self::Shell { argv, cwd } => json!({"tool": "shell", "argv": argv, "cwd": cwd}),
+            Self::FsRead {
+                target,
+                offset,
+                len,
+            } => json!({
+                "tool": "fs_read", "target": target_json(target), "offset": offset, "len": len,
+            }),
+            Self::FsList { target } => json!({"tool": "fs_list", "target": target_json(target)}),
             Self::FsWrite { target, content } => json!({
                 "tool": "fs_write", "target": target_json(target), "content": content.canonical(),
             }),
@@ -291,6 +320,55 @@ mod tests {
     }
 
     #[test]
+    fn reads_and_listings_bind_their_target_and_range() {
+        let r = |rel: &str, offset: u64, len: u64| {
+            bound(Action::FsRead {
+                target: target(rel),
+                offset,
+                len,
+            })
+            .digest()
+        };
+        let base = r("a.md", 0, 10);
+        assert_eq!(base, r("a.md", 0, 10));
+        assert_ne!(base, r("b.md", 0, 10));
+        assert_ne!(base, r("a.md", 1, 10));
+        assert_ne!(base, r("a.md", 0, 11));
+        let list = |rel: &str| {
+            bound(Action::FsList {
+                target: target(rel),
+            })
+            .digest()
+        };
+        assert_ne!(list("a.md"), base);
+        assert_ne!(list("a.md"), list(""));
+        assert_eq!(
+            Action::FsRead {
+                target: target("a.md"),
+                offset: 3,
+                len: 4,
+            }
+            .canonical(),
+            json!({"tool": "fs_read", "offset": 3, "len": 4, "target": {
+                "mount": "/workspace/notes", "rel": "a.md", "host": "/home/u/notes/a.md"}})
+        );
+        assert_eq!(
+            Action::FsList {
+                target: target("d"),
+            }
+            .canonical(),
+            json!({"tool": "fs_list", "target": {
+                "mount": "/workspace/notes", "rel": "d", "host": "/home/u/notes/d"}})
+        );
+    }
+
+    #[test]
+    fn the_mount_root_is_its_own_guest_path() {
+        assert_eq!(target("").guest(), "/workspace/notes");
+        assert_eq!(target("a").guest(), "/workspace/notes/a");
+    }
+
+    #[test]
     fn fetch_binds_method_url_header_values_and_body() {
         let f = |method: &str, url: &str, hdr: (&str, &str), body: &[u8]| {
             bound(Action::Fetch {
@@ -345,7 +423,20 @@ mod tests {
             content: payload(b""),
         };
         assert_eq!(w.tool(), "fs_write");
-        assert_eq!(Action::FsDelete { target: file }.tool(), "fs_delete");
+        assert_eq!(
+            Action::FsDelete {
+                target: file.clone()
+            }
+            .tool(),
+            "fs_delete"
+        );
+        let read = Action::FsRead {
+            target: file.clone(),
+            offset: 0,
+            len: 0,
+        };
+        assert_eq!(read.tool(), "fs_read");
+        assert_eq!(Action::FsList { target: file }.tool(), "fs_list");
         let f = Action::Fetch {
             method: "GET".to_owned(),
             url: String::new(),
