@@ -176,7 +176,7 @@ fn push_escaped(out: &mut String, c: char) {
 
 /// `text` (escaped ASCII) cut at `max` characters, never inside an escape, with an explicit tail
 /// naming what was cut; whether it was cut.
-fn cut(text: &str, max: usize) -> (String, bool) {
+pub(crate) fn cut(text: &str, max: usize) -> (String, bool) {
     if text.len() <= max {
         return (text.to_owned(), false);
     }

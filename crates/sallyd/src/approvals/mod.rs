@@ -3,4 +3,9 @@
 pub mod action;
 pub mod glob;
 pub mod policy;
+pub mod queue;
 pub mod render;
+
+pub use queue::{
+    Approver, Client, DecideError, Decision, Desk, Gate, Limits, Refusal, Ticket, Withdraw, new,
+};

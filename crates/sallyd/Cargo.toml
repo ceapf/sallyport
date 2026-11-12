@@ -24,7 +24,8 @@ rustls = { version = "0.23.46", default-features = false, features = ["ring", "s
 rustls-pki-types = { version = "1.16.0", features = ["std"] }
 time = { version = "0.3.55", default-features = false }
 # `net`: SO_PEERCRED for the peer-UID check on every broker socket (architect Q1).
-rustix = { version = "1.1.6", default-features = false, features = ["fs", "net", "process", "std"] }
+# `rand`: getrandom(2) for single-use approval ids (Task 10; no new crate).
+rustix = { version = "1.1.6", default-features = false, features = ["fs", "net", "process", "rand", "std"] }
 sally-core = { path = "../sally-core", version = "0.1.0" }
 # Already in the tree through serde_json; used directly for the duplicate-key-refusing parse.
 serde = "1.0.229"
