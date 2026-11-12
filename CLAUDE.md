@@ -87,8 +87,8 @@ container-free tests run: unit tests, all of sally-core's `tests/`, `sallyd` `ar
   summary,units}.rs`, `secrets/{store,secret}.rs`, `audit/{entry,redact,verify,writer,layout}.rs`,
   `fsutil.rs`, `fd.rs`; sallyd `sandbox/{argv,check,types,profiles,overlap,scan,images,changes,dirs,
   podman,disk,stage}.rs`, `sandbox/launch/error.rs`, `egress/{addr,authority,head,policy,server,
-  hostaddrs,tunnel,net,ca,roots}.rs` (net.rs tests stay hermetic: nothing leaves the machine),
-  `rpc/{agent,control,frame,json,listen,mcp,message,rate,record}.rs`,
+  hostaddrs,tunnel,net,ca,roots,rewrite,intercept,meter}.rs` (net.rs tests stay hermetic: nothing
+  leaves the machine), `rpc/{agent,control,frame,json,listen,mcp,message,rate,record}.rs`,
   `llm/{body,head,io,reply,server}.rs`, `approvals/{action,glob,handler,policy,queue,render}.rs`;
   sally-shim `args.rs`, `relay.rs`.
 
@@ -167,7 +167,10 @@ manually for the tasks marked opus). Subagents are the files in `.claude/agents/
 
 Two sessions may work in two worktrees at once; container tests are run-scoped
 (`scripts/test-run.sh`), so both may run `make test`/`make redteam` side by side.
-- Each lane rebases on `main` before its push.
+- Each lane rebases on `main` before its push. A branch with commits only on this machine is
+  pushed as a backup when a session is saved (no PR). After a rebase, a lane may
+  `git push --force-with-lease` its own unmerged branch; never `main`, never the other lane's
+  branch.
 - Merges still go one at a time.
 - A lane never touches the other lane's branch.
 - Shared files (`CLAUDE.md`, `REDTEAM_SUITE.md`, `.cargo/mutants.toml`, `Cargo.lock`): expect a

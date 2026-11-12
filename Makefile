@@ -43,13 +43,14 @@ test: test-scripts shim-check
 	$(TEST_RUN) $(CARGO) test -q --workspace
 
 # Shell-script tests (doctor's --redact filter, the commit trailer check, the mutation and
-# coverage gates, the test-run sweep).
+# coverage gates, the test-run sweep, the CI disk check).
 test-scripts:
 	bash tests/scripts/redact_test.sh
 	bash tests/scripts/check_trailers_test.sh
 	bash tests/scripts/mutants_gate_test.sh
 	bash tests/scripts/coverage_gate_test.sh
 	bash tests/scripts/test_run_test.sh
+	bash tests/scripts/disk_check_test.sh
 
 # CI runner (AMENDMENTS-01 §15). nextest skips doctests, so they run separately.
 nextest:
@@ -100,7 +101,7 @@ MUTANTS_WIDE_SALLYD := $(addprefix crates/sallyd/src/sandbox/,argv.rs check.rs t
                        overlap.rs scan.rs images.rs changes.rs dirs.rs podman.rs disk.rs stage.rs \
                        launch/error.rs) \
                        $(addprefix crates/sallyd/src/egress/,addr.rs authority.rs head.rs policy.rs server.rs \
-                       hostaddrs.rs tunnel.rs net.rs ca.rs roots.rs) \
+                       hostaddrs.rs tunnel.rs net.rs ca.rs roots.rs rewrite.rs intercept.rs meter.rs) \
                        $(addprefix crates/sallyd/src/rpc/,agent.rs control.rs frame.rs json.rs listen.rs mcp.rs \
                        message.rs rate.rs record.rs) \
                        $(addprefix crates/sallyd/src/llm/,body.rs head.rs io.rs reply.rs server.rs) \
@@ -130,7 +131,7 @@ zizmor:
 	zizmor --min-severity low .github/workflows
 
 # Fuzz smoke: 60 s per target (needs nightly + cargo-fuzz; CI pins both).
-FUZZ_TARGETS := manifest secrets audit_line egress_head jsonrpc_message llm_request
+FUZZ_TARGETS := manifest secrets audit_line egress_head egress_rewrite jsonrpc_message llm_request
 FUZZ_SECS ?= 60
 CARGO_FUZZ_TOOLCHAIN ?= +nightly
 fuzz:

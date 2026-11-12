@@ -462,7 +462,7 @@ impl Lx {
             .unwrap_or_else(|| resolve_podman(None, std::env::var_os("PATH").as_deref()).unwrap());
         let podman = Podman::setup(bin, &runtime, &state, &host).unwrap();
         let events = Arc::new(Events::default());
-        let egress = super::egress::fake_egress();
+        let egress = super::egress::fake_egress(&f.root);
         let launcher = Launcher::new(LauncherParts {
             podman: podman.clone(),
             runtime: runtime.clone(),

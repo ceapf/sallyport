@@ -6,6 +6,9 @@ line per fact, with where it was found. Check a note again before relying on it 
 
 ## Podman and crun
 
+- `/dev/shm` is read-only inside the workspace and harness containers (`sh: can't create
+  /dev/shm/…: Read-only file system`). (9a-2, RT-SEC-10)
+
 - A container's limits (`pids.max`, `memory.max`, `memory.swap.max`) sit in
   `/sys/fs/cgroup/<CgroupPath>/container`, not in the `libpod-<id>.scope` itself (that shows the
   host default). `<CgroupPath>` is `podman inspect --format '{{.State.CgroupPath}}'`. (6c-2, AG-09)
@@ -114,13 +117,86 @@ line per fact, with where it was found. Check a note again before relying on it 
   (`openssl verify`, Python `ssl`) and rustls-webpki 0.103 accept a leaf for `a.host`. A leaf
   for an unlisted name fails with "permitted subtree violation" / `NameConstraintViolation`.
 - Adding an excluded `dNSName` `.host` (leading dot) refuses the subdomains while `host` itself
-  still verifies, in OpenSSL 3.0.13, Python `ssl` and rustls-webpki 0.103 alike. GnuTLS (git on
-  Debian/Ubuntu) was not tested: no `certtool` on the dev host.
+  still verifies, in OpenSSL 3.0.13, Python `ssl`, rustls-webpki 0.103, GnuTLS 3.8.3 and Go 1.22
+  alike.
 - Path length 0 on the trust anchor: OpenSSL 3.0.13 refuses root → second CA → leaf ("path
-  length constraint exceeded"); rustls-webpki 0.103 accepts it, because a webpki trust anchor
+  length constraint exceeded"), and so do GnuTLS 3.8.3 and Go 1.22 ("too many intermediates
+  for path length constraint"); rustls-webpki 0.103 accepts it, because a webpki trust anchor
   keeps only subject, key and name constraints. Its name constraints still bind the whole
-  chain. So pathlen 0 binds OpenSSL clients (curl, Python, git, Node) only; prove it with
-  OpenSSL, never with a rustls verifier.
+  chain. So pathlen 0 binds OpenSSL, GnuTLS and Go clients (curl, Python, git, Node, Go
+  programs), not rustls ones; prove it with those, never with a rustls verifier.
+- GnuTLS (Task 9a-2, RT-SEC-10): `certtool --verify --load-ca-certificate=ca.pem
+  --infile=chain.pem --verify-hostname=<name> --verify-purpose=<id-kp-serverAuth OID>` (chain: the
+  leaf first, then intermediates; `--verify-hostname` takes an IP address too). Exit 0 and
+  "Verified. The certificate is trusted." for the grant leaf; exit 1 for every rogue chain with
+  "The certificate chain violates the signer's constraints." for a name constraint and for the
+  path length alike (GnuTLS reports neither which constraint nor the depth).
+- Go (`tests/redteam/tls/verify.go`, `crypto/x509` `Verify` with `DNSName`, which takes an IP
+  too, and `ExtKeyUsageServerAuth`): "DNS name … is not permitted by any constraint", "is
+  excluded by constraint \".mock.test\"", "IP address … is excluded by constraint
+  \"0.0.0.0/0\"". Built offline with `GOTOOLCHAIN=local GOPROXY=off GOTELEMETRY=off` and
+  `GOPATH`/`GOCACHE` under the test's directory.
+- `openssl verify` loads the default store too unless given `-no-CApath -no-CAstore`; IP names
+  need `-verify_ip`, not `-verify_hostname`. Python `ssl.create_default_context(cafile=…)` loads
+  that file only (no system roots); `server_hostname` takes an IP address.
+- Searching a container for key material: libcrypto and OpenSSL's `loader_attic.so` contain the
+  bare string `PRIVATE KEY`; match the armor `PRIVATE KEY-----` instead.
+
+## hyper 1.12 HTTP/1 (intercepted tunnels)
+
+Raw bytes into `server::conn::http1` over a duplex (Task 9a-2; architect Q51–Q53). Committed as
+tests in `egress/intercept_tests.rs` where the behaviour matters to the proxy.
+- `Transfer-Encoding: chunked` with `Content-Length`: the service sees only `transfer-encoding`;
+  hyper drops `Content-Length` and reads the body chunked.
+- `Content-Length` twice with the same value: merged into one. Different values, `1, 1` and
+  `+1`: hyper answers 400 itself (`Parse(Header(ContentLengthInvalid))` on the conn future).
+- `Transfer-Encoding: gzip` (no final chunked): 400 by hyper. `gzip, chunked`, `Chunked` and two
+  `chunked` lines reach the service unchanged.
+- Absolute-form, `*`, `CONNECT` inside the connection, HTTP/1.0, no `Host` and two `Host` all
+  reach the service. obs-fold is 400, 101 headers and a 9 KiB head are 431, all by hyper.
+- `header_read_timeout` needs `.timer(TokioTimer)`. It runs from when hyper starts waiting for
+  a head: before the first byte and during keep-alive idle too, not from the head's first byte.
+  Expiry is `Error::is_timeout()` with no reply. Consequence: an intercepted keep-alive tunnel
+  idle for `limits.head` (10 s) between requests is closed; accepted for v1, revisit in #64.
+- A body that fails on its first poll while the response head still sits in hyper's write
+  buffer: hyper drops the unflushed head with the connection, so the client sees nothing at all,
+  not a head and a cut. Which one a client sees depends on whether the body data was already
+  there when the head was written; a test of a cut must accept both.
+- `half_close` defaults to false: a client that shuts its sending side right after a request
+  gets no response. The proxy sets it true (a spliced tunnel carries half-close too).
+- `max_buf_size` is checked only after a read leaves the head incomplete, and one read can fill
+  all spare buffer capacity (`io.rs` reads into the whole `chunk_mut()`), so with `max_buf_size`
+  alone a head can pass well over it (a 65.5 KiB response head passed `max_buf_size(64 KiB)`).
+  `max_header_size` is checked both on a partial head (`curr_len >= max`) and on a complete one
+  (`parsed_len > max`, `role.rs`), so it is an exact cut whatever the reads: with it at 7168 /
+  61440, heads of 7168 / 61440 bytes pass and 7169 / 61441 are refused, whole or split (Task
+  9a-2 part 2; part 1 had read it as checked between reads only). `Meter::max_read` stays as
+  defense in depth.
+- The client accepts equal duplicate response `Content-Length`s, as two lines or one `6, 6`
+  list, and keeps every line in the `HeaderMap`; differing ones fail its parse
+  (`content_length_parse_all`, `headers.rs`). With `Transfer-Encoding: chunked` it reads chunked
+  and keeps the `Content-Length` header too. `rewrite::response` refuses all of these. (9a-2 R4)
+- The server never writes `Content-Length` on a 204 or 304 (`can_have_content_length`); a HEAD
+  answer keeps it. `Incoming::size_hint().exact()` on a client response is `Some(0)` for HEAD,
+  204 and 304, whatever the header says. (9a-2 R5)
+- Two requests pipelined behind a `Connection: close` response: in 15 of 15 runs the second was
+  never read (the tunnel closed after the first response), so the "upstream gone before the
+  entry" branch needs a direct test (`upstream_ready`). (9a-2 R1)
+- `SendRequest::ready()` errs once the client connection future is dropped, without any I/O. A
+  handshake over a `duplex` whose connection future is dropped gives a closed sender. (9a-2 R1)
+- A connection future that completed cleanly but is kept does **not** fail `ready()`: after a
+  `Connection: close` response it stays pending, after keep-alive plus EOF it is `Ok` and
+  `send_request` never completes (no `want::Taker` cancel on a clean shutdown). Drop the
+  connection future when it completes. (9a-2 rust re-review H1, reviewer's probe)
+- A response for which the server disabled keep-alive mid-exchange (`graceful_shutdown`) carries
+  hyper's own `connection: close`, and a pipelined request behind it is never read. (9a-2 H1)
+- `graceful_shutdown` on the server keeps reading a head it holds part of only on the
+  connection's **first** request (`KA::Busy` until a head parses, `conn.rs`). It closes at once
+  when the keep-alive state is `Idle` (a partial head after a finished exchange is dropped) or
+  when nothing has reached hyper's read buffer yet (`dispatch.rs` `disable_keep_alive`, even if
+  bytes wait in the transport). A test of a head refused after the upstream ended must let hyper
+  buffer part of the first head before the upstream hangs up; `select!`'s random branch order
+  otherwise makes it pass or fail by chance (10 of 30). (9a-2 RQ1)
 
 ## Test writing
 

@@ -1,0 +1,6 @@
+GET / HTTP/1.1
+Host: api.mock.test
+Connection: Upgrade, HTTP2-Settings
+Upgrade: h2c
+HTTP2-Settings: AAMAAABkAAQAAP__
+

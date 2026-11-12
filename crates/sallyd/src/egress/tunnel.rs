@@ -29,6 +29,16 @@ pub enum End {
     SessionStopped,
     /// No pinned address accepted the connection; there was no tunnel.
     ConnectFailed,
+    /// Intercepted: the upstream TLS handshake or verification failed (before the `200`).
+    UpstreamTlsFailed,
+    /// Intercepted: the client's TLS handshake failed or timed out.
+    ClientTlsFailed,
+    /// Intercepted: a request was refused (`egress.deny`).
+    Refused,
+    /// Intercepted: a limit ended the tunnel (`egress.limit`).
+    Limit,
+    /// Intercepted: the upstream closed during an exchange.
+    UpstreamClosed,
 }
 
 impl End {
@@ -41,7 +51,18 @@ impl End {
             Self::Error => "error",
             Self::SessionStopped => "session-stopped",
             Self::ConnectFailed => "connect-failed",
+            Self::UpstreamTlsFailed => "upstream-tls-failed",
+            Self::ClientTlsFailed => "client-tls-failed",
+            Self::Refused => "refused",
+            Self::Limit => "limit",
+            Self::UpstreamClosed => "upstream-closed",
         }
+    }
+}
+
+impl Default for Activity {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -57,25 +78,31 @@ pub struct Totals {
 }
 
 /// The time of the last byte moved in either direction, as milliseconds since `start`.
-struct Activity {
+#[derive(Debug)]
+pub struct Activity {
     start: Instant,
     last_ms: AtomicU64,
 }
 
 impl Activity {
-    fn new() -> Self {
+    /// Activity starting now.
+    #[must_use]
+    pub fn new() -> Self {
         Self {
             start: Instant::now(),
             last_ms: AtomicU64::new(0),
         }
     }
 
-    fn touch(&self) {
+    /// A byte moved now.
+    pub fn touch(&self) {
         let ms = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.last_ms.fetch_max(ms, Ordering::Relaxed);
     }
 
-    fn last(&self) -> Instant {
+    /// When the last byte moved.
+    #[must_use]
+    pub fn last(&self) -> Instant {
         self.start + Duration::from_millis(self.last_ms.load(Ordering::Relaxed))
     }
 }
@@ -301,6 +328,11 @@ mod tests {
         assert_eq!(End::Error.as_str(), "error");
         assert_eq!(End::SessionStopped.as_str(), "session-stopped");
         assert_eq!(End::ConnectFailed.as_str(), "connect-failed");
+        assert_eq!(End::UpstreamTlsFailed.as_str(), "upstream-tls-failed");
+        assert_eq!(End::ClientTlsFailed.as_str(), "client-tls-failed");
+        assert_eq!(End::Refused.as_str(), "refused");
+        assert_eq!(End::Limit.as_str(), "limit");
+        assert_eq!(End::UpstreamClosed.as_str(), "upstream-closed");
         assert_eq!(BUF_BYTES, 16_384);
         assert_eq!(IDLE_LIMIT, Duration::from_secs(300));
     }

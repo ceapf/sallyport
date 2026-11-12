@@ -66,9 +66,6 @@ pub enum Code {
     /// A mount tree contains a Unix socket. Emitted by the bounded launch-time scan (sandbox
     /// driver), not by validation.
     SocketInMount,
-    /// A plain-HTTP request to a host with a secret grant. Emitted by the egress proxy (403);
-    /// credentials are injected only inside TLS the proxy terminates.
-    InjectRequiresTls,
     /// Private data (a mount or secret) and an outward channel (an allow rule) coexist
     /// (warning; AMENDMENTS §5).
     DataCanLeave,
@@ -111,7 +108,6 @@ impl Code {
             Self::UnacknowledgedRisk => "unacknowledged-risk",
             Self::ProtectedPath => "protected-path",
             Self::SocketInMount => "socket-in-mount",
-            Self::InjectRequiresTls => "inject-requires-tls",
             Self::DataCanLeave => "data-can-leave",
             Self::Inconsistent => "inconsistent",
             Self::Risky => "risky",

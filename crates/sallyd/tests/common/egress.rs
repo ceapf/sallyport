@@ -8,11 +8,14 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use sallyd::egress::net::Egress;
 use sallyd::egress::server::{Dialer, HostAddrs, Resolver};
-use tokio::io::{AsyncWriteExt, DuplexStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 /// A globally routed address for fake answers.
 pub fn public(n: u8) -> IpAddr {
@@ -58,16 +61,30 @@ impl Resolver for Names {
     }
 }
 
-/// Connects every pinned address to an in-process echo server; records the attempts.
-#[derive(Default)]
+/// The address a name must resolve to for its upstream to speak TLS (Task 9a-2).
+pub fn tls_upstream() -> IpAddr {
+    public(200)
+}
+
+/// Connects every pinned address to an in-process server: [`tls_upstream`] to a TLS mock HTTP
+/// server presenting [`Pki::server`], any other to an echo server. Records the attempts and the
+/// requests the TLS server received.
 pub struct Upstream {
     dials: Mutex<Vec<SocketAddr>>,
+    seen: Arc<Mutex<Vec<String>>>,
+    /// The test PKI the TLS server uses.
+    pub pki: Pki,
 }
 
 impl Upstream {
     /// Every address dialled so far, in order.
     pub fn dials(&self) -> Vec<SocketAddr> {
         self.dials.lock().unwrap().clone()
+    }
+
+    /// Every request (head and body) the TLS server received, in order.
+    pub fn seen(&self) -> Vec<String> {
+        self.seen.lock().unwrap().clone()
     }
 }
 
@@ -76,12 +93,119 @@ impl Dialer for Upstream {
     async fn dial(&self, to: SocketAddr) -> io::Result<DuplexStream> {
         self.dials.lock().unwrap().push(to);
         let (near, mut far) = tokio::io::duplex(64 * 1024);
+        if to.ip() == tls_upstream() {
+            let (cfg, seen) = (Arc::clone(&self.pki.server), Arc::clone(&self.seen));
+            tokio::spawn(serve_tls(far, cfg, seen));
+            return Ok(near);
+        }
         tokio::spawn(async move {
             let (mut r, mut w) = tokio::io::split(&mut far);
             let _ = tokio::io::copy(&mut r, &mut w).await;
             let _ = w.shutdown().await;
         });
         Ok(near)
+    }
+}
+
+/// A test CA and one leaf for `mock.test`, `*.mock.test`, `mock2.test` and `mock3.test`, as an
+/// upstream would
+/// have; the CA is the only certificate in the roots file the starter loads.
+pub struct Pki {
+    /// The CA certificate (PEM), as written to the roots file.
+    pub ca_pem: String,
+    /// The leaf the TLS upstream presents.
+    pub leaf: CertificateDer<'static>,
+    /// Its server configuration.
+    pub server: Arc<rustls::ServerConfig>,
+}
+
+impl Pki {
+    fn new() -> Self {
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca.distinguished_name
+            .push(DnType::CommonName, "Test upstream CA");
+        let ca_cert = ca.self_signed(&ca_key).unwrap();
+        let issuer = Issuer::new(ca, ca_key);
+        let leaf_key = KeyPair::generate().unwrap();
+        let names = ["mock.test", "*.mock.test", "mock2.test", "mock3.test"].map(str::to_owned);
+        let leaf = CertificateParams::new(names.to_vec())
+            .unwrap()
+            .signed_by(&leaf_key, &issuer)
+            .unwrap();
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
+        let server = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![leaf.der().clone()], key)
+        .unwrap();
+        Self {
+            ca_pem: ca_cert.pem(),
+            leaf: leaf.der().clone(),
+            server: Arc::new(server),
+        }
+    }
+}
+
+/// The TLS mock HTTP server: one request at a time; `/echo-headers` returns the request it got,
+/// `/redirect` a 302 to `https://mock2.test/echo-headers`, `/echo-gzip` a gzip-encoded body,
+/// anything else `ok`.
+async fn serve_tls(
+    far: DuplexStream,
+    cfg: Arc<rustls::ServerConfig>,
+    seen: Arc<Mutex<Vec<String>>>,
+) {
+    let Ok(mut tls) = tokio_rustls::TlsAcceptor::from(cfg).accept(far).await else {
+        return;
+    };
+    let mut buf = Vec::new();
+    while let Some(req) = read_request(&mut tls, &mut buf).await {
+        seen.lock().unwrap().push(req.clone());
+        let path = req.split(' ').nth(1).unwrap_or("/");
+        let (status, extra, body) = match path {
+            "/echo-headers" => ("200 OK", "", req.clone()),
+            "/redirect" => (
+                "302 Found",
+                "Location: https://mock2.test/echo-headers\r\n",
+                String::new(),
+            ),
+            "/echo-gzip" => ("200 OK", "Content-Encoding: gzip\r\n", "GZIPPED".into()),
+            _ => ("200 OK", "", "ok".into()),
+        };
+        let resp = format!(
+            "HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        if tls.write_all(resp.as_bytes()).await.is_err() || tls.flush().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// One request (head, and a `Content-Length` body) from `s`.
+async fn read_request<S: AsyncRead + Unpin>(s: &mut S, buf: &mut Vec<u8>) -> Option<String> {
+    loop {
+        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&buf[..end + 4]).to_ascii_lowercase();
+            let n = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length: "))
+                .map_or(0, |v| v.trim().parse::<usize>().unwrap_or(0));
+            if buf.len() >= end + 4 + n {
+                let req: Vec<u8> = buf.drain(..end + 4 + n).collect();
+                return Some(String::from_utf8_lossy(&req).into_owned());
+            }
+        }
+        let mut chunk = [0u8; 4096];
+        match s.read(&mut chunk).await {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
     }
 }
 
@@ -105,12 +229,25 @@ impl HostAddrs for Owned {
 /// The starter the fixtures hand the launcher.
 pub type FakeEgress = Egress<Names, Upstream, Owned>;
 
-/// A starter with no names, an echo upstream, no own addresses and the system trust roots.
-pub fn fake_egress() -> Arc<FakeEgress> {
+/// A starter with no names, the echo and TLS upstreams, no own addresses, and as trust roots
+/// the test CA only: written to `dir/upstream-ca.pem` (0644, owned by the test user, the owner
+/// the starter is built to require; production passes the system bundle and uid 0).
+pub fn fake_egress(dir: &Path) -> Arc<FakeEgress> {
+    let pki = Pki::new();
+    let roots = dir.join("upstream-ca.pem");
+    std::fs::write(&roots, &pki.ca_pem).unwrap();
+    std::fs::set_permissions(&roots, std::fs::Permissions::from_mode(0o644)).unwrap();
     Arc::new(Egress {
         resolver: Arc::new(Names::default()),
-        dialer: Arc::new(Upstream::default()),
+        dialer: Arc::new(Upstream {
+            dials: Mutex::default(),
+            seen: Arc::default(),
+            pki,
+        }),
         host: Arc::new(Owned::default()),
-        roots: sallyd::egress::roots::BundleFiles::default(),
+        roots: sallyd::egress::roots::BundleFiles {
+            paths: vec![roots],
+            owner: rustix::process::getuid().as_raw(),
+        },
     })
 }

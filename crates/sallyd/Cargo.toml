@@ -13,14 +13,15 @@ workspace = true
 
 [dependencies]
 httparse = "1.10.1"
-# llm.sock: the HTTP/1.1 server (Task 7 decision 7; architect Q10). Server and http1 only.
+# llm.sock: the HTTP/1.1 server (Task 7 decision 7; architect Q10). Task 9a-2 (architect Q32):
+# also the client, for HTTP/1.1 inside intercepted tunnels. http1 only; no http2.
 http-body-util = "0.1.5"
-hyper = { version = "1.12.0", default-features = false, features = ["http1", "server"] }
+hyper = { version = "1.12.0", default-features = false, features = ["http1", "client", "server"] }
 # TokioIo for hyper on tokio streams (a hand-written adapter would need unsafe).
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
 pem = { version = "4.0.0", default-features = false, features = ["std"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring", "zeroize"] }
-rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = { version = "1.16.0", features = ["std"] }
 time = { version = "0.3.55", default-features = false }
 # `net`: SO_PEERCRED for the peer-UID check on every broker socket (architect Q1).
@@ -34,6 +35,8 @@ serde_json = "1.0.154"
 sha2 = "0.11.1"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", default-features = false, features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
+# Task 9a-2: TLS termination and re-origination inside intercepted tunnels.
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
 
 [dev-dependencies]
 insta = "1.49.0"

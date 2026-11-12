@@ -676,7 +676,6 @@ fn summary_explains_protected_git_files_and_what_is_not_covered() {
 #[test]
 fn new_codes_have_stable_spellings() {
     for (c, s) in [
-        (Code::InjectRequiresTls, "inject-requires-tls"),
         (Code::ProtectedPath, "protected-path"),
         (Code::SocketInMount, "socket-in-mount"),
         (Code::DataCanLeave, "data-can-leave"),

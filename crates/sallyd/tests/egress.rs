@@ -143,8 +143,13 @@ fn the_session_ca_files_reach_the_workspace_read_only_and_only_with_secrets() {
         for f in [BUNDLE_FILE, CA_FILE] {
             assert!(!harness.join(f).exists(), "{f} in the harness directory");
         }
-        let still = via_shim(&r, &connect("mock.test:443")).await;
-        assert!(still.contains("grant-host-unavailable"), "{still}");
+        // Task 9a-2 (architect Q47 (4)): the grant host is now intercepted, so CONNECT from
+        // inside the container gets its 200 once the upstream verified.
+        lx.egress
+            .resolver
+            .set("mock.test", vec![vec![common::egress::tls_upstream()]]);
+        let opened = via_shim(&r, &connect("mock.test:443")).await;
+        assert!(opened.starts_with("HTTP/1.1 200 "), "{opened}");
         lx.stop(r).await;
         let r = session(&lx, NET, "ca0").await;
         let (_, ls) = exec(&r, "ls -A /run/sallyport").await;
@@ -593,6 +598,7 @@ fn listen(
             SessionEgress {
                 policy: Policy::new(vec![rule], vec![]),
                 max_connections,
+                body_caps: (1 << 20, 1 << 20),
                 session: "rt-net-09".into(),
                 level: sally_core::manifest::AuditLevel::default(),
                 audit,

@@ -39,16 +39,29 @@ jobs:
         run: cargo nextest --version | grep -Fw "$CARGO_NEXTEST_VERSION"
       # Container tests (crates/sallyd/tests/*.rs) need rootless podman, their base image pulled
       # by digest, a C compiler for the red-team probe (tests/redteam/probe) and strace (RT-SUP-02);
-      # the test images are built without a network. They never skip.
+      # the test images are built without a network. They never skip. RT-SEC-10 verifies with
+      # OpenSSL, Python ssl, GnuTLS certtool and Go crypto/x509 (offline; architect Q46).
       - name: container test prerequisites
         run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends gnutls-bin golang-go
+          certtool --version | head -n1
+          command -v go && go version
+          openssl version
+          python3 --version
           podman --version
           cc --version | head -n1
           strace -V | head -n1
           test -n "$XDG_RUNTIME_DIR"
           podman info --format '{{.Host.CgroupsVersion}} {{.Host.OCIRuntime.Path}}'
           podman pull docker.io/library/alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
-      - run: make fmt clippy forbid-unsafe nextest shim-check
+      - run: make fmt clippy forbid-unsafe
+      # Build the test binaries first, so the disk check sees what the container tests will
+      # have: a runner image with less disk fails here with its own message (scripts/disk-check.sh).
+      - run: cargo nextest run --locked --workspace --no-run
+      - name: disk space for container launches
+        run: scripts/disk-check.sh target "$(podman info --format '{{.Store.GraphRoot}}')"
+      - run: make nextest shim-check
   # The red-team rows implemented so far (`make redteam`); a required check from Task 6c on.
   redteam:
     runs-on: ubuntu-24.04
@@ -68,12 +81,21 @@ jobs:
         run: cargo nextest --version | grep -Fw "$CARGO_NEXTEST_VERSION"
       - name: red-team prerequisites
         run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends gnutls-bin golang-go
+          certtool --version | head -n1
+          command -v go && go version
+          openssl version
+          python3 --version
           podman --version
           cc --version | head -n1
           strace -V | head -n1
           test -n "$XDG_RUNTIME_DIR"
           podman info --format '{{.Host.CgroupsVersion}} {{.Host.OCIRuntime.Path}}'
           podman pull docker.io/library/alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+      - run: cargo nextest run --locked --workspace --no-run
+      - name: disk space for container launches
+        run: scripts/disk-check.sh target "$(podman info --format '{{.Store.GraphRoot}}')"
       - run: make redteam
   coverage:
     runs-on: ubuntu-24.04

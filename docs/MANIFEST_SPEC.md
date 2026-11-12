@@ -250,8 +250,8 @@ filter (no loopback/private/link-local/host-own) and requires
 Injection happens **only inside TLS the proxy terminates** (AMENDMENTS-01 §4): on `CONNECT` to a
 grant host the proxy presents a leaf from a per-session, name-constrained CA, injects, and
 re-originates TLS to the verified upstream. Allowed hosts without a grant are spliced untouched.
-A plain-HTTP request to a grant host is refused 403 `inject-requires-tls`; credentials never
-travel over upstream plaintext.
+Every plain-HTTP request, to a grant host or any other, is refused 405 `plain-http-unsupported`
+before policy (Task 8); credentials never travel over upstream plaintext.
 
 The host must have its own **exact** rule in `network.allow` (a matching `*.github.com` or `*`
 rule is not enough), and `network.mode` must be `proxy`. The same secret may be granted to
@@ -370,10 +370,10 @@ validation — otherwise `mount-changed`/`is-symlink` (RT-FS-06).
 | `network.allow[]` | `sallyd::egress::policy` on every CONNECT request (v1 has no absolute-form forwarding: 405 `plain-http-unsupported`) | each connection | HTTP 403, audit `egress.deny` |
 | `network.acknowledge_unrestricted_egress` | validator | validate | reject if `*` without ack |
 | `network.max_connections` | `sallyd::egress::server` admission, decided at accept before any byte is read | each connection | 429 `too-many-connections`, audit `egress.limit` |
-| `network.max_request_bytes`/`max_response_bytes` | `sallyd::egress::inject` body caps (Task 9a, #45: intercepted requests only; a CONNECT tunnel is opaque) | each intercepted request | 413, audit |
+| `network.max_request_bytes`/`max_response_bytes` | `sallyd::egress::server::intercept` body caps (Task 9a-2: intercepted requests only; a spliced tunnel is opaque; body bytes after chunk decoding, per message) | each intercepted request and response | 413 request / 502 response, audit `egress.limit` |
 | `secrets[].name` | validator checks store; `sallyd::egress::inject` | validate + each matching request | reject if missing |
 | `secrets[].inject.host` | validator (exact host, must be allowed) + inject | validate + request | reject |
-| `secrets[].inject.header/format/basic_user` | validator + inject (TLS-terminated grant hosts only) | validate + request | reject; plain HTTP to a grant host → 403 `inject-requires-tls` |
+| `secrets[].inject.header/format/basic_user` | validator + inject (TLS-terminated grant hosts only; from Task 9a-2 every client copy of the header is dropped, Task 9a-3 sets it) | validate + request | reject; plain HTTP to any host → 405 `plain-http-unsupported` |
 | `secrets[].expose_env` | validator (name rule) + workspace `--env NAME=sallyport-placeholder` | validate + launch | reject |
 | `tools.builtin` | `sallyd::tools` dispatch table per session | each `tools/call` on `agent.sock` | `isError: true`, `denied: <code>`, audit `tool.deny` |
 | `tools.shell` | `sallyd::tools::shell` → `podman exec` after policy | each shell call | deny / pending / run |
@@ -427,7 +427,6 @@ never on message text); the field path uses `a.b[0].c` form.
 | `unacknowledged-risk` | an `acknowledge_*` flag is needed (§1.1) |
 | `protected-path` | writable mount inside `.git`; also the broker's denial code for protected-path writes |
 | `socket-in-mount` | launch-time bounded scan found a Unix socket in a mount tree (sandbox driver, task 6) |
-| `inject-requires-tls` | plain-HTTP request to a grant host (egress proxy, 403) |
 | `data-can-leave` | private data and an outward channel coexist (warning) |
 | `inconsistent` / `risky` | warnings only |
 

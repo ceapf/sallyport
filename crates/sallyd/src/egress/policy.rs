@@ -27,7 +27,8 @@ pub enum Reason {
     ConnectFailed,
     /// Not a CONNECT request (v1 has no plain-HTTP forwarding).
     PlainHttpUnsupported,
-    /// The host has a secret grant; served only once the token proxy exists (Task 9a).
+    /// The host has a secret grant, but the proxy holds no session CA leaf for it, so it can be
+    /// neither intercepted nor (ever) spliced (architect Q39: fail closed).
     GrantHostUnavailable,
     /// The session's `network.max_connections` is reached.
     TooManyConnections,
@@ -37,6 +38,27 @@ pub enum Reason {
     HeadTimeout,
     /// Not a usable request.
     Malformed,
+    /// In an intercepted tunnel: the `Host` header names another authority (architect Q29).
+    HostMismatch,
+    /// In an intercepted tunnel: the request asks for a protocol upgrade (decision 5).
+    UpgradeRefused,
+    /// In an intercepted tunnel: the method is `TRACE`, which would echo the request back
+    /// (architect ruling R6, 9a-2 review).
+    MethodRefused,
+    /// In an intercepted tunnel: the request body is over `network.max_request_bytes`.
+    RequestTooLarge,
+    /// In an intercepted tunnel: the response body is over `network.max_response_bytes`, or its
+    /// head over 64 KiB or 100 headers.
+    ResponseTooLarge,
+    /// In an intercepted tunnel: the response is compressed, framed other than plain chunked, or
+    /// an upgrade (architect Q30).
+    UpstreamEncoded,
+    /// The upstream TLS handshake or its certificate verification failed (architect Q28).
+    UpstreamTlsFailed,
+    /// The upstream closed before it sent a response head (architect Q43).
+    UpstreamClosed,
+    /// The upstream's response head is not HTTP/1.x (architect Q45).
+    UpstreamMalformed,
 }
 
 impl Reason {
@@ -56,6 +78,15 @@ impl Reason {
             Self::HeadTooLarge => "head-too-large",
             Self::HeadTimeout => "head-timeout",
             Self::Malformed => "malformed",
+            Self::HostMismatch => "host-mismatch",
+            Self::UpgradeRefused => "upgrade-refused",
+            Self::MethodRefused => "method-refused",
+            Self::RequestTooLarge => "request-too-large",
+            Self::ResponseTooLarge => "response-too-large",
+            Self::UpstreamEncoded => "upstream-encoded",
+            Self::UpstreamTlsFailed => "upstream-tls-failed",
+            Self::UpstreamClosed => "upstream-closed",
+            Self::UpstreamMalformed => "upstream-malformed",
         }
     }
 
@@ -68,13 +99,22 @@ impl Reason {
             | Self::PortNotAllowed
             | Self::IpLiteral
             | Self::IpRangeDenied
-            | Self::GrantHostUnavailable => 403,
-            Self::ResolveFailed | Self::ConnectFailed => 502,
-            Self::PlainHttpUnsupported => 405,
+            | Self::GrantHostUnavailable
+            | Self::UpgradeRefused => 403,
+            Self::ResolveFailed
+            | Self::ConnectFailed
+            | Self::ResponseTooLarge
+            | Self::UpstreamEncoded
+            | Self::UpstreamTlsFailed
+            | Self::UpstreamClosed
+            | Self::UpstreamMalformed => 502,
+            Self::PlainHttpUnsupported | Self::MethodRefused => 405,
             Self::TooManyConnections => 429,
             Self::HeadTooLarge => 431,
             Self::HeadTimeout => 408,
             Self::Malformed => 400,
+            Self::HostMismatch => 421,
+            Self::RequestTooLarge => 413,
         }
     }
 
@@ -84,9 +124,31 @@ impl Reason {
     pub fn is_limit(self) -> bool {
         matches!(
             self,
-            Self::TooManyConnections | Self::HeadTooLarge | Self::HeadTimeout
+            Self::TooManyConnections
+                | Self::HeadTooLarge
+                | Self::HeadTimeout
+                | Self::RequestTooLarge
+                | Self::ResponseTooLarge
         )
     }
+}
+
+/// Where an allowed request goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// A host without a secret grant: the tunnel is spliced untouched (Task 8).
+    Splice,
+    /// A grant host: TLS is terminated with the session CA's leaf (Task 9a-2).
+    Intercept,
+}
+
+/// One secret grant as the proxy sees it: the host and the header name, never the value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Grant {
+    /// The normalized injection host.
+    pub host: String,
+    /// The header the secret is injected into, as the manifest spells it.
+    pub header: String,
 }
 
 /// One allow rule: a host pattern and its ports.
@@ -102,19 +164,19 @@ pub struct Rule {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Policy {
     rules: Vec<Rule>,
-    grant_hosts: Vec<String>,
+    grants: Vec<Grant>,
 }
 
 impl Policy {
-    /// A policy from the session's allow rules and the hosts its secrets are injected into.
+    /// A policy from the session's allow rules and its secret grants (hosts and header names).
     #[must_use]
-    pub fn new(rules: Vec<Rule>, grant_hosts: Vec<String>) -> Self {
-        Self { rules, grant_hosts }
+    pub fn new(rules: Vec<Rule>, grants: Vec<Grant>) -> Self {
+        Self { rules, grants }
     }
 
-    /// The policy of a validated manifest: its `network.allow` rules and the injection host of
-    /// every secret grant. The validator already checked both; an injection host that is not a
-    /// hostname cannot match a normalized authority and is left out.
+    /// The policy of a validated manifest: its `network.allow` rules and the injection host and
+    /// header of every secret grant. The validator already checked both; an injection host that
+    /// is not a hostname cannot match a normalized authority and is left out.
     #[must_use]
     pub fn from_manifest(v: &ValidatedManifest) -> Self {
         let rules = v
@@ -125,28 +187,47 @@ impl Policy {
                 ports: r.ports.clone(),
             })
             .collect();
-        let grant_hosts = v
+        let grants = v
             .manifest()
             .secrets
             .iter()
-            .filter_map(|s| parse_hostname(&s.inject.host).ok())
+            .filter_map(|s| {
+                parse_hostname(&s.inject.host).ok().map(|host| Grant {
+                    host,
+                    header: s.inject.header.clone(),
+                })
+            })
             .collect();
-        Self::new(rules, grant_hosts)
+        Self::new(rules, grants)
     }
 
     /// The injection hosts of the session's secret grants, normalized, in manifest order (a host
     /// may repeat).
     #[must_use]
-    pub fn grant_hosts(&self) -> &[String] {
-        &self.grant_hosts
+    pub fn grant_hosts(&self) -> Vec<String> {
+        self.grants.iter().map(|g| g.host.clone()).collect()
     }
 
-    /// Decides on `a` before anything is resolved.
+    /// The header names of every grant of `host`, lower-cased, each once, in manifest order:
+    /// every client copy of them is dropped inside the tunnel (architect Q40).
+    #[must_use]
+    pub fn grant_headers(&self, host: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for g in self.grants.iter().filter(|g| g.host == host) {
+            let name = g.header.to_ascii_lowercase();
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+        out
+    }
+
+    /// Decides on `a` before anything is resolved: refused, or the route it takes. A grant host
+    /// is intercepted on every allowed port, whichever rule matched, and never spliced.
     ///
     /// # Errors
-    /// [`Reason::HostNotAllowed`], [`Reason::PortNotAllowed`] or
-    /// [`Reason::GrantHostUnavailable`].
-    pub fn decide(&self, a: &Authority) -> Result<(), Reason> {
+    /// [`Reason::HostNotAllowed`] or [`Reason::PortNotAllowed`].
+    pub fn decide(&self, a: &Authority) -> Result<Route, Reason> {
         let mut matching = self
             .rules
             .iter()
@@ -158,12 +239,10 @@ impl Policy {
         if !matching.any(|r| r.ports.contains(&a.port)) {
             return Err(Reason::PortNotAllowed);
         }
-        // TODO(#45): Task 9a serves grant hosts through the token proxy. Until then they are
-        // refused, whichever rule matched, and never spliced.
-        if self.grant_hosts.contains(&a.host) {
-            return Err(Reason::GrantHostUnavailable);
+        if self.grants.iter().any(|g| g.host == a.host) {
+            return Ok(Route::Intercept);
         }
-        Ok(())
+        Ok(Route::Splice)
     }
 }
 
@@ -190,8 +269,8 @@ mod tests {
     #[test]
     fn wildcard_rules_match_on_label_boundaries_only() {
         let p = Policy::new(vec![rule("*.mock.test", &[443])], vec![]);
-        assert_eq!(p.decide(&at("a.mock.test", 443)), Ok(()));
-        assert_eq!(p.decide(&at("b.a.mock.test", 443)), Ok(()));
+        assert_eq!(p.decide(&at("a.mock.test", 443)), Ok(Route::Splice));
+        assert_eq!(p.decide(&at("b.a.mock.test", 443)), Ok(Route::Splice));
         for denied in ["mock.test", "mock.test.evil.test", "xmock.test"] {
             assert_eq!(
                 p.decide(&at(denied, 443)),
@@ -207,8 +286,8 @@ mod tests {
             vec![rule("a.mock.test", &[443]), rule("*.mock.test", &[8443])],
             vec![],
         );
-        assert_eq!(p.decide(&at("a.mock.test", 443)), Ok(()));
-        assert_eq!(p.decide(&at("a.mock.test", 8443)), Ok(()));
+        assert_eq!(p.decide(&at("a.mock.test", 443)), Ok(Route::Splice));
+        assert_eq!(p.decide(&at("a.mock.test", 8443)), Ok(Route::Splice));
         assert_eq!(
             p.decide(&at("a.mock.test", 22)),
             Err(Reason::PortNotAllowed)
@@ -223,24 +302,61 @@ mod tests {
         );
     }
 
+    fn grant(host: &str, header: &str) -> Grant {
+        Grant {
+            host: host.to_owned(),
+            header: header.to_owned(),
+        }
+    }
+
     #[test]
-    fn grant_hosts_are_refused_after_host_and_port_whichever_rule_matched() {
-        let grants = vec!["api.mock.test".to_owned()];
-        let exact = Policy::new(vec![rule("api.mock.test", &[443])], grants.clone());
+    fn grant_hosts_are_intercepted_after_host_and_port_whichever_rule_matched() {
+        let grants = vec![grant("api.mock.test", "authorization")];
+        let exact = Policy::new(vec![rule("api.mock.test", &[443, 8443])], grants.clone());
         assert_eq!(
             exact.decide(&at("api.mock.test", 443)),
-            Err(Reason::GrantHostUnavailable)
+            Ok(Route::Intercept)
+        );
+        assert_eq!(
+            exact.decide(&at("api.mock.test", 8443)),
+            Ok(Route::Intercept)
         );
         assert_eq!(
             exact.decide(&at("api.mock.test", 22)),
             Err(Reason::PortNotAllowed)
         );
         let any = Policy::new(vec![rule("*", &[443])], grants);
-        assert_eq!(
-            any.decide(&at("api.mock.test", 443)),
-            Err(Reason::GrantHostUnavailable)
+        assert_eq!(any.decide(&at("api.mock.test", 443)), Ok(Route::Intercept));
+        assert_eq!(any.decide(&at("www.mock.test", 443)), Ok(Route::Splice));
+        assert_eq!(any.decide(&at("x.api.mock.test", 443)), Ok(Route::Splice));
+    }
+
+    #[test]
+    fn the_headers_to_drop_are_every_grant_header_of_that_host_lower_cased() {
+        let p = Policy::new(
+            vec![rule("*", &[443])],
+            vec![
+                grant("api.mock.test", "Authorization"),
+                grant("api.mock.test", "X-Api-Key"),
+                grant("api.mock.test", "authorization"),
+                grant("other.mock.test", "X-Other"),
+            ],
         );
-        assert_eq!(any.decide(&at("www.mock.test", 443)), Ok(()));
+        assert_eq!(
+            p.grant_headers("api.mock.test"),
+            ["authorization", "x-api-key"]
+        );
+        assert_eq!(p.grant_headers("other.mock.test"), ["x-other"]);
+        assert!(p.grant_headers("www.mock.test").is_empty());
+        assert_eq!(
+            p.grant_hosts(),
+            [
+                "api.mock.test",
+                "api.mock.test",
+                "api.mock.test",
+                "other.mock.test"
+            ]
+        );
     }
 
     #[test]
@@ -272,7 +388,7 @@ mod tests {
                     rule("api.mock.test", &[443]),
                     rule("*.mock.test", &[443, 8443])
                 ],
-                vec!["api.mock.test".to_owned()],
+                vec![grant("api.mock.test", "Authorization")],
             )
         );
     }
@@ -281,6 +397,12 @@ mod tests {
     fn an_empty_policy_allows_nothing() {
         let p = Policy::new(vec![], vec![]);
         assert_eq!(p.decide(&at("mock.test", 443)), Err(Reason::HostNotAllowed));
+    }
+
+    #[test]
+    fn hosts_without_a_grant_are_spliced() {
+        let p = Policy::new(vec![rule("*.mock.test", &[443])], vec![]);
+        assert_eq!(p.decide(&at("a.mock.test", 443)), Ok(Route::Splice));
     }
 
     #[test]
@@ -299,6 +421,15 @@ mod tests {
             (HeadTooLarge, "head-too-large", 431, true),
             (HeadTimeout, "head-timeout", 408, true),
             (Malformed, "malformed", 400, false),
+            (HostMismatch, "host-mismatch", 421, false),
+            (UpgradeRefused, "upgrade-refused", 403, false),
+            (MethodRefused, "method-refused", 405, false),
+            (RequestTooLarge, "request-too-large", 413, true),
+            (ResponseTooLarge, "response-too-large", 502, true),
+            (UpstreamEncoded, "upstream-encoded", 502, false),
+            (UpstreamTlsFailed, "upstream-tls-failed", 502, false),
+            (UpstreamClosed, "upstream-closed", 502, false),
+            (UpstreamMalformed, "upstream-malformed", 502, false),
         ];
         for (r, s, status, limit) in table {
             assert_eq!((r.as_str(), r.status(), r.is_limit()), (s, status, limit));

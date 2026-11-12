@@ -11,7 +11,7 @@ use sally_core::manifest::parse_host_pattern;
 use tokio::io::{DuplexStream, duplex};
 
 use super::*;
-use crate::egress::policy::Rule;
+use crate::egress::policy::{Grant, Rule};
 
 /// A public address (documentation-free, globally routed).
 fn public(n: u8) -> IpAddr {
@@ -180,7 +180,13 @@ impl Setup {
         let dials = Arc::clone(&self.dialer.dials);
         let policy = Policy::new(
             vec![rule("*.mock.test", &[443]), rule("mock.test", &[443, 8443])],
-            self.grants,
+            self.grants
+                .into_iter()
+                .map(|host| Grant {
+                    host,
+                    header: "Authorization".into(),
+                })
+                .collect(),
         );
         let proxy = Arc::new(Proxy::new(Parts {
             policy,
@@ -241,13 +247,17 @@ async fn an_allowed_host_is_tunnelled_to_its_pinned_address() {
     assert_eq!(rig.sink.decisions(), [Some("allow".to_owned()), None]);
     assert_eq!(
         rig.sink.args("egress.allow"),
-        json!({"host": "a.mock.test", "port": 443, "addresses": [public(1).to_string()]})
+        json!({
+            "host": "a.mock.test", "port": 443, "addresses": [public(1).to_string()],
+            "intercept": false,
+        })
     );
     assert_eq!(
         rig.sink.args("egress.close"),
         json!({
             "host": "a.mock.test", "port": 443, "connected": true,
             "address": public(1).to_string(), "bytes_up": 4, "bytes_down": 4, "end": "closed",
+            "intercept": false,
         })
     );
 }
@@ -341,8 +351,10 @@ async fn a_long_target_is_logged_escaped_and_cut_never_echoed() {
     assert_eq!(args["target_cut"], json!(true));
 }
 
+/// Architect Q39: a grant host the proxy cannot intercept (no session CA) is refused, never
+/// spliced, before any lookup or dial.
 #[tokio::test]
-async fn a_grant_host_is_refused_before_any_lookup() {
+async fn a_grant_host_without_a_session_ca_is_refused_before_any_lookup() {
     let rig = Setup {
         grants: vec!["a.mock.test".into()],
         ..Setup::default()
@@ -351,34 +363,40 @@ async fn a_grant_host_is_refused_before_any_lookup() {
     let got = rig.send(&connect("a.mock.test:443")).await;
     assert_eq!(got, reply(Reason::GrantHostUnavailable));
     assert_eq!(rig.lookups(), 0);
+    assert!(rig.dials.lock().unwrap().is_empty());
+    assert_eq!(
+        rig.sink.args("egress.deny")["reason"],
+        json!("grant-host-unavailable")
+    );
 }
 
-/// Task 9a-1: the proxy holds the session CA, but grant hosts stay refused until 9a-2.
+/// Architect Q39: a session CA without a leaf for this grant host refuses it too.
 #[tokio::test]
-async fn a_proxy_with_a_session_ca_still_refuses_grant_hosts() {
+async fn a_grant_host_without_its_own_leaf_is_refused() {
     use crate::egress::ca::{SessionTls, Validity};
     use crate::egress::roots::Roots;
     let v = Validity::for_session(std::time::SystemTime::now(), Duration::from_secs(60)).unwrap();
-    let interception = Interception {
-        tls: SessionTls::mint(&["a.mock.test".to_owned()], v).unwrap(),
-        roots: Roots {
-            store: Arc::new(rustls::RootCertStore::empty()),
-            pem: String::new(),
-            skipped: 0,
-            path: "/roots.pem".into(),
-        },
+    let roots = Roots {
+        store: Arc::new(rustls::RootCertStore::empty()),
+        pem: String::new(),
+        skipped: 0,
+        path: "/roots.pem".into(),
     };
+    let tls = SessionTls::mint(&["b.mock.test".to_owned()], v).unwrap();
     let rig = Setup {
-        grants: vec!["a.mock.test".into()],
-        interception: Some(interception),
+        grants: vec!["a.mock.test".into(), "b.mock.test".into()],
+        interception: Some(Interception::new(tls, roots).unwrap()),
         ..Setup::default()
     }
     .rig();
     let held = rig.proxy.interception().unwrap();
-    assert_eq!(held.tls.leaves[0].host, "a.mock.test");
+    assert_eq!(held.tls.leaves[0].host, "b.mock.test");
+    assert!(held.server("b.mock.test").is_some());
+    assert!(held.server("a.mock.test").is_none());
     let got = rig.send(&connect("a.mock.test:443")).await;
     assert_eq!(got, reply(Reason::GrantHostUnavailable));
     assert_eq!(rig.lookups(), 0);
+    assert!(rig.dials.lock().unwrap().is_empty());
     assert!(Setup::default().rig().proxy.interception().is_none());
 }
 
@@ -538,6 +556,8 @@ async fn stopping_while_dialling_writes_a_close_without_a_reply() {
     let task = tokio::spawn(async move { proxy.serve(server).await });
     client.write_all(&connect("a.mock.test:443")).await.unwrap();
     while rig.dials().is_empty() {
+        // The dial hangs until the stop, so a finished task means the CONNECT was refused.
+        assert!(!task.is_finished(), "refused before the dial");
         tokio::task::yield_now().await;
     }
     rig.proxy.stop();
@@ -549,7 +569,7 @@ async fn stopping_while_dialling_writes_a_close_without_a_reply() {
         rig.sink.args("egress.close"),
         json!({
             "host": "a.mock.test", "port": 443, "connected": false,
-            "bytes_up": 0, "bytes_down": 0, "end": "session-stopped",
+            "bytes_up": 0, "bytes_down": 0, "end": "session-stopped", "intercept": false,
         })
     );
 }
@@ -671,7 +691,7 @@ async fn at_most_three_addresses_are_tried_then_502_connect_failed() {
         rig.sink.args("egress.close"),
         json!({
             "host": "a.mock.test", "port": 443, "connected": false,
-            "bytes_up": 0, "bytes_down": 0, "end": "connect-failed",
+            "bytes_up": 0, "bytes_down": 0, "end": "connect-failed", "intercept": false,
         })
     );
     assert_eq!(rig.sink.decisions(), [Some("allow".to_owned()), None]);
@@ -801,6 +821,16 @@ fn replies_carry_the_status_phrase_and_reason_only() {
         (HeadTooLarge, "431 Request Header Fields Too Large"),
         (HeadTimeout, "408 Request Timeout"),
         (Malformed, "400 Bad Request"),
+        // The in-tunnel reasons (Task 9a-2, architect Q42).
+        (HostMismatch, "421 Misdirected Request"),
+        (UpgradeRefused, "403 Forbidden"),
+        (MethodRefused, "405 Method Not Allowed"),
+        (RequestTooLarge, "413 Content Too Large"),
+        (ResponseTooLarge, "502 Bad Gateway"),
+        (UpstreamEncoded, "502 Bad Gateway"),
+        (UpstreamTlsFailed, "502 Bad Gateway"),
+        (UpstreamClosed, "502 Bad Gateway"),
+        (UpstreamMalformed, "502 Bad Gateway"),
     ];
     for (r, status) in table {
         let code = r.as_str();
@@ -829,8 +859,11 @@ fn the_limits_are_pinned() {
             connect: Duration::from_secs(10),
             idle: Duration::from_secs(300),
             max_connections: 7,
+            max_request: 8 << 20,
+            max_response: 64 << 20,
         }
     );
+    assert_eq!(MAX_RESPONSE_HEAD, 64 * 1024);
     assert_eq!(MAX_DIALS, 3);
     assert_eq!((MAX_ADDRS, MAX_ANSWER, ADMISSION_EXTRA), (16, 64, 64));
 }
