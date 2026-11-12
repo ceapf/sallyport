@@ -184,6 +184,12 @@ tests in `egress/intercept_tests.rs` where the behaviour matters to the proxy.
   entry" branch needs a direct test (`upstream_ready`). (9a-2 R1)
 - `SendRequest::ready()` errs once the client connection future is dropped, without any I/O. A
   handshake over a `duplex` whose connection future is dropped gives a closed sender. (9a-2 R1)
+- A connection future that completed cleanly but is kept does **not** fail `ready()`: after a
+  `Connection: close` response it stays pending, after keep-alive plus EOF it is `Ok` and
+  `send_request` never completes (no `want::Taker` cancel on a clean shutdown). Drop the
+  connection future when it completes. (9a-2 rust re-review H1, reviewer's probe)
+- A response for which the server disabled keep-alive mid-exchange (`graceful_shutdown`) carries
+  hyper's own `connection: close`, and a pipelined request behind it is never read. (9a-2 H1)
 
 ## Test writing
 

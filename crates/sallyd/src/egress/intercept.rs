@@ -493,22 +493,24 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         };
         // Driven here, not spawned: the upstream connection and its TLS stream are dropped with
         // this future, so the tunnel's end closes them by ownership (architect, 9a-2 part 2).
-        tokio::pin!(conn);
+        // Dropped as soon as it completes, too: only then does `ready()` fail for a request read
+        // afterwards (an ended but kept connection future leaves it ready or pending; rust
+        // re-review H1).
+        let mut conn = Some(Box::pin(conn));
         let sender = tokio::sync::Mutex::new(sender);
         let svc = service_fn(|req| self.exchange(req, st, &sender));
         let served = client_builder(self.limits.head).serve_connection(TokioIo::new(plain), svc);
         tokio::pin!(served);
         let idle = idle_out(&st.act, self.limits.idle, st);
         tokio::pin!(idle);
-        let mut upstream_open = true;
         loop {
             tokio::select! {
-                r = &mut served => return match upstream_open {
-                    true => self.served(r, st).await,
-                    false => st.end().unwrap_or(End::Closed),
+                r = &mut served => return match conn {
+                    Some(_) => self.served(r, st).await,
+                    None => st.end().unwrap_or(End::Closed),
                 },
-                _ = &mut conn, if upstream_open => {
-                    upstream_open = false;
+                _ = async { conn.as_mut()?.await.ok() }, if conn.is_some() => {
+                    conn = None;
                     served.as_mut().graceful_shutdown();
                 }
                 () = &mut idle => return End::IdleTimeout,

@@ -219,6 +219,11 @@ impl Upstream {
                     return;
                 }
             }
+            // A keep-alive response, then the upstream closes (an upstream idle timeout).
+            if req.starts_with("GET /then-eof ") {
+                let _ = tls.shutdown().await;
+                return;
+            }
         }
         *self.ended.lock().unwrap() += 1;
     }

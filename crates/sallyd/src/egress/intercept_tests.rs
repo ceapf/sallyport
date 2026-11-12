@@ -673,6 +673,33 @@ async fn a_request_after_the_upstream_closed_is_never_forwarded_or_counted() {
     assert_eq!(close["end"], json!(end), "{out}");
 }
 
+/// Architect ruling R1 (b) as wired (rust re-review H1): the upstream answers keep-alive, then
+/// closes, with a second request pipelined behind the first. Either the tunnel closes after the
+/// first response (seen in every local run: hyper's server disables keep-alive) or the second
+/// request gets the upstream-closed 502 after the close entry; never a hang, never a request
+/// entry the count misses. The H1 window itself (a request read, `ready()` pending, the
+/// connection ending cleanly while kept) cannot be forced here; the fix (the ended connection
+/// future is dropped, which fails `ready()`) rests on the reviewer's hyper probe.
+#[tokio::test]
+async fn a_request_racing_the_upstreams_close_never_hangs_or_miscounts() {
+    let r = slow_head_rig();
+    let two = format!("{}{}", get("/then-eof", ""), get("/echo", ""));
+    let out = r.talk(&two).await;
+    assert!(out.starts_with("HTTP/1.1 200 "), "{out}");
+    assert_eq!(r.seen().len(), 1, "{out}");
+    let close = r.sink.args("egress.close");
+    let end = if out.ends_with("upstream-closed\n") {
+        "upstream-closed"
+    } else {
+        "closed"
+    };
+    assert_eq!(close["end"], json!(end), "{out}");
+    let events = r.sink.events();
+    let entries = events.iter().filter(|e| *e == "egress.request").count();
+    assert_eq!(close["requests"], json!(entries), "{events:?}");
+    assert_eq!(events.last().map(String::as_str), Some("egress.close"));
+}
+
 /// Architect ruling R1 (b), the branch the pipelined test cannot reach on demand: an upstream
 /// connection that is gone before a request is audited gets the close entry and the 502, and
 /// the request is neither audited nor counted.
