@@ -20,6 +20,10 @@ struct Fake {
     ended: AtomicUsize,
     release: Notify,
     seen: Mutex<Vec<(String, Map<String, Value>)>>,
+    /// The call numbers the handler was given, in order.
+    numbers: Mutex<Vec<u64>>,
+    /// The withdrawals it was told about.
+    withdrawn: Mutex<Vec<(u64, Withdraw)>>,
 }
 
 /// Counts a call's end, also when it is dropped mid-way.
@@ -40,18 +44,29 @@ impl ToolHandler for Arc<Fake> {
         }]
     }
 
-    async fn call(&self, name: String, arguments: Map<String, Value>) -> ToolOutcome {
+    async fn call(
+        &self,
+        call: u64,
+        name: String,
+        arguments: Map<String, Value>,
+    ) -> Option<ToolOutcome> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.numbers.lock().unwrap().push(call);
         self.seen.lock().unwrap().push((name.clone(), arguments));
         let _ended = Ended(Arc::clone(self));
         if name == "block" {
             self.release.notified().await;
         }
         self.done.fetch_add(1, Ordering::SeqCst);
-        ToolOutcome {
+        // `unrecorded`: the handler's entry failed, so it answers nothing.
+        (name != "unrecorded").then(|| ToolOutcome {
             is_error: false,
             text: format!("ran {name}"),
-        }
+        })
+    }
+
+    async fn withdraw(&self, call: u64, why: Withdraw) {
+        self.withdrawn.lock().unwrap().push((call, why));
     }
 }
 
@@ -412,6 +427,11 @@ async fn a_cancel_suppresses_the_reply_but_never_stops_the_handler() {
     );
     assert_eq!(agent.in_flight.available_permits(), MAX_IN_FLIGHT - 1);
     assert_eq!(fake.done.load(Ordering::SeqCst), 0);
+    // The handler was told, by the broker's call number, after the entry (#54).
+    assert_eq!(
+        fake.withdrawn.lock().unwrap().as_slice(),
+        [(0, Withdraw::Cancel)]
+    );
     fake.release.notify_one();
     // The handler ran to its end; its reply never comes; the slot comes back only now.
     while fake.done.load(Ordering::SeqCst) == 0 {
@@ -438,12 +458,73 @@ async fn a_closed_connection_still_lets_its_calls_finish() {
         !c.server.is_finished(),
         "the connection ended before its call"
     );
+    // Its prompt, if any, is withdrawn: nobody is left to receive the result.
+    assert_eq!(
+        fake.withdrawn.lock().unwrap().as_slice(),
+        [(0, Withdraw::Closed)]
+    );
     fake.release.notify_one();
     tokio::time::timeout(Duration::from_secs(5), c.server)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(fake.done.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_closed_connection_withdraws_only_its_unfinished_calls() {
+    let (agent, fake, _) = setup();
+    let mut c = start(&agent);
+    let _ = c.call(&call(1, "echo")).await;
+    c.w.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), c.server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(fake.withdrawn.lock().unwrap().is_empty());
+    // A second cancel of the same call is not passed on twice.
+    let mut c = start(&agent);
+    c.send(&call(2, "block")).await;
+    while fake.calls.load(Ordering::SeqCst) < 2 {
+        tokio::task::yield_now().await;
+    }
+    let cancel =
+        json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 2}});
+    c.send(&cancel).await;
+    c.send(&cancel).await;
+    let _ = c.call(&req(3, "tools/list", json!({}))).await;
+    assert_eq!(
+        fake.withdrawn.lock().unwrap().as_slice(),
+        [(1, Withdraw::Cancel)]
+    );
+    fake.release.notify_one();
+}
+
+#[tokio::test]
+async fn call_numbers_are_unique_across_a_sessions_connections() {
+    let (agent, fake, _) = setup();
+    let mut a = start(&agent);
+    let mut b = start(&agent);
+    // The same JSON-RPC id on two connections is two calls with two numbers (ruling Q19).
+    let _ = a.call(&call(1, "echo")).await;
+    let _ = b.call(&call(1, "echo")).await;
+    let _ = a.call(&call(1, "echo")).await;
+    assert_eq!(fake.numbers.lock().unwrap().as_slice(), [0, 1, 2]);
+}
+
+#[tokio::test]
+async fn a_call_whose_handler_could_not_write_an_entry_gets_no_reply() {
+    let (agent, fake, _) = setup();
+    let mut c = start(&agent);
+    c.send(&call(1, "unrecorded")).await;
+    while fake.done.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+    assert!(c.quiet().await, "an unrecorded call was answered");
+    // The connection and the slot are fine.
+    let r = c.call(&call(2, "echo")).await;
+    assert_eq!(r["id"], json!(2));
+    assert_eq!(agent.in_flight.available_permits(), MAX_IN_FLIGHT);
 }
 
 #[tokio::test]

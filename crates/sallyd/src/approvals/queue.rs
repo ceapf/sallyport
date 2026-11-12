@@ -329,6 +329,15 @@ impl Gate {
         }
     }
 
+    /// Refuses a call the executor could not turn into an action: `tool.deny` with the tool's
+    /// name (escaped) and the code, before the denial is returned.
+    pub async fn refuse_call(&self, call: u64, tool: &str, code: &'static str) -> Refusal {
+        let args = json!({"call": call, "tool": escape(tool.as_bytes()), "code": code});
+        self.inner
+            .refuse("tool.deny", Actor::Sallyd, args, code)
+            .await
+    }
+
     /// Withdraws the prompt of `call`, if one waits (#54): its asker gets `withdrawn`.
     pub async fn withdraw(&self, call: u64, why: Withdraw) {
         let inner = &self.inner;

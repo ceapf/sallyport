@@ -43,11 +43,18 @@ impl ToolHandler for Echo {
         }]
     }
 
-    async fn call(&self, name: String, arguments: Map<String, Value>) -> ToolOutcome {
-        ToolOutcome {
+    async fn withdraw(&self, _: u64, _: sallyd::approvals::Withdraw) {}
+
+    async fn call(
+        &self,
+        _: u64,
+        name: String,
+        arguments: Map<String, Value>,
+    ) -> Option<ToolOutcome> {
+        Some(ToolOutcome {
             is_error: false,
             text: format!("{name} {}", Value::Object(arguments)),
-        }
+        })
     }
 }
 
