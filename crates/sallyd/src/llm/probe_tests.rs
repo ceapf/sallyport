@@ -85,8 +85,8 @@ async fn hyper_view(input: &[u8], checked: Option<Head>) -> Option<bool> {
             .serve_connection(TokioIo::new(server), svc)
             .await;
     });
-    // No half-close here: hyper drops a request whose peer has shut its write side
-    // (`half_close` is off), which would hide what it made of the head.
+    // No half-close here: this builder keeps hyper's default (`half_close` off), under which a
+    // peer that has shut its write side gets no reply, which would hide what it made of the head.
     client.write_all(input).await.unwrap();
     let mut sink = Vec::new();
     tokio::time::timeout(
@@ -108,6 +108,56 @@ async fn hyper_never_answers_a_half_closed_peer() {
     let (reply, called) = hyper_reply(b"GET /v1/models HTTP/1.1\r\n\r\n").await;
     assert!(called);
     assert_eq!(reply, "");
+}
+
+/// A half-closed peer's request through a builder with `half_close` as given, served by a
+/// service that answers after a short wait: (reply, whether the service ran to its end).
+async fn half_closed(half_close: bool) -> (String, bool) {
+    let (mut client, server) = tokio::io::duplex(1 << 20);
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done = std::sync::Arc::clone(&finished);
+    let task = tokio::spawn(async move {
+        let svc = service_fn(move |_req| {
+            let done = std::sync::Arc::clone(&done);
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, Infallible>(hyper::Response::new(Full::new(Bytes::from_static(b"ok"))))
+            }
+        });
+        let _ = http1::Builder::new()
+            .keep_alive(false)
+            .half_close(half_close)
+            .serve_connection(TokioIo::new(server), svc)
+            .await;
+    });
+    client
+        .write_all(b"GET /v1/models HTTP/1.1\r\n\r\n")
+        .await
+        .unwrap();
+    client.shutdown().await.unwrap();
+    let mut out = Vec::new();
+    client.read_to_end(&mut out).await.unwrap();
+    task.await.unwrap();
+    // Long enough for a service that was not dropped to finish.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    (
+        String::from_utf8_lossy(&out).into_owned(),
+        finished.load(std::sync::atomic::Ordering::SeqCst),
+    )
+}
+
+/// With `half_close` off (hyper's default), the read EOF drops the service future mid-way: a
+/// half-closed peer gets nothing and the service never finishes. With it on (what `llm.sock`
+/// sets, architect ruling Q14), the service runs to its end and the peer gets the reply.
+#[tokio::test]
+async fn half_close_decides_whether_a_half_closed_peer_is_served() {
+    let (reply, finished) = half_closed(false).await;
+    assert_eq!((reply.as_str(), finished), ("", false));
+    let (reply, finished) = half_closed(true).await;
+    assert!(reply.starts_with("HTTP/1.1 200"), "{reply:?}");
+    assert!(reply.ends_with("ok"), "{reply:?}");
+    assert!(finished);
 }
 
 /// The architect's condition on the head pre-read: the broker decides on its one parse, and hyper

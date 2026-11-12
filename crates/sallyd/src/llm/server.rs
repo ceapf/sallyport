@@ -220,8 +220,14 @@ impl<B: Backend> Llm<B> {
                 me.request(req, route, g).await
             }
         });
+        // A peer that shuts its write side after its request is still answered (the shim passes
+        // half-close on; architect ruling Q14). The write-stall limit and the connection cap
+        // bound a peer that never reads.
+        // TODO(#60): with this on, a read EOF no longer drops the service, so the M3 backend
+        // must stop a completion whose peer is gone.
         let _ = http1::Builder::new()
             .keep_alive(false)
+            .half_close(true)
             .serve_connection(TokioIo::new(io), svc)
             .await;
         if !gate.is_open() {

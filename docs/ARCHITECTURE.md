@@ -533,7 +533,12 @@ else `408`). Strict nested allowlist, duplicate keys refused:
 Refusals are answered `{"error": {"message", "type", "param", "code"}}` (OpenAI's shape) after
 their `llm.deny` entry. **Bounds per session:** 4 connections; 5 requests read per second with a
 burst of 10 (backpressure, as on `agent.sock`); a streamed reply is cut at 16 MiB (no
-`[DONE]`; `llm.response` says `cut: true`); a write stalled for 10 s fails the connection. The backend is a constructor argument:
+`[DONE]`; `llm.response` says `cut: true`); a write stalled for 10 s fails the connection.
+A client that shuts its write side after its request is still answered (hyper's `half_close`
+on; the shim passes half-close on). The cost: a peer that disconnects during a whole
+(non-streamed) completion is noticed only at the first write, so the backend runs on with
+nobody listening, bounded by the connection cap and the rate; the M3 backend must stop such a
+completion (#60). The backend is a constructor argument:
 until M3 none is wired in production (#53), and the scripted mock model exists only in the test
 tree.
 

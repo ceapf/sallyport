@@ -74,10 +74,12 @@ line per fact, with where it was found. Check a note again before relying on it 
   wins; the broker refuses it); it refuses `Transfer-Encoding: identity` with a 400. (Task 7,
   `hyper_never_reads_an_accepted_head_differently`)
 - With `half_close` off (the default), hyper calls the service for a complete request whose
-  peer has already shut its write side, then drops the reply: the peer gets nothing. The shim
-  passes a client's half-close on, so a harness client that half-closes after its request gets
-  no answer (the broker records `http-error`, or `llm.request` if the service already wrote it).
-  (Task 7, `hyper_never_answers_a_half_closed_peer`)
+  peer has already shut its write side, then drops the service future at the read EOF (a
+  service that waits never finishes) and the reply: the peer gets nothing. The shim passes a
+  client's half-close on, so `llm.sock` sets `half_close(true)` (architect ruling Q14): then the
+  service runs to its end and the peer gets the reply, but a read EOF no longer cancels the
+  service, so a peer that is gone is noticed only at the first write (#60). (Task 7,
+  `hyper_never_answers_a_half_closed_peer`, `half_close_decides_whether_a_half_closed_peer_is_served`)
 - Busybox `wget` (the test image) does not half-close: its requests through the shim are
   answered. (Task 7, `tests/rpc.rs`)
 

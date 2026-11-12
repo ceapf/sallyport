@@ -419,6 +419,64 @@ async fn exchange_closed(llm: &Arc<Llm<Arc<Fake>>>, raw: &[u8]) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Architect ruling Q14: a client that sends its whole request and then shuts its write side
+/// (the shim passes that on) gets the full reply, with its entries in order, on both routes.
+#[tokio::test]
+async fn a_half_closed_client_is_answered() {
+    let (llm, fake, sink) = setup();
+    let r = exchange_closed(&llm, b"GET /v1/models HTTP/1.1\r\n\r\n").await;
+    assert_eq!(status(&r), 200, "{r}");
+    assert_eq!(body(&r)["data"][0]["id"], json!("local-model"));
+    assert_eq!(sink.events(), ["llm.request"]);
+    let r = exchange_closed(&llm, &post(&chat(json!({})))).await;
+    assert_eq!(status(&r), 200, "{r}");
+    assert_eq!(body(&r)["choices"][0]["message"]["content"], json!("hi"));
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        sink.events(),
+        ["llm.request", "llm.request", "llm.response"]
+    );
+    let r = exchange_closed(&llm, &post(&chat(json!({"stream": true})))).await;
+    assert!(r.contains("data: [DONE]\n\n"), "{r}");
+}
+
+/// A half-closed client whose body is cut short is refused `400 body-error` after its entry;
+/// no reply ever goes out without one.
+#[tokio::test]
+async fn a_half_closed_client_with_a_short_body_is_refused() {
+    let (llm, fake, sink) = setup();
+    let r = exchange_closed(
+        &llm,
+        b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 100\r\n\r\n{\"messages\"",
+    )
+    .await;
+    assert_eq!(
+        (status(&r), body(&r)["error"]["code"].clone()),
+        (400, json!("body-error"))
+    );
+    assert_eq!(denies(&sink), [("body-error".to_owned(), json!(400))]);
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+}
+
+/// A peer that closes both directions right after its request still ends the connection (its
+/// task returns, so its slot is free) and leaves its entry.
+#[tokio::test]
+async fn a_peer_gone_after_its_request_ends_the_connection() {
+    let (llm, _, sink) = setup();
+    let (mut client, server) = tokio::io::duplex(1024);
+    let task = tokio::spawn(Arc::clone(&llm).serve_stream(server));
+    client.write_all(&post(&chat(json!({})))).await.unwrap();
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the connection outlived its peer")
+        .unwrap();
+    assert_eq!(
+        sink.events().first().map(String::as_str),
+        Some("llm.request")
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_slow_body_is_refused_after_its_timeout() {
     let (llm, fake, sink) = setup();
@@ -631,7 +689,7 @@ async fn a_request_hyper_reads_differently_is_closed_unanswered_and_recorded() {
     let replay = b"GET /v1/models?x HTTP/1.1\r\n\r\n".to_vec();
     let task =
         tokio::spawn(Arc::clone(&llm).hand_to_hyper(server, replay, Route::Models, checked_head));
-    // No half-close: hyper drops a request whose peer has already shut its write side.
+    // The client keeps its write side open: the mismatch alone must close the connection.
     let mut out = Vec::new();
     tokio::time::timeout(Duration::from_secs(10), client.read_to_end(&mut out))
         .await
