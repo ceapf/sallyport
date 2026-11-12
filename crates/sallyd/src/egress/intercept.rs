@@ -554,7 +554,8 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
     }
 
     /// The response head: checked (Q30), its declared length against the cap (Q35), then the
-    /// body streamed back under the cap.
+    /// body streamed back under the cap. The declared length is the one hyper decoded (none for
+    /// HEAD, 204 or 304, whatever their `Content-Length` says: architect ruling R5).
     async fn respond(
         &self,
         st: &Arc<State>,
@@ -566,10 +567,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
             Ok(h) => h,
             Err(reason) => return self.refuse_inside(st, reason, target, None).await,
         };
-        if !rewrite::within(
-            rewrite::declared_length(&rp.headers),
-            self.limits.max_response,
-        ) {
+        if !rewrite::within(body.size_hint().exact(), self.limits.max_response) {
             return self
                 .refuse_inside(st, Reason::ResponseTooLarge, target, Some("body"))
                 .await;

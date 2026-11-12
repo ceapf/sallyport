@@ -59,6 +59,9 @@ fn canned(req: &str) -> Option<String> {
             "HTTP/1.1 200 OK\r\nContent-Length: 6\r\nContent-Length: 7\r\n\r\nSMUGGL".into()
         }
         "/cl-list" => "HTTP/1.1 200 OK\r\nContent-Length: 6, 6\r\n\r\nSMUGGL".into(),
+        // A length over the test cap (16) with no body: the answer to a HEAD, or a 304.
+        "/head-only" => "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n".into(),
+        "/not-modified" => "HTTP/1.1 304 Not Modified\r\nContent-Length: 100\r\n\r\n".into(),
         "/bighead" => format!(
             "HTTP/1.1 200 OK\r\nX-Big: {}\r\nContent-Length: 0\r\n\r\n",
             "a".repeat(MAX_RESPONSE_HEAD + 1)
@@ -684,6 +687,37 @@ async fn response_bodies_pass_at_the_cap_and_are_refused_one_over() {
     let limit = r.sink.args("egress.limit");
     assert_eq!(limit["reason"], json!("response-too-large"));
     assert_eq!(limit["part"], json!("body"));
+}
+
+/// Architect ruling R5: the cap pre-check uses the length hyper decoded, so a HEAD answer or a
+/// 304, whose `Content-Length` describes a body that never comes, is not a false 502. A HEAD
+/// answer keeps its length; hyper's server never writes one on a 204 or 304
+/// (`can_have_content_length`), so the 304 reaches the client without it.
+#[tokio::test]
+async fn a_length_without_a_body_is_not_held_to_the_cap() {
+    for (raw, status, length) in [
+        (
+            format!("HEAD /head-only HTTP/1.1\r\nHost: {HOST}\r\n\r\n"),
+            "200",
+            true,
+        ),
+        (get("/not-modified", ""), "304", false),
+    ] {
+        let r = rig(Opts::default());
+        let out = r.talk(&raw).await;
+        assert!(
+            out.starts_with(&format!("HTTP/1.1 {status} ")),
+            "{raw:?}: {out}"
+        );
+        assert_eq!(
+            out.contains("content-length: 100\r\n"),
+            length,
+            "{raw:?}: {out}"
+        );
+        assert!(out.ends_with("\r\n\r\n"), "{raw:?}: {out}");
+        assert!(!r.sink.events().contains(&"egress.limit".to_owned()));
+        assert_eq!(r.sink.args("egress.close")["requests"], json!(1));
+    }
 }
 
 #[tokio::test]

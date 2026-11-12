@@ -846,7 +846,8 @@ sallyport/
     Body caps are `network.max_request_bytes`/`max_response_bytes`, payload bytes per message
     after chunk decoding (at the cap passes): a declared request length over the cap is 413 with
     nothing sent upstream, a chunked one crossing it aborts the exchange (413 if no response head
-    was forwarded); a declared response length over the cap is 502, a streamed one crossing it is
+    was forwarded); a declared response length (as hyper decoded it; none for HEAD, 204, 304) over
+    the cap is 502, a streamed one crossing it is
     audited, then cut without a final chunk. The response cap counts upstream bytes before
     redaction. hyper's head timer is `limits.head` (10 s) for every wait for a head, so an
     intercepted tunnel's keep-alive idle is 10 s (accepted for v1; revisit in #64): it ends `idle-timeout` with no entry when no
