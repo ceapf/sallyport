@@ -75,12 +75,12 @@ impl<S> Meter<S> {
         }
     }
 
+    /// Counts `n` bytes and marks activity (an end-of-stream read counts nothing, and marking it
+    /// as activity only moves the idle clock for a stream that is ending anyway).
     fn moved(&self, counter: &AtomicU64, n: usize) {
-        if n > 0 {
-            counter.fetch_add(u64::try_from(n).unwrap_or(u64::MAX), Ordering::Relaxed);
-            if let Some(a) = &self.act {
-                a.touch();
-            }
+        counter.fetch_add(u64::try_from(n).unwrap_or(u64::MAX), Ordering::Relaxed);
+        if let Some(a) = &self.act {
+            a.touch();
         }
     }
 }
@@ -101,14 +101,15 @@ impl<S: AsyncRead + Unpin> AsyncRead for Meter<S> {
             return Poll::Ready(Ok(()));
         }
         let n = match this.max_read {
-            Some(max) if buf.remaining() > max => {
-                let mut part = ReadBuf::new(buf.initialize_unfilled_to(max));
+            Some(max) => {
+                let take = buf.remaining().min(max);
+                let mut part = ReadBuf::new(buf.initialize_unfilled_to(take));
                 ready!(Pin::new(&mut this.inner).poll_read(cx, &mut part))?;
                 let n = part.filled().len();
                 buf.advance(n);
                 n
             }
-            _ => {
+            None => {
                 let before = buf.filled().len();
                 ready!(Pin::new(&mut this.inner).poll_read(cx, buf))?;
                 buf.filled().len().saturating_sub(before)
