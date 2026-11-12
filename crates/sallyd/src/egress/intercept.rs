@@ -459,12 +459,20 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         let mut upstream_open = true;
         loop {
             tokio::select! {
-                r = &mut served => return self.served(r, st).await,
+                r = &mut served => {
+                    if upstream_open {
+                        return self.served(r, st).await;
+                    }
+                    // hyper's server ended because the upstream did: no refusal mapping.
+                    return st.end().unwrap_or(End::Closed);
+                }
                 _ = &mut conn, if upstream_open => {
                     upstream_open = false;
-                    if !st.busy() {
-                        return st.end().unwrap_or(End::Closed);
-                    }
+                    // The upstream connection is gone (architect ruling R1): hyper's server
+                    // finishes the response in flight, if any, then closes. The client learns
+                    // from that close, not from a `Connection: close` header. A request already
+                    // read gets the upstream-closed 502 in `exchange`, never forwarded.
+                    served.as_mut().graceful_shutdown();
                 }
                 () = &mut idle => return End::IdleTimeout,
             }
@@ -532,6 +540,12 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
                 .refuse_inside(st, Reason::RequestTooLarge, &target, None)
                 .await;
         }
+        // Held from `ready()` to `send_request`: a request is audited and counted only once the
+        // upstream connection is known to take it (architect ruling R1).
+        let mut sender = sender.lock().await;
+        if sender.ready().await.is_err() {
+            return self.upstream_closed(st).await;
+        }
         let audited = self
             .entry("egress.request", Some("allow"))
             .args(request_args(&st.auth, &parts.method, &target));
@@ -560,13 +574,8 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
             .map_or_else(|| "/".parse(), |p| p.as_str().parse())?;
         *up.version_mut() = Version::HTTP_11;
         *up.headers_mut() = head.headers;
-        let sent = {
-            let mut s = sender.lock().await;
-            match s.ready().await {
-                Ok(()) => s.send_request(up).await,
-                Err(e) => Err(e),
-            }
-        };
+        let sent = sender.send_request(up).await;
+        drop(sender);
         match sent {
             Ok(resp) => self.respond(st, resp, &target).await,
             // Already audited and marked `limit` by RequestEnd, before hyper saw the cut.

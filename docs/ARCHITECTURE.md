@@ -806,7 +806,10 @@ sallyport/
   no retry on another address), `200`, the client's TLS within `limits.head` (the host's
   session-CA leaf, ALPN `http/1.1` only), then HTTP/1.1 through hyper: one upstream connection
   per tunnel, used for one request at a time, never pooled or replayed; an upstream close between
-  requests ends the tunnel (`closed`).
+  requests ends the tunnel (`closed`). When the upstream connection ends, a response in flight is
+  still delivered whole, then the tunnel closes (`closed`) without waiting for the client; a
+  request that arrives after the upstream closed is not forwarded and not counted: `egress.close
+  upstream-closed`, then 502 (9a-2 review R1).
   - Request head rules, in order: (1) check as received — not `CONNECT`, HTTP/1.1, origin-form
     target only (absolute, authority and `*` forms are 400 `malformed`), exactly one `Host`,
     normalized like a CONNECT target and naming the CONNECT host (port omitted only when the

@@ -60,6 +60,14 @@ fn canned(req: &str) -> Option<String> {
         }
         "/cl-list" => "HTTP/1.1 200 OK\r\nContent-Length: 6, 6\r\n\r\nSMUGGL".into(),
         // A length over the test cap (16) with no body: the answer to a HEAD, or a 304.
+        // The upstream ends its connection with the response (architect ruling R1); the slow
+        // one pauses mid-body.
+        "/close-after" => {
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok".into()
+        }
+        "/close-slow" => {
+            format!("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 4\r\n\r\nok{PAUSE}ok")
+        }
         "/early" => "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n".into(),
         "/head-only" => "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n".into(),
         "/not-modified" => "HTTP/1.1 304 Not Modified\r\nContent-Length: 100\r\n\r\n".into(),
@@ -1094,6 +1102,70 @@ async fn an_upstream_that_closes_before_answering_gets_close_first_then_502() {
     let close = r.sink.args("egress.close");
     assert_eq!(close["end"], json!("upstream-closed"));
     assert_eq!(close["connected"], json!(true));
+}
+
+/// A rig whose head timer is long, so only the upstream's close can end a quiet tunnel soon.
+fn slow_head_rig() -> Rig {
+    rig(Opts {
+        limits: Limits {
+            head: Duration::from_secs(30),
+            max_request: 16,
+            max_response: 16,
+            ..Limits::new(8)
+        },
+        ..Opts::default()
+    })
+}
+
+/// Architect ruling R1 (a) and (c): the upstream ends its connection with a response. The
+/// response, even one still streaming when the upstream connection ends, reaches the client
+/// whole; then the tunnel closes (`closed`) at once, not when the client's head timer runs out.
+/// The client keeps its sending side open throughout.
+#[tokio::test]
+async fn an_upstream_that_ends_with_its_response_closes_the_tunnel_after_it() {
+    for (path, body) in [("/close-after", "ok"), ("/close-slow", "okok")] {
+        let r = slow_head_rig();
+        let started = Instant::now();
+        let (_, tls, task) = r.open(443).await;
+        let mut tls = tls.unwrap();
+        tls.write_all(get(path, "").as_bytes()).await.unwrap();
+        let out = drain(&mut tls).await;
+        join(task).await;
+        assert!(started.elapsed() < Duration::from_secs(2), "{path}");
+        assert!(out.starts_with("HTTP/1.1 200 "), "{path}: {out}");
+        assert!(out.ends_with(&format!("\r\n\r\n{body}")), "{path}: {out}");
+        let close = r.sink.args("egress.close");
+        assert_eq!(
+            (close["end"].clone(), close["requests"].clone()),
+            (json!("closed"), json!(1)),
+            "{path}"
+        );
+    }
+}
+
+/// Architect ruling R1 (b): a request that arrives after the upstream closed is never forwarded
+/// or counted. Pipelined behind a response that ends the upstream connection, the second request
+/// either finds the tunnel closing (no reply) or is read first and refused 502 `upstream-closed`
+/// after the close entry; which one depends on task timing, and both keep the rule.
+#[tokio::test]
+async fn a_request_after_the_upstream_closed_is_never_forwarded_or_counted() {
+    let r = slow_head_rig();
+    let two = format!("{}{}", get("/close-after", ""), get("/echo", ""));
+    let out = r.talk(&two).await;
+    assert!(out.starts_with("HTTP/1.1 200 "), "{out}");
+    assert_eq!(r.seen().len(), 1, "{out}");
+    let events = r.sink.events();
+    let requests = events.iter().filter(|e| *e == "egress.request").count();
+    assert_eq!(requests, 1, "{events:?}");
+    assert_eq!(events.last().map(String::as_str), Some("egress.close"));
+    let close = r.sink.args("egress.close");
+    assert_eq!(close["requests"], json!(1));
+    let end = if out.contains("upstream-closed\n") {
+        "upstream-closed"
+    } else {
+        "closed"
+    };
+    assert_eq!(close["end"], json!(end), "{out}");
 }
 
 /// Architect Q28: upstream verification before the `200`; failure is audited, then 502.
