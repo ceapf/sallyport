@@ -103,6 +103,14 @@ mod tests {
         }
     }
 
+    /// Proof of the `visit_unit` mutation exclusion (rule (i), `.cargo/mutants.toml`): the value
+    /// it returns is `Value::default()`, so `Ok(Default::default())` is the same function.
+    #[test]
+    fn null_parses_to_the_default_value() {
+        assert_eq!(parse(b"null").unwrap(), Value::Null);
+        assert_eq!(Value::default(), Value::Null);
+    }
+
     #[test]
     fn the_visitor_names_what_it_expects_and_takes_owned_strings() {
         assert_eq!(Expecting.to_string(), "JSON without repeated keys");

@@ -57,13 +57,16 @@ nextest:
 	$(CARGO) test -q --workspace --doc
 
 # Line-coverage gates (CLAUDE.md): sally-core >= 90%; sallyd egress >= 85% over the whole module
-# directory, lib tests only (architect ruling Q16, Task 8). Approvals join when they exist.
+# directory, lib tests only (architect ruling Q16, Task 8). rpc and llm are gated at the same
+# floor (architect ruling Q15, Task 7). Approvals join when they exist.
 COV_MIN_CORE ?= 90
 COV_MIN_EGRESS ?= 85
 coverage:
 	$(CARGO) llvm-cov -q -p sally-core --summary-only --fail-under-lines $(COV_MIN_CORE)
 	$(CARGO) llvm-cov -q -p sallyd --lib --json --summary-only --output-path target/cov-sallyd.json
 	bash scripts/coverage-gate.sh $(COV_MIN_EGRESS) target/cov-sallyd.json /crates/sallyd/src/egress/
+	bash scripts/coverage-gate.sh $(COV_MIN_EGRESS) target/cov-sallyd.json /crates/sallyd/src/rpc/
+	bash scripts/coverage-gate.sh $(COV_MIN_EGRESS) target/cov-sallyd.json /crates/sallyd/src/llm/
 
 # Mutation testing over the deny paths, zero survivors (AMENDMENTS-01 §15): a surviving mutant in
 # a deny path is an untested control. approvals and tools::fs join as they land; the egress modules
