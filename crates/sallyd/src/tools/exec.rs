@@ -28,7 +28,7 @@ use rustix::fd::OwnedFd;
 use rustix::process::{Pid, PidfdFlags, Signal};
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 
-use super::procs::{self, Snapshot, Stat};
+use super::procs::{self, Call, Snapshot, Stat};
 use super::shell::{Captured, Output, Runner, START_LIMIT, Status, TIME_LIMIT, exec_argv};
 use crate::sandbox::{Podman, Running};
 
@@ -50,10 +50,11 @@ pub struct PodmanExec {
     init_pid: u32,
     init_dir: Arc<OwnedFd>,
     gate: Arc<tokio::sync::Mutex<()>>,
+    time_limit: Duration,
 }
 
 impl PodmanExec {
-    /// The runner for `running`'s container, through hermetic `podman`.
+    /// The runner for `running`'s container, through hermetic `podman`, with [`TIME_LIMIT`].
     #[must_use]
     pub fn new(podman: Podman, running: &Running) -> Self {
         Self {
@@ -62,6 +63,16 @@ impl PodmanExec {
             init_pid: running.init_pid(),
             init_dir: running.init_dir(),
             gate: running.exec_gate(),
+            time_limit: TIME_LIMIT,
+        }
+    }
+
+    /// The same runner with another time limit per command.
+    #[must_use]
+    pub fn time_limit(self, limit: Duration) -> Self {
+        Self {
+            time_limit: limit,
+            ..self
         }
     }
 
@@ -100,8 +111,8 @@ impl PodmanExec {
             == Some(p)
     }
 
-    /// Kills `top`'s call until a snapshot finds none of it (bounded rounds).
-    fn kill_call(&self, top: Stat) {
+    /// Kills `call` until a snapshot finds none of it (bounded rounds).
+    fn kill_call(&self, call: Call) {
         let Some(init) = self.init() else {
             return;
         };
@@ -109,7 +120,7 @@ impl PodmanExec {
             let Some(now) = self.snapshot() else {
                 return;
             };
-            let set = procs::kill_set(&now, top, init);
+            let set = procs::kill_set(&now, call, init);
             if set.is_empty() {
                 return;
             }
@@ -188,28 +199,28 @@ impl Runner for PodmanExec {
             child.stderr.take().map(|r| drain(r, Arc::clone(&stderr))),
         ];
         let mut guard = KillOnDrop(None);
-        let top = match self.find_started(&before, &mut child).await {
-            Found::Started(top, fd) => {
+        let found = self.find_started(&before, &mut child).await;
+        let call = match found {
+            Found::Started(call, fd) => {
                 guard.0 = Some(fd);
-                Some(top)
+                Some(call)
             }
-            Found::Exited => None,
-            Found::Lost => {
+            Found::Exited(call) => call,
+            Found::Lost(call) => {
                 let _ = child.kill().await;
                 drop(gate);
+                self.kill_in_background(call).await;
                 return out(Status::Killed("start-timeout"));
             }
         };
         drop(gate);
-        let status = match tokio::time::timeout(TIME_LIMIT, child.wait()).await {
+        let status = match tokio::time::timeout(self.time_limit, child.wait()).await {
             Ok(Ok(s)) => Status::Exited(s.code().unwrap_or(-1)),
             Ok(Err(e)) => Status::Failed(format!("podman exec: {e}")),
             Err(_) => Status::Killed("timeout"),
         };
-        if let Some(top) = top {
-            let me = self.clone();
-            let _ = tokio::task::spawn_blocking(move || me.kill_call(top)).await;
-        }
+        // Also after a normal exit: what the command left running ends with the call.
+        self.kill_in_background(call).await;
         if status == Status::Killed("timeout")
             && tokio::time::timeout(REAP_LIMIT, child.wait())
                 .await
@@ -228,27 +239,32 @@ impl Runner for PodmanExec {
     }
 }
 
+/// What the search for the started process found; the call's session once any candidate was
+/// seen (crun's intermediate shares it), also when the process itself was too quick to find.
 enum Found {
-    Started(Stat, OwnedFd),
-    Exited,
-    Lost,
+    Started(Call, OwnedFd),
+    Exited(Option<Call>),
+    Lost(Option<Call>),
 }
 
 impl PodmanExec {
     async fn find_started(&self, before: &Snapshot, child: &mut tokio::process::Child) -> Found {
         let deadline = tokio::time::Instant::now() + START_LIMIT;
+        let mut session: Option<i32> = None;
+        let seen = |s: Option<i32>| s.map(|session| Call { top: None, session });
         loop {
             let me = self.clone();
-            let before = before.clone();
+            let then = before.clone();
             let hit = tokio::task::spawn_blocking(move || {
                 let now = me.snapshot()?;
-                let top = *procs::started(&before, &now).first()?;
-                me.pidfd(top).map(|fd| (top, fd))
+                let top = *procs::started(&then, &now).first()?;
+                Some((top, me.pidfd(top)))
             })
             .await
             .ok()
             .flatten();
             if let Some((top, fd)) = hit {
+                session = session.or(Some(top.session));
                 // crun's short-lived intermediate (the one that calls setsid) matches too for a
                 // moment: take a candidate only if it is still the same process a poll later.
                 tokio::time::sleep(POLL).await;
@@ -256,18 +272,40 @@ impl PodmanExec {
                 let alive = tokio::task::spawn_blocking(move || me.still(top))
                     .await
                     .unwrap_or(false);
-                if alive {
-                    return Found::Started(top, fd);
+                if let (true, Some(fd)) = (alive, fd) {
+                    let call = Call {
+                        top: Some(top.pid),
+                        session: top.session,
+                    };
+                    return Found::Started(call, fd);
                 }
-                continue;
             }
             if matches!(child.try_wait(), Ok(Some(_))) {
-                return Found::Exited;
+                if session.is_none() {
+                    // Too quick to be seen: find its session from what it left (gate held).
+                    let me = self.clone();
+                    let before = before.clone();
+                    session = tokio::task::spawn_blocking(move || {
+                        procs::new_session(&before, &me.snapshot()?, me.init()?)
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                }
+                return Found::Exited(seen(session));
             }
             if tokio::time::Instant::now() >= deadline {
-                return Found::Lost;
+                return Found::Lost(seen(session));
             }
             tokio::time::sleep(POLL).await;
+        }
+    }
+
+    /// [`Self::kill_call`] off the runtime, for a call whose session is known.
+    async fn kill_in_background(&self, call: Option<Call>) {
+        if let Some(call) = call {
+            let me = self.clone();
+            let _ = tokio::task::spawn_blocking(move || me.kill_call(call)).await;
         }
     }
 }

@@ -39,7 +39,10 @@ pub fn parse_stat(text: &[u8]) -> Option<Stat> {
     // After ") ": state, ppid, pgrp, session.
     let rest = std::str::from_utf8(text.get(close.checked_add(1)?..)?).ok()?;
     let mut f = rest.split_ascii_whitespace();
-    let _state = f.next()?;
+    // A zombie or dead process runs nothing: it is no process to find or kill.
+    if matches!(f.next()?, "Z" | "X" | "x") {
+        return None;
+    }
     let ppid = f.next().and_then(|s| number(s.as_bytes()))?;
     let _pgrp = f.next()?;
     let session = f.next().and_then(|s| number(s.as_bytes()))?;
@@ -86,17 +89,53 @@ pub fn started(before: &Snapshot, now: &Snapshot) -> Vec<Stat> {
         .collect()
 }
 
-/// What to kill for the call whose top process is `top`: `top`, its descendants, and the
-/// members of its session unless that is the init's; never `init` itself.
+/// The session of a call whose started process was never seen (it exited too soon), from what
+/// it left: the one session found only among processes new since `before`, other than the
+/// init's. The caller holds the exec gate from `before` on, so no other call started meanwhile;
+/// a process forked by one already running shares a session that existed in `before`. `None`
+/// when no such session or more than one is found.
 #[must_use]
-pub fn kill_set(now: &Snapshot, top: Stat, init: Stat) -> Vec<i32> {
+pub fn new_session(before: &Snapshot, now: &Snapshot, init: Stat) -> Option<i32> {
+    let old_pids = before.pids();
+    let old: HashSet<i32> = before.procs.iter().map(|p| p.session).collect();
+    let mut found: Option<i32> = None;
+    for p in &now.procs {
+        if old_pids.contains(&p.pid) || old.contains(&p.session) || p.session == init.session {
+            continue;
+        }
+        match found {
+            None => found = Some(p.session),
+            Some(s) if s == p.session => {}
+            Some(_) => return None,
+        }
+    }
+    found
+}
+
+/// One call's processes, as far as they were seen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Call {
+    /// The started process, if it was found alive.
+    pub top: Option<i32>,
+    /// The session crun gave the exec (shared by the started process and what it forks, also
+    /// once the started process is gone).
+    pub session: i32,
+}
+
+/// What to kill for `call`: its top process, the top's descendants, and the members of its
+/// session unless that is the init's; never `init` itself.
+#[must_use]
+pub fn kill_set(now: &Snapshot, call: Call, init: Stat) -> Vec<i32> {
     let parent: HashMap<i32, i32> = now.procs.iter().map(|p| (p.pid, p.ppid)).collect();
-    let own_session = top.session != init.session;
+    let own_session = call.session != init.session;
     let mut out: Vec<i32> = now
         .procs
         .iter()
         .filter(|p| p.pid != init.pid)
-        .filter(|p| (own_session && p.session == top.session) || descends(&parent, p.pid, top.pid))
+        .filter(|p| {
+            (own_session && p.session == call.session)
+                || call.top.is_some_and(|top| descends(&parent, p.pid, top))
+        })
         .map(|p| p.pid)
         .collect();
     out.sort_unstable();
@@ -136,7 +175,12 @@ mod tests {
         // A command name with spaces and parentheses cannot shift the fields.
         let evil = b"42 (a) S 1 1 1 (b) R 7 8 9 0) S 5 6 7 0 0";
         assert_eq!(parse_stat(evil), Some(st(42, 5, 7)));
-        assert_eq!(parse_stat(b"42 () Z 0 0 0 0"), Some(st(42, 0, 0)));
+        assert_eq!(parse_stat(b"42 () R 0 0 0 0"), Some(st(42, 0, 0)));
+        for dead in ["Z", "X", "x"] {
+            let line = format!("42 (sh) {dead} 1 2 3 0");
+            assert_eq!(parse_stat(line.as_bytes()), None, "{dead}");
+        }
+        assert_eq!(parse_stat(b"42 (sh) S 1 2 3 0"), Some(st(42, 1, 3)));
     }
 
     #[test]
@@ -204,29 +248,77 @@ mod tests {
                 st(31, 30, 29),
             ],
         };
-        assert_eq!(kill_set(&now, top, init), vec![20, 21, 22, 23]);
+        assert_eq!(
+            kill_set(&now, call(Some(20), 19), init),
+            vec![20, 21, 22, 23]
+        );
+        // The top already gone: its session still names what it left behind.
+        let after = Snapshot {
+            procs: now.procs.iter().copied().filter(|p| p.pid != 20).collect(),
+        };
+        assert_eq!(kill_set(&after, call(None, 19), init), vec![21, 22, 23]);
+        assert_eq!(kill_set(&after, call(Some(20), 19), init), vec![21, 22, 23]);
+    }
+
+    #[test]
+    fn a_quick_calls_session_is_the_one_new_session() {
+        let init = st(10, 5, 10);
+        let before = Snapshot {
+            procs: vec![init, st(11, 10, 10), st(30, 98, 29)],
+        };
+        let mut now = before.clone();
+        // Forked by the running call 30 meanwhile: its session existed before.
+        now.procs.push(st(31, 30, 29));
+        // Forked into init's session: never a call's.
+        now.procs.push(st(12, 10, 10));
+        assert_eq!(new_session(&before, &now, init), None);
+        // What the quick call left, reparented to init, in its own session.
+        now.procs.push(st(40, 10, 39));
+        now.procs.push(st(41, 40, 39));
+        assert_eq!(new_session(&before, &now, init), Some(39));
+        // Two new sessions: not ours to guess.
+        now.procs.push(st(50, 10, 50));
+        assert_eq!(new_session(&before, &now, init), None);
+        // A process already there before is never new, whatever its session.
+        let mut moved = before.clone();
+        moved.procs.push(st(60, 10, 59));
+        let mut later = moved.clone();
+        later.procs.push(st(61, 10, 59));
+        assert_eq!(new_session(&moved, &later, init), None);
+        let mut renamed = moved.clone();
+        renamed.procs[3] = st(60, 10, 61);
+        assert_eq!(new_session(&moved, &renamed, init), None);
+    }
+
+    fn call(top: Option<i32>, session: i32) -> Call {
+        Call { top, session }
     }
 
     #[test]
     fn a_call_in_the_inits_session_is_killed_by_descent_only() {
         let init = st(10, 5, 10);
-        let top = st(20, 99, 10);
         let now = Snapshot {
-            procs: vec![init, st(11, 10, 10), top, st(21, 20, 10), st(22, 21, 10)],
+            procs: vec![
+                init,
+                st(11, 10, 10),
+                st(20, 99, 10),
+                st(21, 20, 10),
+                st(22, 21, 10),
+            ],
         };
-        assert_eq!(kill_set(&now, top, init), vec![20, 21, 22]);
+        assert_eq!(kill_set(&now, call(Some(20), 10), init), vec![20, 21, 22]);
+        assert!(kill_set(&now, call(None, 10), init).is_empty());
         // Even a top that is the init is never selected itself; only its descendants are (20
         // hangs under a conmon outside the namespace, not under the init).
-        assert_eq!(kill_set(&now, init, init), vec![11]);
+        assert_eq!(kill_set(&now, call(Some(10), 10), init), vec![11]);
     }
 
     #[test]
     fn a_parent_cycle_ends_the_walk() {
         let init = st(1, 0, 1);
-        let top = st(20, 99, 1);
         let now = Snapshot {
-            procs: vec![top, st(30, 31, 1), st(31, 30, 1)],
+            procs: vec![st(20, 99, 1), st(30, 31, 1), st(31, 30, 1)],
         };
-        assert_eq!(kill_set(&now, top, init), vec![20]);
+        assert_eq!(kill_set(&now, call(Some(20), 1), init), vec![20]);
     }
 }
