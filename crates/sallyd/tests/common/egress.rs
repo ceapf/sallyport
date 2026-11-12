@@ -152,9 +152,10 @@ impl Pki {
     }
 }
 
-/// The TLS mock HTTP server: one request at a time; `/echo-headers` returns the request it got,
-/// `/redirect` a 302 to `https://mock2.test/echo-headers`, `/echo-gzip` a gzip-encoded body,
-/// anything else `ok`.
+/// The TLS mock HTTP server: one request at a time; `/echo-headers` returns the request it got
+/// as its body and the request's `Authorization` value in an `X-Echo-Authorization` header
+/// (RT-SEC-06), `/redirect` a 302 to `https://mock2.test/echo-headers`, `/echo-gzip` a
+/// gzip-encoded body, anything else `ok`.
 async fn serve_tls(
     far: DuplexStream,
     cfg: Arc<rustls::ServerConfig>,
@@ -168,14 +169,28 @@ async fn serve_tls(
         seen.lock().unwrap().push(req.clone());
         let path = req.split(' ').nth(1).unwrap_or("/");
         let (status, extra, body) = match path {
-            "/echo-headers" => ("200 OK", "", req.clone()),
+            "/echo-headers" => {
+                let auth = req
+                    .split("\r\n")
+                    .find_map(|l| {
+                        let (n, v) = l.split_once(':')?;
+                        n.eq_ignore_ascii_case("authorization").then(|| v.trim())
+                    })
+                    .map(|v| format!("X-Echo-Authorization: {v}\r\n"))
+                    .unwrap_or_default();
+                ("200 OK", auth, req.clone())
+            }
             "/redirect" => (
                 "302 Found",
-                "Location: https://mock2.test/echo-headers\r\n",
+                "Location: https://mock2.test/echo-headers\r\n".into(),
                 String::new(),
             ),
-            "/echo-gzip" => ("200 OK", "Content-Encoding: gzip\r\n", "GZIPPED".into()),
-            _ => ("200 OK", "", "ok".into()),
+            "/echo-gzip" => (
+                "200 OK",
+                "Content-Encoding: gzip\r\n".into(),
+                "GZIPPED".into(),
+            ),
+            _ => ("200 OK", String::new(), "ok".into()),
         };
         let resp = format!(
             "HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\n\r\n{body}",
