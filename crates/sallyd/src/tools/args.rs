@@ -325,6 +325,8 @@ mod tests {
         assert_eq!(cwd_of("/workspace/p"), Ok("/workspace/p".into()));
         assert_eq!(cwd_of("//workspace/./p/"), Ok("/workspace/p".into()));
         assert_eq!(cwd_of("/"), Ok("/".into()));
+        // A space is the first byte past the control range.
+        assert_eq!(cwd_of("/a b"), Ok("/a b".into()));
         for bad in [
             "workspace",
             "",

@@ -25,7 +25,8 @@
 //!   `curl … | sh`, which needs `sh -c`);
 //! - a wrapper (`env nice nohup timeout stdbuf ionice chrt taskset time command exec xargs sudo
 //!   doas busybox setsid flock watch chroot`) when any later suffix of the command tags, with
-//!   each argument also split on whitespace (`env -S "rm -rf /"`). Wrapper options are not
+//!   each argument also split on whitespace (`env -S "rm -rf /"`); more than [`MAX_WORDS`]
+//!   words tag the command unread. Wrapper options are not
 //!   parsed.
 //!
 //! Not tagged: everything else, including `cp`, `make`, `npm`, and scripts (`./build.sh`). An
@@ -51,6 +52,10 @@ const FIND_ACTIONS: [&str; 9] = [
     "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls",
 ];
 
+/// Most words a wrapper's arguments are split into before the command is tagged unread (the
+/// argv bound, so a split argument costs no more than separate ones).
+pub const MAX_WORDS: usize = super::args::MAX_ARGV;
+
 /// Whether `argv` is tagged destructive.
 #[must_use]
 pub fn destructive(argv: &[String]) -> bool {
@@ -64,7 +69,13 @@ pub fn destructive(argv: &[String]) -> bool {
         let words: Vec<&str> = rest
             .iter()
             .flat_map(|a| a.split_ascii_whitespace())
+            .take(MAX_WORDS + 1)
             .collect();
+        // Past the bound the command is tagged unread: the scan below is quadratic in the
+        // words, and one argument can hold a frame's worth of them (rust review H1).
+        if words.len() > MAX_WORDS {
+            return true;
+        }
         return (0..words.len()).any(|i| {
             words
                 .get(i..)
@@ -215,6 +226,8 @@ mod tests {
             &["git", "status"],
             &["git", "push"],
             &["git", "push", "origin", "main"],
+            // A lone `:` is the "matching branches" refspec; `:x` deletes x.
+            &["git", "push", "origin", ":"],
             &["git", "checkout", "main"],
             &["git", "branch", "new"],
             &["git", "stash"],
@@ -362,9 +375,29 @@ mod tests {
         let last = chain.len() - 1;
         chain[last] = "rm";
         assert!(t(&chain));
+        // A wrapper's words up to the bound are judged; one more and the command is tagged
+        // unread.
+        let words = |n: usize| {
+            let mut w = vec!["nice"; n - 1];
+            w.push("ls");
+            w.join(" ")
+        };
+        assert!(!t(&["env", &words(MAX_WORDS)]));
+        assert!(t(&["env", &words(MAX_WORDS + 1)]));
         let mut spaced = vec!["env"];
         spaced.extend(std::iter::repeat_n("nice nohup", 254));
         spaced.push("ls");
-        assert!(!t(&spaced));
+        assert!(t(&spaced));
+    }
+
+    // Rust review H1: one argument holding a frame's worth of words is judged at once.
+    #[test]
+    fn one_argument_full_of_words_is_tagged_without_scanning_it() {
+        let flood = "git ".repeat(65_000);
+        let start = std::time::Instant::now();
+        assert!(t(&["env", &flood]));
+        assert!(start.elapsed() < std::time::Duration::from_millis(500));
+        // Not a wrapper: the words of an argument are never split.
+        assert!(!t(&["echo", &flood]));
     }
 }

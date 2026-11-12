@@ -21,6 +21,9 @@ pub struct Stat {
     pub ppid: i32,
     /// Field 6.
     pub session: i32,
+    /// Field 22, the start time in clock ticks since boot: with the pid, it names one process
+    /// even across pid reuse (rust review LOW 2).
+    pub start: u64,
 }
 
 /// Longest `/proc/<pid>/stat` text parsed (the kernel's is well below it).
@@ -36,18 +39,31 @@ pub fn parse_stat(text: &[u8]) -> Option<Stat> {
     let open = text.iter().position(|&b| b == b'(')?;
     let close = text.iter().rposition(|&b| b == b')')?;
     let pid = number(text.get(..open)?.trim_ascii())?;
-    // After ") ": state, ppid, pgrp, session.
+    // After ") ": field 3 (state) onwards.
     let rest = std::str::from_utf8(text.get(close.checked_add(1)?..)?).ok()?;
-    let mut f = rest.split_ascii_whitespace();
+    let f: Vec<&str> = rest.split_ascii_whitespace().take(STARTTIME + 1).collect();
     // A zombie or dead process runs nothing: it is no process to find or kill.
-    if matches!(f.next()?, "Z" | "X" | "x") {
+    if matches!(*f.first()?, "Z" | "X" | "x") {
         return None;
     }
-    let ppid = f.next().and_then(|s| number(s.as_bytes()))?;
-    let _pgrp = f.next()?;
-    let session = f.next().and_then(|s| number(s.as_bytes()))?;
-    Some(Stat { pid, ppid, session })
+    let field = |n: usize| f.get(n).map(|s| s.as_bytes());
+    let ppid = number(field(PPID)?)?;
+    let session = number(field(SESSION)?)?;
+    let start = field(STARTTIME)
+        .filter(|b| !b.is_empty() && b.iter().all(u8::is_ascii_digit))
+        .and_then(|b| std::str::from_utf8(b).ok()?.parse().ok())?;
+    Some(Stat {
+        pid,
+        ppid,
+        session,
+        start,
+    })
 }
+
+/// Positions after the command name: field 3 (state) is 0.
+const PPID: usize = 1;
+const SESSION: usize = 3;
+const STARTTIME: usize = 19;
 
 /// A non-negative decimal `i32`, digits only.
 fn number(b: &[u8]) -> Option<i32> {
@@ -77,15 +93,20 @@ impl Snapshot {
 }
 
 /// The processes a new exec started: not in `before`, in the namespace, with a parent outside
-/// it (the exec session's `conmon`).
+/// it (the exec session's `conmon`), and in a session no process of `before` had. A running
+/// call can fork with `CLONE_PARENT` and give a child a parent outside the namespace; that child
+/// keeps its call's session, which existed before (security review LOW-5).
 #[must_use]
 pub fn started(before: &Snapshot, now: &Snapshot) -> Vec<Stat> {
     let old = before.pids();
+    let old_sessions: HashSet<i32> = before.procs.iter().map(|p| p.session).collect();
     let inside = now.pids();
     now.procs
         .iter()
         .copied()
-        .filter(|p| !old.contains(&p.pid) && !inside.contains(&p.ppid))
+        .filter(|p| {
+            !old.contains(&p.pid) && !inside.contains(&p.ppid) && !old_sessions.contains(&p.session)
+        })
         .collect()
 }
 
@@ -165,44 +186,81 @@ mod tests {
     use super::*;
 
     fn st(pid: i32, ppid: i32, session: i32) -> Stat {
-        Stat { pid, ppid, session }
+        Stat {
+            pid,
+            ppid,
+            session,
+            start: 0,
+        }
+    }
+
+    /// A `/proc/<pid>/stat` line: fields 3..=22 after the name are `state ppid pgrp session`,
+    /// fourteen zeros, `starttime`; then a tail like the kernel's.
+    fn line(head: &str, state: &str, ppid: &str, session: &str, start: &str) -> String {
+        format!("{head} {state} {ppid} 9 {session} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {start} 1 2 3")
     }
 
     #[test]
     fn stat_is_parsed_from_after_the_last_parenthesis() {
-        let line = b"1224962 (sleep) S 1224959 1224961 1224961 0 -1 4194560 92 0 0 0";
-        assert_eq!(parse_stat(line), Some(st(1_224_962, 1_224_959, 1_224_961)));
+        let real = "1224962 (sleep) S 1224959 1224961 1224961 0 -1 4194560 92 0 0 0 0 0 0 0 20 \
+                    0 1 0 8835722 1695744 98 18446744073709551615";
+        let want = Stat {
+            pid: 1_224_962,
+            ppid: 1_224_959,
+            session: 1_224_961,
+            start: 8_835_722,
+        };
+        assert_eq!(parse_stat(real.as_bytes()), Some(want));
         // A command name with spaces and parentheses cannot shift the fields.
-        let evil = b"42 (a) S 1 1 1 (b) R 7 8 9 0) S 5 6 7 0 0";
-        assert_eq!(parse_stat(evil), Some(st(42, 5, 7)));
-        assert_eq!(parse_stat(b"42 () R 0 0 0 0"), Some(st(42, 0, 0)));
+        let evil = line("42 (a) S 1 1 1 (b) R 7 8 9 0)", "S", "5", "7", "11");
+        let want = Stat {
+            pid: 42,
+            ppid: 5,
+            session: 7,
+            start: 11,
+        };
+        assert_eq!(parse_stat(evil.as_bytes()), Some(want));
+        assert_eq!(
+            parse_stat(line("42 ()", "R", "0", "0", "0").as_bytes()),
+            Some(st(42, 0, 0))
+        );
         for dead in ["Z", "X", "x"] {
-            let line = format!("42 (sh) {dead} 1 2 3 0");
-            assert_eq!(parse_stat(line.as_bytes()), None, "{dead}");
+            let l = line("42 (sh)", dead, "1", "3", "0");
+            assert_eq!(parse_stat(l.as_bytes()), None, "{dead}");
         }
-        assert_eq!(parse_stat(b"42 (sh) S 1 2 3 0"), Some(st(42, 1, 3)));
+        assert_eq!(
+            parse_stat(line("42 (sh)", "S", "1", "3", "0").as_bytes()),
+            Some(st(42, 1, 3))
+        );
     }
 
     #[test]
     fn malformed_stat_is_refused() {
+        let ok = |h: &str| line(h, "S", "1", "3", "4");
         for bad in [
-            &b""[..],
-            b"42",
-            b"42 (x",
-            b"42 x) S 1 2 3",
-            b"(x) S 1 2 3",
-            b"-1 (x) S 1 2 3",
-            b"4x (x) S 1 2 3",
-            b"42 (x) S",
-            b"42 (x) S 1 2",
-            b"42 (x) S -1 2 3",
-            b"42 (x) S 1 2 x",
-            b"42 (x) S 99999999999 2 3",
-            b"42 (x) S 1 2 \xff",
+            String::new(),
+            "42".into(),
+            "42 (x".into(),
+            ok("42 x)"),
+            ok("(x)"),
+            ok("-1 (x)"),
+            ok("4x (x)"),
+            "42 (x) S".into(),
+            "42 (x) S 1 9 3 0 0 0 0 0 0 0 0 0 0 0 0 0 0".into(),
+            line("42 (x)", "S", "-1", "3", "4"),
+            line("42 (x)", "S", "1", "x", "4"),
+            line("42 (x)", "S", "99999999999", "3", "4"),
+            line("42 (x)", "S", "1", "3", "-4"),
+            line("42 (x)", "S", "1", "3", "4x"),
+            // `str::parse` would take a sign: the field is digits only.
+            line("42 (x)", "S", "1", "3", "+4"),
+            line("42 (x)", "S", "1", "3", "99999999999999999999999"),
         ] {
-            assert_eq!(parse_stat(bad), None, "{:?}", String::from_utf8_lossy(bad));
+            assert_eq!(parse_stat(bad.as_bytes()), None, "{bad:?}");
         }
-        let mut long = b"42 (x) S 1 2 3 ".to_vec();
+        assert_eq!(parse_stat(b"42 (x) S 1 2 \xff"), None);
+        let mut long = ok("42 (x)").into_bytes();
+        long.push(b' ');
         long.resize(MAX_STAT, b'0');
         assert!(parse_stat(&long).is_some());
         long.push(b'0');
@@ -229,6 +287,20 @@ mod tests {
         assert!(started(&now, &now).is_empty());
         assert_eq!(now.get(21), Some(st(21, 20, 19)));
         assert_eq!(now.get(5), None);
+    }
+
+    /// Security review LOW-5: a running call's `CLONE_PARENT` child has a parent outside the
+    /// namespace, but its call's session existed before the new exec.
+    #[test]
+    fn a_running_calls_clone_parent_child_is_not_a_new_start() {
+        let before = Snapshot {
+            procs: vec![st(10, 5, 10), st(30, 98, 29)],
+        };
+        let mut now = before.clone();
+        now.procs.push(st(31, 98, 29));
+        assert!(started(&before, &now).is_empty());
+        now.procs.push(st(40, 97, 39));
+        assert_eq!(started(&before, &now), vec![st(40, 97, 39)]);
     }
 
     #[test]

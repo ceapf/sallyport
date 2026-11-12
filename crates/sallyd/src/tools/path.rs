@@ -14,7 +14,8 @@ use crate::approvals::glob;
 pub const MAX_PATH: usize = glob::MAX_PATH;
 
 /// Why a path names no target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("{}", self.code())]
 pub enum PathError {
     /// Outside every mount: relative, `..`, under no mount, or a symlink or mount crossing met
     /// during resolution.
@@ -162,6 +163,9 @@ mod tests {
         assert_eq!((l.mount, l.rel.as_str()), (0, "bc"));
         // A guest root with no segment matches nothing.
         assert_eq!(locate(&["/"], "/a", false), Err(PathError::Escapes));
+        // Only a strictly longer root replaces a match: of equal ones the first stays.
+        let twice = ["/workspace/a", "//workspace/a/"];
+        assert_eq!(locate(&twice, "/workspace/a/c", false).unwrap().mount, 0);
     }
 
     #[test]
@@ -176,6 +180,8 @@ mod tests {
             assert_eq!(at(p), Err(PathError::Bad), "{p:?}");
         }
         let head = "/workspace/p/";
+        // A space is the first byte past the control range.
+        assert!(at("/workspace/p/a b").is_ok());
         let at_bound = format!("{head}{}", "a".repeat(MAX_PATH - head.len()));
         assert!(at(&at_bound).is_ok());
         let over = format!("{at_bound}a");
@@ -186,6 +192,7 @@ mod tests {
     fn codes_are_the_wire_spellings() {
         assert_eq!(PathError::Escapes.code(), "path_escapes_mount");
         assert_eq!(PathError::Bad.code(), "bad-path");
+        assert_eq!(PathError::Escapes.to_string(), "path_escapes_mount");
     }
 
     #[test]

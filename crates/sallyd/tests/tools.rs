@@ -87,6 +87,8 @@ fn session(x: &Lx, v: &ValidatedManifest, r: &Running, timeout: Duration) -> Ses
         mounts: tool_mounts(v, &r.init_dir()),
         record: rec,
         exec_gate: r.exec_gate(),
+        // The launcher's ids: the workspace's `--user`.
+        ids: ids(),
         shell: PodmanExec::new(x.podman.clone(), r),
     });
     Session {
@@ -237,6 +239,34 @@ fn what_a_finished_command_left_running_is_killed() {
     });
 }
 
+/// #66: the approved argv is the command, never podman options. Words that look like `podman
+/// exec` flags reach the container as the program name and fail there.
+#[test]
+fn an_argv_that_looks_like_podman_flags_is_the_command() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let v = manifest(&x, "", "allow");
+        let r = x.launch(&v, "flags").await.unwrap();
+        let run = PodmanExec::new(x.podman.clone(), &r);
+        for argv in [
+            &["--privileged", "id"][..],
+            &["--user=0", "id"],
+            &["-e", "X=1", "env"],
+            &["--env=X=1", "env"],
+        ] {
+            let argv: Vec<String> = argv.iter().map(|s| (*s).to_owned()).collect();
+            let out = run.run(&argv, "/").await;
+            assert_eq!(out.status, Status::Exited(127), "{argv:?}");
+            assert!(out.stdout.kept.is_empty(), "{argv:?}");
+        }
+        // The command sees the fixed environment, not one the argv names.
+        let out = run.run(&["env".to_owned()], "/").await;
+        let env = String::from_utf8_lossy(&out.stdout.kept).into_owned();
+        assert!(!env.lines().any(|l| l.starts_with("X=")), "{env}");
+        x.stop(r).await;
+    });
+}
+
 /// #62: a call dropped at teardown kills the command it started.
 #[test]
 fn a_dropped_call_kills_its_command() {
@@ -275,26 +305,33 @@ fn the_exec_gate_is_held_only_while_a_command_starts() {
         let gate = r.exec_gate();
         let held = Arc::clone(&gate).lock_owned().await;
         let run = PodmanExec::new(x.podman.clone(), &r);
-        let h = tokio::spawn(async move { run.run(&["sleep".into(), "5".into()], "/").await });
+        let h = tokio::spawn(async move { run.run(&["sleep".into(), "304".into()], "/").await });
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert_eq!(
-            sleeps(r.container(), "5"),
+            sleeps(r.container(), "304"),
             0,
             "started while the gate was held"
         );
         drop(held);
         until("the command started", Duration::from_secs(20), || {
-            sleeps(r.container(), "5") == 1
+            sleeps(r.container(), "304") == 1
         })
         .await;
+        // The command runs for minutes: the gate comes back long before it ends.
         until(
             "the gate free while it runs",
-            Duration::from_secs(4),
+            Duration::from_secs(20),
             || gate.try_lock().is_ok(),
         )
         .await;
-        assert_eq!(sleeps(r.container(), "5"), 1, "the command still runs");
-        assert_eq!(h.await.unwrap().status, Status::Exited(0));
+        assert_eq!(sleeps(r.container(), "304"), 1, "the command still runs");
+        assert!(!h.is_finished());
+        h.abort();
+        let _ = h.await;
+        until("the command gone", Duration::from_secs(10), || {
+            sleeps(r.container(), "304") == 0
+        })
+        .await;
         x.stop(r).await;
     });
 }

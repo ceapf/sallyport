@@ -100,6 +100,14 @@ struct Fx {
     gate: Arc<tokio::sync::Mutex<()>>,
     ran: Ran,
     rows_at_run: Arc<AtomicUsize>,
+    /// The fixture's scratch directory, removed on drop.
+    base: PathBuf,
+}
+
+impl Drop for Fx {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.base);
+    }
 }
 
 impl Fx {
@@ -135,13 +143,29 @@ impl Fx {
 
     /// Waits until `n` prompts were shown.
     async fn until_shown(&self, n: usize) -> Prompt {
-        for _ in 0..2000 {
-            if let Some(p) = self.prompts().get(n - 1) {
-                return p.clone();
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        panic!("no prompt");
+        until("a prompt", || self.prompts().len() >= n).await;
+        self.prompts()[n - 1].clone()
+    }
+
+    /// Waits until a `tool.run` entry was written.
+    async fn until_run(&self) {
+        until("tool.run", || {
+            self.sink.events().iter().any(|e| e == "tool.run")
+        })
+        .await;
+    }
+}
+
+/// Waits for `f` on a wall-clock deadline, and fails the test past it (rust review M7: a loaded
+/// runner never lets a wait fall through silently).
+async fn until(what: &str, mut f: impl FnMut() -> bool) {
+    let end = std::time::Instant::now() + Duration::from_secs(10);
+    while !f() {
+        assert!(
+            std::time::Instant::now() < end,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
 
@@ -257,6 +281,10 @@ fn fx(name: &str, o: Opts) -> Fx {
         mounts,
         record: rec,
         exec_gate: Arc::clone(&exec_gate),
+        ids: UserIds {
+            uid: rustix::process::getuid().as_raw(),
+            gid: rustix::process::getgid().as_raw(),
+        },
         shell: Fake {
             ran: Arc::clone(&ran),
             out: o.out,
@@ -276,6 +304,7 @@ fn fx(name: &str, o: Opts) -> Fx {
         gate: exec_gate,
         ran,
         rows_at_run,
+        base,
     }
 }
 
@@ -556,13 +585,9 @@ async fn rw_writes_run_unasked_in_the_workspace_view_holding_the_exec_gate() {
         )
         .await
     });
-    for _ in 0..2000 {
-        if f.sink.events().iter().any(|e| e == "tool.run") {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    f.until_run().await;
+    // Time for an unguarded write to land, so the check below proves the gate holds it.
+    tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
         !rw.join("x").exists(),
         "written while the exec gate was held"
@@ -596,6 +621,43 @@ async fn rw_writes_run_unasked_in_the_workspace_view_holding_the_exec_gate() {
         json!({"path": "/workspace/rw/x", "deleted": true})
     );
     assert!(!rw.join("x").exists());
+}
+
+/// The hard-link refusal is the brokered mount's alone (the broker would write through to the
+/// other name); in the workspace's own view the sandbox could write it anyway.
+#[tokio::test]
+async fn only_a_brokered_write_refuses_a_hard_link() {
+    let f = fx("hard-link", opts(all_modes()));
+    for guest in ["/workspace/notes", "/workspace/rw"] {
+        let d = f.dir(guest).to_owned();
+        std::fs::write(d.join("a"), b"a").unwrap();
+        std::fs::hard_link(d.join("a"), d.join("h")).unwrap();
+    }
+    let out = f
+        .call(
+            "fs_write",
+            json!({"path": "/workspace/notes/h", "content_b64": "eA=="}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.text, "denied: hard-link");
+    assert!(f.prompts().is_empty());
+    let out = f
+        .call(
+            "fs_write",
+            json!({"path": "/workspace/rw/h", "content_b64": "eA=="}),
+        )
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.text);
+    assert_eq!(
+        std::fs::read(f.dir("/workspace/rw").join("a")).unwrap(),
+        b"x"
+    );
+    assert_eq!(
+        std::fs::read(f.dir("/workspace/notes").join("a")).unwrap(),
+        b"a"
+    );
 }
 
 #[tokio::test]
@@ -716,12 +778,7 @@ async fn a_failure_at_run_time_is_reported_and_audited() {
         json!({"path": "/workspace/rw/t", "content_b64": "eA=="}),
     );
     let swap = async {
-        for _ in 0..2000 {
-            if f.sink.events().iter().any(|e| e == "tool.run") {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
+        f.until_run().await;
         std::fs::remove_file(rw.join("t")).unwrap();
         std::fs::create_dir(rw.join("t")).unwrap();
         drop(held);
@@ -1066,6 +1123,7 @@ fn the_session_mounts_take_their_roots_by_mode() {
         ]
     );
     assert_eq!(ms[1].host, base.join("rw"));
+    std::fs::remove_dir_all(&base).unwrap();
 }
 
 impl<R: Runner> Executor for Arc<Tools<R>> {

@@ -15,6 +15,7 @@
 //!   operation, so the disk watchdog never walks a tree the broker is changing (ruling Q29).
 
 pub mod args;
+pub mod dac;
 pub mod exec;
 pub mod fs;
 pub mod path;
@@ -37,6 +38,7 @@ use crate::approvals::queue::fields;
 use crate::approvals::{Executor, Prepared, Ticket};
 use crate::rpc::mcp::{Tool, ToolOutcome};
 use crate::rpc::record::{Recorder, escape};
+use crate::sandbox::UserIds;
 use args::Args;
 use fs::{FsError, RootSource};
 use shell::{Output, Runner, Status};
@@ -109,6 +111,9 @@ pub struct Parts<R> {
     pub record: Recorder,
     /// The session's exec gate (`Running::exec_gate`).
     pub exec_gate: Arc<tokio::sync::Mutex<()>>,
+    /// The sandbox's identity, the launcher's own `UserIds` (the `--user` of the workspace): every
+    /// file object is judged by it (architect ruling Q39). Never read from `getuid` here.
+    pub ids: UserIds,
     /// Runs `shell` commands ([`exec::PodmanExec`] in production).
     pub shell: R,
 }
@@ -119,6 +124,7 @@ pub struct Tools<R> {
     mounts: Vec<Mount>,
     record: Recorder,
     gate: Arc<tokio::sync::Mutex<()>>,
+    ids: UserIds,
     shell: R,
 }
 
@@ -131,6 +137,7 @@ impl<R: Runner> Tools<R> {
             mounts: p.mounts,
             record: p.record,
             gate: p.exec_gate,
+            ids: p.ids,
             shell: p.shell,
         }
     }
@@ -145,13 +152,14 @@ fn mode_str(m: MountMode) -> &'static str {
     }
 }
 
-/// Runs `f` on the opened root of `src`, off the runtime.
+/// Runs `f` on the opened root of `src` (objects judged as `ids`), off the runtime.
 async fn on_root<T: Send + 'static>(
     src: &RootSource,
+    ids: UserIds,
     f: impl FnOnce(&fs::Root) -> Result<T, FsError> + Send + 'static,
 ) -> Result<T, FsError> {
     let src = src.clone();
-    tokio::task::spawn_blocking(move || f(&src.open()?))
+    tokio::task::spawn_blocking(move || f(&src.open(ids)?))
         .await
         .unwrap_or(Err(FsError::Io(rustix::io::Errno::IO)))
 }
@@ -214,7 +222,7 @@ impl<R: Runner> Tools<R> {
         }
         if m.mode != MountMode::Ro {
             let (rel, brokered) = (t.rel.clone(), m.mode == MountMode::Brokered);
-            on_root(&m.root, move |r| check(r, &rel, brokered))
+            on_root(&m.root, self.ids, move |r| check(r, &rel, brokered))
                 .await
                 .map_err(FsError::code)?;
         }
@@ -235,7 +243,7 @@ impl<R: Runner> Tools<R> {
         len: u64,
     ) -> Option<ToolOutcome> {
         let rel = t.rel.clone();
-        let res = on_root(&m.root, move |r| fs::read(r, &rel, offset, len)).await;
+        let res = on_root(&m.root, self.ids, move |r| fs::read(r, &rel, offset, len)).await;
         let mut f = fields(b);
         add(&mut f, "mode", Value::from(mode_str(m.mode)));
         add(&mut f, "offset", Value::from(offset));
@@ -269,7 +277,7 @@ impl<R: Runner> Tools<R> {
 
     async fn run_list(&self, b: &Bound, m: &Mount, t: &Target) -> Option<ToolOutcome> {
         let rel = t.rel.clone();
-        let res = on_root(&m.root, move |r| fs::list(r, &rel)).await;
+        let res = on_root(&m.root, self.ids, move |r| fs::list(r, &rel)).await;
         let mut f = fields(b);
         add(&mut f, "mode", Value::from(mode_str(m.mode)));
         let out = match res {
@@ -329,7 +337,9 @@ impl<R: Runner> Tools<R> {
             return None;
         }
         let brokered = m.mode == MountMode::Brokered;
-        // In the workspace's view the watchdog may be walking the same tree: hold the gate.
+        // In the workspace's view the watchdog may be walking the same tree: hold the gate. The
+        // guard moves into the blocking work, so a dropped call cannot release it while the
+        // write still runs (rust review M5).
         let held = if brokered {
             None
         } else {
@@ -339,11 +349,20 @@ impl<R: Runner> Tools<R> {
         let res = match content {
             Some(c) => {
                 let bytes = c.bytes().to_vec();
-                on_root(&m.root, move |r| fs::write(r, &rel, &bytes, brokered)).await
+                on_root(&m.root, self.ids, move |r| {
+                    let _held = held;
+                    fs::write(r, &rel, &bytes, brokered)
+                })
+                .await
             }
-            None => on_root(&m.root, move |r| fs::delete(r, &rel)).await,
+            None => {
+                on_root(&m.root, self.ids, move |r| {
+                    let _held = held;
+                    fs::delete(r, &rel)
+                })
+                .await
+            }
         };
-        drop(held);
         let mut r = json!({"call": b.call, "tool": b.action.tool(), "action_sha256": b.digest()});
         let out = match res {
             Ok(()) => {
@@ -452,7 +471,7 @@ impl<R: Runner> Executor for Tools<R> {
             Args::Read { path, offset, len } => {
                 let (m, target) = self.target(&path, false)?;
                 let rel = target.rel.clone();
-                on_root(&m.root, move |r| fs::check_read(r, &rel))
+                on_root(&m.root, self.ids, move |r| fs::check_read(r, &rel))
                     .await
                     .map_err(FsError::code)?;
                 Action::FsRead {
@@ -464,7 +483,7 @@ impl<R: Runner> Executor for Tools<R> {
             Args::List { path } => {
                 let (m, target) = self.target(&path, true)?;
                 let rel = target.rel.clone();
-                on_root(&m.root, move |r| fs::check_list(r, &rel))
+                on_root(&m.root, self.ids, move |r| fs::check_list(r, &rel))
                     .await
                     .map_err(FsError::code)?;
                 Action::FsList { target }
@@ -520,7 +539,11 @@ impl<R: Runner> Executor for Tools<R> {
             Action::FsWrite { content, .. } => {
                 self.run_file(&ticket, m, target, Some(content)).await
             }
-            _ => self.run_file(&ticket, m, target, None).await,
+            Action::FsDelete { .. } => self.run_file(&ticket, m, target, None).await,
+            // Answered above; never a delete by default (rust review H2).
+            Action::Shell { .. } | Action::Fetch { .. } | Action::Mcp { .. } => {
+                Some(failed("unsupported"))
+            }
         }
     }
 }
