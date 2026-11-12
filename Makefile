@@ -43,13 +43,14 @@ test: test-scripts shim-check
 	$(TEST_RUN) $(CARGO) test -q --workspace
 
 # Shell-script tests (doctor's --redact filter, the commit trailer check, the mutation and
-# coverage gates, the test-run sweep).
+# coverage gates, the test-run sweep, the CI disk check).
 test-scripts:
 	bash tests/scripts/redact_test.sh
 	bash tests/scripts/check_trailers_test.sh
 	bash tests/scripts/mutants_gate_test.sh
 	bash tests/scripts/coverage_gate_test.sh
 	bash tests/scripts/test_run_test.sh
+	bash tests/scripts/disk_check_test.sh
 
 # CI runner (AMENDMENTS-01 §15). nextest skips doctests, so they run separately.
 nextest:

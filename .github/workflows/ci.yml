@@ -48,7 +48,13 @@ jobs:
           test -n "$XDG_RUNTIME_DIR"
           podman info --format '{{.Host.CgroupsVersion}} {{.Host.OCIRuntime.Path}}'
           podman pull docker.io/library/alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
-      - run: make fmt clippy forbid-unsafe nextest shim-check
+      - run: make fmt clippy forbid-unsafe
+      # Build the test binaries first, so the disk check sees what the container tests will
+      # have: a runner image with less disk fails here with its own message (scripts/disk-check.sh).
+      - run: cargo nextest run --locked --workspace --no-run
+      - name: disk space for container launches
+        run: scripts/disk-check.sh target "$(podman info --format '{{.Store.GraphRoot}}')"
+      - run: make nextest shim-check
   # The red-team rows implemented so far (`make redteam`); a required check from Task 6c on.
   redteam:
     runs-on: ubuntu-24.04
@@ -74,6 +80,9 @@ jobs:
           test -n "$XDG_RUNTIME_DIR"
           podman info --format '{{.Host.CgroupsVersion}} {{.Host.OCIRuntime.Path}}'
           podman pull docker.io/library/alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+      - run: cargo nextest run --locked --workspace --no-run
+      - name: disk space for container launches
+        run: scripts/disk-check.sh target "$(podman info --format '{{.Store.GraphRoot}}')"
       - run: make redteam
   coverage:
     runs-on: ubuntu-24.04
