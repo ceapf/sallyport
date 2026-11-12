@@ -106,10 +106,11 @@ mutants:
 MUTANTS_WIDE_CORE := $(addprefix crates/sally-core/src/,manifest/image.rs manifest/hostenv.rs \
                      manifest/parse.rs manifest/summary.rs manifest/units.rs secrets/store.rs \
                      secrets/secret.rs audit/entry.rs audit/redact.rs audit/verify.rs \
-                     audit/writer.rs audit/layout.rs fsutil.rs fd.rs)
+                     audit/writer.rs audit/layout.rs fsutil.rs fd.rs text.rs)
 MUTANTS_WIDE_SALLYD := $(addprefix crates/sallyd/src/sandbox/,argv.rs check.rs types.rs profiles.rs \
                        overlap.rs scan.rs images.rs changes.rs dirs.rs podman.rs disk.rs stage.rs \
-                       launch/error.rs) \
+                       launch/error.rs budget.rs) \
+                       $(addprefix crates/sallyd/src/daemon/,crash.rs) \
                        $(addprefix crates/sallyd/src/egress/,addr.rs authority.rs head.rs policy.rs server.rs \
                        hostaddrs.rs tunnel.rs net.rs ca.rs roots.rs rewrite.rs intercept.rs \
                        intercept_tls.rs intercept_report.rs meter.rs inject.rs redact.rs) \
