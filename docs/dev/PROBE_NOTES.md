@@ -34,6 +34,16 @@ line per fact, with where it was found. Check a note again before relying on it 
   copy + whiteout (EXDEV, no redirect_dir). (6c-2, FS-15)
 - `podman rmi <repo:tag>` on an image that has another tag only untags ("Untagged: …"); the
   image stays, and `<repo>@<digest>` still resolves through the remaining tag. (8-prC, Q25)
+- Killing the `podman exec` client (SIGKILL or SIGTERM) leaves the exec'd command running in the
+  container. An exec'd process's host parent is the exec session's `conmon`, outside the
+  container's pid namespace; crun gives each exec its own session through a short-lived
+  intermediate that calls `setsid` (the process's sid names a pid that is already gone).
+  `podman exec C <args…>` parses nothing after the container: `--privileged` there is a command
+  name. A missing command or `--workdir` exits 127; a signal exits 128+N. (Task 11, Q32)
+- `/proc/<container init pid>/root` is openable by the user after `podman start` (keep-id). A
+  write through it into a `:O` staged mount lands in the upper directory (owned by the user in
+  the container's view), the host lower stays byte-identical, and the container sees the change;
+  an unlink there leaves a whiteout. (Task 11, Q29)
 - `podman build` keeps intermediate layer images (`<none>` in `images -a`) unless
   `--layers=false`. `ps --filter name=` is an unanchored regex: match names with `grep -E '^…'`.
   (8-prC)

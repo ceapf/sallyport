@@ -60,7 +60,8 @@ nextest:
 
 # Line-coverage gates (CLAUDE.md): sally-core >= 90%; sallyd egress >= 85% over the whole module
 # directory, lib tests only (architect ruling Q16, Task 8). rpc and llm are gated at the same
-# floor (architect ruling Q15, Task 7), and approvals (architect ruling Q26, Task 10).
+# floor (architect ruling Q15, Task 7), approvals (architect ruling Q26, Task 10) and tools
+# (Task 11; tools/exec.rs is container-only and counts as uncovered here).
 COV_MIN_CORE ?= 90
 COV_MIN_EGRESS ?= 85
 coverage:
@@ -70,11 +71,12 @@ coverage:
 	bash scripts/coverage-gate.sh $(COV_MIN_EGRESS) target/cov-sallyd.json /crates/sallyd/src/rpc/
 	bash scripts/coverage-gate.sh $(COV_MIN_EGRESS) target/cov-sallyd.json /crates/sallyd/src/llm/
 	bash scripts/coverage-gate.sh $(COV_MIN_EGRESS) target/cov-sallyd.json /crates/sallyd/src/approvals/
+	bash scripts/coverage-gate.sh $(COV_MIN_EGRESS) target/cov-sallyd.json /crates/sallyd/src/tools/
 
 # Mutation testing over the deny paths, zero survivors (AMENDMENTS-01 §15): a surviving mutant in
-# a deny path is an untested control. tools::fs joins as it lands; the egress modules run in
-# mutants-wide-sallyd below (architect ruling Q6, Task 8), and so do approvals (maintainer's Task
-# 10 decision 8, architect ruling Q26).
+# a deny path is an untested control. The egress modules run in mutants-wide-sallyd below
+# (architect ruling Q6, Task 8), and so do approvals (maintainer's Task 10 decision 8, architect
+# ruling Q26) and tools (Task 11 decision 8, ruling Q38; tools/exec.rs stays with the rt_ tests).
 MUTANTS_FILES := crates/sally-core/src/manifest/validate/*.rs crates/sally-core/src/manifest/paths.rs \
                  crates/sally-core/src/manifest/host.rs crates/sally-core/src/config.rs
 # cargo-mutants copies the tree to $$TMPDIR; /tmp is denylisted for mounts, so the copy (and the
@@ -114,7 +116,9 @@ MUTANTS_WIDE_SALLYD := $(addprefix crates/sallyd/src/sandbox/,argv.rs check.rs t
                        message.rs rate.rs record.rs) \
                        $(addprefix crates/sallyd/src/llm/,body.rs head.rs io.rs reply.rs server.rs) \
                        $(addprefix crates/sallyd/src/approvals/,action.rs glob.rs handler.rs policy.rs \
-                       queue.rs render.rs)
+                       queue.rs render.rs) \
+                       $(addprefix crates/sallyd/src/tools/,args.rs path.rs tag.rs fs.rs shell.rs procs.rs \
+                       mod.rs)
 MUTANTS_WIDE_SHIM := $(addprefix crates/sally-shim/src/,args.rs relay.rs)
 MUTANTS_WIDE_TESTS_CORE :=
 MUTANTS_WIDE_TESTS_SALLYD := --lib --test=argv --test=scan

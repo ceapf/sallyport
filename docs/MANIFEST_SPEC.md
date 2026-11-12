@@ -156,9 +156,11 @@ normal shape of a useful agent, so the point is that the user sees it every time
     deletes: ["**"]               # globs whose deletes need approval; omitted = ["**"]
 ```
 Mounts exist only in the workspace container. The harness reaches them only through broker
-tools: `fs_read`/`fs_list` on any mode, `fs_write`/`fs_delete` on `rw` and `brokered` (denied on
-`ro` and `staged`), and `shell` (`podman exec` in the workspace). Every such action is audited
-(SI-4).
+tools: `fs_read`/`fs_list` on any mode, `fs_write`/`fs_delete` on `rw`, `staged` and `brokered`
+(denied on `ro`), and `shell` (`podman exec` in the workspace). Writes and deletes on `rw` and
+`staged` run in the workspace's own view of the mount, so the overlay and the `.git` shields
+apply; on `brokered` the broker performs them on the host folder after approval (maintainer's
+Task 11 decision 1; ARCHITECTURE §4.3). Every such action is audited (SI-4).
 
 - `ro`: bind mount read-only.
 - `rw`: bind mount read-write (`nosuid,nodev`). **This is the blast radius.** Writes are audited
@@ -204,8 +206,10 @@ tools: `fs_read`/`fs_list` on any mode, `fs_write`/`fs_delete` on `rw` and `brok
   covers every `rw` mount (an `rw` mount without a scan is refused). More than 32 shielded
   entries in one `rw` mount, or a tree beyond the scan's bounds, refuses the launch with advice
   to use `staged`. In a `staged` mount the host is untouched anyway and nothing under a `.git`
-  component is ever applied. Broker `fs_write`/`fs_delete` deny any path with a `.git` component
-  (`protected-path`). The validator refuses an `rw`/`brokered`/`staged` mount whose realpath has a
+  component is ever applied. Broker `fs_write`/`fs_delete` deny any path with a `.git` component,
+  compared ASCII case-insensitively, in every mode (`protected-path`, #19). Residual: other
+  spellings a file system may fold to `.git` (`.git.` or an 8.3 short name on a foreign file
+  system) are not caught. The validator refuses an `rw`/`brokered`/`staged` mount whose realpath has a
   `.git` component or is (inside) a git directory by structure (`HEAD` + `objects/` + `refs/`,
   i.e. bare repos and separate git dirs; `protected-path`). `summary()` names what an `rw` mount
   cannot protect: `Makefile`, `package.json` scripts, `.vscode/tasks.json`, `.envrc`, new
@@ -362,7 +366,7 @@ validation — otherwise `mount-changed`/`is-symlink` (RT-FS-06).
 | `model.context` (token limit) | `sallyd::llm` (`body::check`): a request's `max_tokens` / `max_completion_tokens` above it is refused (and 0 always is); absent, the backend is given `model.context` as the bound. The M3 fit estimator clamps further | each `llm.sock` request | 400 `token-limit` (0: `bad-value`) + audit `llm.deny` |
 | `filesystem.mounts[].host` | validator (realpath, denylist, is-dir, not-symlink) **and again** at launch: the launch scan re-opens the root without following symlinks and compares `st_dev:st_ino`, pins are re-checked before `podman init`, and bind mounts are compared inside the container after `init` (ARCHITECTURE §3.5) | validate + launch | reject / `sandbox.refuse` / `sandbox.mount_mismatch` |
 | `filesystem.mounts[].guest` | validator (`/workspace/…`, no `..`, unique) | validate | reject |
-| `filesystem.mounts[].mode` | workspace `podman run` (`sallyd::sandbox::workspace_argv`): bind `ro`/`rw` with `nosuid,nodev,bind` (non-recursive); `brokered` → `ro` + broker `fs_*`; `staged` → `:O` overlay with upper/work in session scratch | launch + each `fs_*` call | EROFS in workspace; `fs_write`/`fs_delete` denied on `ro` and `staged` |
+| `filesystem.mounts[].mode` | workspace `podman run` (`sallyd::sandbox::workspace_argv`): bind `ro`/`rw` with `nosuid,nodev,bind` (non-recursive); `brokered` → `ro` + broker `fs_*`; `staged` → `:O` overlay with upper/work in session scratch | launch + each `fs_*` call | EROFS in workspace; `fs_write`/`fs_delete` denied on `ro` (`read-only`); on `staged` they land in the overlay's upper directory |
 | `filesystem.mounts[].approve` | validator (glob syntax, §1 Mount) + `sallyd::approvals` glob match on canonical relative path; omitted = `["**"]` | validate + each brokered write/delete | reject; pending → approve/deny |
 | git metadata (AMENDMENTS-02 B2(a)) | validator (no writable mount inside `.git`); `.git` directories in `rw` mounts as overlays over session scratch, `.git` files bound read-only (argv builder, Task 6a; launch scan, Task 6b); broker `fs_write`/`fs_delete` | validate + launch + each call | reject / EROFS / `protected-path` |
 | `filesystem.deny` | validator adds to denylist | validate | reject |
@@ -375,9 +379,9 @@ validation — otherwise `mount-changed`/`is-symlink` (RT-FS-06).
 | `secrets[].inject.host` | validator (exact host, must be allowed) + inject | validate + request | reject |
 | `secrets[].inject.header/format/basic_user` | validator + inject (TLS-terminated grant hosts only; from Task 9a-2 every client copy of the header is dropped, Task 9a-3 sets it) | validate + request | reject; plain HTTP to any host → 405 `plain-http-unsupported` |
 | `secrets[].expose_env` | validator (name rule) + workspace `--env NAME=sallyport-placeholder` | validate + launch | reject |
-| `tools.builtin` | `sallyd::tools` dispatch table per session | each `tools/call` on `agent.sock` | `isError: true`, `denied: <code>`, audit `tool.deny` |
-| `tools.shell` | `sallyd::tools::shell` → `podman exec` after policy | each shell call | deny / pending / run |
-| `tools.destructive_requires_approval` | pattern tagger in `tools::shell` (Task 11, #66), its verdict an input to `sallyd::approvals` | each shell call in `allow` mode | pending if tagged, or if no tagger ran |
+| `tools.builtin` | `sallyd::tools` per session: `tools/list` shows the granted tools; the grant is checked before arguments or paths (Task 11, architect ruling Q28); `fetch` is not offered until #75 | each `tools/call` on `agent.sock` | `isError: true`, `denied: tool_not_granted` (a granted `fetch`: `tool_unavailable`), audit `tool.deny` |
+| `tools.shell` | `sallyd::tools::exec` → `podman exec` after policy; 300 s and 64 KiB per stream, the call killed past the limit | each shell call | deny / pending / run |
+| `tools.destructive_requires_approval` | pattern tagger `sallyd::tools::tag` (Task 11, architect ruling Q33), its verdict an input to `sallyd::approvals` | each shell call in `allow` mode | pending if tagged, or if no tagger ran |
 | `tools.fetch_writes` | `sallyd::tools::fetch` → `sallyd::approvals` | each non-GET/HEAD fetch, and each GET/HEAD with a body, a method-override header (`X-HTTP-Method-Override`, `X-HTTP-Method`, `X-Method-Override`) or body framing (`Content-Length`, `Transfer-Encoding`) | pending if `approve` |
 | `tools.acknowledge_unapproved` | validator (`ack.rs`); launch audit `manifest.acknowledged_risk` | validate + launch | reject if needed and unset |
 | `tools.mcp[]` | env-name filter in validator; broker MCP gateway (M4) | validate + each relayed call | reject secret-like env; pending if `approve: always` |

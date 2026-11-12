@@ -86,7 +86,7 @@ flowchart LR
 | `sallyd::llm` | Per-session `llm.sock` (§4.4): HTTP/1.1 through hyper; the broker reads and decides on the head itself and gates hyper's writes; strict body allowlist; the model backend is a constructor argument (M3 wires the engine) | **yes** |
 | `sallyd::session` | Lifecycle: validate → ensure inference loaded → create socket dir → launch agent → wire → monitor → teardown (always, even on panic — `Drop` guard) | yes |
 | `sallyd::infer` | Pool of at most one loaded model (v1); start/stop inference container; forward OpenAI-compatible requests over `infer.sock`; validate request JSON (allowed fields, size caps); stream back | yes |
-| `sallyd::tools::{fs,fetch,shell}` | Brokered tools with policy + approvals | **yes** |
+| `sallyd::tools` | The built-in tools as the approvals `Executor` (§4.3, Task 11): `path` (guest path → mount + canonical rel), `args`, `fs` (openat2 beneath a checked root: the host pin for `brokered`/`ro`, the workspace's own view through the container init's `/proc/<pid>/root` for `rw`/`staged`), `tag` (destructive tagger), `shell` + `exec` (`podman exec` runner; finds, limits and kills the call's processes through pidfds), `procs`. `fetch` follows (#75) | **yes** |
 | `sallyd::approvals` | Queue, canonicalization, rendering sanitization, single-use IDs, timeout, flood control, notifications to UI/CLI | **yes** |
 | `sallyd::egress::{server,policy,addr,net,…}` | Accept streams from `net.sock`; parse the request head (bounded, CONNECT only in v1); policy decision; host addresses → resolve → filter → pinned connect; CONNECT splice. Grant hosts are refused until the token proxy (`inject`, Task 9a) terminates TLS for them | **yes** |
 | `sally-shim` (separate crate, musl static, std only) | generic relay (AMENDMENTS-01 §3.3): `--listen LOOPBACK_IP:PORT=/abs/sock` (repeatable; `127.0.0.1:3128` → `net.sock`, `127.0.0.1:8080` → `llm.sock`) with one fresh UDS connection per TCP connection, opaque bidirectional copy with fixed 16 KiB buffers, half-close propagated, at most `--max-connections` (default 32, shared by all listeners; each costs two threads against the sandbox's `pids` limit) live connections, and a 30 s linger for a client that never closes after the server finished; `--stdio /abs/sock` for stdio clients. Parses nothing, holds no policy, listens on IPv4 loopback (127/8) only (`::1` too is refused); `make shim-check` keeps it static and dependency-free | low (dumb, inside the sandbox) |
@@ -497,16 +497,36 @@ compiled into the broker; manifest or user text is never interpolated into them.
 
 | Tool | Args | Executes | Policy |
 |---|---|---|---|
-| `fs_list` | `{path}` | broker, `openat2` on the host path of any mount | path must resolve inside a mount; `ro\|rw\|brokered` all allowed; audited at `audit.level: full` |
-| `fs_read` | `{path, offset?, len?}` | broker, `openat2` | same; size cap |
-| `fs_write` | `{path, content_b64}` | broker, `openat2` | `ro` → denied; `rw` → allowed, audited (path, bytes, sha256); `brokered` → `approve.writes` globs → pending; protected paths always denied |
-| `fs_delete` | `{path}` | broker, `openat2` | as `fs_write`, with `approve.deletes` |
-| `fetch` | `{url, method?, headers?, body?}` | broker egress path | same egress policy and injection as the proxy; non-GET/HEAD per `tools.fetch_writes`; response capped and redacted |
-| `shell` | `{cmd: [..], cwd?}` | `podman exec` in the **workspace** container | `tools.shell` deny / approve / allow (+ destructive tags); output streamed, capped |
+| `fs_list` | `{path}` (the mount root allowed) | broker, `openat2` beneath the mount's root (see below) | path must resolve inside a mount; every mode; never asked; `tool.read` at every level (count, `truncated`, sha256 of the listing) |
+| `fs_read` | `{path, offset?, len?}` | broker, as `fs_list` | same; regular files only; at most 1 MiB per call (`len` cut to it); `tool.read` (path, size, bytes, sha256; never the content) |
+| `fs_write` | `{path, content_b64}` (strict base64) | broker: on the host folder for `brokered`; in the workspace's view for `rw`/`staged` | `ro` → denied; `rw`/`staged` → runs, audited (path, bytes, sha256; staged writes land in the session's upper directory); `brokered` → `approve.writes` globs → pending; a `.git` component in any case → `protected-path` |
+| `fs_delete` | `{path}` | as `fs_write` | as `fs_write`, with `approve.deletes`; a regular file or an empty directory |
+| `fetch` | `{url, method?, headers?, body?}` | broker egress path | not offered until #75 (a granted call is `denied: tool_unavailable`): same egress policy and injection as the proxy; non-GET/HEAD per `tools.fetch_writes`; response capped and redacted |
+| `shell` | `{cmd: [1–256 strings], cwd?}` (default: the first mount's root, else `/`) | `podman exec --workdir=<cwd> <container> <cmd…>` in the **workspace** container: the container's environment, no stdin, no terminal | `tools.shell` deny / approve / allow (+ destructive tags); 300 s, then the call is killed; output read incrementally, 64 KiB kept per stream; one reply per call |
 | `<server>__<tool>` | the server's schema | relayed to a declared MCP server (M4) | per-server `approve` |
 
-All `fs_*` paths are resolved relative to the mount's pinned `O_PATH` fd with
-`openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)`.
+**Where file tools resolve** (maintainer's Task 11 decisions 1–2; architect rulings Q29, Q30,
+Q37). Every path resolves with `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
+RESOLVE_NO_MAGICLINKS)` from a checked root fd, at prepare and again at run: a `..`, any symlink
+(the last component too) or a magic link is `path_escapes_mount`. `brokered` and `ro` mounts use
+the host folder, opened by its realpath without following a symlink and compared with the launch
+pin on every call (`mount-changed`), with `RESOLVE_NO_XDEV` added: a file system mounted inside
+the folder on the host is invisible in the sandbox, and to the tools. `rw` and `staged` mounts use
+the workspace's own view, `/proc/<init pid>/root` through the init's `/proc/<pid>` directory fd
+taken at launch (a dead init refuses the call: `container-gone`); the `rw` guest root must show
+the pin, the `staged` one must be an overlay mount root. A write there lands where an in-container
+write would (the host folder of an `rw` mount behind its `.git` shields; a `staged` mount's
+upper directory), and holds the session's exec gate for the whole operation. A broker-side write
+never reaches the host folder of a `staged` or `ro` mount. Files open `O_NOFOLLOW | O_NONBLOCK`
+and must be regular after `fstat`; a write opens without `O_TRUNC` and truncates after that
+check; on `brokered` mounts a file with more than one link is refused (`hard-link`).
+
+**Shell** (decision 3; #24, #62; ruling Q32). The runner holds the exec gate only until it has
+found the started process: the new process in the container's pid namespace whose parent is
+outside it (the exec's `conmon`), still the same process a poll later. It then holds a pidfd.
+On the time limit, after a normal exit, and best-effort on drop, it kills the call: the started
+process, its descendants and the members of its session (crun gives each exec its own), never the
+init or the init's session. Killing the `podman exec` client alone would leave the command running.
 
 ### 4.4 `llm.sock` — OpenAI-compatible HTTP (the harness)
 
@@ -596,10 +616,11 @@ sequenceDiagram
     D-->>U: approval.requested {id, action (escaped), digest, risk_tags}
     U->>D: approvals.decide(id, approve) over control.sock
     D->>D: id taken once ✓ → audit approval.decide {client} → ticket = the broker's own copy
-    D->>D: effect entry (Task 11, #62)
+    D->>D: audit tool.run (the ticket's action and digest)
     D->>C: podman exec … rm -rf build/ (from the ticket)
     C-->>D: exit code, stdout/err (capped)
-    D-->>H: tools/call result {exit, output}
+    D->>D: kill what the call left in its session → audit tool.result {exit, sizes, sha256}
+    D-->>H: tools/call result {exit, killed, stdout, stderr}
 ```
 
 ### 5.3 Egress to a grant host (interception; Task 9a)
@@ -972,6 +993,20 @@ sallyport/
   - `approval.flood` (sallyd): `{max_pending}`, once per episode.
   - `tool.deny` (sallyd): action fields (or `{call, tool}` when no action could be built) and
     `code`.
+- **Tool events** (Task 11, #62; architect ruling Q34), at every `audit.level`; a failed append
+  runs nothing more and answers nothing:
+  - `tool.run` (harness, `allow`), before the effect and before any blocking section: action
+    fields, `approval` (the id, or null when the policy needed none); for files `mode`, and for a
+    write `bytes` and `sha256`. The command and paths are in `action`, escaped and bounded.
+  - `tool.result` (sallyd), after it: `{call, tool, action_sha256}` and `outcome` (`ok`,
+    `failed` with `code`) for files; for `shell` `exit` or `killed` (`timeout`,
+    `start-timeout`), `stdout`/`stderr` `{bytes, kept, sha256 (of the kept bytes), cut}`, and
+    `error` (escaped, cut) when podman could not run. Never output or content. A `tool.run` with
+    no `tool.result` before the session's stop entry means teardown interrupted the call.
+  - `tool.read` (harness, `allow`), after the bytes are in the broker and before the reply:
+    action fields, `mode`, and `offset`, `len`, `size`, `bytes`, `sha256` (`fs_read`) or
+    `entries`, `truncated`, `sha256` of the listing (`fs_list`), or `code`. Stricter than §4.3's
+    old "audited at `audit.level: full`": `rpc.request` never carries the path.
 - **Audit entry**: `{seq, ts, session, actor: user|harness|sallyd, event, decision, args
   (redacted, ≤ 4 KiB), args_sha256, prev_hash, hash}` with `hash = sha256(prev_hash ||
   canonical_json(entry_without_hash))`; canonical JSON is compact with the fields in that order
@@ -1010,14 +1045,15 @@ upstream release binaries checked against committed SHA-256 sums):
 |---|---|
 | `rust` | `make fmt clippy forbid-unsafe nextest` (cargo-nextest, plus doctests) |
 | `deny` | `cargo deny check` for the workspace and `fuzz/` |
-| `coverage` | `make coverage`: cargo-llvm-cov, `sally-core` ≥ 90 % lines; each of `sallyd/src/{egress,rpc,llm,approvals}/` ≥ 85 % over its files together (lib tests, `scripts/coverage-gate.sh`) |
+| `coverage` | `make coverage`: cargo-llvm-cov, `sally-core` ≥ 90 % lines; each of `sallyd/src/{egress,rpc,llm,approvals,tools}/` ≥ 85 % over its files together (lib tests, `scripts/coverage-gate.sh`) |
 | `fuzz` | 60 s per cargo-fuzz target on a pinned nightly |
 | `zizmor` | GitHub Actions static analysis, offline, no findings at `low` or above |
 | `doctor-syntax` | `bash -n scripts/doctor.sh` |
 
 Nightly (`nightly.yml`): `make mutants`, cargo-mutants over the deny paths
-(`manifest::validate`, `paths`, `host`, `config` today; `tools::fs` as it lands; the egress,
-rpc, llm and approvals modules run in the wide job, `make mutants-wide-sallyd`) with a **zero-survivor gate**: a surviving mutant in a deny path is an untested
+(`manifest::validate`, `paths`, `host`, `config` today; the egress, rpc, llm, approvals and
+tools modules run in the wide job, `make mutants-wide-sallyd`, `tools::exec` excepted: its
+decisions need a container and its `rt_` tests hold it) with a **zero-survivor gate**: a surviving mutant in a deny path is an untested
 control. cargo-mutants runs with `TMPDIR` under `target/` because `/tmp` is denylisted.
 
 Dev-dependencies: `insta` (summary and diagnostic snapshots; review changes with
