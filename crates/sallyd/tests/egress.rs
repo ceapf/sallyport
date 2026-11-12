@@ -364,7 +364,7 @@ fn rt_net_09_oversized_heads_slow_clients_and_too_many_connections_are_limited()
         assert_eq!(status(&line), "431", "{line:?}");
         // 20 MiB of headers: the proxy stops reading at 8 KiB, answers, drains at most
         // DRAIN_BYTES and closes. The reply may be lost: a client still sending past the drain
-        // fails its send, and the shim then closes its TCP side (#71). The audit entry is not.
+        // fails its send, and the shim then closes its TCP side (#76). The audit entry is not.
         let t0 = Instant::now();
         exec(
             &r,

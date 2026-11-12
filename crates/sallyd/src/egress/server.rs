@@ -266,7 +266,9 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
     }
 
     /// Ends every connection: those still being checked close without a reply, open tunnels
-    /// end with `session-stopped`. Connections served after this close at once.
+    /// end with `session-stopped`. Connections served after this close at once, except that a
+    /// reply already being written (429, connect-failed, a pre-`200` 502) finishes and drains,
+    /// within [`REPLY_TIMEOUT`] + [`DRAIN_TIMEOUT`] (#71).
     pub fn stop(&self) {
         self.stop.send_replace(true);
     }
@@ -515,7 +517,8 @@ pub(crate) async fn until_true(mut rx: watch::Receiver<bool>) {
 /// Writes the reply to `reason` within [`REPLY_TIMEOUT`] and closes the sending half; then, once
 /// the reply is out, discards what the client still sends until its end, [`DRAIN_BYTES`] or
 /// [`DRAIN_TIMEOUT`] (#71). `copy` buffers on the heap only while it drains, so no connection's
-/// future grows (RT-NET-09).
+/// future grows (RT-NET-09). TODO(#76): a client sending past the drain can still lose the reply
+/// through the shim; its entry is already written.
 async fn write_reply<C: AsyncRead + AsyncWrite + Unpin>(client: &mut C, reason: Reason) {
     let send = async {
         client.write_all(reply(reason).as_bytes()).await?;

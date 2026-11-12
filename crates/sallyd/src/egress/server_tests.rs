@@ -810,7 +810,10 @@ async fn the_drain_after_a_reply_is_bounded_in_bytes_and_in_time() {
     let mut got = vec![0u8; reply(Reason::HeadTooLarge).len()];
     client.read_exact(&mut got).await.unwrap();
     let t0 = tokio::time::Instant::now();
-    task.await.unwrap();
+    tokio::time::timeout(2 * DRAIN_TIMEOUT, task)
+        .await
+        .expect("a silent client is closed after DRAIN_TIMEOUT")
+        .unwrap();
     assert_eq!(t0.elapsed(), DRAIN_TIMEOUT);
     drop(client);
 }
@@ -938,6 +941,13 @@ fn the_limits_are_pinned() {
     assert_eq!(MAX_RESPONSE_HEAD, 64 * 1024);
     assert_eq!(MAX_DIALS, 3);
     assert_eq!((MAX_ADDRS, MAX_ANSWER, ADMISSION_EXTRA), (16, 64, 64));
+    assert_eq!(
+        (DRAIN_BYTES, DRAIN_TIMEOUT),
+        (256 * 1024, Duration::from_secs(1))
+    );
+    // A reply written after the stop (429, connect-failed, a pre-`200` 502) finishes and drains
+    // within the grace the stop gives (architect ruling on the #71 drain, Q3).
+    assert!(REPLY_TIMEOUT + DRAIN_TIMEOUT < crate::egress::net::STOP_GRACE);
 }
 
 #[test]

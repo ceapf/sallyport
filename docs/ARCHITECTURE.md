@@ -759,7 +759,13 @@ sallyport/
   can hold every slot for about a resolver timeout (#47). Each session's accept loop holds at
   most `max_connections + 64` accepted connections (the extra ones are answered 429); past that
   it stops accepting until one ends. Residual: descriptors are not yet bounded across sessions
-  (#48).
+  (#48). After a refusal reply (every pre-tunnel refusal, the 429 included, and the 502s written
+  before a `200`) the proxy closes its sending half and discards client input until its end,
+  256 KiB or 1 s in total (`DRAIN_BYTES`, `DRAIN_TIMEOUT`), then closes (#71). The bytes are
+  never parsed, stored or audited, and the entry is already written. The connection keeps its
+  slot or admission extra meanwhile, so a refused connection ends at most 3 s after its
+  decision. `head-timeout` gets no reply and no drain. Residual: a client still sending past the
+  drain bound may lose the reply through the shim (#76); its entry is not lost.
 - **Egress audit events** (Task 8). Written at every `audit.level`, each before its effect:
   - `egress.allow` (decision `allow`), before the first dial and the `200`: `{host, port,
     addresses, intercept}` — the addresses that passed the filter, at most 16, in the order they
