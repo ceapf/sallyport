@@ -314,17 +314,23 @@ fn the_in_container_check_compares_identities_from_the_host() {
             dev,
             ino,
         };
+        let dir = sally_core::fd::open(
+            format!("/proc/{pid}").as_str(),
+            rustix::fs::OFlags::PATH | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap();
         check_in_container(
-            pid,
+            &dir,
             &[
                 want("/workspace/p", id("")),
                 want("/workspace/p/m/.git", id("m/.git")),
             ],
         )
         .unwrap();
-        let wrong = check_in_container(pid, &[want("/workspace/p/m", id("m/.git"))]).unwrap_err();
+        let wrong = check_in_container(&dir, &[want("/workspace/p/m", id("m/.git"))]).unwrap_err();
         assert!(wrong.to_string().contains("pinned"), "{wrong}");
-        let missing = check_in_container(pid, &[want("/workspace/nothing", id(""))]).unwrap_err();
+        let missing = check_in_container(&dir, &[want("/workspace/nothing", id(""))]).unwrap_err();
         assert!(
             missing.to_string().contains("cannot be opened"),
             "{missing}"

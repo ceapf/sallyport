@@ -93,8 +93,8 @@ pub trait ToolHandler: Send + Sync + 'static {
     /// handler must be safe to drop at any await. A drop before the effect starts means nothing
     /// ran (a dropped approval wait is a deny); a drop after it started may leave the effect
     /// finished with no completion entry (blocking work is not abortable), so the entry comes
-    /// first.
-    // TODO(#62): Task 11's executors write their effect entries and are drop-safe.
+    /// first. The production handler (`approvals::Gated` over `tools::Tools`) does: `tool.run`
+    /// before every effect, a pidfd kill of a dropped `shell` call (#62).
     fn call(
         &self,
         call: u64,

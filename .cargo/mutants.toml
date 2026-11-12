@@ -27,6 +27,14 @@ exclude_re = [
   '''crates/sallyd/src/sandbox/scan\.rs:\d+:\d+: replace \| with \^ in Walk<'a>::pin_parents$''',
   'crates/sallyd/src/sandbox/stage\.rs:\d+:\d+: replace \| with \^ in open_dir$',
   'crates/sallyd/src/sandbox/types\.rs:\d+:\d+: replace \| with \^ in VerifiedModel::pin$',
+  'crates/sallyd/src/tools/fs\.rs:\d+:\d+: replace \| with \^ in beneath$',
+  'crates/sallyd/src/tools/fs\.rs:\d+:\d+: replace \| with \^ in beneath_same_fs$',
+  'crates/sallyd/src/tools/fs\.rs:\d+:\d+: replace \| with \^ in no_links$',
+  'crates/sallyd/src/tools/fs\.rs:\d+:\d+: replace \| with \^ in in_root$',
+  'crates/sallyd/src/tools/fs\.rs:\d+:\d+: replace \| with \^ in dir_path$',
+  'crates/sallyd/src/tools/fs\.rs:\d+:\d+: replace \| with \^ in read_file$',
+  'crates/sallyd/src/tools/fs\.rs:\d+:\d+: replace \| with \^ in write_existing$',
+  'crates/sallyd/src/tools/fs\.rs:\d+:\d+: replace \| with \^ in write_new$',
   # Power loss only: the directory fsync makes a rename or a new file durable across a crash.
   # Nothing a test can observe without cutting power differs.
   'crates/sally-core/src/audit/writer\.rs:\d+:\d+: replace sync_dir -> Result<\(\), AuditError> with Ok\(\(\)\)$',

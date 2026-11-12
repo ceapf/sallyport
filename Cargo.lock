@@ -945,6 +945,7 @@ version = "0.1.0"
 name = "sallyd"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "http-body-util",
  "httparse",
  "hyper",

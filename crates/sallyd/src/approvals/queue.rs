@@ -18,7 +18,8 @@
 //!   (`approval.flood`). `agent.sock` runs at most 16 calls at once, so a `max_pending` above 16
 //!   is never reached.
 //! - **Audit.** `tool.pending` before the prompt is shown; `approval.decide` (with the deciding
-//!   client) before the asker learns the answer, and before a `deny_all_session` latches;
+//!   client) before the asker learns the answer (a `deny_all_session` latches first, so a
+//!   failed entry still leaves the session latched);
 //!   `approval.expire`, `approval.withdraw`, `approval.deny`, `approval.flood`, `tool.deny`
 //!   before the denial is returned. A failed append is [`Refusal::Unrecorded`]: nothing runs and
 //!   no reply is sent. A decision or withdraw, once it has taken an entry, finishes in its own
@@ -449,7 +450,8 @@ impl Desk {
     }
 
     /// Answers prompt `id` for `client`. The entry is written before the asker learns the
-    /// answer, and a `deny_all_session` latches only once its own entry is written; an approval
+    /// answer; a `deny_all_session` latches before its entry is written and stays latched if
+    /// that write fails (the client is told `Unrecorded`, `audit-failed`); an approval
     /// that cannot be written is not given. Once it has taken the prompt it finishes in its own
     /// task, so dropping this future loses no entry.
     ///
@@ -499,30 +501,31 @@ impl Inner {
         Some(st.pending.swap_remove(i))
     }
 
-    /// Writes and delivers a decision on a taken prompt; for `DenyAllSession`, then latches the
-    /// session and denies every other shown prompt, each with its own entry.
+    /// Writes and delivers a decision on a taken prompt. A `DenyAllSession` latches the session
+    /// first (maintainer's Task 11 audit: a failed entry never leaves it open), then writes its
+    /// entry and denies every other shown prompt, each with its own entry.
     async fn finish(&self, first: Entry, d: Decision, client: Client) -> Result<(), DecideError> {
-        if !self.decided(&first, d, client, None).await {
-            self.close(first, Answer::Unrecorded);
-            return Err(DecideError::Unrecorded);
-        }
-        let answer = match d {
-            Decision::Approve => Answer::Approve,
-            Decision::Deny | Decision::DenyAllSession => Answer::Deny("denied"),
-        };
-        let via = first.id.clone();
-        self.close(first, answer);
-        if d != Decision::DenyAllSession {
-            return Ok(());
-        }
-        let rest: Vec<Entry> = {
+        let rest: Vec<Entry> = if d == Decision::DenyAllSession {
             let mut st = self.state();
             st.latched = true;
             let (rest, keep) = st.pending.drain(..).partition(|e| e.announced);
             st.pending = keep;
             rest
+        } else {
+            Vec::new()
         };
+        let via = first.id.clone();
         let mut result = Ok(());
+        if self.decided(&first, d, client, None).await {
+            let answer = match d {
+                Decision::Approve => Answer::Approve,
+                Decision::Deny | Decision::DenyAllSession => Answer::Deny("denied"),
+            };
+            self.close(first, answer);
+        } else {
+            self.close(first, Answer::Unrecorded);
+            result = Err(DecideError::Unrecorded);
+        }
         for e in rest {
             let answer = if self.decided(&e, d, client, Some(&via)).await {
                 Answer::Deny("session-denied")
@@ -750,8 +753,9 @@ fn withdraw_by(why: Withdraw) -> (Actor, &'static str) {
     }
 }
 
-/// The bounded action fields of an audit entry (architect ruling Q24), from a bound action.
-fn fields(b: &Bound) -> Value {
+/// The bounded action fields of an audit entry (architect ruling Q24), from a bound action; the
+/// tools' own entries (`tool.run`, `tool.read`, `tool.result`) start from them too.
+pub(crate) fn fields(b: &Bound) -> Value {
     let text = render::action_text(&b.action);
     action_fields(b.call, &b.action.tool(), &text, &b.digest())
 }

@@ -10,8 +10,7 @@
 //! the overlap rule keeps every other live sandbox from writing there. Blocking I/O.
 //! TODO(#17): a launcher-level `sandbox.mount_mismatch` test (Task 6c if cheap, else Task 13).
 
-use std::path::Path;
-
+use rustix::fd::AsFd;
 use rustix::fs::{Mode, OFlags, ResolveFlags};
 
 /// What must be at a guest path.
@@ -35,21 +34,23 @@ pub struct Mismatch {
     pub why: String,
 }
 
-/// Checks every expectation inside the mount namespace of `pid`.
+/// Checks every expectation inside the mount namespace of the process whose `/proc/<pid>`
+/// directory is `proc_dir` (held, so a pid reused after the open names nothing: the open of
+/// `root` fails instead of reaching another process).
 ///
 /// # Errors
 /// [`Mismatch`] for the first guest path that does not show its pinned object, or cannot be
 /// opened.
-pub fn check_in_container(pid: u32, expect: &[Expect]) -> Result<(), Mismatch> {
-    let proc_root = format!("/proc/{pid}/root");
-    let root = sally_core::fd::open(
-        Path::new(&proc_root),
+pub fn check_in_container(proc_dir: impl AsFd, expect: &[Expect]) -> Result<(), Mismatch> {
+    let root = sally_core::fd::openat(
+        proc_dir,
+        "root",
         OFlags::PATH | OFlags::DIRECTORY,
         Mode::empty(),
     )
     .map_err(|e| Mismatch {
         guest: "/".into(),
-        why: format!("cannot open {proc_root}: {e}"),
+        why: format!("cannot open the init's root: {e}"),
     })?;
     for x in expect {
         let rel = x.guest.trim_start_matches('/');
