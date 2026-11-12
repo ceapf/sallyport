@@ -13,6 +13,7 @@
 //!
 //! The backend is a constructor argument (Task 7 decision 2). Until M3 none is wired in
 //! production; the scripted mock model lives in the test tree (architect ruling Q3).
+// TODO(#53): Task 12 wires no backend (llm.sock not served) until M3; never the test mock.
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};

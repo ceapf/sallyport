@@ -34,6 +34,7 @@ pub const MAX_FUNCTION_NAME: usize = 64;
 /// Message roles accepted.
 const ROLES: [&str; 5] = ["system", "developer", "user", "assistant", "tool"];
 /// Members of a message.
+// TODO(#55): M4 checks what the stock openai client replays (null refusal, annotations, …).
 const MESSAGE: [&str; 5] = ["role", "content", "name", "tool_calls", "tool_call_id"];
 /// Top-level members (§3.2).
 const TOP: [&str; 17] = [

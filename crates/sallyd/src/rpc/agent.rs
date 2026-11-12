@@ -303,6 +303,7 @@ impl<T: ToolHandler> Agent<T> {
 
     /// Marks an in-flight call cancelled (its reply is then suppressed). Unknown or finished ids
     /// are ignored.
+    // TODO(#54): Task 10 withdraws a call's pending approval here, through the handler's API.
     async fn cancel(&self, request: &Id, conn: &Conn) -> bool {
         if lock(&conn.pending).get(request) != Some(&false) {
             return true;
