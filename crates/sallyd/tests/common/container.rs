@@ -4,7 +4,7 @@
 //! These tests never skip: without podman or the base image they fail. CI pulls the base image
 //! by digest first (`ci.yml`); the test images are built from it offline.
 
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -51,13 +51,107 @@ fn probe_binary(out: &Path) {
     assert!(status.success(), "cc {}", src.display());
 }
 
-/// An exclusive or shared `flock` on `<CARGO_TARGET_TMPDIR>/<name>.lock`, held until the file is
-/// dropped. It works across nextest's processes and `cargo test`'s threads alike.
+/// This run's id: `SALLYPORT_TEST_RUN` when `scripts/test-run.sh` set it (a malformed value
+/// panics, never falls back), otherwise a per-process token of the same shape (architect Q24).
+/// Every container name a fixture makes carries it ([`Lx::scope`]), so the wrapper's sweep finds
+/// exactly this run's leftovers and a reused pid never meets another run's.
+pub fn run_id() -> &'static str {
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| {
+        resolve_run_id(std::env::var("SALLYPORT_TEST_RUN"), random_run_id)
+            .unwrap_or_else(|e| panic!("{e}"))
+    })
+}
+
+/// The run id from the variable's value: unset → `random()`; set → it must parse as a run id,
+/// including a value that is not UTF-8 (it panics in [`run_id`], never falls back).
+pub fn resolve_run_id(
+    var: Result<String, std::env::VarError>,
+    random: impl FnOnce() -> String,
+) -> Result<String, String> {
+    let bad = |v: &dyn std::fmt::Debug| format!("SALLYPORT_TEST_RUN must be 8 of [a-z0-9]: {v:?}");
+    match var {
+        Ok(v) => parse_run_id(&v).map(str::to_owned).ok_or_else(|| bad(&v)),
+        Err(std::env::VarError::NotPresent) => Ok(random()),
+        Err(std::env::VarError::NotUnicode(v)) => Err(bad(&v)),
+    }
+}
+
+/// 8 characters of `[a-z0-9]` from `/dev/urandom` (a slight modulo bias is fine: a label that
+/// keeps concurrent runs apart, not a secret).
+pub fn random_run_id() -> String {
+    let mut b = [0u8; 8];
+    std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom").unwrap(), &mut b).unwrap();
+    let alphabet = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    b.iter()
+        .map(|x| char::from(alphabet[usize::from(*x) % alphabet.len()]))
+        .collect()
+}
+
+/// `s` if it is a run id: exactly 8 of `[a-z0-9]` (no dash, so `t<run>-` ends the run part).
+pub fn parse_run_id(s: &str) -> Option<&str> {
+    (s.len() == 8
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()))
+    .then_some(s)
+}
+
+/// The run part of test image tags: the wrapper's id, or `local` for ad-hoc runs, whose images
+/// stay cached and are never swept (architect Q25).
+pub fn image_run() -> &'static str {
+    if std::env::var_os("SALLYPORT_TEST_RUN").is_some() {
+        run_id()
+    } else {
+        "local"
+    }
+}
+
+/// `<xdg>/sallyport-test`, created 0700. Panics unless both it and `xdg` are real directories
+/// owned by this user with no group or other access (architect Q23): the locks are shared by
+/// every worktree of this user, so nobody else may plant or hold them.
+pub fn lock_dir_in(xdg: &Path) -> PathBuf {
+    let private = |d: &Path| {
+        sallyd::sandbox::check_runtime_dir(d)
+            .unwrap_or_else(|e| panic!("test lock directory {}: {e}", d.display()));
+    };
+    private(xdg);
+    let dir = xdg.join("sallyport-test");
+    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => panic!("{}: {e}", dir.display()),
+    }
+    private(&dir);
+    dir
+}
+
+/// Where the lock `name` lives: `$XDG_RUNTIME_DIR/sallyport-test/<name>.lock`. Read at run time,
+/// no fallback: a per-worktree place would let two worktrees' disk tests overlap.
+pub fn lock_path(name: &str) -> PathBuf {
+    let xdg = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .expect("XDG_RUNTIME_DIR must be set to an absolute path");
+    lock_dir_in(&xdg).join(format!("{name}.lock"))
+}
+
+/// Opens (creating) a lock file without truncating it, and never through a symlink.
+pub fn open_lock(path: &Path) -> std::fs::File {
+    use std::os::unix::fs::OpenOptionsExt;
+    let nofollow = i32::try_from(rustix::fs::OFlags::NOFOLLOW.bits()).unwrap();
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .custom_flags(nofollow)
+        .open(path)
+        .unwrap_or_else(|e| panic!("lock {}: {e}", path.display()))
+}
+
+/// An exclusive or shared `flock` on [`lock_path`]`(name)`, held until the file is dropped. It
+/// works across worktrees, nextest's processes and `cargo test`'s threads alike. Order: the I/O
+/// lock before the image lock; `build` never takes the I/O lock.
 pub fn lock(name: &str, exclusive: bool) -> std::fs::File {
-    let f = std::fs::File::create(
-        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}.lock")),
-    )
-    .unwrap();
+    let f = open_lock(&lock_path(name));
     let op = if exclusive {
         rustix::fs::FlockOperation::LockExclusive
     } else {
@@ -69,22 +163,28 @@ pub fn lock(name: &str, exclusive: bool) -> std::fs::File {
 
 /// The I/O lock: ordinary container tests share it; tests that write hundreds of MiB at full
 /// speed take it exclusively, so their disk saturation never stalls another test's container
-/// (seen on CI: `podman rm` timing out on a process blocked in I/O).
+/// (seen on CI: `podman rm` timing out on a process blocked in I/O). The lock is per user, so
+/// two worktrees share it. `flock` gives a waiting exclusive holder no priority: if two runs'
+/// shared holders ever starve a disk test, add a turnstile lock rather than a longer timeout
+/// (architect Q23 (6); not seen in the two-worktree proof).
 pub fn io_lock(exclusive: bool) -> std::fs::File {
     lock("container-io", exclusive)
 }
 
-/// Builds `localhost/<name>:<input key>` once and returns `localhost/<name>@sha256:…`. The tag
-/// is a hash of every input (the base reference, the entry, the stand-in, the probe source), and
-/// the build runs under a lock: a process finding the tag reuses it. So a tag never moves to
-/// another image, and an earlier process's `name@digest` always resolves (CI saw "image not
-/// known" when parallel builds re-tagged one name).
-fn build(name: &str, entry: &str, shim: Option<&[u8]>) -> String {
+/// Builds `localhost/<name>:<run>-<input key>` once and returns that tag and
+/// `localhost/<name>@sha256:…`.
+/// `<run>` is [`image_run`]; the key is a hash of every input (the base reference, the entry,
+/// the stand-in, the probe source). The build runs under the per-user image lock: a process
+/// finding the tag reuses it. So a tag never moves to another image, and an earlier process's
+/// `name@digest` always resolves (CI saw "image not known" when parallel builds re-tagged one
+/// name). Each run owns its tags: `scripts/test-run.sh` untags only its own afterwards, and
+/// `--layers=false` leaves no untagged intermediate images (architect Q25).
+fn build(name: &str, entry: &str, shim: Option<&[u8]>) -> (String, String) {
     use std::hash::{Hash, Hasher};
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/redteam/probe/probe.c");
     let mut h = std::hash::DefaultHasher::new();
     (BASE, entry, STAND_IN, std::fs::read(&src).unwrap(), shim).hash(&mut h);
-    let tag = format!("localhost/{name}:{:016x}", h.finish());
+    let tag = format!("localhost/{name}:{}-{:016x}", image_run(), h.finish());
     let _held = lock("test-image", true);
     if !podman(&["image", "exists", &tag]).status.success() {
         build_image(&tag, entry, shim);
@@ -95,10 +195,11 @@ fn build(name: &str, entry: &str, shim: Option<&[u8]>) -> String {
         "inspect: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    format!(
+    let pinned = format!(
         "localhost/{name}@{}",
         String::from_utf8_lossy(&out.stdout).trim()
-    )
+    );
+    (tag, pinned)
 }
 
 /// The `llama-server` stand-in: it idles.
@@ -125,6 +226,7 @@ fn build_image(tag: &str, entry: &str, shim: Option<&[u8]>) {
         "build",
         "--pull=never",
         "--network=none",
+        "--layers=false",
         "--timestamp",
         "0",
         "-q",
@@ -143,10 +245,17 @@ fn build_image(tag: &str, entry: &str, shim: Option<&[u8]>) {
 /// `localhost/sallyport-test@sha256:…`: the base image, an entry and a `llama-server` that both
 /// idle, and the probe.
 pub fn test_image() -> ImageRef {
-    static IMAGE: OnceLock<String> = OnceLock::new();
-    let r =
-        IMAGE.get_or_init(|| build("sallyport-test", "#!/bin/sh\nexec sleep 2147483647\n", None));
-    ImageRef::parse(r).unwrap()
+    ImageRef::parse(&test_image_built().1).unwrap()
+}
+
+/// The tag [`test_image`] was built under: `localhost/sallyport-test:<run>-<input key>`.
+pub fn test_image_tag() -> &'static str {
+    &test_image_built().0
+}
+
+fn test_image_built() -> &'static (String, String) {
+    static IMAGE: OnceLock<(String, String)> = OnceLock::new();
+    IMAGE.get_or_init(|| build("sallyport-test", "#!/bin/sh\nexec sleep 2147483647\n", None))
 }
 
 /// Where the net image keeps the shim.
@@ -200,7 +309,7 @@ pub fn net_image() -> ImageRef {
              exec sleep 2147483647\n"
         );
         let shim = shim_binary();
-        build("sallyport-test-net", &entry, Some(&shim))
+        build("sallyport-test-net", &entry, Some(&shim)).1
     });
     ImageRef::parse(r).unwrap()
 }
@@ -210,7 +319,8 @@ pub fn net_image() -> ImageRef {
 /// grace period (6c-1 Rust review M4).
 pub fn exiting_image() -> ImageRef {
     static IMAGE: OnceLock<String> = OnceLock::new();
-    let r = IMAGE.get_or_init(|| build("sallyport-test-exit", "#!/nonexistent/sh\nexit 3\n", None));
+    let r =
+        IMAGE.get_or_init(|| build("sallyport-test-exit", "#!/nonexistent/sh\nexit 3\n", None).1);
     ImageRef::parse(r).unwrap()
 }
 
@@ -262,7 +372,9 @@ pub struct Lx {
     pub xdg: PathBuf,
     /// The fake network side of every session's egress listener.
     pub egress: Arc<super::egress::FakeEgress>,
-    /// Prefix of every session id this fixture makes: `t<pid>-<n>`.
+    /// Prefix of every session id this fixture makes: `t<run>-<pid>-<n>`, with [`run_id`]
+    /// (architect Q24), so every container name carries the run and `Drop` and the wrapper's
+    /// sweep remove only their own.
     pub scope: String,
     /// The shared I/O lock ([`io_lock`]); released after `Drop` has removed the containers.
     _io: Option<std::fs::File>,
@@ -372,7 +484,7 @@ impl Lx {
             events,
             xdg,
             egress,
-            scope: format!("t{}-{n}", std::process::id()),
+            scope: format!("t{}-{}-{n}", run_id(), std::process::id()),
             _io: io,
         }
     }
