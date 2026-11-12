@@ -5,6 +5,8 @@
 pub mod addr;
 pub mod authority;
 pub mod head;
+pub mod hostaddrs;
+pub mod net;
 pub mod policy;
 pub mod server;
 pub mod tunnel;

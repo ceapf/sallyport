@@ -5,7 +5,7 @@
 //! secret-grant check; resolution and the address filter come after, so a denied name is never
 //! resolved.
 
-use sally_core::manifest::HostPattern;
+use sally_core::manifest::{HostPattern, ValidatedManifest, parse_hostname};
 
 use super::authority::Authority;
 
@@ -112,6 +112,28 @@ impl Policy {
         Self { rules, grant_hosts }
     }
 
+    /// The policy of a validated manifest: its `network.allow` rules and the injection host of
+    /// every secret grant. The validator already checked both; an injection host that is not a
+    /// hostname cannot match a normalized authority and is left out.
+    #[must_use]
+    pub fn from_manifest(v: &ValidatedManifest) -> Self {
+        let rules = v
+            .egress()
+            .iter()
+            .map(|r| Rule {
+                host: r.host.clone(),
+                ports: r.ports.clone(),
+            })
+            .collect();
+        let grant_hosts = v
+            .manifest()
+            .secrets
+            .iter()
+            .filter_map(|s| parse_hostname(&s.inject.host).ok())
+            .collect();
+        Self::new(rules, grant_hosts)
+    }
+
     /// Decides on `a` before anything is resolved.
     ///
     /// # Errors
@@ -212,6 +234,40 @@ mod tests {
             Err(Reason::GrantHostUnavailable)
         );
         assert_eq!(any.decide(&at("www.mock.test", 443)), Ok(()));
+    }
+
+    #[test]
+    fn a_manifest_gives_its_rules_and_grant_hosts() {
+        use sally_core::manifest::{HostEnv, load};
+        let env = HostEnv {
+            home: "/nonexistent/home".into(),
+            other_homes: Vec::new(),
+            xdg_config_home: None,
+            xdg_data_home: None,
+            xdg_runtime_dir: None,
+            podman_storage: Vec::new(),
+            nproc: 8,
+            mem_bytes: 16 << 30,
+        };
+        let body = "apiVersion: sallyport/v1\nkind: Manifest\nname: t\nmodel:\n  ref: any\n\
+                    network:\n  mode: proxy\n  allow:\n    - host: api.mock.test\n    \
+                    - host: \"*.mock.test\"\n      ports: [443, 8443]\n\
+                    secrets:\n  - name: GITHUB_TOKEN\n    inject:\n      host: api.mock.test\n      \
+                    header: Authorization\n      format: \"Bearer {value}\"\n";
+        let names: std::collections::BTreeSet<String> =
+            ["GITHUB_TOKEN".to_owned()].into_iter().collect();
+        let v = load(body, &env, &names).unwrap().manifest;
+        let p = Policy::from_manifest(&v);
+        assert_eq!(
+            p,
+            Policy::new(
+                vec![
+                    rule("api.mock.test", &[443]),
+                    rule("*.mock.test", &[443, 8443])
+                ],
+                vec!["api.mock.test".to_owned()],
+            )
+        );
     }
 
     #[test]
