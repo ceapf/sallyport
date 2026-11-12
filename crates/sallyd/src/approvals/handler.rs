@@ -11,8 +11,8 @@ use std::future::Future;
 use serde_json::{Map, Value};
 
 use super::action::{Action, Bound};
-use super::queue::{Gate, Refusal, Ticket, Withdraw};
-use crate::rpc::agent::ToolHandler;
+use super::queue::{Gate, Refusal, Ticket};
+use crate::rpc::agent::{ToolHandler, Withdraw};
 use crate::rpc::mcp::{Tool, ToolOutcome};
 
 /// A call made ready to run: the action, the agent's note and the shell tagger's verdict.
@@ -26,7 +26,16 @@ pub struct Prepared {
     pub destructive: Option<bool>,
 }
 
-/// The tools behind the gate.
+/// The tools behind the gate. What runs is what was shown (maintainer's Task 10 decision 3), so
+/// an executor (Task 11, #66; M4, #68) must keep this contract:
+/// - [`prepare`](Self::prepare) has no effect: it only reads and resolves.
+/// - Everything the run depends on is in the [`Action`]: a tool takes no input the action does
+///   not carry (no environment, stdin or flags beyond its fields), or the action grows a field
+///   for it first.
+/// - [`run`](Self::run) acts on the ticket only. A file target is re-resolved from the mount's
+///   pinned fd (`openat2`, SI-8) and refused if it no longer is the ticket's `host`/`rel`; a
+///   fetch follows no redirect; fetch headers are the harness's, before any injection, so a
+///   secret never reaches a prompt or the audit (SI-3).
 pub trait Executor: Send + Sync + 'static {
     /// The session's tools, as `tools/list` returns them.
     fn tools(&self) -> Vec<Tool>;
@@ -47,20 +56,24 @@ pub trait Executor: Send + Sync + 'static {
 
 /// The tool handler of one session.
 pub struct Gated<E> {
-    session: String,
     gate: Gate,
     exec: E,
 }
 
 impl<E: Executor> Gated<E> {
-    /// The handler for `session`, asking `gate` and running through `exec`.
+    /// The handler asking `gate` (which names the session) and running through `exec`.
     #[must_use]
-    pub fn new(session: String, gate: Gate, exec: E) -> Self {
-        Self {
-            session,
-            gate,
-            exec,
-        }
+    pub fn new(gate: Gate, exec: E) -> Self {
+        Self { gate, exec }
+    }
+}
+
+/// Clears a withdraw kept for a call once the call ends, also when teardown drops it.
+struct Ends<'a>(&'a Gate, u64);
+
+impl Drop for Ends<'_> {
+    fn drop(&mut self) {
+        self.0.forget(self.1);
     }
 }
 
@@ -75,11 +88,12 @@ impl<E: Executor> ToolHandler for Gated<E> {
         name: String,
         arguments: Map<String, Value>,
     ) -> Option<ToolOutcome> {
+        let _ends = Ends(&self.gate, call);
         let refusal = match self.exec.prepare(&name, &arguments).await {
             Err(code) => self.gate.refuse_call(call, &name, code).await,
             Ok(p) => {
                 let bound = Bound {
-                    session: self.session.clone(),
+                    session: self.gate.session().to_owned(),
                     call,
                     action: p.action,
                 };

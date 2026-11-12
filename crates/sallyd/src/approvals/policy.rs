@@ -109,9 +109,10 @@ impl Policy {
             },
             Action::FsWrite { target, .. } => self.file(target, |g| &g.writes),
             Action::FsDelete { target } => self.file(target, |g| &g.deletes),
-            Action::Fetch { method, .. } => {
-                // HTTP methods are case-sensitive: only these exact spellings are reads.
-                if method == "GET" || method == "HEAD" {
+            Action::Fetch { method, body, .. } => {
+                // HTTP methods are case-sensitive: only these exact spellings, with no body,
+                // are reads; a body is a way out whatever the method.
+                if (method == "GET" || method == "HEAD") && body.is_empty() {
                     Need::Run
                 } else {
                     match self.fetch_writes {
@@ -129,6 +130,10 @@ impl Policy {
     }
 
     fn file(&self, t: &Target, globs: impl Fn(&ApproveGlobs) -> &Vec<String>) -> Need {
+        // The globs match canonical paths only; anything else could match less than it should.
+        if !canonical(&t.rel) {
+            return Need::Deny("bad-path");
+        }
         let Some(m) = self.mounts.iter().find(|m| m.guest == t.mount) else {
             return Need::Deny("unknown-mount");
         };
@@ -144,6 +149,14 @@ impl Policy {
             }
         }
     }
+}
+
+/// A canonical path relative to a mount: not empty, not absolute, no empty, `.` or `..`
+/// segment, at most [`glob::MAX_PATH`] bytes.
+fn canonical(rel: &str) -> bool {
+    !rel.is_empty()
+        && rel.len() <= glob::MAX_PATH
+        && rel.split('/').all(|s| !matches!(s, "" | "." | ".."))
 }
 
 #[cfg(test)]
@@ -412,9 +425,57 @@ mod tests {
         ] {
             assert_eq!(need(&p, &fetch(m)), Need::Ask, "{m}");
         }
+        // A read with a body is a write.
+        for m in ["GET", "HEAD"] {
+            let Action::Fetch {
+                method,
+                url,
+                headers,
+                ..
+            } = fetch(m)
+            else {
+                unreachable!()
+            };
+            let with_body = Action::Fetch {
+                method,
+                url,
+                headers,
+                body: Payload::new(b"x".to_vec()),
+            };
+            assert_eq!(need(&p, &with_body), Need::Ask, "{m}");
+        }
         p.fetch_writes = FetchWrites::Allow;
         assert_eq!(need(&p, &fetch("POST")), Need::Run);
         assert_eq!(need(&p, &fetch("GET")), Need::Run);
+    }
+
+    #[test]
+    fn a_path_that_is_not_canonical_is_denied_before_any_glob() {
+        let p = policy();
+        let too_long = "a".repeat(glob::MAX_PATH + 1);
+        let at_bound = "a".repeat(glob::MAX_PATH);
+        for rel in [
+            "", "/a.md", "./a.md", "a.md/", "d//a.md", "d/./a.md", "../a.md", "d/..", &too_long,
+        ] {
+            for m in ["/workspace/notes", "/workspace/rw", "/workspace/all"] {
+                assert_eq!(
+                    need(&p, &write(m, rel)),
+                    Need::Deny("bad-path"),
+                    "{m} {rel}"
+                );
+                assert_eq!(
+                    need(&p, &delete(m, rel)),
+                    Need::Deny("bad-path"),
+                    "{m} {rel}"
+                );
+            }
+        }
+        for rel in ["a.md", ".hidden", "d/a..b", &at_bound] {
+            assert_ne!(
+                need(&p, &write("/workspace/rw", rel)),
+                Need::Deny("bad-path")
+            );
+        }
     }
 
     #[test]

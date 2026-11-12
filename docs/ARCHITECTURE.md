@@ -840,8 +840,10 @@ sallyport/
   are quoted (`"` escaped). The action is cut at 2 000 chars, never inside an escape, with an
   explicit `… (+N bytes, sha256 …)` tail, and travels whole (`full`) for a reveal; a client must
   not take "approve" on a cut prompt before showing the whole text. Paths are shown as *host
-  realpath* **and** guest path. Model text (a reason) is a separate one-line field, cut at 500
-  chars and labelled untrusted; it is never part of the action.
+  realpath* **and** guest path; payloads (write content, fetch body, MCP arguments) also by
+  size and sha256. Model text (a reason) is a separate one-line field: quoted, escaped only up to
+  its 500-char cut (the tail names the raw bytes left and their hash), shown last and labelled
+  untrusted; it is never part of the action.
 - **Approval events** (Task 10; each before the effect, the prompt or the reply it covers; a
   failed append runs nothing and answers nothing). Action fields are `{call, tool, action
   (≤ 1 024 chars), action_sha256}`, where `action_sha256` is the digest the approval binds
@@ -853,7 +855,12 @@ sallyport/
     unknown-id` for an id that is not waiting.
   - `approval.expire` (sallyd, `deny`): `{id, call, reason: timeout}`.
   - `approval.withdraw` (harness for a cancel, sallyd for a closed connection; `deny`): `{id,
-    call, reason}`. A wait dropped by teardown leaves the queue at once with no entry.
+    call, reason}`; `id` is null when the cancel or close came before the call reached the
+    queue (it is kept until the call ends, so that call is never shown). A wait dropped by
+    teardown leaves the queue at once with no entry. A decision or withdraw that has taken its
+    prompt finishes in its own task, so a dropped caller loses no entry; a `deny_all_session`
+    latches only after its own entry is written. A panic under the queue's lock latches the
+    session.
   - `approval.deny` (sallyd): action fields and `reason` (`approval-flood`, `session-denied`,
     `no-approver`, `id-unavailable`).
   - `approval.flood` (sallyd): `{max_pending}`, once per episode.

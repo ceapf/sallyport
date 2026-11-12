@@ -6,7 +6,9 @@
 //! character inside a segment. Every other character is literal; case matters. The syntax is
 //! the validator's [`check_glob`]; a glob it refuses (only possible for a manifest that skipped
 //! validation) is treated as `**`. Matching more means asking more, so every ambiguity resolves
-//! towards a match. The work is bounded by the product of the two lengths (no backtracking).
+//! towards a match. One glob costs at most the product of the two lengths (no backtracking), so
+//! a list costs at most its total glob bytes (validator: 256 globs of 256 bytes) times
+//! [`MAX_PATH`]; the path is split once per list.
 //!
 //! Residual: on a case-folding or normalizing file system a narrowed glob can match less than
 //! the file system resolves; the default `["**"]` cannot.
@@ -17,7 +19,11 @@ use sally_core::manifest::check_glob;
 /// Whether any of `globs` matches `rel`.
 #[must_use]
 pub fn any_matches(globs: &[String], rel: &str) -> bool {
-    globs.iter().any(|g| matches(g, rel))
+    if rel.len() > MAX_PATH {
+        return true;
+    }
+    let path = split(rel);
+    globs.iter().any(|g| matches_path(g, &path, &mut 0))
 }
 
 /// Longest relative path matched; a longer one (no file system resolves it) counts as a match, so
@@ -32,20 +38,28 @@ pub fn matches(glob: &str, rel: &str) -> bool {
 
 /// [`matches`], adding the inner-loop steps taken to `steps`.
 fn matches_counting(glob: &str, rel: &str, steps: &mut u64) -> bool {
-    let Some(segments) = parse(glob) else {
-        return true;
-    };
     if rel.len() > MAX_PATH {
         return true;
     }
-    let path: Vec<&str> = rel.split('/').collect();
+    matches_path(glob, &split(rel), steps)
+}
+
+/// A path's segments, as characters.
+fn split(rel: &str) -> Vec<Vec<char>> {
+    rel.split('/').map(|s| s.chars().collect()).collect()
+}
+
+fn matches_path(glob: &str, path: &[Vec<char>], steps: &mut u64) -> bool {
+    let Some(segments) = parse(glob) else {
+        return true;
+    };
     // reached[j]: the glob segments seen so far match the first `j` path segments.
     let mut reached = vec![false; path.len() + 1];
     if let Some(first) = reached.first_mut() {
         *first = true;
     }
     for g in segments {
-        reached = if g == "**" {
+        reached = if g == ['*', '*'] {
             // Zero or more segments: everything at or after the first reached point.
             let mut seen = false;
             reached
@@ -61,8 +75,8 @@ fn matches_counting(glob: &str, rel: &str, steps: &mut u64) -> bool {
                 .chain(
                     reached
                         .iter()
-                        .zip(&path)
-                        .map(|(&r, seg)| r && segment_matches(g, seg, steps)),
+                        .zip(path)
+                        .map(|(&r, seg)| r && segment_matches(&g, seg, steps)),
                 )
                 .collect()
         };
@@ -70,17 +84,17 @@ fn matches_counting(glob: &str, rel: &str, steps: &mut u64) -> bool {
     reached.last().copied().unwrap_or(false)
 }
 
-/// The segments of a glob the validator accepts; `None` for any other.
-fn parse(glob: &str) -> Option<Vec<&str>> {
-    check_glob(glob).ok().map(|()| glob.split('/').collect())
+/// The segments, as characters, of a glob the validator accepts; `None` for any other.
+fn parse(glob: &str) -> Option<Vec<Vec<char>>> {
+    check_glob(glob)
+        .ok()
+        .map(|()| glob.split('/').map(|s| s.chars().collect()).collect())
 }
 
 /// `*` (any run) and `?` (one character) inside one segment; everything else literal.
 /// Each star retry moves the segment start forward once, so the loop runs at most
 /// `(|glob| + 1) * (|seg| + 1)` times.
-fn segment_matches(glob: &str, seg: &str, steps: &mut u64) -> bool {
-    let g: Vec<char> = glob.chars().collect();
-    let s: Vec<char> = seg.chars().collect();
+fn segment_matches(g: &[char], s: &[char], steps: &mut u64) -> bool {
     let (mut gi, mut si) = (0usize, 0usize);
     // The last `*` seen in the glob, and the segment position it was retried from.
     let mut star: Option<(usize, usize)> = None;
@@ -171,9 +185,26 @@ mod tests {
     }
 
     #[test]
-    fn double_star_inside_a_segment_acts_as_a_star() {
-        assert!(matches("a**", "abc"));
-        assert!(!matches("a**", "a/bc"));
+    fn double_star_inside_a_segment_is_refused_and_so_matches_everything() {
+        for g in ["a**", "**.md", "a/b**"] {
+            assert!(check_glob(g).is_err(), "{g}");
+            assert!(matches(g, "x/y/z"), "{g}");
+        }
+    }
+
+    #[test]
+    fn a_list_matches_like_its_globs_one_by_one_and_past_the_bound_asks() {
+        let globs = vec!["*.md".to_owned(), "src/**".to_owned()];
+        for p in ["a.md", "src/x/y", "b.txt", "d/a.md"] {
+            assert_eq!(
+                any_matches(&globs, p),
+                globs.iter().any(|g| matches(g, p)),
+                "{p}"
+            );
+        }
+        let long = "a".repeat(MAX_PATH + 1);
+        assert!(any_matches(&["b".to_owned()], &long));
+        assert!(!any_matches(&["b".to_owned()], &"a".repeat(MAX_PATH)));
     }
 
     #[test]
@@ -290,7 +321,11 @@ mod tests {
 
         #[test]
         fn the_matcher_parses_exactly_what_the_validator_accepts(g in "[ab./*?!\\[{\\\\]{0,8}") {
-            prop_assert_eq!(parse(&g).is_some(), check_glob(&g).is_ok(), "{}", g);
+            let parsed = parse(&g);
+            prop_assert_eq!(parsed.is_some(), check_glob(&g).is_ok(), "{}", g);
+            if let Some(segs) = parsed {
+                prop_assert_eq!(segs.len(), g.split('/').count());
+            }
         }
 
         #[test]

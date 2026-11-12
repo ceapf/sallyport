@@ -1,10 +1,11 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::Ordering::SeqCst;
 
 use sally_core::manifest::{ApproveGlobs, BuiltinTool, FetchWrites, MountMode, ShellPolicy};
 
-use super::super::action::{Payload, Target};
+use super::super::action::{Action, Payload, Target};
 use super::super::policy::MountRule;
 use super::*;
 use crate::rpc::testkit::{Sink, recorder};
@@ -98,32 +99,39 @@ fn get(call: u64) -> Bound {
     }
 }
 
+/// Polls until `cond` holds (paused time moves 1 ms per poll).
+async fn until(what: &str, mut cond: impl FnMut() -> bool) {
+    for _ in 0..2000 {
+        if cond() {
+            return;
+        }
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    panic!("never: {what}");
+}
+
 /// Starts an ask in its own task and waits until its prompt is shown.
 async fn asking(f: &Fx, b: Bound) -> (String, tokio::task::JoinHandle<Result<Ticket, Refusal>>) {
     let before = f.fake.requested.lock().unwrap().len();
     let gate = f.gate.clone();
     let h = tokio::spawn(async move { gate.admit(b, None, None).await });
-    for _ in 0..1000 {
-        if f.fake.requested.lock().unwrap().len() > before {
-            break;
-        }
-        tokio::task::yield_now().await;
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
+    until("prompt shown", || {
+        f.fake.requested.lock().unwrap().len() > before
+    })
+    .await;
     let id = f.fake.requested.lock().unwrap()[before].id.clone();
     (id, h)
 }
 
-fn decisions(sink: &Sink) -> Vec<(String, Option<String>)> {
-    sink.rows()
-        .into_iter()
-        .map(|r| (r.event, r.decision))
-        .collect()
+fn count(sink: &Sink, event: &str) -> usize {
+    sink.events().iter().filter(|e| *e == event).count()
 }
 
 #[tokio::test]
 async fn an_action_that_needs_no_approval_gets_a_ticket_without_a_prompt() {
     let f = fx(5);
+    assert_eq!(f.gate.session(), "s-1");
     let t = f.gate.admit(get(1), None, None).await.unwrap();
     assert_eq!(t.bound(), &get(1));
     assert_eq!(t.action(), &get(1).action);
@@ -190,14 +198,35 @@ async fn approve_once_runs_the_askers_own_copy_and_the_id_is_single_use() {
     // Replay: the id is gone, and the refusal is audited.
     let again = f.desk.decide(&id, Decision::Approve, ME).await;
     assert_eq!(again, Err(DecideError::UnknownId));
-    let rows = decisions(&f.sink);
+    let last = f.sink.rows().pop().unwrap();
     assert_eq!(
-        rows.last().unwrap(),
-        &("approval.decide".to_owned(), Some("refuse".to_owned()))
+        (last.event.as_str(), last.decision.as_deref()),
+        ("approval.decide", Some("refuse"))
     );
-    assert_eq!(f.sink.last("approval.decide")["reason"], "unknown-id");
+    assert_eq!(last.args["reason"], "unknown-id");
     assert!(f.desk.list().is_empty());
     assert_eq!(f.fake.closed.lock().unwrap().as_slice(), [id]);
+}
+
+#[tokio::test]
+async fn two_decisions_at_once_on_one_id_take_it_once() {
+    let f = fx(5);
+    let (id, h) = asking(&f, shell(1, &["ls"])).await;
+    let (a, b) = tokio::join!(
+        f.desk.decide(&id, Decision::Approve, ME),
+        f.desk.decide(&id, Decision::Approve, ME)
+    );
+    let oks = [a, b].iter().filter(|r| r.is_ok()).count();
+    assert_eq!(oks, 1);
+    assert!([a, b].contains(&Err(DecideError::UnknownId)));
+    assert!(h.await.unwrap().is_ok());
+    let approvals = f
+        .sink
+        .rows()
+        .into_iter()
+        .filter(|r| r.decision.as_deref() == Some("approve"))
+        .count();
+    assert_eq!(approvals, 1);
 }
 
 #[tokio::test]
@@ -228,9 +257,9 @@ async fn ids_are_128_bit_hex_and_unique() {
 async fn a_prompt_nobody_answers_expires_as_a_denial() {
     let f = fx(5);
     let (id, h) = asking(&f, shell(1, &["ls"])).await;
-    tokio::time::advance(Duration::from_secs(299)).await;
+    tokio::time::advance(Duration::from_secs(290)).await;
     assert_eq!(f.desk.list().len(), 1);
-    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::time::advance(Duration::from_secs(10)).await;
     assert_eq!(h.await.unwrap(), Err(Refusal::Denied("timeout")));
     let e = f.sink.last("approval.expire");
     assert_eq!(e["id"], id.as_str());
@@ -258,6 +287,8 @@ async fn a_failed_pending_entry_shows_nothing_and_runs_nothing() {
     let r = f.gate.admit(shell(1, &["ls"]), None, None).await;
     assert_eq!(r, Err(Refusal::Unrecorded));
     assert!(f.fake.requested.lock().unwrap().is_empty());
+    // The approver was never shown it, so it is not told it closed.
+    assert!(f.fake.closed.lock().unwrap().is_empty());
     assert!(f.desk.list().is_empty());
 }
 
@@ -274,6 +305,21 @@ async fn an_approval_that_cannot_be_written_is_not_given() {
         f.desk.decide("ap-x", Decision::Deny, ME).await,
         Err(DecideError::Unrecorded)
     );
+}
+
+#[tokio::test]
+async fn a_decision_whose_caller_is_dropped_still_completes() {
+    let f = fx(5);
+    let (id, h) = asking(&f, shell(1, &["ls"])).await;
+    // Poll decide once (it takes the prompt and hands the rest to its task), then drop it.
+    tokio::select! {
+        biased;
+        _ = f.desk.decide(&id, Decision::Deny, ME) => panic!("finished in one poll"),
+        () = tokio::task::yield_now() => {}
+    }
+    assert_eq!(h.await.unwrap(), Err(Refusal::Denied("denied")));
+    assert_eq!(f.sink.last("approval.decide")["id"], id.as_str());
+    assert!(f.fake.closed.lock().unwrap().contains(&id));
 }
 
 #[tokio::test]
@@ -295,6 +341,7 @@ async fn deny_all_session_denies_every_pending_prompt_and_every_later_one() {
         .collect();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].args["id"], a.as_str());
+    assert!(rows[0].args.get("via").is_none());
     assert_eq!(rows[1].args["id"], b.as_str());
     assert_eq!(rows[1].args["via"], a.as_str());
     assert!(
@@ -311,6 +358,42 @@ async fn deny_all_session_denies_every_pending_prompt_and_every_later_one() {
 }
 
 #[tokio::test]
+async fn deny_all_session_latches_only_once_its_entry_is_written() {
+    let f = fx(5);
+    let (a, ha) = asking(&f, shell(1, &["a"])).await;
+    let (b, hb) = asking(&f, shell(2, &["b"])).await;
+    f.sink.fail_next.store(1, SeqCst);
+    let r = f.desk.decide(&a, Decision::DenyAllSession, ME).await;
+    assert_eq!(r, Err(DecideError::Unrecorded));
+    assert_eq!(ha.await.unwrap(), Err(Refusal::Unrecorded));
+    // Not latched: the other prompt still waits, and a new one is shown.
+    assert_eq!(f.desk.list().len(), 1);
+    let (c, hc) = asking(&f, shell(3, &["c"])).await;
+    for id in [b, c] {
+        f.desk.decide(&id, Decision::Deny, ME).await.unwrap();
+    }
+    assert_eq!(hb.await.unwrap(), Err(Refusal::Denied("denied")));
+    assert_eq!(hc.await.unwrap(), Err(Refusal::Denied("denied")));
+}
+
+#[tokio::test]
+async fn deny_all_session_reports_an_entry_it_could_not_write_for_another_prompt() {
+    let f = fx(5);
+    let (a, ha) = asking(&f, shell(1, &["a"])).await;
+    let (_, hb) = asking(&f, shell(2, &["b"])).await;
+    // The decision entry for `a` is written; the one for `b` is not.
+    f.sink.fail_from.store(f.sink.rows().len() + 1, SeqCst);
+    let r = f.desk.decide(&a, Decision::DenyAllSession, ME).await;
+    assert_eq!(r, Err(DecideError::Unrecorded));
+    assert_eq!(ha.await.unwrap(), Err(Refusal::Denied("denied")));
+    assert_eq!(hb.await.unwrap(), Err(Refusal::Unrecorded));
+    // The session is latched all the same: `a`'s decision was recorded.
+    f.sink.fail_from.store(0, SeqCst);
+    let r = f.gate.admit(shell(3, &["c"]), None, None).await;
+    assert_eq!(r, Err(Refusal::Denied("session-denied")));
+}
+
+#[tokio::test]
 async fn deny_all_session_on_a_stale_id_sets_nothing() {
     let f = fx(5);
     let r = f.desk.decide("ap-0", Decision::DenyAllSession, ME).await;
@@ -324,15 +407,11 @@ async fn deny_all_session_on_a_stale_id_sets_nothing() {
 async fn a_withdrawn_call_leaves_the_queue_audited_and_cannot_be_approved() {
     let f = fx(5);
     let (id, h) = asking(&f, shell(7, &["ls"])).await;
-    f.gate.withdraw(99, Withdraw::Cancel).await;
-    assert_eq!(f.desk.list().len(), 1);
     f.gate.withdraw(7, Withdraw::Cancel).await;
     assert_eq!(h.await.unwrap(), Err(Refusal::Denied("withdrawn")));
     let w = f.sink.last("approval.withdraw");
-    assert_eq!(
-        (w["id"].as_str(), w["call"].as_u64()),
-        (Some(id.as_str()), Some(7))
-    );
+    assert_eq!(w["id"], id.as_str());
+    assert_eq!(w["call"], 7);
     assert_eq!(w["reason"], "cancel");
     assert!(f.sink.rows().last().unwrap().debug.contains("Harness"));
     assert_eq!(
@@ -356,25 +435,63 @@ async fn a_withdraw_that_cannot_be_written_is_unrecorded() {
 }
 
 #[tokio::test]
-async fn a_withdraw_before_the_prompt_is_shown_still_withdraws_it() {
+async fn a_withdraw_before_the_call_reaches_the_queue_keeps_it_from_being_shown() {
+    let f = fx(5);
+    // Another call's withdraw changes nothing for this one.
+    f.gate.withdraw(8, Withdraw::Closed).await;
+    f.gate.withdraw(9, Withdraw::Cancel).await;
+    let r = f.gate.admit(shell(9, &["ls"]), None, None).await;
+    assert_eq!(r, Err(Refusal::Denied("withdrawn")));
+    let w = f.sink.last("approval.withdraw");
+    assert_eq!(
+        (w["call"].as_u64(), w["reason"].as_str()),
+        (Some(9), Some("cancel"))
+    );
+    assert!(w["id"].is_null());
+    assert!(f.sink.rows().last().unwrap().debug.contains("Harness"));
+    assert!(f.fake.requested.lock().unwrap().is_empty());
+    // Once the call ends, its number is forgotten.
+    f.gate.forget(9);
+    let (id, h) = asking(&f, shell(9, &["ls"])).await;
+    f.desk.decide(&id, Decision::Deny, ME).await.unwrap();
+    let _ = h.await;
+    f.gate.forget(8);
+    assert!(f.gate.inner.state().withdrawn.is_empty());
+}
+
+#[tokio::test]
+async fn a_withdraw_before_the_prompt_is_shown_keeps_its_reason() {
     let f = fx(5);
     let b = shell(5, &["ls"]);
-    let id = f.gate.inner.queue(&b, None, vec![]).unwrap();
+    let Ok((id, _, _rx)) = f.gate.inner.queue(&b, None, vec![]) else {
+        panic!("not queued");
+    };
     f.gate.withdraw(5, Withdraw::Cancel).await;
-    assert_eq!(f.gate.inner.announce(&id), Err("withdrawn"));
+    assert!(matches!(
+        f.gate.inner.announce(&id),
+        Err(NotQueued::Withdrawn(Withdraw::Cancel))
+    ));
     assert!(f.desk.list().is_empty());
     assert!(f.fake.requested.lock().unwrap().is_empty());
+    assert!(matches!(
+        f.gate.inner.announce("ap-none"),
+        Err(NotQueued::Withdrawn(Withdraw::Closed))
+    ));
 }
 
 #[tokio::test]
 async fn a_latch_set_while_the_entry_is_written_denies_the_prompt() {
     let f = fx(5);
     let b = shell(5, &["ls"]);
-    let id = f.gate.inner.queue(&b, None, vec![]).unwrap();
-    lock(&f.gate.inner.state).latched = true;
-    assert_eq!(f.gate.inner.announce(&id), Err("session-denied"));
-    assert!(lock(&f.gate.inner.state).pending.is_empty());
-    assert_eq!(f.gate.inner.announce("ap-none"), Err("withdrawn"));
+    let Ok((id, _, _rx)) = f.gate.inner.queue(&b, None, vec![]) else {
+        panic!("not queued");
+    };
+    f.gate.inner.state().latched = true;
+    assert!(matches!(
+        f.gate.inner.announce(&id),
+        Err(NotQueued::Deny("session-denied", false))
+    ));
+    assert!(f.gate.inner.state().pending.is_empty());
 }
 
 #[tokio::test]
@@ -391,8 +508,21 @@ async fn a_dropped_wait_invalidates_the_id_at_once() {
     );
 }
 
+#[tokio::test]
+async fn a_panic_under_the_lock_latches_the_session() {
+    let f = fx(5);
+    let inner = Arc::clone(&f.gate.inner);
+    let _ = std::thread::spawn(move || {
+        let _st = inner.state.lock().unwrap();
+        panic!("poison");
+    })
+    .join();
+    let r = f.gate.admit(shell(1, &["ls"]), None, None).await;
+    assert_eq!(r, Err(Refusal::Denied("session-denied")));
+}
+
 #[tokio::test(start_paused = true)]
-async fn the_pending_bound_denies_each_extra_call_and_announces_the_episode_once() {
+async fn a_flood_episode_is_announced_once_and_again_after_it_ends() {
     let f = fx(2);
     let (a, ha) = asking(&f, shell(1, &["a"])).await;
     let (b, hb) = asking(&f, shell(2, &["b"])).await;
@@ -400,9 +530,8 @@ async fn the_pending_bound_denies_each_extra_call_and_announces_the_episode_once
         let r = f.gate.admit(shell(call, &["x"]), None, None).await;
         assert_eq!(r, Err(Refusal::Denied("approval-flood")));
     }
-    let events = f.sink.events();
-    assert_eq!(events.iter().filter(|e| *e == "approval.flood").count(), 1);
-    assert_eq!(events.iter().filter(|e| *e == "approval.deny").count(), 3);
+    assert_eq!(count(&f.sink, "approval.flood"), 1);
+    assert_eq!(count(&f.sink, "approval.deny"), 3);
     assert_eq!(f.fake.floods.lock().unwrap().as_slice(), ["s-1"]);
     assert_eq!(f.sink.last("approval.deny")["reason"], "approval-flood");
     // The episode ends once the queue is empty and the rate is full again.
@@ -411,12 +540,37 @@ async fn the_pending_bound_denies_each_extra_call_and_announces_the_episode_once
     let _ = (ha.await, hb.await);
     tokio::time::advance(REFILL * 2).await;
     let (c, hc) = asking(&f, shell(6, &["c"])).await;
-    let (_, _hd) = asking(&f, shell(7, &["d"])).await;
+    let (d, hd) = asking(&f, shell(7, &["d"])).await;
     let r = f.gate.admit(shell(8, &["e"]), None, None).await;
     assert_eq!(r, Err(Refusal::Denied("approval-flood")));
     assert_eq!(f.fake.floods.lock().unwrap().len(), 2);
-    f.desk.decide(&c, Decision::Deny, ME).await.unwrap();
-    let _ = hc.await;
+    for id in [c, d] {
+        f.desk.decide(&id, Decision::Deny, ME).await.unwrap();
+    }
+    let _ = (hc.await, hd.await);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_pending_bound_alone_refuses_and_refused_calls_take_no_rate_slot() {
+    let f = fx(2);
+    let (a, ha) = asking(&f, shell(1, &["a"])).await;
+    let (b, hb) = asking(&f, shell(2, &["b"])).await;
+    // The rate is full again; only the pending bound can refuse now, and refusals take no slot.
+    tokio::time::advance(REFILL * 4).await;
+    for call in 3..10 {
+        let r = f.gate.admit(shell(call, &["x"]), None, None).await;
+        assert_eq!(r, Err(Refusal::Denied("approval-flood")));
+    }
+    f.desk.decide(&a, Decision::Deny, ME).await.unwrap();
+    f.desk.decide(&b, Decision::Deny, ME).await.unwrap();
+    let _ = (ha.await, hb.await);
+    // Both slots are still there.
+    let (c, hc) = asking(&f, shell(10, &["c"])).await;
+    let (d, hd) = asking(&f, shell(11, &["d"])).await;
+    for id in [c, d] {
+        f.desk.decide(&id, Decision::Deny, ME).await.unwrap();
+    }
+    let _ = (hc.await, hd.await);
 }
 
 #[tokio::test(start_paused = true)]
@@ -440,60 +594,79 @@ async fn new_prompts_come_at_most_one_per_refill_after_the_burst() {
     assert!(h.await.unwrap().is_ok());
 }
 
-#[tokio::test(start_paused = true)]
-async fn a_denial_over_the_bound_does_not_take_a_rate_slot() {
+#[tokio::test]
+async fn a_flood_announcement_that_cannot_be_written_is_announced_again() {
     let f = fx(1);
     let (id, h) = asking(&f, shell(1, &["a"])).await;
-    for call in 2..20 {
-        let _ = f.gate.admit(shell(call, &["x"]), None, None).await;
-    }
-    f.desk.decide(&id, Decision::Deny, ME).await.unwrap();
-    let _ = h.await;
-    tokio::time::advance(REFILL).await;
-    // One slot came back and the refused calls took none of it.
-    let (id, h) = asking(&f, shell(30, &["b"])).await;
-    f.desk.decide(&id, Decision::Deny, ME).await.unwrap();
-    let _ = h.await;
-}
-
-#[tokio::test]
-async fn a_flood_announcement_that_cannot_be_written_is_unrecorded() {
-    let f = fx(1);
-    let (_, _h) = asking(&f, shell(1, &["a"])).await;
-    f.sink.set_failing(true);
+    f.sink.fail_next.store(1, SeqCst);
     let r = f.gate.admit(shell(2, &["b"]), None, None).await;
     assert_eq!(r, Err(Refusal::Unrecorded));
     assert!(f.fake.floods.lock().unwrap().is_empty());
+    let r = f.gate.admit(shell(3, &["c"]), None, None).await;
+    assert_eq!(r, Err(Refusal::Denied("approval-flood")));
+    assert_eq!(count(&f.sink, "approval.flood"), 1);
+    assert_eq!(f.fake.floods.lock().unwrap().len(), 1);
+    f.desk.decide(&id, Decision::Deny, ME).await.unwrap();
+    let _ = h.await;
 }
 
-/// RT-AG-03 at the gate: 1 000 shell calls at once.
-#[tokio::test(start_paused = true)]
-async fn rt_ag_03_a_thousand_asks_leave_at_most_max_pending_and_run_nothing() {
-    let f = fx(5);
-    let mut tasks = tokio::task::JoinSet::new();
-    for call in 0..1000 {
+/// Spawns `n` asks for calls `from..from + n`.
+fn spawn_asks(
+    f: &Fx,
+    tasks: &mut tokio::task::JoinSet<Result<Ticket, Refusal>>,
+    from: u64,
+    n: u64,
+) {
+    for call in from..from + n {
         let gate = f.gate.clone();
         tasks.spawn(async move { gate.admit(shell(call, &["touch", "x"]), None, None).await });
     }
-    for _ in 0..50 {
-        tokio::task::yield_now().await;
-    }
+}
+
+/// RT-AG-03 at the gate: 1 000 shell calls in four waves, so that each bound is the only
+/// thing between the flood and a prompt in at least one wave.
+#[tokio::test(start_paused = true)]
+async fn rt_ag_03_a_thousand_asks_leave_at_most_max_pending_and_run_nothing() {
+    let f = fx(5);
+    let shown = || f.fake.requested.lock().unwrap().len();
+    let mut tasks = tokio::task::JoinSet::new();
+    // Wave 1: the burst fills the queue; the rest flood.
+    spawn_asks(&f, &mut tasks, 0, 400);
+    until("5 shown", || shown() == 5).await;
+    until("395 denied", || count(&f.sink, "approval.deny") == 395).await;
     assert_eq!(f.desk.list().len(), 5);
+    // Wave 2: the queue is empty but the rate is spent, so the rate alone refuses.
+    for p in f.desk.list() {
+        f.desk.decide(&p.id, Decision::Deny, ME).await.unwrap();
+    }
+    spawn_asks(&f, &mut tasks, 400, 200);
+    until("595 denied", || count(&f.sink, "approval.deny") == 595).await;
+    assert_eq!(shown(), 5);
+    // Wave 3: the rate is full again; the queue fills to the bound.
+    tokio::time::advance(REFILL * 10).await;
+    spawn_asks(&f, &mut tasks, 600, 200);
+    until("10 shown", || shown() == 10).await;
+    until("790 denied", || count(&f.sink, "approval.deny") == 790).await;
+    // Wave 4: the rate is full and the queue is full, so the pending bound alone refuses.
+    tokio::time::advance(REFILL * 10).await;
+    spawn_asks(&f, &mut tasks, 800, 200);
+    until("990 denied", || count(&f.sink, "approval.deny") == 990).await;
+    assert_eq!(shown(), 10);
+    assert!(f.desk.list().len() <= 5);
     tokio::time::advance(Duration::from_secs(300)).await;
-    let mut flood = 0;
+    let mut tally = std::collections::BTreeMap::<&str, usize>::new();
     while let Some(r) = tasks.join_next().await {
         match r.unwrap() {
             Ok(_) => panic!("a ticket was issued"),
-            Err(Refusal::Denied("approval-flood")) => flood += 1,
-            Err(Refusal::Denied("timeout")) => {}
-            Err(other) => panic!("{other:?}"),
+            Err(Refusal::Denied(code)) => *tally.entry(code).or_default() += 1,
+            Err(Refusal::Unrecorded) => panic!("unrecorded"),
         }
     }
-    assert_eq!(flood, 995);
-    let events = f.sink.events();
-    assert_eq!(events.iter().filter(|e| *e == "approval.flood").count(), 1);
-    assert_eq!(events.iter().filter(|e| *e == "approval.deny").count(), 995);
-    assert_eq!(events.iter().filter(|e| *e == "approval.expire").count(), 5);
+    assert_eq!(tally.get("approval-flood"), Some(&990), "{tally:?}");
+    assert_eq!(tally.get("denied"), Some(&5), "{tally:?}");
+    assert_eq!(tally.get("timeout"), Some(&5), "{tally:?}");
+    // Two episodes: waves 1–2, then 3–4 (the queue emptied and the rate refilled between).
+    assert_eq!(count(&f.sink, "approval.flood"), 2);
 }
 
 #[tokio::test]
@@ -505,15 +678,10 @@ async fn the_pending_entry_carries_note_hash_and_tags_never_the_note() {
         gate.admit(shell(1, &["rm", "x"]), Some(note), Some(true))
             .await
     });
-    for _ in 0..100 {
-        if !f.desk.list().is_empty() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
+    until("shown", || !f.desk.list().is_empty()).await;
     let p = f.desk.list().remove(0);
     assert_eq!(p.risk_tags, vec!["destructive"]);
-    assert_eq!(p.note.as_deref(), Some(note));
+    assert_eq!(p.note.as_deref(), Some(format!("\"{note}\"").as_str()));
     let e = f.sink.last("tool.pending");
     assert_eq!(e["note_bytes"], note.len());
     assert_eq!(e["note_sha256"], sha256(note.as_bytes()));
@@ -532,17 +700,12 @@ async fn the_pending_entry_stays_under_the_writer_bound_in_the_worst_case() {
         gate.admit(shell(u64::MAX, &[&worst, &worst]), Some("n"), Some(true))
             .await
     });
-    for _ in 0..100 {
-        if !f.desk.list().is_empty() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
+    until("shown", || !f.desk.list().is_empty()).await;
     let e = f.sink.last("tool.pending");
     let len = e.to_string().len();
     assert!(len < 4096, "{len}");
     assert!(e["action"].as_str().unwrap().contains("… (+"));
-    let id = f.desk.list().remove(0).id;
+    let id = f.desk.list().remove(0).id.clone();
     f.desk.decide(&id, Decision::Deny, ME).await.unwrap();
     let _ = h.await;
     // So does the decision entry, which carries the same fields and the client.

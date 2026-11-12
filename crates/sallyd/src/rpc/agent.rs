@@ -19,8 +19,9 @@
 //! - A cancel or a closed connection never drops a call: it runs to its end (so its own audit
 //!   entries are written) and only its reply is suppressed; a prompt it waits on is withdrawn
 //!   through the handler (#54; ruling Q27). Its in-flight slot is held until it returns. A call
-//!   whose handler could not write an entry gets no reply. Session teardown does drop calls: after [`listen::STOP_GRACE`]
-//!   (`Handle::shutdown`) or at once (the `Handle` dropped) (architect ruling Q17).
+//!   whose handler could not write an entry gets no reply. Session teardown does drop calls:
+//!   after [`listen::STOP_GRACE`] (`Handle::shutdown`) or at once (the `Handle` dropped)
+//!   (architect ruling Q17).
 //! - The broker never sends a request; replies are the only messages it writes.
 
 use std::collections::HashMap;
@@ -45,7 +46,15 @@ use super::message::{
 };
 use super::rate::Rate;
 use super::record::{Recorder, escape};
-use crate::approvals::Withdraw;
+
+/// Why a call's prompt is withdrawn ([`ToolHandler::withdraw`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Withdraw {
+    /// `notifications/cancelled` named the call.
+    Cancel,
+    /// The connection that sent the call closed.
+    Closed,
+}
 
 /// Largest frame accepted (ARCHITECTURE §4: 256 KiB on the session socket).
 pub const MAX_FRAME: usize = 256 * 1024;

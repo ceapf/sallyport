@@ -10,17 +10,24 @@
 //!   copy of that action; the executor runs the ticket and nothing else. Ids are 128-bit random,
 //!   single use: deciding removes the entry under the lock, so a second decide is `unknown-id`.
 //! - **Default deny.** No approver attached, a timeout, a dropped wait, a withdrawn call: deny.
+//!   A withdraw that arrives before the call reaches the queue is kept until the call ends, so
+//!   the call is never shown.
 //! - **Bounds.** Per session at most `max_pending` prompts wait, and new prompts come at most one
 //!   per [`REFILL`] with a burst of `max_pending`; over either bound a call is denied
 //!   `approval-flood`, each with its own entry, and each flood episode is announced once
 //!   (`approval.flood`). `agent.sock` runs at most 16 calls at once, so a `max_pending` above 16
 //!   is never reached.
 //! - **Audit.** `tool.pending` before the prompt is shown; `approval.decide` (with the deciding
-//!   client) before the asker learns the answer; `approval.expire`, `approval.withdraw`,
-//!   `approval.deny`, `approval.flood`, `tool.deny` before the denial is returned. A failed
-//!   append is [`Refusal::Unrecorded`]: nothing runs and no reply is sent. A wait dropped by
-//!   teardown is invalidated at once without an entry; the session's stop entry covers it.
+//!   client) before the asker learns the answer, and before a `deny_all_session` latches;
+//!   `approval.expire`, `approval.withdraw`, `approval.deny`, `approval.flood`, `tool.deny`
+//!   before the denial is returned. A failed append is [`Refusal::Unrecorded`]: nothing runs and
+//!   no reply is sent. A decision or withdraw, once it has taken an entry, finishes in its own
+//!   task, so dropping its caller loses no entry. A wait dropped by teardown is invalidated at
+//!   once without an entry; the session's stop entry covers it.
+//! - **Poison.** A panic while the queue's lock is held latches the session: every later prompt
+//!   is denied.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -29,9 +36,10 @@ use sally_core::manifest::Approvals;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
-use super::action::{Action, Bound, hex};
+use super::action::{Bound, hex};
 use super::policy::{Need, Policy};
 use super::render::{self, Prompt};
+use crate::rpc::agent::Withdraw;
 use crate::rpc::rate::Rate;
 use crate::rpc::record::{Recorder, escape};
 
@@ -40,6 +48,8 @@ pub const REFILL: Duration = Duration::from_secs(2);
 /// Characters of action text in an audit entry: escaped ASCII doubles at most in JSON, so the
 /// entry stays under the writer's 4 KiB (architect ruling Q24).
 pub const AUDIT_ACTION_CHARS: usize = 1024;
+/// Attempts at `getrandom(2)` before an id is unavailable (it is interrupted only by signals).
+const ID_ATTEMPTS: usize = 3;
 
 /// A human's answer to one prompt (ARCHITECTURE §4.1). v1 has no "allow for this session".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,13 +84,14 @@ pub struct Client {
     pub pid: i32,
 }
 
-/// Where prompts go: the UI or CLI notifier. Answers come back through the [`Desk`].
+/// Where prompts go: the UI or CLI notifier. Answers come back through the [`Desk`]. Called
+/// from async code outside the queue's lock: implementations must not block.
 pub trait Approver: Send + Sync + 'static {
     /// A prompt is waiting.
     fn requested(&self, prompt: &Prompt);
     /// The session started a flood episode (one call per episode).
     fn flood(&self, session: &str);
-    /// The prompt `id` is gone (decided, expired, withdrawn or dropped).
+    /// The shown prompt `id` is gone (decided, expired, withdrawn or dropped).
     fn closed(&self, id: &str);
 }
 
@@ -129,7 +140,7 @@ impl Ticket {
 
     /// The action to run.
     #[must_use]
-    pub fn action(&self) -> &Action {
+    pub fn action(&self) -> &super::action::Action {
         &self.bound.action
     }
 
@@ -151,15 +162,6 @@ pub enum DecideError {
     Unrecorded,
 }
 
-/// Why a call's prompt is withdrawn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Withdraw {
-    /// `notifications/cancelled` named the call.
-    Cancel,
-    /// The connection that sent the call closed.
-    Closed,
-}
-
 enum Answer {
     Approve,
     Deny(&'static str),
@@ -169,17 +171,19 @@ enum Answer {
 
 struct Entry {
     id: String,
-    bound: Bound,
-    prompt: Prompt,
+    call: u64,
+    prompt: Arc<Prompt>,
     /// `tool.pending` is written and the approver told: only then can it be decided.
     announced: bool,
     /// A withdraw arrived before it was announced.
-    cancel: bool,
-    tx: Option<oneshot::Sender<Answer>>,
+    withdrawn: Option<Withdraw>,
+    tx: oneshot::Sender<Answer>,
 }
 
 struct State {
     pending: Vec<Entry>,
+    /// Calls withdrawn before they reached the queue, until they end ([`Gate::forget`]).
+    withdrawn: HashMap<u64, Withdraw>,
     latched: bool,
     flooding: bool,
     rate: Rate,
@@ -192,6 +196,14 @@ struct Inner {
     session: String,
     approver: Option<Arc<dyn Approver>>,
     state: Mutex<State>,
+}
+
+/// Why a call does not queue.
+enum NotQueued {
+    /// Denied with this code; `true` when a flood episode starts with it.
+    Deny(&'static str, bool),
+    /// Withdrawn before it was shown.
+    Withdrawn(Withdraw),
 }
 
 /// The asking half (held by the tool handler).
@@ -225,6 +237,7 @@ pub fn new(
         approver,
         state: Mutex::new(State {
             pending: Vec::new(),
+            withdrawn: HashMap::new(),
             latched: false,
             flooding: false,
             rate: Rate::every(REFILL, burst),
@@ -239,6 +252,12 @@ pub fn new(
 }
 
 impl Gate {
+    /// The session this gate binds actions to.
+    #[must_use]
+    pub fn session(&self) -> &str {
+        &self.inner.session
+    }
+
     /// Decides whether `bound` may run: policy first (deny before ask), then, if it needs a
     /// human, a prompt and the wait for its answer. `note` is model text shown apart from the
     /// action; `destructive` is the shell tagger's verdict (`None`: no tagger ran).
@@ -281,9 +300,12 @@ impl Gate {
         tags: Vec<String>,
     ) -> Result<Ticket, Refusal> {
         let inner = &self.inner;
-        let id = match inner.queue(&bound, note, tags) {
-            Ok(id) => id,
-            Err((code, episode)) => {
+        let (id, prompt, rx) = match inner.queue(&bound, note, tags) {
+            Ok(q) => q,
+            Err(NotQueued::Withdrawn(why)) => {
+                return Err(inner.withdrawn_before_shown(bound.call, None, why).await);
+            }
+            Err(NotQueued::Deny(code, episode)) => {
                 if episode && !inner.flood_started().await {
                     return Err(Refusal::Unrecorded);
                 }
@@ -293,28 +315,26 @@ impl Gate {
                     .await);
             }
         };
-        let (guard, rx) = Waiting::arm(Arc::clone(inner), id.clone());
-        let mut args = fields(&bound);
-        add(&mut args, "id", Value::from(id.as_str()));
-        if let Some(n) = note {
-            add(&mut args, "note_bytes", Value::from(n.len()));
-            add(&mut args, "note_sha256", Value::from(sha256(n.as_bytes())));
-        }
-        let entry = inner
-            .record
-            .entry(Actor::Harness, "tool.pending", Some("pending"))
-            .args(args);
-        if !inner.record.append(entry).await {
+        let guard = Waiting {
+            inner: Arc::clone(inner),
+            id: id.clone(),
+        };
+        if !inner.pending_entry(&prompt, note).await {
             return Err(Refusal::Unrecorded);
         }
-        if let Err(code) = inner.announce(&id) {
-            let event = if code == "withdrawn" {
-                "approval.withdraw"
-            } else {
-                "approval.deny"
-            };
-            let args = json!({"id": id, "call": bound.call, "reason": code});
-            return Err(inner.refuse(event, Actor::Sallyd, args, code).await);
+        match inner.announce(&id) {
+            Ok(()) => {}
+            Err(NotQueued::Withdrawn(why)) => {
+                return Err(inner
+                    .withdrawn_before_shown(bound.call, Some(&id), why)
+                    .await);
+            }
+            Err(NotQueued::Deny(code, _)) => {
+                let args = json!({"id": id, "call": bound.call, "reason": code});
+                return Err(inner
+                    .refuse("approval.deny", Actor::Sallyd, args, code)
+                    .await);
+            }
         }
         let answer = inner.wait(&id, rx).await;
         drop(guard);
@@ -338,61 +358,73 @@ impl Gate {
             .await
     }
 
-    /// Withdraws the prompt of `call`, if one waits (#54): its asker gets `withdrawn`.
+    /// Withdraws the prompt of `call` (#54): a shown prompt leaves the queue and its asker gets
+    /// `withdrawn`; a call not yet shown is never shown. Once it has taken the prompt it
+    /// finishes in its own task, so dropping this future loses no entry.
     pub async fn withdraw(&self, call: u64, why: Withdraw) {
-        let inner = &self.inner;
         let taken = {
-            let mut st = lock(&inner.state);
-            let Some(i) = st.pending.iter().position(|e| e.bound.call == call) else {
-                return;
-            };
-            let announced = st.pending.get(i).is_some_and(|e| e.announced);
-            if !announced {
-                if let Some(e) = st.pending.get_mut(i) {
-                    e.cancel = true;
+            let mut st = self.inner.state();
+            match st.pending.iter().position(|e| e.call == call) {
+                None => {
+                    st.withdrawn.insert(call, why);
+                    return;
                 }
-                return;
+                Some(i) if st.pending.get(i).is_some_and(|e| !e.announced) => {
+                    if let Some(e) = st.pending.get_mut(i) {
+                        e.withdrawn = Some(why);
+                    }
+                    return;
+                }
+                Some(i) => st.pending.swap_remove(i),
             }
-            st.pending.swap_remove(i)
         };
-        let (actor, reason) = match why {
-            Withdraw::Cancel => (Actor::Harness, "cancel"),
-            Withdraw::Closed => (Actor::Sallyd, "closed"),
-        };
-        let args = json!({"id": taken.id, "call": call, "reason": reason});
-        let entry = inner
-            .record
-            .entry(actor, "approval.withdraw", Some("deny"))
-            .args(args);
-        let answer = if inner.record.append(entry).await {
-            Answer::Withdrawn
-        } else {
-            Answer::Unrecorded
-        };
-        inner.close(taken, answer);
+        let inner = Arc::clone(&self.inner);
+        let task = tokio::spawn(async move {
+            let (actor, reason) = withdraw_by(why);
+            let args = json!({"id": taken.id, "call": call, "reason": reason});
+            let entry = inner
+                .record
+                .entry(actor, "approval.withdraw", Some("deny"))
+                .args(args);
+            let answer = if inner.record.append(entry).await {
+                Answer::Withdrawn
+            } else {
+                Answer::Unrecorded
+            };
+            inner.close(taken, answer);
+        });
+        let _ = task.await;
+    }
+
+    /// The call ended: a withdraw kept for it is no longer needed.
+    pub fn forget(&self, call: u64) {
+        self.inner.state().withdrawn.remove(&call);
     }
 }
 
 impl Desk {
     /// The prompts waiting for an answer.
     #[must_use]
-    pub fn list(&self) -> Vec<Prompt> {
-        lock(&self.inner.state)
+    pub fn list(&self) -> Vec<Arc<Prompt>> {
+        self.inner
+            .state()
             .pending
             .iter()
             .filter(|e| e.announced)
-            .map(|e| e.prompt.clone())
+            .map(|e| Arc::clone(&e.prompt))
             .collect()
     }
 
     /// Answers prompt `id` for `client`. The entry is written before the asker learns the
-    /// answer; an approval that cannot be written is not given.
+    /// answer, and a `deny_all_session` latches only once its own entry is written; an approval
+    /// that cannot be written is not given. Once it has taken the prompt it finishes in its own
+    /// task, so dropping this future loses no entry.
     ///
     /// # Errors
     /// `UnknownId` (audited) for an id that is not waiting; `Unrecorded` if an entry failed.
     pub async fn decide(&self, id: &str, d: Decision, client: Client) -> Result<(), DecideError> {
-        let inner = &self.inner;
-        let Some(taken) = inner.take(id, d) else {
+        let inner = Arc::clone(&self.inner);
+        let Some(first) = inner.take(id) else {
             let args = json!({
                 "id": escape(id.as_bytes()), "reason": "unknown-id", "client": who(client),
             });
@@ -406,99 +438,147 @@ impl Desk {
                 Err(DecideError::Unrecorded)
             };
         };
-        let mut result = Ok(());
-        for (n, e) in taken.into_iter().enumerate() {
-            let mut args = fields(&e.bound);
-            add(&mut args, "id", Value::from(e.id.as_str()));
-            add(&mut args, "client", who(client));
-            if n > 0 {
-                // Denied together with `id` by its deny_all_session.
-                add(&mut args, "via", Value::from(id));
-            }
-            let entry = inner
-                .record
-                .entry(Actor::User, "approval.decide", Some(d.as_str()))
-                .args(args);
-            let answer = match (inner.record.append(entry).await, d, n) {
-                (false, _, _) => {
-                    result = Err(DecideError::Unrecorded);
-                    Answer::Unrecorded
-                }
-                (true, Decision::Approve, _) => Answer::Approve,
-                (true, Decision::Deny, _) | (true, Decision::DenyAllSession, 0) => {
-                    Answer::Deny("denied")
-                }
-                (true, Decision::DenyAllSession, _) => Answer::Deny("session-denied"),
-            };
-            inner.close(e, answer);
-        }
-        result
+        let task = tokio::spawn(async move { inner.finish(first, d, client).await });
+        task.await.unwrap_or(Err(DecideError::Unrecorded))
     }
 }
 
 impl Inner {
-    /// Takes the shown prompt `id` out of the queue (so it is decided once), and for
-    /// `DenyAllSession` latches the session and takes every other shown prompt after it.
-    fn take(&self, id: &str, d: Decision) -> Option<Vec<Entry>> {
-        let mut st = lock(&self.state);
-        let i = st.pending.iter().position(|e| e.announced && e.id == id)?;
-        let mut taken = vec![st.pending.swap_remove(i)];
-        if d == Decision::DenyAllSession {
+    /// Locks the queue. A poisoned lock (a panic while it was held) latches the session.
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|p| {
+            let mut st = p.into_inner();
             st.latched = true;
-            let (rest, keep): (Vec<Entry>, Vec<Entry>) =
-                st.pending.drain(..).partition(|e| e.announced);
-            st.pending = keep;
-            taken.extend(rest);
-        }
-        Some(taken)
+            st
+        })
     }
 
-    /// Queues a prompt for `bound` or says why not: the code, and whether a flood episode
-    /// starts with it. Check order (architect ruling Q22): the session latch, no approver, the
-    /// pending bound, the rate; only a prompt actually queued takes a rate slot.
+    /// Takes the shown prompt `id` out of the queue, so it is decided once.
+    fn take(&self, id: &str) -> Option<Entry> {
+        let mut st = self.state();
+        let i = st.pending.iter().position(|e| e.announced && e.id == id)?;
+        Some(st.pending.swap_remove(i))
+    }
+
+    /// Writes and delivers a decision on a taken prompt; for `DenyAllSession`, then latches the
+    /// session and denies every other shown prompt, each with its own entry.
+    async fn finish(&self, first: Entry, d: Decision, client: Client) -> Result<(), DecideError> {
+        if !self.decided(&first, d, client, None).await {
+            self.close(first, Answer::Unrecorded);
+            return Err(DecideError::Unrecorded);
+        }
+        let answer = match d {
+            Decision::Approve => Answer::Approve,
+            Decision::Deny | Decision::DenyAllSession => Answer::Deny("denied"),
+        };
+        let via = first.id.clone();
+        self.close(first, answer);
+        if d != Decision::DenyAllSession {
+            return Ok(());
+        }
+        let rest: Vec<Entry> = {
+            let mut st = self.state();
+            st.latched = true;
+            let (rest, keep) = st.pending.drain(..).partition(|e| e.announced);
+            st.pending = keep;
+            rest
+        };
+        let mut result = Ok(());
+        for e in rest {
+            let answer = if self.decided(&e, d, client, Some(&via)).await {
+                Answer::Deny("session-denied")
+            } else {
+                result = Err(DecideError::Unrecorded);
+                Answer::Unrecorded
+            };
+            self.close(e, answer);
+        }
+        result
+    }
+
+    /// Writes one `approval.decide` entry; whether it was written.
+    async fn decided(&self, e: &Entry, d: Decision, client: Client, via: Option<&str>) -> bool {
+        let mut args = fields_of(&e.prompt);
+        add(&mut args, "id", Value::from(e.id.as_str()));
+        add(&mut args, "client", who(client));
+        if let Some(v) = via {
+            // Denied together with `v` by its deny_all_session.
+            add(&mut args, "via", Value::from(v));
+        }
+        let entry = self
+            .record
+            .entry(Actor::User, "approval.decide", Some(d.as_str()))
+            .args(args);
+        self.record.append(entry).await
+    }
+
+    /// Queues a prompt for `bound` or says why not. Check order (architect ruling Q22): an
+    /// earlier withdraw, the session latch, no approver, the pending bound, the rate; only a
+    /// prompt actually queued takes a rate slot.
     fn queue(
         &self,
         bound: &Bound,
         note: Option<&str>,
         tags: Vec<String>,
-    ) -> Result<String, (&'static str, bool)> {
-        let mut st = lock(&self.state);
+    ) -> Result<(String, Arc<Prompt>, oneshot::Receiver<Answer>), NotQueued> {
+        let mut st = self.state();
         if st.flooding && st.pending.is_empty() && st.rate.full() {
             st.flooding = false;
         }
+        if let Some(&why) = st.withdrawn.get(&bound.call) {
+            return Err(NotQueued::Withdrawn(why));
+        }
         if st.latched {
-            return Err(("session-denied", false));
+            return Err(NotQueued::Deny("session-denied", false));
         }
         if self.approver.is_none() {
-            return Err(("no-approver", false));
+            return Err(NotQueued::Deny("no-approver", false));
         }
         if st.pending.len() >= self.limits.max_pending || st.rate.take().is_err() {
             let episode = !st.flooding;
             st.flooding = true;
-            return Err(("approval-flood", episode));
+            return Err(NotQueued::Deny("approval-flood", episode));
         }
         let Some(id) = new_id() else {
-            return Err(("id-unavailable", false));
+            return Err(NotQueued::Deny("id-unavailable", false));
         };
-        let prompt = Prompt::new(id.clone(), bound, note, tags);
+        let prompt = Arc::new(Prompt::new(id.clone(), bound, note, tags));
+        let (tx, rx) = oneshot::channel();
         st.pending.push(Entry {
             id: id.clone(),
-            bound: bound.clone(),
-            prompt,
+            call: bound.call,
+            prompt: Arc::clone(&prompt),
             announced: false,
-            cancel: false,
-            tx: None,
+            withdrawn: None,
+            tx,
         });
-        Ok(id)
+        Ok((id, prompt, rx))
+    }
+
+    /// Writes `tool.pending` for a queued prompt; whether it was written.
+    async fn pending_entry(&self, prompt: &Prompt, note: Option<&str>) -> bool {
+        let mut args = fields_of(prompt);
+        add(&mut args, "id", Value::from(prompt.id.as_str()));
+        if let Some(n) = note {
+            add(&mut args, "note_bytes", Value::from(n.len()));
+            add(&mut args, "note_sha256", Value::from(sha256(n.as_bytes())));
+        }
+        let entry = self
+            .record
+            .entry(Actor::Harness, "tool.pending", Some("pending"))
+            .args(args);
+        self.record.append(entry).await
     }
 
     /// Writes the episode's `approval.flood` and tells the approver; whether it was written.
+    /// If it was not, the next flood starts the episode again.
     async fn flood_started(&self) -> bool {
         let entry = self
             .record
             .entry(Actor::Sallyd, "approval.flood", Some("deny"))
             .args(json!({"max_pending": self.limits.max_pending}));
         if !self.record.append(entry).await {
+            self.state().flooding = false;
             return false;
         }
         if let Some(a) = &self.approver {
@@ -508,28 +588,31 @@ impl Inner {
     }
 
     /// Makes `id` decidable and shows it, unless it was withdrawn or the session latched while
-    /// its entry was written (then it leaves the queue with that code).
-    fn announce(&self, id: &str) -> Result<(), &'static str> {
+    /// its entry was written (then it leaves the queue with that reason).
+    fn announce(&self, id: &str) -> Result<(), NotQueued> {
         let prompt = {
-            let mut st = lock(&self.state);
+            let mut st = self.state();
             let latched = st.latched;
             let Some(i) = st.pending.iter().position(|e| e.id == id) else {
-                return Err("withdrawn");
+                return Err(NotQueued::Withdrawn(Withdraw::Closed));
             };
-            let code = match st.pending.get(i) {
-                Some(e) if e.cancel => Some("withdrawn"),
-                Some(_) if latched => Some("session-denied"),
-                _ => None,
+            let stop = match st.pending.get(i) {
+                Some(e) => match e.withdrawn {
+                    Some(why) => Some(NotQueued::Withdrawn(why)),
+                    None if latched => Some(NotQueued::Deny("session-denied", false)),
+                    None => None,
+                },
+                None => None,
             };
-            if let Some(code) = code {
+            if let Some(stop) = stop {
                 st.pending.swap_remove(i);
-                return Err(code);
+                return Err(stop);
             }
             let Some(e) = st.pending.get_mut(i) else {
-                return Err("withdrawn");
+                return Err(NotQueued::Withdrawn(Withdraw::Closed));
             };
             e.announced = true;
-            e.prompt.clone()
+            Arc::clone(&e.prompt)
         };
         if let Some(a) = &self.approver {
             a.requested(&prompt);
@@ -537,24 +620,31 @@ impl Inner {
         Ok(())
     }
 
+    /// The `approval.withdraw` of a call withdrawn before its prompt was shown.
+    async fn withdrawn_before_shown(&self, call: u64, id: Option<&str>, why: Withdraw) -> Refusal {
+        let (actor, reason) = withdraw_by(why);
+        let args = json!({"id": id, "call": call, "reason": reason});
+        self.refuse("approval.withdraw", actor, args, "withdrawn")
+            .await
+    }
+
     /// Waits for the answer to `id` until the timeout; on expiry the prompt leaves the queue.
-    async fn wait(&self, id: &str, rx: oneshot::Receiver<Answer>) -> Answer {
-        let mut rx = rx;
+    async fn wait(&self, id: &str, mut rx: oneshot::Receiver<Answer>) -> Answer {
         if let Ok(r) = tokio::time::timeout(self.limits.timeout, &mut rx).await {
             return r.unwrap_or(Answer::Unrecorded);
         }
         let expired = {
-            let mut st = lock(&self.state);
+            let mut st = self.state();
             st.pending
                 .iter()
                 .position(|e| e.id == id)
                 .map(|i| st.pending.swap_remove(i))
         };
         let Some(e) = expired else {
-            // A decision took it first and is being written: its answer is coming.
+            // A decision or withdraw took it first and is being written: its answer is coming.
             return rx.await.unwrap_or(Answer::Unrecorded);
         };
-        let args = json!({"id": e.id, "call": e.bound.call, "reason": "timeout"});
+        let args = json!({"id": e.id, "call": e.call, "reason": "timeout"});
         let entry = self
             .record
             .entry(Actor::Sallyd, "approval.expire", Some("deny"))
@@ -570,11 +660,9 @@ impl Inner {
         answer
     }
 
-    /// Sends `answer` to the asker of a taken entry and tells the approver it is gone.
+    /// Sends `answer` to the asker of a taken, shown entry and tells the approver it is gone.
     fn close(&self, e: Entry, answer: Answer) {
-        if let Some(tx) = e.tx {
-            let _ = tx.send(answer);
-        }
+        let _ = e.tx.send(answer);
         if let Some(a) = &self.approver {
             a.closed(&e.id);
         }
@@ -598,40 +686,49 @@ struct Waiting {
     id: String,
 }
 
-impl Waiting {
-    fn arm(inner: Arc<Inner>, id: String) -> (Self, oneshot::Receiver<Answer>) {
-        let (tx, rx) = oneshot::channel();
-        if let Some(e) = lock(&inner.state).pending.iter_mut().find(|e| e.id == id) {
-            e.tx = Some(tx);
-        }
-        (Self { inner, id }, rx)
-    }
-}
-
 impl Drop for Waiting {
     fn drop(&mut self) {
         let gone = {
-            let mut st = lock(&self.inner.state);
+            let mut st = self.inner.state();
             st.pending
                 .iter()
                 .position(|e| e.id == self.id)
                 .map(|i| st.pending.swap_remove(i))
         };
-        if let (Some(e), Some(a)) = (gone, &self.inner.approver) {
+        // Only a prompt the approver was shown is closed to it.
+        if let (Some(e), Some(a)) = (gone, &self.inner.approver)
+            && e.announced
+        {
             a.closed(&e.id);
         }
     }
 }
 
-/// The bounded fields of an action for an audit entry (architect ruling Q24).
+fn withdraw_by(why: Withdraw) -> (Actor, &'static str) {
+    match why {
+        Withdraw::Cancel => (Actor::Harness, "cancel"),
+        Withdraw::Closed => (Actor::Sallyd, "closed"),
+    }
+}
+
+/// The bounded action fields of an audit entry (architect ruling Q24), from a bound action.
 fn fields(b: &Bound) -> Value {
     let text = render::action_text(&b.action);
-    let (action, _) = render::cut(&text, AUDIT_ACTION_CHARS);
+    action_fields(b.call, &b.action.tool(), &text, &b.digest())
+}
+
+/// The same fields from a prompt, which already holds the text and digest.
+fn fields_of(p: &Prompt) -> Value {
+    action_fields(p.call, &p.tool, &p.full, &p.digest)
+}
+
+fn action_fields(call: u64, tool: &str, text: &str, digest: &str) -> Value {
+    let (action, _) = render::cut(text, AUDIT_ACTION_CHARS);
     json!({
-        "call": b.call,
-        "tool": escape(b.action.tool().as_bytes()),
+        "call": call,
+        "tool": escape(tool.as_bytes()),
         "action": action,
-        "action_sha256": b.digest(),
+        "action_sha256": digest,
     })
 }
 
@@ -658,14 +755,14 @@ fn sha256(b: &[u8]) -> String {
 /// A fresh 128-bit id, or `None` if the kernel gives no randomness (then the call is denied).
 fn new_id() -> Option<String> {
     let mut buf = [0u8; 16];
-    match rustix::rand::getrandom(&mut buf, rustix::rand::GetRandomFlags::empty()) {
-        Ok(n) if n == buf.len() => Some(format!("ap-{}", hex(&buf))),
-        _ => None,
+    for _ in 0..ID_ATTEMPTS {
+        match rustix::rand::getrandom(&mut buf, rustix::rand::GetRandomFlags::empty()) {
+            Ok(n) if n == buf.len() => return Some(format!("ap-{}", hex(&buf))),
+            Err(rustix::io::Errno::INTR) => {}
+            _ => return None,
+        }
     }
-}
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    None
 }
 
 #[cfg(test)]

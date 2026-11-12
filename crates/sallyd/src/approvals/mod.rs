@@ -10,7 +10,8 @@ pub mod render;
 #[cfg(test)]
 mod rt_tests;
 
+pub use crate::rpc::agent::Withdraw;
 pub use handler::{Executor, Gated, Prepared};
 pub use queue::{
-    Approver, Client, DecideError, Decision, Desk, Gate, Limits, Refusal, Ticket, Withdraw, new,
+    Approver, Client, DecideError, Decision, Desk, Gate, Limits, Refusal, Ticket, new,
 };

