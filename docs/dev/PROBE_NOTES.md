@@ -114,13 +114,30 @@ line per fact, with where it was found. Check a note again before relying on it 
   (`openssl verify`, Python `ssl`) and rustls-webpki 0.103 accept a leaf for `a.host`. A leaf
   for an unlisted name fails with "permitted subtree violation" / `NameConstraintViolation`.
 - Adding an excluded `dNSName` `.host` (leading dot) refuses the subdomains while `host` itself
-  still verifies, in OpenSSL 3.0.13, Python `ssl` and rustls-webpki 0.103 alike. GnuTLS (git on
-  Debian/Ubuntu) was not tested: no `certtool` on the dev host.
+  still verifies, in OpenSSL 3.0.13, Python `ssl`, rustls-webpki 0.103, GnuTLS 3.8.3 and Go 1.22
+  alike.
 - Path length 0 on the trust anchor: OpenSSL 3.0.13 refuses root → second CA → leaf ("path
-  length constraint exceeded"); rustls-webpki 0.103 accepts it, because a webpki trust anchor
+  length constraint exceeded"), and so do GnuTLS 3.8.3 and Go 1.22 ("too many intermediates
+  for path length constraint"); rustls-webpki 0.103 accepts it, because a webpki trust anchor
   keeps only subject, key and name constraints. Its name constraints still bind the whole
-  chain. So pathlen 0 binds OpenSSL clients (curl, Python, git, Node) only; prove it with
-  OpenSSL, never with a rustls verifier.
+  chain. So pathlen 0 binds OpenSSL, GnuTLS and Go clients (curl, Python, git, Node, Go
+  programs), not rustls ones; prove it with those, never with a rustls verifier.
+- GnuTLS (Task 9a-2, RT-SEC-10): `certtool --verify --load-ca-certificate=ca.pem
+  --infile=chain.pem --verify-hostname=<name> --verify-purpose=<id-kp-serverAuth OID>` (chain: the
+  leaf first, then intermediates; `--verify-hostname` takes an IP address too). Exit 0 and
+  "Verified. The certificate is trusted." for the grant leaf; exit 1 for every rogue chain with
+  "The certificate chain violates the signer's constraints." for a name constraint and for the
+  path length alike (GnuTLS reports neither which constraint nor the depth).
+- Go (`tests/redteam/tls/verify.go`, `crypto/x509` `Verify` with `DNSName`, which takes an IP
+  too, and `ExtKeyUsageServerAuth`): "DNS name … is not permitted by any constraint", "is
+  excluded by constraint \".mock.test\"", "IP address … is excluded by constraint
+  \"0.0.0.0/0\"". Built offline with `GOTOOLCHAIN=local GOPROXY=off GOTELEMETRY=off` and
+  `GOPATH`/`GOCACHE` under the test's directory.
+- `openssl verify` loads the default store too unless given `-no-CApath -no-CAstore`; IP names
+  need `-verify_ip`, not `-verify_hostname`. Python `ssl.create_default_context(cafile=…)` loads
+  that file only (no system roots); `server_hostname` takes an IP address.
+- Searching a container for key material: libcrypto and OpenSSL's `loader_attic.so` contain the
+  bare string `PRIVATE KEY`; match the armor `PRIVATE KEY-----` instead.
 
 ## hyper 1.12 HTTP/1 (intercepted tunnels)
 
@@ -136,13 +153,22 @@ tests in `egress/intercept_tests.rs` where the behaviour matters to the proxy.
   reach the service. obs-fold is 400, 101 headers and a 9 KiB head are 431, all by hyper.
 - `header_read_timeout` needs `.timer(TokioTimer)`. It runs from when hyper starts waiting for
   a head: before the first byte and during keep-alive idle too, not from the head's first byte.
-  Expiry is `Error::is_timeout()` with no reply.
+  Expiry is `Error::is_timeout()` with no reply. Consequence: an intercepted keep-alive tunnel
+  idle for `limits.head` (10 s) between requests is closed; accepted for v1, revisit in #64.
+- A body that fails on its first poll while the response head still sits in hyper's write
+  buffer: hyper drops the unflushed head with the connection, so the client sees nothing at all,
+  not a head and a cut. Which one a client sees depends on whether the body data was already
+  there when the head was written; a test of a cut must accept both.
 - `half_close` defaults to false: a client that shuts its sending side right after a request
   gets no response. The proxy sets it true (a spliced tunnel carries half-close too).
-- `max_buf_size` and `max_header_size` are checked only after a read leaves the head incomplete,
-  and one read can fill all spare buffer capacity, so a head can pass well over the limit (a
-  65.5 KiB response head passed `max_buf_size(64 KiB)`). Bound it by capping each read below
-  hyper (`Meter::max_read`) and setting `max_header_size` that far under the bound.
+- `max_buf_size` is checked only after a read leaves the head incomplete, and one read can fill
+  all spare buffer capacity (`io.rs` reads into the whole `chunk_mut()`), so with `max_buf_size`
+  alone a head can pass well over it (a 65.5 KiB response head passed `max_buf_size(64 KiB)`).
+  `max_header_size` is checked both on a partial head (`curr_len >= max`) and on a complete one
+  (`parsed_len > max`, `role.rs`), so it is an exact cut whatever the reads: with it at 7168 /
+  61440, heads of 7168 / 61440 bytes pass and 7169 / 61441 are refused, whole or split (Task
+  9a-2 part 2; part 1 had read it as checked between reads only). `Meter::max_read` stays as
+  defense in depth.
 
 ## Test writing
 

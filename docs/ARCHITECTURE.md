@@ -826,17 +826,25 @@ sallyport/
     `upstream-malformed`. `Connection` and what it names, `Keep-Alive`, `Proxy-*`, `TE`,
     `Trailer`, `Transfer-Encoding` and `Upgrade` are dropped. Redirects are returned, never
     followed. Trailers are never forwarded in either direction.
-  - Limits: request heads at most 8 KiB and 100 headers, response heads at most 64 KiB and 100
-    headers. hyper checks a head's size only between reads, so the proxy hands it at most 1 KiB
-    (client side) and 4 KiB (upstream side) per read and sets hyper's limit that far below the
-    bound: a head over the bound is always refused and one up to 7 KiB / 60 KiB always passes.
+  - Limits: 100 headers either way. Head size, exact: a request head (request line and blank
+    line included) passes iff it is at most 7168 bytes (7 KiB) and is refused from 7169 (431,
+    `egress.limit head-too-large`); a response head passes iff at most 61440 bytes (60 KiB) and
+    is refused from 61441 (502, `response-too-large`, `part: "head"`). The cut is hyper's
+    `max_header_size`, which hyper 1.12 checks on a partial head and on a complete one, so it
+    holds wherever reads end. Its `max_buf_size` of 8 KiB / 64 KiB is the backstop: with the
+    proxy handing hyper at most 1 KiB (client side) / 4 KiB (upstream side) per read, no head
+    over 8 KiB / 64 KiB could pass even a hyper that checked only partial heads. So the in-tunnel
+    request head limit is 1 KiB below the CONNECT head limit (8192, Task 8). (Architect, Task
+    9a-2 part 2; `request_heads_pass_up_to_7168_bytes_and_are_refused_from_7169` and
+    `response_heads_pass_up_to_61440_bytes_and_are_refused_from_61441`, whole and split
+    deliveries.)
     Body caps are `network.max_request_bytes`/`max_response_bytes`, payload bytes per message
     after chunk decoding (at the cap passes): a declared request length over the cap is 413 with
     nothing sent upstream, a chunked one crossing it aborts the exchange (413 if no response head
     was forwarded); a declared response length over the cap is 502, a streamed one crossing it is
     audited, then cut without a final chunk. The response cap counts upstream bytes before
     redaction. hyper's head timer is `limits.head` (10 s) for every wait for a head, so an
-    intercepted tunnel's keep-alive idle is 10 s: it ends `idle-timeout` with no entry when no
+    intercepted tunnel's keep-alive idle is 10 s (accepted for v1; revisit in #64): it ends `idle-timeout` with no entry when no
     plaintext byte arrived since the handshake or the last response, and `egress.limit
     head-timeout` (end `limit`) when a head had started (Q53). The 300 s idle limit applies only
     within an exchange (request body, response wait, response body).
@@ -853,8 +861,9 @@ sallyport/
   container is created, `session-ca.pem` (the CA) and `ca-bundle.pem` (the session's trust roots
   re-encoded, then the CA) are written into the workspace socket directory, mounted read-only at
   `/run/sallyport`: new files only (`O_EXCL`, `O_NOFOLLOW`, close-on-exec), mode 0444. The
-  harness directory never gets them. Pathlen 0 binds OpenSSL clients; rustls-webpki ignores a
-  trust anchor's path length (name constraints still bind it; `docs/dev/PROBE_NOTES.md`).
+  harness directory never gets them. Pathlen 0 binds OpenSSL, GnuTLS and Go clients;
+  rustls-webpki ignores a trust anchor's path length (name constraints still bind it;
+  `docs/dev/PROBE_NOTES.md`, RT-SEC-10).
 - **Upstream trust roots** (Task 9a-1, `egress::roots`; architect Q31). Read per session at launch
   from the first file that exists of `/etc/ssl/certs/ca-certificates.crt`,
   `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/cert.pem`,
