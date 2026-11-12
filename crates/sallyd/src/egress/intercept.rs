@@ -6,7 +6,9 @@
 //! exchanges through hyper: one upstream connection per tunnel, used for one request at a time,
 //! never replayed. Each request head is checked and rewritten by [`super::super::rewrite`],
 //! audited (`egress.request`) and forwarded; each response head is checked and its body streamed
-//! back under the response cap. Every refusal is audited before its reply and ends the tunnel.
+//! back under the response cap. Every refusal is audited before its reply and ends the tunnel,
+//! except a head hyper refuses itself (too large, unparsable): hyper answers first, and the entry
+//! follows when its connection future returns (architect Q45, a recorded deviation).
 //!
 //! No secret reaches this module (Q27 (1)): the proxy holds the leaves' keys and header names
 //! only. Task 9a-3 adds injection here, constructible only together with response redaction.
@@ -44,10 +46,13 @@ const HTTP_1_1: &[u8] = b"http/1.1";
 pub const MAX_RESPONSE_HEAD: usize = 64 * 1024;
 /// Header lines a head may have, either way.
 const MAX_HEADERS: usize = 100;
-/// Most plaintext bytes hyper gets per read, client side and upstream side. hyper checks its
-/// head limit (`max_header_size`, set this much below the bound) only between reads, so a head
-/// over [`MAX_HEAD`] or [`MAX_RESPONSE_HEAD`] is always refused, and one at most the bound minus
-/// this always passes.
+/// Most plaintext bytes hyper gets per read, client side and upstream side; hyper's head limit
+/// (`max_header_size`) is set this much below the bound. hyper 1.12 checks that limit on a
+/// partial head and on a complete one, so the cut is exact: a request head passes iff it is at
+/// most `MAX_HEAD - REQUEST_READ` (7168) bytes, a response head iff at most
+/// `MAX_RESPONSE_HEAD - RESPONSE_READ` (61440). The read cap is defense in depth (architect,
+/// Task 9a-2 part 2): should a hyper version check only partial heads, a head still never passes
+/// [`MAX_HEAD`] or [`MAX_RESPONSE_HEAD`].
 const REQUEST_READ: usize = 1024;
 const RESPONSE_READ: usize = 4096;
 
@@ -299,15 +304,6 @@ impl OnEnd for ResponseEnd {
     }
 }
 
-/// Aborts the upstream connection task when the tunnel ends.
-struct AbortOnDrop(tokio::task::JoinHandle<Result<(), hyper::Error>>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
 impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
     /// Upstream TLS, the `200`, the client's TLS and the exchanges, then `egress.close` (unless
     /// an `upstream-closed` exchange already wrote it, Q43).
@@ -400,7 +396,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
     ) -> End
     where
         C: AsyncRead + AsyncWrite + Unpin + Send,
-        U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        U: AsyncRead + AsyncWrite + Unpin + Send,
     {
         let accept = TlsAcceptor::from(server).accept(raw);
         let Ok(Ok(tls)) = tokio::time::timeout(self.limits.head, accept).await else {
@@ -417,7 +413,9 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         let Ok((sender, conn)) = client_side.handshake(TokioIo::new(upstream)).await else {
             return End::Error;
         };
-        let mut conn = AbortOnDrop(tokio::spawn(conn));
+        // Driven here, not spawned: the upstream connection and its TLS stream are dropped with
+        // this future, so the tunnel's end closes them by ownership (architect, 9a-2 part 2).
+        tokio::pin!(conn);
         let sender = tokio::sync::Mutex::new(sender);
         let svc = service_fn(|req| self.exchange(req, st, &sender));
         let mut server_side = hyper::server::conn::http1::Builder::new();
@@ -438,7 +436,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         loop {
             tokio::select! {
                 r = &mut served => return self.served(r, st).await,
-                _ = &mut conn.0, if upstream_open => {
+                _ = &mut conn, if upstream_open => {
                     upstream_open = false;
                     if !st.busy() {
                         return st.end().unwrap_or(End::Closed);
@@ -475,6 +473,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
             "egress.deny"
         };
         let args = json!({"reason": reason.as_str(), "host": st.auth.host, "port": st.auth.port});
+        // TODO(#49): log a refusal entry that could not be written.
         let _ = self
             .append(self.entry(event, Some("deny")).args(args))
             .await;
@@ -643,18 +642,22 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
 /// Resolves once an exchange in flight moved nothing for `idle` (Q53: between exchanges the
 /// head timer governs).
 async fn idle_out(act: &Activity, idle: Duration, st: &State) {
-    loop {
-        let deadline = act.last() + idle;
-        let now = Instant::now();
-        if now >= deadline && st.busy() {
-            return;
-        }
-        let wake = if now >= deadline {
-            now + idle
-        } else {
-            deadline
-        };
+    while let Some(wake) = idle_wake(Instant::now(), act.last(), idle, st.busy()) {
         tokio::time::sleep_until(wake).await;
+    }
+}
+
+/// When the idle watch looks next, or `None` when it fires: an exchange in flight moved nothing
+/// for `idle`. Past the deadline with no exchange in flight it looks again `idle` later, never
+/// at once (that would spin between exchanges).
+fn idle_wake(now: Instant, last: Instant, idle: Duration, busy: bool) -> Option<Instant> {
+    let deadline = last + idle;
+    if now < deadline {
+        Some(deadline)
+    } else if busy {
+        None
+    } else {
+        Some(now + idle)
     }
 }
 
