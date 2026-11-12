@@ -1387,6 +1387,47 @@ fn partially_encoded_and_json_escaped_secrets_are_redacted() {
     assert!(!args.to_string().contains("word-with-quotes"));
 }
 
+/// Task 9a-3 (architect D3): the token proxy redacts exactly the audit redactor's forms.
+#[test]
+fn secret_forms_are_the_forms_the_redactor_replaces_each_once() {
+    let pw = "pa ss+word/with=special&chars";
+    let forms: Vec<String> = sally_core::audit::secret_forms(pw)
+        .iter()
+        .map(|f| f.expose().clone())
+        .collect();
+    let r = Redactor::new([("PW", pw)]);
+    for f in &forms {
+        assert_eq!(r.redact_str(f), "[REDACTED:PW]", "{f}");
+    }
+    let unique: std::collections::BTreeSet<&String> = forms.iter().collect();
+    assert_eq!(unique.len(), forms.len());
+    assert_eq!(forms.first().map(String::as_str), Some(pw));
+    for expected in [
+        "pa%20ss%2Bword%2Fwith%3Dspecial%26chars",
+        "pa+ss%2bword/with%3dspecial%26chars",
+        "pa ss+word/with=special&chars",
+    ] {
+        assert!(forms.iter().any(|f| f == expected), "{expected}");
+    }
+    // Base64 forms of both alphabets: "~~~" is "fn5+" in the standard one, "fn5-" URL-safe.
+    let tildes = sally_core::audit::secret_forms("~~~~~~~~~~~~~~~~~~");
+    assert!(
+        tildes
+            .iter()
+            .any(|f| f.expose().starts_with("fn5+fn5+fn5+"))
+    );
+    assert!(
+        tildes
+            .iter()
+            .any(|f| f.expose().starts_with("fn5-fn5-fn5-"))
+    );
+    assert!(sally_core::audit::secret_forms("").is_empty());
+    // A short value keeps its raw and percent forms but no base64 form under 12 characters.
+    let short = sally_core::audit::secret_forms("abcdefgh");
+    assert!(short.iter().all(|f| f.expose().len() >= 8));
+    assert!(short.iter().any(|f| f.expose() == "abcdefgh"));
+}
+
 #[test]
 fn keys_that_redact_to_the_same_text_keep_both_values() {
     let r = Redactor::new([("S", "supersecretvalue1234")]);

@@ -10,6 +10,7 @@ pub mod hostaddrs;
 pub mod meter;
 pub mod net;
 pub mod policy;
+pub mod redact;
 pub mod rewrite;
 pub mod roots;
 #[cfg(test)]

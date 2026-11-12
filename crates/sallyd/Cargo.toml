@@ -40,6 +40,9 @@ thiserror = "2.0.21"
 tokio = { version = "1.54.1", default-features = false, features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
 # Task 9a-2: TLS termination and re-origination inside intercepted tunnels.
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
+# Already in the tree through sally-core: wipes the response bytes the redactor holds back
+# (Task 9a-3, architect D2), which may hold part of a secret.
+zeroize = { version = "1.9.1", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 insta = "1.49.0"

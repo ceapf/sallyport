@@ -7,8 +7,9 @@
 //! collision-prone (the store warns when a value is under 16 bytes). Matches are replaced by
 //! `[REDACTED:NAME]`.
 //!
-//! Grant-specific forms (the injected header value, the `{basic}` blob) belong to the token
-//! proxy and are added there (M1 task 9b).
+//! [`secret_forms`] gives the same forms to the token proxy's response redaction, so the two
+//! cannot drift; the proxy adds the grant-specific ones itself (the injected header value from
+//! Task 9a-3, the `{basic}` blob from Task 9b).
 
 use std::borrow::Cow;
 use std::fmt;
@@ -162,6 +163,21 @@ impl Redactor {
             Value::Bool(_) | Value::Null => v.clone(),
         }
     }
+}
+
+/// Every form of `value` the audit redactor replaces: the raw value, its percent-encodings, its
+/// JSON-escaped form, and its trimmed base64 in both alphabets at all three alignments (forms
+/// shorter than [`MIN_BASE64_PATTERN`] characters left out). Each form appears once; an empty
+/// value has none.
+#[must_use]
+pub fn secret_forms(value: &str) -> Vec<Secret<String>> {
+    if value.is_empty() {
+        return Vec::new();
+    }
+    forms(value.as_bytes(), value)
+        .into_iter()
+        .map(Secret::new)
+        .collect()
 }
 
 /// Every form of a secret worth redacting.
