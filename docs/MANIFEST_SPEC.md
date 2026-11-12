@@ -427,7 +427,6 @@ never on message text); the field path uses `a.b[0].c` form.
 | `unacknowledged-risk` | an `acknowledge_*` flag is needed (§1.1) |
 | `protected-path` | writable mount inside `.git`; also the broker's denial code for protected-path writes |
 | `socket-in-mount` | launch-time bounded scan found a Unix socket in a mount tree (sandbox driver, task 6) |
-| `inject-requires-tls` | not emitted (plain HTTP is 405 `plain-http-unsupported` for every host); kept until the maintainer decides (#59) |
 | `data-can-leave` | private data and an outward channel coexist (warning) |
 | `inconsistent` / `risky` | warnings only |
 
