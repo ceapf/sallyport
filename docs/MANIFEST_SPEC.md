@@ -180,6 +180,11 @@ Task 11 decision 1; ARCHITECTURE §4.3). Every such action is audited (SI-4).
   host under `openat2` confinement and apply the `approve` globs. Use for "the agent may propose
   edits to my notes". Omitted globs mean `["**"]`; an explicit empty list is a `risky` warning
   when the matching tool is enabled. Glob syntax below.
+
+In every mode the file tools act with the sandbox's permissions, not the broker's: the workspace
+runs as the user's `uid:gid` without supplementary groups, so a file or folder reachable only
+through such a group is refused `permission`, even for a brokered write the user would approve;
+an object carrying a POSIX ACL is open to its owner only (architect ruling Q39; ARCHITECTURE §4.3).
 - **Glob syntax** (`approve.writes`/`approve.deletes`; architect ruling Q20, Task 10). A glob is
   matched segment by segment against the target's canonical path relative to the mount: `**` as
   a whole segment matches zero or more segments (`notes/**` covers `notes` and everything under
@@ -366,7 +371,7 @@ validation — otherwise `mount-changed`/`is-symlink` (RT-FS-06).
 | `model.context` (token limit) | `sallyd::llm` (`body::check`): a request's `max_tokens` / `max_completion_tokens` above it is refused (and 0 always is); absent, the backend is given `model.context` as the bound. The M3 fit estimator clamps further | each `llm.sock` request | 400 `token-limit` (0: `bad-value`) + audit `llm.deny` |
 | `filesystem.mounts[].host` | validator (realpath, denylist, is-dir, not-symlink) **and again** at launch: the launch scan re-opens the root without following symlinks and compares `st_dev:st_ino`, pins are re-checked before `podman init`, and bind mounts are compared inside the container after `init` (ARCHITECTURE §3.5) | validate + launch | reject / `sandbox.refuse` / `sandbox.mount_mismatch` |
 | `filesystem.mounts[].guest` | validator (`/workspace/…`, no `..`, unique) | validate | reject |
-| `filesystem.mounts[].mode` | workspace `podman run` (`sallyd::sandbox::workspace_argv`): bind `ro`/`rw` with `nosuid,nodev,bind` (non-recursive); `brokered` → `ro` + broker `fs_*`; `staged` → `:O` overlay with upper/work in session scratch | launch + each `fs_*` call | EROFS in workspace; `fs_write`/`fs_delete` denied on `ro` (`read-only`); on `staged` they land in the overlay's upper directory |
+| `filesystem.mounts[].mode` | workspace `podman run` (`sallyd::sandbox::workspace_argv`): bind `ro`/`rw` with `nosuid,nodev,bind` (non-recursive); `brokered` → `ro` + broker `fs_*`; `staged` → `:O` overlay with upper/work in session scratch | launch + each `fs_*` call | EROFS in workspace; `fs_write`/`fs_delete` denied on `ro` (`read-only`); on `staged` they land in the overlay's upper directory; in every mode a call the sandbox's `uid:gid` could not make by mode bits is `permission` (Q39) |
 | `filesystem.mounts[].approve` | validator (glob syntax, §1 Mount) + `sallyd::approvals` glob match on canonical relative path; omitted = `["**"]` | validate + each brokered write/delete | reject; pending → approve/deny |
 | git metadata (AMENDMENTS-02 B2(a)) | validator (no writable mount inside `.git`); `.git` directories in `rw` mounts as overlays over session scratch, `.git` files bound read-only (argv builder, Task 6a; launch scan, Task 6b); broker `fs_write`/`fs_delete` | validate + launch + each call | reject / EROFS / `protected-path` |
 | `filesystem.deny` | validator adds to denylist | validate | reject |

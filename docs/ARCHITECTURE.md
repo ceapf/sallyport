@@ -517,9 +517,26 @@ taken at launch (a dead init refuses the call: `container-gone`); the `rw` guest
 the pin, the `staged` one must be an overlay mount root. A write there lands where an in-container
 write would (the host folder of an `rw` mount behind its `.git` shields; a `staged` mount's
 upper directory), and holds the session's exec gate for the whole operation. A broker-side write
-never reaches the host folder of a `staged` or `ro` mount. Files open `O_NOFOLLOW | O_NONBLOCK`
-and must be regular after `fstat`; a write opens without `O_TRUNC` and truncates after that
-check; on `brokered` mounts a file with more than one link is refused (`hard-link`).
+never reaches the host folder of a `staged` or `ro` mount. A file is reached `O_PATH`, must be
+regular after `fstat` and is judged (below) before the same inode is opened for I/O through
+`/proc/self/fd`, so a FIFO or device is never opened. That open is `O_NONBLOCK`: a file another
+process holds a lease on fails at once instead of parking a broker thread (and, for a write,
+the exec gate) until the lease breaks (ruling Q40). A write opens without `O_TRUNC` and
+truncates after those checks; on `brokered` mounts a file with more than one link is refused
+(`hard-link`).
+
+**Whose permissions** (architect ruling Q39). `sallyd` holds supplementary groups the sandbox
+lacks: the workspace runs as `uid:gid` alone (§3). So in every mode, for every operation, the
+tools first judge the object's mode bits for that `uid:gid` (the launcher's `UserIds`) and refuse
+what the sandbox could not do (`permission`). Class: owner if the uid matches; else, when the
+object carries a POSIX ACL (or its presence cannot be read), nothing; else group if the gid
+matches; else other. The walk is fd-anchored: each directory, the mount root included, needs x
+before the next component opens, so a refusal says nothing about what lies deeper. A read needs r;
+a listing r and x; a write to an existing file w on the file; a create w and x on the parent,
+with `O_EXCL` so the case judged is the case that ran; a delete w and x on the parent (the sticky
+rule is the kernel's). `prepare` runs the same checks, so nobody is asked about a call that cannot
+run. Brokered writes the user approves are narrowed too: a folder reachable only through a
+supplementary group is not writable through the broker.
 
 **Shell** (decision 3; #24, #62; ruling Q32). The runner holds the exec gate only until it has
 found the started process: the new process in the container's pid namespace whose parent is

@@ -44,6 +44,20 @@ line per fact, with where it was found. Check a note again before relying on it 
   write through it into a `:O` staged mount lands in the upper directory (owned by the user in
   the container's view), the host lower stays byte-identical, and the container sees the change;
   an unlink there leaves a whiteout. (Task 11, Q29)
+- ACL presence from an `O_PATH` fd: `fgetxattr` on it fails `EBADF`. `getxattr` on
+  `/proc/self/fd/<n>` works and names the held object (the magic link is not re-resolved from a
+  guest path); a size-0 query answers `ENODATA` with no ACL (probed on ext4). `ENOTSUP`, a file
+  system without ACL support, is documented, not probed. An unprivileged owner can set `system.posix_acl_access` with `setxattr` and a raw
+  version-2 blob (no `setfacl` needed in tests). (Task 11, Q39)
+- An `O_PATH` open raises no inotify `IN_OPEN` (kernel 6.18); opening `/proc/self/fd/<n>` of
+  that fd for read or write does, and reaches the same inode, with the kernel's access check
+  run again. A test can watch `IN_OPEN` to prove a file was never opened. (Task 11, re-review)
+- File leases (`F_SETLEASE`): the file's owner (or `CAP_LEASE`) can take one, so a sandbox can
+  on files of its own uid (keep-id). Another process's open that conflicts gets `EWOULDBLOCK`
+  at once with `O_NONBLOCK`; without it, it blocks until the holder releases or
+  `/proc/sys/fs/lease-break-time` (45 s by default) passes. Either way the holder gets `SIGIO`,
+  whose default action ends it. `fs.leases-enable` is 1 by default. Rust has no lease call
+  without `unsafe` or a new crate: the Q40 test uses a `python3 -I -c` holder. (Task 11, Q40)
 - `podman build` keeps intermediate layer images (`<none>` in `images -a`) unless
   `--layers=false`. `ps --filter name=` is an unanchored regex: match names with `grep -E '^…'`.
   (8-prC)

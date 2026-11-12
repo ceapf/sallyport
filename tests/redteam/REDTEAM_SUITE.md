@@ -56,6 +56,7 @@ Fixture manifests: `fx-coding` (= `coding-agent.yaml` with mock hosts), `fx-brok
 | RT-FS-15 | Staged changes stay staged | in a `staged` mount: create, modify and delete files, including `.vscode/settings.json` and `sub/.git/config` | the host tree is identical during and after the session; `staged_changes` lists exactly those paths (written / deleted), live and after stop; a host directory removed and re-created is listed `Replaced` (opaque), a renamed one as its copy plus a deletion. CLI `sally session changes`: Task 12 (#20) | CI | M1 |
 | RT-FS-16 | Nested host mount | a filesystem is mounted below a granted directory (made in podman's rootless mount namespace); the sandbox lists and reads it in `ro`, `rw`, `brokered` and `staged` mode | not visible in any bind mode (binds are non-recursive); `staged` refuses to launch on Podman 4.9.3 (overlay `EINVAL` in the keep-id namespace) and nothing runs | CI | M1 |
 | RT-FS-17 | New namespaces | from each role (workspace, harness, inference), with the probe (`tests/redteam/probe/probe.c`): `unshare`, fork-like `clone` and `clone3` with `CLONE_NEWUSER`, `CLONE_NEWNS`, `CLONE_NEWNET`, `CLONE_NEWCGROUP` and combinations; busybox `unshare -U -r` | every call fails with `ENOSYS` (the seccomp default; the kernel never returns it for these calls, so the profile refused); a plain fork-like `clone` still works | CI | M1 |
+| RT-FS-18 | The broker's groups do the sandbox's work | the file tools act for a `uid:gid` other than `sallyd`'s (the launcher's ids; container-free, `tools/fs_tests.rs` `rt_fs_18_*`): read 0640, 0600 and 0644 files as group and as other; reach through and list 0710 and 0750 directories and a 0700 mount root; write a 0644 then 0664 file, and create and delete under 0755, 0775 and 0770 directories; read a world-readable file as other once it carries a POSIX ACL; read and write a 0600 file as other under an `IN_OPEN` watch | each is refused `permission` exactly where the mode bits refuse that `uid:gid` without supplementary groups (owner, group, other; ACL-bearing objects owner-only), at prepare and at run; a directory without x refuses before anything deeper is looked at, whether or not it exists; a refused file is never opened (no open event; an allowed read is seen); the owner and the permitted class succeed (architect ruling Q39) | CI | M1 |
 
 ## NET — egress bypass and exfiltration
 
@@ -191,7 +192,7 @@ No RT-SEC-03..07 row is claimed passing before Task 9a-3.
 
 ---
 
-### Count: 79 tests (RT-FS 17, NET 12, SEC 10, MDL 9, INF 5, AG 14, AUD 2, MAN 4, SUP 3, UI 3) — 62 of them land in M1 (in part or in full).
+### Count: 80 tests (RT-FS 18, NET 12, SEC 10, MDL 9, INF 5, AG 14, AUD 2, MAN 4, SUP 3, UI 3) — 63 of them land in M1 (in part or in full).
 
 ### Adding a test
 1. Pick the SI it defends. 2. Add a row here with a concrete attack and a *mechanically checkable*
