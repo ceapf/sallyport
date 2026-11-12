@@ -7,6 +7,7 @@
 //! check.
 
 mod argv;
+pub mod budget;
 mod changes;
 mod check;
 mod commands;

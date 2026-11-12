@@ -38,6 +38,7 @@ use serde_json::json;
 use crate::egress::net::{EgressError, EgressHandle, EgressStarter, NET_SOCK, SessionEgress};
 
 use super::argv::workspace_argv;
+use super::budget::session_cost;
 use super::commands::container_id;
 use super::dirs::SessionDirs;
 use super::disk::DiskFloor;
@@ -318,8 +319,12 @@ impl Launcher {
         let level = req.manifest.manifest().audit.level;
         let sid = req.paths.id().as_str().to_owned();
         let v = Arc::clone(&req.manifest);
+        let fds = session_cost(req.manifest.manifest().network.max_connections);
         let reserved = match blocking(move || claims(&v).map_err(LaunchError::Claims)).await {
-            Ok(c) => self.sessions.reserve(&sid, c).map_err(LaunchError::from),
+            Ok(c) => self
+                .sessions
+                .reserve(&sid, c, fds)
+                .map_err(LaunchError::from),
             Err(e) => Err(e),
         };
         if let Err(e) = reserved {
@@ -654,6 +659,27 @@ mod tests {
             assert!(matches!(e, LaunchError::NotRunning(_)), "{bad:?}");
             assert_eq!(e.reason(), "not-running");
         }
+    }
+
+    /// #48 (architect Q45): a session over the descriptor budget is refused `fd-budget`, the
+    /// message naming needed, free and limit; an overlap keeps its own reason.
+    #[test]
+    fn an_fd_budget_refusal_has_its_own_reason() {
+        use crate::sandbox::budget::FdRefusal;
+        use crate::sandbox::overlap::ReserveError;
+        let e = LaunchError::from(ReserveError::FdBudget(FdRefusal {
+            needed: 256,
+            free: 100,
+            limit: 512,
+        }));
+        assert_eq!(e.reason(), "fd-budget");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("256") && msg.contains("100") && msg.contains("512"),
+            "{msg}"
+        );
+        let dup = LaunchError::from(ReserveError::Duplicate("a".into()));
+        assert_eq!(dup.reason(), "overlap");
     }
 
     #[test]

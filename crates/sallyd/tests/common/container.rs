@@ -518,7 +518,8 @@ impl Lx {
             runtime: runtime.clone(),
             ids: ids(),
             xdg_runtime_dir: xdg.clone(),
-            sessions: Arc::new(Sessions::default()),
+            // Well past what the test sessions need; the budget is unit-tested in `overlap.rs`.
+            sessions: Arc::new(Sessions::new(1 << 20)),
             audit: events.clone(),
             limits: ScanLimits::default(),
             disk_floor: floor,

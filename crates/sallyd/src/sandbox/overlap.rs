@@ -10,9 +10,11 @@
 //! review M2).
 //!
 //! The rule is a pure function ([`conflict`]); [`Sessions`] holds the live claims of this
-//! `sallyd` and reserves atomically. One `sallyd` runs per user (its control socket is the lock);
-//! containers a previous `sallyd` left behind are removed before the first launch
-//! ([`super::Launcher::remove_orphans`]), so in-process state is the whole picture.
+//! `sallyd` and reserves atomically, together with each session's file-descriptor budget (#48).
+//! One `sallyd` runs per user: it holds an exclusive `flock` on its runtime directory for life
+//! (architect Q42), and under that lock removes the containers a previous `sallyd` left behind
+//! ([`super::Launcher::remove_orphans`]) before the first launch, so in-process state is the
+//! whole picture.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -20,6 +22,8 @@ use std::sync::Mutex;
 
 use rustix::fs::{Mode, OFlags};
 use sally_core::manifest::{MountMode, ValidatedManifest};
+
+use super::budget::{FdRefusal, admit};
 
 /// Bound on the ancestor walk (the kernel's path depth is far below it).
 const MAX_ANCESTORS: usize = 4096;
@@ -137,52 +141,75 @@ pub enum ReserveError {
     /// An overlap with a live session.
     #[error(transparent)]
     Overlap(#[from] Conflict),
+    /// The session's descriptors do not fit the daemon's budget (#48).
+    #[error(transparent)]
+    FdBudget(#[from] FdRefusal),
 }
 
-/// The live sessions of this `sallyd` and their claims.
-#[derive(Debug, Default)]
+/// The live sessions of this `sallyd`: their claims and the descriptors each reserved.
+#[derive(Debug)]
 pub struct Sessions {
-    live: Mutex<BTreeMap<String, Vec<Claim>>>,
+    live: Mutex<Live>,
+    /// The descriptors all sessions may hold together ([`super::budget::session_budget`]).
+    fd_budget: u64,
+}
+
+#[derive(Debug, Default)]
+struct Live {
+    held: BTreeMap<String, (Vec<Claim>, u64)>,
+    fds: u64,
 }
 
 impl Sessions {
-    /// Checks `claims` against every live session and records them under `id`, atomically.
+    /// No live session yet; together the sessions may hold `fd_budget` descriptors.
+    #[must_use]
+    pub fn new(fd_budget: u64) -> Self {
+        Self {
+            live: Mutex::new(Live::default()),
+            fd_budget,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Live> {
+        self.live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Checks `claims` against every live session and `fds` against the descriptor budget, and
+    /// records both under `id`, atomically.
     ///
     /// # Errors
-    /// [`ReserveError`] for a live id or an overlap.
-    pub fn reserve(&self, id: &str, claims: Vec<Claim>) -> Result<(), ReserveError> {
-        let mut live = self
-            .live
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if live.contains_key(id) {
+    /// [`ReserveError`] for a live id, an overlap or a budget the session does not fit.
+    pub fn reserve(&self, id: &str, claims: Vec<Claim>, fds: u64) -> Result<(), ReserveError> {
+        let mut live = self.lock();
+        if live.held.contains_key(id) {
             return Err(ReserveError::Duplicate(id.to_owned()));
         }
         if let Some(c) = conflict(
-            live.iter().map(|(k, v)| (k.as_str(), v.as_slice())),
+            live.held.iter().map(|(k, v)| (k.as_str(), v.0.as_slice())),
             &claims,
         ) {
             return Err(c.into());
         }
-        live.insert(id.to_owned(), claims);
+        admit(self.fd_budget, live.fds, fds)?;
+        live.fds = live.fds.saturating_add(fds);
+        live.held.insert(id.to_owned(), (claims, fds));
         Ok(())
     }
 
     /// Whether `id` holds claims.
     #[must_use]
     pub fn is_live(&self, id: &str) -> bool {
-        self.live
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(id)
+        self.lock().held.contains_key(id)
     }
 
-    /// Forgets `id` (teardown).
+    /// Forgets `id` and frees its descriptors (teardown).
     pub fn release(&self, id: &str) {
-        self.live
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(id);
+        let mut live = self.lock();
+        if let Some((_, fds)) = live.held.remove(id) {
+            live.fds = live.fds.saturating_sub(fds);
+        }
     }
 }
 
@@ -191,6 +218,9 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    /// A budget no test reaches.
+    const BIG: u64 = 1 << 40;
 
     const MODES: [MountMode; 4] = [
         MountMode::Ro,
@@ -296,9 +326,9 @@ mod tests {
 
     #[test]
     fn a_session_is_live_from_reserve_to_release() {
-        let s = Sessions::default();
+        let s = Sessions::new(BIG);
         assert!(!s.is_live("a"));
-        s.reserve("a", vec![]).unwrap();
+        s.reserve("a", vec![], 0).unwrap();
         assert!(s.is_live("a"));
         assert!(!s.is_live("b"));
         s.release("a");
@@ -333,28 +363,81 @@ mod tests {
 
     #[test]
     fn reservations_are_atomic_unique_and_released() {
-        let s = Sessions::default();
-        s.reserve("a", vec![c("/h/p", MountMode::Rw)]).unwrap();
+        let s = Sessions::new(BIG);
+        s.reserve("a", vec![c("/h/p", MountMode::Rw)], 0).unwrap();
         assert_eq!(
-            s.reserve("a", vec![]),
+            s.reserve("a", vec![], 0),
             Err(ReserveError::Duplicate("a".into()))
         );
         let e = s
-            .reserve("b", vec![c("/h/p/x", MountMode::Ro)])
+            .reserve("b", vec![c("/h/p/x", MountMode::Ro)], 0)
             .unwrap_err();
         assert!(e.to_string().contains("live session a"), "{e}");
-        s.reserve("c", vec![c("/h/q", MountMode::Rw)]).unwrap();
+        s.reserve("c", vec![c("/h/q", MountMode::Rw)], 0).unwrap();
         s.release("a");
-        s.reserve("b", vec![c("/h/p/x", MountMode::Ro)]).unwrap();
+        s.reserve("b", vec![c("/h/p/x", MountMode::Ro)], 0).unwrap();
     }
 
     #[test]
     fn read_only_and_staged_sessions_may_share() {
-        let s = Sessions::default();
-        s.reserve("a", vec![c("/h/p", MountMode::Staged)]).unwrap();
-        s.reserve("b", vec![c("/h/p", MountMode::Ro)]).unwrap();
-        s.reserve("c", vec![c("/h/p/x", MountMode::Staged)])
+        let s = Sessions::new(BIG);
+        s.reserve("a", vec![c("/h/p", MountMode::Staged)], 0)
             .unwrap();
-        assert!(s.reserve("d", vec![c("/h", MountMode::Brokered)]).is_err());
+        s.reserve("b", vec![c("/h/p", MountMode::Ro)], 0).unwrap();
+        s.reserve("c", vec![c("/h/p/x", MountMode::Staged)], 0)
+            .unwrap();
+        assert!(
+            s.reserve("d", vec![c("/h", MountMode::Brokered)], 0)
+                .is_err()
+        );
+    }
+
+    /// #48 (architect Q45): the descriptors are reserved with the claims, in the same lock, and
+    /// freed with them.
+    #[test]
+    fn the_fd_budget_is_reserved_and_released_with_the_claims() {
+        let s = Sessions::new(1000);
+        s.reserve("a", vec![c("/h/a", MountMode::Rw)], 600).unwrap();
+        assert_eq!(
+            s.reserve("b", vec![c("/h/b", MountMode::Rw)], 401),
+            Err(ReserveError::FdBudget(FdRefusal {
+                needed: 401,
+                free: 400,
+                limit: 1000
+            }))
+        );
+        assert!(!s.is_live("b"), "a refused session holds nothing");
+        s.reserve("b", vec![c("/h/b", MountMode::Rw)], 400).unwrap();
+        assert!(s.reserve("c", vec![], 1).is_err());
+        s.release("a");
+        s.reserve("c", vec![], 600).unwrap();
+        // Releasing an unknown id frees nothing.
+        s.release("zzz");
+        assert!(s.reserve("d", vec![], 1).is_err());
+    }
+
+    #[test]
+    fn a_refused_overlap_or_duplicate_takes_no_descriptors() {
+        let s = Sessions::new(100);
+        s.reserve("a", vec![c("/h/p", MountMode::Rw)], 50).unwrap();
+        assert!(matches!(
+            s.reserve("b", vec![c("/h/p/x", MountMode::Ro)], 10),
+            Err(ReserveError::Overlap(_))
+        ));
+        assert!(matches!(
+            s.reserve("a", vec![], 10),
+            Err(ReserveError::Duplicate(_))
+        ));
+        s.reserve("c", vec![], 50).unwrap();
+    }
+
+    #[test]
+    fn a_budget_too_small_for_one_session_refuses_it() {
+        let s = Sessions::new(10);
+        assert!(matches!(
+            s.reserve("a", vec![], 11),
+            Err(ReserveError::FdBudget(_))
+        ));
+        assert_eq!(s.reserve("a", vec![], 10), Ok(()));
     }
 }
