@@ -87,8 +87,8 @@ flowchart LR
 | `sallyd::infer` | Pool of at most one loaded model (v1); start/stop inference container; forward OpenAI-compatible requests over `infer.sock`; validate request JSON (allowed fields, size caps); stream back | yes |
 | `sallyd::tools::{fs,fetch,shell}` | Brokered tools with policy + approvals | **yes** |
 | `sallyd::approvals` | Queue, canonicalization, rendering sanitization, single-use IDs, timeout, flood control, notifications to UI/CLI | **yes** |
-| `sallyd::egress::{server,policy,inject}` | Accept streams from `net.sock`; parse proxy requests (bounded); policy decision; resolve → filter → pinned connect; CONNECT splice; absolute-form forwarding with optional injection + TLS upgrade + redaction | **yes** |
-| `sally-shim` (separate crate, musl static, std only) | generic relay (AMENDMENTS-01 §3.3): `--listen LOOPBACK_IP:PORT=/abs/sock` (repeatable; `127.0.0.1:3128` → `net.sock`, `127.0.0.1:8080` → `llm.sock`) with one fresh UDS connection per TCP connection, opaque bidirectional copy with fixed 16 KiB buffers, half-close propagated, at most `--max-connections` (default 32, shared by all listeners; each costs two threads against the sandbox's `pids` limit) live connections, and a 30 s linger for a client that never closes after the server finished; `--stdio /abs/sock` for stdio clients. Parses nothing, holds no policy, refuses non-loopback addresses; `make shim-check` keeps it static and dependency-free | low (dumb, inside the sandbox) |
+| `sallyd::egress::{server,policy,addr,net,…}` | Accept streams from `net.sock`; parse the request head (bounded, CONNECT only in v1); policy decision; host addresses → resolve → filter → pinned connect; CONNECT splice. Grant hosts are refused until the token proxy (`inject`, Task 9a) terminates TLS for them | **yes** |
+| `sally-shim` (separate crate, musl static, std only) | generic relay (AMENDMENTS-01 §3.3): `--listen LOOPBACK_IP:PORT=/abs/sock` (repeatable; `127.0.0.1:3128` → `net.sock`, `127.0.0.1:8080` → `llm.sock`) with one fresh UDS connection per TCP connection, opaque bidirectional copy with fixed 16 KiB buffers, half-close propagated, at most `--max-connections` (default 32, shared by all listeners; each costs two threads against the sandbox's `pids` limit) live connections, and a 30 s linger for a client that never closes after the server finished; `--stdio /abs/sock` for stdio clients. Parses nothing, holds no policy, listens on IPv4 loopback (127/8) only (`::1` too is refused); `make shim-check` keeps it static and dependency-free | low (dumb, inside the sandbox) |
 | `sally-proto` | Shared request/response types; `ts-rs` generates TypeScript for the UI | no |
 | `sally` CLI | `doctor`, `manifest validate`, `models …`, `secrets …`, `sandbox run`, `run`, `chat`, `approvals`, `audit tail\|verify`, `sessions …` | no |
 
@@ -297,7 +297,13 @@ are released only once the container is confirmed gone.
    Otherwise the launch is refused `digest-mismatch`; a podman error is refused as `podman`. The
    check exists for the clear reason only: enforcement is the digest reference plus
    `--pull=never` at `podman create`, so nothing depends on the gap between the two.
-5. **Argv** (§3.2), then **audit** `sandbox.launch` (SI-4: before anything is visible).
+5. **Argv** (§3.2), then, with `network.mode: proxy` only, the **egress listener** (Task 8):
+   `sessions/<id>/workspace/net.sock` is bound 0600 (through `/proc/self/fd` of the opened
+   directory, so no path length can exceed `sun_path`) and served by the session's proxy. A bind
+   failure is refused `egress-listener`. The listener lives with the running session: `stop`
+   shuts it down after the container is gone (open tunnels audit `egress.close` with `end:
+   session-stopped`), a failed launch drops it. Then **audit** `sandbox.launch` (SI-4: before
+   anything is visible).
 6. `podman create`; then every pin is re-checked on the host (`LaunchScan::recheck_host`), then
    `podman init`. The runtime builds the mounts but starts nothing.
 7. **Post-init mount check** (B4). From the host, under `/proc/<init-pid>/root` with
@@ -508,7 +514,7 @@ sequenceDiagram
     E->>E: redact any occurrence of the secret value; do not follow 3xx
     E-->>S: response
     S-->>P: response
-    E->>E: audit egress.allow {host, port, bytes_in, bytes_out, injected: GITHUB_TOKEN}
+    E->>E: audit egress.close {host, port, address, bytes_up, bytes_down, end} (egress.allow {host, port, addresses, injected: GITHUB_TOKEN} was written before the connect; §7)
 ```
 For `CONNECT host:443` (TLS from the client) the proxy applies policy and splices bytes; no
 injection is possible or attempted.
@@ -617,10 +623,31 @@ sallyport/
 - **Safetensors strict check**: `header_len ≤ 100 MiB` and `8 + header_len ≤ file_len`; header is
   a JSON object; each entry has known `dtype`, `shape` (`checked_mul`), `data_offsets` ascending,
   contiguous, within `file_len - 8 - header_len`; `__metadata__` values are strings.
-- **Proxy request parsing**: hand-written, bounded (request line ≤ 8 KiB, headers ≤ 64 KiB, ≤ 100
-  headers), reject anything that isn't `CONNECT authority` or absolute-form `http://` with
-  `Host` matching the authority. Reject `Transfer-Encoding` + `Content-Length` conflicts
-  (smuggling). Only HTTP/1.1.
+- **Proxy request parsing** (Task 8): `httparse` over one fixed 8 KiB buffer, ≤ 100 headers, all
+  headers ignored (the decision reads the request-target only). Over 8 KiB or 100 headers: 431
+  `head-too-large`; no complete head within 10 s: closed without a reply (`head-timeout`); not
+  HTTP/1.x: 400 `malformed`; any method but `CONNECT` (absolute-form included): 405
+  `plain-http-unsupported`. The authority is `host:port` with the port required; IP literals
+  are refused in every spelling (`ip-literal`), userinfo is malformed. Then policy, the host's
+  own addresses, one lookup (5 s), the address filter over every address (any denied address
+  refuses the name), at most 3 pinned addresses tried (10 s each), `200`, and a tunnel with one
+  16 KiB buffer per direction and a 300 s idle limit shared by both directions.
+- **Egress audit events** (Task 8). Written at every `audit.level`, each before its effect:
+  - `egress.allow` (decision `allow`), before the first dial and the `200`: `{host, port,
+    addresses}` — the addresses that passed the filter, at most 16, in the order they are tried.
+  - `egress.deny` (decision `deny`), before the reply: `{reason, target, target_bytes,
+    target_cut}` (the request-target escaped and cut at 256 bytes, never a header), or `{reason,
+    head_bytes}` when no target was parsed; `filter: "host-addresses-unavailable"` when the
+    host's own addresses could not be read.
+  - `egress.limit` (decision `deny`): as `egress.deny`, for `too-many-connections` (decided at
+    accept: `{reason}` only), `head-too-large` and `head-timeout`.
+  - `egress.close` (no decision): `{host, port, connected, address (the one used, only when
+    connected), bytes_up, bytes_down, end}`; `end` is `closed`, `idle-timeout`, `error`,
+    `session-stopped` or `connect-failed` (with `connected: false`, written before the 502).
+  - Reasons (reply body and `reason`): 403 `host-not-allowed`, `port-not-allowed`,
+    `ip-literal`, `ip-range-denied`, `grant-host-unavailable`; 502 `resolve-failed`,
+    `connect-failed`; 405 `plain-http-unsupported`; 429 `too-many-connections`; 431
+    `head-too-large`; `head-timeout` (no reply); 400 `malformed`. Replies never echo the target.
 - **Approval rendering**: escape all C0/C1 controls and `\x1b`, strip Unicode bidi overrides
   (U+202A–U+202E, U+2066–U+2069), NFC-normalize, cap at 2 000 chars with an explicit
   `… (+N bytes, sha256 …)` tail. Paths shown as *host realpath* **and** guest path.
@@ -662,14 +689,14 @@ upstream release binaries checked against committed SHA-256 sums):
 |---|---|
 | `rust` | `make fmt clippy forbid-unsafe nextest` (cargo-nextest, plus doctests) |
 | `deny` | `cargo deny check` for the workspace and `fuzz/` |
-| `coverage` | `make coverage`: cargo-llvm-cov, `sally-core` ≥ 90 % lines (sallyd policy/approvals/egress ≥ 85 % once they exist) |
+| `coverage` | `make coverage`: cargo-llvm-cov, `sally-core` ≥ 90 % lines; every file under `sallyd/src/egress/` ≥ 85 % together (lib tests, `scripts/coverage-gate.sh`); approvals join when they exist |
 | `fuzz` | 60 s per cargo-fuzz target on a pinned nightly |
 | `zizmor` | GitHub Actions static analysis, offline, no findings at `low` or above |
 | `doctor-syntax` | `bash -n scripts/doctor.sh` |
 
 Nightly (`nightly.yml`): `make mutants`, cargo-mutants over the deny paths
-(`manifest::validate`, `paths`, `host`, `config` today; `egress::policy`, `approvals`, `tools::fs`
-as they land) with a **zero-survivor gate**: a surviving mutant in a deny path is an untested
+(`manifest::validate`, `paths`, `host`, `config` today; `approvals`, `tools::fs` as they land;
+the egress modules run in the wide job, `make mutants-wide-sallyd`) with a **zero-survivor gate**: a surviving mutant in a deny path is an untested
 control. cargo-mutants runs with `TMPDIR` under `target/` because `/tmp` is denylisted.
 
 Dev-dependencies: `insta` (summary and diagnostic snapshots; review changes with

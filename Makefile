@@ -59,7 +59,8 @@ coverage:
 	bash scripts/coverage-gate.sh $(COV_MIN_EGRESS) target/cov-sallyd.json /crates/sallyd/src/egress/
 
 # Mutation testing over the deny paths, zero survivors (AMENDMENTS-01 §15): a surviving mutant in
-# a deny path is an untested control. egress::policy, approvals and tools::fs join as they land.
+# a deny path is an untested control. approvals and tools::fs join as they land; the egress modules
+# run in mutants-wide-sallyd below (architect ruling Q6, Task 8).
 MUTANTS_FILES := crates/sally-core/src/manifest/validate/*.rs crates/sally-core/src/manifest/paths.rs \
                  crates/sally-core/src/manifest/host.rs crates/sally-core/src/config.rs
 # cargo-mutants copies the tree to $$TMPDIR; /tmp is denylisted for mounts, so the copy (and the

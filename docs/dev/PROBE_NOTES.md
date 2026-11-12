@@ -47,6 +47,20 @@ line per fact, with where it was found. Check a note again before relying on it 
 - `yes` exits 1 silently on ENOSPC; prove the error with a following `dd`. (6c-2, AG-09)
 - A busybox copy named `sh` treats `sh id -u` as a script path: use `sh -c 'id -u'`. (6c-2a)
 - `awk 'BEGIN { s = "x"; while (1) s = s s }'` is a reliable memory bomb (no python in the image).
+- Alpine's busybox `nc` has no `-U`: reach a Unix socket with `sally-shim --stdio <sock>`. The
+  image has `nslookup` and `getent` but no `/etc/resolv.conf`, `curl` or `python3`. (Task 8)
+
+## Host network state (/proc)
+
+- `/proc/net/fib_trie` lists each IPv4 address as a `|-- <ip>` leaf followed by `/<len> <scope>
+  <type>` lines; an address the host owns has `/32 host LOCAL`. The leaf of the 127/8 network
+  address carries `/8 host LOCAL` (the loopback route), `127.0.0.1` its own `/32 host LOCAL`; broadcast leaves
+  are `/32 link BROADCAST`. The table appears twice (`Main:` and `Local:`). About 1.3 KiB on WSL2.
+- `/proc/net/if_inet6`: one line per IPv6 address, 32 hex digits then index, prefix length,
+  scope, flags and the interface name. Absent when IPv6 is disabled. (Task 8, `egress/hostaddrs.rs`)
+- A Unix socket path over 107 bytes fails `bind` with `InvalidInput` ("path must be shorter than
+  SUN_LEN"); the test fixture's `CARGO_TARGET_TMPDIR` paths exceed it. Binding through
+  `/proc/self/fd/<dir fd>/<name>` of an `O_PATH` directory works and keeps the name short.
 
 ## Test writing
 
