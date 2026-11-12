@@ -378,8 +378,10 @@ async fn deny_all_session_denies_every_pending_prompt_and_every_later_one() {
     assert!(f.gate.admit(get(4), None, None).await.is_ok());
 }
 
+// Maintainer's Task 11 audit: the latch comes first, so a failed entry never leaves the session
+// open; the client is told `audit-failed` (`Unrecorded`).
 #[tokio::test]
-async fn deny_all_session_latches_only_once_its_entry_is_written() {
+async fn deny_all_session_latches_first_and_stays_latched_when_its_entry_fails() {
     let f = fx(5);
     let (a, ha) = asking(&f, shell(1, &["a"])).await;
     let (b, hb) = asking(&f, shell(2, &["b"])).await;
@@ -387,14 +389,16 @@ async fn deny_all_session_latches_only_once_its_entry_is_written() {
     let r = f.desk.decide(&a, Decision::DenyAllSession, ME).await;
     assert_eq!(r, Err(DecideError::Unrecorded));
     assert_eq!(ha.await.unwrap(), Err(Refusal::Unrecorded));
-    // Not latched: the other prompt still waits, and a new one is shown.
-    assert_eq!(f.desk.list().len(), 1);
-    let (c, hc) = asking(&f, shell(3, &["c"])).await;
-    for id in [b, c] {
-        f.desk.decide(&id, Decision::Deny, ME).await.unwrap();
-    }
-    assert_eq!(hb.await.unwrap(), Err(Refusal::Denied("denied")));
-    assert_eq!(hc.await.unwrap(), Err(Refusal::Denied("denied")));
+    // Latched all the same: the other prompt is denied with its own entry, and nothing new is
+    // shown.
+    assert_eq!(hb.await.unwrap(), Err(Refusal::Denied("session-denied")));
+    assert_eq!(f.sink.last("approval.decide")["id"], b.as_str());
+    assert_eq!(f.sink.last("approval.decide")["via"], a.as_str());
+    assert!(f.desk.list().is_empty());
+    let shown = f.fake.requested.lock().unwrap().len();
+    let r = f.gate.admit(shell(3, &["c"]), None, None).await;
+    assert_eq!(r, Err(Refusal::Denied("session-denied")));
+    assert_eq!(f.fake.requested.lock().unwrap().len(), shown);
 }
 
 #[tokio::test]
@@ -524,7 +528,8 @@ async fn no_decision_slips_in_while_a_deny_all_session_is_written() {
     f.sink.hold(true);
     let desk = f.desk.clone();
     let all = tokio::spawn(async move { desk.decide(&a, Decision::DenyAllSession, ME).await });
-    until("a taken", || f.desk.list().len() == 1).await;
+    // The latch comes first: `a` is taken and `b` drained before `a`'s entry is written.
+    until("a taken, b drained", || f.desk.list().is_empty()).await;
     let desk = f.desk.clone();
     let bb = b.clone();
     let approve = tokio::spawn(async move { desk.decide(&bb, Decision::Approve, ME).await });

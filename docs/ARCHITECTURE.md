@@ -962,8 +962,9 @@ sallyport/
     teardown leaves the queue at once with no entry. Only live calls (begun, not yet ended)
     keep a withdraw, so the harness cannot grow that state. Decisions of a session run one at
     a time; one that has taken its prompt finishes in its own task, so a dropped caller loses no
-    entry. A `deny_all_session` latches only after its own entry is written (if that write
-    fails, nothing is latched and the client is told `audit-failed`). A panic under the queue's
+    entry. A `deny_all_session` latches first, then writes its entry and denies every other
+    shown prompt (maintainer's Task 11 audit): if that write fails, the latch stays and the
+    client is told `audit-failed`. A panic under the queue's
     lock latches the session.
   - `approval.deny` (sallyd): action fields and `reason` (`approval-flood`, `session-denied`,
     `no-approver`, `id-unavailable`).
