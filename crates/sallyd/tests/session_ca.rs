@@ -88,12 +88,17 @@ struct Matrix {
     cases: Vec<Case>,
 }
 
+/// A leaf from the production `leaf_params`, with `sans` and the common name `cn` instead.
 fn leaf_with(
+    cn: &str,
     sans: Vec<SanType>,
     issuer: &Issuer<'_, KeyPair>,
 ) -> (CertificateDer<'static>, KeyPair) {
     let mut p = leaf_params(GRANT, validity()).unwrap();
     p.subject_alt_names = sans;
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, cn);
+    p.distinguished_name = dn;
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
     let cert = p.signed_by(&key, issuer).unwrap().der().clone();
     (cert, key)
@@ -114,8 +119,8 @@ fn matrix() -> Matrix {
             .collect()
     };
     let mut cases = Vec::new();
-    let mut single = |label, sans, name: &str| {
-        let (leaf, key) = leaf_with(sans, &issuer);
+    let mut single = |label, cn: &str, sans, name: &str| {
+        let (leaf, key) = leaf_with(cn, sans, &issuer);
         cases.push(Case {
             label,
             chain_pem: pem(&[&leaf]),
@@ -124,14 +129,23 @@ fn matrix() -> Matrix {
             name: name.to_owned(),
         });
     };
-    single("grant", vec![dns(GRANT)], GRANT);
-    single("unlisted", vec![dns("evil.test")], "evil.test");
-    single("subdomain", vec![dns("sub.mock.test")], "sub.mock.test");
+    single("grant", GRANT, vec![dns(GRANT)], GRANT);
+    single("unlisted", GRANT, vec![dns("evil.test")], "evil.test");
+    single(
+        "subdomain",
+        GRANT,
+        vec![dns("sub.mock.test")],
+        "sub.mock.test",
+    );
     single(
         "ip",
+        GRANT,
         vec![SanType::IpAddress(ROGUE_IP)],
         &ROGUE_IP.to_string(),
     );
+    // No SAN at all, the name only in the common name (a verifier may fall back to it).
+    single("cn-only", "evil.test", vec![], "evil.test");
+    single("wildcard", GRANT, vec![dns("*.mock.test")], "x.mock.test");
 
     // root -> second CA -> leaf for the grant host itself: only the root's path length (0)
     // stands in the way.
@@ -149,7 +163,7 @@ fn matrix() -> Matrix {
         .der()
         .clone();
     let second_issuer = Issuer::new(second, second_key);
-    let (leaf, key) = leaf_with(vec![dns(GRANT)], &second_issuer);
+    let (leaf, key) = leaf_with(GRANT, vec![dns(GRANT)], &second_issuer);
     cases.push(Case {
         label: "second-ca",
         chain_pem: pem(&[&leaf, &second_cert]),
@@ -324,6 +338,11 @@ fn rt_sec_10_rogue_leaves_of_a_session_ca_fail_in_every_verifier() {
 fn expected(label: &str, verifier: &str) -> Option<&'static str> {
     let constraint = match label {
         "grant" => return None,
+        // webpki and Go never read a common name; OpenSSL and GnuTLS hold it to the name
+        // constraints.
+        "cn-only" if verifier == "webpki" => return Some("not valid for any names"),
+        "cn-only" if verifier == "go" => return Some("relies on legacy Common Name field"),
+        "cn-only" => "permitted",
         // PROBE_NOTES: a webpki trust anchor keeps no path length; its name constraints still
         // bind the whole chain.
         "second-ca" if verifier == "webpki" => return None,
