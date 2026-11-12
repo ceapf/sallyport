@@ -74,6 +74,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "egress_redact"
+path = "fuzz_targets/egress_redact.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "tool_path"
 path = "fuzz_targets/tool_path.rs"
 test = false
