@@ -380,9 +380,9 @@ validation — otherwise `mount-changed`/`is-symlink` (RT-FS-06).
 | `network.acknowledge_unrestricted_egress` | validator | validate | reject if `*` without ack |
 | `network.max_connections` | `sallyd::egress::server` admission, decided and audited at accept before any byte is read; after the 429 is written the proxy discards, unparsed, what the client still sends (at most 256 KiB, at most 1 s), then closes | each connection | 429 `too-many-connections`, audit `egress.limit` |
 | `network.max_request_bytes`/`max_response_bytes` | `sallyd::egress::server::intercept` body caps (Task 9a-2: intercepted requests only; a spliced tunnel is opaque; body bytes after chunk decoding, per message) | each intercepted request and response | 413 request / 502 response, audit `egress.limit` |
-| `secrets[].name` | validator checks store; `sallyd::egress::inject` | validate + each matching request | reject if missing |
-| `secrets[].inject.host` | validator (exact host, must be allowed) + inject | validate + request | reject |
-| `secrets[].inject.header/format/basic_user` | validator + inject (TLS-terminated grant hosts only; from Task 9a-2 every client copy of the header is dropped, Task 9a-3 sets it) | validate + request | reject; plain HTTP to any host → 405 `plain-http-unsupported` |
+| `secrets[].name` | validator checks store; `sallyd::egress::inject` reads the grants' values from the store at launch (Task 9a-3) | validate + launch + each matching request | reject if missing; at launch `sandbox.refuse` `secret-missing` (`secret-store` when the store cannot be read) |
+| `secrets[].inject.host` | validator (exact host, must be allowed) + inject (a grant's credential is set on its own host only; every intercepted response is redacted with every secret of the session) | validate + request | reject |
+| `secrets[].inject.header/format/basic_user` | validator + inject (TLS-terminated grant hosts only; every client copy of the header is dropped, then the grant's value set once the request is audited; `{basic}` refuses the launch, `basic-unsupported`, until Task 9b) | validate + launch + request | reject; plain HTTP to any host → 405 `plain-http-unsupported`; a grant that cannot be injected → `sandbox.refuse` `secret-grant` |
 | `secrets[].expose_env` | validator (name rule) + workspace `--env NAME=sallyport-placeholder` | validate + launch | reject |
 | `tools.builtin` | `sallyd::tools` per session: `tools/list` shows the granted tools; the grant is checked before arguments or paths (Task 11, architect ruling Q28); `fetch` is not offered until #75 | each `tools/call` on `agent.sock` | `isError: true`, `denied: tool_not_granted` (a granted `fetch`: `tool_unavailable`), audit `tool.deny` |
 | `tools.shell` | `sallyd::tools::exec` → `podman exec` after policy; 300 s and 64 KiB per stream, the call killed past the limit | each shell call | deny / pending / run |
@@ -428,7 +428,8 @@ never on message text); the field path uses `a.b[0].c` form.
 | `bad-host` / `ip-literal` / `not-exact-host` | hostname malformed or too broad / IP literal / wildcard where exact is required |
 | `unacknowledged-wildcard` | `"*"` without the ack flag |
 | `network-disabled` | secrets with `network.mode: none` |
-| `secret-missing` / `secret-host-not-allowed` | name not in store / no exact allow rule for the inject host |
+| `secret-missing` / `secret-host-not-allowed` | name not in store (at validation; at launch also a `sandbox.refuse` reason, Task 9a-3) / no exact allow rule for the inject host |
+| `secret-store` / `basic-unsupported` / `secret-grant` | launch refusals (`sandbox.refuse`, Task 9a-3): the secrets store cannot be read / a `{basic}` grant (until Task 9b, #80) / a grant whose header or rendered value cannot be sent, or two grants on one header of one host |
 | `secret-like-env` | MCP env name looks like a secret |
 | `bad-header` / `bad-format` | injection header/format invalid |
 | `mount-changed` | launch-time re-check: mount root replaced since validation |
