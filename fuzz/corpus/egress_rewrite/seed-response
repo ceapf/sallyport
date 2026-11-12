@@ -1,0 +1,10 @@
+HTTP/1.1 302 Found
+Location: https://other.mock.test/
+Connection: close, X-Named
+X-Named: 1
+Keep-Alive: timeout=5
+Proxy-Authenticate: Basic
+Trailer: X-Late
+Transfer-Encoding: chunked
+Content-Encoding: identity
+

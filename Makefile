@@ -101,7 +101,7 @@ MUTANTS_WIDE_SALLYD := $(addprefix crates/sallyd/src/sandbox/,argv.rs check.rs t
                        overlap.rs scan.rs images.rs changes.rs dirs.rs podman.rs disk.rs stage.rs \
                        launch/error.rs) \
                        $(addprefix crates/sallyd/src/egress/,addr.rs authority.rs head.rs policy.rs server.rs \
-                       hostaddrs.rs tunnel.rs net.rs ca.rs roots.rs) \
+                       hostaddrs.rs tunnel.rs net.rs ca.rs roots.rs rewrite.rs intercept.rs meter.rs) \
                        $(addprefix crates/sallyd/src/rpc/,agent.rs control.rs frame.rs json.rs listen.rs mcp.rs \
                        message.rs rate.rs record.rs) \
                        $(addprefix crates/sallyd/src/llm/,body.rs head.rs io.rs reply.rs server.rs) \
@@ -131,7 +131,7 @@ zizmor:
 	zizmor --min-severity low .github/workflows
 
 # Fuzz smoke: 60 s per target (needs nightly + cargo-fuzz; CI pins both).
-FUZZ_TARGETS := manifest secrets audit_line egress_head jsonrpc_message llm_request
+FUZZ_TARGETS := manifest secrets audit_line egress_head egress_rewrite jsonrpc_message llm_request
 FUZZ_SECS ?= 60
 CARGO_FUZZ_TOOLCHAIN ?= +nightly
 fuzz:

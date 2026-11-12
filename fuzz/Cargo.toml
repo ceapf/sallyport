@@ -13,6 +13,9 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4.13"
+# egress_rewrite: the same head parser and header types the proxy gets from hyper.
+httparse = "1.10.1"
+hyper = { version = "1.12.0", default-features = false }
 sally-core = { path = "../crates/sally-core", version = "0.1.0" }
 sallyd = { path = "../crates/sallyd", version = "0.1.0" }
 
@@ -57,6 +60,13 @@ bench = false
 [[bin]]
 name = "llm_request"
 path = "fuzz_targets/llm_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "egress_rewrite"
+path = "fuzz_targets/egress_rewrite.rs"
 test = false
 doc = false
 bench = false

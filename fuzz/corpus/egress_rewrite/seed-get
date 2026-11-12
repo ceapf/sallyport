@@ -1,0 +1,9 @@
+GET /x?y=1 HTTP/1.1
+Host: API.mock.test.
+Authorization: Bearer attacker
+Accept-Encoding: gzip
+Proxy-Authorization: Basic eA==
+Connection: keep-alive, X-Hop
+X-Hop: 1
+X-Kept: yes
+
