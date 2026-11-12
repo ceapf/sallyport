@@ -357,8 +357,15 @@ type Client = tokio_rustls::client::TlsStream<DuplexStream>;
 
 impl Rig {
     /// CONNECT through the proxy; returns the reply head and, after a `200`, the client's TLS
-    /// stream to the session-CA leaf.
+    /// stream to the session-CA leaf. Bounded.
     async fn open(&self, port: u16) -> (String, Option<Client>, tokio::task::JoinHandle<()>) {
+        bounded("CONNECT and the TLS handshake", self.open_unbounded(port)).await
+    }
+
+    async fn open_unbounded(
+        &self,
+        port: u16,
+    ) -> (String, Option<Client>, tokio::task::JoinHandle<()>) {
         let (mut c, s) = duplex(1 << 20);
         let proxy = Arc::clone(&self.proxy);
         let task = tokio::spawn(async move { proxy.serve(s).await });
@@ -409,16 +416,19 @@ impl Rig {
         let (head, tls, task) = self.open(443).await;
         let mut tls = tls.unwrap_or_else(|| panic!("not opened: {head}"));
         let (first, rest) = raw.as_bytes().split_at(at);
-        tls.write_all(first).await.unwrap();
-        if !rest.is_empty() {
-            tls.flush().await.unwrap();
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            // A refusal may already have closed the tunnel; its reply is still read below.
-            let _ = tls.write_all(rest).await;
-        }
-        let _ = tls.shutdown().await;
+        bounded("writing the request", async {
+            tls.write_all(first).await.unwrap();
+            if !rest.is_empty() {
+                tls.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                // A refusal may already have closed the tunnel; its reply is still read below.
+                let _ = tls.write_all(rest).await;
+            }
+            let _ = tls.shutdown().await;
+        })
+        .await;
         let out = drain(&mut tls).await;
-        task.await.unwrap();
+        join(task).await;
         out
     }
 
@@ -427,16 +437,46 @@ impl Rig {
     }
 }
 
+/// The bound on every step a test awaits from the proxy. A mutant that hangs a tunnel then fails
+/// its test in seconds instead of timing out the whole mutation run (9a-2 part 2: 11 timeouts).
+const STEP: Duration = Duration::from_secs(5);
+
+/// `f`, or a panic naming `what` once [`STEP`] passes without it finishing.
+async fn bounded<F: std::future::Future>(what: &str, f: F) -> F::Output {
+    tokio::time::timeout(STEP, f)
+        .await
+        .unwrap_or_else(|_| panic!("{what}: not done within {STEP:?}"))
+}
+
+/// Waits (bounded) for a tunnel's task to finish.
+async fn join(task: tokio::task::JoinHandle<()>) {
+    bounded("the tunnel's task", task).await.unwrap();
+}
+
+/// Everything `s` sends until it ends (bounded).
 async fn drain<S: AsyncRead + Unpin>(s: &mut S) -> String {
     let mut out = Vec::new();
     let mut chunk = [0u8; 4096];
-    loop {
-        match s.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => out.extend_from_slice(&chunk[..n]),
+    bounded("reading to the end", async {
+        loop {
+            match s.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => out.extend_from_slice(&chunk[..n]),
+            }
         }
-    }
+    })
+    .await;
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Waits (bounded) until `done` holds, polling every 10 ms.
+async fn until(what: &str, done: impl Fn() -> bool) {
+    bounded(what, async {
+        while !done() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
 }
 
 fn get(path: &str, extra: &str) -> String {
@@ -896,7 +936,7 @@ async fn an_upstream_that_fails_verification_gets_no_200() {
         ..Opts::default()
     });
     let (reply, tls, task) = r.open(443).await;
-    task.await.unwrap();
+    join(task).await;
     assert!(tls.is_none());
     assert!(reply.starts_with("HTTP/1.1 502 "), "{reply}");
     assert!(reply.ends_with("upstream-tls-failed\n"), "{reply}");
@@ -922,7 +962,7 @@ async fn a_client_that_does_not_speak_tls_ends_client_tls_failed() {
         format!("CONNECT {HOST}:443 HTTP/1.1\r\nHost: {HOST}:443\r\n\r\nGET / HTTP/1.1\r\n\r\n");
     c.write_all(connect.as_bytes()).await.unwrap();
     let out = drain(&mut c).await;
-    task.await.unwrap();
+    join(task).await;
     assert!(out.starts_with("HTTP/1.1 200 "), "{out}");
     assert_eq!(
         r.sink.args("egress.close")["end"],
@@ -939,7 +979,7 @@ async fn head_timeouts_are_limits_only_once_a_head_started() {
     let (_, tls, task) = r.open(443).await;
     let mut tls = tls.unwrap();
     let _ = drain(&mut tls).await;
-    task.await.unwrap();
+    join(task).await;
     assert_eq!(r.sink.args("egress.close")["end"], json!("idle-timeout"));
     assert!(!r.sink.events().contains(&"egress.limit".to_owned()));
 
@@ -949,7 +989,7 @@ async fn head_timeouts_are_limits_only_once_a_head_started() {
     tls.write_all(b"GET /echo HT").await.unwrap();
     tls.flush().await.unwrap();
     let _ = drain(&mut tls).await;
-    task.await.unwrap();
+    join(task).await;
     assert_eq!(r.sink.args("egress.limit")["reason"], json!("head-timeout"));
     assert_eq!(r.sink.args("egress.close")["end"], json!("limit"));
 
@@ -958,7 +998,7 @@ async fn head_timeouts_are_limits_only_once_a_head_started() {
     let mut tls = tls.unwrap();
     tls.write_all(get("/echo", "").as_bytes()).await.unwrap();
     let out = drain(&mut tls).await;
-    task.await.unwrap();
+    join(task).await;
     assert!(out.starts_with("HTTP/1.1 200 "), "{out}");
     assert_eq!(r.sink.args("egress.close")["end"], json!("idle-timeout"));
     assert!(!r.sink.events().contains(&"egress.limit".to_owned()));
@@ -1033,19 +1073,22 @@ async fn the_idle_limit_does_not_run_between_exchanges() {
     let mut tls = tls.unwrap();
     for _ in 0..2 {
         tls.write_all(get("/echo", "").as_bytes()).await.unwrap();
-        let mut head = Vec::new();
-        let mut byte = [0u8; 1];
-        while !head.ends_with(b"\r\n\r\n") {
-            assert_eq!(tls.read(&mut byte).await.unwrap(), 1, "tunnel ended early");
-            head.push(byte[0]);
-        }
-        let mut body = [0u8; 2];
-        tls.read_exact(&mut body).await.unwrap();
+        bounded("a response", async {
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                assert_eq!(tls.read(&mut byte).await.unwrap(), 1, "tunnel ended early");
+                head.push(byte[0]);
+            }
+            let mut body = [0u8; 2];
+            tls.read_exact(&mut body).await.unwrap();
+        })
+        .await;
         tokio::time::sleep(Duration::from_millis(400)).await;
     }
     let _ = tls.shutdown().await;
     let _ = drain(&mut tls).await;
-    task.await.unwrap();
+    join(task).await;
     assert_eq!(r.sink.args("egress.close")["requests"], json!(2));
 }
 
@@ -1063,13 +1106,10 @@ async fn a_failed_request_entry_closes_without_a_reply_or_an_upstream_request() 
 
 /// Waits (bounded) until the mock upstream saw its connection end.
 async fn upstream_ends(r: &Rig) {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while *r.ended.lock().unwrap() == 0 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+    until("the upstream connection closes with the tunnel", || {
+        *r.ended.lock().unwrap() > 0
     })
-    .await
-    .expect("the upstream connection is closed when the tunnel ends");
+    .await;
 }
 
 /// A stop ends the tunnel `session-stopped`, and the upstream connection goes with it (it is
@@ -1091,21 +1131,22 @@ async fn stopping_the_session_ends_an_intercepted_tunnel() {
         let mut tls = tls.unwrap();
         if in_flight {
             tls.write_all(get("/hang", "").as_bytes()).await.unwrap();
-            while r.seen().is_empty() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            until("the upstream sees the request", || !r.seen().is_empty()).await;
         } else {
             tls.write_all(get("/echo", "").as_bytes()).await.unwrap();
-            let mut got = Vec::new();
-            let mut b = [0u8; 1];
-            while !got.ends_with(b"\r\n\r\nok") {
-                tls.read_exact(&mut b).await.unwrap();
-                got.push(b[0]);
-            }
+            bounded("the first response", async {
+                let mut got = Vec::new();
+                let mut b = [0u8; 1];
+                while !got.ends_with(b"\r\n\r\nok") {
+                    tls.read_exact(&mut b).await.unwrap();
+                    got.push(b[0]);
+                }
+            })
+            .await;
         }
         r.proxy.stop();
         let _ = drain(&mut tls).await;
-        task.await.unwrap();
+        join(task).await;
         let close = r.sink.args("egress.close");
         assert_eq!(close["end"], json!("session-stopped"), "{in_flight}");
         upstream_ends(&r).await;
@@ -1122,7 +1163,7 @@ async fn an_intercepted_tunnel_on_another_allowed_port_names_it_in_host() {
         .unwrap();
     let _ = tls.shutdown().await;
     let out = drain(&mut tls).await;
-    task.await.unwrap();
+    join(task).await;
     assert!(out.starts_with("HTTP/1.1 200 "), "{out}");
     assert!(
         r.seen()[0]
