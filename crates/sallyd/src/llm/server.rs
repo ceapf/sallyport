@@ -6,9 +6,10 @@
 //! body framing, and answers every refusal itself after its `llm.deny` entry. Only a request it
 //! accepts goes to hyper, which replays the head ([`io::Io`]); hyper's writes stay gated until
 //! the service has written an entry, so a request hyper refuses by itself is closed unanswered
-//! and recorded `http-error`. The service reads the body (at most [`body::MAX_BODY`], within
-//! [`BODY_TIMEOUT`]), checks it ([`body::check`]), records `llm.request`, and only then calls the
-//! backend. `llm.response` (detail) follows the reply, like `egress.close`. A failed append
+//! and recorded `http-error`. Every decision is made on the broker's one parse: a request hyper
+//! reads differently ([`agrees`]) is closed unanswered and recorded `head-mismatch`. The service
+//! reads the body (at most [`body::MAX_BODY`], within [`BODY_TIMEOUT`]), checks it
+//! ([`body::check`]), records `llm.request`, and only then calls the backend. `llm.response` (detail) follows the reply, like `egress.close`. A failed append
 //! closes the connection without a reply or a backend call.
 //!
 //! The backend is a constructor argument (Task 7 decision 2). Until M3 none is wired in
@@ -16,6 +17,7 @@
 // TODO(#53): Task 12 wires no backend (llm.sock not served) until M3; never the test mock.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -191,28 +193,46 @@ impl<B: Backend> Llm<B> {
                 .refuse(&mut stream, Some(status), reason, Some(&h))
                 .await;
         }
-        self.hand_to_hyper(stream, buf, route).await;
+        self.hand_to_hyper(stream, buf, route, h).await;
     }
 
     /// Serves the accepted request through hyper on the replayed stream.
-    async fn hand_to_hyper<S>(self: Arc<Self>, stream: S, prefix: Vec<u8>, route: Route)
+    async fn hand_to_hyper<S>(self: Arc<Self>, stream: S, prefix: Vec<u8>, route: Route, h: Head)
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let gate = Gate::default();
+        let mismatch = Arc::new(AtomicBool::new(false));
         let io = Io::new(prefix, stream, gate.clone(), WRITE_STALL);
-        let (me, g) = (Arc::clone(&self), gate.clone());
+        let (me, g, h, m) = (
+            Arc::clone(&self),
+            gate.clone(),
+            Arc::new(h),
+            Arc::clone(&mismatch),
+        );
         let svc = service_fn(move |req: hyper::Request<Incoming>| {
-            let (me, g) = (Arc::clone(&me), g.clone());
-            async move { me.request(req, route, g).await }
+            let (me, g, h, m) = (Arc::clone(&me), g.clone(), Arc::clone(&h), Arc::clone(&m));
+            async move {
+                if !agrees(&h, &req) {
+                    m.store(true, Ordering::SeqCst);
+                    return Err(Closed);
+                }
+                me.request(req, route, g).await
+            }
         });
         let _ = http1::Builder::new()
             .keep_alive(false)
             .serve_connection(TokioIo::new(io), svc)
             .await;
         if !gate.is_open() {
-            // hyper refused the request by itself; its reply was dropped by the gate.
-            let _ = self.deny("http-error", None, None, None).await;
+            // hyper refused the request by itself, or read it differently from the broker; any
+            // reply it wrote was dropped by the gate.
+            let reason = if mismatch.load(Ordering::SeqCst) {
+                "head-mismatch"
+            } else {
+                "http-error"
+            };
+            let _ = self.deny(reason, None, None, None).await;
         }
     }
 
@@ -402,6 +422,30 @@ impl<B: Backend> Server for Llm<B> {
     fn stop(&self) {
         self.stop.send_replace(true);
     }
+}
+
+/// Whether hyper read the request the broker checked: the same method, request-target and
+/// version, no `Transfer-Encoding`, and the same body length. Every allow or deny decision is
+/// made on the broker's parse ([`head::parse`]); hyper only serves it, so a request it reads any
+/// other way is closed unanswered (architect ruling on the head pre-read).
+pub(super) fn agrees<B: hyper::body::Body>(h: &Head, req: &hyper::Request<B>) -> bool {
+    let headers = req.headers();
+    let lengths = headers
+        .get_all(hyper::header::CONTENT_LENGTH)
+        .iter()
+        .count();
+    let uri = req.uri();
+    req.method().as_str() == h.method
+        && uri.scheme().is_none()
+        && uri.authority().is_none()
+        && uri
+            .path_and_query()
+            .map(hyper::http::uri::PathAndQuery::as_str)
+            == Some(h.path.as_str())
+        && req.version() == hyper::Version::HTTP_11
+        && !headers.contains_key(hyper::header::TRANSFER_ENCODING)
+        && lengths == usize::from(h.content_length.is_some())
+        && req.body().size_hint().exact() == Some(h.content_length.unwrap_or(0))
 }
 
 /// Reads until the head is complete, too large or refused; `None` at end of stream first.

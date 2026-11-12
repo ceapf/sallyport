@@ -11,6 +11,9 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use super::head::{Head, Parsed, parse};
+use super::server::agrees;
+
 async fn hyper_reply(input: &[u8]) -> (String, bool) {
     let (mut client, server) = tokio::io::duplex(1 << 20);
     let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -61,4 +64,164 @@ async fn hyper_answers_an_oversize_head_without_calling_the_service() {
     let (reply, called) = hyper_reply(&big).await;
     assert!(!called);
     assert!(reply.starts_with("HTTP/1.1 431"), "{reply:?}");
+}
+
+/// What hyper made of `input`: `None` when it refused it (the service never ran), otherwise
+/// whether it read the request `checked` describes.
+async fn hyper_view(input: &[u8], checked: Option<Head>) -> Option<bool> {
+    let (mut client, server) = tokio::io::duplex(1 << 20);
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let out = std::sync::Arc::clone(&seen);
+    let task = tokio::spawn(async move {
+        let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+            let agree = checked.as_ref().is_some_and(|h| agrees(h, &req));
+            *out.lock().unwrap() = Some(agree);
+            async {
+                Ok::<_, Infallible>(hyper::Response::new(Full::new(Bytes::from_static(b"ok"))))
+            }
+        });
+        let _ = http1::Builder::new()
+            .keep_alive(false)
+            .serve_connection(TokioIo::new(server), svc)
+            .await;
+    });
+    // No half-close here: hyper drops a request whose peer has shut its write side
+    // (`half_close` is off), which would hide what it made of the head.
+    client.write_all(input).await.unwrap();
+    let mut sink = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.read_to_end(&mut sink),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    task.await.unwrap();
+    *seen.lock().unwrap()
+}
+
+/// hyper (`half_close` off) calls the service for a complete request whose peer has already
+/// shut its write side, then drops the reply: the peer gets nothing (the broker records the
+/// close as `http-error` unless the request entry was already written).
+#[tokio::test]
+async fn hyper_never_answers_a_half_closed_peer() {
+    let (reply, called) = hyper_reply(b"GET /v1/models HTTP/1.1\r\n\r\n").await;
+    assert!(called);
+    assert_eq!(reply, "");
+}
+
+/// The architect's condition on the head pre-read: the broker decides on its one parse, and hyper
+/// never reads a head the broker accepted as some other request. Heads two parsers could read
+/// differently: the broker either refuses each, or accepts it exactly as hyper reads it.
+#[tokio::test]
+async fn hyper_never_reads_an_accepted_head_differently() {
+    use Parsed::{Complete, Refused};
+    const CHAT: &str = "POST /v1/chat/completions HTTP/1.1";
+    const MODELS: &str = "GET /v1/models HTTP/1.1";
+    // (input, what the broker makes of it, whether hyper accepts it)
+    let cases = [
+        // Duplicate Content-Length: hyper takes equal values; the broker refuses every form.
+        (
+            format!("{CHAT}\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\n{{}}"),
+            "content-length",
+            true,
+        ),
+        (
+            format!("{CHAT}\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\n{{}}x"),
+            "content-length",
+            false,
+        ),
+        (
+            format!("{CHAT}\r\nContent-Length: 2, 2\r\n\r\n{{}}"),
+            "content-length",
+            false,
+        ),
+        // Content-Length with Transfer-Encoding, in both orders: hyper reads the chunked body.
+        (
+            format!("{CHAT}\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"),
+            "transfer-encoding",
+            true,
+        ),
+        (
+            format!("{CHAT}\r\nTransfer-Encoding: chunked\r\nContent-Length: 2\r\n\r\n0\r\n\r\n"),
+            "transfer-encoding",
+            true,
+        ),
+        (
+            format!("{CHAT}\r\nTransfer-Encoding: identity\r\nContent-Length: 2\r\n\r\n{{}}"),
+            "transfer-encoding",
+            false,
+        ),
+        // Folded (obs-fold) headers.
+        (
+            format!("{MODELS}\r\nX-A: a\r\n b\r\n\r\n"),
+            "malformed",
+            false,
+        ),
+        (
+            format!("{CHAT}\r\nContent-Length:\r\n 2\r\n\r\n{{}}"),
+            "malformed",
+            false,
+        ),
+        (
+            format!("{CHAT}\r\nX-A: a\r\n\tContent-Length: 9\r\nContent-Length: 2\r\n\r\n{{}}"),
+            "malformed",
+            false,
+        ),
+        // Whitespace before the colon.
+        (
+            format!("{CHAT}\r\nContent-Length : 2\r\n\r\n{{}}"),
+            "malformed",
+            false,
+        ),
+        // Bare line feeds, alone and mixed with CRLF.
+        (format!("{CHAT}\nContent-Length: 2\n\n{{}}"), "ok", true),
+        (
+            format!("{MODELS}\r\nX-A: a\nContent-Length: 0\r\n\n"),
+            "ok",
+            true,
+        ),
+        // A bare carriage return.
+        (
+            format!("{MODELS}\rContent-Length: 0\r\n\r\n"),
+            "malformed",
+            false,
+        ),
+        // A leading empty line, and padding around the length value.
+        (format!("\r\n{MODELS}\r\n\r\n"), "ok", true),
+        (
+            format!("{CHAT}\r\nContent-Length:   2  \r\n\r\n{{}}"),
+            "ok",
+            true,
+        ),
+        // A signed Content-Length.
+        (
+            format!("{CHAT}\r\nContent-Length: +2\r\n\r\n{{}}"),
+            "content-length",
+            false,
+        ),
+    ];
+    for (input, broker, hyper_accepts) in &cases {
+        let (input, broker, hyper_accepts) = (input.as_bytes(), *broker, *hyper_accepts);
+        let shown = String::from_utf8_lossy(input);
+        let ours = parse(input);
+        let checked = match &ours {
+            Complete(h) => {
+                assert_eq!(broker, "ok", "{shown:?}");
+                Some(h.clone())
+            }
+            Refused(r) => {
+                assert_eq!(broker, *r, "{shown:?}");
+                None
+            }
+            other => panic!("{shown:?}: {other:?}"),
+        };
+        let view = hyper_view(input, checked).await;
+        // Where the broker is stricter than hyper, the row records it.
+        assert_eq!(view.is_some(), hyper_accepts, "{shown:?}");
+        // The condition itself: every head the broker accepts, hyper reads the same way.
+        if matches!(ours, Complete(_)) {
+            assert_eq!(view, Some(true), "{shown:?}");
+        }
+    }
 }

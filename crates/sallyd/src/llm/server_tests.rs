@@ -336,6 +336,56 @@ async fn heads_the_broker_refuses_are_answered_by_it() {
     assert_eq!(denies(&sink).len(), 7);
 }
 
+/// Heads two parsers could read differently, end to end: the broker refuses each with its own
+/// entry, or serves exactly the request it checked (architect ruling on the head pre-read).
+#[tokio::test]
+async fn ambiguous_heads_are_refused_or_served_as_checked() {
+    let (llm, fake, sink) = setup();
+    let chat_line = "POST /v1/chat/completions HTTP/1.1";
+    let b = chat(json!({}));
+    let n = b.len();
+    for (raw, code, reason) in [
+        (
+            format!("{chat_line}\r\nContent-Length: {n}\r\nContent-Length: {n}\r\n\r\n{b}"),
+            400,
+            "content-length",
+        ),
+        (
+            format!("{chat_line}\r\nTransfer-Encoding: chunked\r\nContent-Length: {n}\r\n\r\n{b}"),
+            400,
+            "transfer-encoding",
+        ),
+        (
+            format!("{chat_line}\r\nX-A: a\r\n Content-Length: {n}\r\n\r\n{b}"),
+            400,
+            "malformed",
+        ),
+        (
+            format!("{chat_line}\r\nContent-Length:\r\n {n}\r\n\r\n{b}"),
+            400,
+            "malformed",
+        ),
+    ] {
+        let r = exchange(&llm, raw.as_bytes()).await;
+        assert_eq!(
+            (status(&r), body(&r)["error"]["code"].clone()),
+            (code, json!(reason)),
+            "{raw:?}"
+        );
+    }
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(denies(&sink).len(), 4);
+    // Bare line feeds: both parsers read the same request, so it is served.
+    let r = exchange(
+        &llm,
+        format!("{chat_line}\nContent-Length: {n}\n\n{b}").as_bytes(),
+    )
+    .await;
+    assert_eq!(status(&r), 200, "{r}");
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(sink.last("llm.request")["bytes"], json!(n));
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_slow_head_is_closed_unanswered_and_recorded() {
     let (llm, _, sink) = setup();
@@ -469,4 +519,127 @@ fn hashes_are_lowercase_hex() {
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
     );
     assert_eq!(hex(&[0, 255, 16]), "00ff10");
+}
+
+fn checked(method: &str, path: &str, content_length: Option<u64>) -> Head {
+    Head {
+        method: method.into(),
+        path: path.into(),
+        content_length,
+        len: 0,
+    }
+}
+
+fn hyper_req(
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &'static str,
+) -> hyper::Request<http_body_util::Full<Bytes>> {
+    let mut b = hyper::Request::builder()
+        .method(method)
+        .uri(path)
+        .version(hyper::Version::HTTP_11);
+    for (k, v) in headers {
+        b = b.header(*k, *v);
+    }
+    b.body(http_body_util::Full::new(Bytes::from_static(
+        body.as_bytes(),
+    )))
+    .unwrap()
+}
+
+#[test]
+fn hyper_must_read_the_request_the_broker_checked() {
+    let chat = checked("POST", "/v1/chat/completions", Some(2));
+    let same = || {
+        hyper_req(
+            "POST",
+            "/v1/chat/completions",
+            &[("content-length", "2")],
+            "{}",
+        )
+    };
+    assert!(agrees(&chat, &same()));
+    // Each field read differently is a mismatch.
+    let other_method = hyper_req(
+        "PUT",
+        "/v1/chat/completions",
+        &[("content-length", "2")],
+        "{}",
+    );
+    assert!(!agrees(&chat, &other_method));
+    let other_path = hyper_req("POST", "/v1/models", &[("content-length", "2")], "{}");
+    assert!(!agrees(&chat, &other_path));
+    let mut http10 = same();
+    *http10.version_mut() = hyper::Version::HTTP_10;
+    assert!(!agrees(&chat, &http10));
+    let te = hyper_req(
+        "POST",
+        "/v1/chat/completions",
+        &[("content-length", "2"), ("transfer-encoding", "chunked")],
+        "{}",
+    );
+    assert!(!agrees(&chat, &te));
+    let other_length = hyper_req(
+        "POST",
+        "/v1/chat/completions",
+        &[("content-length", "3")],
+        "{}x",
+    );
+    assert!(!agrees(&chat, &other_length));
+    let two_lengths = hyper_req(
+        "POST",
+        "/v1/chat/completions",
+        &[("content-length", "2"), ("content-length", "2")],
+        "{}",
+    );
+    assert!(!agrees(&chat, &two_lengths));
+    // A body length hyper frames differently from the header the broker read.
+    let unframed = hyper_req(
+        "POST",
+        "/v1/chat/completions",
+        &[("content-length", "2")],
+        "{}x",
+    );
+    assert!(!agrees(&chat, &unframed));
+    // No Content-Length: hyper must see none, and an empty body.
+    let models = checked("GET", "/v1/models", None);
+    assert!(agrees(&models, &hyper_req("GET", "/v1/models", &[], "")));
+    let zero = hyper_req("GET", "/v1/models", &[("content-length", "0")], "");
+    assert!(!agrees(&models, &zero));
+    assert!(agrees(&checked("GET", "/v1/models", Some(0)), &zero));
+    assert!(!agrees(&models, &hyper_req("GET", "/v1/models", &[], "x")));
+    // The request-target compares as sent: no query, no absolute form, no case folding.
+    assert!(!agrees(&models, &hyper_req("GET", "/v1/models?x", &[], "")));
+    assert!(!agrees(&models, &hyper_req("GET", "/V1/models", &[], "")));
+    let absolute = checked("GET", "http://x/v1/models", None);
+    assert!(!agrees(
+        &absolute,
+        &hyper_req("GET", "http://x/v1/models", &[], "")
+    ));
+    let authority = checked("GET", "x:80", None);
+    assert!(!agrees(&authority, &hyper_req("GET", "x:80", &[], "")));
+}
+
+#[tokio::test]
+async fn a_request_hyper_reads_differently_is_closed_unanswered_and_recorded() {
+    // Force a disagreement: the broker checked one head, the replayed bytes hold another.
+    let (llm, fake, sink) = setup();
+    let (mut client, server) = tokio::io::duplex(1 << 16);
+    let checked_head = checked("GET", "/v1/models", None);
+    let replay = b"GET /v1/models?x HTTP/1.1\r\n\r\n".to_vec();
+    let task =
+        tokio::spawn(Arc::clone(&llm).hand_to_hyper(server, replay, Route::Models, checked_head));
+    // No half-close: hyper drops a request whose peer has already shut its write side.
+    let mut out = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), client.read_to_end(&mut out))
+        .await
+        .expect("the connection stayed open")
+        .unwrap();
+    task.await.unwrap();
+    assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+    assert_eq!(denies(&sink), [("head-mismatch".to_owned(), Value::Null)]);
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+    assert!(!sink.events().contains(&"llm.request".to_owned()));
 }
