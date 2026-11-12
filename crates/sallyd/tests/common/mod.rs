@@ -93,7 +93,10 @@ impl Fx {
     }
 
     pub fn load(&self, body: &str) -> ValidatedManifest {
-        let secrets: BTreeSet<String> = ["GITHUB_TOKEN".to_owned()].into_iter().collect();
+        let secrets: BTreeSet<String> = ["GITHUB_TOKEN", "MOCK3_TOKEN"]
+            .map(str::to_owned)
+            .into_iter()
+            .collect();
         match load(&format!("{HEADER}{body}"), &self.env, &secrets) {
             Ok(v) => v.manifest,
             Err(e) => panic!("{e:#?}"),

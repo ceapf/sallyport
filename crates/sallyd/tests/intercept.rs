@@ -26,11 +26,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio_rustls::client::TlsStream;
 
-/// `mock.test` (grant host) and `mock2.test` (allowed, no grant) on 443.
+/// `mock.test` and `mock3.test` (grant hosts, a secret each) and `mock2.test` (allowed, no
+/// grant) on 443.
 const MANIFEST: &str = "network:\n  mode: proxy\n  allow:\n    - host: mock.test\n    \
-                        - host: mock2.test\n\
+                        - host: mock2.test\n    - host: mock3.test\n\
                         secrets:\n  - name: GITHUB_TOKEN\n    inject: {host: mock.test, \
-                        header: Authorization, format: \"Bearer {value}\"}\n";
+                        header: Authorization, format: \"Bearer {value}\"}\n  \
+                        - name: MOCK3_TOKEN\n    inject: {host: mock3.test, \
+                        header: X-Api-Key, format: \"{value}\"}\n";
 
 async fn session(lx: &Lx, tag: &str) -> Running {
     let req = WorkspaceRequest {
@@ -42,7 +45,7 @@ async fn session(lx: &Lx, tag: &str) -> Running {
     for _ in 0..100 {
         let (_, log) = exec(&r, &format!("cat {SHIM_LOG} 2>/dev/null")).await;
         if log.contains("sally-shim: listening on 127.0.0.1:3128") {
-            for host in ["mock.test", "mock2.test"] {
+            for host in ["mock.test", "mock2.test", "mock3.test"] {
                 lx.egress.resolver.set(host, vec![vec![tls_upstream()]]);
             }
             return r;
@@ -136,8 +139,10 @@ fn allow_routes(lx: &Lx) -> Vec<(String, bool)> {
 }
 
 /// RT-SEC-09. Controls: the route decision (`policy::decide` → `Route::Intercept` only for grant
-/// hosts) and the leaf selection (`Interception::server`). Splicing the grant host fails the
-/// session-CA handshake; intercepting the other host fails the byte-equal leaf assertion.
+/// hosts) and the leaf selection (`Interception::server`, by the CONNECT host). Splicing a grant
+/// host fails the session-CA handshake; intercepting the other host fails the byte-equal leaf
+/// assertion; presenting one grant host's leaf for the other (say, the first leaf for every
+/// host) fails that host's own-name handshake.
 #[test]
 fn rt_sec_09_a_grant_host_gets_a_session_ca_leaf_and_any_other_host_its_own_chain() {
     rt().block_on(async {
@@ -146,19 +151,23 @@ fn rt_sec_09_a_grant_host_gets_a_session_ca_leaf_and_any_other_host_its_own_chai
         let sock = lx.paths("sec09").workspace_sockets().join("net.sock");
         let ca = session_ca(&lx, "sec09");
 
-        let t = tls(connect(&sock, "mock.test").await, "mock.test", &ca)
-            .await
-            .expect("grant host: the leaf verifies against the container's session CA");
-        let chain = t.get_ref().1.peer_certificates().unwrap().to_vec();
-        assert_ne!(
-            chain[0], lx.egress.dialer.pki.leaf,
-            "the upstream's own leaf"
-        );
-        let other = tls(connect(&sock, "mock.test").await, "other.mock.test", &ca).await;
-        assert!(
-            other.is_err(),
-            "the session-CA leaf verified for another name"
-        );
+        for (grant, other_grant) in [("mock.test", "mock3.test"), ("mock3.test", "mock.test")] {
+            let t = tls(connect(&sock, grant).await, grant, &ca)
+                .await
+                .unwrap_or_else(|e| panic!("{grant}: its leaf must verify: {e}"));
+            let chain = t.get_ref().1.peer_certificates().unwrap().to_vec();
+            assert_ne!(
+                chain[0], lx.egress.dialer.pki.leaf,
+                "{grant}: the upstream's own leaf"
+            );
+            for name in [other_grant, "other.mock.test"] {
+                let wrong = tls(connect(&sock, grant).await, name, &ca).await;
+                assert!(
+                    wrong.is_err(),
+                    "{grant}: its session-CA leaf verified for {name}"
+                );
+            }
+        }
 
         let t = tls(
             connect(&sock, "mock2.test").await,
@@ -183,16 +192,17 @@ fn rt_sec_09_a_grant_host_gets_a_session_ca_leaf_and_any_other_host_its_own_chai
         );
 
         let routes = allow_routes(&lx);
+        for (host, intercept) in [
+            ("mock.test", true),
+            ("mock3.test", true),
+            ("mock2.test", false),
+        ] {
+            assert!(routes.contains(&(host.to_owned(), intercept)), "{routes:?}");
+        }
         assert!(
-            routes.contains(&("mock.test".to_owned(), true)),
-            "{routes:?}"
-        );
-        assert!(
-            routes.contains(&("mock2.test".to_owned(), false)),
-            "{routes:?}"
-        );
-        assert!(
-            routes.iter().all(|(h, i)| *i == (h == "mock.test")),
+            routes
+                .iter()
+                .all(|(h, i)| *i == (h == "mock.test" || h == "mock3.test")),
             "{routes:?}"
         );
         lx.stop(r).await;

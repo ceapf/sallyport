@@ -107,7 +107,8 @@ impl Dialer for Upstream {
     }
 }
 
-/// A test CA and one leaf for `mock.test`, `*.mock.test` and `mock2.test`, as an upstream would
+/// A test CA and one leaf for `mock.test`, `*.mock.test`, `mock2.test` and `mock3.test`, as an
+/// upstream would
 /// have; the CA is the only certificate in the roots file the starter loads.
 pub struct Pki {
     /// The CA certificate (PEM), as written to the roots file.
@@ -129,7 +130,7 @@ impl Pki {
         let ca_cert = ca.self_signed(&ca_key).unwrap();
         let issuer = Issuer::new(ca, ca_key);
         let leaf_key = KeyPair::generate().unwrap();
-        let names = ["mock.test", "*.mock.test", "mock2.test"].map(str::to_owned);
+        let names = ["mock.test", "*.mock.test", "mock2.test", "mock3.test"].map(str::to_owned);
         let leaf = CertificateParams::new(names.to_vec())
             .unwrap()
             .signed_by(&leaf_key, &issuer)
