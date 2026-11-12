@@ -45,6 +45,10 @@ summary "$tmp/s.json" /r/crates/sallyd/src/egress/a.rs 100 84 \
 expect 1 "test files do not lift the figure" 85 /crates/sallyd/src/egress/
 summary "$tmp/s.json" /r/crates/sallyd/src/egress/a.rs 0 0
 expect 1 "matching files without lines fail" 85 /crates/sallyd/src/egress/
+summary "$tmp/s.json" /r/crates/sallyd/src/egress/a.rs 100 100
+for bad in "" 85.5 -1 101 "8 5" "85;0" x; do
+  expect 2 "a minimum of '$bad' is a usage error" "$bad" /crates/sallyd/src/egress/
+done
 rc=0
 bash "$gate" 85 "$tmp/s.json" >/dev/null 2>&1 || rc=$?
 if [ "$rc" -ne 2 ]; then

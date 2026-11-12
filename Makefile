@@ -76,7 +76,9 @@ mutants:
 # The wider scope (CLAUDE.md "Mutation scope"): every other file whose security decisions can be
 # tested without starting a container, zero survivors too. Per mutant only container-free tests
 # run: the crate's unit tests plus the integration binaries that start no container (sally-core's
-# all start none). Launch, teardown and the watchdog tasks stay with the rt_ tests.
+# all start none). Launch, teardown and the watchdog tasks stay with the rt_ tests. egress/net.rs is
+# in (architect Q22): its unit tests are hermetic (fakes, a loopback dialer, `localhost` from
+# /etc/hosts), so no mutant's run sends a packet off the machine.
 # MUTANTS_SHARD=k/n runs one round-robin shard; MUTANTS_OUT=<dir> moves mutants.out.
 MUTANTS_WIDE_CORE := $(addprefix crates/sally-core/src/,manifest/image.rs manifest/hostenv.rs \
                      manifest/parse.rs manifest/summary.rs manifest/units.rs secrets/store.rs \
@@ -86,7 +88,7 @@ MUTANTS_WIDE_SALLYD := $(addprefix crates/sallyd/src/sandbox/,argv.rs check.rs t
                        overlap.rs scan.rs images.rs changes.rs dirs.rs podman.rs disk.rs stage.rs \
                        launch/error.rs) \
                        $(addprefix crates/sallyd/src/egress/,addr.rs authority.rs head.rs policy.rs server.rs \
-                       hostaddrs.rs tunnel.rs)
+                       hostaddrs.rs tunnel.rs net.rs)
 MUTANTS_WIDE_SHIM := $(addprefix crates/sally-shim/src/,args.rs relay.rs)
 MUTANTS_WIDE_TESTS_CORE :=
 MUTANTS_WIDE_TESTS_SALLYD := --lib --test=argv --test=scan

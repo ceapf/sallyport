@@ -78,7 +78,7 @@ If a task seems to require breaking one of these, **stop and ask**. Do not imple
 
 Rule: a file is in scope when its security decisions can be tested without starting a container.
 Orchestration that only container tests can prove (`sandbox/launch.rs`, `launch/teardown.rs`,
-`watchdog.rs`, `commands.rs`, `inside.rs`, `egress/net.rs`) stays with the `rt_` tests. Per mutant only
+`watchdog.rs`, `commands.rs`, `inside.rs`) stays with the `rt_` tests. Per mutant only
 container-free tests run: unit tests, all of sally-core's `tests/`, `sallyd` `argv` + `scan`,
 `sally-shim` `relay`. A new file that fits the rule joins its list in the same PR. Nightly, two jobs:
 - `make mutants` (deny paths): sally-core `manifest/validate/*.rs`, `manifest/paths.rs`,
@@ -87,7 +87,7 @@ container-free tests run: unit tests, all of sally-core's `tests/`, `sallyd` `ar
   summary,units}.rs`, `secrets/{store,secret}.rs`, `audit/{entry,redact,verify,writer,layout}.rs`,
   `fsutil.rs`, `fd.rs`; sallyd `sandbox/{argv,check,types,profiles,overlap,scan,images,changes,dirs,
   podman,disk,stage}.rs`, `sandbox/launch/error.rs`, `egress/{addr,authority,head,policy,server,
-  hostaddrs,tunnel}.rs`;
+  hostaddrs,tunnel,net}.rs` (net.rs tests stay hermetic: nothing leaves the machine);
   sally-shim `args.rs`, `relay.rs`.
 
 ## Agent / model routing (ECC)

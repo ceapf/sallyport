@@ -13,6 +13,11 @@ if [ "$#" -ne 3 ]; then
   exit 2
 fi
 min="$1" json="$2" frag="$3"
+# A whole percent, 0..100: anything else would let bash arithmetic pass the gate by accident.
+if ! [[ "$min" =~ ^(100|[1-9]?[0-9])$ ]]; then
+  echo "coverage-gate: <min-percent> must be a whole number 0..100, got '$min'" >&2
+  exit 2
+fi
 command -v jq >/dev/null || { echo "coverage-gate: jq not found" >&2; exit 2; }
 
 read -r files count covered < <(jq -r --arg f "$frag" '
