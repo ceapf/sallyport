@@ -793,9 +793,16 @@ fn sha256(b: &[u8]) -> String {
 
 /// A fresh 128-bit id, or `None` if the kernel gives no randomness (then the call is denied).
 fn new_id() -> Option<String> {
+    id_from(|buf| rustix::rand::getrandom(buf, rustix::rand::GetRandomFlags::empty()))
+}
+
+/// An id from `fill`: retried while interrupted, refused on a short fill or any other error.
+fn id_from(
+    mut fill: impl FnMut(&mut [u8; 16]) -> Result<usize, rustix::io::Errno>,
+) -> Option<String> {
     let mut buf = [0u8; 16];
     for _ in 0..ID_ATTEMPTS {
-        match rustix::rand::getrandom(&mut buf, rustix::rand::GetRandomFlags::empty()) {
+        match fill(&mut buf) {
             Ok(n) if n == buf.len() => return Some(format!("ap-{}", hex(&buf))),
             Err(rustix::io::Errno::INTR) => {}
             _ => return None,

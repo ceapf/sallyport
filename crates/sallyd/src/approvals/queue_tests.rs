@@ -253,6 +253,24 @@ async fn ids_are_128_bit_hex_and_unique() {
     }
 }
 
+#[test]
+fn an_id_is_retried_while_interrupted_and_refused_on_a_short_or_failed_fill() {
+    use rustix::io::Errno;
+    let mut tries = 0;
+    let id = id_from(|b| {
+        tries += 1;
+        if tries < ID_ATTEMPTS {
+            return Err(Errno::INTR);
+        }
+        b.fill(0xab);
+        Ok(b.len())
+    });
+    assert_eq!(id, Some(format!("ap-{}", "ab".repeat(16))));
+    assert_eq!(id_from(|_| Err(Errno::INTR)), None);
+    assert_eq!(id_from(|_| Ok(15)), None);
+    assert_eq!(id_from(|_| Err(Errno::NOSYS)), None);
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_prompt_nobody_answers_expires_as_a_denial() {
     let f = fx(5);
@@ -744,7 +762,9 @@ async fn the_pending_entry_carries_note_hash_and_tags_never_the_note() {
     assert_eq!(p.note.as_deref(), Some(format!("\"{note}\"").as_str()));
     let e = f.sink.last("tool.pending");
     assert_eq!(e["note_bytes"], note.len());
-    assert_eq!(e["note_sha256"], sha256(note.as_bytes()));
+    // An independent hash: the module's own helper is not the oracle.
+    let want = super::super::action::hex(&<sha2::Sha256 as sha2::Digest>::digest(note.as_bytes()));
+    assert_eq!(e["note_sha256"], want);
     assert!(!e.to_string().contains("ignore the user"));
     f.desk.decide(&p.id, Decision::Deny, ME).await.unwrap();
     let _ = h.await;

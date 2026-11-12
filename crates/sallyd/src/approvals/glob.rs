@@ -241,6 +241,18 @@ mod tests {
     }
 
     #[test]
+    fn a_star_retry_resumes_one_character_further_and_after_the_star() {
+        let chars = |s: &str| s.chars().collect::<Vec<char>>();
+        // `*b` on `aab`: star, two retries, the match: four steps exactly.
+        let mut steps = 0;
+        assert!(segment_matches(&chars("*b"), &chars("aab"), &mut steps));
+        assert_eq!(steps, 4);
+        let mut steps = 0;
+        assert!(!segment_matches(&chars("*b"), &chars("aaa"), &mut steps));
+        assert_eq!(steps, 4);
+    }
+
+    #[test]
     fn a_path_past_the_bound_counts_as_a_match() {
         let at = "a".repeat(MAX_PATH);
         assert!(!matches("b", &at));

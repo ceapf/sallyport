@@ -226,15 +226,14 @@ pub(crate) fn cut(text: &str, max: usize) -> (String, bool) {
 fn escape_boundary(text: &str, max: usize) -> usize {
     let bytes = text.as_bytes();
     let mut i = 0usize;
-    let mut last = 0usize;
-    while i < bytes.len() {
-        let len = match (bytes.get(i), bytes.get(i.saturating_add(1))) {
-            (Some(b'\\'), Some(b'x')) => 4,
-            (Some(b'\\'), Some(b'u')) => text
+    while let Some(&b) = bytes.get(i) {
+        let len = match (b, bytes.get(i.saturating_add(1))) {
+            (b'\\', Some(b'x')) => 4,
+            (b'\\', Some(b'u')) => text
                 .get(i..)
                 .and_then(|r| r.find('}'))
                 .map_or(1, |e| e.saturating_add(1)),
-            (Some(b'\\'), Some(_)) => 2,
+            (b'\\', Some(_)) => 2,
             _ => 1,
         };
         let next = i.saturating_add(len);
@@ -242,9 +241,8 @@ fn escape_boundary(text: &str, max: usize) -> usize {
             break;
         }
         i = next;
-        last = i;
     }
-    last
+    i
 }
 
 #[cfg(test)]
