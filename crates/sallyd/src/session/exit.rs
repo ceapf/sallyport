@@ -99,6 +99,8 @@ mod tests {
     async fn the_default_poll_notices_an_exit() {
         let (mut child, dir) = sleeper();
         let exit = Exit::watch(dir).unwrap();
+        let early = tokio::time::timeout(Duration::from_millis(300), exit.exited());
+        assert!(early.await.is_err(), "reported a live process as exited");
         child.kill().unwrap();
         child.wait().unwrap();
         tokio::time::timeout(EXIT_POLL * 3, exit.exited())

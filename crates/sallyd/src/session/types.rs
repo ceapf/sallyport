@@ -65,9 +65,11 @@ pub fn scoped_id(scope: &str, bytes: [u8; ID_BYTES]) -> String {
 /// invalid.
 pub fn fresh_id(scope: &str) -> io::Result<SessionId> {
     let mut bytes = [0u8; ID_BYTES];
-    let mut filled = 0;
-    while let Some(rest) = bytes.get_mut(filled..).filter(|r| !r.is_empty()) {
-        filled += rustix::rand::getrandom(rest, rustix::rand::GetRandomFlags::empty())?;
+    // getrandom(2) fills up to 256 bytes in one call once the pool is ready (it blocks until
+    // then); a short read is refused rather than looped over.
+    let n = rustix::rand::getrandom(&mut bytes, rustix::rand::GetRandomFlags::empty())?;
+    if n != ID_BYTES {
+        return Err(io::Error::other("getrandom returned a short read"));
     }
     SessionId::parse(&scoped_id(scope, bytes))
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
