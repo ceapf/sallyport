@@ -12,6 +12,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 
 use sally_core::manifest::Cpus;
 use sallyd::sandbox::{
@@ -53,23 +54,30 @@ struct Boxed {
     container: String,
     /// The workspace's launcher handle; the other roles are removed by the fixture.
     running: Option<Running>,
+    /// The host directory mounted at `/run/sallyport` in this role.
+    sockets: PathBuf,
 }
 
 async fn start(x: &Lx, role: Role) -> Boxed {
     let tag = format!("{role:?}").to_lowercase();
     let v = x.f.load("");
     let paths = x.paths(&tag);
-    let (container, running) = match role {
+    let (container, running, sockets) = match role {
         Role::Workspace => {
             let v =
                 x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "rw")]));
             let r = x.launch(&v, &tag).await.unwrap();
-            (r.container().to_owned(), Some(r))
+            let sockets = r.paths().workspace_sockets();
+            (r.container().to_owned(), Some(r), sockets)
         }
         Role::Harness => {
             let dirs = SessionDirs::create(&paths, &x.xdg, &[], 0).unwrap();
             let argv = harness_argv(&x.common_args(&dirs), &paths, &v, &test_image()).unwrap();
-            (x.create_and_start(argv).await, None)
+            (
+                x.create_and_start(argv).await,
+                None,
+                paths.harness_sockets(),
+            )
         }
         Role::Inference => {
             let dirs = SessionDirs::create(&paths, &x.xdg, &[], 0).unwrap();
@@ -83,7 +91,7 @@ async fn start(x: &Lx, role: Role) -> Boxed {
             std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
             let spec = InferenceSpec {
                 instance: SessionId::parse(&format!("{}-{tag}", x.scope)).unwrap(),
-                socket_dir,
+                socket_dir: socket_dir.clone(),
                 model: VerifiedModel::pin(&blobs, D1).unwrap(),
                 image: test_image(),
                 gpu: false,
@@ -93,13 +101,14 @@ async fn start(x: &Lx, role: Role) -> Boxed {
                 memory: None,
             };
             let argv = inference_argv(&x.common_args(&dirs), &spec).unwrap();
-            (x.create_and_start(argv).await, None)
+            (x.create_and_start(argv).await, None, socket_dir)
         }
     };
     Boxed {
         role,
         container,
         running,
+        sockets,
     }
 }
 
@@ -325,7 +334,7 @@ fn rt_fs_17_no_role_creates_a_namespace() {
 /// is out of its reach rather than absent: `control.sock` (bound), the audit directory, the
 /// secrets file, the library blobs directory, and the blobs directory the inference model came
 /// from. Absolute host paths (ARCHITECTURE §3.1).
-fn broker_state(x: &Lx) -> (Vec<String>, std::os::unix::net::UnixListener) {
+fn broker_state(x: &Lx) -> (Vec<PathBuf>, std::os::unix::net::UnixListener) {
     let home = x.f.root.join("home");
     let data = home.join(".local/share/sallyport");
     let sockets = x.xdg.join("sallyport");
@@ -342,21 +351,34 @@ fn broker_state(x: &Lx) -> (Vec<String>, std::os::unix::net::UnixListener) {
     std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o600)).unwrap();
     let blobs = data.join("library/blobs/sha256");
     std::fs::create_dir_all(&blobs).unwrap();
-    let paths: Vec<String> = [control, audit, secrets, blobs, x.f.root.join("blobs")]
-        .iter()
-        .map(|p| {
-            assert!(p.exists(), "{} must exist on the host", p.display());
-            p.to_str().unwrap().to_owned()
-        })
-        .collect();
+    let paths = vec![control, audit, secrets, blobs, x.f.root.join("blobs")];
+    for p in &paths {
+        assert!(p.exists(), "{} must exist on the host", p.display());
+    }
     (paths, listener)
 }
 
-/// RT-FS-10, the ENOENT half (#61 item 1): from every role, the broker's state is out of reach.
-/// Each host path, the same path under `/run/sallyport/../..` (the harness's socket directory is
-/// a bind mount; `..` must not climb to the host), and `control.sock` beside the role's own
-/// sockets all give ENOENT. Control: the role's mount set (`argv.rs`): adding any of these host
-/// directories to a role's mounts makes its path resolve.
+/// The relative path that climbs from host directory `from` to host path `to` (`../../x`), as a
+/// process would try it from where `from` is mounted.
+fn climb(from: &Path, to: &Path) -> String {
+    let from: Vec<_> = from.components().collect();
+    let to: Vec<_> = to.components().collect();
+    let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+    let mut parts: Vec<String> = vec!["..".into(); from.len() - common];
+    parts.extend(
+        to[common..]
+            .iter()
+            .map(|c| c.as_os_str().to_str().unwrap().to_owned()),
+    );
+    parts.join("/")
+}
+
+/// RT-FS-10, the ENOENT half (#61 item 1; architect Q82): from every role, the broker's state is
+/// out of reach. Each host path by its absolute path, under `/run/sallyport/../..`, and by the
+/// `..` chain that climbs from the role's host socket directory (mounted at `/run/sallyport`) to
+/// it, and `control.sock` beside the role's own sockets: all ENOENT. `/run/sallyport` itself is
+/// found in every role, so the probe tells present from absent. Control: the role's mount set
+/// (`argv.rs`): mounting any of these host directories into a role makes its path resolve.
 #[test]
 fn rt_fs_10_broker_state_is_enoent_from_every_role() {
     rt().block_on(async {
@@ -367,21 +389,34 @@ fn rt_fs_10_broker_state_is_enoent_from_every_role() {
         }
         // After the starts: the inference role's blobs directory exists only from then.
         let (host, _control) = broker_state(&x);
-        let mut tried: Vec<String> = host.clone();
-        tried.extend(host.iter().map(|p| format!("/run/sallyport/../..{p}")));
-        tried.push("/run/sallyport/control.sock".into());
-        let script: String = tried
-            .iter()
-            .map(|p| {
-                format!("r=$(ls -d -- '{p}' 2>&1 >/dev/null) && echo 'found' || echo \"$r\"; ")
-            })
-            .collect();
         for b in &boxes {
+            let mut tried: Vec<String> = host.iter().map(|p| p.display().to_string()).collect();
+            tried.extend(
+                host.iter()
+                    .map(|p| format!("/run/sallyport/../..{}", p.display())),
+            );
+            for p in &host {
+                // On the host, the climb reaches the path: from the container it must not.
+                let up = b.sockets.join(climb(&b.sockets, p));
+                assert_eq!(up.canonicalize().unwrap(), p.canonicalize().unwrap());
+            }
+            tried.extend(
+                host.iter()
+                    .map(|p| format!("/run/sallyport/{}", climb(&b.sockets, p))),
+            );
+            tried.push("/run/sallyport/control.sock".into());
+            let script: String = std::iter::once("/run/sallyport")
+                .chain(tried.iter().map(String::as_str))
+                .map(|p| {
+                    format!("r=$(ls -d -- '{p}' 2>&1 >/dev/null) && echo 'found' || echo \"$r\"; ")
+                })
+                .collect();
             let (code, out) = exec_in(&b.container, &["sh", "-c", &script]);
             assert_eq!(code, 0, "{:?}: {out}", b.role);
             let lines: Vec<&str> = out.lines().collect();
-            assert_eq!(lines.len(), tried.len(), "{:?}: {out}", b.role);
-            for (p, line) in tried.iter().zip(&lines) {
+            assert_eq!(lines.len(), tried.len() + 1, "{:?}: {out}", b.role);
+            assert_eq!(lines[0], "found", "{:?}: /run/sallyport", b.role);
+            for (p, line) in tried.iter().zip(&lines[1..]) {
                 assert!(
                     line.ends_with("No such file or directory"),
                     "{:?}: {p}: {line}",
