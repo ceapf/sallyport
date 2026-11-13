@@ -12,7 +12,7 @@ use std::time::Duration;
 use sally_core::audit::{AuditError, NewEntry};
 use sally_core::manifest::AuditLevel;
 use sallyd::sandbox::{AuditSink, LaunchError};
-use sallyd::session::{AGENT_SOCK, Registry, StartError, StopOutcome, StopReason};
+use sallyd::session::{AGENT_SOCK, Registry, SessionState, StartError, StopOutcome, StopReason};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -161,8 +161,9 @@ fn a_session_starts_in_order_and_stops_once_on_request() {
     });
 }
 
-/// A failed `session.start` append binds nothing and stops the workspace; with no
-/// `session.start` there is no `session.stop`.
+/// A failed `session.start` append binds nothing and stops the workspace. Its entry may have
+/// reached the log before the error, so a best-effort `session.stop` (`start-failed`) follows
+/// (security review L6): never a `session.start` without its stop.
 #[test]
 fn an_unaudited_session_start_binds_nothing_and_stops_the_workspace() {
     rt().block_on(async {
@@ -174,10 +175,48 @@ fn an_unaudited_session_start_binds_nothing_and_stops_the_workspace() {
         assert!(matches!(e, StartError::Audit(_)), "{e}");
         assert!(agent_socks(&r.sink.sockets).is_empty());
         assert!(r.reg.list().is_empty());
-        assert_eq!(session_events(&r.x), ["sandbox.launch", "sandbox.stop"]);
+        assert_eq!(
+            session_events(&r.x),
+            ["sandbox.launch", "session.stop", "sandbox.stop"]
+        );
+        assert_eq!(stops(&r.x), ["start-failed"]);
         let names = podman(&["ps", "-a", "--format", "{{.Names}}"]);
         let names = String::from_utf8_lossy(&names.stdout);
         assert!(!names.contains(&r.x.scope), "{names}");
+    });
+}
+
+/// Rust review HIGH: the workspace of a failed start that cannot be confirmed gone is not left to
+/// an untracked retry loop. It stays listed as stop-failed (with no desk: its session never
+/// started); a stop request retries it, and shutdown counts it while it still fails and clears
+/// it once it stops.
+#[test]
+fn a_failed_starts_workspace_not_confirmed_gone_stays_listed_and_is_retried() {
+    rt().block_on(async {
+        let r = registry();
+        r.x.events
+            .fail(&["session.start", "session.stop", "sandbox.stop"]);
+        let v = Arc::new(r.x.f.load(""));
+        let e = r.reg.start(v).await.unwrap_err();
+        assert!(matches!(e, StartError::Audit(_)), "{e}");
+        let listed = r.reg.list();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].state, SessionState::StopFailed);
+        let id = listed[0].id.clone();
+        assert!(r.reg.desk(&id).is_none() && r.reg.reporter(&id).is_none());
+        assert!(matches!(
+            r.reg.stop(&id, StopReason::Request).await,
+            Some(StopOutcome::Failed(_))
+        ));
+        assert_eq!(r.reg.shutdown().await, std::slice::from_ref(&id));
+        r.x.events.fail(&[]);
+        assert!(r.reg.shutdown().await.is_empty());
+        assert!(r.reg.list().is_empty());
+        assert!(
+            !session_events(&r.x)
+                .iter()
+                .any(|e| e.starts_with("session."))
+        );
     });
 }
 
@@ -420,5 +459,77 @@ fn rt_ag_08_a_foreign_session_id_reaches_only_its_own_session() {
                 Some(StopOutcome::Stopped)
             );
         }
+    });
+}
+
+/// RT-AG-15 (architect Q59; the maintainer's rule: once stop returns, nothing from the session
+/// has any further effect): a command running when the stop comes is killed by it, and its
+/// `tool.result` (`killed: session-stop`) is written before the session's `session.stop
+/// {in_flight: 0}`; after that entry no tool, approval or rpc entry of the session follows, and
+/// no process of the call is left. TODO(#65): a prompt pending at the stop joins this test once
+/// PR B gives the desk an approver (until then every prompt is denied `no-approver`); the
+/// withdraw and the parked write are unit-tested (`approvals::queue_tests`, `tools::tests`).
+#[test]
+fn rt_ag_15_nothing_of_a_session_follows_its_stop() {
+    rt().block_on(async {
+        let r = registry();
+        let at = r.x.f.root.join("home/code/rt15");
+        std::fs::create_dir_all(&at).unwrap();
+        let v = Arc::new(r.x.f.load(&format!(
+            "{}tools:\n  builtin: [fs_list, fs_write, shell]\n  shell: allow\n",
+            mounts(&[mount("~/code/rt15", "/workspace/p", "rw")])
+        )));
+        let s = r.reg.start(v).await.unwrap();
+        let sock = r.x.session_paths(&s.id).harness_sockets().join(AGENT_SOCK);
+        let dir = std::fs::File::open(sock.parent().unwrap()).unwrap();
+        let short = Path::new("/proc/self/fd")
+            .join(std::os::fd::AsRawFd::as_raw_fd(&dir).to_string())
+            .join(AGENT_SOCK);
+        let mut conn = tokio::net::UnixStream::connect(&short).await.unwrap();
+        let meta = json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+        let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"_meta": meta, "name": "shell",
+                       "arguments": {"cmd": ["sleep", "307"], "cwd": "/workspace/p"}}});
+        conn.write_all(format!("{call}\n").as_bytes())
+            .await
+            .unwrap();
+        until("the command runs", Duration::from_secs(30), || {
+            let (_, ps) = exec_in(&s.container, &["ps", "-o", "args"]);
+            ps.lines().any(|l| l.trim() == "sleep 307")
+        })
+        .await;
+        assert_eq!(
+            r.reg.stop(&s.id, StopReason::Request).await,
+            Some(StopOutcome::Stopped)
+        );
+        let all = r.x.events.all();
+        let stop = all
+            .iter()
+            .position(|(e, _)| e == "session.stop")
+            .expect("session.stop");
+        assert_eq!(all[stop].1["in_flight"], 0, "{all:#?}");
+        let result = all
+            .iter()
+            .position(|(e, a)| e == "tool.result" && a["tool"] == "shell")
+            .expect("the command's tool.result");
+        assert!(result < stop, "{all:#?}");
+        assert_eq!(all[result].1["killed"], "session-stop");
+        let after: Vec<&String> = all[stop + 1..].iter().map(|(e, _)| e).collect();
+        assert!(
+            after.iter().all(|e| e.starts_with("sandbox.")),
+            "entries after session.stop: {after:?}"
+        );
+        assert!(!exists(&s.container));
+        let left = std::fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .filter_map(|e| std::fs::read(e.path().join("cmdline")).ok())
+            .filter(|c| c.as_slice() == b"sleep\x00307\x00")
+            .count();
+        assert_eq!(left, 0, "a process of the call is left");
+        drop(conn);
     });
 }

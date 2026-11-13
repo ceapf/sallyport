@@ -18,6 +18,7 @@ pub mod args;
 pub mod dac;
 pub mod exec;
 pub mod fs;
+pub mod ops;
 pub mod path;
 pub mod procs;
 pub mod shell;
@@ -36,12 +37,17 @@ use sha2::{Digest as _, Sha256};
 use crate::approvals::action::{Action, Bound, Payload, Target, hex};
 use crate::approvals::queue::fields;
 use crate::approvals::{Executor, Prepared, Ticket};
+use crate::daemon::crash::CrashReporter;
 use crate::rpc::mcp::{Tool, ToolOutcome};
 use crate::rpc::record::{Recorder, escape};
 use crate::sandbox::UserIds;
 use args::Args;
 use fs::{FsError, RootSource};
+use ops::Ops;
 use shell::{Output, Runner, Status};
+
+/// The code of a call refused, or a write aborted, because its session is stopping (Q59).
+pub const STOPPING: &str = "session-stopping";
 
 /// Every built-in tool, in `tools/list` order.
 const ALL: [BuiltinTool; 6] = [
@@ -111,6 +117,10 @@ pub struct Parts<R> {
     pub record: Recorder,
     /// The session's exec gate (`Running::exec_gate`).
     pub exec_gate: Arc<tokio::sync::Mutex<()>>,
+    /// The session's operations, closed and drained by its stop (architect Q59).
+    pub ops: Ops,
+    /// The session's crash reporter: each run section is a task of its own.
+    pub crash: CrashReporter,
     /// The sandbox's identity, the launcher's own `UserIds` (the `--user` of the workspace): every
     /// file object is judged by it (architect ruling Q39). Never read from `getuid` here.
     pub ids: UserIds,
@@ -120,10 +130,17 @@ pub struct Parts<R> {
 
 /// The built-in tools of one session.
 pub struct Tools<R> {
+    core: Arc<Core<R>>,
+    crash: CrashReporter,
+}
+
+/// What a run section needs, shared with its task.
+struct Core<R> {
     builtin: Vec<BuiltinTool>,
     mounts: Vec<Mount>,
     record: Recorder,
     gate: Arc<tokio::sync::Mutex<()>>,
+    ops: Ops,
     ids: UserIds,
     shell: R,
 }
@@ -133,12 +150,16 @@ impl<R: Runner> Tools<R> {
     #[must_use]
     pub fn new(p: Parts<R>) -> Self {
         Self {
-            builtin: p.builtin,
-            mounts: p.mounts,
-            record: p.record,
-            gate: p.exec_gate,
-            ids: p.ids,
-            shell: p.shell,
+            core: Arc::new(Core {
+                builtin: p.builtin,
+                mounts: p.mounts,
+                record: p.record,
+                gate: p.exec_gate,
+                ops: p.ops,
+                ids: p.ids,
+                shell: p.shell,
+            }),
+            crash: p.crash,
         }
     }
 }
@@ -188,7 +209,7 @@ fn reply(v: &Value) -> ToolOutcome {
     }
 }
 
-impl<R: Runner> Tools<R> {
+impl<R: Runner> Core<R> {
     fn mount_of(&self, guest: &str) -> Option<&Mount> {
         self.mounts.iter().find(|m| m.guest == guest)
     }
@@ -339,12 +360,19 @@ impl<R: Runner> Tools<R> {
         let brokered = m.mode == MountMode::Brokered;
         // In the workspace's view the watchdog may be walking the same tree: hold the gate. The
         // guard moves into the blocking work, so a dropped call cannot release it while the
-        // write still runs (rust review M5).
+        // write still runs (rust review M5). A stop while it waits aborts it (Q59 (b)).
         let held = if brokered {
             None
         } else {
-            Some(Arc::clone(&self.gate).lock_owned().await)
+            tokio::select! {
+                g = Arc::clone(&self.gate).lock_owned() => Some(g),
+                () = self.ops.stopped() => return self.aborted(b).await,
+            }
         };
+        // The last point before the effect: once it begins it runs to its end.
+        if self.ops.is_closed() {
+            return self.aborted(b).await;
+        }
         let rel = t.rel.clone();
         let res = match content {
             Some(c) => {
@@ -383,6 +411,28 @@ impl<R: Runner> Tools<R> {
         self.record(Actor::Sallyd, "tool.result", None, r)
             .await
             .then_some(out)
+    }
+
+    /// The `tool.result` of a write or delete the session's stop kept from beginning.
+    async fn aborted(&self, b: &Bound) -> Option<ToolOutcome> {
+        let r = json!({
+            "call": b.call, "tool": b.action.tool(), "action_sha256": b.digest(),
+            "outcome": "aborted", "reason": ops::SESSION_STOP,
+        });
+        self.record(Actor::Sallyd, "tool.result", None, r)
+            .await
+            .then(|| failed(STOPPING))
+    }
+
+    /// The `tool.deny` of a call that arrived once the session's operations were closed.
+    async fn stopping(&self, b: &Bound) -> Option<ToolOutcome> {
+        let args = json!({"call": b.call, "tool": b.action.tool(), "code": STOPPING});
+        self.record(Actor::Sallyd, "tool.deny", Some("deny"), args)
+            .await
+            .then(|| ToolOutcome {
+                is_error: true,
+                text: format!("denied: {STOPPING}"),
+            })
     }
 
     async fn run_shell(&self, ticket: &Ticket, argv: &[String], cwd: &str) -> Option<ToolOutcome> {
@@ -445,11 +495,39 @@ fn shell_reply(o: &Output, exit: Value, killed: Value) -> ToolOutcome {
 impl<R: Runner> Executor for Tools<R> {
     fn tools(&self) -> Vec<Tool> {
         ALL.iter()
-            .filter(|t| self.builtin.contains(t))
+            .filter(|t| self.core.builtin.contains(t))
             .filter_map(|t| describe(*t))
             .collect()
     }
 
+    async fn prepare(
+        &self,
+        name: &str,
+        arguments: &Map<String, Value>,
+    ) -> Result<Prepared, &'static str> {
+        self.core.prepare(name, arguments).await
+    }
+
+    /// Q59: the call enters the session's operations or is denied `session-stopping`; its run
+    /// section, from `tool.run`/`tool.read` to `tool.result`, is a task of its own holding the
+    /// operation, so a caller dropped meanwhile loses no effect and no entry, and the session's
+    /// stop waits for it.
+    async fn run(&self, ticket: Ticket) -> Option<ToolOutcome> {
+        let Some(op) = self.core.ops.enter() else {
+            return self.core.stopping(ticket.bound()).await;
+        };
+        let core = Arc::clone(&self.core);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.crash.spawn("tool", async move {
+            let out = core.run(ticket).await;
+            drop(op);
+            let _ = tx.send(out);
+        });
+        rx.await.ok().flatten()
+    }
+}
+
+impl<R: Runner> Core<R> {
     async fn prepare(
         &self,
         name: &str,

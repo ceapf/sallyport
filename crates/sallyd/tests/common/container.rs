@@ -376,12 +376,19 @@ pub fn exiting_image() -> ImageRef {
     ImageRef::parse(r).unwrap()
 }
 
-/// Records every audit entry's event name and arguments.
+/// Records every audit entry's event name and arguments; appends of the events named by
+/// [`Events::fail`] fail, unrecorded.
 #[derive(Default)]
-pub struct Events(Mutex<Vec<(String, serde_json::Value)>>);
+pub struct Events(
+    Mutex<Vec<(String, serde_json::Value)>>,
+    Mutex<Vec<&'static str>>,
+);
 
 impl AuditSink for Events {
     fn append(&self, e: NewEntry, _: AuditLevel) -> Result<(), AuditError> {
+        if self.1.lock().unwrap().contains(&e.event()) {
+            return Err(AuditError::InvalidEntry("fake failure"));
+        }
         let args = e.arguments().clone();
         self.0.lock().unwrap().push((e.event().to_owned(), args));
         Ok(())
@@ -389,6 +396,12 @@ impl AuditSink for Events {
 }
 
 impl Events {
+    /// From now on, appends of `events` fail (an empty list: none does).
+    #[allow(dead_code)] // Not every test binary that includes this module fails appends.
+    pub fn fail(&self, events: &[&'static str]) {
+        *self.1.lock().unwrap() = events.to_vec();
+    }
+
     pub fn list(&self) -> Vec<String> {
         self.0
             .lock()

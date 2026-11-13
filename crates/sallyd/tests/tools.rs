@@ -12,11 +12,13 @@ use sallyd::approvals::Gated;
 use sallyd::approvals::policy::Policy;
 use sallyd::approvals::queue::{self, Approver, Client, Decision, Desk, Limits};
 use sallyd::approvals::render::Prompt;
+use sallyd::daemon::crash::CrashReporter;
 use sallyd::rpc::agent::ToolHandler;
 use sallyd::rpc::mcp::ToolOutcome;
 use sallyd::rpc::record::Recorder;
 use sallyd::sandbox::{DiskFloor, Running, staged_changes};
 use sallyd::tools::exec::PodmanExec;
+use sallyd::tools::ops::Ops;
 use sallyd::tools::shell::{Runner, Status};
 use sallyd::tools::{Parts, Tools, mounts as tool_mounts};
 use serde_json::{Value, json};
@@ -82,14 +84,17 @@ fn session(x: &Lx, v: &ValidatedManifest, r: &Running, timeout: Duration) -> Ses
         rec.clone(),
         Some(Arc::clone(&shown) as Arc<dyn Approver>),
     );
+    let ops = Ops::new();
     let tools = Tools::new(Parts {
         builtin: v.manifest().tools.builtin.clone(),
         mounts: tool_mounts(v, &r.init_dir()),
         record: rec,
         exec_gate: r.exec_gate(),
+        ops: ops.clone(),
+        crash: CrashReporter::channel().0,
         // The launcher's ids: the workspace's `--user`.
         ids: ids(),
-        shell: PodmanExec::new(x.podman.clone(), r),
+        shell: PodmanExec::new(x.podman.clone(), r, ops),
     });
     Session {
         gated: Gated::new(gate, tools),
@@ -186,7 +191,8 @@ fn a_command_past_its_time_limit_is_killed_with_what_it_started() {
         let x = Lx::new();
         let v = manifest(&x, "", "allow");
         let r = x.launch(&v, "limit").await.unwrap();
-        let run = PodmanExec::new(x.podman.clone(), &r).time_limit(Duration::from_secs(2));
+        let run =
+            PodmanExec::new(x.podman.clone(), &r, Ops::new()).time_limit(Duration::from_secs(2));
         let argv: Vec<String> = ["sh", "-c", "sleep 300 & exec sleep 301"]
             .iter()
             .map(|s| (*s).to_owned())
@@ -211,7 +217,7 @@ fn what_a_finished_command_left_running_is_killed() {
         let x = Lx::new();
         let v = manifest(&x, "", "allow");
         let r = x.launch(&v, "leftover").await.unwrap();
-        let run = PodmanExec::new(x.podman.clone(), &r);
+        let run = PodmanExec::new(x.podman.clone(), &r, Ops::new());
         let argv: Vec<String> = ["sh", "-c", "sleep 302 & echo hi"]
             .iter()
             .map(|s| (*s).to_owned())
@@ -247,7 +253,7 @@ fn an_argv_that_looks_like_podman_flags_is_the_command() {
         let x = Lx::new();
         let v = manifest(&x, "", "allow");
         let r = x.launch(&v, "flags").await.unwrap();
-        let run = PodmanExec::new(x.podman.clone(), &r);
+        let run = PodmanExec::new(x.podman.clone(), &r, Ops::new());
         for argv in [
             &["--privileged", "id"][..],
             &["--user=0", "id"],
@@ -274,7 +280,7 @@ fn a_dropped_call_kills_its_command() {
         let x = Lx::new();
         let v = manifest(&x, "", "allow");
         let r = x.launch(&v, "drop").await.unwrap();
-        let run = PodmanExec::new(x.podman.clone(), &r);
+        let run = PodmanExec::new(x.podman.clone(), &r, Ops::new());
         let h = tokio::spawn(async move { run.run(&["sleep".into(), "303".into()], "/").await });
         // Started and found: the runner gives the exec gate back once it holds the pidfd.
         let gate = r.exec_gate();
@@ -304,7 +310,7 @@ fn the_exec_gate_is_held_only_while_a_command_starts() {
         let r = x.launch(&v, "gate").await.unwrap();
         let gate = r.exec_gate();
         let held = Arc::clone(&gate).lock_owned().await;
-        let run = PodmanExec::new(x.podman.clone(), &r);
+        let run = PodmanExec::new(x.podman.clone(), &r, Ops::new());
         let h = tokio::spawn(async move { run.run(&["sleep".into(), "304".into()], "/").await });
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert_eq!(
@@ -349,7 +355,7 @@ fn rt_ag_09_stage_size_is_enforced_during_one_long_exec() {
             mounts(&[mount("~/code/other", "/workspace/o", "staged")])
         ));
         let r = x.launch(&v, "longexec").await.unwrap();
-        let run = PodmanExec::new(x.podman.clone(), &r);
+        let run = PodmanExec::new(x.podman.clone(), &r, Ops::new());
         let script = "dd if=/dev/zero of=/workspace/o/f bs=1M count=96 2>/dev/null; sleep 120";
         let argv: Vec<String> = ["sh", "-c", script]
             .iter()

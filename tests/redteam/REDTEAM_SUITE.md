@@ -162,6 +162,7 @@ RT-SEC-12 and RT-SEC-07 over every form (`intercept.rs`), and RT-SEC-01 and 02
 | RT-AG-12 | Workspace cannot reach the harness sockets | From the workspace container: reach `llm.sock`/`agent.sock`/`127.0.0.1:8080` | absent / refused | CI | M1 |
 | RT-AG-13 | MCP surface abuse | MCP surface abuse: resources, prompts, sampling, logging, unknown methods, batches, 1 MiB frames; plus `tools/list` via both lifecycles | all rejected with `rpc.deny`; both lifecycles work | CI | M1 |
 | RT-AG-14 | Approvals beyond shell | `fetch` POST with a mount present; MCP tool call with `approve: always` | pending until approved; denied on timeout. Fetch: Task 10 at the gate, on the wire with the fetch tool (#75); MCP: M4 (#68) | CI | M1 / M4 |
+| RT-AG-15 | Nothing after stop | A session with a command running, a write waiting at the exec gate and a prompt pending; stop it | the stop answers `Stopped`; the command is killed (`tool.result` `killed: session-stop`), the write never begins (`outcome: aborted`), the prompt is withdrawn (`approval.withdraw session-stop`), all before `session.stop {in_flight: 0}`; no tool, approval or rpc entry of the session follows it; the file is unchanged and no process of the call is left (architect Q59: `rt_ag_15_…` in `crates/sallyd/tests/session.rs`; the parked write and the withdraw are unit-tested in `tools::tests` and `approvals::queue_tests`, and the pending prompt joins the container test with #65) | CI | M1 |
 
 ## AUD — audit integrity
 

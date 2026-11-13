@@ -545,6 +545,64 @@ async fn no_decision_slips_in_while_a_deny_all_session_is_written() {
     assert_eq!(hb.await.unwrap(), Err(Refusal::Denied("session-denied")));
 }
 
+/// Q59 (a) step 3: the session's stop takes every shown prompt out of the queue with
+/// `approval.withdraw session-stop` (sallyd's), its asker is denied, a later approve of it is
+/// refused, and from then on no call queues: `approval.deny session-stopping`, never shown.
+#[tokio::test]
+async fn the_session_stop_withdraws_every_prompt_and_queues_no_more() {
+    let f = fx(5);
+    let (a, ha) = asking(&f, shell(7, &["ls"])).await;
+    let (b, hb) = asking(&f, shell(8, &["ls"])).await;
+    f.desk.stop().await;
+    assert!(f.desk.list().is_empty());
+    for h in [ha, hb] {
+        assert_eq!(h.await.unwrap(), Err(Refusal::Denied("withdrawn")));
+    }
+    assert_eq!(count(&f.sink, "approval.withdraw"), 2);
+    let w = f.sink.last("approval.withdraw");
+    assert_eq!(w["reason"], "session-stop");
+    assert!(f.sink.rows().last().unwrap().debug.contains("Sallyd"));
+    for id in [&a, &b] {
+        assert_eq!(
+            f.desk.decide(id, Decision::Approve, ME).await,
+            Err(DecideError::UnknownId)
+        );
+    }
+    let shown = f.fake.requested.lock().unwrap().len();
+    let r = f.gate.admit(shell(9, &["ls"]), None, None).await;
+    assert_eq!(r, Err(Refusal::Denied("session-stopping")));
+    assert_eq!(f.sink.last("approval.deny")["reason"], "session-stopping");
+    assert_eq!(f.fake.requested.lock().unwrap().len(), shown, "never shown");
+    // Stopping twice changes nothing.
+    f.desk.stop().await;
+    assert_eq!(count(&f.sink, "approval.withdraw"), 2);
+}
+
+/// A prompt queued but not yet shown when the stop comes is never shown: its asker leaves with
+/// the stop's reason.
+#[tokio::test]
+async fn a_prompt_not_yet_shown_at_the_stop_is_never_shown() {
+    let f = fx(5);
+    let b = shell(5, &["ls"]);
+    let Ok((id, _, _rx)) = f.gate.inner.queue(&b, None, vec![]) else {
+        panic!("not queued");
+    };
+    f.desk.stop().await;
+    assert!(matches!(
+        f.gate.inner.announce(&id),
+        Err(NotQueued::Withdrawn(Withdraw::SessionStop))
+    ));
+    assert!(f.fake.requested.lock().unwrap().is_empty());
+    assert_eq!(
+        f.gate
+            .inner
+            .withdrawn_before_shown(5, Some(&id), Withdraw::SessionStop)
+            .await,
+        Refusal::Denied("withdrawn")
+    );
+    assert_eq!(f.sink.last("approval.withdraw")["reason"], "session-stop");
+}
+
 #[tokio::test]
 async fn a_withdraw_before_the_prompt_is_shown_keeps_its_reason() {
     let f = fx(5);

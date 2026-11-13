@@ -14,6 +14,9 @@
 //! 3. Wait for the client up to the time limit; past it, kill the call ([`procs::kill_set`],
 //!    repeated until a snapshot finds none) and report `killed: timeout`. After a normal exit
 //!    what the command left behind in its session is killed too: one reply per call.
+//!    The session's stop (architect Q59 (c)) is watched at the gate, during the search and
+//!    during the wait: it takes the same awaited kill as a timeout, `killed: session-stop`,
+//!    finished before the call's `tool.result`.
 //! 4. Dropped at any await (session teardown): the client is killed (`kill_on_drop`), the
 //!    started process is sent `SIGKILL` through its pidfd at once, and the call's session is
 //!    killed off the runtime; the output readers are aborted. The container's removal ends the
@@ -34,6 +37,7 @@ use rustix::fs::{Mode, OFlags};
 use rustix::process::{Pid, PidfdFlags, Signal};
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 
+use super::ops::{Ops, SESSION_STOP};
 use super::procs::{self, Call, Snapshot, Stat};
 use super::shell::{Captured, Output, Runner, START_LIMIT, Status, TIME_LIMIT, exec_argv};
 use crate::sandbox::{Podman, Running};
@@ -63,13 +67,16 @@ struct Inner {
     init_dir: Arc<OwnedFd>,
     gate: Arc<tokio::sync::Mutex<()>>,
     time_limit: Duration,
+    /// The session's operations: their stop kills a running call (`killed: session-stop`).
+    ops: Ops,
 }
 
 impl PodmanExec {
-    /// The runner for `running`'s container, through hermetic `podman`, with [`TIME_LIMIT`].
+    /// The runner for `running`'s container, through hermetic `podman`, with [`TIME_LIMIT`]; the
+    /// stop of `ops` kills what it runs (architect Q59 (c)).
     #[must_use]
-    pub fn new(podman: Podman, running: &Running) -> Self {
-        Self::with(podman, running, TIME_LIMIT)
+    pub fn new(podman: Podman, running: &Running, ops: Ops) -> Self {
+        Self::with(podman, running, TIME_LIMIT, ops)
     }
 
     /// The same runner with another time limit per command.
@@ -83,11 +90,12 @@ impl PodmanExec {
                 init_dir: Arc::clone(&i.init_dir),
                 gate: Arc::clone(&i.gate),
                 time_limit: limit,
+                ops: i.ops.clone(),
             }),
         }
     }
 
-    fn with(podman: Podman, running: &Running, time_limit: Duration) -> Self {
+    fn with(podman: Podman, running: &Running, time_limit: Duration, ops: Ops) -> Self {
         Self {
             inner: Arc::new(Inner {
                 podman,
@@ -95,6 +103,7 @@ impl PodmanExec {
                 init_dir: running.init_dir(),
                 gate: running.exec_gate(),
                 time_limit,
+                ops,
             }),
         }
     }
@@ -242,7 +251,11 @@ impl Runner for PodmanExec {
             stdout: take(&stdout),
             stderr: take(&stderr),
         };
-        let gate = Arc::clone(&me.gate).lock_owned().await;
+        let gate = tokio::select! {
+            g = Arc::clone(&me.gate).lock_owned() => g,
+            // Nothing started yet: nothing to kill.
+            () = me.ops.stopped() => return out(Status::Killed(SESSION_STOP)),
+        };
         let Some(Some(before)) = blocking(me, |i| i.snapshot()).await else {
             return out(Status::Failed(
                 "cannot list the container's processes".into(),
@@ -275,13 +288,17 @@ impl Runner for PodmanExec {
             pidfd: None,
             session: None,
         };
-        let call = match self.find_started(&before, &mut child).await {
-            Found::Started(call, fd) => {
+        let found = tokio::select! {
+            f = self.find_started(&before, &mut child) => Some(f),
+            () = me.ops.stopped() => None,
+        };
+        let call = match found {
+            Some(Found::Started(call, fd)) => {
                 guard.pidfd = Some(fd);
                 Some(call)
             }
-            Found::Exited(call) => call,
-            Found::Lost => {
+            Some(Found::Exited(call)) => call,
+            lost @ (Some(Found::Lost) | None) => {
                 let _ = child.kill().await;
                 // Whatever the dead client may still have started is new since `before`.
                 let call = blocking(me, move |i| i.quick_session(&before))
@@ -289,19 +306,28 @@ impl Runner for PodmanExec {
                     .flatten();
                 drop(gate);
                 kill(me, call).await;
-                return out(Status::Killed("start-timeout"));
+                let why = if lost.is_none() {
+                    SESSION_STOP
+                } else {
+                    "start-timeout"
+                };
+                return out(Status::Killed(why));
             }
         };
         drop(gate);
         guard.session = call.map(|c| (Arc::clone(me), c));
-        let status = match tokio::time::timeout(me.time_limit, child.wait()).await {
-            Ok(Ok(s)) => Status::Exited(
-                s.code()
-                    .or_else(|| s.signal().map(|n| 128 + n))
-                    .unwrap_or(-1),
-            ),
-            Ok(Err(e)) => Status::Failed(format!("podman exec: {e}")),
-            Err(_) => Status::Killed("timeout"),
+        let status = tokio::select! {
+            r = tokio::time::timeout(me.time_limit, child.wait()) => match r {
+                Ok(Ok(s)) => Status::Exited(
+                    s.code()
+                        .or_else(|| s.signal().map(|n| 128 + n))
+                        .unwrap_or(-1),
+                ),
+                Ok(Err(e)) => Status::Failed(format!("podman exec: {e}")),
+                Err(_) => Status::Killed("timeout"),
+            },
+            // The same awaited kill as a timeout, finished before `tool.result` (Q59 (c)).
+            () = me.ops.stopped() => Status::Killed(SESSION_STOP),
         };
         // Also after a normal exit: what the command left running ends with the call. Its top
         // has exited then, so only its session is followed (its pid could be another's now).
@@ -311,7 +337,7 @@ impl Runner for PodmanExec {
         };
         kill(me, left).await;
         guard.session = None;
-        if status == Status::Killed("timeout")
+        if matches!(status, Status::Killed(_))
             && tokio::time::timeout(REAP_LIMIT, child.wait())
                 .await
                 .is_err()

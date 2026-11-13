@@ -1,19 +1,18 @@
 //! The session registry (Task 12, architect Q57): it starts sessions in a fixed order, supervises
-//! each one in its own task, and ends it exactly once.
+//! each one in its own task ([`super::supervise`]), and ends it exactly once.
 //!
 //! Start: `launch_workspace` (overlap and fd budget reserved, `sandbox.launch` audited) → the
 //! init's exit watch → approvals, tools and the agent server built in memory → audit
 //! `session.start {model:{kind:"none"}}` → bind `agent.sock` (0600) in the session's harness
 //! socket directory → listen. A failed launch is the launcher's `sandbox.refuse` only; a failed
-//! `session.start` append binds nothing and stops the workspace; any failure after it ends the
-//! session with `start-failed`. Every `session.start` gets exactly one `session.stop`.
+//! `session.start` append binds nothing, writes a best-effort `session.stop` (`start-failed`: the
+//! entry may have reached the log) and stops the workspace; any failure after it ends the session
+//! with `start-failed`. Every `session.start` gets exactly one `session.stop`. A start runs in its
+//! own task: a caller that goes away mid-start leaves nothing half-made.
 //!
-//! Stop ([`StopReason`]): `session.timeout` (timeout) or `session.crash` (crash) first, then
-//! `session.stop`, then the agent listener is shut down (calls still waiting on an approval are
-//! dropped, which denies them), then `Launcher::stop`, retried a bounded number of times. A
-//! session whose container could not be confirmed gone stays listed as stop-failed, keeping its
-//! claims and its disk watchdog, and a later stop request or [`Registry::shutdown`] retries it.
-//! A failed entry still tears down; the oplog records it.
+//! A workspace that cannot be confirmed gone, whether its session started or not, stays listed
+//! as stop-failed, keeping its claims and its disk watchdog; a later stop request or
+//! [`Registry::shutdown`] retries it, and shutdown counts what is still unconfirmed.
 
 use std::collections::HashMap;
 use std::io;
@@ -29,33 +28,30 @@ use tokio::sync::RwLock;
 use tokio::sync::{mpsc, oneshot};
 
 use super::exit::Exit;
+use super::supervise::{Request, Supervised};
 use super::types::{StopReason, fresh_id};
 use crate::approvals::Gated;
 use crate::approvals::policy::Policy;
 use crate::approvals::queue::{self, Desk, Limits};
-use crate::daemon::crash::{Crash, CrashReceiver, CrashReporter};
+use crate::daemon::crash::CrashReporter;
 use crate::egress::net::bind;
 use crate::oplog::Oplog;
 use crate::rpc::agent::Agent;
-use crate::rpc::listen::Handle;
 use crate::rpc::record::Recorder;
 use crate::sandbox::{
-    AuditSink, ImageRef, LaunchError, Launcher, Podman, Running, SessionPaths, UserIds,
+    ArgvError, AuditSink, ImageRef, LaunchError, Launcher, Podman, Running, SessionPaths, UserIds,
     WorkspaceRequest,
 };
 use crate::tools::exec::PodmanExec;
+use crate::tools::ops::Ops;
 use crate::tools::{self, Parts, Tools};
 
 /// The session's tool socket in its harness socket directory.
 pub const AGENT_SOCK: &str = "agent.sock";
-/// `Launcher::stop` attempts per stop before the session is left stop-failed.
-const STOP_ATTEMPTS: u32 = 3;
-/// Pause between two `Launcher::stop` attempts.
-const STOP_RETRY: Duration = Duration::from_secs(2);
 /// Stop requests queued per session.
 const REQUESTS: usize = 16;
 /// The oplog component.
-const LOG: &str = "session";
+pub(super) const LOG: &str = "session";
 
 /// What the registry is built from.
 pub struct RegistryParts {
@@ -89,7 +85,8 @@ pub struct RegistryParts {
 pub enum SessionState {
     /// Started and not yet stopping.
     Running,
-    /// Its container could not be confirmed gone; a stop request retries.
+    /// Its container could not be confirmed gone (or operations of it were still running); a
+    /// stop request retries.
     StopFailed,
 }
 
@@ -116,6 +113,9 @@ pub enum StartError {
     /// No session id could be drawn.
     #[error("session id: {0}")]
     Id(#[source] io::Error),
+    /// The session's paths could not be formed.
+    #[error("session paths: {0}")]
+    Paths(#[source] ArgvError),
     /// The workspace was refused (`sandbox.refuse` is audited).
     #[error(transparent)]
     Launch(#[from] LaunchError),
@@ -128,9 +128,12 @@ pub enum StartError {
     /// `agent.sock` could not be bound; the session ended `start-failed`.
     #[error("{AGENT_SOCK}: {0}")]
     Socket(#[source] io::Error),
-    /// A background task failed.
-    #[error("internal: {0}")]
-    Internal(String),
+    /// An audit append's task failed.
+    #[error("audit task: {0}")]
+    Join(#[source] tokio::task::JoinError),
+    /// The start's own task ended without an answer (it panicked; `sallyd` is stopping).
+    #[error("the start task ended: {0}")]
+    Task(#[source] oneshot::error::RecvError),
 }
 
 /// How a stop ended.
@@ -138,36 +141,30 @@ pub enum StartError {
 pub enum StopOutcome {
     /// The container is gone and the session released.
     Stopped,
-    /// The container could not be confirmed gone; the session stays listed as stop-failed.
+    /// The container could not be confirmed gone, or operations of the session still run; the
+    /// session stays listed as stop-failed.
     Failed(String),
 }
 
-type Reply = oneshot::Sender<StopOutcome>;
+pub(super) type Reply = oneshot::Sender<StopOutcome>;
 
-struct Live {
-    info: SessionInfo,
-    desk: Desk,
-    crash: CrashReporter,
-    requests: mpsc::Sender<(StopReason, Option<Reply>)>,
+pub(super) struct Live {
+    pub(super) info: SessionInfo,
+    /// `None` for a workspace whose session never started.
+    desk: Option<Desk>,
+    crash: Option<CrashReporter>,
+    requests: mpsc::Sender<Request>,
 }
 
-/// What a session's supervisor owns.
-struct Supervised {
-    sid: String,
-    level: AuditLevel,
-    timeout: Duration,
-    running: Running,
-    agent: Option<Handle>,
-    exit: Exit,
-    crashes: CrashReceiver,
-    requests: mpsc::Receiver<(StopReason, Option<Reply>)>,
-    /// Set when the session must end at once (`start-failed`).
-    first: Option<StopReason>,
+/// A stop request on its way: the session id and where its answer comes.
+struct Asked {
+    id: String,
+    done: oneshot::Receiver<StopOutcome>,
 }
 
 /// Every live session of one `sallyd`. Shared as `Arc<Registry>`.
 pub struct Registry {
-    p: RegistryParts,
+    pub(super) p: RegistryParts,
     live: Mutex<HashMap<String, Live>>,
     closing: AtomicBool,
     /// Held shared by every start from before its `closing` check to its insertion, and once
@@ -193,7 +190,7 @@ impl Registry {
         })
     }
 
-    fn live(&self) -> std::sync::MutexGuard<'_, HashMap<String, Live>> {
+    pub(super) fn live(&self) -> std::sync::MutexGuard<'_, HashMap<String, Live>> {
         self.live.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -208,31 +205,44 @@ impl Registry {
     /// The approvals desk of session `id`, for control-side clients.
     #[must_use]
     pub fn desk(&self, id: &str) -> Option<Desk> {
-        self.live().get(id).map(|l| l.desk.clone())
+        self.live().get(id).and_then(|l| l.desk.clone())
     }
 
     /// The crash reporter of session `id`, for a session task started after the session (the
     /// `llm.sock` listener): a panic it reports ends the session `crash`.
     #[must_use]
     pub fn reporter(&self, id: &str) -> Option<CrashReporter> {
-        self.live().get(id).map(|l| l.crash.clone())
+        self.live().get(id).and_then(|l| l.crash.clone())
     }
 
-    async fn audit(&self, entry: NewEntry, level: AuditLevel) -> Result<(), StartError> {
+    pub(super) async fn audit(&self, entry: NewEntry, level: AuditLevel) -> Result<(), StartError> {
         let sink = Arc::clone(&self.p.audit);
         tokio::task::spawn_blocking(move || sink.append(entry, level))
             .await
-            .map_err(|e| StartError::Internal(e.to_string()))?
+            .map_err(StartError::Join)?
             .map_err(StartError::Audit)
     }
 
-    /// Starts a session for `manifest` and returns it once `agent.sock` is served.
+    /// Starts a session for `manifest` and returns it once `agent.sock` is served. The start
+    /// runs in a task of its own: dropping this future does not interrupt it.
     ///
     /// # Errors
     /// [`StartError`]. Nothing of the session is left running, except a container that could not
-    /// be confirmed gone after a failure past `session.start` (listed as stop-failed).
+    /// be confirmed gone (listed as stop-failed).
     pub async fn start(
         self: &Arc<Self>,
+        manifest: Arc<ValidatedManifest>,
+    ) -> Result<SessionInfo, StartError> {
+        let this = Arc::clone(self);
+        let (tx, rx) = oneshot::channel();
+        self.p.crash.spawn("session", async move {
+            let _ = tx.send(this.start_owned(manifest).await);
+        });
+        rx.await.map_err(StartError::Task)?
+    }
+
+    async fn start_owned(
+        self: Arc<Self>,
         manifest: Arc<ValidatedManifest>,
     ) -> Result<SessionInfo, StartError> {
         let _start = self.starts.read().await;
@@ -241,8 +251,8 @@ impl Registry {
         }
         let id = fresh_id(&self.p.scope).map_err(StartError::Id)?;
         let sid = id.as_str().to_owned();
-        let paths = SessionPaths::new(id, &self.p.sockets, &self.p.data)
-            .map_err(|e| StartError::Internal(e.to_string()))?;
+        let paths =
+            SessionPaths::new(id, &self.p.sockets, &self.p.data).map_err(StartError::Paths)?;
         let (crash, crashes) = CrashReporter::channel();
         let running = self
             .p
@@ -254,16 +264,17 @@ impl Registry {
                 crash: crash.clone(),
             })
             .await?;
+        let v = manifest.manifest();
         let exit = match Exit::watch(running.init_dir()) {
             Ok(x) => x,
             Err(e) => {
-                self.discard(running).await;
+                self.discard(running, &v.name).await;
                 return Err(StartError::Exited(e));
             }
         };
-        let v = manifest.manifest();
         let level = v.audit.level;
-        let agent = self.agent(&manifest, &running, &sid, level);
+        let ops = Ops::new();
+        let (agent, desk) = self.agent(&manifest, &running, &sid, level, &ops, &crash);
         let start = NewEntry::new(Actor::Sallyd, "session.start")
             .session(&sid)
             .decision("allow")
@@ -276,13 +287,18 @@ impl Registry {
             self.p
                 .oplog
                 .error(LOG, "session.start not audited", &[("session", &sid)]);
-            self.discard(running).await;
+            // The entry may have reached the log before the error (L6): close it, best effort.
+            let stop = NewEntry::new(Actor::Sallyd, "session.stop")
+                .session(&sid)
+                .args(json!({"reason": StopReason::StartFailed.as_str(), "in_flight": 0}));
+            let _ = self.audit(stop, level).await;
+            self.discard(running, &v.name).await;
             return Err(e);
         }
         let sock = running.paths().harness_sockets().join(AGENT_SOCK);
         let (handle, first, failed) = match bind(&sock) {
             Ok(l) => (
-                Some(agent.0.listen(l, self.p.ids.uid, crash.clone())),
+                Some(agent.listen(l, self.p.ids.uid, crash.clone())),
                 None,
                 None,
             ),
@@ -299,8 +315,8 @@ impl Registry {
             sid.clone(),
             Live {
                 info: info.clone(),
-                desk: agent.1,
-                crash,
+                desk: Some(desk.clone()),
+                crash: Some(crash),
                 requests: tx.clone(),
             },
         );
@@ -310,12 +326,14 @@ impl Registry {
             timeout: Duration::from_secs(v.runtime.timeout.as_secs()),
             running,
             agent: handle,
+            desk,
+            ops,
             exit,
             crashes,
             requests: rx,
             first,
         };
-        let this = Arc::clone(self);
+        let this = Arc::clone(&self);
         self.p
             .crash
             .spawn("session", async move { this.supervise(s).await });
@@ -343,6 +361,8 @@ impl Registry {
         running: &Running,
         sid: &str,
         level: AuditLevel,
+        ops: &Ops,
+        crash: &CrashReporter,
     ) -> (Arc<Agent<Gated<Tools<PodmanExec>>>>, Desk) {
         let v = manifest.manifest();
         let rec = Recorder::new(Arc::clone(&self.p.audit), sid.to_owned(), level);
@@ -359,210 +379,160 @@ impl Registry {
             mounts: tools::mounts(manifest, &running.init_dir()),
             record: rec.clone(),
             exec_gate: running.exec_gate(),
+            ops: ops.clone(),
+            crash: crash.clone(),
             ids: self.p.ids,
-            shell: PodmanExec::new(self.p.podman.clone(), running),
+            shell: PodmanExec::new(self.p.podman.clone(), running, ops.clone()),
         });
         (Arc::new(Agent::new(Gated::new(gate, tools), rec)), desk)
     }
 
-    /// Stops a workspace whose session never started (no `session.start`, so no `session.stop`).
-    async fn discard(&self, running: Running) {
-        let sid = running.paths().id().as_str().to_owned();
-        if let Err(r) = self.stop_bounded(running).await {
-            // Nobody holds the session: keep retrying, as an unreceived launch does.
-            self.p.oplog.error(
-                LOG,
-                "workspace of a failed start not confirmed gone",
-                &[("session", &sid)],
-            );
-            let launcher = Arc::clone(&self.p.launcher);
-            let mut r = *r;
-            self.p.crash.spawn("session", async move {
-                loop {
-                    tokio::time::sleep(STOP_RETRY).await;
-                    match launcher.stop(r).await {
-                        Ok(()) => return,
-                        Err(e) => r = e.running,
-                    }
-                }
-            });
+    /// Stops a workspace whose session never started (no `session.start`, so no
+    /// `session.stop`). One that cannot be confirmed gone stays listed as stop-failed, under a
+    /// supervisor that retries it on request (and at shutdown).
+    async fn discard(self: &Arc<Self>, running: Running, manifest: &str) {
+        let Err(r) = self.stop_bounded(running).await else {
+            return;
+        };
+        let sid = r.paths().id().as_str().to_owned();
+        self.p.oplog.error(
+            LOG,
+            "workspace of a failed start not confirmed gone",
+            &[("session", &sid)],
+        );
+        let (tx, rx) = mpsc::channel(REQUESTS);
+        self.live().insert(
+            sid.clone(),
+            Live {
+                info: SessionInfo {
+                    id: sid.clone(),
+                    manifest: manifest.to_owned(),
+                    container: r.name().to_owned(),
+                    state: SessionState::StopFailed,
+                },
+                desk: None,
+                crash: None,
+                requests: tx,
+            },
+        );
+        let this = Arc::clone(self);
+        self.p.crash.spawn("session", async move {
+            this.retry_stop(sid, *r, Vec::new(), rx, StopReason::StartFailed)
+                .await;
+        });
+    }
+
+    /// Sends a stop request to session `id`. `Err`: the outcome is already known (`None`: no
+    /// such session).
+    async fn ask(&self, id: &str, reason: StopReason) -> Result<Asked, Option<StopOutcome>> {
+        let requests = self
+            .live()
+            .get(id)
+            .map(|l| l.requests.clone())
+            .ok_or(None)?;
+        let (reply, done) = oneshot::channel();
+        if requests.send((reason, Some(reply))).await.is_err() {
+            return Err(Some(self.supervisor_gone(id)));
+        }
+        Ok(Asked {
+            id: id.to_owned(),
+            done,
+        })
+    }
+
+    /// The answer to a request.
+    async fn answer(&self, asked: Asked) -> StopOutcome {
+        match asked.done.await {
+            Ok(o) => o,
+            Err(_) => self.supervisor_gone(&asked.id),
         }
     }
 
-    /// `Launcher::stop`, at most [`STOP_ATTEMPTS`] times.
-    async fn stop_bounded(&self, running: Running) -> Result<(), Box<Running>> {
-        let mut r = running;
-        for attempt in 1..=STOP_ATTEMPTS {
-            match self.p.launcher.stop(r).await {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    let detail = e.error.to_string();
-                    self.p.oplog.warn(
-                        LOG,
-                        "workspace stop failed",
-                        &[
-                            ("session", e.running.paths().id().as_str()),
-                            ("attempt", &attempt.to_string()),
-                            ("detail", &detail),
-                        ],
-                    );
-                    r = e.running;
-                }
-            }
-            if attempt < STOP_ATTEMPTS {
-                tokio::time::sleep(STOP_RETRY).await;
-            }
+    /// No supervisor answers for `id`. It removed its entry when the session ended (then the
+    /// session is stopped); an entry still there means the supervisor died with it.
+    fn supervisor_gone(&self, id: &str) -> StopOutcome {
+        let outcome = unanswered(&mut self.live(), id);
+        if outcome != StopOutcome::Stopped {
+            self.p
+                .oplog
+                .error(LOG, "session supervisor ended", &[("session", id)]);
         }
-        Err(Box::new(r))
+        outcome
     }
 
     /// Asks session `id` to stop and waits for the outcome. `None`: no such session.
     pub async fn stop(&self, id: &str, reason: StopReason) -> Option<StopOutcome> {
-        let requests = self.live().get(id).map(|l| l.requests.clone())?;
-        let (reply, done) = oneshot::channel();
-        if requests.send((reason, Some(reply))).await.is_err() {
-            // The supervisor ended between the lookup and the send: the session is gone.
-            return Some(StopOutcome::Stopped);
+        match self.ask(id, reason).await {
+            Ok(asked) => Some(self.answer(asked).await),
+            Err(known) => known,
         }
-        Some(done.await.unwrap_or(StopOutcome::Stopped))
     }
 
-    /// Refuses new sessions and stops every live one (`shutdown`). The ids of sessions whose
-    /// container could not be confirmed gone; `sallyd` then exits non-zero.
+    /// Refuses new sessions and stops every live one (`shutdown`), all at once. The ids of
+    /// sessions whose container could not be confirmed gone; `sallyd` then exits non-zero.
     pub async fn shutdown(&self) -> Vec<String> {
         self.closing.store(true, Ordering::SeqCst);
         // Waits out every start already past its check; later ones see `closing`.
         drop(self.starts.write().await);
         let ids: Vec<String> = self.live().keys().cloned().collect();
+        let mut asked = Vec::new();
         let mut unconfirmed = Vec::new();
         for id in ids {
-            if let Some(StopOutcome::Failed(_)) = self.stop(&id, StopReason::Shutdown).await {
+            match self.ask(&id, StopReason::Shutdown).await {
+                Ok(a) => asked.push(a),
+                Err(Some(StopOutcome::Failed(_))) => unconfirmed.push(id),
+                Err(_) => {}
+            }
+        }
+        for a in asked {
+            let id = a.id.clone();
+            if let StopOutcome::Failed(_) = self.answer(a).await {
                 unconfirmed.push(id);
             }
         }
+        unconfirmed.sort();
         unconfirmed
     }
+}
 
-    /// One session's life after its start: wait for a reason, end it once, then retry a failed
-    /// stop on request.
-    async fn supervise(self: Arc<Self>, s: Supervised) {
-        let Supervised {
-            sid,
-            level,
-            timeout,
-            running,
-            agent,
-            exit,
-            mut crashes,
-            mut requests,
-            first,
-        } = s;
-        let mut replies = Vec::new();
-        let reason = match first {
-            Some(r) => r,
-            None => {
-                tokio::select! {
-                    r = requests.recv() => match r {
-                        Some((r, reply)) => {
-                            replies.extend(reply);
-                            r
-                        }
-                        None => StopReason::Shutdown,
-                    },
-                    () = tokio::time::sleep(timeout) => StopReason::Timeout,
-                    Some(c) = crashes.recv() => {
-                        self.crashed(&sid, level, &c).await;
-                        StopReason::Crash
-                    }
-                    () = exit.exited() => StopReason::Exited,
-                }
-            }
-        };
-        self.ending(&sid, level, reason, timeout).await;
-        if let Some(h) = agent {
-            h.shutdown().await;
-        }
-        let mut running = running;
-        loop {
-            match self.stop_bounded(running).await {
-                Ok(()) => {
-                    self.live().remove(&sid);
-                    requests.close();
-                    while let Ok((_, reply)) = requests.try_recv() {
-                        replies.extend(reply);
-                    }
-                    for r in replies.drain(..) {
-                        let _ = r.send(StopOutcome::Stopped);
-                    }
-                    self.p.oplog.info(
-                        LOG,
-                        "session stopped",
-                        &[("session", &sid), ("reason", reason.as_str())],
-                    );
-                    return;
-                }
-                Err(r) => {
-                    running = *r;
-                    self.p.oplog.error(
-                        LOG,
-                        "session container not confirmed gone",
-                        &[("session", &sid)],
-                    );
-                    if let Some(l) = self.live().get_mut(&sid) {
-                        l.info.state = SessionState::StopFailed;
-                    }
-                    let why = format!("the container of session {sid} could not be confirmed gone");
-                    for r in replies.drain(..) {
-                        let _ = r.send(StopOutcome::Failed(why.clone()));
-                    }
-                    match requests.recv().await {
-                        Some((_, reply)) => replies.extend(reply),
-                        // Unreachable while the registry holds the sender; retry anyway.
-                        None => tokio::time::sleep(STOP_RETRY).await,
-                    }
-                }
-            }
-        }
+/// What a stop of `id` answers when no supervisor took or answered the request. A supervisor
+/// removes its entry when its session ends, so no entry means stopped; an entry still listed
+/// means the supervisor died with the session (rust review M4): it is dropped from the listing
+/// and the stop fails, never reported `Stopped`.
+fn unanswered(live: &mut HashMap<String, Live>, id: &str) -> StopOutcome {
+    if live.remove(id).is_none() {
+        return StopOutcome::Stopped;
     }
+    StopOutcome::Failed(format!("the supervisor of session {id} ended"))
+}
 
-    /// Q47: the oplog line, then `session.crash`. A failed append still ends the session.
-    async fn crashed(&self, sid: &str, level: AuditLevel, c: &Crash) {
-        self.p.oplog.error(
-            LOG,
-            "session task panicked",
-            &[("session", sid), ("task", c.task), ("payload", &c.payload)],
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_session_whose_supervisor_died_fails_its_stop_once() {
+        let (requests, _) = mpsc::channel(1);
+        let mut live = HashMap::from([(
+            "s-1".to_owned(),
+            Live {
+                info: SessionInfo {
+                    id: "s-1".into(),
+                    manifest: "m".into(),
+                    container: "c".into(),
+                    state: SessionState::Running,
+                },
+                desk: None,
+                crash: None,
+                requests,
+            },
+        )]);
+        assert_eq!(
+            unanswered(&mut live, "s-1"),
+            StopOutcome::Failed("the supervisor of session s-1 ended".into())
         );
-        let entry = NewEntry::new(Actor::Sallyd, "session.crash")
-            .session(sid)
-            .decision("deny")
-            .args(json!({"task": c.task, "reason": "panic", "payload": c.payload}));
-        if self.audit(entry, level).await.is_err() {
-            self.p
-                .oplog
-                .error(LOG, "session.crash not audited", &[("session", sid)]);
-        }
-    }
-
-    /// `session.timeout` (timeout only), then the one `session.stop`.
-    async fn ending(&self, sid: &str, level: AuditLevel, reason: StopReason, timeout: Duration) {
-        if reason == StopReason::Timeout {
-            let entry = NewEntry::new(Actor::Sallyd, "session.timeout")
-                .session(sid)
-                .decision("deny")
-                .args(json!({"timeout_secs": timeout.as_secs()}));
-            if self.audit(entry, level).await.is_err() {
-                self.p
-                    .oplog
-                    .error(LOG, "session.timeout not audited", &[("session", sid)]);
-            }
-        }
-        let entry = NewEntry::new(Actor::Sallyd, "session.stop")
-            .session(sid)
-            .args(json!({"reason": reason.as_str()}));
-        if self.audit(entry, level).await.is_err() {
-            self.p
-                .oplog
-                .error(LOG, "session.stop not audited", &[("session", sid)]);
-        }
+        assert!(live.is_empty());
+        assert_eq!(unanswered(&mut live, "s-1"), StopOutcome::Stopped);
     }
 }

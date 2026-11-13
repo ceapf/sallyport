@@ -6,6 +6,7 @@ pub mod lookup;
 pub mod types;
 
 mod registry;
+mod supervise;
 
 pub use registry::{
     AGENT_SOCK, Registry, RegistryParts, SessionInfo, SessionState, StartError, StopOutcome,

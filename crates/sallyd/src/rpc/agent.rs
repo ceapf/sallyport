@@ -53,6 +53,8 @@ pub enum Withdraw {
     Cancel,
     /// The connection that sent the call closed.
     Closed,
+    /// The session is stopping (architect Q59).
+    SessionStop,
 }
 
 /// Largest frame accepted (ARCHITECTURE §4: 256 KiB on the session socket).
@@ -91,10 +93,11 @@ pub trait ToolHandler: Send + Sync + 'static {
     /// [`withdraw`](Self::withdraw). Session teardown does drop calls: after
     /// [`listen::STOP_GRACE`] (`Handle::shutdown`) or at once (the `Handle` dropped). So a
     /// handler must be safe to drop at any await. A drop before the effect starts means nothing
-    /// ran (a dropped approval wait is a deny); a drop after it started may leave the effect
-    /// finished with no completion entry (blocking work is not abortable), so the entry comes
-    /// first. The production handler (`approvals::Gated` over `tools::Tools`) does: `tool.run`
-    /// before every effect, a pidfd kill of a dropped `shell` call (#62).
+    /// ran (a dropped approval wait is a deny). The production handler (`approvals::Gated` over
+    /// `tools::Tools`) runs each call's section from `tool.run` to `tool.result` as a task of its
+    /// own, counted by the session's `tools::ops::Ops` (architect Q59): a dropped caller loses
+    /// neither the effect nor its entry, and the session's stop withdraws prompts, kills
+    /// commands and aborts writes not yet begun before it waits for that count.
     fn call(
         &self,
         call: u64,

@@ -121,7 +121,7 @@ MUTANTS_WIDE_SALLYD := $(addprefix crates/sallyd/src/sandbox/,argv.rs check.rs t
                        $(addprefix crates/sallyd/src/approvals/,action.rs glob.rs handler.rs policy.rs \
                        queue.rs render.rs) \
                        $(addprefix crates/sallyd/src/tools/,args.rs path.rs tag.rs fs.rs shell.rs procs.rs \
-                       mod.rs dac.rs)
+                       mod.rs dac.rs ops.rs)
 MUTANTS_WIDE_SHIM := $(addprefix crates/sally-shim/src/,args.rs relay.rs)
 MUTANTS_WIDE_TESTS_CORE :=
 MUTANTS_WIDE_TESTS_SALLYD := --lib --test=argv --test=scan

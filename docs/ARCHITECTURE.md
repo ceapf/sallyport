@@ -705,11 +705,29 @@ TODO(#28): the harness container and `llm.sock` (Task 13, Task 12 PR C).
   every 250 ms (Q62); a lookup through it fails once that process is gone, even if its pid is
   reused.
 
-**Stop order:** `session.stop` is audited first. Then the agent listener stops, which drops calls
-still waiting on an approval: each counts as a deny. Then `Launcher::stop` runs, retried up to 3
-times. A container that cannot be confirmed gone leaves the session listed as stop-failed. It
-keeps its claims and its disk watchdog until a later stop succeeds. At shutdown it makes
-`sallyd` exit non-zero.
+**Stop order** (Q57, amended by Q59: once a stop returns, nothing from the session has any
+further effect):
+1. The session's operations close, before anything else: a call that reaches the tools from now
+   on is denied `session-stopping`.
+2. `session.timeout` or `session.crash`, for those reasons.
+3. Every pending prompt is withdrawn (`approval.withdraw`, `session-stop`); no call queues after
+   it.
+4. The stop signal: a running `shell` is killed (`killed: session-stop`, the kill finished before
+   its `tool.result`), and a write or delete that has not begun aborts (`outcome: aborted`). The
+   agent listener shuts down meanwhile.
+5. At most 5 s (`STOP_DRAIN`) for the operations in flight to end, each with its `tool.result`.
+6. The one `session.stop {reason, in_flight}`.
+7. `Launcher::stop`, retried up to 3 times.
+
+A file operation already inside its blocking call is never cut. One still running after the
+drain leaves `in_flight > 0`: the stop answers failed and the session stays stop-failed until
+it returns; then the supervisor removes the container by itself. Residual risk: a hung file
+system under a mount keeps an idle container (listener closed, shells killed, nothing new can
+start) until that operation returns. A container that cannot be confirmed gone, whether its
+session started or not, also leaves the session listed as stop-failed. It keeps its claims and
+its disk watchdog until a later stop succeeds. At shutdown, which stops every session at once,
+it makes `sallyd` exit non-zero. A failed `session.start` append is followed by a best-effort
+`session.stop` (`start-failed`), since the entry may have reached the log.
 
 ## 6. Repository structure
 
@@ -1087,10 +1105,13 @@ sallyport/
     {uid, pid}`, `via` (the id whose `deny_all_session` took it); `refuse` with `reason:
     unknown-id` for an id that is not waiting.
   - `approval.expire` (sallyd, `deny`): `{id, call, reason: timeout}`.
-  - `approval.withdraw` (harness for a cancel, sallyd for a closed connection; `deny`): `{id,
-    call, reason}`; `id` is null when the cancel or close came before the call reached the
-    queue (it is kept until the call ends, so that call is never shown). A wait dropped by
-    teardown leaves the queue at once with no entry. Only live calls (begun, not yet ended)
+  - `approval.withdraw` (harness for a cancel, sallyd for a closed connection or the session's
+    stop; `deny`): `{id, call, reason}` with `reason` `cancel`, `closed` or `session-stop`; `id`
+    is null when the cancel or close came before the call reached the queue (it is kept until
+    the call ends, so that call is never shown). The session's stop withdraws every pending
+    prompt before its `session.stop` (Q59), and from then on no call queues (`approval.deny
+    session-stopping`). A wait dropped by teardown leaves the queue at once with no entry; since
+    the stop withdraws first, that is only a crash's path. Only live calls (begun, not yet ended)
     keep a withdraw, so the harness cannot grow that state. Decisions of a session run one at
     a time; one that has taken its prompt finishes in its own task, so a dropped caller loses no
     entry. A `deny_all_session` latches first, then writes its entry and denies every other
@@ -1098,20 +1119,25 @@ sallyport/
     client is told `audit-failed`. A panic under the queue's
     lock latches the session.
   - `approval.deny` (sallyd): action fields and `reason` (`approval-flood`, `session-denied`,
-    `no-approver`, `id-unavailable`).
+    `no-approver`, `id-unavailable`, `session-stopping`).
   - `approval.flood` (sallyd): `{max_pending}`, once per episode.
   - `tool.deny` (sallyd): action fields (or `{call, tool}` when no action could be built) and
-    `code`.
+    `code`; `session-stopping` for a call that reaches the tools once the session's stop has
+    begun (Q59).
 - **Tool events** (Task 11, #62; architect ruling Q34), at every `audit.level`; a failed append
   runs nothing more and answers nothing:
   - `tool.run` (harness, `allow`), before the effect and before any blocking section: action
     fields, `approval` (the id, or null when the policy needed none); for files `mode`, and for a
     write `bytes` and `sha256`. The command and paths are in `action`, escaped and bounded.
   - `tool.result` (sallyd), after it: `{call, tool, action_sha256}` and `outcome` (`ok`,
-    `failed` with `code`) for files; for `shell` `exit` or `killed` (`timeout`,
-    `start-timeout`), `stdout`/`stderr` `{bytes, kept, sha256 (of the kept bytes), cut}`, and
-    `error` (escaped, cut) when podman could not run. Never output or content. A `tool.run` with
-    no `tool.result` before the session's stop entry means teardown interrupted the call.
+    `failed` with `code`, or `aborted` with `reason: session-stop` for a write or delete the
+    session's stop kept from beginning) for files; for `shell` `exit` or `killed` (`timeout`,
+    `start-timeout`, `session-stop`), `stdout`/`stderr` `{bytes, kept, sha256 (of the kept
+    bytes), cut}`, and `error` (escaped, cut) when podman could not run. Never output or content.
+    Each call's section from `tool.run`/`tool.read` to `tool.result` is a task of its own
+    counted by the session's stop (Q59): a caller that goes away loses neither the effect nor
+    the entry. A `tool.run` with no `tool.result` before the session's `session.stop` happens
+    only when that entry carries `in_flight > 0` (the result follows it) or the session crashed.
   - `tool.read` (harness, `allow`), after the bytes are in the broker and before the reply:
     action fields, `mode`, and `offset`, `len`, `size`, `bytes`, `sha256` (`fs_read`) or
     `entries`, `truncated`, `sha256` of the listing (`fs_list`), or `code`. Stricter than §4.3's
