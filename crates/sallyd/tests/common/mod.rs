@@ -12,6 +12,7 @@ pub mod container;
 pub mod egress;
 pub mod forms;
 pub mod mock_model;
+pub mod search;
 
 use sallyd::sandbox::{
     CheckedRuntime, CommonArgs, ImageRef, LaunchScan, ScanLimits, SessionId, SessionPaths, UserIds,
