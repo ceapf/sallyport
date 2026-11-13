@@ -461,14 +461,46 @@ fn mutation_scope() -> Vec<String> {
     files
 }
 
-/// The paths `var := …` names in `make` (continuation lines joined, `dir/*.rs` expanded).
+/// The paths `var := …` and every later `var += …` name in `make` (continuation lines joined,
+/// `dir/*.rs` expanded). Any other assignment of `var` (a second `:=`, `=`, `?=`) fails: it
+/// would replace the list.
 fn make_list(make: &str, var: &str) -> Vec<String> {
-    let head = format!("{var} := ");
-    let at = make
-        .find(&head)
-        .unwrap_or_else(|| panic!("Makefile: no `{head}`"));
+    let mut defs = 0;
+    let mut out = Vec::new();
+    let mut offset = 0;
+    for line in make.split_inclusive('\n') {
+        let start = offset;
+        offset += line.len();
+        let Some(rest) = line.strip_prefix(var) else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let (op, value) = match ["+=", "::=", ":=", "?=", "="]
+            .iter()
+            .find_map(|op| rest.strip_prefix(op).map(|v| (*op, v)))
+        {
+            Some(found) => found,
+            None => continue, // another variable that starts with `var`
+        };
+        if op != "+=" {
+            defs += 1;
+            assert!(
+                op == ":=" && defs == 1,
+                "Makefile: `{var}` is defined more than once or not with `:=`"
+            );
+        }
+        let at = start + line.len() - value.len();
+        out.extend(make_words(&make[at..]));
+    }
+    assert_eq!(defs, 1, "Makefile: no `{var} := `");
+    out.into_iter().flat_map(expand_rs_glob).collect()
+}
+
+/// The words of the make value starting `text` (its continuation lines joined), with
+/// `$(addprefix p,a b)` expanded.
+fn make_words(text: &str) -> Vec<String> {
     let mut def = String::new();
-    for line in make[at + head.len()..].lines() {
+    for line in text.lines() {
         if let Some(more) = line.strip_suffix('\\') {
             def.push_str(more);
             def.push(' ');
@@ -491,7 +523,7 @@ fn make_list(make: &str, var: &str) -> Vec<String> {
             rest = rest[end..].trim_start();
         }
     }
-    out.into_iter().flat_map(expand_rs_glob).collect()
+    out
 }
 
 /// `dir/*.rs` as the sorted `.rs` files of `dir`; any other path as itself.
@@ -560,10 +592,7 @@ fn news(src: &str) -> Vec<(String, String)> {
         if !word_start || !matches!(after.chars().next(), Some('(' | '<')) {
             continue;
         }
-        let Some(open) = after
-            .find(['{', ';'])
-            .filter(|&i| after[i..].starts_with('{'))
-        else {
+        let Some(open) = body_open(after) else {
             continue; // a trait's declaration: no body
         };
         let open = at + "fn new".len() + open;
@@ -571,6 +600,35 @@ fn news(src: &str) -> Vec<(String, String)> {
         out.push((impl_type(&src[..at]), src[open + 1..close].to_owned()));
     }
     out
+}
+
+/// In `sig` (the text right after a `fn` name): the index of the body's `{`, the first at depth
+/// 0 after the parameter list's matching `)`, or `None` when a `;` comes first (a declaration).
+/// `<…>`, `(…)` and `[…]` nest (an `->` arrow is not a `>`), and inside a `{…}` that is not the
+/// body (`Bar<{ N < 3 }>`) only braces count, so G5's const generic return is skipped.
+fn body_open(sig: &str) -> Option<usize> {
+    let (mut depth, mut braces) = (0usize, 0usize);
+    let mut params_done = false;
+    let mut prev = ' ';
+    for (i, c) in sig.char_indices() {
+        match c {
+            '{' if depth == 0 && braces == 0 && params_done => return Some(i),
+            ';' if depth == 0 && braces == 0 && params_done => return None,
+            '{' => braces += 1,
+            '}' => braces -= 1,
+            _ if braces > 0 => {}
+            '<' | '(' | '[' => depth += 1,
+            '>' if prev == '-' => {}
+            '>' | ']' => depth -= 1,
+            ')' => {
+                depth -= 1;
+                params_done |= depth == 0;
+            }
+            _ => {}
+        }
+        prev = c;
+    }
+    None
 }
 
 /// The type of the last `impl` block opened in `before`: the path after `for` when there is
@@ -656,18 +714,97 @@ fn logic_in(body: &str) -> Option<String> {
         if c == '!' && !prev.is_some_and(is_ident) {
             return Some("`!`".into());
         }
+        // A unary minus: not `->`, not after an operand (rustfmt spaces a binary one).
+        if c == '-'
+            && chars.get(i + 1) != Some(&'>')
+            && !prev.is_some_and(|p| is_ident(p) || p == ')')
+        {
+            return Some("a unary `-`".into());
+        }
         if c == '.' && prev.is_some_and(|p| p != '.') && chars.get(i + 1) != Some(&'.') {
-            let name: String = chars[i + 1..]
-                .iter()
-                .take_while(|&&q| is_ident(q))
-                .collect();
-            let call = chars.get(i + 1 + name.chars().count()) == Some(&'(');
+            let (name, call) = called(&chars, i + 1);
             if call && !CONVERSIONS.contains(&name.as_str()) {
                 return Some(format!("the method call `.{name}(…)`"));
             }
         }
+        if is_ident(c) && !prev.is_some_and(|p| is_ident(p) || p == '.') {
+            let (path, call) = called(&chars, i);
+            if call && std_path_call(&path) {
+                return Some(format!("the call `{path}(…)`"));
+            }
+        }
     }
     None
+}
+
+/// The path or name starting at `chars[start]` (an optional turbofish `::<…>` skipped, `::`
+/// trimmed), and whether a `(` follows it: `.sum::<u64>()` is the call `sum`.
+fn called(chars: &[char], start: usize) -> (String, bool) {
+    let name: String = chars[start..]
+        .iter()
+        .take_while(|&&q| is_ident(q))
+        .collect();
+    let mut j = start + name.chars().count();
+    if name.ends_with("::") && chars.get(j) == Some(&'<') {
+        let mut depth = 0usize;
+        while let Some(&q) = chars.get(j) {
+            let arrow = j > 0 && chars[j - 1] == '-';
+            j += 1;
+            match q {
+                '<' => depth += 1,
+                '>' if !arrow => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let call = chars.get(j) == Some(&'(');
+    (name.trim_end_matches(':').to_owned(), call)
+}
+
+/// G1: a call of `path` computes rather than delegates: its qualifier is a primitive or a std
+/// type, module or trait (`usize::max`, `std::cmp::min`) or a generic one (`<T as Ord>::max`,
+/// read as `::max`), and it is not a constructor. `Self::f`, `Type::f` and bare `f` delegate.
+fn std_path_call(path: &str) -> bool {
+    const STD: [&str; 27] = [
+        "u8",
+        "u16",
+        "u32",
+        "u64",
+        "u128",
+        "usize",
+        "i8",
+        "i16",
+        "i32",
+        "i64",
+        "i128",
+        "isize",
+        "f32",
+        "f64",
+        "bool",
+        "char",
+        "str",
+        "std",
+        "core",
+        "alloc",
+        "cmp",
+        "mem",
+        "Ord",
+        "PartialOrd",
+        "Iterator",
+        "Option",
+        "Result",
+    ];
+    const CONSTRUCTORS: [&str; 4] = ["new", "default", "from", "with_capacity"];
+    let segments: Vec<&str> = path.split("::").collect();
+    let Some((method, qualifiers)) = segments.split_last() else {
+        return false;
+    };
+    !CONSTRUCTORS.contains(method) && qualifiers.iter().any(|q| q.is_empty() || STD.contains(q))
 }
 
 /// `fn new` bodies in mutation scope that hold logic today, by file and `impl` type (never by
@@ -800,6 +937,92 @@ fn the_guard_refuses_a_closure_and_a_not() {
 #[should_panic(expected = "holds")]
 fn the_guard_refuses_a_question_mark() {
     refuse(" Ok(Self { v: parse(x)? }) ");
+}
+
+/// G1: a path call whose qualifier is a primitive or std type, module or trait is logic.
+#[test]
+#[should_panic(expected = "holds")]
+fn the_guard_refuses_a_primitive_ufcs_call() {
+    refuse(" Self { burst: usize::max(rate, 1) } ");
+}
+
+#[test]
+#[should_panic(expected = "holds")]
+fn the_guard_refuses_a_ufcs_saturating_add() {
+    refuse(" Self { end: u64::saturating_add(start, len) } ");
+}
+
+#[test]
+#[should_panic(expected = "holds")]
+fn the_guard_refuses_a_ufcs_then_some() {
+    refuse(" Self { v: bool::then_some(on, x) } ");
+}
+
+#[test]
+#[should_panic(expected = "holds")]
+fn the_guard_refuses_a_std_path_call() {
+    refuse(" Self { a: std::cmp::min(a, b) } ");
+}
+
+#[test]
+fn constructors_and_delegations_on_paths_are_no_logic() {
+    for body in [
+        " Self::build(a) ",
+        " Self { v: Vec::with_capacity(n), s: String::from(x), a: Arc::new(x), d: Foo::default() } ",
+        " Self { v: std::sync::Arc::new(x), w: u64::from(n), z: build(a) } ",
+        " Self { v: Vec::<u8>::new() } ",
+    ] {
+        assert_eq!(logic_in(&strip_literals(body)), None, "{body}");
+    }
+}
+
+/// G2: a turbofish method call is still a method call.
+#[test]
+#[should_panic(expected = "holds")]
+fn the_guard_refuses_a_turbofish_method_call() {
+    refuse(" Self { total: sizes.into_iter().sum::<u64>() } ");
+}
+
+/// G3: a unary minus is logic (cargo-mutants deletes it).
+#[test]
+#[should_panic(expected = "holds")]
+fn the_guard_refuses_a_unary_minus() {
+    refuse(" Self { offset: -delta } ");
+}
+
+#[test]
+#[should_panic(expected = "holds")]
+fn the_guard_refuses_a_negative_literal() {
+    refuse(" Self { offset: -1 } ");
+}
+
+/// G4: `VAR += …` lines extend the list.
+#[test]
+fn the_guard_reads_appended_makefile_lists() {
+    let make = "A := x.rs \\\n     y.rs\nB := q.rs\nA += $(addprefix p/,a.rs) \\\n     z.rs\n";
+    assert_eq!(make_list(make, "A"), ["x.rs", "y.rs", "p/a.rs", "z.rs"]);
+}
+
+#[test]
+#[should_panic(expected = "defined more than once")]
+fn the_guard_refuses_a_redefined_makefile_list() {
+    make_list("A := x.rs\nA := y.rs\n", "A");
+}
+
+/// G5: the body is the first `{` after the parameter list at depth 0, not one inside the
+/// generics or the return type; a `;` inside the return type is not a declaration's end.
+#[test]
+fn the_guard_finds_the_body_after_a_braced_return_type() {
+    let src = strip_literals(
+        "impl Foo {\n    fn new<T: Fn(u8)>(a: T) -> Bar<{ N }> { if a { x } else { y } }\n}\n\
+         impl Baz {\n    fn new() -> [u8; 4] { [0, 1, 2, 3] }\n}\n\
+         trait Q { fn new() -> [u8; 4]; }\n",
+    );
+    let found = news(&src);
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert_eq!(found[0].0, "Foo");
+    assert!(logic_in(&found[0].1).is_some(), "{found:?}");
+    assert_eq!(found[1], ("Baz".to_owned(), " [0, 1, 2, 3] ".to_owned()));
 }
 
 /// Panics with "holds …" when `body` holds logic.
