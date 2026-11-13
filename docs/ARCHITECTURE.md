@@ -677,11 +677,38 @@ An allowed host without a grant is spliced: after `egress.allow {…, intercept:
 `200`, the proxy copies bytes and never sees the plaintext. Plain-HTTP requests are refused 405
 `plain-http-unsupported` before policy (Task 8), grant host or not.
 
-### 5.4 Session start
-`sessions.create` → validate manifest (again) → resolve model → `infer.load` if needed (Z2 up,
-health check over `infer.sock`) → create session dir + `agent.sock` (+ `net.sock`) → re-check
-mounts (TOCTOU) → `podman run` Z3 → wait for harness `session.info` within 30 s → `running`.
-Teardown on stop/timeout/crash: `podman kill`, remove session dir, audit `session.stop`.
+### 5.4 Session start and stop
+The session registry (`sallyd::session`, Task 12, architect Q57) owns every live session.
+
+**Start**, in this order:
+1. `launch_workspace` (§3.5): the image, the overlap claims and fd budget reserved,
+   `sandbox.launch` audited, the workspace container started. A failed launch is the
+   launcher's `sandbox.refuse` only, with no `session.start` and no `session.stop`.
+2. The container's init is watched for exit.
+3. Approvals, tools and the agent server are built in memory.
+4. Audit `session.start` (`model: {kind: "none"}` until a session can have a model).
+5. Bind `agent.sock` (0600) in the session's harness socket directory and serve it.
+
+A failed `session.start` append binds nothing and stops the workspace. Any failure after it
+ends the session with reason `start-failed`. Every `session.start` gets exactly one
+`session.stop`.
+
+TODO(#28): the harness container and `llm.sock` (Task 13, Task 12 PR C).
+
+**Stop reasons:**
+- `request`: a client asked.
+- `timeout`: `runtime.timeout`; `session.timeout` is audited first.
+- `crash`: a session task panicked; the oplog line comes first, then `session.crash`.
+- `shutdown`: SIGTERM or SIGINT; `control.sock` is closed first.
+- `start-failed`.
+- `exited`: the container ended on its own. The registry checks the init's `/proc/<pid>` fd
+  every second; a lookup through it fails once that process is gone, even if its pid is reused.
+
+**Stop order:** `session.stop` is audited first. Then the agent listener stops, which drops calls
+still waiting on an approval: each counts as a deny. Then `Launcher::stop` runs, retried up to 3
+times. A container that cannot be confirmed gone leaves the session listed as stop-failed. It
+keeps its claims and its disk watchdog until a later stop succeeds. At shutdown it makes
+`sallyd` exit non-zero.
 
 ## 6. Repository structure
 
@@ -800,12 +827,19 @@ sallyport/
   session; a lookup that finds no free slot is `resolve-failed` at once (never queued), and a
   slot stays taken until its call returns, even after the 5 s timeout. Lookups and audit appends
   share tokio's blocking pool, so stuck lookups take at most 64 of its threads and never delay
-  the audit log while the pool is larger (the daemon's runtime must keep it so: #47). One
-  resolver serves every session. Residual: one session
-  can hold every slot for about a resolver timeout (#47). Each session's accept loop holds at
-  most `max_connections + 64` accepted connections (the extra ones are answered 429); past that
-  it stops accepting until one ends. Residual: descriptors are not yet bounded across sessions
-  (#48). After a refusal reply (every pre-tunnel refusal, the 429 included, and the 502s written
+  the audit log: the daemon's runtime (`sallyd::daemon::runtime`) has 512 blocking threads, a
+  relation its test pins (#47, architect Q44). Each session also has a share of its own, 16 =
+  64 / 4 lookups at once (`sallyd::session::lookup`), so one session naming slow-resolving hosts
+  cannot take every slot; both bounds hold, and a slot is held only while a lookup is in flight.
+  A lookup over either bound is `resolve-failed` at once. Making both numbers configurable: #86.
+  Each session's accept loop holds at most `max_connections + 64` accepted connections (the
+  extra ones are answered 429); past that it stops accepting until one ends. Descriptors are
+  bounded across sessions (#48, architect Q45): `sallyd` raises its soft `NOFILE` to the hard
+  limit (at most 2^20), and sessions together may reserve half of it. A session costs
+  `2 * (network.max_connections + 64) + 64` (the proxy's two descriptors per connection, plus
+  `agent.sock`/`llm.sock` connections and exec pipes); it is reserved with the overlap claims, in
+  one step, and a session over the budget is refused `fd-budget` before anything is created.
+  After a refusal reply (every pre-tunnel refusal, the 429 included, and the 502s written
   before a `200`) the proxy closes its sending half and discards client input until its end,
   256 KiB or 1 s in total (`DRAIN_BYTES`, `DRAIN_TIMEOUT`), then closes (#71). The bytes are
   never parsed, stored or audited, and the entry is already written. The connection keeps its
