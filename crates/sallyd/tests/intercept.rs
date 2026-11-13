@@ -88,7 +88,7 @@ async fn session(lx: &Lx, tag: &str) -> Running {
 async fn session_of(lx: &Lx, tag: &str, manifest: &str) -> Running {
     let req = WorkspaceRequest {
         paths: lx.paths(tag),
-        manifest: Arc::new(lx.f.load(MANIFEST)),
+        manifest: Arc::new(lx.f.load(manifest)),
         default_image: Some(net_image()),
         crash: sallyd::daemon::crash::CrashReporter::channel().0,
     };
