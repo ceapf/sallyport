@@ -49,7 +49,11 @@ impl Env {
     }
 
     fn sallyd(&self) -> Command {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_sallyd"));
+        self.command(Command::new(env!("CARGO_BIN_EXE_sallyd")))
+    }
+
+    /// `c` (`sallyd`, or a tracer that runs it) with the private environment.
+    fn command(&self, mut c: Command) -> Command {
         c.env_clear()
             .env("HOME", self.root.join("home"))
             .env("XDG_RUNTIME_DIR", self.root.join("run"))
@@ -203,4 +207,116 @@ fn a_loose_state_directory_refuses_start() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("0700"), "{err}");
     assert!(!env.state().join("control.sock").exists());
+}
+
+/// A trace line that could be (or prepare) an outbound connection: an IP socket, a connect to a
+/// non-loopback address, or a connect whose address strace could not read. A non-dumpable
+/// `sallyd` cannot have its memory read, so its addresses show as pointers: what cannot be shown
+/// to be loopback counts. `socket()` arguments are plain integers and always decode.
+fn outbound(line: &str) -> bool {
+    if line.contains("socket(AF_INET") {
+        return true;
+    }
+    if !line.contains("connect(") {
+        return false;
+    }
+    if line.contains("AF_UNIX") {
+        return false;
+    }
+    let loopback = ["inet_addr(\"127.", "\"::1\"", "\"::ffff:127."];
+    !(line.contains("AF_INET") && loopback.iter().any(|l| line.contains(l)))
+}
+
+#[test]
+fn only_unix_and_loopback_lines_pass_the_trace_filter() {
+    let unix = r#"7 connect(5, {sa_family=AF_UNIX, sun_path="/x"}, 110) = 0"#;
+    let unix_socket = "7 socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0) = 5";
+    let lo4 = r#"7 connect(5, {sa_family=AF_INET, sin_port=htons(1), sin_addr=inet_addr("127.0.0.1")}, 16) = 0"#;
+    let lo6 = r#"7 connect(5, {sa_family=AF_INET6, sin6_port=htons(1), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "::1", &sin6_addr), sin6_scope_id=0}, 28) = 0"#;
+    let out4 = r#"7 connect(5, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("192.0.2.1")}, 16) = 0"#;
+    let out6 = r#"7 connect(5, {sa_family=AF_INET6, sin6_port=htons(443), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "2001:db8::1", &sin6_addr), sin6_scope_id=0}, 28) = 0"#;
+    let unread = "7 connect(11, 0x7fff45e25100, 16) = 0";
+    let ip4 = "7 socket(AF_INET, SOCK_DGRAM|SOCK_CLOEXEC, IPPROTO_IP) = 5";
+    let ip6 = "7 socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP) = 5";
+    for l in [unix, unix_socket, lo4, lo6] {
+        assert!(!outbound(l), "{l}");
+    }
+    for l in [out4, out6, unread, ip4, ip6] {
+        assert!(outbound(l), "{l}");
+    }
+}
+
+/// RT-NET-11 (SI-12): `sallyd` with no sessions and no downloads, traced for 60 s with every
+/// process it starts (`strace -f`), makes no connect() to a non-loopback address. The trace must
+/// show the `control.sock` bind, or it did not follow `sallyd`.
+#[test]
+fn rt_net_11_an_idle_sallyd_connects_nowhere() {
+    let env = Env::new();
+    // Traced processes run setuid helpers without their privilege, so podman could not create
+    // its user namespace (`newuidmap`); an untraced podman creates the pause process first, and
+    // the traced ones join it.
+    let mut pause = Command::new("podman");
+    pause.args(["unshare", "true"]);
+    let made = env.command(pause).output().unwrap();
+    assert!(
+        made.status.success(),
+        "{}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    let trace = env.root.join("trace");
+    let mut strace = Command::new("strace");
+    strace
+        .args([
+            "-f",
+            "-qq",
+            "-e",
+            "trace=socket,connect,bind",
+            "-e",
+            "signal=none",
+            "-o",
+        ])
+        .arg(&trace)
+        .arg(env!("CARGO_BIN_EXE_sallyd"));
+    let mut tracer = env.command(strace).spawn().unwrap();
+    let started = Instant::now();
+    let sock = env.state().join("control.sock");
+    while !sock.exists() {
+        if let Some(status) = tracer.try_wait().unwrap() {
+            panic!("strace exited {status}: {}", stderr(tracer));
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "control.sock never appeared"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_secs(60).saturating_sub(started.elapsed()));
+    // sallyd is strace's one child; SIGTERM goes to it, and strace exits with it.
+    let children = format!("/proc/{0}/task/{0}/children", tracer.id());
+    let sallyd: u32 = std::fs::read_to_string(children)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let pid = rustix::process::Pid::from_raw(i32::try_from(sallyd).unwrap()).unwrap();
+    rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
+    let out = tracer.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = std::fs::read_to_string(&trace).unwrap();
+    // sallyd's own bind of control.sock (its address is unreadable: the process is not
+    // dumpable), from its main thread's pid.
+    let own = format!("{sallyd} bind(");
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with(&own) && l.ends_with("= 0")),
+        "the trace did not follow sallyd:\n{text}"
+    );
+    let bad: Vec<&str> = text.lines().filter(|l| outbound(l)).collect();
+    assert!(bad.is_empty(), "outbound connects: {bad:#?}");
 }
