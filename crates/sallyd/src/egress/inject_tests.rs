@@ -18,7 +18,34 @@ fn spec(name: &str, host: &str, header: &str, format: &str) -> Spec {
         host: host.into(),
         header: header.into(),
         format: format.into(),
+        basic_user: None,
     }
+}
+
+fn basic(name: &str, host: &str, user: &str) -> Spec {
+    Spec {
+        basic_user: Some(user.into()),
+        ..spec(name, host, "Authorization", "Basic {basic}")
+    }
+}
+
+/// RFC 7617's blob, computed here by hand (standard alphabet, padded), not by sally-core.
+fn blob(user: &str, secret: &str) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let data = format!("{user}:{secret}").into_bytes();
+    let mut out = String::new();
+    for chunk in data.chunks(3) {
+        let b = |i: usize| u32::from(chunk.get(i).copied().unwrap_or(0));
+        let n = (b(0) << 16) | (b(1) << 8) | b(2);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 fn values(names: &[&str]) -> Vec<(String, Secret<String>)> {
@@ -123,20 +150,65 @@ fn a_grant_whose_secret_is_missing_is_refused_by_name() {
     assert!(!err.to_string().contains(&value("GH")));
 }
 
+/// Task 9b (#80): a `{basic}` grant gets `base64(basic_user:secret)` at its placeholder, for
+/// every user length (1, 2, 3 bytes put the secret at all three base64 alignments).
 #[test]
-fn a_basic_format_is_refused_until_task_9b() {
-    let s = spec("GH", "a.mock.test", "Authorization", "Basic {basic}");
-    assert!(s.is_basic());
-    assert!(!bearer("GH", "a.mock.test").is_basic());
-    assert_eq!(
-        Credentials::new(&[s], values(&["GH"])).unwrap_err(),
-        CredentialsError::Basic("GH".into())
-    );
+fn a_basic_grant_gets_the_padded_base64_of_user_colon_secret() {
+    for user in ["x", "ab", "git", "x-access-token"] {
+        let c = Credentials::new(&[basic("GH", "a.mock.test", user)], values(&["GH"])).unwrap();
+        let mut h = HeaderMap::new();
+        assert_eq!(set(&c, "a.mock.test", &mut h), ["secret:GH"]);
+        let want = format!("Basic {}", blob(user, &value("GH")));
+        assert_eq!(
+            h.get(header::AUTHORIZATION).unwrap(),
+            want.as_str(),
+            "{user}"
+        );
+        assert!(h.get(header::AUTHORIZATION).unwrap().is_sensitive());
+    }
+    // The placeholder anywhere in the format, text kept on both sides.
+    let s = Spec {
+        basic_user: Some("u".into()),
+        ..spec("GH", "a.mock.test", "X-Git", "a {basic} b")
+    };
+    let c = Credentials::new(&[s], values(&["GH"])).unwrap();
+    let mut h = HeaderMap::new();
+    let _ = set(&c, "a.mock.test", &mut h);
+    let want = format!("a {} b", blob("u", &value("GH")));
+    assert_eq!(h.get("x-git").unwrap(), want.as_str());
+}
+
+/// Architect ruling A2 condition 1: `render` is a full second guard behind the validator.
+/// Exactly one placeholder in all, `basic_user` exactly with `{basic}`, and a user that is
+/// neither empty nor holds `:`.
+#[test]
+fn a_format_and_user_that_do_not_pair_are_refused() {
+    let with_user = |format: &str, user: Option<&str>| Spec {
+        basic_user: user.map(str::to_owned),
+        ..spec("GH", "a.mock.test", "Authorization", format)
+    };
+    for s in [
+        with_user("{value} {basic}", Some("u")),
+        with_user("{value} {basic}", None),
+        with_user("{basic} {basic}", Some("u")),
+        with_user("Basic {basic}", None),
+        with_user("Bearer {value}", Some("u")),
+        with_user("Basic {basic}", Some("")),
+        with_user("Basic {basic}", Some("a:b")),
+        with_user("Basic {basic}", Some(":")),
+        with_user("Basic", Some("u")),
+    ] {
+        assert_eq!(
+            Credentials::new(std::slice::from_ref(&s), values(&["GH"])).unwrap_err(),
+            CredentialsError::Format("GH".into()),
+            "{s:?}"
+        );
+    }
 }
 
 #[test]
 fn a_format_without_exactly_one_value_placeholder_is_refused() {
-    for f in ["Bearer", "{value} {value}", "{valu}", ""] {
+    for f in ["Bearer", "{value} {value}", "{valu}", "{basic}", ""] {
         let s = spec("GH", "a.mock.test", "Authorization", f);
         assert_eq!(
             Credentials::new(&[s], values(&["GH"])).unwrap_err(),
@@ -244,6 +316,53 @@ fn the_redaction_covers_every_secret_its_forms_and_each_rendered_value() {
     assert_eq!((value("KEY").len(), gh.len() + 8), (24, 31));
     assert_eq!(r.longest(), 32);
 }
+
+/// Architect ruling A2 (ARCHITECTURE §7): a `{basic}` grant's redaction covers the rendered
+/// value, the whole blob with its padding, and the blob with the padding stripped. Each check
+/// covers bytes the secret's own forms cannot: the `Basic ` prefix, and the blob's first
+/// characters (the user's) and its last.
+#[test]
+fn a_basic_grants_redaction_covers_its_rendered_value_and_blob_with_and_without_padding() {
+    let fill = |n: usize| "*".repeat(n);
+    // 25, 26 and 27 bytes of `user:secret`: two, one and no padding characters.
+    for user in ["x", "ab", "git"] {
+        let b = blob(user, &value("GH"));
+        let c = Credentials::new(&[basic("GH", "a.mock.test", user)], values(&["GH"])).unwrap();
+        let r = c.redaction();
+        assert_eq!(r.filler(), b'*');
+        let rendered = format!("Basic {b}");
+        assert_eq!(
+            r.bytes(rendered.as_bytes()),
+            fill(rendered.len()).as_bytes()
+        );
+        assert_eq!(r.bytes(b.as_bytes()), fill(b.len()).as_bytes(), "{user}");
+        let bare = b.trim_end_matches('=');
+        let echo = format!("\"{bare}\"");
+        let want = format!("\"{}\"", fill(bare.len()));
+        assert_eq!(r.bytes(echo.as_bytes()), want.as_bytes(), "{user}");
+    }
+}
+
+/// Allow (architect ruling A2 condition 4): the longest user the manifest accepts with the
+/// largest store value still builds.
+#[test]
+fn the_longest_basic_user_with_the_largest_store_value_builds() {
+    use sally_core::secrets::MAX_VALUE_BYTES;
+    let s = basic("GH", "a.mock.test", &"u".repeat(MAX_BASIC_USER));
+    let v = vec![("GH".to_owned(), Secret::new("!".repeat(MAX_VALUE_BYTES)))];
+    assert!(Credentials::new(&[s], v).is_ok());
+}
+
+/// `secrets[].inject.basic_user`'s limit (MANIFEST_SPEC §3; the validator's own constant is
+/// private).
+const MAX_BASIC_USER: usize = 256;
+
+/// The `{basic}` bound: the padded base64 of the longest user, `:` and the largest store value,
+/// plus the longest format, fits a form.
+const _: () = assert!(
+    4 * (MAX_BASIC_USER + 1 + sally_core::secrets::MAX_VALUE_BYTES).div_ceil(3) + 1024
+        <= super::super::redact::MAX_FORM
+);
 
 /// Decision 5 (architect D7): the store file gives the named values that exist and nothing else;
 /// a store it refuses is an error that carries no value.

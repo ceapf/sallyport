@@ -7,19 +7,11 @@ Date: 2026-11-09. Written after Task 2b, before Task 1f.
 `AMENDMENTS-01.md`, this file wins until the change has been folded into that doc. Fold each
 section in the task that implements it, then delete the section here and say so in the commit.
 
-## B1. `{basic}` redaction (Task 9b)
+## B1. Folded
 
-The redaction set for each grant is:
-- the raw secret;
-- the exact injected header value and its credential part (the whole `{basic}` blob);
-- the secret in all three base64 alignments, both alphabets, trimmed of the edge characters that
-  depend on neighbouring bytes, so base64 of *any* string containing the secret is caught;
-- percent-encoding.
-
-Add a proptest: for random prefix and suffix, `base64(prefix ‖ secret ‖ suffix)` is always
-redacted. `sally secrets set` warns when a value is shorter than 16 bytes (trimmed patterns under
-12 characters are skipped as too collision-prone). RT-SEC-12 gains `basic_user` values of length
-1, 2 and 3 (`x`, `ab`, `git`).
+B1 (`{basic}` redaction) is folded into `ARCHITECTURE.md §7` (credentials and redaction; the
+audit Redaction bullet), `THREAT_MODEL.md` and `REDTEAM_SUITE.md` (RT-SEC-12) in Task 9b. Its
+CLI warning for a value under 16 bytes is #98 (Task 12).
 
 ## B2. Git and writable mounts
 

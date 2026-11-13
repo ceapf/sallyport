@@ -1,4 +1,4 @@
-//! The per-session interception CA (AMENDMENTS-01 §4; Task 9a decision 3, architect Q38).
+//! The per-session interception CA (ARCHITECTURE §7; Task 9a decision 3, architect Q38).
 //!
 //! At launch of a session with secret grants, `sallyd` makes a CA that can only vouch for the
 //! session's grant hosts, mints one leaf per grant host, and drops the CA key. The CA key never

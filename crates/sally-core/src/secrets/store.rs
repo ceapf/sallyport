@@ -22,7 +22,7 @@ pub const MAX_SECRETS: usize = 256;
 /// Longest secret value, in bytes.
 pub const MAX_VALUE_BYTES: usize = 8 * 1024;
 /// Values shorter than this are stored but flagged: redaction skips collision-prone short
-/// patterns (AMENDMENTS-02 B1).
+/// patterns (ARCHITECTURE §7, Redaction; the CLI's warning is TODO(#98)).
 pub const SHORT_SECRET_BYTES: usize = 16;
 
 const MAX_NAME_BYTES: usize = 64;

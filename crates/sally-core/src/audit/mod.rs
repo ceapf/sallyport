@@ -33,7 +33,7 @@ mod writer;
 pub use entry::{
     Actor, Entry, GENESIS_HASH, MAX_ARGS_BYTES, MAX_LINE_BYTES, VerifyErrorKind, parse_line,
 };
-pub use redact::{MIN_BASE64_PATTERN, Redactor, SessionForms, secret_forms};
+pub use redact::{MIN_BASE64_PATTERN, Redactor, SessionForms, basic_credential, secret_forms};
 /// Strict parse of the bytes of an `audit.head` file: `(seq, hash)`. Bounded and canonical-only;
 /// the fuzz entry point for the head parser.
 ///

@@ -58,15 +58,14 @@ gh, pip, SDKs) work unmodified and never see a token.
 ### 3.4 MCP gateway (basic, M4)
 Servers declared in `tools.mcp[]` are started by the **broker** inside the **workspace** container (`podman exec -i`, stdio). The broker acts as their MCP client, relays only `tools/list` and `tools/call`, namespaces tools as `<server>__<tool>`, audits every call, and applies `tools.mcp[].approve` (`always` default, or `never`). Bounded frames, per-call timeout. Their descriptions are untrusted text passed through to the model. Servers that download themselves (`npx -y …`) need the registry allowlisted or must be baked into `runtime.image`.
 
-## 4. Token proxy = selective TLS interception (replaces http→https upgrade injection)
+## 4. Folded
 
-- On `CONNECT host:443` where `host` has a secret grant: reply 200, terminate TLS with a leaf certificate for `host` minted from a **per-session CA** (rcgen; ECDSA P-256; validity = session timeout + 5 min; X.509 name constraints permitting exactly the grant hosts; path length 0). Offer ALPN `http/1.1` only. For each request: drop any client-supplied value of the target header, inject, strip `Accept-Encoding`, forward over a new upstream TLS connection (rustls, real verification, SNI = host, pinned resolved IP). Never follow redirects. Refuse `Upgrade` on intercepted hosts in v1.
-- Allowed hosts **without** a secret grant are spliced untouched; the proxy never sees their plaintext.
-- Plain-HTTP requests to a grant host → 403 `inject-requires-tls`. Credentials never travel over upstream plaintext. The old "absolute-form http upgraded to TLS" path is deleted.
-- The CA private key lives only in `sallyd` memory (`Secret`, zeroized at session end). The workspace container gets `ca-bundle.pem` (host system roots + session CA) and `session-ca.pem` read-only in `/run/sallyport`, with `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`, `PIP_CERT`, `CARGO_HTTP_CAINFO`, `AWS_CA_BUNDLE` → bundle and `NODE_EXTRA_CA_CERTS` → session CA.
-- Response redaction is streaming with an overlap window ≥ the longest secret form, and covers the raw value, standard and URL-safe base64, and percent-encoding. Other encodings are a documented residual.
-- Placeholders: `expose_env: NAME` sets `NAME=sallyport-placeholder` in the workspace container so tools that refuse to run without a token proceed; the proxy overwrites the header. The placeholder is a public constant.
-- Schemes: `format` contains exactly one of `{value}` or `{basic}`; `{basic}` = base64(`basic_user:secret`) and requires `basic_user` (git over HTTPS: `Authorization: Basic {basic}`, `basic_user: x-access-token`). The same secret name may appear in several grants with different hosts.
+§4 (the token proxy as selective TLS interception) is folded in Task 9 (9a-1 to 9b) into
+`ARCHITECTURE.md §3` (CA files and variables) and `§7` (interception, CA parameters,
+credentials and redaction), `MANIFEST_SPEC.md` (`secrets[]`, enforcement points),
+`THREAT_MODEL.md` and `REDTEAM_SUITE.md`. Superseded on the way: 403 `inject-requires-tls`
+is now 405 `plain-http-unsupported` for every host (Task 8, #59); a new upstream TLS
+connection per request is now one per tunnel (architect Q28).
 
 ## 5–8. Folded
 
@@ -99,7 +98,7 @@ Anything from a sandbox that `sallyd` relays to a terminal or the UI in line mod
 | 5 shim | §3.3 generic relay + `--stdio` |
 | 6 sandbox | roles (§2), argv (§6.1), protected paths (§6.3), socket scan, session-overlap check, runtime parameter (§6.5); fold into `ARCHITECTURE.md §3` |
 | 7 rpc | control socket unchanged; session socket = MCP subset (§3.1) |
-| 8–9 egress | §4 in full; delete the upgrade path |
+| 8–9 egress | §4 in full; delete the upgrade path (folded, Task 9b) |
 | 10 approvals | blocking `tools/call`; adds fetch-write and MCP-tool approvals |
 | 11 tools | §3.1 table; `fs_*` on all mount modes |
 | 12 session + CLI | two-container lifecycle stub (workspace now, harness role for tests), §6.4, `sally bridge` (stdin/stdout ↔ `control.sock`; lets a Windows-native shell reach `sallyd` through `wsl.exe` with no TCP port) |
@@ -114,15 +113,11 @@ Budget: this adds roughly half a week to M1 and is about neutral afterwards. The
 
 ## 10. New red-team rows (add to `REDTEAM_SUITE.md`; all CI)
 
-RT-AG-11 to RT-AG-14 and RT-INF-05 are folded into `REDTEAM_SUITE.md` (Task 7).
+RT-AG-11 to RT-AG-14 and RT-INF-05 are folded into `REDTEAM_SUITE.md` (Task 7); RT-SEC-09 to
+RT-SEC-13 are folded into `REDTEAM_SUITE.md` (Task 9, old → new table there).
 
 | ID | Attack | PASS | M |
 |---|---|---|---|
-| RT-SEC-09 | CONNECT to a grant host and to an allowed non-grant host; inspect the presented chain | grant host: leaf from session CA; non-grant host: upstream's own chain, never the session CA | M1 |
-| RT-SEC-10 | Use the session CA for another name; search both containers for a private key | leaf for an unlisted name fails validation in a stock client; no key material in any sandbox | M1 |
-| RT-SEC-11 | `expose_env` set; dump env; call grant host and non-grant host | env holds only the placeholder; upstream of grant host receives the real credential; non-grant host receives at most the placeholder | M1 |
-| RT-SEC-12 | Upstream echoes the token split across chunks, base64 and percent-encoded | all forms redacted | M1 |
-| RT-SEC-13 | `http://` request to a grant host | 403 `inject-requires-tls`; mock sees no credential | M1 |
 | RT-FS-12 | Write `.git/hooks/pre-commit` and a `core.fsmonitor` line, via shell and via `fs_write`; then run `git status` on the host in the harness | both writes refused; host canary not executed | M1 |
 | RT-FS-13 | Mount tree contains a Unix socket | launch refused `socket-in-mount` | M1 |
 | RT-FS-14 | Mount a bind-mount alias of a protected folder | refused (`st_dev`/`st_ino` match) | M1 |

@@ -155,7 +155,8 @@ impl Pki {
 /// The TLS mock HTTP server: one request at a time; `/echo-headers` returns the request it got
 /// as its body and the request's `Authorization` value in an `X-Echo-Authorization` header
 /// (RT-SEC-06), `/redirect` a 302 to `https://mock2.test/echo-headers`, `/echo-gzip` a
-/// gzip-encoded body, anything else `ok`.
+/// gzip-encoded body, `/echo-forms` the encodings of `GIT_TOKEN` chunked ([`echo_forms`],
+/// RT-SEC-12), anything else `ok`.
 async fn serve_tls(
     far: DuplexStream,
     cfg: Arc<rustls::ServerConfig>,
@@ -168,6 +169,12 @@ async fn serve_tls(
     while let Some(req) = read_request(&mut tls, &mut buf).await {
         seen.lock().unwrap().push(req.clone());
         let path = req.split(' ').nth(1).unwrap_or("/");
+        if path == "/echo-forms" {
+            if echo_forms(&mut tls, &req).await.is_err() {
+                return;
+            }
+            continue;
+        }
         let (status, extra, body) = match path {
             "/echo-headers" => {
                 let auth = req
@@ -200,6 +207,35 @@ async fn serve_tls(
             return;
         }
     }
+}
+
+/// The size of each chunk `/echo-forms` sends (RT-SEC-12: every form is split across chunks).
+pub const FORMS_CHUNK: usize = 5;
+
+/// RT-SEC-12's `/echo-forms`: [`super::forms::echo_body`] for `GIT_TOKEN`'s canary and the
+/// `Basic` credential the request carried, chunked in [`FORMS_CHUNK`]-byte chunks, each written
+/// and flushed on its own.
+async fn echo_forms<S: AsyncWriteExt + Unpin>(tls: &mut S, req: &str) -> io::Result<()> {
+    let blob = req
+        .split("\r\n")
+        .find_map(|l| {
+            let (n, v) = l.split_once(':')?;
+            n.eq_ignore_ascii_case("authorization").then(|| v.trim())
+        })
+        .and_then(|v| v.strip_prefix("Basic "))
+        .unwrap_or_default();
+    let body = super::forms::echo_body(&canary("GIT_TOKEN"), blob, req);
+    tls.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+        .await?;
+    for chunk in body.as_bytes().chunks(FORMS_CHUNK) {
+        tls.write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+            .await?;
+        tls.write_all(chunk).await?;
+        tls.write_all(b"\r\n").await?;
+        tls.flush().await?;
+    }
+    tls.write_all(b"0\r\n\r\n").await?;
+    tls.flush().await
 }
 
 /// One request (head, and a `Content-Length` body) from `s`.
@@ -245,12 +281,20 @@ impl HostAddrs for Owned {
 pub type FakeEgress = Egress<Names, Upstream, Owned>;
 
 /// The secrets the fixtures' store holds (the names the test manifests grant).
-pub const STORED: [&str; 2] = ["GITHUB_TOKEN", "MOCK3_TOKEN"];
+pub const STORED: [&str; 3] = ["GITHUB_TOKEN", "MOCK3_TOKEN", "GIT_TOKEN"];
 
 /// The canary value the fixtures' store holds for `name`: assembled at runtime, so no
 /// credential-shaped literal is in the tree; `CANARY` makes it easy to grep for (RT-SEC-07).
+/// `GIT_TOKEN`'s also holds characters a percent-encoder escapes (`/ + ? & = %` and a space),
+/// so each percent spelling differs from the raw value (architect ruling A4); none of the
+/// canaries holds `*`, so a session's filler is `*`.
 pub fn canary(name: &str) -> String {
-    format!("SALLY_CANARY_{name}_{}", "c0ffee".repeat(4))
+    let base = format!("SALLY_CANARY_{name}_{}", "c0ffee".repeat(4));
+    if name == "GIT_TOKEN" {
+        format!("{base}/a+b c?d&e=f%g")
+    } else {
+        base
+    }
 }
 
 /// The production secrets store file, 0600 in a 0700 directory of its own (`egress-secrets`,

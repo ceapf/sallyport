@@ -20,6 +20,7 @@ use std::time::{Duration, SystemTime};
 
 use common::container::{Lx, SHIM_LOG, exec, exec_in, ids, net_image, rt, test_image};
 use common::egress::tls_upstream;
+use common::search::{Plants, Scope, found};
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
     KeyUsagePurpose, PKCS_ECDSA_P256_SHA256, SanType,
@@ -431,53 +432,25 @@ fn planted_b64(key: &KeyPair) -> String {
 /// whose command lines hold the patterns; a command line carrying it is skipped.
 const SEARCH_MARK: &str = "sp-rt-sec-10-search";
 
-/// A shell script that plants a throwaway key (a PEM file and its DER under `/tmp`, a process
-/// environment, a process command line) and prints every file outside
-/// `/proc`, `/sys` and `/dev`, every file in `/dev/shm`, and every `/proc/*/environ` and
-/// `/proc/*/cmdline` (but the search's own) that holds key material or `ca_line`;
-/// `unreadable <path>` for an environment it may not read. Key material: a PEM private-key armor
-/// line (the bare label is a string in libcrypto), and the PKCS#8 P-256 prefix in base64 and in
-/// DER. A `/proc` hit is labelled `<planted>` for the two planted processes and `<pid N>` for any
-/// other, so a real leak never merges with the positive control (security re-review M1).
-/// `/dev/shm` is read-only in both sandboxes, so nothing can be planted there; the script says so
-/// if that ever changes (a tripwire: the test then fails until a plant there is added).
+/// The shared search (`common::search`) for key material or `ca_line`, after planting a
+/// throwaway key: a PEM file and its DER under `/tmp`, a process environment, a process command
+/// line. Key material: a PEM private-key armor line (the bare label is a string in libcrypto),
+/// and the PKCS#8 P-256 prefix in base64 and in DER.
 fn search_script(planted_pem: &str, planted_b64: &str, ca_line: &str) -> String {
-    format!(
-        "set -u\n\
-         printf '%s' '{planted_pem}' > /tmp/planted.pem\n\
-         ( printf '%s' '{planted_pem}' > /dev/shm/planted.pem ) 2>/dev/null \
-           && echo '/dev/shm is writable: plant there as a positive control'\n\
-         printf '%s' '{planted_b64}' | base64 -d > /tmp/planted.der\n\
-         env SP_PLANTED='{planted_b64}' sleep 120 </dev/null >/dev/null 2>&1 &\n\
-         planted_env=$!\n\
-         sh -c 'sleep 120; :' planted '{planted_b64}' </dev/null >/dev/null 2>&1 &\n\
-         planted_cmd=$!\n\
-         sleep 1\n\
-         der=\"$(printf '{KEY_DER_OCTAL}')\"\n\
-         set -- -e '{SEARCH_MARK}' -e 'PRIVATE KEY-----' -e '{KEY_B64}' -e \"$der\" -e '{ca_line}'\n\
-         find / \\( -path /proc -o -path /sys -o -path /dev \\) -prune -o -type f -print0 2>/dev/null \
-           | xargs -0 grep -l -a -F \"$@\" 2>/dev/null\n\
-         find /dev/shm -type f -print0 2>/dev/null | xargs -0 grep -l -a -F \"$@\" 2>/dev/null\n\
-         label() {{ p=${{1#/proc/}}; p=${{p%%/*}}; \
-           if [ \"$p\" = \"$planted_env\" ] || [ \"$p\" = \"$planted_cmd\" ]; \
-           then echo '<planted>'; else echo \"<pid $p>\"; fi; }}\n\
-         for e in /proc/[0-9]*/environ; do\n\
-           if [ -e \"$e\" ] && ! [ -r \"$e\" ]; then echo \"unreadable $e\"; fi\n\
-           if grep -q -a -F \"$@\" \"$e\" 2>/dev/null; then echo \"/proc/$(label $e)/environ\"; fi\n\
-         done\n\
-         for c in /proc/[0-9]*/cmdline; do\n\
-           if grep -q -a -F -e '{SEARCH_MARK}' \"$c\" 2>/dev/null; then continue; fi\n\
-           if grep -q -a -F \"$@\" \"$c\" 2>/dev/null; then echo \"/proc/$(label $c)/cmdline\"; fi\n\
-         done\n\
-         exit 0\n"
-    )
-}
-
-fn found(out: &str) -> Vec<String> {
-    let mut v: Vec<String> = out.lines().map(str::to_owned).collect();
-    v.sort();
-    v.dedup();
-    v
+    let files = format!(
+        "printf '%s' '{planted_pem}' > /tmp/planted.pem\n\
+         printf '%s' '{planted_b64}' | base64 -d > /tmp/planted.der\n"
+    );
+    let patterns = format!(
+        "der=\"$(printf '{KEY_DER_OCTAL}')\"\n\
+         set -- -e '{SEARCH_MARK}' -e 'PRIVATE KEY-----' -e '{KEY_B64}' -e \"$der\" -e '{ca_line}'"
+    );
+    let plants = Plants {
+        files: &files,
+        shm: planted_pem,
+        process: planted_b64,
+    };
+    common::search::search_script(SEARCH_MARK, &plants, &patterns, Scope::All)
 }
 
 /// RT-SEC-10, key reach and the live leg. Controls: the leaf keys live only in `sallyd`

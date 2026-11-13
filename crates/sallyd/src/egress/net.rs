@@ -348,8 +348,8 @@ pub enum EgressError {
     /// The secrets store could not be read (Task 9a-3, architect D7).
     #[error("secrets store: {0}")]
     Store(#[source] sally_core::secrets::SecretsError),
-    /// The grants' credentials could not be built: a secret missing from the store, a `{basic}`
-    /// grant (Task 9b), or a grant that cannot be injected.
+    /// The grants' credentials could not be built: a secret missing from the store, or a grant
+    /// that cannot be injected or redacted.
     #[error(transparent)]
     Credentials(#[from] CredentialsError),
 }
@@ -358,12 +358,11 @@ pub enum EgressError {
 /// the resolver, dialer, host addresses and trust roots behind it are constructor arguments
 /// (decision 10; Task 9a decision 6).
 pub trait EgressStarter: Send + Sync {
-    /// For a session with a session CA ([`SessionEgress::ca`]): refuses a `{basic}` grant (before
-    /// the store is opened), reads the grants' values from the secrets source and builds the
-    /// credentials, loads the upstream trust roots, mints the CA and its leaves, and writes
-    /// `ca-bundle.pem` and `session-ca.pem` into `dir` (the workspace socket directory), before
-    /// the container exists. Blocking: the launcher runs it off the runtime. Other sessions pass
-    /// through unchanged.
+    /// For a session with a session CA ([`SessionEgress::ca`]): reads the grants' values from
+    /// the secrets source and builds the credentials, loads the upstream trust roots, mints the
+    /// CA and its leaves, and writes `ca-bundle.pem` and `session-ca.pem` into `dir` (the
+    /// workspace socket directory), before the container exists. Blocking: the launcher runs it
+    /// off the runtime. Other sessions pass through unchanged.
     ///
     /// # Errors
     /// [`EgressError::Credentials`], [`EgressError::Store`], [`EgressError::Roots`],
@@ -404,9 +403,6 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> EgressStarter for Egress<R, D, H> {
     fn prepare(&self, dir: &Path, mut s: SessionEgress) -> Result<SessionEgress, EgressError> {
         if !s.ca {
             return Ok(s);
-        }
-        if let Some(g) = s.grants.iter().find(|g| g.is_basic()) {
-            return Err(CredentialsError::Basic(g.name.clone()).into());
         }
         let mut names: Vec<String> = Vec::new();
         for g in &s.grants {

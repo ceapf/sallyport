@@ -908,16 +908,19 @@ sallyport/
     `Trailer`, `Transfer-Encoding` and `Upgrade` are dropped. Redirects are returned, never
     followed. Trailers are never forwarded in either direction. The client gets hyper's canonical
     reason phrase, never the upstream's.
-  - Credentials and redaction (Task 9a-3, `egress::inject`, `egress::redact`; maintainer
-    decisions 1–7, architect D1–D13). At launch, a session with grants refuses a `{basic}`
-    grant (`basic-unsupported`, until 9b: #80) before the secrets store is opened, then reads
+  - Credentials and redaction (Tasks 9a-3 and 9b, `egress::inject`, `egress::redact`;
+    maintainer decisions 1–7, architect D1–D13, A1–A3). At launch, a session with grants reads
     the grants' values through the starter's `SecretSource` (production: the 0600 store file;
     every other value is dropped, wiped, before `prepare` returns): a missing one refuses the
     launch (`secret-missing`), an unreadable store too (`secret-store`), a grant that cannot be
     injected or redacted as well (`secret-grant`), and a session whose forms hold every filler
-    candidate (`secret-filler`). `Credentials` holds each grant's rendered header value as
-    a `Secret` and the redaction of every form of every session secret (sally-core's
-    `secret_forms`, as the audit redactor, plus each rendered value); it has one constructor and
+    candidate (`secret-filler`). A format holds exactly one placeholder: `{value}` takes the
+    secret, `{basic}` takes RFC 7617's padded standard base64 of `basic_user:secret`
+    (`sally-core::audit::basic_credential`); the pairing of placeholder and `basic_user` is
+    checked again here, behind the validator. `Credentials` holds each grant's rendered header
+    value as a `Secret` and the redaction of every form of every session secret (sally-core's
+    `secret_forms`, as the audit redactor, plus each rendered value and, for `{basic}`, the blob
+    padded and unpadded); it has one constructor and
     `Interception::new` refuses leaves and credentials naming different hosts. Each request builds
     a sensitive `HeaderValue`; everything drops with the session's proxy. Every response on every
     grant host is redacted with every secret of the session (D4): each header is scanned as the
@@ -980,7 +983,7 @@ sallyport/
   an error, never skipped. Certificates the verifier cannot use are skipped and counted; none
   usable is an error. Any error refuses the launch (`sandbox.refuse` reason `trust-roots`; a CA or
   file failure is `session-ca`; the credentials, read first, refuse with `secret-missing`,
-  `secret-store`, `basic-unsupported`, `secret-grant` or `secret-filler`: Task 9a-3). One load feeds the upstream verifier and `ca-bundle.pem`. The
+  `secret-store`, `secret-grant` or `secret-filler`: Task 9a-3). One load feeds the upstream verifier and `ca-bundle.pem`. The
   file list and owner are constructor arguments of the egress starter (Task 8 decision 10);
   production passes these. Doctor V17 applies the same checks.
 - **RPC and LLM audit events** (Task 7). All are written at every `audit.level` except
@@ -1090,10 +1093,12 @@ sallyport/
 - **Redaction** (`sally-core::audit::Redactor`): the raw secret, its percent-encoding (both hex
   cases, and `+` for space), and its base64 in three alignments and both alphabets trimmed to the
   characters that do not depend on neighbouring bytes (patterns under 12 characters skipped), so
-  the base64 of any string containing the secret is caught (AMENDMENTS-02 B1). Matches become
+  the base64 of any string containing the secret is caught. Matches become
   `[REDACTED:NAME]`. The token proxy's response redaction uses the same forms
-  (`sally-core::audit::secret_forms`, held per session in `SessionForms`) with a same-length
-  filler and no name (Task 9a-3).
+  (`sally-core::audit::secret_forms`, held per session in `SessionForms`) plus each grant's
+  rendered value and `{basic}` blob, with a same-length filler and no name (Tasks 9a-3, 9b).
+  A store value under 16 bytes is stored and reported short (`SHORT_SECRET_BYTES`: its base64
+  forms are few or none); `sally secrets set` warns about it (Task 12, TODO(#98)).
 - **Tauri bridge**: Rust side exposes one command `rpc(method: String, params: Value)` that
   forwards to `control.sock` **only** for methods in a compile-time allowlist (no
   `secrets.list` of values exists anyway). Capabilities file grants `core:default` only.
