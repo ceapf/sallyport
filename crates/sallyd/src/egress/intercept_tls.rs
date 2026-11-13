@@ -9,9 +9,9 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::sign::{CertifiedKey, SingleCertAndKey};
-use rustls::{ClientConfig, ServerConfig};
+use rustls::{ClientConfig, RootCertStore, ServerConfig};
 
 use super::super::ca::{CaError, Leaf, SessionTls};
 use super::super::inject::Credentials;
@@ -49,12 +49,7 @@ impl Interception {
     fn build(tls: SessionTls, roots: Roots, credentials: Credentials) -> Result<Self, CaError> {
         hosts_match(&tls, &credentials)?;
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let mut upstream = ClientConfig::builder_with_provider(Arc::clone(&provider))
-            .with_safe_default_protocol_versions()
-            .map_err(tls_error)?
-            .with_root_certificates(Arc::clone(&roots.store))
-            .with_no_client_auth();
-        upstream.alpn_protocols = vec![HTTP_1_1.to_vec()];
+        let upstream = upstream_client(&roots)?;
         let mut servers = Vec::with_capacity(tls.leaves.len());
         for leaf in &tls.leaves {
             let mut cfg = ServerConfig::builder_with_provider(Arc::clone(&provider))
@@ -68,7 +63,7 @@ impl Interception {
         Ok(Self {
             tls,
             roots,
-            upstream: Arc::new(upstream),
+            upstream,
             servers,
             credentials: Arc::new(credentials),
         })
@@ -89,6 +84,18 @@ impl Interception {
             .map(|(_, c)| Arc::clone(c))
     }
 
+    /// The verifying client configuration toward the upstream.
+    #[must_use]
+    pub fn upstream(&self) -> &Arc<ClientConfig> {
+        &self.upstream
+    }
+
+    /// The hosts the session CA has leaves for, in leaf order.
+    #[must_use]
+    pub fn leaf_hosts(&self) -> Vec<String> {
+        self.servers.iter().map(|(h, _)| h.clone()).collect()
+    }
+
     /// What intercepting `host` takes, if the session CA made its leaf.
     pub(super) fn host_tls(&self, host: &str) -> Option<HostTls> {
         Some(HostTls {
@@ -105,6 +112,38 @@ pub(super) struct HostTls {
     pub(super) server: Arc<ServerConfig>,
     pub(super) upstream: Arc<ClientConfig>,
     pub(super) credentials: Arc<Credentials>,
+}
+
+/// The one verifying client configuration toward an upstream (architect ruling Q2): rustls
+/// defaults (TLS 1.2 and 1.3), `roots` only, ALPN `http/1.1`. The proxy's interception and the
+/// `fetch` tool's spliced connections both use it.
+///
+/// # Errors
+/// [`CaError::Generate`] when rustls refuses it.
+pub fn upstream_client(roots: &Roots) -> Result<Arc<ClientConfig>, CaError> {
+    client(Arc::clone(&roots.store))
+}
+
+/// A client configuration that trusts `ca` only: the `fetch` tool's view of an intercepted host,
+/// whose leaf the session CA signed. Never used toward an upstream.
+///
+/// # Errors
+/// [`CaError::Generate`] when rustls refuses the certificate or the configuration.
+pub fn trusting(ca: &CertificateDer<'static>) -> Result<Arc<ClientConfig>, CaError> {
+    let mut store = RootCertStore::empty();
+    store.add(ca.clone()).map_err(tls_error)?;
+    client(Arc::new(store))
+}
+
+fn client(store: Arc<RootCertStore>) -> Result<Arc<ClientConfig>, CaError> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut cfg = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(tls_error)?
+        .with_root_certificates(store)
+        .with_no_client_auth();
+    cfg.alpn_protocols = vec![HTTP_1_1.to_vec()];
+    Ok(Arc::new(cfg))
 }
 
 /// Every leaf host has a credential and every credential a leaf (architect D10). Outside

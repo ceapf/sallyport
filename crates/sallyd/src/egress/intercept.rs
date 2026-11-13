@@ -61,6 +61,9 @@ const MAX_HEADERS: usize = 100;
 /// [`MAX_HEAD`] or [`MAX_RESPONSE_HEAD`].
 const REQUEST_READ: usize = 1024;
 const RESPONSE_READ: usize = 4096;
+/// Largest request head an intercepted tunnel passes on (exact, see above): the `fetch` tool
+/// refuses at prepare a request whose head would not fit (architect ruling Q3).
+pub const MAX_REQUEST_HEAD: usize = MAX_HEAD - REQUEST_READ;
 
 /// What an intercepted tunnel's `egress.close` adds: its requests and their status classes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -598,7 +601,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         ));
         Arc::new(RequestEnd {
             state: Arc::clone(st),
-            limit: Mutex::new(Some((over, Arc::clone(&self.audit)))),
+            limit: Mutex::new(Some((over, self.sink()))),
             level: self.level,
         })
     }
@@ -670,7 +673,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         ));
         let on_end = ResponseEnd {
             state: Arc::clone(st),
-            limit: Mutex::new(Some((over, Arc::clone(&self.audit)))),
+            limit: Mutex::new(Some((over, self.sink()))),
             level: self.level,
         };
         let capped = Capped::new(body, self.limits.max_response, Arc::new(on_end));
@@ -680,7 +683,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
             target: target.to_owned(),
             status: rp.status,
             redaction: Arc::clone(redaction),
-            sink: Arc::clone(&self.audit),
+            sink: self.sink(),
             level: self.level,
         });
         // A body known empty now (HEAD, 204, 304) is never polled: its entry is written here,
@@ -792,8 +795,10 @@ fn upstream_request(
 }
 
 /// hyper's client toward the upstream: response heads up to `MAX_RESPONSE_HEAD - RESPONSE_READ`
-/// bytes (exact) and `MAX_HEADERS` lines.
-fn upstream_builder() -> hyper::client::conn::http1::Builder {
+/// bytes (exact) and `MAX_HEADERS` lines. The `fetch` tool parses with it too (architect ruling
+/// Q5): on a spliced host it is the only parser of the upstream's bytes.
+#[must_use]
+pub fn upstream_builder() -> hyper::client::conn::http1::Builder {
     let mut b = hyper::client::conn::http1::Builder::new();
     b.max_buf_size(MAX_RESPONSE_HEAD)
         .max_header_size(MAX_RESPONSE_HEAD - RESPONSE_READ)

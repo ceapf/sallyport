@@ -611,6 +611,8 @@ fn listen(
                 timeout: std::time::Duration::from_secs(60),
                 grants: Vec::new(),
                 interception: None,
+                fetch: false,
+                roots: None,
             },
         )
         .unwrap();

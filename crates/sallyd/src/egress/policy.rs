@@ -65,6 +65,39 @@ pub enum Reason {
 }
 
 impl Reason {
+    /// Every reason, in declaration order.
+    pub const ALL: [Self; 22] = [
+        Self::HostNotAllowed,
+        Self::PortNotAllowed,
+        Self::IpLiteral,
+        Self::IpRangeDenied,
+        Self::ResolveFailed,
+        Self::ConnectFailed,
+        Self::PlainHttpUnsupported,
+        Self::GrantHostUnavailable,
+        Self::TooManyConnections,
+        Self::HeadTooLarge,
+        Self::HeadTimeout,
+        Self::Malformed,
+        Self::HostMismatch,
+        Self::UpgradeRefused,
+        Self::MethodRefused,
+        Self::RequestTooLarge,
+        Self::ResponseTooLarge,
+        Self::UpstreamEncoded,
+        Self::UpstreamTlsFailed,
+        Self::UpstreamClosed,
+        Self::UpstreamMalformed,
+        Self::UpstreamEchoedSecret,
+    ];
+
+    /// The reason whose [`Self::as_str`] form is `code`, if any (the `fetch` tool reads the
+    /// proxy's refusal back with it; architect ruling Q5).
+    #[must_use]
+    pub fn from_code(code: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.as_str() == code)
+    }
+
     /// The audit and reply form.
     #[must_use]
     pub fn as_str(self) -> &'static str {
@@ -408,6 +441,17 @@ mod tests {
     fn hosts_without_a_grant_are_spliced() {
         let p = Policy::new(vec![rule("*.mock.test", &[443])], vec![]);
         assert_eq!(p.decide(&at("a.mock.test", 443)), Ok(Route::Splice));
+    }
+
+    #[test]
+    fn every_reason_is_listed_once_and_read_back_from_its_code() {
+        for (i, r) in Reason::ALL.into_iter().enumerate() {
+            assert_eq!(Reason::from_code(r.as_str()), Some(r));
+            assert!(!Reason::ALL[..i].contains(&r), "{r:?} listed twice");
+        }
+        for other in ["", "Host-Not-Allowed", "host-not-allowed\n", "ok"] {
+            assert_eq!(Reason::from_code(other), None, "{other:?}");
+        }
     }
 
     #[test]

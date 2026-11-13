@@ -8,6 +8,7 @@ pub mod ca;
 pub mod head;
 pub mod hostaddrs;
 pub mod inject;
+pub mod local;
 pub mod meter;
 pub mod net;
 pub mod policy;
