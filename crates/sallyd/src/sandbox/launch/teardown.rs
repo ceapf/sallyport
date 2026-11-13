@@ -69,7 +69,8 @@ impl Launcher {
                 AuditLevel::default(),
             )
             .await?;
-            self.run("rm", rm_args(&o.name)).await?;
+            // By ID: a name re-used since the listing is another container (PS-L5).
+            self.run("rm", rm_args(&o.container)).await?;
             removed.push(o.name);
         }
         Ok(removed)

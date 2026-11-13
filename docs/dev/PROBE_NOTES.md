@@ -66,6 +66,9 @@ line per fact, with where it was found. Check a note again before relying on it 
   has none; an empty listing is `[]`. The template `{{index .Labels "k"}}` prints an empty value
   for a missing label (`{{.Label "k"}}` is an error), but a label value can hold a newline, so
   the sweep reads the JSON. (Task 12 PR A, ruling Q64)
+- `ps --format '{{json .ID}}'` prints the 12-digit short ID; with `--no-trunc` it prints all 64
+  lowercase hex digits, which is what the sweep lists and passes to `rm` (a name can be re-used
+  between the listing and the removal; an ID cannot). (Task 12 PR A, review PS-L5)
 
 ## Kernel and namespaces
 

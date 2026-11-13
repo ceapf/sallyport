@@ -16,7 +16,7 @@ mod disk;
 mod images;
 mod inside;
 mod launch;
-pub mod orphans;
+pub(crate) mod orphans;
 mod overlap;
 mod podman;
 mod profiles;

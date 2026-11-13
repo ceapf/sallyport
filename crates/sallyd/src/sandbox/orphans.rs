@@ -9,9 +9,11 @@
 //!   sweep's scope;
 //! - no live session owns that id.
 //!
-//! The listing is one line per container, `<name as JSON> <labels as JSON object or null>`
-//! ([`ps_args`]), so a label value holding a newline cannot forge a line (PROBE_NOTES). A line
-//! that does not parse fails the whole sweep, never skips silently.
+//! The listing is one line per container, `<full ID> <name> <labels as JSON object or null>`,
+//! each as JSON ([`ps_args`]), so a label value holding a newline cannot forge a line
+//! (PROBE_NOTES). A line that does not parse fails the whole sweep, never skips silently. An
+//! orphan is removed by its full ID, never its name, which a new container could have taken
+//! since the listing.
 
 use std::ffi::OsString;
 
@@ -28,29 +30,37 @@ pub fn ps_args(installation: &Installation) -> Vec<OsString> {
     [
         "ps".to_owned(),
         "--all".to_owned(),
+        "--no-trunc".to_owned(),
         "--filter".to_owned(),
         format!("label={INSTALLATION_LABEL}={}", installation.as_str()),
         "--format".to_owned(),
-        "{{json .Names}} {{json .Labels}}".to_owned(),
+        "{{json .ID}} {{json .Names}} {{json .Labels}}".to_owned(),
     ]
     .into_iter()
     .map(OsString::from)
     .collect()
 }
 
-/// A container to remove: its name, and the session id in it.
+/// A container to remove: its full ID (what `podman rm` is given), its name, and the session id
+/// in the name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Orphan {
+    /// The full container ID: 64 lowercase hex digits.
+    pub container: String,
     /// The container name.
     pub name: String,
     /// The session id the name carries.
     pub id: String,
 }
 
+/// One parsed listing line: the ID, the name and the labels (`None` for `null`).
+type Line = (String, String, Option<serde_json::Map<String, Value>>);
+
 /// The orphans in `listing` (the output of [`ps_args`]).
 ///
 /// # Errors
-/// A line that is not a JSON string followed by a JSON object or `null`, naming the line number.
+/// A line that is not a full container ID and a name (JSON strings) followed by a JSON object or
+/// `null`, naming the line number.
 pub fn orphans(
     listing: &str,
     installation: &Installation,
@@ -62,7 +72,7 @@ pub fn orphans(
         if line.trim().is_empty() {
             continue;
         }
-        let (name, labels) =
+        let (container, name, labels) =
             parse_line(line).ok_or_else(|| format!("ps line {}: malformed", n + 1))?;
         let ours = labels
             .as_ref()
@@ -84,25 +94,35 @@ pub fn orphans(
         }
         out.push(Orphan {
             id: id.to_owned(),
+            container,
             name,
         });
     }
     Ok(out)
 }
 
-/// `<string> <object|null>` and nothing else.
-fn parse_line(line: &str) -> Option<(String, Option<serde_json::Map<String, Value>>)> {
+/// `<string: full ID> <string> <object|null>` and nothing else.
+fn parse_line(line: &str) -> Option<Line> {
     let mut values = serde_json::Deserializer::from_str(line).into_iter::<Value>();
-    let name = match values.next()?.ok()? {
-        Value::String(s) => s,
-        _ => return None,
+    let mut string = || match values.next()?.ok()? {
+        Value::String(s) => Some(s),
+        _ => None,
     };
+    let container = string().filter(|c| full_id(c))?;
+    let name = string()?;
     let labels = match values.next()?.ok()? {
         Value::Object(m) => Some(m),
         Value::Null => None,
         _ => return None,
     };
-    values.next().is_none().then_some((name, labels))
+    values.next().is_none().then_some((container, name, labels))
+}
+
+/// 64 lowercase hex digits, as `podman ps --no-trunc` prints an ID.
+fn full_id(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// `id` is inside `scope` (empty: everything), which ends at a dash.
@@ -129,12 +149,26 @@ mod tests {
         Installation::parse(OWN).unwrap()
     }
 
+    /// A container ID derived from its name, so each test container has its own.
+    fn cid(name: &str) -> String {
+        let mut h = [0u8; 32];
+        for (i, b) in name.bytes().enumerate() {
+            let at = i % 32;
+            h[at] = h[at].wrapping_mul(31).wrapping_add(b);
+        }
+        h.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
     fn line(name: &str, label: Option<&str>) -> String {
         let labels = label.map_or(
             Value::Null,
             |v| serde_json::json!({ INSTALLATION_LABEL: v, "other": "x" }),
         );
-        format!("{} {labels}", Value::String(name.to_owned()))
+        format!(
+            "\"{}\" {} {labels}",
+            cid(name),
+            Value::String(name.to_owned())
+        )
     }
 
     fn names(listing: &str, scope: &str, live: &[&str]) -> Vec<String> {
@@ -156,12 +190,34 @@ mod tests {
             [
                 "ps",
                 "--all",
+                "--no-trunc",
                 "--filter",
                 &format!("label=sallyport.installation={OWN}"),
                 "--format",
-                "{{json .Names}} {{json .Labels}}",
+                "{{json .ID}} {{json .Names}} {{json .Labels}}",
             ]
         );
+    }
+
+    /// The removal names the listed container by its full ID (security review PS-L5): a name
+    /// re-used between the listing and the removal is another container, and not equal.
+    #[test]
+    fn an_orphan_carries_its_full_container_id() {
+        let listing = line("sp-ws-a-1", Some(OWN));
+        let o = orphans(&listing, &own(), "", |_| false).unwrap();
+        assert_eq!(o.len(), 1);
+        assert_eq!(o[0].container, cid("sp-ws-a-1"));
+        assert_eq!(o[0].container.len(), 64);
+        let reused = listing.replacen(&cid("sp-ws-a-1"), &cid("sp-ws-a-1x"), 1);
+        let again = orphans(&reused, &own(), "", |_| false).unwrap();
+        assert_eq!(again[0].name, o[0].name);
+        assert_ne!(again, o);
+        // Every hex digit, `a` to `f` and `0` to `9`, is one.
+        for id in ["0123456789abcdef".repeat(4), "f9".repeat(32)] {
+            let l = format!("\"{id}\" \"sp-ws-a-1\" {{\"{INSTALLATION_LABEL}\": \"{OWN}\"}}");
+            let o = orphans(&l, &own(), "", |_| false).unwrap();
+            assert_eq!(o[0].container, id);
+        }
     }
 
     #[test]
@@ -188,8 +244,10 @@ mod tests {
 
     #[test]
     fn a_label_that_is_not_a_string_is_not_this_installations() {
+        let (a, b) = (cid("a"), cid("b"));
         let listing = format!(
-            "\"sp-ws-a-1\" {{\"{INSTALLATION_LABEL}\": 7}}\n\"sp-ws-a-2\" {{\"other\": \"{OWN}\"}}"
+            "\"{a}\" \"sp-ws-a-1\" {{\"{INSTALLATION_LABEL}\": 7}}\n\
+             \"{b}\" \"sp-ws-a-2\" {{\"other\": \"{OWN}\"}}"
         );
         assert!(names(&listing, "", &[]).is_empty());
     }
@@ -207,7 +265,10 @@ mod tests {
 
     #[test]
     fn a_newline_in_a_label_cannot_forge_a_line() {
-        let forged = format!("{OWN}\n\"sp-ws-victim\" {{\"{INSTALLATION_LABEL}\": \"{OWN}\"}}");
+        let forged = format!(
+            "{OWN}\n\"{}\" \"sp-ws-victim\" {{\"{INSTALLATION_LABEL}\": \"{OWN}\"}}",
+            cid("victim")
+        );
         let listing = line("sp-ws-a-1", Some(&forged));
         assert_eq!(listing.lines().count(), 1);
         assert!(names(&listing, "", &[]).is_empty());
@@ -215,15 +276,29 @@ mod tests {
 
     #[test]
     fn a_malformed_line_fails_the_sweep() {
+        let id = "0fab".repeat(16);
+        let short = &id[..12];
+        let upper = id.to_uppercase();
         for bad in [
-            "sp-ws-a-1",
-            "\"sp-ws-a-1\"",
-            "\"sp-ws-a-1\" {",
-            "\"sp-ws-a-1\" [] ",
-            "\"sp-ws-a-1\" null null",
-            "7 null",
+            "sp-ws-a-1".to_owned(),
+            format!("\"{id}\" \"sp-ws-a-1\""),
+            format!("\"{id}\" \"sp-ws-a-1\" {{"),
+            format!("\"{id}\" \"sp-ws-a-1\" [] "),
+            format!("\"{id}\" \"sp-ws-a-1\" null null"),
+            format!("\"{id}\" 7 null"),
+            // The name where the ID belongs (the old two-field form).
+            "\"sp-ws-a-1\" null".to_owned(),
+            // An ID that is not 64 lowercase hex digits: truncated, uppercase, too long, a name.
+            format!("\"{short}\" \"sp-ws-a-1\" null"),
+            format!("\"{upper}\" \"sp-ws-a-1\" null"),
+            format!("\"{id}0\" \"sp-ws-a-1\" null"),
+            format!("\"{}g\" \"sp-ws-a-1\" null", &id[..63]),
+            format!("\"{}`\" \"sp-ws-a-1\" null", &id[..63]),
+            format!("\"{}/\" \"sp-ws-a-1\" null", &id[..63]),
+            "\"sp-ws-a-1\" \"sp-ws-a-1\" null".to_owned(),
+            "7 \"sp-ws-a-1\" null".to_owned(),
             // A listing cut at the output cap.
-            "\"sp-ws-a-1\" {\"sallyport.installation\":\"0123",
+            format!("\"{id}\" \"sp-ws-a-1\" {{\"sallyport.installation\":\"0123"),
         ] {
             let listing = format!("{}\n{bad}", line("sp-ws-a-0", Some(OWN)));
             let e = orphans(&listing, &own(), "", |_| false).unwrap_err();
