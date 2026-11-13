@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use sally_core::audit::{AuditError, NewEntry};
 use sally_core::manifest::AuditLevel;
+use sallyd::approvals::hub::{Hub, Note};
 use sallyd::sandbox::{AuditSink, LaunchError};
 use sallyd::session::{AGENT_SOCK, Registry, SessionState, StartError, StopOutcome, StopReason};
 use serde_json::{Value, json};
@@ -68,6 +69,11 @@ fn registry() -> Rx {
 }
 
 fn registry_with(default_image: Option<sallyd::sandbox::ImageRef>) -> Rx {
+    registry_hub(default_image, Arc::new(Hub::default()))
+}
+
+/// A registry whose prompts go to `hub` (a watcher on it answers them).
+fn registry_hub(default_image: Option<sallyd::sandbox::ImageRef>, hub: Arc<Hub>) -> Rx {
     let x = Lx::new();
     let sink = Arc::new(Hooked {
         events: x.events.clone(),
@@ -76,10 +82,11 @@ fn registry_with(default_image: Option<sallyd::sandbox::ImageRef>) -> Rx {
         debug: Mutex::new(Vec::new()),
     });
     let log = Lines::default();
-    let reg = x.registry_logged(
+    let reg = x.registry_hub(
         sink.clone(),
         default_image,
         sallyd::oplog::Oplog::new(log.clone()),
+        hub,
     );
     Rx { x, reg, sink, log }
 }
@@ -596,9 +603,7 @@ fn a_session_fetches_through_its_own_proxy_and_only_with_one() {
 /// has any further effect): a command running when the stop comes is killed by it, and its
 /// `tool.result` (`killed: session-stop`) is written before the session's `session.stop
 /// {in_flight: 0}`; after that entry no tool, approval or rpc entry of the session follows, and
-/// no process of the call is left. TODO(#65): a prompt pending at the stop joins this test once
-/// PR B gives the desk an approver (until then every prompt is denied `no-approver`); the
-/// withdraw and the parked write are unit-tested (`approvals::queue_tests`, `tools::tests`).
+/// no process of the call is left. A prompt pending at the stop is the next test.
 #[test]
 fn rt_ag_15_nothing_of_a_session_follows_its_stop() {
     rt().block_on(async {
@@ -661,6 +666,75 @@ fn rt_ag_15_nothing_of_a_session_follows_its_stop() {
             .count();
         assert_eq!(left, 0, "a process of the call is left");
         drop(conn);
+    });
+}
+
+/// RT-AG-15 with a prompt pending at the stop (#65; architect Q59, Q73): with a watcher
+/// attached, a shell call waits for its answer; the stop withdraws the prompt (`approval.withdraw`
+/// `session-stop`) and denies the call before `session.stop`, the watcher is told the prompt
+/// closed, the call gets its refusal, and nothing of the session follows. Control: the desk's
+/// stop step (without it the prompt outlives the session's entries).
+#[test]
+fn rt_ag_15_a_prompt_pending_at_the_stop_is_withdrawn_before_it() {
+    rt().block_on(async {
+        let hub = Arc::new(Hub::default());
+        let r = registry_hub(Some(test_image()), Arc::clone(&hub));
+        let mut watch = hub.watch();
+        let v = Arc::new(r.x.f.load("tools:\n  builtin: [shell]\n  shell: approve\n"));
+        let s = r.reg.start(v).await.unwrap();
+        let sock = r.x.session_paths(&s.id).harness_sockets().join(AGENT_SOCK);
+        let (conn, _dir) = connect(&sock).await;
+        let (rd, mut wr) = conn.into_split();
+        let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"_meta": meta(), "name": "shell",
+                       "arguments": {"cmd": ["true"], "cwd": "/workspace"}}});
+        wr.write_all(format!("{call}\n").as_bytes()).await.unwrap();
+        let note = tokio::time::timeout(Duration::from_secs(30), watch.rx.recv())
+            .await
+            .expect("no prompt")
+            .expect("the hub dropped the watcher");
+        let Note::Requested(prompt) = note else {
+            panic!("{note:?}")
+        };
+        assert_eq!(prompt.session, s.id);
+        assert_eq!(
+            r.reg.stop(&s.id, StopReason::Request).await,
+            Some(StopOutcome::Stopped)
+        );
+        let closed = tokio::time::timeout(Duration::from_secs(5), watch.rx.recv())
+            .await
+            .expect("no close");
+        assert_eq!(closed, Some(Note::Closed(prompt.id.clone())));
+        let mut reply = String::new();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            BufReader::new(rd).read_line(&mut reply),
+        )
+        .await;
+        if !reply.is_empty() {
+            let v: Value = serde_json::from_str(&reply).unwrap();
+            assert!(
+                v.get("error").is_some() || v["result"]["isError"] == json!(true),
+                "the call ran: {v}"
+            );
+        }
+        let all = r.x.events.all();
+        let stop = all
+            .iter()
+            .position(|(e, _)| e == "session.stop")
+            .expect("session.stop");
+        let withdraw = all
+            .iter()
+            .position(|(e, a)| e == "approval.withdraw" && a["id"] == json!(prompt.id))
+            .expect("approval.withdraw");
+        assert!(withdraw < stop, "{all:#?}");
+        assert_eq!(all[withdraw].1["reason"], "session-stop");
+        assert!(
+            !all.iter().any(|(e, _)| e == "approval.decide"),
+            "nobody answered: {all:#?}"
+        );
+        let (_, after) = after_stop(&r.x);
+        assert!(after.is_empty(), "entries after session.stop: {after:?}");
     });
 }
 

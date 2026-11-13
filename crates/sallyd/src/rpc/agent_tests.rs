@@ -276,21 +276,22 @@ async fn legacy_state_belongs_to_one_connection() {
     );
 }
 
-/// RT-AG-06: control-plane methods on the session socket are not found, and audited.
+/// RT-AG-06: control-plane methods on the session socket are not found, and audited: every
+/// method `control.sock` serves (architect Q72), and the control families still to come.
 #[tokio::test]
 async fn rt_ag_06_control_methods_on_agent_sock_are_not_found() {
     let (agent, fake, sink) = setup();
     let mut c = start(&agent);
-    let methods = [
+    let mut methods = crate::rpc::mcp::CONTROL_METHODS.to_vec();
+    methods.extend([
         "secrets.set",
-        "sessions.create",
         "infer.load",
-        "approvals.decide",
         "manifests.save",
         "audit.tail",
         "audit.note",
-    ];
-    for (i, m) in (0..).zip(methods) {
+    ]);
+    assert_eq!(methods.len(), 12);
+    for (i, m) in (0..).zip(methods.iter().copied()) {
         for msg in [
             req(i, m, json!({"name": "x", "value": "y"})),
             bare(i, m, json!({})),
