@@ -92,6 +92,34 @@ async fn an_echoed_credential_is_redacted_in_headers_and_across_body_writes() {
     assert_eq!(entry["end"], json!("complete"));
 }
 
+/// CP4 note 4 (architect ruling Q10): a grant host reached on another allowed port (8443 here)
+/// is intercepted like 443: the upstream gets the credential, the client's copy is dropped, and
+/// the echo comes back redacted. Fails if the grant check looked at the port.
+#[tokio::test]
+async fn a_grant_host_on_another_allowed_port_gets_the_credential_and_a_redacted_echo() {
+    let r = echoing(Arc::new(echo_split));
+    let raw = get("/echo", "Authorization: Bearer attacker\r\n").replace(
+        &format!("Host: {HOST}\r\n"),
+        &format!("Host: {HOST}:8443\r\n"),
+    );
+    let out = r.talk_at(8443, &raw, raw.len()).await;
+    let secret = value(0);
+    let up = &r.seen()[0];
+    assert!(up.contains(&format!("Bearer {secret}")), "{up}");
+    assert!(!up.contains("attacker"), "{up}");
+    assert!(out.starts_with("HTTP/1.1 200 "), "{out}");
+    assert!(!out.contains(&secret), "{out}");
+    let allow = r.sink.args("egress.allow");
+    assert_eq!(
+        (allow["port"].clone(), allow["intercept"].clone()),
+        (json!(8443), json!(true))
+    );
+    assert_eq!(
+        r.sink.args("egress.response")["redacted"][0]["secret"],
+        json!("secret:T0")
+    );
+}
+
 /// The same over a chunked response whose chunks split the value.
 #[tokio::test]
 async fn a_chunked_echo_split_inside_the_value_is_redacted() {

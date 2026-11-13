@@ -35,6 +35,7 @@ use sally_core::audit::{Actor, AuditError, AuditWriter, NewEntry};
 use sally_core::manifest::{AuditLevel, MountMode, NetworkMode, ValidatedManifest};
 use serde_json::json;
 
+use crate::egress::local::Connector;
 use crate::egress::net::{EgressError, EgressHandle, EgressStarter, NET_SOCK, SessionEgress};
 
 use super::argv::workspace_argv;
@@ -161,6 +162,14 @@ impl Running {
     #[must_use]
     pub fn exec_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
         Arc::clone(&self.exec_gate)
+    }
+
+    /// The session proxy's connector for the `fetch` tool: `Some` only for a proxy-mode session
+    /// whose listener loaded upstream trust roots ([`EgressHandle::connector`], architect ruling
+    /// Q2). It hands out the connector only; the handle, and its shutdown, stay here (#103).
+    #[must_use]
+    pub fn fetch_connector(&self) -> Option<Arc<dyn Connector>> {
+        self.egress.as_ref().and_then(EgressHandle::connector)
     }
 
     /// Podman's container id (64 hex digits).

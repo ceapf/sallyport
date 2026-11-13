@@ -22,7 +22,7 @@ use crate::approvals::render::Prompt;
 use crate::rpc::agent::ToolHandler;
 use crate::rpc::testkit::{Sink, recorder};
 
-const ME: Client = Client { uid: 1000, pid: 7 };
+pub(crate) const ME: Client = Client { uid: 1000, pid: 7 };
 
 #[derive(Default)]
 struct Shown(StdMutex<Vec<Prompt>>);
@@ -87,12 +87,13 @@ fn spec(guest: &'static str, mode: MountMode) -> Spec {
     }
 }
 
-struct Fx {
+/// The tools behind a real gate; shared with the `fetch` tests on the egress rig.
+pub(crate) struct Fx {
     gated: Gated<Arc<Tools<Fake>>>,
     tools: Arc<Tools<Fake>>,
     queue: queue::Gate,
-    desk: Desk,
-    sink: Arc<Sink>,
+    pub(crate) desk: Desk,
+    pub(crate) sink: Arc<Sink>,
     shown: Arc<Shown>,
     /// Host directory of each mount, by guest root.
     dirs: Vec<(String, PathBuf)>,
@@ -119,14 +120,14 @@ impl Fx {
         &self.dirs.iter().find(|(g, _)| g == guest).unwrap().1
     }
 
-    async fn call(&self, name: &str, args: Value) -> Option<ToolOutcome> {
+    pub(crate) async fn call(&self, name: &str, args: Value) -> Option<ToolOutcome> {
         let n = self.gated.begin();
         self.gated
             .call(n, name.to_owned(), args.as_object().unwrap().clone())
             .await
     }
 
-    async fn text(&self, name: &str, args: Value) -> String {
+    pub(crate) async fn text(&self, name: &str, args: Value) -> String {
         self.call(name, args).await.unwrap().text
     }
 
@@ -141,14 +142,19 @@ impl Fx {
         self.tools.run(ticket).await
     }
 
-    fn prompts(&self) -> Vec<Prompt> {
+    pub(crate) fn prompts(&self) -> Vec<Prompt> {
         self.shown.0.lock().unwrap().clone()
     }
 
     /// Waits until `n` prompts were shown.
-    async fn until_shown(&self, n: usize) -> Prompt {
+    pub(crate) async fn until_shown(&self, n: usize) -> Prompt {
         until("a prompt", || self.prompts().len() >= n).await;
         self.prompts()[n - 1].clone()
+    }
+
+    /// The names `tools/list` shows.
+    pub(crate) fn listed(&self) -> Vec<&'static str> {
+        self.gated.tools().iter().map(|t| t.name).collect()
     }
 
     /// Waits until a `tool.run` entry was written.
@@ -173,12 +179,19 @@ async fn until(what: &str, mut f: impl FnMut() -> bool) {
     }
 }
 
-struct Opts {
+pub(crate) struct Opts {
     builtin: Vec<BuiltinTool>,
     shell: ShellPolicy,
     destructive: bool,
     mounts: Vec<Spec>,
     out: Output,
+    pub(crate) fetch: Option<FetchParts>,
+    pub(crate) approval_timeout: Duration,
+}
+
+/// The fixture's defaults: every tool, `shell: allow`, no mount, no way out for `fetch`.
+pub(crate) fn opts_without_mounts() -> Opts {
+    opts(vec![])
 }
 
 fn opts(mounts: Vec<Spec>) -> Opts {
@@ -188,6 +201,8 @@ fn opts(mounts: Vec<Spec>) -> Opts {
         destructive: true,
         mounts,
         out: ok_output(),
+        fetch: None,
+        approval_timeout: Duration::from_secs(30),
     }
 }
 
@@ -202,7 +217,7 @@ fn scratch(name: &str) -> PathBuf {
     std::fs::canonicalize(&d).unwrap()
 }
 
-fn fx(name: &str, o: Opts) -> Fx {
+pub(crate) fn fx(name: &str, o: Opts) -> Fx {
     let base = scratch(name);
     let outside = base.join("outside");
     std::fs::create_dir(&outside).unwrap();
@@ -266,7 +281,7 @@ fn fx(name: &str, o: Opts) -> Fx {
         mcp: vec![],
     };
     let limits = Limits {
-        timeout: Duration::from_secs(30),
+        timeout: o.approval_timeout,
         // Burst room for RT-AG-07's five prompts (one new prompt per 2 s beyond the burst).
         max_pending: 8,
     };
@@ -299,6 +314,7 @@ fn fx(name: &str, o: Opts) -> Fx {
             sink: Arc::clone(&sink),
             rows_at_run: Arc::clone(&rows_at_run),
         },
+        fetch: o.fetch,
     }));
     Fx {
         gated: Gated::new(gate.clone(), Arc::clone(&tools)),
@@ -335,9 +351,11 @@ fn all_modes() -> Vec<Spec> {
 }
 
 #[tokio::test]
-async fn tools_list_shows_the_granted_tools_and_never_fetch() {
+async fn tools_list_shows_the_granted_tools_and_fetch_only_with_a_connector() {
     let mut o = opts(vec![]);
     o.builtin = vec![BuiltinTool::Shell, BuiltinTool::Fetch, BuiltinTool::FsRead];
+    // Granted but without a way out: unlisted (architect ruling Q8). Listed with one:
+    // `egress::intercept_fetch_tests`.
     let f = fx("list", o);
     let names: Vec<&str> = f.gated.tools().iter().map(|t| t.name).collect();
     assert_eq!(names, ["fs_read", "shell"]);
@@ -353,7 +371,9 @@ async fn tools_list_shows_the_granted_tools_and_never_fetch() {
         assert_eq!(t.input_schema["additionalProperties"], false, "{}", t.name);
         assert!(!t.description.is_empty());
     }
-    assert_eq!(describe(BuiltinTool::Fetch), None);
+    let fetch = describe(BuiltinTool::Fetch);
+    assert_eq!(fetch.name, "fetch");
+    assert_eq!(fetch.input_schema["required"], json!(["url"]));
 }
 
 /// RT-AG-01 (unit): an ungranted tool is denied before its arguments or paths are looked at,
@@ -384,7 +404,7 @@ async fn rt_ag_01_ungranted_tools_are_denied_and_audited() {
 }
 
 #[tokio::test]
-async fn a_granted_fetch_is_unavailable_until_75() {
+async fn a_granted_fetch_without_a_connector_is_unavailable() {
     let f = fx("fetch", opts(vec![]));
     assert_eq!(
         f.text("fetch", json!({"url": "https://example.org/"}))
@@ -815,14 +835,14 @@ async fn a_failure_at_run_time_is_reported_and_audited() {
         assert_eq!(out.text, "failed: not-found");
         assert_eq!(f.sink.last("tool.read")["code"], "not-found");
     }
-    // A ticket for a tool these tools never prepare.
+    // A fetch ticket on tools without a way out (architect ruling Q8).
     let fetch = Action::Fetch {
         method: "GET".into(),
-        url: "https://x/".into(),
+        url: "https://x.mock.test/".into(),
         headers: vec![],
         body: Payload::new(vec![]),
     };
-    assert_eq!(f.run(fetch).await.unwrap().text, "failed: unsupported");
+    assert_eq!(f.run(fetch).await.unwrap().text, "failed: tool_unavailable");
 }
 
 fn target(mount: &str, rel: &str) -> Target {
@@ -1211,6 +1231,85 @@ async fn a_write_parked_at_the_exec_gate_aborts_at_the_stop() {
     assert!(!rw.join("x").exists(), "an aborted write landed");
 }
 
+/// A way out that never answers: it keeps each stream's far end, so a fetch waits on its
+/// `CONNECT` (an upstream that stalls, or a connection queued for a slot).
+#[derive(Default)]
+struct Stall(StdMutex<Vec<tokio::io::DuplexStream>>);
+
+impl crate::egress::local::Connector for Stall {
+    fn open(&self, _origin: Value) -> std::io::Result<tokio::io::DuplexStream> {
+        let (ours, theirs) = tokio::io::duplex(1 << 12);
+        self.0.lock().unwrap().push(theirs);
+        Ok(ours)
+    }
+
+    fn client_tls(&self, _host: &str) -> Arc<rustls::ClientConfig> {
+        unreachable!("the CONNECT is never answered")
+    }
+
+    fn grants(&self, _host: &str) -> crate::egress::local::HostGrants {
+        crate::egress::local::HostGrants::default()
+    }
+}
+
+/// Q59 for fetch (security re-review M1, #75 part 2): a fetch in flight when the stop comes
+/// ends at once, inside the drain: `tool.result` `killed: session-stop`, the reply
+/// `session-stopping`, and its connection is dropped (the proxy's side reads its end).
+#[tokio::test]
+async fn a_fetch_in_flight_at_the_stop_ends_killed_inside_the_drain() {
+    let stall = Arc::new(Stall::default());
+    let mut o = opts_without_mounts();
+    o.fetch = Some(FetchParts {
+        connector: Arc::clone(&stall) as Arc<dyn crate::egress::local::Connector>,
+        max_request: 1 << 20,
+        max_response: 1 << 20,
+    });
+    let f = Arc::new(fx("fetch-stop", o));
+    let f2 = Arc::clone(&f);
+    let h = tokio::spawn(async move {
+        f2.call("fetch", json!({"url": "https://example.org/"}))
+            .await
+    });
+    f.until_run().await;
+    let opened = || stall.0.lock().unwrap().len();
+    for _ in 0..200 {
+        if opened() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(opened(), 1, "the fetch never opened its connection");
+    f.ops.stop();
+    assert_eq!(f.ops.drained(Duration::from_secs(5)).await, 0);
+    let out = h.await.unwrap().unwrap();
+    assert_eq!(
+        (out.is_error, out.text.as_str()),
+        (true, "failed: session-stopping")
+    );
+    let r = f.sink.last("tool.result");
+    assert_eq!(
+        (
+            r["outcome"].as_str(),
+            r["killed"].as_str(),
+            r["tool"].as_str()
+        ),
+        (Some("killed"), Some("session-stop"), Some("fetch"))
+    );
+    assert!(r["action_sha256"].is_string() && r["call"].is_u64(), "{r}");
+    let mut far = stall.0.lock().unwrap().pop().unwrap();
+    let mut got = Vec::new();
+    let read = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::io::AsyncReadExt::read_to_end(&mut far, &mut got),
+    )
+    .await;
+    assert!(
+        matches!(read, Ok(Ok(_))),
+        "the connection outlived the stop"
+    );
+    assert!(got.starts_with(b"CONNECT example.org:443 "), "{got:?}");
+}
+
 /// Q59 (b): the last check before the effect. A write that waited at the gate while the session's
 /// operations closed (the stop signal not raised yet) does not begin once the gate is free.
 #[tokio::test]
@@ -1328,6 +1427,7 @@ async fn a_panicking_run_is_reported_and_ends_its_operation() {
         crash,
         ids: UserIds { uid: 1, gid: 1 },
         shell: Boom,
+        fetch: None,
     });
     let b = Bound {
         session: "s-boom".into(),

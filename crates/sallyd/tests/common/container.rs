@@ -273,6 +273,8 @@ pub struct Events(
     Mutex<Vec<&'static str>>,
     /// The event of each append waiting in a hold now, one per append.
     Mutex<Vec<String>>,
+    /// Every recorded entry's `Debug` form (which shows its session id), oldest first.
+    Mutex<Vec<String>>,
 );
 
 impl AuditSink for Events {
@@ -295,6 +297,7 @@ impl AuditSink for Events {
             return Err(AuditError::InvalidEntry("fake failure"));
         }
         let args = e.arguments().clone();
+        self.4.lock().unwrap().push(format!("{e:?}"));
         self.0.lock().unwrap().push((e.event().to_owned(), args));
         Ok(())
     }
@@ -348,6 +351,12 @@ impl Events {
     /// Every entry's event name and arguments, oldest first.
     pub fn all(&self) -> Vec<(String, serde_json::Value)> {
         self.0.lock().unwrap().clone()
+    }
+
+    /// Every recorded entry's `Debug` form (event, session id; arguments omitted), oldest first.
+    #[allow(dead_code)] // Not every test binary that includes this module reads them.
+    pub fn debug(&self) -> Vec<String> {
+        self.4.lock().unwrap().clone()
     }
 
     /// The arguments of the last entry named `event`.

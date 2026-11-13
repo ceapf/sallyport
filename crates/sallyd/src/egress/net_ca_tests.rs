@@ -201,6 +201,8 @@ fn session_of(ca: bool, specs: Vec<Spec>) -> SessionEgress {
         timeout: Duration::from_secs(3600),
         grants: specs,
         interception: None,
+        fetch: false,
+        roots: None,
     }
 }
 
@@ -228,7 +230,43 @@ fn a_session_without_a_ca_passes_through_and_nothing_is_read_or_written() {
         .prepare(&dir, session(false, &[]))
         .unwrap();
     assert!(s.interception.is_none());
+    assert!(s.roots.is_none());
     assert!(entries(&dir).is_empty());
+}
+
+/// Architect ruling Q2: a session that grants `fetch` gets its upstream trust roots without a
+/// CA (no CA, no file, no secret read), and without roots it is refused.
+#[test]
+fn a_fetch_session_without_a_ca_gets_its_roots_only_and_none_refuses_it() {
+    let dir = scratch("fetch");
+    let ws = dir.join("ws");
+    std::fs::create_dir(&ws).unwrap();
+    let (roots, root_pem) = roots_file(&dir);
+    let st = scratch("fetch-store");
+    let path = store(&st, 1);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let fetch = SessionEgress {
+        fetch: true,
+        ..session(false, &[])
+    };
+    let s = starter_with(roots, path.clone())
+        .prepare(&ws, fetch)
+        .unwrap();
+    assert!(s.interception.is_none());
+    assert_eq!(s.roots.as_ref().unwrap().pem, root_pem);
+    assert!(entries(&ws).is_empty());
+    let missing = BundleFiles {
+        paths: vec![dir.join("no-roots.pem")],
+        owner: 0,
+    };
+    let refused = starter_with(missing, path).prepare(
+        &ws,
+        SessionEgress {
+            fetch: true,
+            ..session(false, &[])
+        },
+    );
+    assert!(matches!(refused, Err(EgressError::Roots(_))));
 }
 
 #[test]

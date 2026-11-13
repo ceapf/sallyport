@@ -943,7 +943,7 @@ fn summary_of_coding_agent() {
     let s = s.replace(&real_root, "$ROOT");
     assert_eq!(
         s,
-        "[data-can-leave] Anything this agent reads — $ROOT/home/code/myproject and whatever your GITHUB_TOKEN unlocks on api.github.com or github.com — can be sent to pypi.org, files.pythonhosted.org, api.github.com (acting as you) and github.com (acting as you).\n\
+        "[data-can-leave] Anything this agent reads — $ROOT/home/code/myproject and whatever your GITHUB_TOKEN unlocks on api.github.com or github.com — can be sent to pypi.org, files.pythonhosted.org, api.github.com (acting as you) and github.com (acting as you). The fetch tool's GET requests are not prompted and can carry data out in the URL.\n\
          This agent:\n\
          - uses the model qwen2.5-coder-7b-instruct-q4_k_m.\n\
          - can change files in $ROOT/home/code/myproject (at /workspace/myproject) only inside the sandbox; your folder is not changed. The changes are kept apart (`sally session changes` lists them; this version cannot apply them), and commits made in the session are never applied.\n\

@@ -318,3 +318,11 @@ suggests. Task 9 was planned as four tasks (9a-1, 9a-2, 9a-3, 9b) and took 10 se
 Remaining: Task 12 (in progress, lane B), Task 13 and Task 14. The AMENDMENTS-02 cut order (fetch-write approvals,
 `{basic}`, the template-mismatch flag, `sally session changes`) was to be revisited here;
 `{basic}` has shipped, so it is no longer on the list.
+
+**After the review (maintainer's decisions, recorded in the fetch PR, #75):**
+- The cut order is closed and nothing is cut. Fetch-write approvals shipped with the fetch tool
+  (#75). The template-mismatch flag is neither cut nor shipped in M1: it is the M2 row of
+  AMENDMENTS-01 §9, tracked in #102.
+- Reports no longer measure sessions against the 22-unit estimate: with the 45 % context rule
+  and two lanes, a session no longer measures effort. From Checkpoint 5 on, reports list the
+  tasks remaining instead.

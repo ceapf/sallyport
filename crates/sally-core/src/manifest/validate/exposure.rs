@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::host::HostPattern;
-use super::super::types::{Manifest, NetworkMode};
+use super::super::types::{BuiltinTool, Manifest, NetworkMode};
 use super::{EgressRule, ResolvedMount};
 
 /// The finding's sentence, or `None` when private data and an outward channel do not coexist.
@@ -31,12 +31,22 @@ pub(crate) fn data_can_leave(
         .iter()
         .map(|r| destination(&r.host, &grant_hosts))
         .collect();
+    let fetch = if m.tools.builtin.contains(&BuiltinTool::Fetch) {
+        FETCH_GET
+    } else {
+        ""
+    };
     Some(format!(
-        "Anything this agent reads — {} — can be sent to {}.",
+        "Anything this agent reads — {} — can be sent to {}.{fetch}",
         join(&readable),
         join(&destinations)
     ))
 }
+
+/// What the finding adds when `fetch` is granted: GET and HEAD never prompt, whatever
+/// `tools.fetch_writes` says, so a URL is an unprompted way out (maintainer, #75 part 2).
+const FETCH_GET: &str =
+    " The fetch tool's GET requests are not prompted and can carry data out in the URL.";
 
 /// Mount realpaths, then what each secret unlocks (one entry per secret, all its hosts).
 fn readable(m: &Manifest, mounts: &[ResolvedMount]) -> Vec<String> {

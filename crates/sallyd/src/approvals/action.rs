@@ -101,7 +101,8 @@ pub enum Action {
     Fetch {
         /// HTTP method, as sent.
         method: String,
-        /// The URL, as sent.
+        /// The URL, canonical, as requested (`tools::fetch_url`; #75 ruling Q4): what is shown is
+        /// what goes on the wire.
         url: String,
         /// The request headers (name, value), in order, as sent.
         headers: Vec<(String, String)>,

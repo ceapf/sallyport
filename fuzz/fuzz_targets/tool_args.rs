@@ -5,7 +5,8 @@
 //! Invariants: never panics; an accepted read asks for at most `READ_CAP` bytes and its end does
 //! not overflow; an accepted write body is canonical base64 (it re-encodes to the input); an
 //! accepted command has 1 to `MAX_ARGV` words, the first not empty, none holding NUL; an accepted
-//! `cwd` is absolute and canonical (no empty, `.` or `..` segment, no trailing `/`); the tagger
+//! `cwd` is absolute and canonical (no empty, `.` or `..` segment, no trailing `/`); an accepted
+//! `fetch` body is canonical base64 and keeps every header pair it was given (#75); the tagger
 //! returns on every accepted command and on every word list the input splits into.
 #![no_main]
 #![forbid(unsafe_code)]
@@ -61,6 +62,18 @@ fuzz_target!(|data: &[u8]| {
                 );
             }
             let _ = destructive(&cmd);
+        }
+        Args::Fetch { body, headers, .. } => {
+            if let Some(Value::String(b64)) = map.get("body_b64") {
+                assert_eq!(&encode(&body), b64, "non-canonical base64 accepted");
+            } else {
+                assert!(body.is_empty(), "a body without body_b64");
+            }
+            let Some(Value::Array(given)) = map.get("headers") else {
+                assert!(headers.is_empty(), "headers without a headers array");
+                return;
+            };
+            assert_eq!(given.len(), headers.len(), "a header pair lost or added");
         }
         Args::List { .. } | Args::Delete { .. } => {}
     }

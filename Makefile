@@ -115,14 +115,14 @@ MUTANTS_WIDE_SALLYD := $(addprefix crates/sallyd/src/sandbox/,argv.rs check.rs t
                        $(addprefix crates/sallyd/src/session/,lookup.rs types.rs exit.rs) \
                        $(addprefix crates/sallyd/src/egress/,addr.rs authority.rs head.rs policy.rs server.rs \
                        hostaddrs.rs tunnel.rs net.rs ca.rs roots.rs rewrite.rs intercept.rs \
-                       intercept_tls.rs intercept_report.rs meter.rs inject.rs redact.rs) \
+                       intercept_tls.rs intercept_report.rs meter.rs inject.rs redact.rs local.rs) \
                        $(addprefix crates/sallyd/src/rpc/,agent.rs control.rs frame.rs json.rs listen.rs mcp.rs \
                        message.rs rate.rs record.rs) \
                        $(addprefix crates/sallyd/src/llm/,body.rs head.rs io.rs reply.rs server.rs) \
                        $(addprefix crates/sallyd/src/approvals/,action.rs glob.rs handler.rs policy.rs \
                        queue.rs render.rs) \
                        $(addprefix crates/sallyd/src/tools/,args.rs path.rs tag.rs fs.rs shell.rs procs.rs \
-                       mod.rs dac.rs ops.rs)
+                       mod.rs dac.rs ops.rs fetch.rs fetch_url.rs fetch_client.rs)
 MUTANTS_WIDE_SHIM := $(addprefix crates/sally-shim/src/,args.rs relay.rs)
 MUTANTS_WIDE_TESTS_CORE :=
 MUTANTS_WIDE_TESTS_SALLYD := --lib --test=argv --test=scan
@@ -148,7 +148,7 @@ zizmor:
 
 # Fuzz smoke: 60 s per target (needs nightly + cargo-fuzz; CI pins both).
 FUZZ_TARGETS := manifest secrets audit_line egress_head egress_rewrite egress_redact \
-                jsonrpc_message llm_request tool_path tool_args proc_stat
+                jsonrpc_message llm_request tool_path tool_args proc_stat fetch_url
 FUZZ_SECS ?= 60
 CARGO_FUZZ_TOOLCHAIN ?= +nightly
 fuzz:

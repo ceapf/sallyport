@@ -88,7 +88,7 @@ flowchart LR
 | `sallyd::daemon` | Startup (Task 12, architect Q42): umask 077, no core dumps, non-dumpable, refuse root and set-id, the `$XDG_RUNTIME_DIR/sallyport` fd checked and `flock`ed for life (one `sallyd` per user), `NOFILE` raised; the crash reporter that turns a session task's panic into `session.crash` (Q47) | **yes** |
 | `sallyd::oplog` | The operational log on stderr (Q43): in-tree, no `tracing` subscriber. Diagnostics only, after the audit entry; each value redacted, escaped (`sally-core::text`) and capped at 4 KiB, the line at 16 KiB; a bounded queue and a writer thread, so logging never blocks. Never manifests, argv, bodies, model output or environment | yes |
 | `sallyd::infer` | Pool of at most one loaded model (v1); start/stop inference container; forward OpenAI-compatible requests over `infer.sock`; validate request JSON (allowed fields, size caps); stream back | yes |
-| `sallyd::tools` | The built-in tools as the approvals `Executor` (§4.3, Task 11): `path` (guest path → mount + canonical rel), `args`, `fs` (openat2 beneath a checked root: the host pin for `brokered`/`ro`, the workspace's own view through the container init's `/proc/<pid>/root` for `rw`/`staged`), `tag` (destructive tagger), `shell` + `exec` (`podman exec` runner; finds, limits and kills the call's processes through pidfds), `procs`. `fetch` follows (#75) | **yes** |
+| `sallyd::tools` | The built-in tools as the approvals `Executor` (§4.3, Task 11): `path` (guest path → mount + canonical rel), `args`, `fs` (openat2 beneath a checked root: the host pin for `brokered`/`ro`, the workspace's own view through the container init's `/proc/<pid>/root` for `rw`/`staged`), `tag` (destructive tagger), `shell` + `exec` (`podman exec` runner; finds, limits and kills the call's processes through pidfds), `procs`, and `fetch` (`fetch_url` the URL, `fetch` the checks and the reply, `fetch_client` one exchange through the session proxy's `Connector`, §7) | **yes** |
 | `sallyd::approvals` | Queue, canonicalization, rendering sanitization, single-use IDs, timeout, flood control, notifications to UI/CLI | **yes** |
 | `sallyd::egress::{server,policy,addr,net,…}` | Accept streams from `net.sock`; parse the request head (bounded, CONNECT only in v1); policy decision; host addresses → resolve → filter → pinned connect; CONNECT splice. Grant hosts are refused until the token proxy (`inject`, Task 9a) terminates TLS for them | **yes** |
 | `sally-shim` (separate crate, musl static, std only) | generic relay (AMENDMENTS-01 §3.3): `--listen LOOPBACK_IP:PORT=/abs/sock` (repeatable; `127.0.0.1:3128` → `net.sock`, `127.0.0.1:8080` → `llm.sock`) with one fresh UDS connection per TCP connection, opaque bidirectional copy with fixed 16 KiB buffers, half-close propagated, at most `--max-connections` (default 32, shared by all listeners; each costs two threads against the sandbox's `pids` limit) live connections, and a 30 s linger for a client that never closes after the server finished; `--stdio /abs/sock` for stdio clients. Parses nothing, holds no policy, listens on IPv4 loopback (127/8) only (`::1` too is refused); `make shim-check` keeps it static and dependency-free | low (dumb, inside the sandbox) |
@@ -519,7 +519,7 @@ compiled into the broker; manifest or user text is never interpolated into them.
 | `fs_read` | `{path, offset?, len?}` | broker, as `fs_list` | same; regular files only; at most 1 MiB per call (`len` cut to it); `tool.read` (path, size, bytes, sha256; never the content) |
 | `fs_write` | `{path, content_b64}` (strict base64) | broker: on the host folder for `brokered`; in the workspace's view for `rw`/`staged` | `ro` → denied; `rw`/`staged` → runs, audited (path, bytes, sha256; staged writes land in the session's upper directory); `brokered` → `approve.writes` globs → pending; a `.git` component in any case → `protected-path` |
 | `fs_delete` | `{path}` | as `fs_write` | as `fs_write`, with `approve.deletes`; a regular file or an empty directory |
-| `fetch` | `{url, method?, headers?, body?}` | broker egress path | not offered until #75 (a granted call is `denied: tool_unavailable`): same egress policy and injection as the proxy; non-GET/HEAD per `tools.fetch_writes`; response capped and redacted |
+| `fetch` | `{url, method?, headers?: [[name, value]…], body_b64?}` | broker: a client of the session's own proxy (§7, broker-originated connections) | listed only with a `Connector` (a granted call without one is `denied: tool_unavailable`, #75 ruling Q8). `https` only; no userinfo, fragment or dot segment; the host as the proxy normalizes it, IP literals refused; the ticket binds the canonical URL `https://host[:port]/path[?query]`. Method `[A-Z]{1,16}`, never `CONNECT`/`TRACE`; ≤ 64 headers, token names each at most once (sent lower-case), visible-ASCII values; any header the proxy would drop or refuse (framing, `Host`, `Connection` and hop-by-hop, `Expect`, `Accept-Encoding`, `Range`/`If-Range`/`Request-Range`, `Proxy-*`, `HTTP2-Settings`, the host's grant headers) is `bad-arguments`; body ≤ `network.max_request_bytes`; the head must fit the proxy's 7168-byte request-head limit. GET/HEAD without a body run; others per `tools.fetch_writes`; a grant host's prompt names the credential added (`secret:NAME`). Reply: `{status, headers, encoding, body, bytes, truncated}`: headers from an allowlist (≤ 32, a value over 1 KiB left out), body ≤ 1 MiB and ≤ `network.max_response_bytes`, UTF-8 or base64, never decompressed; a redirect is returned, never followed. A refused `CONNECT` answers the proxy's reason code. One call ≤ 60 s (`timeout`). `tool.run` before the `CONNECT`, `tool.result` before the reply, at every level; the proxy's own entries follow as for any tunnel |
 | `shell` | `{cmd: [1–256 strings], cwd?}` (default: the first mount's root, else `/`) | `podman exec --workdir=<cwd> <container> <cmd…>` in the **workspace** container: the container's environment, no stdin, no terminal | `tools.shell` deny / approve / allow (+ destructive tags); 300 s, then the call is killed; output read incrementally, 64 KiB kept per stream; one reply per call |
 | `<server>__<tool>` | the server's schema | relayed to a declared MCP server (M4) | per-server `approve` |
 
@@ -957,8 +957,25 @@ sallyport/
     429 `too-many-connections`; 431 `head-too-large`;
     `head-timeout` (no reply); 400 `malformed`. Replies never echo the target; in-tunnel replies
     carry `Connection: close` and end the tunnel.
+- **Broker-originated connections** (#75, `egress::local`; architect rulings Q1, Q2, Q7). The
+  `fetch` tool reaches the network only as a client of its session's proxy: a `Connector`
+  (from `EgressHandle::connector`) opens an in-memory stream that the session's accept loop
+  serves like an accepted one (an in-flight slot, the same connection set, the same stop
+  grace), so admission, policy, resolution, the address filter, pinning, the request rewrite,
+  injection, redaction, the caps and every `egress.*` entry are the proxy's own code. Each
+  entry of such a connection carries `origin` (`{"tool": "fetch", "call": N}`); entries of
+  workspace connections carry none. Inside the tunnel the client trusts the session CA only
+  for a host that has a leaf, and the session's upstream trust roots only for any other host,
+  never both. A session that grants `fetch` loads its upstream trust roots even without secret
+  grants (no CA and no file then); without them its launch is refused. The proxy's
+  `egress.close` of a fetch may land after the call's `tool.result`. Production wires it in
+  `session::Registry::agent` through `Running::fetch_connector` (#103), with the proxy's own
+  `network.max_*_bytes` caps; the launcher keeps the handle and its shutdown.
 - **Interception** (Task 9a-2, `egress::server::intercept`, `egress::rewrite`; lane decisions
-  2–6, architect Q27–Q53). Only grant hosts are intercepted, on every allowed port. Order:
+  2–6, architect Q27–Q53). Only grant hosts are intercepted, on every allowed port: a grant host
+  reached on 8443, say, gets its credential injected and its responses redacted exactly as on
+  443, and an upstream there that does not speak TLS fails `upstream-tls-failed` (CP4 note 4,
+  #75 ruling Q10; pinned by `intercept_inject_tests.rs`). Order:
   `egress.allow`, dial, upstream TLS within `limits.connect` (rustls with the session's trust
   roots, SNI = host, ALPN `http/1.1`, TLS 1.2 and 1.3; failure is `upstream-tls-failed` with
   no retry on another address), `200`, the client's TLS within `limits.head` (the host's

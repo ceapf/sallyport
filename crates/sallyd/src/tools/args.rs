@@ -52,6 +52,18 @@ pub enum Args {
         /// Absolute guest working directory, canonical (`None`: the tool's default).
         cwd: Option<String>,
     },
+    /// `fetch {url, method?, headers?, body_b64?}` (architect ruling Q3); `fetch.rs` checks the
+    /// values.
+    Fetch {
+        /// The URL as given.
+        url: String,
+        /// The method (default `GET`).
+        method: String,
+        /// `[name, value]` pairs, order and duplicates kept.
+        headers: Vec<(String, String)>,
+        /// The decoded body (default empty).
+        body: Vec<u8>,
+    },
 }
 
 /// Parses `a` as the arguments of `tool` (a built-in wire name).
@@ -104,8 +116,45 @@ pub fn parse(tool: &str, a: &Map<String, Value>) -> Result<Args, &'static str> {
             };
             Ok(Args::Shell { cmd, cwd })
         }
+        "fetch" => {
+            only(a, &["url", "method", "headers", "body_b64"])?;
+            let method = match a.get("method") {
+                None => "GET".to_owned(),
+                Some(_) => string(a, "method")?,
+            };
+            let headers = match a.get("headers") {
+                None => Vec::new(),
+                Some(v) => pairs(v)?,
+            };
+            let body = match a.get("body_b64") {
+                None => Vec::new(),
+                Some(_) => base64::engine::general_purpose::STANDARD
+                    .decode(string(a, "body_b64")?.as_bytes())
+                    .map_err(|_| BAD)?,
+            };
+            Ok(Args::Fetch {
+                url: string(a, "url")?,
+                method,
+                headers,
+                body,
+            })
+        }
         _ => Err("unknown-tool"),
     }
+}
+
+/// An array of `[name, value]` string pairs (the count is bounded by `fetch.rs`).
+fn pairs(v: &Value) -> Result<Vec<(String, String)>, &'static str> {
+    let Value::Array(items) = v else {
+        return Err(BAD);
+    };
+    items
+        .iter()
+        .map(|p| match p.as_array().map(Vec::as_slice) {
+            Some([Value::String(n), Value::String(v)]) => Ok((n.clone(), v.clone())),
+            _ => Err(BAD),
+        })
+        .collect()
 }
 
 /// Refuses a key not in `keys`.
@@ -258,8 +307,53 @@ mod tests {
             Err(BAD)
         );
         assert_eq!(p("shell", json!({"cmd": ["ls"], "env": {}})), Err(BAD));
-        assert_eq!(p("fetch", json!({})), Err("unknown-tool"));
         assert_eq!(p("nope", json!({})), Err("unknown-tool"));
+    }
+
+    #[test]
+    fn fetch_takes_a_url_and_optional_method_header_pairs_and_base64_body() {
+        assert_eq!(
+            p("fetch", json!({"url": "u"})),
+            Ok(Args::Fetch {
+                url: "u".into(),
+                method: "GET".into(),
+                headers: vec![],
+                body: vec![],
+            })
+        );
+        assert_eq!(
+            p(
+                "fetch",
+                json!({"url": "u", "method": "POST", "body_b64": "aGk=",
+                       "headers": [["A", "1"], ["A", "2"], ["b", ""]]})
+            ),
+            Ok(Args::Fetch {
+                url: "u".into(),
+                method: "POST".into(),
+                headers: vec![
+                    ("A".into(), "1".into()),
+                    ("A".into(), "2".into()),
+                    ("b".into(), String::new()),
+                ],
+                body: b"hi".to_vec(),
+            })
+        );
+        for bad in [
+            json!({}),
+            json!({"url": 1}),
+            json!({"url": "u", "method": 1}),
+            json!({"url": "u", "headers": {"A": "1"}}),
+            json!({"url": "u", "headers": [["A"]]}),
+            json!({"url": "u", "headers": [["A", "1", "2"]]}),
+            json!({"url": "u", "headers": [["A", 1]]}),
+            json!({"url": "u", "headers": [[1, "1"]]}),
+            json!({"url": "u", "headers": ["A: 1"]}),
+            json!({"url": "u", "body_b64": "aGk"}),
+            json!({"url": "u", "body_b64": 1}),
+            json!({"url": "u", "body": "hi"}),
+        ] {
+            assert_eq!(p("fetch", bad.clone()), Err(BAD), "{bad}");
+        }
     }
 
     #[test]

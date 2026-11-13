@@ -2,7 +2,7 @@
 source: crates/sally-core/tests/snapshots.rs
 expression: "stable(&f, &summary(&v.manifest))"
 ---
-[data-can-leave] Anything this agent reads — $ROOT/home/Documents/research and whatever your BRAVE_SEARCH_KEY unlocks on api.search.brave.com — can be sent to api.search.brave.com (acting as you) and any public hostname.
+[data-can-leave] Anything this agent reads — $ROOT/home/Documents/research and whatever your BRAVE_SEARCH_KEY unlocks on api.search.brave.com — can be sent to api.search.brave.com (acting as you) and any public hostname. The fetch tool's GET requests are not prompted and can carry data out in the URL.
 This agent:
 - uses a model you pick at launch.
 - can read $ROOT/home/Documents/research (at /workspace/research); can write there with your approval; cannot delete there.

@@ -93,9 +93,11 @@ container-free tests run: unit tests, all of sally-core's `tests/`, `sallyd` `ar
   `daemon/{mod,crash,startup,stale,install}.rs`,
   `oplog.rs`, `session/{lookup,types,exit}.rs`, `egress/{addr,authority,head,policy,server,
   hostaddrs,tunnel,net,ca,roots,rewrite,intercept,intercept_tls,intercept_report,meter,inject,
-  redact}.rs` (net.rs tests stay hermetic: nothing leaves the machine), `rpc/{agent,control,frame,json,listen,mcp,message,rate,record}.rs`,
+  redact,local}.rs` (net.rs tests stay hermetic: nothing leaves the machine),
+  `rpc/{agent,control,frame,json,listen,mcp,message,rate,record}.rs`,
   `llm/{body,head,io,reply,server}.rs`, `approvals/{action,glob,handler,policy,queue,render}.rs`,
-  `tools/{args,path,tag,fs,shell,procs,mod,dac,ops}.rs`; sally-shim `args.rs`, `relay.rs`.
+  `tools/{args,path,tag,fs,shell,procs,mod,dac,ops,fetch,fetch_url,fetch_client}.rs`; sally-shim
+  `args.rs`, `relay.rs`.
 
 ## Agent / model routing (ECC)
 

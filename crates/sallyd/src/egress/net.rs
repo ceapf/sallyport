@@ -11,16 +11,17 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use rustix::fs::{Mode, OFlags};
-use sally_core::manifest::{AuditLevel, ValidatedManifest};
+use sally_core::manifest::{AuditLevel, BuiltinTool, ValidatedManifest};
 use tokio::net::{TcpStream, UnixListener, UnixStream};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use super::ca::{self, CaError, SessionTls, Validity};
 use super::hostaddrs;
 use super::inject::{Credentials, CredentialsError, SecretSource, Spec};
+use super::local::{ClientTls, Connector, LOCAL_QUEUE, Local, ORIGIN, Opened, Reach, host_grants};
 use super::policy::Policy;
-use super::roots::{BundleFiles, RootsError};
+use super::roots::{BundleFiles, Roots, RootsError};
 use super::server::{Dialer, HostAddrs, Interception, Limits, Parts, Proxy, Resolver, until_true};
 use crate::sandbox::AuditSink;
 
@@ -201,9 +202,19 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
 pub struct EgressHandle {
     stop: watch::Sender<bool>,
     task: Option<JoinHandle<()>>,
+    connector: Option<Local>,
 }
 
 impl EgressHandle {
+    /// The session's [`Connector`] for the `fetch` tool, when the session has upstream trust
+    /// roots (a session with secret grants, or one granting `fetch`; architect ruling Q2).
+    #[must_use]
+    pub fn connector(&self) -> Option<Arc<dyn Connector>> {
+        self.connector
+            .clone()
+            .map(|c| Arc::new(c) as Arc<dyn Connector>)
+    }
+
     /// Stops accepting, ends every connection and waits up to [`STOP_GRACE`] for their
     /// `egress.close` entries; then aborts what is left.
     pub async fn shutdown(mut self) {
@@ -226,8 +237,24 @@ impl Drop for EgressHandle {
 
 /// Runs the accept loop of `listener` for `proxy`: one task per connection, at most
 /// [`Limits::in_flight`](super::server::Limits::in_flight) at once (architect Q20); past that
-/// nothing more is accepted until a connection ends.
+/// nothing more is accepted until a connection ends. No broker-originated connections.
 pub fn serve<R, D, H>(listener: UnixListener, proxy: Arc<Proxy<R, D, H>>) -> EgressHandle
+where
+    R: Resolver,
+    D: Dialer,
+    H: HostAddrs,
+{
+    serve_with(listener, proxy, None)
+}
+
+/// [`serve`], and with `reach` the broker-originated connections of a [`Local`] connector
+/// (`local.rs`): each waits for an in-flight slot like an accepted stream, is served in the same
+/// set (so a stop waits for its `egress.close` too), inside its origin's scope.
+pub fn serve_with<R, D, H>(
+    listener: UnixListener,
+    proxy: Arc<Proxy<R, D, H>>,
+    reach: Option<Reach>,
+) -> EgressHandle
 where
     R: Resolver,
     D: Dialer,
@@ -235,50 +262,83 @@ where
 {
     let (stop, stopping) = watch::channel(false);
     let in_flight = Arc::new(Semaphore::new(proxy.limits().in_flight()));
+    let (tx, mut rx) = mpsc::channel::<Opened>(LOCAL_QUEUE);
+    let connector = reach.map(|r| Local::new(tx, r));
     let task = tokio::spawn(async move {
         let mut conns = JoinSet::new();
         let stopped = until_true(stopping);
         tokio::pin!(stopped);
+        let mut local_open = true;
         loop {
             tokio::select! {
                 biased;
                 () = &mut stopped => break,
                 // TODO(#49): log a connection task that panicked.
                 Some(_) = conns.join_next(), if !conns.is_empty() => {}
-                admitted = admit(&in_flight, &listener) => match admitted {
-                    Ok((slot, stream)) => {
+                admitted = admit(&in_flight, &listener, &mut rx, local_open) => match admitted {
+                    Ok(Admitted::Accepted(slot, stream)) => {
                         let p = Arc::clone(&proxy);
                         conns.spawn(async move {
                             let _slot = slot;
                             p.serve(stream).await;
                         });
                     }
+                    Ok(Admitted::Local(slot, (stream, origin))) => {
+                        let p = Arc::clone(&proxy);
+                        conns.spawn(ORIGIN.scope(origin, async move {
+                            let _slot = slot;
+                            p.serve(stream).await;
+                        }));
+                    }
+                    Ok(Admitted::LocalGone) => local_open = false,
                     Err(_) => tokio::time::sleep(ACCEPT_BACKOFF).await,
                 },
             }
         }
         drop(listener);
+        rx.close();
         proxy.stop();
         while conns.join_next().await.is_some() {}
     });
     EgressHandle {
         stop,
         task: Some(task),
+        connector,
     }
 }
 
-/// Waits for an in-flight slot, then accepts; the slot goes with the connection. Dropping it
-/// mid-way (stop won) releases the slot, and `accept` is cancel-safe.
+/// What [`admit`] let in.
+enum Admitted {
+    /// A stream accepted on the listener.
+    Accepted(OwnedSemaphorePermit, UnixStream),
+    /// A broker-originated connection.
+    Local(OwnedSemaphorePermit, Opened),
+    /// Every connector is gone (no slot is held).
+    LocalGone,
+}
+
+/// Waits for one in-flight slot, then for whichever comes first: an accepted stream or, while
+/// `local` holds, a broker-originated connection; the slot goes with it. One slot for both, so a
+/// queued fetch is never kept waiting by a slot held for `accept` (rust review M2, security
+/// review L2). Dropping it mid-way (stop won) releases the slot; `accept` and `recv` are
+/// cancel-safe.
 async fn admit(
     in_flight: &Arc<Semaphore>,
     listener: &UnixListener,
-) -> io::Result<(OwnedSemaphorePermit, UnixStream)> {
+    rx: &mut mpsc::Receiver<Opened>,
+    local: bool,
+) -> io::Result<Admitted> {
     let slot = Arc::clone(in_flight)
         .acquire_owned()
         .await
         .map_err(io::Error::other)?;
-    let (stream, _) = listener.accept().await?;
-    Ok((slot, stream))
+    tokio::select! {
+        accepted = listener.accept() => Ok(Admitted::Accepted(slot, accepted?.0)),
+        opened = rx.recv(), if local => Ok(match opened {
+            Some(o) => Admitted::Local(slot, o),
+            None => Admitted::LocalGone,
+        }),
+    }
 }
 
 /// A session's egress settings.
@@ -305,6 +365,12 @@ pub struct SessionEgress {
     /// The CA, its leaves, the upstream roots and the credentials, once
     /// [`EgressStarter::prepare`] made them.
     pub interception: Option<Interception>,
+    /// Whether the manifest grants the `fetch` tool: the session then needs upstream trust roots
+    /// even without secret grants (architect ruling Q2).
+    pub fetch: bool,
+    /// The upstream trust roots of a session that grants `fetch` but has no session CA, once
+    /// [`EgressStarter::prepare`] loaded them (a CA session keeps its own in `interception`).
+    pub roots: Option<Roots>,
 }
 
 impl SessionEgress {
@@ -326,6 +392,8 @@ impl SessionEgress {
             timeout: Duration::from_secs(m.runtime.timeout.as_secs()),
             grants: Spec::from_manifest(v),
             interception: None,
+            fetch: m.tools.builtin.contains(&BuiltinTool::Fetch),
+            roots: None,
         }
     }
 }
@@ -362,7 +430,8 @@ pub trait EgressStarter: Send + Sync {
     /// the secrets source and builds the credentials, loads the upstream trust roots, mints the
     /// CA and its leaves, and writes `ca-bundle.pem` and `session-ca.pem` into `dir` (the
     /// workspace socket directory), before the container exists. Blocking: the launcher runs it
-    /// off the runtime. Other sessions pass through unchanged.
+    /// off the runtime. A session without a CA that grants `fetch` only gets its upstream trust
+    /// roots loaded (architect ruling Q2; no CA, no file); other sessions pass through unchanged.
     ///
     /// # Errors
     /// [`EgressError::Credentials`], [`EgressError::Store`], [`EgressError::Roots`],
@@ -402,6 +471,9 @@ pub type SystemEgress = Egress<SystemResolver, TcpDialer, ProcHostAddrs>;
 impl<R: Resolver, D: Dialer, H: HostAddrs> EgressStarter for Egress<R, D, H> {
     fn prepare(&self, dir: &Path, mut s: SessionEgress) -> Result<SessionEgress, EgressError> {
         if !s.ca {
+            if s.fetch {
+                s.roots = Some(self.roots.load()?);
+            }
             return Ok(s);
         }
         let mut names: Vec<String> = Vec::new();
@@ -426,6 +498,16 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> EgressStarter for Egress<R, D, H> {
 
     fn start(&self, sock: &Path, s: SessionEgress) -> io::Result<EgressHandle> {
         let listener = bind(sock)?;
+        let reach = if s.fetch {
+            ClientTls::of(s.interception.as_ref(), s.roots.as_ref())
+                .map_err(io::Error::other)?
+                .map(|tls| Reach {
+                    tls,
+                    grants: host_grants(&s.policy, &s.grants),
+                })
+        } else {
+            None
+        };
         let proxy = Proxy::new(Parts {
             policy: s.policy,
             resolver: Arc::clone(&self.resolver),
@@ -437,7 +519,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> EgressStarter for Egress<R, D, H> {
             limits: Limits::of_session(s.max_connections, s.body_caps),
             interception: s.interception,
         });
-        Ok(serve(listener, Arc::new(proxy)))
+        Ok(serve_with(listener, Arc::new(proxy), reach))
     }
 }
 
@@ -755,12 +837,186 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Architect rulings Q1 and Q7: a connector's connections are served by the session's accept
+    /// loop like accepted ones, every entry of theirs carries the origin and no other does, and a
+    /// stop ends them with their close entry; afterwards the connector is refused.
+    #[tokio::test]
+    async fn a_connectors_connections_are_served_tagged_and_stop_with_the_session() {
+        let dir = scratch("local");
+        let sock = dir.join("net.sock");
+        assert!(
+            start(Arc::new(OnePublic), Arc::default(), 4, &sock)
+                .connector()
+                .is_none(),
+            "no fetch, no connector"
+        );
+        std::fs::remove_file(&sock).unwrap();
+        let audit = Arc::new(Ends::default());
+        let roots = super::super::roots::Roots {
+            store: Arc::new(rustls::RootCertStore::empty()),
+            pem: String::new(),
+            skipped: 0,
+            path: "/test-roots.pem".into(),
+        };
+        let handle = start_with(
+            Arc::new(OnePublic),
+            Arc::clone(&audit),
+            4,
+            &sock,
+            Some(roots),
+        );
+        let c = handle.connector().unwrap();
+        let origin = || serde_json::json!({"tool": "fetch", "call": 1});
+        let mut denied = c.open(origin()).unwrap();
+        denied
+            .write_all(b"CONNECT evil.test:443 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut out = String::new();
+        denied.read_to_string(&mut out).await.unwrap();
+        assert!(out.starts_with("HTTP/1.1 403 "), "{out}");
+        assert!(
+            exchange(&sock, "evil.test:443")
+                .await
+                .starts_with("HTTP/1.1 403 ")
+        );
+        let mut open = c.open(origin()).unwrap();
+        open.write_all(b"CONNECT a.mock.test:443 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut ok = vec![0u8; super::super::server::ESTABLISHED.len()];
+        open.read_exact(&mut ok).await.unwrap();
+        handle.shutdown().await;
+        let tag = r#" origin={"call":1,"tool":"fetch"}"#;
+        assert_eq!(
+            audit.rows(),
+            [
+                format!("egress.deny host-not-allowed{tag}"),
+                "egress.deny host-not-allowed".to_owned(),
+                format!("egress.allow {tag}"),
+                format!("egress.close session-stopped{tag}"),
+            ]
+        );
+        let refused = c.open(origin()).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::BrokenPipe);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Rust review M2 / security review L2: with one in-flight slot left, a queued
+    /// broker-originated connection gets it; no slot is held back for an `accept` that waits.
+    #[tokio::test]
+    async fn the_last_free_slot_serves_a_queued_connector_connection() {
+        let dir = scratch("lastslot");
+        let sock = dir.join("net.sock");
+        let (gate, _open) = Gate::shut();
+        let audit = Arc::new(Ends {
+            gate: Some(Arc::clone(&gate)),
+            ..Ends::default()
+        });
+        let roots = super::super::roots::Roots {
+            store: Arc::new(rustls::RootCertStore::empty()),
+            pem: String::new(),
+            skipped: 0,
+            path: "/test-roots.pem".into(),
+        };
+        // Cap 0: each connection is a 429 whose append waits at the gate, holding its slot.
+        let handle = start_with(
+            Arc::new(OnePublic),
+            Arc::clone(&audit),
+            0,
+            &sock,
+            Some(roots),
+        );
+        let bound = Limits::new(0).in_flight();
+        let mut clients = Vec::new();
+        for _ in 1..bound {
+            clients.push(UnixStream::connect(&sock).await.unwrap());
+        }
+        until("all but one slot to fill", || gate.entered() == bound - 1).await;
+        let local = handle
+            .connector()
+            .unwrap()
+            .open(serde_json::json!({"call": 1}))
+            .unwrap();
+        until("the connector's connection to be served", || {
+            gate.entered() == bound
+        })
+        .await;
+        gate.release();
+        until("every entry", || audit.rows().len() == bound).await;
+        assert!(audit.rows().iter().any(|r| r.contains("origin=")));
+        handle.shutdown().await;
+        drop((clients, local));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Security re-review L (#75 part 2): a connector connection still queued for a slot when
+    /// the handle is dropped (the abort path) is never served: its stream reads its end, it
+    /// never reaches an entry, and the connector is refused from then on.
+    #[tokio::test]
+    async fn dropping_the_handle_ends_a_queued_connector_connection_unserved() {
+        let dir = scratch("dropq");
+        let sock = dir.join("net.sock");
+        let (gate, _open) = Gate::shut();
+        let audit = Arc::new(Ends {
+            gate: Some(Arc::clone(&gate)),
+            ..Ends::default()
+        });
+        let roots = super::super::roots::Roots {
+            store: Arc::new(rustls::RootCertStore::empty()),
+            pem: String::new(),
+            skipped: 0,
+            path: "/test-roots.pem".into(),
+        };
+        // Cap 0: each connection is a 429 whose append waits at the gate, holding its slot.
+        let handle = start_with(
+            Arc::new(OnePublic),
+            Arc::clone(&audit),
+            0,
+            &sock,
+            Some(roots),
+        );
+        let bound = Limits::new(0).in_flight();
+        let mut clients = Vec::new();
+        for _ in 0..bound {
+            clients.push(UnixStream::connect(&sock).await.unwrap());
+        }
+        until("every slot to fill", || gate.entered() == bound).await;
+        let c = handle.connector().unwrap();
+        let mut queued = c.open(serde_json::json!({"call": 1})).unwrap();
+        drop(handle);
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), queued.read_to_end(&mut rest))
+            .await
+            .expect("the queued connection outlived the handle")
+            .unwrap();
+        assert!(rest.is_empty(), "{rest:?}");
+        assert_eq!(gate.entered(), bound, "the queued connection was served");
+        let refused = c.open(serde_json::json!({"call": 2})).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::BrokenPipe);
+        gate.release();
+        assert!(!audit.rows().iter().any(|r| r.contains("origin=")));
+        drop(clients);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Starts a listener at `sock` that allows `a.mock.test:443` only.
     fn start<R: Resolver>(
         resolver: Arc<R>,
         audit: Arc<Ends>,
         max_connections: usize,
         sock: &Path,
+    ) -> EgressHandle {
+        start_with(resolver, audit, max_connections, sock, None)
+    }
+
+    /// [`start`]; with `roots`, a session that grants `fetch`.
+    fn start_with<R: Resolver>(
+        resolver: Arc<R>,
+        audit: Arc<Ends>,
+        max_connections: usize,
+        sock: &Path,
+        roots: Option<super::super::roots::Roots>,
     ) -> EgressHandle {
         use sally_core::manifest::parse_host_pattern;
         let starter = Egress {
@@ -788,6 +1044,8 @@ mod tests {
                     timeout: Duration::from_secs(60),
                     grants: Vec::new(),
                     interception: None,
+                    fetch: roots.is_some(),
+                    roots,
                 },
             )
             .unwrap()
@@ -902,10 +1160,13 @@ mod tests {
                 .as_str()
                 .or(a["reason"].as_str())
                 .unwrap_or_default();
+            let origin = a
+                .get("origin")
+                .map_or_else(String::new, |o| format!(" origin={o}"));
             self.rows
                 .lock()
                 .unwrap()
-                .push(format!("{} {why}", e.event()));
+                .push(format!("{} {why}{origin}", e.event()));
             Ok(())
         }
     }

@@ -89,10 +89,8 @@ pub fn request(
     let named = connection_tokens(headers);
     let mut out = HeaderMap::with_capacity(headers.len());
     for (name, value) in headers {
-        let dropped = REQUEST_DROPPED.contains(name)
-            || is_proxy_header(name)
-            || named.iter().any(|n| n == name.as_str())
-            || grants.iter().any(|g| g == name.as_str());
+        let dropped =
+            dropped_request_header(name, grants) || named.iter().any(|n| n == name.as_str());
         if !dropped {
             out.append(name.clone(), value.clone());
         }
@@ -238,6 +236,18 @@ fn connection_tokens(headers: &HeaderMap) -> Vec<String> {
         .map(|t| String::from_utf8_lossy(t.trim_ascii()).to_ascii_lowercase())
         .filter(|t| !t.is_empty())
         .collect()
+}
+
+/// Whether a request header `name` never reaches the upstream, whatever its value: one of
+/// [`REQUEST_DROPPED`], a `Proxy-*` header, or one of `grants` (the host's grant header names,
+/// lower-case). Besides these, the tokens a `Connection` header names are dropped too. The
+/// `fetch` tool refuses such a header at prepare, so no ticket shows a header that is never sent
+/// (architect ruling Q3).
+#[must_use]
+pub fn dropped_request_header(name: &HeaderName, grants: &[String]) -> bool {
+    REQUEST_DROPPED.contains(name)
+        || is_proxy_header(name)
+        || grants.iter().any(|g| g == name.as_str())
 }
 
 /// `Proxy-*` (Q41: every one, not only `Proxy-Authorization` and `Proxy-Connection`).

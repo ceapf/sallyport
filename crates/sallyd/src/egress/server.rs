@@ -174,8 +174,8 @@ fn permits(n: usize) -> usize {
 mod intercept;
 #[path = "intercept_tls.rs"]
 mod intercept_tls;
-pub use intercept::{MAX_RESPONSE_HEAD, Summary};
-pub use intercept_tls::Interception;
+pub use intercept::{MAX_REQUEST_HEAD, MAX_RESPONSE_HEAD, Summary, upstream_builder};
+pub use intercept_tls::{Interception, trusting, upstream_client};
 
 /// What a session's proxy is built from.
 pub struct Parts<R, D, H> {
@@ -517,9 +517,15 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         }
     }
 
+    /// The audit sink of the connection on this task: entries of a broker-originated connection
+    /// carry its origin (`local.rs`). Taken on the connection's task, before any `spawn_blocking`.
+    fn sink(&self) -> Arc<dyn AuditSink> {
+        super::local::sink(&self.audit)
+    }
+
     /// Appends off the runtime; whether the entry was written.
     async fn append(&self, entry: NewEntry) -> bool {
-        let (sink, level) = (Arc::clone(&self.audit), self.level);
+        let (sink, level) = (self.sink(), self.level);
         matches!(
             tokio::task::spawn_blocking(move || sink.append(entry, level)).await,
             Ok(Ok(()))

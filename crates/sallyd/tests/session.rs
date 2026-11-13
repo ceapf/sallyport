@@ -18,6 +18,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 mod common;
 use common::container::*;
+use common::egress::tls_upstream;
 use common::*;
 
 type Hook = Box<dyn Fn(&Path) -> Result<(), AuditError> + Send + Sync>;
@@ -471,6 +472,118 @@ fn rt_ag_08_a_foreign_session_id_reaches_only_its_own_session() {
         let theirs = format!("session: Some({:?})", b.id);
         assert!(!caused.iter().any(|d| d.contains(&theirs)), "{caused:#?}");
         for s in [&a, &b] {
+            assert_eq!(
+                r.reg.stop(&s.id, StopReason::Request).await,
+                Some(StopOutcome::Stopped)
+            );
+        }
+    });
+}
+
+/// #103 (architect ruling on #75 part 2): production hands each session's tools its own proxy's
+/// connector. (a) A proxy-mode session granting `fetch` lists it; (b) a GET through `agent.sock`
+/// reaches the fixture's TLS upstream, and the proxy's one `egress.allow` carries the fetch's
+/// `origin` and this session's id; a body over the session's `max_request_bytes` (1 KiB, below
+/// its 2 KiB `max_response_bytes`) is refused `request-too-large` at prepare, so the caps are
+/// not swapped. (c) Fetch granted with `network.mode: none` (no proxy, so no connector):
+/// unlisted, a call is `tool_unavailable` with `tool.deny`. (d) Not granted in proxy mode:
+/// unlisted. Fails without the `fetch:` expression in `Registry::agent` (a, b) or with
+/// `Running::fetch_connector` answering `None` (a, b); (c) fails if it ever answers `Some`
+/// without a proxy.
+#[test]
+fn a_session_fetches_through_its_own_proxy_and_only_with_one() {
+    rt().block_on(async {
+        let r = registry();
+        r.x.egress
+            .resolver
+            .set("mock.test", vec![vec![tls_upstream()]]);
+        let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list",
+                          "params": {"_meta": meta()}});
+        let get = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                         "params": {"_meta": meta(), "name": "fetch",
+                                    "arguments": {"url": "https://mock.test/"}}});
+        let names = |reply: &Value| -> Vec<String> {
+            reply["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        let start = |body: &str| r.reg.start(Arc::new(r.x.f.load(body)));
+        let sock = |id: &str| r.x.session_paths(id).harness_sockets().join(AGENT_SOCK);
+
+        // (a), (b)
+        let net = "network:\n  mode: proxy\n  allow:\n    - host: mock.test\n";
+        let a = start(&format!(
+            "{net}  max_request_bytes: 1KiB\n  max_response_bytes: 2KiB\n\
+             tools:\n  builtin: [fetch]\n"
+        ))
+        .await
+        .unwrap();
+        // 1536 bytes: over the request cap, under the response cap.
+        let post = json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                          "params": {"_meta": meta(), "name": "fetch",
+                                     "arguments": {"url": "https://mock.test/", "method": "POST",
+                                                   "body_b64": "QUFB".repeat(512)}}});
+        let mark = r.sink.debug.lock().unwrap().len();
+        let replies = exchange(&sock(&a.id), &[list.clone(), get.clone(), post]).await;
+        assert_eq!(names(&replies[0]), ["fetch"], "{replies:?}");
+        assert_eq!(
+            replies[2]["result"]["content"][0]["text"],
+            json!("denied: request-too-large"),
+            "{replies:?}"
+        );
+        assert_eq!(replies[1]["result"]["isError"], json!(false), "{replies:?}");
+        let text = replies[1]["result"]["content"][0]["text"].as_str().unwrap();
+        let out: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(out["status"], json!(200), "{out}");
+        assert_eq!(out["body"], json!("ok"), "{out}");
+        // The proxy writes through the launcher's sink (`r.x.events`), the tools through the
+        // registry's (`r.sink`). One `egress.allow` in all, the fetch's, and it is A's.
+        let allows: Vec<Value> =
+            r.x.events
+                .all()
+                .into_iter()
+                .filter(|(e, _)| e == "egress.allow")
+                .map(|(_, a)| a)
+                .collect();
+        assert_eq!(allows.len(), 1, "{allows:#?}");
+        assert_eq!(allows[0]["origin"]["tool"], json!("fetch"), "{allows:#?}");
+        assert!(allows[0]["origin"]["call"].is_u64(), "{allows:#?}");
+        let own = format!("session: Some({:?})", a.id);
+        let debug = r.x.events.debug();
+        let allow = debug.iter().find(|d| d.contains("\"egress.allow\""));
+        assert!(allow.is_some_and(|d| d.contains(&own)), "{debug:#?}");
+        let caused: Vec<String> = r.sink.debug.lock().unwrap()[mark..].to_vec();
+        // Three requests, the GET's run and result, the POST's deny (rust re-review L1).
+        assert!(caused.len() >= 6, "{caused:#?}");
+        assert!(caused.iter().all(|d| d.contains(&own)), "{caused:#?}");
+
+        // (c)
+        let c = start("tools:\n  builtin: [fetch]\n").await.unwrap();
+        let replies = exchange(&sock(&c.id), &[list.clone(), get.clone()]).await;
+        assert!(names(&replies[0]).is_empty(), "{replies:?}");
+        assert_eq!(replies[1]["result"]["isError"], json!(true), "{replies:?}");
+        let text = replies[1]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("tool_unavailable"), "{text}");
+        assert!(
+            r.x.events
+                .all()
+                .iter()
+                .any(|(e, a)| e == "tool.deny" && a.to_string().contains("tool_unavailable")),
+            "{:#?}",
+            r.x.events.all()
+        );
+
+        // (d)
+        let d = start(&format!("{net}tools:\n  builtin: [fs_list]\n"))
+            .await
+            .unwrap();
+        let replies = exchange(&sock(&d.id), &[list]).await;
+        assert_eq!(names(&replies[0]), ["fs_list"], "{replies:?}");
+
+        for s in [&a, &c, &d] {
             assert_eq!(
                 r.reg.stop(&s.id, StopReason::Request).await,
                 Some(StopOutcome::Stopped)
