@@ -273,12 +273,12 @@ are released only once the container is confirmed gone.
    directory as another session's mount, so no live sandbox can swap what another session's
    launch scan pinned. `Launcher::remove_orphans` removes `sp-ws-*`/`sp-h-*` containers a
    previous `sallyd` of this installation left running (audited `sandbox.orphan_removed` with
-   `sweep: startup`); `sallyd` calls it before it accepts the first launch, then every 60 s
+   the name, the full ID it removes by, and `sweep: startup`); `sallyd` calls it before it accepts the first launch, then every 60 s
    (`sweep: periodic`, architect Q61): a `podman create` a killed `sallyd` left running can make
    its container after the startup sweep. A container is removed only if it carries this
    installation's label (`sallyport.installation`, a UUID v4 kept 0600 as `installation` in
    the state directory, created once under the single-instance lock, crash-safe (written and
-   synced as `installation.new`, renamed into place without replacing anything, directory
+   synced as `installation.new`, linked into place, which never replaces anything, directory
    synced), and never regenerated; architect Q64), has a session container's name and no live session owns it. One without the
    label (another daemon's, a test run's, or one made before the label existed) is never
    removed. The label is compared in `sandbox::orphans`, after podman's own label filter. A
