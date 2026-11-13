@@ -2,13 +2,14 @@
 //! hardening, the identity checks, and the single-instance lock on the runtime directory.
 //!
 //! The decisions are pure functions ([`check_ids`], [`check_state_dir`], [`nofile_target`]),
-//! unit-tested here; the thin wrappers around them make the system calls (all safe rustix fns).
+//! unit-tested here with the lock. The calls that change this process for good (umask, limits,
+//! dumpable) are in `process.rs`: a test cannot make them without breaking the test process, so
+//! the `sallyd` binary's tests cover them.
 
 use std::os::fd::OwnedFd;
 use std::path::Path;
 
 use rustix::fs::{FileType, FlockOperation, Mode, OFlags};
-use rustix::process::{DumpableBehavior, Resource, Rlimit};
 
 /// The directory under `$XDG_RUNTIME_DIR` that holds `control.sock` and the session socket
 /// directories, and whose fd carries the single-instance lock.
@@ -106,43 +107,6 @@ pub fn nofile_target(soft: Option<u64>, hard: Option<u64>) -> u64 {
     cap.max(soft.unwrap_or(0).min(cap))
 }
 
-/// Step 1–2: umask 077, no core dumps, not dumpable. Runs first, before the runtime, secrets
-/// and the audit log exist.
-///
-/// # Errors
-/// [`StartError::Harden`] naming the call.
-pub fn harden() -> Result<(), StartError> {
-    rustix::process::umask(Mode::from_raw_mode(0o077));
-    let none = Rlimit {
-        current: Some(0),
-        maximum: Some(0),
-    };
-    rustix::process::setrlimit(Resource::Core, none).map_err(|e| StartError::Harden {
-        what: "setrlimit(RLIMIT_CORE)",
-        source: e.into(),
-    })?;
-    rustix::process::set_dumpable_behavior(DumpableBehavior::NotDumpable).map_err(|e| {
-        StartError::Harden {
-            what: "prctl(PR_SET_DUMPABLE)",
-            source: e.into(),
-        }
-    })
-}
-
-/// Step 3 for this process.
-///
-/// # Errors
-/// As [`check_ids`].
-pub fn check_own_ids() -> Result<(), StartError> {
-    use rustix::process::{getegid, geteuid, getgid, getuid};
-    check_ids(
-        getuid().as_raw(),
-        geteuid().as_raw(),
-        getgid().as_raw(),
-        getegid().as_raw(),
-    )
-}
-
 /// Step 4–5: creates `<runtime>/sallyport` (0700; an existing one is fine), opens it without
 /// following a symlink, checks the opened directory, and takes the single-instance lock on that
 /// fd. The returned fd holds the lock for as long as it lives (close-on-exec: no child inherits
@@ -172,27 +136,6 @@ pub fn open_and_lock(runtime: &Path) -> Result<OwnedFd, StartError> {
         Err(rustix::io::Errno::WOULDBLOCK) => Err(StartError::AlreadyRunning(shown)),
         Err(e) => Err(fail(format!("flock: {e}"))),
     }
-}
-
-/// Step 7: raises the soft `NOFILE` toward the hard limit; the limit now in force.
-///
-/// # Errors
-/// [`StartError::Harden`].
-pub fn raise_nofile() -> Result<u64, StartError> {
-    let now = rustix::process::getrlimit(Resource::Nofile);
-    let target = nofile_target(now.current, now.maximum);
-    rustix::process::setrlimit(
-        Resource::Nofile,
-        Rlimit {
-            current: Some(target),
-            maximum: now.maximum,
-        },
-    )
-    .map_err(|e| StartError::Harden {
-        what: "setrlimit(RLIMIT_NOFILE)",
-        source: e.into(),
-    })?;
-    Ok(target)
 }
 
 #[cfg(test)]

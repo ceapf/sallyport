@@ -2,6 +2,8 @@
 //! lock, the crash reporter and the runtime.
 
 pub mod crash;
+pub mod process;
+pub mod serve;
 pub mod startup;
 
 /// tokio's blocking-pool size for the daemon. Stuck name lookups take at most

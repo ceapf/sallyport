@@ -73,6 +73,12 @@ line per fact, with where it was found. Check a note again before relying on it 
 - `pids.peak` is not on every kernel; fall back to `pids.current`. (6c-2 review)
 - WSL: `/proc/sys/fs/binfmt_misc/WSLInterop` (flags `PF`, interpreter `/init`) marks interop;
   the host's `cmd.exe` is `/mnt/c/Windows/System32/cmd.exe`. (6c-2a, FS-11)
+- A non-dumpable process (`PR_SET_DUMPABLE 0`) still binds and chmods a socket through
+  `/proc/self/fd/<dirfd>/<name>`. Its `/proc/<pid>` directory keeps its own owner; the entries
+  under it (`fd/`, `status`, …) become root's, so other processes of the same user cannot read
+  them. `/proc/<pid>/limits` and `status` stay world-readable. Opening `/proc/<init>` of a
+  session container from a non-dumpable `sallyd` is proven when a session starts through the
+  binary (Task 12 PR B). (Task 12, `tests/daemon.rs`)
 
 ## Busybox (test image)
 

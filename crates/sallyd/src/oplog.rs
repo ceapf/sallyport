@@ -16,7 +16,7 @@ use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sally_core::audit::Redactor;
 use sally_core::text::escape_capped;
@@ -27,6 +27,8 @@ pub const MAX_VALUE: usize = 4096;
 pub const MAX_LINE: usize = 16 * 1024;
 /// Lines waiting for the writer; past this a line is dropped.
 pub const QUEUE: usize = 1024;
+/// How often [`Oplog::flush`] looks at the queue.
+const FLUSH_POLL: Duration = Duration::from_millis(5);
 
 /// A line's severity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +61,8 @@ pub struct Oplog {
 struct Shared {
     redactor: RwLock<Arc<Redactor>>,
     dropped: AtomicU64,
+    /// Lines queued and not yet written.
+    pending: AtomicU64,
 }
 
 impl std::fmt::Debug for Oplog {
@@ -81,6 +85,7 @@ impl Oplog {
         let shared = Arc::new(Shared {
             redactor: RwLock::new(Arc::new(Redactor::default())),
             dropped: AtomicU64::new(0),
+            pending: AtomicU64::new(0),
         });
         let s = Arc::clone(&shared);
         // A thread that cannot start leaves a log that drops every line (counted, never blocks).
@@ -109,11 +114,28 @@ impl Oplog {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
         let line = format_line(&now(), level, component, msg, fields, &redactor);
+        self.shared.pending.fetch_add(1, Ordering::SeqCst);
         match self.tx.try_send(line) {
             Ok(()) => {}
             Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+                self.shared.pending.fetch_sub(1, Ordering::SeqCst);
                 self.shared.dropped.fetch_add(1, Ordering::Relaxed);
             }
+        }
+    }
+
+    /// Waits, at most `limit`, until every queued line is written: before the process exits.
+    /// Whether the queue drained.
+    pub fn flush(&self, limit: Duration) -> bool {
+        let end = Instant::now() + limit;
+        loop {
+            if self.shared.pending.load(Ordering::SeqCst) == 0 {
+                return true;
+            }
+            if Instant::now() >= end {
+                return false;
+            }
+            std::thread::sleep(FLUSH_POLL);
         }
     }
 
@@ -148,6 +170,7 @@ fn drain(rx: &Receiver<String>, mut out: impl Write, s: &Shared) {
             let _ = out.write_all(note.as_bytes());
         }
         let _ = out.flush();
+        s.pending.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -343,6 +366,30 @@ mod tests {
         drop(held);
         log.info("t", "after", &[]);
         wait_for(&sink, "lines dropped");
+    }
+
+    /// `flush` returns once every queued line is written, and gives up at its limit on a stuck
+    /// writer; a dropped line is not waited for.
+    #[test]
+    fn flush_waits_for_queued_lines_within_its_limit() {
+        let sink = Sink::default();
+        let held = sink.gate.lock().unwrap();
+        let log = Oplog::new(sink.clone());
+        for i in 0..(QUEUE + 10) {
+            log.info("t", "line", &[("i", &i.to_string())]);
+        }
+        let start = Instant::now();
+        assert!(!log.flush(Duration::from_millis(100)));
+        assert!(start.elapsed() >= Duration::from_millis(100));
+        drop(held);
+        assert!(log.flush(Duration::from_secs(10)));
+        let text = String::from_utf8(sink.lines.lock().unwrap().clone()).unwrap();
+        // Every queued line is there: the writer holds one and the queue the rest.
+        assert!(text.matches(" info t ").count() > QUEUE, "{}", text.len());
+        log.info("t", "last", &[]);
+        assert!(log.flush(Duration::from_secs(10)));
+        let text = String::from_utf8(sink.lines.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("\"last\""), "{text}");
     }
 
     #[test]
