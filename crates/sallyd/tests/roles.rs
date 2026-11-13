@@ -1,6 +1,6 @@
 //! Task 6c red-team rows that hold in every role, with real containers (rootless Podman):
 //! RT-NET-01 (no route out), RT-NET-08 (raw sockets and ICMP), RT-NET-12 (socket families) and
-//! RT-FS-17 (no new namespaces).
+//! RT-FS-17 (no new namespaces), and the ENOENT half of RT-FS-10 (broker state out of reach).
 //!
 //! The workspace comes from the launcher; the harness and inference containers from their argv
 //! builders, created and started with hermetic podman exactly as the argv says (their launchers
@@ -316,6 +316,78 @@ fn rt_fs_17_no_role_creates_a_namespace() {
                 "{:?}: refused by the profile (ENOSYS): {out}",
                 b.role
             );
+        }
+        finish(&x, boxes).await;
+    });
+}
+
+/// The broker's state on the host, made to exist first so that ENOENT from a role proves the path
+/// is out of its reach rather than absent: `control.sock` (bound), the audit directory, the
+/// secrets file, the library blobs directory, and the blobs directory the inference model came
+/// from. Absolute host paths (ARCHITECTURE §3.1).
+fn broker_state(x: &Lx) -> (Vec<String>, std::os::unix::net::UnixListener) {
+    let home = x.f.root.join("home");
+    let data = home.join(".local/share/sallyport");
+    let sockets = x.xdg.join("sallyport");
+    std::fs::create_dir_all(&sockets).unwrap();
+    let control = sockets.join("control.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&control).unwrap();
+    let audit = data.join("audit");
+    std::fs::create_dir_all(&audit).unwrap();
+    std::fs::write(audit.join("audit-202611.jsonl"), b"{}\n").unwrap();
+    let config = home.join(".config/sallyport");
+    std::fs::create_dir_all(&config).unwrap();
+    let secrets = config.join("secrets.toml");
+    std::fs::write(&secrets, b"").unwrap();
+    std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let blobs = data.join("library/blobs/sha256");
+    std::fs::create_dir_all(&blobs).unwrap();
+    let paths: Vec<String> = [control, audit, secrets, blobs, x.f.root.join("blobs")]
+        .iter()
+        .map(|p| {
+            assert!(p.exists(), "{} must exist on the host", p.display());
+            p.to_str().unwrap().to_owned()
+        })
+        .collect();
+    (paths, listener)
+}
+
+/// RT-FS-10, the ENOENT half (#61 item 1): from every role, the broker's state is out of reach.
+/// Each host path, the same path under `/run/sallyport/../..` (the harness's socket directory is
+/// a bind mount; `..` must not climb to the host), and `control.sock` beside the role's own
+/// sockets all give ENOENT. Control: the role's mount set (`argv.rs`): adding any of these host
+/// directories to a role's mounts makes its path resolve.
+#[test]
+fn rt_fs_10_broker_state_is_enoent_from_every_role() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let mut boxes = Vec::new();
+        for role in ROLES {
+            boxes.push(start(&x, role).await);
+        }
+        // After the starts: the inference role's blobs directory exists only from then.
+        let (host, _control) = broker_state(&x);
+        let mut tried: Vec<String> = host.clone();
+        tried.extend(host.iter().map(|p| format!("/run/sallyport/../..{p}")));
+        tried.push("/run/sallyport/control.sock".into());
+        let script: String = tried
+            .iter()
+            .map(|p| {
+                format!("r=$(ls -d -- '{p}' 2>&1 >/dev/null) && echo 'found' || echo \"$r\"; ")
+            })
+            .collect();
+        for b in &boxes {
+            let (code, out) = exec_in(&b.container, &["sh", "-c", &script]);
+            assert_eq!(code, 0, "{:?}: {out}", b.role);
+            let lines: Vec<&str> = out.lines().collect();
+            assert_eq!(lines.len(), tried.len(), "{:?}: {out}", b.role);
+            for (p, line) in tried.iter().zip(&lines) {
+                assert!(
+                    line.ends_with("No such file or directory"),
+                    "{:?}: {p}: {line}",
+                    b.role
+                );
+            }
         }
         finish(&x, boxes).await;
     });

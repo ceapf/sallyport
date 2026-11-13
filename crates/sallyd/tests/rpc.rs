@@ -159,8 +159,8 @@ fn meta() -> Value {
 
 /// RT-FS-10, from inside the harness: `/run/sallyport` lists exactly `want` (sorted), each a
 /// socket the harness's user owns with mode 0600 (architect Q55: exactly `agent.sock` for a
-/// registry session without a model, plus `llm.sock` only when the session has one).
-// TODO(#61): the ENOENT half of the row (Task 12 PR B).
+/// registry session without a model, plus `llm.sock` only when the session has one). The ENOENT
+/// half of the row is `roles.rs` `rt_fs_10_broker_state_is_enoent_from_every_role`.
 async fn sockets_are_exactly(container: &str, want: &[&str]) {
     let (code, out) = sh(container, "ls -A /run/sallyport").await;
     assert_eq!(code, 0, "{out}");
