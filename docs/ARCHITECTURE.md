@@ -277,8 +277,9 @@ are released only once the container is confirmed gone.
    (`sweep: periodic`, architect Q61): a `podman create` a killed `sallyd` left running can make
    its container after the startup sweep. A container is removed only if it carries this
    installation's label (`sallyport.installation`, a UUID v4 kept 0600 as `installation` in
-   the state directory, created once under the single-instance lock and never regenerated;
-   architect Q64), has a session container's name and no live session owns it. One without the
+   the state directory, created once under the single-instance lock, crash-safe (written and
+   synced as `installation.new`, renamed into place without replacing anything, directory
+   synced), and never regenerated; architect Q64), has a session container's name and no live session owns it. One without the
    label (another daemon's, a test run's, or one made before the label existed) is never
    removed. The label is compared in `sandbox::orphans`, after podman's own label filter. A
    launch reserves its id before it creates anything, so no sweep takes a launch in progress; a
