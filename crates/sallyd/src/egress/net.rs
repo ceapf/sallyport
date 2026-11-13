@@ -752,6 +752,9 @@ mod tests {
             std::os::unix::net::UnixStream::connect(&sock).is_err()
         })
         .await;
+        // The proxy and every connection task hold the sink: once they are gone, a graceful
+        // stop (what a dropped handle without the abort gets) would have written its close.
+        until("the proxy to go", || Arc::strong_count(&audit) == 1).await;
         assert_eq!(audit.rows(), ["egress.allow "], "aborted: no close entry");
         std::fs::remove_dir_all(&dir).unwrap();
     }
