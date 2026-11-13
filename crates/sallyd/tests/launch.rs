@@ -684,8 +684,11 @@ fn create_out_of_band(name: &str, label: Option<&str>) {
 /// session's container survives the same sweeps. Without the sweep it would hold mounts the
 /// overlap rule does not know. A foreign container with a session name survives every sweep:
 /// one with no label (another daemon's, a test run's) and one with another installation's id.
-/// Controls: the sweep loop and `is_live` (the late orphan, the live session); the label
-/// comparison in `sandbox::orphans` (the two foreign containers).
+/// Controls: the sweep loop and `is_live` (the late orphan, the live session); the label match
+/// (the two foreign containers), both layers together: podman's `--filter label=` and the
+/// comparison in `sandbox::orphans`. Removing one layer alone leaves the other refusing them,
+/// so each is pinned by its own unit test in `sandbox::orphans` (the listing asks podman for
+/// the label; only this installation's containers match).
 #[test]
 fn rt_ag_08b_a_late_orphan_is_swept_while_a_live_session_and_foreign_containers_stay() {
     rt().block_on(async {
