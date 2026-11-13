@@ -77,4 +77,9 @@ exclude_re = [
   # Same value (rule i): `Value::default()` is `Value::Null`, which is what visit_unit returns
   # (architect ruling Q13, Task 7). Proof: json.rs `null_parses_to_the_default_value`.
   '''crates/sallyd/src/rpc/json\.rs:\d+:\d+: replace <impl Visitor<'de> for StrictVisitor>::visit_unit -> Result<Value, E> with Ok\(Default::default\(\)\)$''',
+  # Same value (rule i): NoSecrets::load returns an empty Vec, written Ok(Vec::new()); the mutant
+  # writes the same empty Vec as Ok(vec![]) (architect ruling Q70, Task 12). TODO(#99): remove
+  # this entry when the store file replaces NoSecrets.
+  # Proof: lookup.rs `no_secrets_holds_no_value`.
+  'crates/sallyd/src/session/lookup\.rs:\d+:\d+: replace <impl SecretSource for NoSecrets>::load -> Result<Vec<\(String, Secret<String>\)>, SecretsError> with Ok\(vec!\[\]\)$',
 ]
