@@ -37,7 +37,7 @@ pub const READ_RATE: u32 = 20;
 pub const READ_BURST: u32 = 40;
 /// Most bytes of serialized items in one listing reply (architect Q75, Q84). One prompt at its
 /// largest fits (see the relation test), and the reply's envelope stays under the client's
-/// frame cap.
+/// frame cap. TODO(#107): paging, and fair order across sessions for prompts.
 pub const REPLY_BYTES: usize = 768 * 1024;
 /// Most characters of one detail or error line in a reply or an entry.
 pub const DETAIL_CHARS: usize = 1024;
@@ -434,7 +434,8 @@ pub(crate) fn change(c: &Change) -> WireChange {
 }
 
 /// A prompt on the wire (architect Q74): the terminal text, and for a cut prompt its full text
-/// when it fits the wire, else `full_unavailable` (the prompt can then only be denied).
+/// when it fits the wire, else `full_unavailable` (the prompt can then only be denied;
+/// TODO(#108): a way to review and approve such an action).
 pub(crate) fn prompt(p: &Prompt) -> WirePrompt {
     let full = if p.truncated { p.full_on_wire() } else { None };
     WirePrompt {

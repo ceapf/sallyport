@@ -5,6 +5,8 @@
 //! type refuses unknown fields, so a field the daemon does not know (a `client`, a `model` before
 //! PR C) is `invalid-params`, never ignored. Text a sandbox chose (paths, prompt text) arrives
 //! already escaped by `sallyd`; a client still checks it before printing.
+//!
+//! TODO(#109): TypeScript types for the M5 UI bridge, generated from these with ts-rs.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 

@@ -8,7 +8,10 @@
 //! closes the connection with no effect and no reply.
 //!
 //! A connection that called `approvals.watch` also receives `approval.*` notifications between
-//! its replies; the read in progress is kept across them, so none splits a frame.
+//! its replies; the read in progress is kept across them, so none splits a frame. A watching
+//! connection should not also create or stop sessions: a watcher that falls `WATCH_QUEUE`
+//! notifications behind during a long request is dropped with its connection, and the reply
+//! is lost (architect Q89 f). TODO(#110): the M5 UI bridge watches on a connection of its own.
 
 use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
