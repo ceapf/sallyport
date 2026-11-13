@@ -10,6 +10,10 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Largest frame either side of `control.sock` reads (ARCHITECTURE §4: 1 MiB). `sallyd` refuses
+/// a longer request; a client treats a longer reply or notification as fatal (architect Q78).
+pub const MAX_FRAME: usize = 1024 * 1024;
+
 /// The control methods, exactly what `control.sock` serves (architect Q72).
 pub mod method {
     /// Start a session from a manifest's text.
@@ -197,8 +201,27 @@ fn is_false(b: &bool) -> bool {
 /// `approvals.list` and `approvals.watch` result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Prompts {
-    /// The prompts waiting, oldest first.
+    /// The prompts waiting, by session id, then oldest first.
     pub prompts: Vec<Prompt>,
+    /// Whether `prompts` holds every waiting prompt; `false` when the reply's byte budget cut
+    /// it (architect Q84). Prompts cut from a watch result are not notified later: a client
+    /// lists again once it has answered the ones it holds.
+    pub complete: bool,
+    /// How many prompts are waiting, listed or not.
+    pub total: usize,
+}
+
+/// The `data` of every control error reply (architect Q88).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorData {
+    /// The reason code (`unknown-session`, `manifest-invalid`, ...).
+    pub reason: String,
+    /// One line of detail, escaped: the refusal text `sallyd` audited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// A rejected manifest's errors, one escaped line each.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
 }
 
 /// `approval.flood` params.
@@ -275,6 +298,55 @@ mod tests {
             ..whole
         };
         assert_eq!(to_value(&deny_only).unwrap()["full_unavailable"], true);
+    }
+
+    /// Architect Q84: a prompt list says whether the reply's budget cut it.
+    #[test]
+    fn a_prompt_list_says_if_it_was_cut() {
+        let p: Prompts = from_value(json!({"prompts": [], "complete": false, "total": 3})).unwrap();
+        assert!(!p.complete);
+        assert_eq!(p.total, 3);
+    }
+
+    /// Architect Q88: the error data of every control reply; `detail` and `errors` only when
+    /// there are some.
+    #[test]
+    fn error_data_in_wire_form() {
+        let bare = ErrorData {
+            reason: "unknown-session".into(),
+            detail: None,
+            errors: Vec::new(),
+        };
+        assert_eq!(
+            to_value(&bare).unwrap(),
+            json!({"reason": "unknown-session"})
+        );
+        let full = ErrorData {
+            reason: "manifest-invalid".into(),
+            detail: Some("d".into()),
+            errors: vec!["error: name: empty [required]".into()],
+        };
+        let v = to_value(&full).unwrap();
+        assert_eq!(v["detail"], "d");
+        assert_eq!(v["errors"][0], "error: name: empty [required]");
+        assert_eq!(from_value::<ErrorData>(v).unwrap(), full);
+        assert_eq!(
+            from_value::<ErrorData>(json!({"reason": "r"})).unwrap(),
+            bare_with("r")
+        );
+    }
+
+    fn bare_with(reason: &str) -> ErrorData {
+        ErrorData {
+            reason: reason.into(),
+            detail: None,
+            errors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn frames_are_capped_at_1_mib() {
+        assert_eq!(MAX_FRAME, 1_048_576);
     }
 
     #[test]
