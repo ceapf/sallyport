@@ -323,21 +323,43 @@ fn ambiguous_response_framing_is_upstream_malformed() {
     );
 }
 
+/// Allow (R1, architect Q10): no `Content-Encoding`, or exactly one `identity` in any case,
+/// forwarded unchanged.
+#[test]
+fn an_identity_content_encoding_passes_unchanged() {
+    for v in ["identity", "IDENTITY", "Identity"] {
+        let h = heads(&[("content-encoding", v), ("content-length", "4")]);
+        let out = response(StatusCode::OK, &h).unwrap();
+        assert_eq!(out.get(header::CONTENT_ENCODING).unwrap(), v);
+    }
+    let none = heads(&[("content-length", "4")]);
+    assert!(response(StatusCode::OK, &none).is_ok());
+}
+
 #[test]
 fn encoded_or_upgraded_responses_are_refused() {
     assert_eq!(
         response(StatusCode::SWITCHING_PROTOCOLS, &HeaderMap::new()),
         Err(Reason::UpstreamEncoded)
     );
-    // Task 9a-3 (decision 1, architect D6): any Content-Encoding at all, even `identity`.
-    let bad: [&[(&str, &str)]; 9] = [
+    // Task 9a-3 (decision 1 as relaxed by R1, architect Q10): any Content-Encoding but one
+    // `identity`.
+    let bad: [&[(&str, &str)]; 11] = [
         &[("content-encoding", "gzip")],
-        &[("content-encoding", "identity")],
-        &[("content-encoding", "Identity")],
+        &[("content-encoding", "x-identity")],
         &[("content-encoding", "")],
         &[("content-encoding", "identity, gzip")],
+        &[("content-encoding", "identity, identity")],
         &[
             ("content-encoding", "identity"),
+            ("content-encoding", "identity"),
+        ],
+        &[
+            ("content-encoding", "identity"),
+            ("content-encoding", "gzip"),
+        ],
+        &[
+            ("content-encoding", "gzip"),
             ("content-encoding", "identity"),
         ],
         &[("transfer-encoding", "gzip, chunked")],

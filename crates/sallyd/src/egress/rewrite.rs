@@ -111,9 +111,10 @@ pub fn request(
 /// The client always gets a head without `Transfer-Encoding`: hyper's server frames the body.
 ///
 /// # Errors
-/// [`Reason::UpstreamEncoded`] for `101`, any `Content-Encoding` at all (even `identity`: a body
-/// the redaction cannot read is never forwarded; Task 9a-3, decision 1, architect D6 tightening
-/// Q30), or a `Transfer-Encoding` other than absent or one `chunked` (Q30); then
+/// [`Reason::UpstreamEncoded`] for `101`, a `Content-Encoding` other than absent or exactly one
+/// `identity` in any case (a body the redaction cannot read is never forwarded; Task 9a-3,
+/// decision 1 as relaxed by R1, architect Q10), or a `Transfer-Encoding` other than absent or
+/// one `chunked` (Q30); then
 /// [`Reason::UpstreamMalformed`] for `Transfer-Encoding` beside `Content-Length`, or a
 /// `Content-Length` other than one decimal value (two lines, or a list such as `6, 6`, which
 /// hyper accepts when the values agree: architect ruling R4, 9a-2 review).
@@ -121,7 +122,7 @@ pub fn response(status: StatusCode, headers: &HeaderMap) -> Result<HeaderMap, Re
     if status == StatusCode::SWITCHING_PROTOCOLS || headers.contains_key(header::UPGRADE) {
         return Err(Reason::UpstreamEncoded);
     }
-    if headers.contains_key(header::CONTENT_ENCODING)
+    if !at_most_one_equal(headers, &header::CONTENT_ENCODING, "identity")
         || !at_most_one_equal(headers, &header::TRANSFER_ENCODING, "chunked")
     {
         return Err(Reason::UpstreamEncoded);

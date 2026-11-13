@@ -204,20 +204,28 @@ async fn range_requests_reach_the_upstream_whole() {
     assert!(!up.contains("range"), "{up}");
 }
 
-/// Decision 1 (architect D6): even `Content-Encoding: identity` is refused, nothing forwarded.
-#[tokio::test]
-async fn any_content_encoding_is_refused_unforwarded() {
-    let r = rig(Opts {
-        handler: Arc::new(|_| {
-            Some(
-                "HTTP/1.1 200 OK\r\nContent-Encoding: identity\r\nContent-Length: 4\r\n\r\nbody"
-                    .into(),
-            )
+/// The upstream answers with `Content-Encoding: <encoding>` and a 4-byte body.
+fn encoded(encoding: &'static str) -> Rig {
+    rig(Opts {
+        handler: Arc::new(move |_| {
+            Some(format!(
+                "HTTP/1.1 200 OK\r\nContent-Encoding: {encoding}\r\nContent-Length: 4\r\n\r\nbody"
+            ))
         }),
         ..Opts::default()
-    });
-    let out = r.talk(&get("/echo", "")).await;
+    })
+}
+
+/// Decision 1 as relaxed by R1 (architect Q10): an encoded response is refused, nothing
+/// forwarded; one `identity` passes, unchanged.
+#[tokio::test]
+async fn an_encoded_response_is_refused_unforwarded_and_identity_passes() {
+    let out = encoded("gzip").talk(&get("/echo", "")).await;
     assert!(out.starts_with("HTTP/1.1 502 "), "{out}");
     assert!(out.ends_with("upstream-encoded\n"), "{out}");
     assert!(!out.contains("body"), "{out}");
+    let out = encoded("Identity").talk(&get("/echo", "")).await;
+    assert!(out.starts_with("HTTP/1.1 200 "), "{out}");
+    assert!(out.contains("content-encoding: Identity\r\n"), "{out}");
+    assert!(out.ends_with("\r\n\r\nbody"), "{out}");
 }

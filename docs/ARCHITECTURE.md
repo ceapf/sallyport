@@ -661,8 +661,8 @@ sequenceDiagram
     E->>E: audit egress.request {host, port, method, target, injected: ["secret:NAME"]}
     E->>E: set Authorization from the credentials (after the entry, last)
     E->>X: GET /user (same upstream connection for the next request)
-    X-->>E: 200 + body (no Content-Encoding, plain or chunked)
-    E->>E: check response head (no Content-Encoding, no 101); redact header lines; cap the body; never follow 3xx
+    X-->>E: 200 + body (no Content-Encoding or identity, plain or chunked)
+    E->>E: check response head (no Content-Encoding but identity, no 101); redact header lines; cap the body; never follow 3xx
     E-->>P: response, body redacted as it streams (same length)
     E->>E: audit egress.close {host, port, address, bytes_up, bytes_down, end, intercept, requests, statuses}
 ```
@@ -883,8 +883,9 @@ sallyport/
     `Content-Length` it discards `Content-Length` and reads chunked; equal duplicate
     `Content-Length` values merge; unequal or malformed ones it answers 400 itself (architect
     Q51; such a request counts as chunked for the cap).
-  - Response rules: `101`, any `Upgrade`, any `Content-Encoding` (even `identity`: a body the
-    redaction cannot read is never forwarded; decision 1, architect D6 tightening Q30), or a
+  - Response rules: `101`, any `Upgrade`, a `Content-Encoding` other than exactly one
+    `identity` in any case (a body the redaction cannot read is never forwarded; decision 1 as
+    relaxed by R1, architect Q10; an `identity` header is forwarded unchanged), or a
     `Transfer-Encoding` other than absent or one `chunked` is 502
     `upstream-encoded` and the body is never forwarded (Q30); an unparsable head, a
     `Transfer-Encoding` beside a `Content-Length`, or a `Content-Length` other than one decimal
