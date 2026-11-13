@@ -163,13 +163,36 @@ fn a_stream_holds_back_one_byte_less_than_the_longest_form() {
     assert_eq!(s.finish(), b"");
 }
 
+/// Re-review L2: even with no form longer than one byte, the last byte waits for the end.
 #[test]
-fn a_stream_with_no_forms_holds_nothing_back() {
-    let r = redaction(&[("A", &[""])]);
-    assert_eq!(r.longest(), 0);
+fn a_stream_always_holds_back_its_last_byte() {
+    for r in [redaction(&[("A", &[""])]), redaction(&[("A", &["q"])])] {
+        let mut s = r.stream();
+        assert_eq!(s.push(b"abc"), b"ab");
+        assert_eq!(s.finish(), b"c");
+    }
+}
+
+/// Re-review M3: touching occurrences merge into one pending range, and nothing stays pending
+/// once everything is emitted.
+#[test]
+fn pending_ranges_merge_when_they_touch_and_empty_at_the_end() {
+    let r = redaction(&[("A", &["ab", "xxxxxxxx"])]);
     let mut s = r.stream();
-    assert_eq!(s.push(b"abc"), b"abc");
-    assert_eq!(s.finish(), b"");
+    assert_eq!(s.push(b"abab"), b"");
+    assert_eq!(s.pending, [vec![(0, 4)]]);
+    assert_eq!(s.finish(), b"****");
+    assert!(s.pending.iter().all(Vec::is_empty), "{:?}", s.pending);
+}
+
+#[test]
+fn a_stream_debug_shows_its_state_never_a_held_byte() {
+    let r = redaction(&[("A", &["abcdefgh"])]);
+    let mut s = r.stream();
+    let _ = s.push(b"abcdefg");
+    let d = format!("{s:?}");
+    assert!(d.contains("held") && d.contains('7'), "{d}");
+    assert!(!d.contains("abcdefg"), "{d}");
 }
 
 #[test]
@@ -425,6 +448,36 @@ fn an_empty_body_reported_at_its_head_is_at_its_end_before_it_is_polled() {
     assert!(!b.is_end_stream());
     assert_eq!(drain(b), (Vec::new(), None));
     assert_eq!(*on.ends.lock().unwrap(), [(Ending::Complete, 0)]);
+}
+
+/// A report that has not finished: the last bytes wait for it, still counted in the size hint
+/// (re-review M2), and go out once it succeeds.
+#[test]
+fn the_last_bytes_wait_for_a_pending_report() {
+    struct Slow(Arc<std::sync::atomic::AtomicBool>);
+    impl OnRedacted for Slow {
+        fn ended(&self, _: Ending, _: Tally) -> Option<Report> {
+            let done = Arc::clone(&self.0);
+            Some(Box::pin(std::future::poll_fn(move |_| {
+                if done.load(std::sync::atomic::Ordering::Relaxed) {
+                    Poll::Ready(true)
+                } else {
+                    Poll::Pending
+                }
+            })))
+        }
+    }
+    let r = redaction(&[("A", &["0123456789"])]);
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let on: Arc<dyn OnRedacted> = Arc::new(Slow(Arc::clone(&done)));
+    let mut b = Redacted::new(Frames(vec![data("abc")]), &r, Tally::default(), on);
+    let waker = std::task::Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    assert!(Pin::new(&mut b).poll_frame(&mut cx).is_pending());
+    assert!(!b.is_end_stream());
+    assert_eq!(b.size_hint().exact(), Some(3));
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(drain(b), (vec!["abc".to_owned()], None));
 }
 
 #[test]

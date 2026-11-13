@@ -318,6 +318,25 @@ async fn an_empty_response_is_recorded_before_its_head() {
     });
     let out = failing.talk(&get("/echo", "")).await;
     assert!(!out.contains("304"), "{out}");
+    // A HEAD response's declared length is no body (re-review L4).
+    let head: Handler = Arc::new(|_| Some("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n".into()));
+    let req = format!("HEAD /echo HTTP/1.1\r\nHost: {HOST}\r\n\r\n");
+    let r = echoing(Arc::clone(&head));
+    let out = r.talk(&req).await;
+    assert!(out.starts_with("HTTP/1.1 200 "), "{out}");
+    let entry = r.sink.args("egress.response");
+    assert_eq!(
+        (&entry["status"], &entry["end"]),
+        (&json!(200), &json!("complete"))
+    );
+    let failing = rig(Opts {
+        handler: head,
+        limits: roomy(),
+        fail_on: Some("egress.response"),
+        ..Opts::default()
+    });
+    let out = failing.talk(&req).await;
+    assert!(!out.contains("200"), "{out}");
 }
 
 /// Architect Q13: one `egress.response` per response the tunnel forwarded, as many as

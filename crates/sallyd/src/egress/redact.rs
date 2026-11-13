@@ -15,7 +15,8 @@
 //!
 //! [`Stream`] does the same over a body that arrives in pieces: it holds back the last
 //! `longest - 1` bytes (decision 3), the most an occurrence that is not yet complete can have
-//! arrived of, and emits a byte only once no later occurrence can cover it. Its output is the
+//! arrived of, and at least one, so a body's end always waits for its report; it emits a byte
+//! only once no later occurrence can cover it. Its output is the
 //! same for every split of the same input ([`Redaction::bytes`] is the one-shot form). Each push
 //! scans only the windows that end in the new piece: an occurrence wholly inside the bytes held
 //! before was marked by an earlier push. The bytes it holds may be part of a secret: they are
@@ -120,9 +121,9 @@ impl Redaction {
         self.filler
     }
 
-    /// The longest form, in bytes: a stream holds back one byte less.
-    #[must_use]
-    pub const fn longest(&self) -> usize {
+    /// The longest form, in bytes: a stream holds back one byte less (at least one).
+    #[cfg(test)]
+    pub(crate) const fn longest(&self) -> usize {
         self.longest
     }
 
@@ -196,11 +197,23 @@ pub struct Scan {
 /// What a stream redacted: per secret (in grant order), the emitted bytes any occurrence of its
 /// forms covers, and the emitted filler bytes in all (architect Q13). A byte two secrets cover
 /// counts for both, so each secret's count is at most the total and the total at most their sum.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct Tally {
     bytes: Vec<u64>,
     total: u64,
 }
+
+/// Equal when every secret's count and the total are: a secret never counted equals one
+/// counted zero (re-review L2).
+impl PartialEq for Tally {
+    fn eq(&self, other: &Self) -> bool {
+        let n = self.bytes.len().max(other.bytes.len());
+        let at = |t: &Self, i: usize| t.bytes.get(i).copied().unwrap_or(0);
+        self.total == other.total && (0..n).all(|i| at(self, i) == at(other, i))
+    }
+}
+
+impl Eq for Tally {}
 
 impl Tally {
     /// The bytes redacted in all.
@@ -211,9 +224,8 @@ impl Tally {
 
     /// Adds `other`'s counts to these (a response's header lines and its body).
     pub fn add(&mut self, other: &Self) {
-        if self.bytes.len() < other.bytes.len() {
-            self.bytes.resize(other.bytes.len(), 0);
-        }
+        let n = self.bytes.len().max(other.bytes.len());
+        self.bytes.resize(n, 0);
         for (mine, theirs) in self.bytes.iter_mut().zip(&other.bytes) {
             *mine = mine.saturating_add(*theirs);
         }
@@ -265,7 +277,9 @@ impl Stream {
         append_wiped(&mut self.held, piece);
         self.covered.resize(self.held.len(), false);
         self.mark(before);
-        let keep = self.redaction.longest.saturating_sub(1);
+        // At least one byte stays back, so a body's end always passes through `finish` and its
+        // report, even when the longest form is one byte (re-review L2).
+        let keep = self.redaction.longest.saturating_sub(1).max(1);
         self.emit(self.held.len().saturating_sub(keep))
     }
 
@@ -309,6 +323,9 @@ impl Stream {
         for (secret, (_, forms)) in redaction.forms.secrets().enumerate() {
             for form in forms {
                 let needle = form.expose().as_bytes();
+                if needle.is_empty() {
+                    continue;
+                }
                 let from = before.saturating_sub(needle.len().saturating_sub(1));
                 let Some(tail) = self.held.get(from..) else {
                     continue;
@@ -372,9 +389,7 @@ impl Stream {
                 *s = (*s).max(end);
                 *e > end
             });
-            if emitted > 0 {
-                self.tally.count(secret, emitted);
-            }
+            self.tally.count(secret, emitted);
         }
         self.held.drain(..n);
         self.covered.drain(..n);
@@ -613,7 +628,12 @@ where
             return SizeHint::with_exact(0);
         }
         let inner = self.inner.size_hint();
-        let held = as_u64(self.stream.held());
+        // Bytes held, or already taken out for the last frame a pending report holds back.
+        let last = match &self.reporting {
+            Some((_, Tail::Data(b))) => b.len(),
+            _ => 0,
+        };
+        let held = as_u64(self.stream.held().saturating_add(last));
         let mut hint = SizeHint::new();
         hint.set_lower(inner.lower().saturating_add(held));
         if let Some(upper) = inner.upper() {
