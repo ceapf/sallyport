@@ -19,7 +19,8 @@
 //! So after `session.stop` no tool, approval or rpc entry of the session is written, whatever
 //! its `in_flight`: a write in flight at the deadline lands before it or fails, and a failed
 //! write means no effect. Teardown entries (`sandbox.*`, the watchdog's, egress closes) may
-//! follow it; TODO(#94) adds `session.closed` after them. An operation still running past the
+//! follow it; TODO(#94) adds `session.closed` after them. A shell is killed and a fetch's
+//! exchange dropped at the stop signal, so an operation still running past the
 //! bound is a file operation inside its blocking call, which is never cut: the stop then
 //! answers `Failed`, the session stays stop-failed with its claims and its watchdog, and the
 //! supervisor removes the container by itself once the operation returns (its `tool.result` is

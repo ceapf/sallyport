@@ -152,6 +152,11 @@ impl Fx {
         self.prompts()[n - 1].clone()
     }
 
+    /// The names `tools/list` shows.
+    pub(crate) fn listed(&self) -> Vec<&'static str> {
+        self.gated.tools().iter().map(|t| t.name).collect()
+    }
+
     /// Waits until a `tool.run` entry was written.
     async fn until_run(&self) {
         until("tool.run", || {
@@ -346,9 +351,11 @@ fn all_modes() -> Vec<Spec> {
 }
 
 #[tokio::test]
-async fn tools_list_shows_the_granted_tools_and_never_fetch() {
+async fn tools_list_shows_the_granted_tools_and_fetch_only_with_a_connector() {
     let mut o = opts(vec![]);
     o.builtin = vec![BuiltinTool::Shell, BuiltinTool::Fetch, BuiltinTool::FsRead];
+    // Granted but without a way out: unlisted (architect ruling Q8). Listed with one:
+    // `egress::intercept_fetch_tests`.
     let f = fx("list", o);
     let names: Vec<&str> = f.gated.tools().iter().map(|t| t.name).collect();
     assert_eq!(names, ["fs_read", "shell"]);
@@ -364,7 +371,6 @@ async fn tools_list_shows_the_granted_tools_and_never_fetch() {
         assert_eq!(t.input_schema["additionalProperties"], false, "{}", t.name);
         assert!(!t.description.is_empty());
     }
-    // Granted but without a way out: unlisted (architect ruling Q8).
     let fetch = describe(BuiltinTool::Fetch);
     assert_eq!(fetch.name, "fetch");
     assert_eq!(fetch.input_schema["required"], json!(["url"]));
@@ -398,7 +404,7 @@ async fn rt_ag_01_ungranted_tools_are_denied_and_audited() {
 }
 
 #[tokio::test]
-async fn a_granted_fetch_is_unavailable_until_75() {
+async fn a_granted_fetch_without_a_connector_is_unavailable() {
     let f = fx("fetch", opts(vec![]));
     assert_eq!(
         f.text("fetch", json!({"url": "https://example.org/"}))
@@ -1223,6 +1229,85 @@ async fn a_write_parked_at_the_exec_gate_aborts_at_the_stop() {
     drop(held);
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(!rw.join("x").exists(), "an aborted write landed");
+}
+
+/// A way out that never answers: it keeps each stream's far end, so a fetch waits on its
+/// `CONNECT` (an upstream that stalls, or a connection queued for a slot).
+#[derive(Default)]
+struct Stall(StdMutex<Vec<tokio::io::DuplexStream>>);
+
+impl crate::egress::local::Connector for Stall {
+    fn open(&self, _origin: Value) -> std::io::Result<tokio::io::DuplexStream> {
+        let (ours, theirs) = tokio::io::duplex(1 << 12);
+        self.0.lock().unwrap().push(theirs);
+        Ok(ours)
+    }
+
+    fn client_tls(&self, _host: &str) -> Arc<rustls::ClientConfig> {
+        unreachable!("the CONNECT is never answered")
+    }
+
+    fn grants(&self, _host: &str) -> crate::egress::local::HostGrants {
+        crate::egress::local::HostGrants::default()
+    }
+}
+
+/// Q59 for fetch (security re-review M1, #75 part 2): a fetch in flight when the stop comes
+/// ends at once, inside the drain: `tool.result` `killed: session-stop`, the reply
+/// `session-stopping`, and its connection is dropped (the proxy's side reads its end).
+#[tokio::test]
+async fn a_fetch_in_flight_at_the_stop_ends_killed_inside_the_drain() {
+    let stall = Arc::new(Stall::default());
+    let mut o = opts_without_mounts();
+    o.fetch = Some(FetchParts {
+        connector: Arc::clone(&stall) as Arc<dyn crate::egress::local::Connector>,
+        max_request: 1 << 20,
+        max_response: 1 << 20,
+    });
+    let f = Arc::new(fx("fetch-stop", o));
+    let f2 = Arc::clone(&f);
+    let h = tokio::spawn(async move {
+        f2.call("fetch", json!({"url": "https://example.org/"}))
+            .await
+    });
+    f.until_run().await;
+    let opened = || stall.0.lock().unwrap().len();
+    for _ in 0..200 {
+        if opened() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(opened(), 1, "the fetch never opened its connection");
+    f.ops.stop();
+    assert_eq!(f.ops.drained(Duration::from_secs(5)).await, 0);
+    let out = h.await.unwrap().unwrap();
+    assert_eq!(
+        (out.is_error, out.text.as_str()),
+        (true, "failed: session-stopping")
+    );
+    let r = f.sink.last("tool.result");
+    assert_eq!(
+        (
+            r["outcome"].as_str(),
+            r["killed"].as_str(),
+            r["tool"].as_str()
+        ),
+        (Some("killed"), Some("session-stop"), Some("fetch"))
+    );
+    assert!(r["action_sha256"].is_string() && r["call"].is_u64(), "{r}");
+    let mut far = stall.0.lock().unwrap().pop().unwrap();
+    let mut got = Vec::new();
+    let read = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::io::AsyncReadExt::read_to_end(&mut far, &mut got),
+    )
+    .await;
+    assert!(
+        matches!(read, Ok(Ok(_))),
+        "the connection outlived the stop"
+    );
+    assert!(got.starts_with(b"CONNECT example.org:443 "), "{got:?}");
 }
 
 /// Q59 (b): the last check before the effect. A write that waited at the gate while the session's

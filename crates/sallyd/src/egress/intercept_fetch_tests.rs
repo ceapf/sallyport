@@ -334,6 +334,8 @@ async fn rt_ag_14_fetch_a_write_reaches_the_upstream_only_once_approved() {
     // review M1: a loaded runner must not turn a deny or an approve into a timeout).
     let short = gated(&r, Duration::from_millis(400));
     let f = gated(&r, Duration::from_secs(30));
+    // With a connector a granted fetch is listed (without one: `tools::tests`, ruling Q8).
+    assert!(f.listed().contains(&"fetch"), "{:?}", f.listed());
     let post = json!({"url": format!("https://{HOST}/echo"), "method": "POST",
                       "headers": [["X-Trace", "t-1"]], "body_b64": "c2VjcmV0IG5vdGVz"});
     let nothing_sent = |when: &str| {

@@ -950,6 +950,56 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Security re-review L (#75 part 2): a connector connection still queued for a slot when
+    /// the handle is dropped (the abort path) is never served: its stream reads its end, it
+    /// never reaches an entry, and the connector is refused from then on.
+    #[tokio::test]
+    async fn dropping_the_handle_ends_a_queued_connector_connection_unserved() {
+        let dir = scratch("dropq");
+        let sock = dir.join("net.sock");
+        let (gate, _open) = Gate::shut();
+        let audit = Arc::new(Ends {
+            gate: Some(Arc::clone(&gate)),
+            ..Ends::default()
+        });
+        let roots = super::super::roots::Roots {
+            store: Arc::new(rustls::RootCertStore::empty()),
+            pem: String::new(),
+            skipped: 0,
+            path: "/test-roots.pem".into(),
+        };
+        // Cap 0: each connection is a 429 whose append waits at the gate, holding its slot.
+        let handle = start_with(
+            Arc::new(OnePublic),
+            Arc::clone(&audit),
+            0,
+            &sock,
+            Some(roots),
+        );
+        let bound = Limits::new(0).in_flight();
+        let mut clients = Vec::new();
+        for _ in 0..bound {
+            clients.push(UnixStream::connect(&sock).await.unwrap());
+        }
+        until("every slot to fill", || gate.entered() == bound).await;
+        let c = handle.connector().unwrap();
+        let mut queued = c.open(serde_json::json!({"call": 1})).unwrap();
+        drop(handle);
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), queued.read_to_end(&mut rest))
+            .await
+            .expect("the queued connection outlived the handle")
+            .unwrap();
+        assert!(rest.is_empty(), "{rest:?}");
+        assert_eq!(gate.entered(), bound, "the queued connection was served");
+        let refused = c.open(serde_json::json!({"call": 2})).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::BrokenPipe);
+        gate.release();
+        assert!(!audit.rows().iter().any(|r| r.contains("origin=")));
+        drop(clients);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Starts a listener at `sock` that allows `a.mock.test:443` only.
     fn start<R: Resolver>(
         resolver: Arc<R>,

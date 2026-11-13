@@ -562,7 +562,7 @@ impl<R: Runner> Core<R> {
         }
         let origin = json!({"tool": "fetch", "call": b.call});
         let cap = fetch::response_cap(f.max_response);
-        let got = fetch_client::send(
+        let send = fetch_client::send(
             f.connector.as_ref(),
             origin,
             &u,
@@ -570,11 +570,22 @@ impl<R: Runner> Core<R> {
             headers,
             body.bytes(),
             cap,
-        )
-        .await;
+        );
+        // Q59: the session's stop ends the exchange at once; dropping it drops the connection,
+        // whose end the proxy records itself (security re-review M1).
+        let got = tokio::select! {
+            biased;
+            () = self.ops.stopped() => None,
+            got = send => Some(got),
+        };
         let mut r = json!({"call": b.call, "tool": "fetch", "action_sha256": b.digest()});
         let out = match got {
-            Ok(x) => {
+            None => {
+                add(&mut r, "outcome", Value::from("killed"));
+                add(&mut r, "killed", Value::from(ops::SESSION_STOP));
+                failed(STOPPING)
+            }
+            Some(Ok(x)) => {
                 let kept = fetch::reply_headers(&x.headers);
                 add(&mut r, "outcome", Value::from("ok"));
                 add(&mut r, "status", Value::from(x.status));
@@ -584,7 +595,7 @@ impl<R: Runner> Core<R> {
                 add(&mut r, "truncated", Value::from(x.truncated));
                 reply(&fetch::reply(x.status, &kept, x.body, x.truncated))
             }
-            Err(code) => {
+            Some(Err(code)) => {
                 add(&mut r, "outcome", Value::from("failed"));
                 add(&mut r, "code", Value::from(code));
                 failed(code)

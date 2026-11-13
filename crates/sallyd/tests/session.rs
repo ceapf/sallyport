@@ -482,12 +482,14 @@ fn rt_ag_08_a_foreign_session_id_reaches_only_its_own_session() {
 
 /// #103 (architect ruling on #75 part 2): production hands each session's tools its own proxy's
 /// connector. (a) A proxy-mode session granting `fetch` lists it; (b) a GET through `agent.sock`
-/// reaches the fixture's TLS upstream, and the proxy's `egress.allow` carries `origin` under
-/// this session's id: so the connector is this session's proxy, not merely `Some`. (c) Fetch
-/// granted with `network.mode: none` (no proxy, so no connector): unlisted, a call is
-/// `tool_unavailable` with `tool.deny`. (d) Not granted in proxy mode: unlisted. Fails without
-/// the `fetch:` expression in `Registry::agent` (a, b) or with `Running::fetch_connector`
-/// answering `None` (a, b); (c) fails if it ever answers `Some` without a proxy.
+/// reaches the fixture's TLS upstream, and the proxy's one `egress.allow` carries the fetch's
+/// `origin` and this session's id; a body over the session's `max_request_bytes` (1 KiB, below
+/// its 2 KiB `max_response_bytes`) is refused `request-too-large` at prepare, so the caps are
+/// not swapped. (c) Fetch granted with `network.mode: none` (no proxy, so no connector):
+/// unlisted, a call is `tool_unavailable` with `tool.deny`. (d) Not granted in proxy mode:
+/// unlisted. Fails without the `fetch:` expression in `Registry::agent` (a, b) or with
+/// `Running::fetch_connector` answering `None` (a, b); (c) fails if it ever answers `Some`
+/// without a proxy.
 #[test]
 fn a_session_fetches_through_its_own_proxy_and_only_with_one() {
     rt().block_on(async {
@@ -513,12 +515,25 @@ fn a_session_fetches_through_its_own_proxy_and_only_with_one() {
 
         // (a), (b)
         let net = "network:\n  mode: proxy\n  allow:\n    - host: mock.test\n";
-        let a = start(&format!("{net}tools:\n  builtin: [fetch]\n"))
-            .await
-            .unwrap();
+        let a = start(&format!(
+            "{net}  max_request_bytes: 1KiB\n  max_response_bytes: 2KiB\n\
+             tools:\n  builtin: [fetch]\n"
+        ))
+        .await
+        .unwrap();
+        // 1536 bytes: over the request cap, under the response cap.
+        let post = json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                          "params": {"_meta": meta(), "name": "fetch",
+                                     "arguments": {"url": "https://mock.test/", "method": "POST",
+                                                   "body_b64": "QUFB".repeat(512)}}});
         let mark = r.sink.debug.lock().unwrap().len();
-        let replies = exchange(&sock(&a.id), &[list.clone(), get.clone()]).await;
+        let replies = exchange(&sock(&a.id), &[list.clone(), get.clone(), post]).await;
         assert_eq!(names(&replies[0]), ["fetch"], "{replies:?}");
+        assert_eq!(
+            replies[2]["result"]["content"][0]["text"],
+            json!("denied: request-too-large"),
+            "{replies:?}"
+        );
         assert_eq!(replies[1]["result"]["isError"], json!(false), "{replies:?}");
         let text = replies[1]["result"]["content"][0]["text"].as_str().unwrap();
         let out: Value = serde_json::from_str(text).unwrap();
@@ -541,6 +556,8 @@ fn a_session_fetches_through_its_own_proxy_and_only_with_one() {
         let allow = debug.iter().find(|d| d.contains("\"egress.allow\""));
         assert!(allow.is_some_and(|d| d.contains(&own)), "{debug:#?}");
         let caused: Vec<String> = r.sink.debug.lock().unwrap()[mark..].to_vec();
+        // Three requests, the GET's run and result, the POST's deny (rust re-review L1).
+        assert!(caused.len() >= 6, "{caused:#?}");
         assert!(caused.iter().all(|d| d.contains(&own)), "{caused:#?}");
 
         // (c)
