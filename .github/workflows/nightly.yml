@@ -36,11 +36,11 @@ jobs:
   # The wider scope (CLAUDE.md "Mutation scope"), zero survivors too. Only container-free tests
   # run per mutant, so no podman is needed. Each mutant rebuilds the crate and reruns its whole
   # test set, about 27 s per mutant on these runners (#79), so the sallyd count sets the shards:
-  # 24 keeps each one near 45 minutes. The 90-minute timeout is headroom, not the budget. Some
+  # 24 keeps each one near 45 minutes; mutant TIMEOUTs (#82) need the 150-minute sallyd limit. Some
   # shards queue behind the concurrent-job limit; that is fine for a nightly.
   mutants-wide:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: ${{ matrix.set == 'sallyd' && 150 || 90 }}
     strategy:
       fail-fast: false
       matrix:
