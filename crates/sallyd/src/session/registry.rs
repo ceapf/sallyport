@@ -388,6 +388,9 @@ impl Registry {
             crash: crash.clone(),
             ids: self.p.ids,
             shell: PodmanExec::new(self.p.podman.clone(), running, ops.clone()),
+            // TODO(#103): the session proxy's connector; until then a granted fetch is
+            // unlisted and `tool_unavailable` (architect ruling Q8, fails closed).
+            fetch: None,
         });
         (
             Arc::new(Agent::new(Gated::new(gate, tools), rec.clone())),

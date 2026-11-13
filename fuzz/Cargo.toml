@@ -100,3 +100,10 @@ path = "fuzz_targets/proc_stat.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fetch_url"
+path = "fuzz_targets/fetch_url.rs"
+test = false
+doc = false
+bench = false

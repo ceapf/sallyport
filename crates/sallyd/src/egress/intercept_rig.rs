@@ -297,6 +297,9 @@ impl Sink {
             .map(|r| r.0.clone())
             .collect()
     }
+    pub(super) fn rows(&self) -> Vec<(String, Value)> {
+        self.rows.lock().unwrap().clone()
+    }
     pub(super) fn args(&self, event: &str) -> Value {
         let rows = self.rows.lock().unwrap();
         rows.iter()

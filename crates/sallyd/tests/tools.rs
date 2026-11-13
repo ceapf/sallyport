@@ -95,6 +95,8 @@ fn session(x: &Lx, v: &ValidatedManifest, r: &Running, timeout: Duration) -> Ses
         // The launcher's ids: the workspace's `--user`.
         ids: ids(),
         shell: PodmanExec::new(x.podman.clone(), r, ops),
+        // The container tests do not reach the network; fetch has its own tests (#75).
+        fetch: None,
     });
     Session {
         gated: Gated::new(gate, tools),

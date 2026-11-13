@@ -17,6 +17,9 @@
 pub mod args;
 pub mod dac;
 pub mod exec;
+pub mod fetch;
+pub mod fetch_client;
+pub mod fetch_url;
 pub mod fs;
 pub mod ops;
 pub mod path;
@@ -38,6 +41,7 @@ use crate::approvals::action::{Action, Bound, Payload, Target, hex};
 use crate::approvals::queue::fields;
 use crate::approvals::{Executor, Prepared, Ticket};
 use crate::daemon::crash::CrashReporter;
+use crate::egress::local::Connector;
 use crate::rpc::mcp::{Tool, ToolOutcome};
 use crate::rpc::record::{Recorder, escape};
 use crate::sandbox::UserIds;
@@ -126,6 +130,20 @@ pub struct Parts<R> {
     pub ids: UserIds,
     /// Runs `shell` commands ([`exec::PodmanExec`] in production).
     pub shell: R,
+    /// The way out for `fetch`: `None` leaves a granted `fetch` unlisted and `tool_unavailable`
+    /// (architect ruling Q8: a session without a proxy, or without trust roots).
+    pub fetch: Option<FetchParts>,
+}
+
+/// What `fetch` runs through.
+#[derive(Clone)]
+pub struct FetchParts {
+    /// The session proxy's connector (`EgressHandle::connector`).
+    pub connector: Arc<dyn Connector>,
+    /// `network.max_request_bytes`.
+    pub max_request: u64,
+    /// `network.max_response_bytes`.
+    pub max_response: u64,
 }
 
 /// The built-in tools of one session.
@@ -143,6 +161,7 @@ struct Core<R> {
     ops: Ops,
     ids: UserIds,
     shell: R,
+    fetch: Option<FetchParts>,
 }
 
 impl<R: Runner> Tools<R> {
@@ -158,6 +177,7 @@ impl<R: Runner> Tools<R> {
                 ops: p.ops,
                 ids: p.ids,
                 shell: p.shell,
+                fetch: p.fetch,
             }),
             crash: p.crash,
         }
@@ -474,6 +494,104 @@ impl<R: Runner> Core<R> {
         }
         Some(shell_reply(&o, exit, killed))
     }
+
+    /// `fetch` at prepare: the URL first (its host names the grants), then the checks of
+    /// `fetch.rs`; the action binds the canonical URL (architect ruling Q4) and, for a grant host,
+    /// the note names the credentials the proxy adds, never a value (Q3).
+    fn prepare_fetch(
+        &self,
+        url: &str,
+        method: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) -> Result<Prepared, &'static str> {
+        let f = self.fetch.as_ref().ok_or("tool_unavailable")?;
+        let host = fetch_url::parse(url)
+            .map_err(fetch_url::UrlError::code)?
+            .host;
+        let g = f.connector.grants(&host);
+        let len = u64::try_from(body.len()).unwrap_or(u64::MAX);
+        let u = fetch::check(url, &method, &headers, len, f.max_request, &g.headers)?;
+        let note = (!g.names.is_empty())
+            .then(|| format!("the proxy adds {} for {host}", g.names.join(", ")));
+        Ok(Prepared {
+            action: Action::Fetch {
+                method,
+                url: u.canonical(),
+                headers,
+                body: Payload::new(body),
+            },
+            note,
+            destructive: None,
+        })
+    }
+
+    /// `fetch` at run: `tool.run` before the `CONNECT`, the exchange through the proxy (whose
+    /// own entries carry this call as their origin), `tool.result` before the reply (Q7).
+    async fn run_fetch(&self, ticket: &Ticket) -> Option<ToolOutcome> {
+        let b = ticket.bound();
+        let Action::Fetch {
+            method,
+            url,
+            headers,
+            body,
+        } = &b.action
+        else {
+            return Some(failed("unsupported"));
+        };
+        let (Some(f), Ok(u)) = (self.fetch.as_ref(), fetch_url::parse(url)) else {
+            return Some(failed("tool_unavailable"));
+        };
+        let mut e = fields(b);
+        add(
+            &mut e,
+            "approval",
+            ticket.approval().map_or(Value::Null, Value::from),
+        );
+        add(&mut e, "host", Value::from(u.host.clone()));
+        add(&mut e, "port", Value::from(u.port));
+        add(&mut e, "bytes", Value::from(body.len()));
+        add(&mut e, "sha256", Value::from(body.sha256()));
+        if !self
+            .record(Actor::Harness, "tool.run", Some("allow"), e)
+            .await
+        {
+            return None;
+        }
+        let origin = json!({"tool": "fetch", "call": b.call});
+        let cap = fetch::response_cap(f.max_response);
+        let got = fetch_client::send(
+            f.connector.as_ref(),
+            origin,
+            &u,
+            method,
+            headers,
+            body.bytes(),
+            cap,
+        )
+        .await;
+        let mut r = json!({"call": b.call, "tool": "fetch", "action_sha256": b.digest()});
+        let out = match got {
+            Ok(x) => {
+                let kept = fetch::reply_headers(&x.headers);
+                add(&mut r, "outcome", Value::from("ok"));
+                add(&mut r, "status", Value::from(x.status));
+                add(&mut r, "headers", Value::from(kept.len()));
+                add(&mut r, "kept", Value::from(x.body.len()));
+                add(&mut r, "sha256", Value::from(sha256(&x.body)));
+                add(&mut r, "truncated", Value::from(x.truncated));
+                reply(&fetch::reply(x.status, &kept, x.body, x.truncated))
+            }
+            Err(code) => {
+                add(&mut r, "outcome", Value::from("failed"));
+                add(&mut r, "code", Value::from(code));
+                failed(code)
+            }
+        };
+        self.record(Actor::Sallyd, "tool.result", None, r)
+            .await
+            .then_some(out)
+    }
 }
 
 fn shell_reply(o: &Output, exit: Value, killed: Value) -> ToolOutcome {
@@ -497,7 +615,8 @@ impl<R: Runner> Executor for Tools<R> {
     fn tools(&self) -> Vec<Tool> {
         ALL.iter()
             .filter(|t| self.core.builtin.contains(t))
-            .filter_map(|t| describe(*t))
+            .filter(|t| **t != BuiltinTool::Fetch || self.core.fetch.is_some())
+            .map(|t| describe(*t))
             .collect()
     }
 
@@ -542,11 +661,16 @@ impl<R: Runner> Core<R> {
         if !self.builtin.contains(&tool) {
             return Err("tool_not_granted");
         }
-        if tool == BuiltinTool::Fetch {
-            // TODO(#75): the fetch tool, once the upstream TLS client is on main.
+        if tool == BuiltinTool::Fetch && self.fetch.is_none() {
             return Err("tool_unavailable");
         }
         let action = match args::parse(name, arguments)? {
+            Args::Fetch {
+                url,
+                method,
+                headers,
+                body,
+            } => return self.prepare_fetch(&url, method, headers, body),
             Args::Read { path, offset, len } => {
                 let (m, target) = self.target(&path, false)?;
                 let rel = target.rel.clone();
@@ -601,8 +725,9 @@ impl<R: Runner> Core<R> {
         let b = ticket.bound();
         let target = match &b.action {
             Action::Shell { argv, cwd } => return self.run_shell(&ticket, argv, cwd).await,
-            // Never prepared by these tools (fetch: #75; MCP: M4).
-            Action::Fetch { .. } | Action::Mcp { .. } => return Some(failed("unsupported")),
+            Action::Fetch { .. } => return self.run_fetch(&ticket).await,
+            // Never prepared by these tools (MCP: M4).
+            Action::Mcp { .. } => return Some(failed("unsupported")),
             Action::FsRead { target, .. }
             | Action::FsList { target }
             | Action::FsWrite { target, .. }
@@ -627,8 +752,8 @@ impl<R: Runner> Core<R> {
     }
 }
 
-/// The static `tools/list` entry of a tool (`fetch`: none until #75).
-fn describe(t: BuiltinTool) -> Option<Tool> {
+/// The static `tools/list` entry of a tool.
+fn describe(t: BuiltinTool) -> Tool {
     let path = json!({"type": "string", "description": "Absolute guest path under a mount"});
     let (name, description, schema) = match t {
         BuiltinTool::FsList => (
@@ -669,13 +794,25 @@ fn describe(t: BuiltinTool) -> Option<Tool> {
                 "cwd": {"type": "string"}},
                 "required": ["cmd"], "additionalProperties": false}),
         ),
-        BuiltinTool::Fetch => return None,
+        BuiltinTool::Fetch => (
+            "fetch",
+            "Send one HTTPS request through the session's egress policy. Redirects are returned, \
+             not followed; the response body is capped.",
+            json!({"type": "object", "properties": {
+                "url": {"type": "string", "maxLength": fetch_url::MAX_URL},
+                "method": {"type": "string", "pattern": "^[A-Z]{1,16}$"},
+                "headers": {"type": "array", "maxItems": fetch::MAX_HEADERS,
+                            "items": {"type": "array", "items": {"type": "string"},
+                                      "minItems": 2, "maxItems": 2}},
+                "body_b64": {"type": "string", "contentEncoding": "base64"}},
+                "required": ["url"], "additionalProperties": false}),
+        ),
     };
-    Some(Tool {
+    Tool {
         name,
         description,
         input_schema: schema,
-    })
+    }
 }
 
 #[cfg(test)]

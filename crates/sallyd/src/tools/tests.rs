@@ -299,6 +299,7 @@ fn fx(name: &str, o: Opts) -> Fx {
             sink: Arc::clone(&sink),
             rows_at_run: Arc::clone(&rows_at_run),
         },
+        fetch: None,
     }));
     Fx {
         gated: Gated::new(gate.clone(), Arc::clone(&tools)),
@@ -353,7 +354,10 @@ async fn tools_list_shows_the_granted_tools_and_never_fetch() {
         assert_eq!(t.input_schema["additionalProperties"], false, "{}", t.name);
         assert!(!t.description.is_empty());
     }
-    assert_eq!(describe(BuiltinTool::Fetch), None);
+    // Granted but without a way out: unlisted (architect ruling Q8).
+    let fetch = describe(BuiltinTool::Fetch);
+    assert_eq!(fetch.name, "fetch");
+    assert_eq!(fetch.input_schema["required"], json!(["url"]));
 }
 
 /// RT-AG-01 (unit): an ungranted tool is denied before its arguments or paths are looked at,
@@ -815,14 +819,14 @@ async fn a_failure_at_run_time_is_reported_and_audited() {
         assert_eq!(out.text, "failed: not-found");
         assert_eq!(f.sink.last("tool.read")["code"], "not-found");
     }
-    // A ticket for a tool these tools never prepare.
+    // A fetch ticket on tools without a way out (architect ruling Q8).
     let fetch = Action::Fetch {
         method: "GET".into(),
-        url: "https://x/".into(),
+        url: "https://x.mock.test/".into(),
         headers: vec![],
         body: Payload::new(vec![]),
     };
-    assert_eq!(f.run(fetch).await.unwrap().text, "failed: unsupported");
+    assert_eq!(f.run(fetch).await.unwrap().text, "failed: tool_unavailable");
 }
 
 fn target(mount: &str, rel: &str) -> Target {
@@ -1328,6 +1332,7 @@ async fn a_panicking_run_is_reported_and_ends_its_operation() {
         crash,
         ids: UserIds { uid: 1, gid: 1 },
         shell: Boom,
+        fetch: None,
     });
     let b = Bound {
         session: "s-boom".into(),
