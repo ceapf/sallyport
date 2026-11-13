@@ -1,5 +1,6 @@
-//! Red-team rows RT-SEC-09 and RT-SEC-13 (Task 9a-2; RT-SEC-10 is in `session_ca.rs`), and
-//! RT-SEC-03, 04, 05, 06, 06b, 07 and 11 (Task 9a-3: injection and response redaction).
+//! Red-team rows RT-SEC-09 and RT-SEC-13 (Task 9a-2; RT-SEC-10 is in `session_ca.rs`),
+//! RT-SEC-03, 04, 05, 06, 06b, 07 and 11 (Task 9a-3: injection and response redaction), and
+//! RT-SEC-12 with RT-SEC-07 over every form (Task 9b: `{basic}` grants and encoded echoes).
 //!
 //! Each test launches a real workspace session with secret grants on `mock.test` and
 //! `mock3.test` (launcher, session CA, CA files, and the credentials from the production
@@ -18,6 +19,10 @@ use std::time::Duration;
 
 use common::container::{Lx, SHIM_LOG, exec, net_image, rt};
 use common::egress::tls_upstream;
+use common::forms::{
+    ALPHABETS, Line, PCTS, b64, basic_blob, basic_forms, core_range, echo_body, echo_lines,
+    forms_of, pct,
+};
 use rustls::RootCertStore;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName};
@@ -36,6 +41,41 @@ const MANIFEST: &str = "network:\n  mode: proxy\n  allow:\n    - host: mock.test
                         - name: MOCK3_TOKEN\n    inject: {host: mock3.test, \
                         header: X-Api-Key, format: \"{value}\"}\n";
 
+/// [`MANIFEST`] plus `GIT_TOKEN` granted three times as `Authorization: Basic {basic}`, on
+/// `b1`, `b2` and `b3.mock.test` with the users of [`BASIC_HOSTS`] (RT-SEC-12, RT-SEC-07).
+const FORMS_MANIFEST: &str = "network:\n  mode: proxy\n  allow:\n    - host: mock.test\n    \
+                              - host: mock2.test\n    - host: mock3.test\n    \
+                              - host: b1.mock.test\n    - host: b2.mock.test\n    \
+                              - host: b3.mock.test\n\
+                              secrets:\n  - name: GITHUB_TOKEN\n    inject: {host: mock.test, \
+                              header: Authorization, format: \"Bearer {value}\"}\n  \
+                              - name: MOCK3_TOKEN\n    inject: {host: mock3.test, \
+                              header: X-Api-Key, format: \"{value}\"}\n  \
+                              - name: GIT_TOKEN\n    inject: {host: b1.mock.test, \
+                              header: Authorization, format: \"Basic {basic}\", basic_user: x}\n  \
+                              - name: GIT_TOKEN\n    inject: {host: b2.mock.test, \
+                              header: Authorization, format: \"Basic {basic}\", basic_user: ab}\n  \
+                              - name: GIT_TOKEN\n    inject: {host: b3.mock.test, \
+                              header: Authorization, format: \"Basic {basic}\", basic_user: git}\n";
+
+/// The `{basic}` grant hosts of [`FORMS_MANIFEST`] and their users: one, two and three bytes,
+/// so the secret sits at all three base64 alignments inside the blob (AMENDMENTS-02 B1).
+const BASIC_HOSTS: [(&str, &str); 3] = [
+    ("b1.mock.test", "x"),
+    ("b2.mock.test", "ab"),
+    ("b3.mock.test", "git"),
+];
+
+/// Every host the test manifests allow; each resolves to the TLS mock.
+const HOSTS: [&str; 6] = [
+    "mock.test",
+    "mock2.test",
+    "mock3.test",
+    "b1.mock.test",
+    "b2.mock.test",
+    "b3.mock.test",
+];
+
 async fn session(lx: &Lx, tag: &str) -> Running {
     session_of(lx, tag, MANIFEST).await
 }
@@ -50,7 +90,7 @@ async fn session_of(lx: &Lx, tag: &str, manifest: &str) -> Running {
     for _ in 0..100 {
         let (_, log) = exec(&r, &format!("cat {SHIM_LOG} 2>/dev/null")).await;
         if log.contains("sally-shim: listening on 127.0.0.1:3128") {
-            for host in ["mock.test", "mock2.test", "mock3.test"] {
+            for host in HOSTS {
                 lx.egress.resolver.set(host, vec![vec![tls_upstream()]]);
             }
             return r;
@@ -328,6 +368,87 @@ fn mock3() -> String {
     common::egress::canary("MOCK3_TOKEN")
 }
 
+fn git() -> String {
+    common::egress::canary("GIT_TOKEN")
+}
+
+/// A response's body, its chunked framing removed if it has one.
+fn decoded_body(resp: &str) -> String {
+    let body = resp.split_once("\r\n\r\n").map_or("", |(_, b)| b);
+    if header_values(resp, "transfer-encoding") != ["chunked"] {
+        return body.to_owned();
+    }
+    let mut out = String::new();
+    let mut rest = body;
+    loop {
+        let (size, after) = rest.split_once("\r\n").expect("a chunk size line");
+        let n = usize::from_str_radix(size.split(';').next().unwrap().trim(), 16).unwrap();
+        if n == 0 {
+            return out;
+        }
+        out.push_str(&after[..n]);
+        rest = after[n..].strip_prefix("\r\n").expect("CRLF after a chunk");
+    }
+}
+
+/// Every string, object key and number in `v`, as text: what a search of an entry must cover
+/// whatever JSON escaping its serialization applies (architect ruling A5 condition 3).
+fn texts(v: &serde_json::Value, out: &mut Vec<String>) {
+    match v {
+        serde_json::Value::String(s) => out.push(s.clone()),
+        serde_json::Value::Number(n) => out.push(n.to_string()),
+        serde_json::Value::Array(a) => a.iter().for_each(|x| texts(x, out)),
+        serde_json::Value::Object(o) => {
+            for (k, x) in o {
+                out.push(k.clone());
+                texts(x, out);
+            }
+        }
+        serde_json::Value::Bool(_) | serde_json::Value::Null => {}
+    }
+}
+
+/// Every independently computed form of every canary of [`FORMS_MANIFEST`]: the forms of each
+/// value, each rendered `Bearer` value, and each `{basic}` grant's rendered value and blobs.
+fn every_form() -> Vec<String> {
+    let mut all: Vec<String> = [gh(), mock3(), git()]
+        .iter()
+        .flat_map(|c| forms_of(c))
+        .collect();
+    all.push(rendered());
+    for (_, user) in BASIC_HOSTS {
+        all.extend(basic_forms(user, &git()));
+    }
+    all
+}
+
+/// The encoders RT-SEC-12 and RT-SEC-07 compute their forms with, against published vectors:
+/// RFC 4648 §10 (base64), RFC 7617 §2 (Basic), and the URL-safe alphabet's two characters.
+#[test]
+fn the_test_encoders_match_published_vectors() {
+    assert_eq!(b64(b"foobar", ALPHABETS[0]), "Zm9vYmFy");
+    assert_eq!(b64(b"fooba", ALPHABETS[0]), "Zm9vYmE=");
+    assert_eq!(b64(b"foob", ALPHABETS[0]), "Zm9vYg==");
+    assert_eq!(
+        basic_blob("Aladdin", "open sesame"),
+        "QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
+    );
+    assert_eq!(b64(&[0xfb, 0xff], ALPHABETS[0]), "+/8=");
+    assert_eq!(b64(&[0xfb, 0xff], ALPHABETS[1]), "-_8=");
+    assert_eq!(pct("a/b c", PCTS[0]), "a%2Fb%20c");
+    assert_eq!(pct("a/b c", PCTS[1]), "a%2fb%20c");
+    assert_eq!(pct("a/b c", PCTS[2]), "a%2Fb+c");
+    assert_eq!(pct("a/b c", PCTS[3]), "a/b%20c");
+    // The secret's core of base64("A" ‖ "foo" ‖ …): bits 8..32 give characters 2..5.
+    assert_eq!(core_range(1, 3), 2..5);
+    // Each percent spelling of GIT_TOKEN's canary differs from the raw value and the others.
+    let mut spellings: Vec<String> = PCTS.iter().map(|p| pct(&git(), *p)).collect();
+    spellings.push(git());
+    spellings.sort();
+    spellings.dedup();
+    assert_eq!(spellings.len(), PCTS.len() + 1);
+}
+
 /// The GitHub grant's rendered header value, the run an echo of it covers.
 fn rendered() -> String {
     format!("Bearer {}", gh())
@@ -593,15 +714,17 @@ fn rt_sec_06b_compression_is_stripped_and_an_encoded_echo_is_refused() {
     });
 }
 
-/// RT-SEC-07 (Task 9a-3 leg; 9b greps every form): after injected and echoed exchanges on both
-/// grant hosts, no audit entry holds a canary, and each `egress.request` names its grant.
-/// Control: `request_args` builds `injected` from grant names (`Prepared::names`), and no
-/// entry is built from a header map or a body.
+/// RT-SEC-07: after injected and echoed exchanges on every grant host (`Bearer`, a bare value,
+/// three `{basic}` grants, the encoded echoes of `/echo-forms`), no audit entry holds any form
+/// of any canary (each independently computed: raw, percent, base64 cores, rendered values,
+/// blobs; searched in every decoded string, key and number, so JSON escaping cannot hide one),
+/// and each `egress.request` names its grant. Control: `request_args` builds `injected` from
+/// grant names (`Prepared::names`), and no entry is built from a header map or a body.
 #[test]
 fn rt_sec_07_no_audit_entry_holds_a_credential() {
     rt().block_on(async {
         let lx = Lx::new();
-        let r = session(&lx, "sec07").await;
+        let r = session_of(&lx, "sec07", FORMS_MANIFEST).await;
         let _ = over(
             &lx,
             "sec07",
@@ -630,17 +753,34 @@ fn rt_sec_07_no_audit_entry_holds_a_credential() {
             &get_req("mock.test", "/echo-gzip", ""),
         )
         .await;
-        // Positive control: both credentials were sent.
+        for (host, _) in BASIC_HOSTS {
+            for path in ["/echo-headers", "/echo-forms"] {
+                let _ = over(&lx, "sec07", host, &get_req(host, path, "")).await;
+            }
+        }
+        // Positive control: every credential was sent.
         let seen = lx.egress.dialer.seen().concat();
         assert!(seen.contains(&gh()) && seen.contains(&mock3()));
+        for (_, user) in BASIC_HOSTS {
+            assert!(seen.contains(&basic_blob(user, &git())), "{user}");
+        }
         lx.stop(r).await;
         let all = lx.events.all();
+        let forms = every_form();
         for (event, args) in &all {
             let text = args.to_string();
             assert!(
                 !text.contains(&gh()) && !text.contains(&mock3()) && !text.contains("CANARY"),
                 "{event}: {text}"
             );
+            let mut decoded = vec![event.clone()];
+            texts(args, &mut decoded);
+            for t in &decoded {
+                assert!(!t.contains("CANARY"), "{event}: {t}");
+                for f in &forms {
+                    assert!(!t.contains(f.as_str()), "{event}: {f} in {t}");
+                }
+            }
         }
         let injected: Vec<(String, serde_json::Value)> = all
             .iter()
@@ -652,14 +792,17 @@ fn rt_sec_07_no_audit_entry_holds_a_credential() {
                 )
             })
             .collect();
-        assert_eq!(
-            injected,
-            [
-                ("mock.test".to_owned(), json!(["secret:GITHUB_TOKEN"])),
-                ("mock3.test".to_owned(), json!(["secret:MOCK3_TOKEN"])),
-                ("mock.test".to_owned(), json!(["secret:GITHUB_TOKEN"])),
-            ]
-        );
+        let mut want = vec![
+            ("mock.test".to_owned(), json!(["secret:GITHUB_TOKEN"])),
+            ("mock3.test".to_owned(), json!(["secret:MOCK3_TOKEN"])),
+            ("mock.test".to_owned(), json!(["secret:GITHUB_TOKEN"])),
+        ];
+        for (host, _) in BASIC_HOSTS {
+            for _ in 0..2 {
+                want.push((host.to_owned(), json!(["secret:GIT_TOKEN"])));
+            }
+        }
+        assert_eq!(injected, want);
     });
 }
 
@@ -711,5 +854,90 @@ fn rt_sec_11_the_workspace_holds_only_the_placeholder() {
             ["Bearer sallyport-placeholder"]
         );
         lx.stop(r).await;
+    });
+}
+
+/// RT-SEC-12: encoded echoes split across chunks. Each `{basic}` grant host answers
+/// `/echo-forms` with `GIT_TOKEN`'s raw value, every percent spelling, base64 of
+/// prefix‖secret‖suffix at all three alignments in both alphabets, the padded and the unpadded
+/// blob, and the request it got, in 5-byte HTTP chunks; and `/echo-headers` with the rendered
+/// value in a header. The three users put the secret at all three alignments inside the blob.
+/// Controls: the held-back overlap of `redact::Stream` (without it, a form split across chunks
+/// passes); the forms `Credentials::new` builds: the secret's own (raw, percent, base64 cores),
+/// and the grant's rendered value and blobs (`render`; without them the `Basic ` prefix and
+/// the blob's edge characters pass); `redact::headers` for the header echo.
+#[test]
+fn rt_sec_12_every_encoded_echo_split_across_chunks_is_redacted() {
+    rt().block_on(async {
+        let lx = Lx::new();
+        let r = session_of(&lx, "sec12", FORMS_MANIFEST).await;
+        let mut outs = Vec::new();
+        for (host, _) in BASIC_HOSTS {
+            let forms = over(&lx, "sec12", host, &get_req(host, "/echo-forms", "")).await;
+            let headers = over(&lx, "sec12", host, &get_req(host, "/echo-headers", "")).await;
+            outs.push((forms, headers));
+        }
+        let seen = lx.egress.dialer.seen();
+        assert_eq!(seen.len(), 2 * BASIC_HOSTS.len(), "{seen:?}");
+        lx.stop(r).await;
+        let fill = |n: usize| "*".repeat(n);
+        for (i, ((host, user), (forms, headers))) in BASIC_HOSTS.iter().zip(&outs).enumerate() {
+            let blob = basic_blob(user, &git());
+            let rendered = format!("Basic {blob}");
+            // Positive control: the grant host got the credential computed independently.
+            let req = &seen[2 * i];
+            assert_eq!(
+                header_values(req, "authorization"),
+                std::slice::from_ref(&rendered),
+                "{host}"
+            );
+            assert!(forms.starts_with("HTTP/1.1 200 OK"), "{forms}");
+            let body = decoded_body(forms);
+            let upstream = echo_body(&git(), &blob, req);
+            assert_eq!(body.len(), upstream.len(), "{host}: {body}");
+            for (o, u) in body.bytes().zip(upstream.bytes()) {
+                assert!(o == u || o == b'*', "{host}: {body}");
+            }
+            for f in forms_of(&git()).iter().chain(&basic_forms(user, &git())) {
+                assert!(!body.contains(f.as_str()), "{host}: {f} in {body}");
+            }
+            let lines = echo_lines(&git(), &blob);
+            let out_lines: Vec<&str> = body.split('\n').collect();
+            for ((up, kind), out) in lines.iter().zip(&out_lines) {
+                let covered = match kind {
+                    Line::Whole => 0..up.len(),
+                    Line::Core(range) => range.clone(),
+                    Line::AllButLast => 0..up.len() - 1,
+                };
+                assert_eq!(out.len(), up.len(), "{host}: {out}");
+                assert_eq!(
+                    &out[covered.clone()],
+                    fill(covered.len()),
+                    "{host}: {up} -> {out}"
+                );
+            }
+            // The echoed request: the whole rendered value, `Basic ` included, is filler.
+            let echoed = &body[body.len() - req.len()..];
+            assert_eq!(
+                header_values(echoed, "authorization"),
+                [fill(rendered.len())]
+            );
+            assert_eq!(
+                header_values(&outs[i].1, "x-echo-authorization"),
+                [fill(rendered.len())],
+                "{headers}"
+            );
+            assert!(!headers.contains(blob.trim_end_matches('=')), "{headers}");
+            let entries = responses(&lx, host);
+            assert_eq!(entries.len(), 2, "{entries:?}");
+            let n = body.bytes().filter(|b| *b == b'*').count() as u64;
+            assert_eq!(
+                entries[0]["redacted"],
+                json!([{"secret": "secret:GIT_TOKEN", "bytes": n}]),
+                "{host}"
+            );
+            assert_eq!(entries[0]["redacted_bytes"], json!(n));
+            assert_eq!(entries[0]["end"], json!("complete"));
+        }
     });
 }

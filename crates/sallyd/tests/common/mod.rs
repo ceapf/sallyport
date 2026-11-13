@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use sally_core::manifest::{HostEnv, ValidatedManifest, load};
 pub mod container;
 pub mod egress;
+pub mod forms;
 pub mod mock_model;
 
 use sallyd::sandbox::{
@@ -93,10 +94,7 @@ impl Fx {
     }
 
     pub fn load(&self, body: &str) -> ValidatedManifest {
-        let secrets: BTreeSet<String> = ["GITHUB_TOKEN", "MOCK3_TOKEN"]
-            .map(str::to_owned)
-            .into_iter()
-            .collect();
+        let secrets: BTreeSet<String> = egress::STORED.map(str::to_owned).into_iter().collect();
         match load(&format!("{HEADER}{body}"), &self.env, &secrets) {
             Ok(v) => v.manifest,
             Err(e) => panic!("{e:#?}"),
