@@ -911,7 +911,8 @@ fn with(mut v: Value, key: &str, value: &str) -> Value {
     v
 }
 
-fn who(c: Client) -> Value {
+/// A deciding client as audited: `{uid, pid}`.
+pub(crate) fn who(c: Client) -> Value {
     json!({"uid": c.uid, "pid": c.pid})
 }
 

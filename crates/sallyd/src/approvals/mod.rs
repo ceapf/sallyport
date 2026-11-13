@@ -14,5 +14,5 @@ mod rt_tests;
 pub use crate::rpc::agent::Withdraw;
 pub use handler::{Executor, Gated, Prepared};
 pub use queue::{
-    Approver, Client, DecideError, Decision, Desk, Gate, Limits, Refusal, Ticket, new,
+    Approver, Client, DecideError, Decision, Desk, Gate, Limits, Refusal, Seen, Ticket, new,
 };

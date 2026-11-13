@@ -515,7 +515,8 @@ pub(crate) fn failure(id: Option<&Id>, error: Value) -> Vec<u8> {
 }
 
 /// `v` serialized on one line (JSON escapes every newline inside strings), plus `\n`.
-fn line(v: &Value) -> Vec<u8> {
+/// `v` as one newline-terminated frame.
+pub(crate) fn line(v: &Value) -> Vec<u8> {
     let mut b = serde_json::to_vec(v).unwrap_or_default();
     b.push(b'\n');
     b

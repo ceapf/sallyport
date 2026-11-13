@@ -56,8 +56,9 @@ pub const SESSION_METHODS: [&str; 7] = [
     "tools/call",
     "notifications/cancelled",
 ];
-/// The control socket's methods. Task 12 fills it; until then every method is `-32601`.
-pub const CONTROL_METHODS: [&str; 0] = [];
+/// The control socket's methods (architect Q72): the wire names `sally-proto` shares with the
+/// CLI. Every other method is `-32601`.
+pub const CONTROL_METHODS: [&str; 7] = sally_proto::method::ALL;
 
 /// The lifecycle a request is served under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

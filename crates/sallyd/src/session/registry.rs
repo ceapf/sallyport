@@ -523,6 +523,29 @@ impl Registry {
     }
 }
 
+/// The control socket's sessions (architect Q86): pure delegation, proved by the container
+/// tests in `tests/control.rs`.
+impl crate::rpc::control_methods::SessionSet for Arc<Registry> {
+    fn list(&self) -> Vec<SessionInfo> {
+        Registry::list(self)
+    }
+
+    fn desk(&self, id: &str) -> Option<Desk> {
+        Registry::desk(self, id)
+    }
+
+    fn start(
+        &self,
+        manifest: Arc<ValidatedManifest>,
+    ) -> impl std::future::Future<Output = Result<SessionInfo, StartError>> + Send {
+        Registry::start(self, manifest)
+    }
+
+    fn stop(&self, id: &str) -> impl std::future::Future<Output = Option<StopOutcome>> + Send {
+        Registry::stop(self, id, StopReason::Request)
+    }
+}
+
 /// What a stop of `id` answers when no supervisor took or answered the request. A supervisor
 /// removes its entry when its session ends, so no entry means stopped; an entry still listed
 /// means the supervisor died with the session (rust review M4): it is dropped from the listing

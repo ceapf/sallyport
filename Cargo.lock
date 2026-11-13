@@ -962,6 +962,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "sally-core",
+ "sally-proto",
  "serde",
  "serde_json",
  "sha2",

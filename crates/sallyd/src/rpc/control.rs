@@ -1,43 +1,86 @@
 //! `control.sock`: the trusted clients' socket (the CLI, the UI bridge; ARCHITECTURE §4.1). Its
-//! method table is separate from the session socket's and never shared with it (architect ruling
-//! Q1). Task 7 builds the listener, the framing (1 MiB frames) and the peer-UID check; the table
-//! is empty until Task 12 fills it, so every method is `-32601`.
+//! method table ([`CONTROL_METHODS`]) is separate from the session socket's and never shared
+//! with it (architect ruling Q1). The methods are in `control_methods.rs`.
 //!
-//! Every request is recorded before its reply, like the session socket's.
+//! Every request is recorded before its effect: one that is never admitted (a frame error, an
+//! unknown method, invalid params) as `rpc.deny`; an admitted one as `rpc.request` with the
+//! client's uid and pid from `SO_PEERCRED` (architect Q76). An entry that cannot be written
+//! closes the connection with no effect and no reply.
+//!
+//! A connection that called `approvals.watch` also receives `approval.*` notifications between
+//! its replies; the read in progress is kept across them, so none splits a frame.
 
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
+use rustix::fd::OwnedFd;
 use sally_core::audit::Actor;
-use serde_json::{Value, json};
+use sally_core::manifest::{HostEnv, SecretCatalog};
+use sally_proto::notification;
+use serde_json::{Map, Value, json};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::watch;
 
-use super::agent::{WRITE_TIMEOUT, error_object, failure};
+use super::agent::{WRITE_TIMEOUT, error_object, failure, line, success};
+use super::control_methods::{
+    Call, Done, NotAdmitted, READ_BURST, READ_RATE, REFUSED, SessionSet, prompt,
+};
 use super::frame::{self, Frame};
 use super::listen::{self, Peer, Server, until_true};
-use super::mcp::CONTROL_METHODS;
-use super::message::{self, INVALID_REQUEST, METHOD_NOT_FOUND, Message};
+use super::message::{self, INVALID_PARAMS, INVALID_REQUEST, Id, METHOD_NOT_FOUND, Message};
+use super::rate::Rate;
 use super::record::{Recorder, escape};
+use crate::approvals::Client;
+use crate::approvals::hub::{Hub, Note, Watch};
+use crate::approvals::queue::who;
+
+pub use super::mcp::CONTROL_METHODS;
 
 /// Largest frame accepted (ARCHITECTURE §4: 1 MiB on the control socket).
-pub const MAX_FRAME: usize = 1024 * 1024;
+pub const MAX_FRAME: usize = sally_proto::MAX_FRAME;
 /// Control connections at once.
 pub const MAX_CONNECTIONS: usize = 16;
 
+/// What the control socket is built from, once, by the daemon.
+pub struct ControlParts<S> {
+    /// The control audit handle (its entries carry no session).
+    pub record: Recorder,
+    /// The live sessions.
+    pub sessions: S,
+    /// The daemon's one approver: `approvals.watch` attaches to it (architect Q73).
+    pub hub: Arc<Hub>,
+    /// The open `sessions/` data directory, for `sessions.changes` (architect Q81).
+    pub sessions_dir: Arc<OwnedFd>,
+    /// The host facts a manifest is validated against, read once at start (architect Q87).
+    pub env: Arc<HostEnv>,
+    /// The secret names a manifest may grant. TODO(#99): the store's names; until then none.
+    pub catalog: Arc<dyn SecretCatalog + Send + Sync>,
+}
+
 /// The control socket's server.
-pub struct Control {
-    record: Recorder,
+pub struct Control<S> {
+    pub(super) p: ControlParts<S>,
+    /// The daemon-wide read rate (architect Q77).
+    rate: Mutex<Rate>,
     stop: watch::Sender<bool>,
 }
 
-impl Control {
-    /// A server recording into `record` (its entries carry no session).
+/// One connection's state.
+pub(crate) struct Conn {
+    /// The peer, as audited and as the deciding client.
+    pub(crate) client: Client,
+    /// Attached by `approvals.watch`; dropped with the connection.
+    pub(crate) watch: Option<Watch>,
+}
+
+impl<S: SessionSet> Control<S> {
+    /// A server over `p`.
     #[must_use]
-    pub fn new(record: Recorder) -> Self {
+    pub fn new(p: ControlParts<S>) -> Self {
         Self {
-            record,
+            p,
+            rate: Mutex::new(Rate::new(READ_RATE, READ_BURST)),
             stop: watch::Sender::new(false),
         }
     }
@@ -53,23 +96,43 @@ impl Control {
         listen::spawn(listener, self, MAX_CONNECTIONS, uid, "control.sock", crash)
     }
 
-    /// Serves one stream to its end.
-    pub async fn serve_stream<S: AsyncRead + AsyncWrite + Send + 'static>(
+    /// Serves one stream of `peer` to its end.
+    pub async fn serve_stream<T: AsyncRead + AsyncWrite + Send + 'static>(
         self: Arc<Self>,
-        stream: S,
+        stream: T,
+        peer: Peer,
     ) {
         let (r, mut w) = tokio::io::split(stream);
         let mut reader = BufReader::new(r);
         let stopped = until_true(self.stop.subscribe());
         tokio::pin!(stopped);
+        let mut conn = Conn {
+            client: Client {
+                uid: peer.uid,
+                pid: peer.pid,
+            },
+            watch: None,
+        };
         loop {
-            let frame = tokio::select! {
-                biased;
-                () = &mut stopped => break,
-                f = frame::read(&mut reader, MAX_FRAME) => f,
+            // One read per frame, kept across notifications: it is not cancel-safe.
+            let read = frame::read(&mut reader, MAX_FRAME);
+            tokio::pin!(read);
+            let frame = loop {
+                tokio::select! {
+                    biased;
+                    () = &mut stopped => return,
+                    f = &mut read => break f,
+                    note = next_note(&mut conn.watch) => {
+                        // `None`: the hub dropped this watcher as too slow (architect Q73.5).
+                        let Some(note) = note else { return };
+                        if !write(&mut w, &notify(&note)).await {
+                            return;
+                        }
+                    }
+                }
             };
             let reply = match frame {
-                Ok(Frame::Line(line)) => match self.handle(&line).await {
+                Ok(Frame::Line(l)) => match self.handle(&l, &mut conn).await {
                     Some(reply) => reply,
                     None => break,
                 },
@@ -91,10 +154,16 @@ impl Control {
         }
     }
 
-    /// The reply to one frame (empty for none); `None` closes the connection (a failed append).
-    async fn handle(&self, line: &[u8]) -> Option<Vec<u8>> {
-        let (id, method, reason, code) = match message::parse(line) {
-            Err(r) => (r.id, None, r.reason.as_str(), r.reason.code()),
+    /// The reply to one frame (empty for none); `None` closes the connection.
+    async fn handle(&self, frame: &[u8], conn: &mut Conn) -> Option<Vec<u8>> {
+        let (id, method, params) = match message::parse(frame) {
+            Err(r) => {
+                let reply = failure(
+                    r.id.as_ref(),
+                    error_object(r.reason.code(), r.reason.as_str()),
+                );
+                return self.deny(None, r.reason.as_str()).await.then_some(reply);
+            }
             Ok(Message::Response) => {
                 return self.deny(None, "unexpected-response").await.then(Vec::new);
             }
@@ -104,16 +173,67 @@ impl Control {
                     .await
                     .then(Vec::new);
             }
-            Ok(Message::Request { id, method, .. }) => {
-                // Task 12 dispatches the methods of CONTROL_METHODS here.
-                debug_assert!(!CONTROL_METHODS.contains(&method.as_str()));
-                (Some(id), Some(method), "method-not-found", METHOD_NOT_FOUND)
+            Ok(Message::Request { id, method, params }) => (id, method, params),
+        };
+        let call = match Call::parse(&method, params) {
+            Ok(c) => c,
+            Err(no) => {
+                let (code, reason) = match no {
+                    NotAdmitted::MethodNotFound => (METHOD_NOT_FOUND, "method-not-found"),
+                    NotAdmitted::InvalidParams => (INVALID_PARAMS, "invalid-params"),
+                };
+                let reply = failure(Some(&id), error_object(code, reason));
+                return self.deny(Some(&method), reason).await.then_some(reply);
             }
         };
-        if !self.deny(method.as_deref(), reason).await {
+        if call.rated() && !self.wait_rate().await {
             return None;
         }
-        Some(failure(id.as_ref(), error_object(code, reason)))
+        if !self.request(&call, conn.client).await {
+            return None;
+        }
+        match self.run(call, conn).await {
+            Done::Ok(result) => Some(success(&id, result)),
+            Done::Refused(data) => Some(refused(&id, &data)),
+            Done::Close => None,
+        }
+    }
+
+    /// Waits for a slot of the read rate; `false` if `sallyd` stopped meanwhile.
+    async fn wait_rate(&self) -> bool {
+        let stopped = until_true(self.stop.subscribe());
+        tokio::pin!(stopped);
+        loop {
+            let wait = match self
+                .rate
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+            {
+                Ok(()) => return true,
+                Err(d) => d,
+            };
+            tokio::select! {
+                biased;
+                () = &mut stopped => return false,
+                () = tokio::time::sleep(wait) => {}
+            }
+        }
+    }
+
+    /// `rpc.request` for an admitted call; whether it was written.
+    async fn request(&self, call: &Call, client: Client) -> bool {
+        let mut args = Map::new();
+        args.insert("socket".into(), Value::from("control"));
+        args.insert("method".into(), Value::from(call.method()));
+        args.insert("client".into(), who(client));
+        args.extend(call.request_args());
+        let entry = self
+            .p
+            .record
+            .entry(Actor::User, "rpc.request", None)
+            .args(Value::Object(args));
+        self.p.record.append(entry).await
     }
 
     async fn deny(&self, method: Option<&str>, reason: &str) -> bool {
@@ -122,24 +242,26 @@ impl Control {
             a.insert("method".into(), Value::from(escape(m.as_bytes())));
         }
         let entry = self
+            .p
             .record
             .entry(Actor::User, "rpc.deny", Some("deny"))
             .args(args);
-        self.record.append(entry).await
+        self.p.record.append(entry).await
     }
 }
 
-impl Server for Control {
-    fn serve(self: Arc<Self>, stream: UnixStream, _: Peer) -> impl Future<Output = ()> + Send {
-        self.serve_stream(stream)
+impl<S: SessionSet> Server for Control<S> {
+    fn serve(self: Arc<Self>, stream: UnixStream, peer: Peer) -> impl Future<Output = ()> + Send {
+        self.serve_stream(stream, peer)
     }
 
     async fn refuse_peer(self: Arc<Self>, uid: Option<u32>) {
         let entry = self
+            .p
             .record
             .entry(Actor::Sallyd, "rpc.deny", Some("deny"))
             .args(json!({"socket": "control", "reason": "peer-uid", "uid": uid}));
-        let _ = self.record.append(entry).await;
+        let _ = self.p.record.append(entry).await;
     }
 
     fn stop(&self) {
@@ -147,7 +269,37 @@ impl Server for Control {
     }
 }
 
-/// Writes one reply within [`WRITE_TIMEOUT`]; whether it was written.
+/// The next notification for a watching connection; never, for one that is not watching.
+async fn next_note(watch: &mut Option<Watch>) -> Option<Note> {
+    match watch {
+        Some(w) => w.rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// A notification as one frame.
+pub(crate) fn notify(note: &Note) -> Vec<u8> {
+    let (method, params) = match note {
+        Note::Requested(p) => (
+            notification::APPROVAL_REQUESTED,
+            serde_json::to_value(prompt(p)).unwrap_or(Value::Null),
+        ),
+        Note::Flood(session) => (notification::APPROVAL_FLOOD, json!({"session": session})),
+        Note::Closed(id) => (notification::APPROVAL_CLOSED, json!({"id": id})),
+    };
+    line(&json!({"jsonrpc": "2.0", "method": method, "params": params}))
+}
+
+/// A refusal reply, its `data` the shared [`ErrorData`](sally_proto::ErrorData).
+fn refused(id: &Id, data: &sally_proto::ErrorData) -> Vec<u8> {
+    let data = serde_json::to_value(data).unwrap_or(Value::Null);
+    failure(
+        Some(id),
+        json!({"code": REFUSED, "message": "Server error", "data": data}),
+    )
+}
+
+/// Writes one frame within [`WRITE_TIMEOUT`]; whether it was written.
 async fn write<W: AsyncWrite + Unpin>(w: &mut W, line: &[u8]) -> bool {
     matches!(
         tokio::time::timeout(WRITE_TIMEOUT, w.write_all(line)).await,
@@ -156,154 +308,5 @@ async fn write<W: AsyncWrite + Unpin>(w: &mut W, line: &[u8]) -> bool {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
-mod tests {
-    use super::*;
-    use crate::rpc::testkit::recorder;
-    use std::time::Duration;
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
-
-    async fn exchange(lines: &[&[u8]]) -> (Vec<Value>, Vec<crate::rpc::testkit::Row>) {
-        let (sink, rec) = recorder("");
-        let control = Arc::new(Control::new(rec));
-        let (client, server) = tokio::io::duplex(4 * MAX_FRAME);
-        let task = tokio::spawn(Arc::clone(&control).serve_stream(server));
-        let (r, mut w) = tokio::io::split(client);
-        for l in lines {
-            w.write_all(l).await.unwrap();
-            w.write_all(b"\n").await.unwrap();
-        }
-        w.shutdown().await.unwrap();
-        let mut replies = Vec::new();
-        let mut r = BufReader::new(r);
-        let mut line = String::new();
-        while r.read_line(&mut line).await.unwrap() > 0 {
-            replies.push(serde_json::from_str(&line).unwrap());
-            line.clear();
-        }
-        task.await.unwrap();
-        (replies, sink.rows())
-    }
-
-    #[test]
-    fn the_control_table_is_empty_until_task_12() {
-        assert!(CONTROL_METHODS.is_empty());
-    }
-
-    #[test]
-    fn frames_are_capped_at_1_mib() {
-        assert_eq!(MAX_FRAME, 1_048_576);
-    }
-
-    #[tokio::test]
-    async fn stop_ends_a_live_connection() {
-        let (_, rec) = recorder("");
-        let control = Arc::new(Control::new(rec));
-        let (_client, server) = tokio::io::duplex(1024);
-        let task = tokio::spawn(Arc::clone(&control).serve_stream(server));
-        tokio::task::yield_now().await;
-        Server::stop(&*control);
-        tokio::time::timeout(Duration::from_secs(5), task)
-            .await
-            .expect("stop left the connection open")
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn a_peer_with_another_uid_is_refused_and_recorded() {
-        let dir = std::env::temp_dir().join(format!("sp-control-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir(&dir).unwrap();
-        let path = dir.join("control.sock");
-        let listener = tokio::net::UnixListener::bind(&path).unwrap();
-        let (sink, rec) = recorder("");
-        let me = rustix::process::getuid().as_raw();
-        let (crash, _crashes) = crate::rpc::listen::CrashReporter::channel();
-        let h = crate::rpc::listen::spawn(
-            listener,
-            Arc::new(Control::new(rec)),
-            1,
-            me.wrapping_add(1),
-            "control.sock",
-            crash,
-        );
-        let mut s = UnixStream::connect(&path).await.unwrap();
-        let _ = s.write_all(b"{}\n").await;
-        let mut out = Vec::new();
-        let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out)).await;
-        assert!(out.is_empty());
-        assert_eq!(
-            sink.last("rpc.deny"),
-            json!({"socket": "control", "reason": "peer-uid", "uid": me})
-        );
-        h.shutdown().await;
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn every_method_is_not_found_and_recorded() {
-        let (replies, rows) = exchange(&[
-            br#"{"jsonrpc":"2.0","id":1,"method":"secrets.set","params":{}}"#,
-            br#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
-            br#"{"jsonrpc":"2.0","method":"sessions.stop"}"#,
-            br#"{"jsonrpc":"2.0","id":3,"result":{}}"#,
-            b"[1]",
-        ])
-        .await;
-        let codes: Vec<_> = replies
-            .iter()
-            .map(|r| (r["id"].clone(), r["error"]["code"].clone()))
-            .collect();
-        assert_eq!(
-            codes,
-            [
-                (json!(1), json!(-32601)),
-                (json!(2), json!(-32601)),
-                (Value::Null, json!(-32600)),
-            ]
-        );
-        let reasons: Vec<_> = rows
-            .iter()
-            .map(|r| r.args["reason"].as_str().unwrap().to_owned())
-            .collect();
-        assert_eq!(
-            reasons,
-            [
-                "method-not-found",
-                "method-not-found",
-                "method-not-found",
-                "unexpected-response",
-                "batch"
-            ]
-        );
-        assert!(
-            rows.iter()
-                .all(|r| r.event == "rpc.deny" && r.args["socket"] == json!("control"))
-        );
-        assert!(rows.iter().all(|r| r.debug.contains("session: None")));
-        assert_eq!(rows[0].args["method"], json!("secrets.set"));
-    }
-
-    #[tokio::test]
-    async fn frames_up_to_one_mib_are_read() {
-        let mut exact = br#"{"jsonrpc":"2.0","id":1,"method":"m"}"#.to_vec();
-        exact.splice(1..1, std::iter::repeat_n(b' ', MAX_FRAME - exact.len()));
-        let mut over = exact.clone();
-        over.insert(1, b' ');
-        let (replies, rows) = exchange(&[&exact, &over]).await;
-        assert_eq!(
-            replies[0]["error"]["data"]["reason"],
-            json!("method-not-found")
-        );
-        assert_eq!(
-            replies[1]["error"]["data"]["reason"],
-            json!("frame-too-large")
-        );
-        assert_eq!(
-            replies.len(),
-            2,
-            "the connection closes after an oversize frame"
-        );
-        assert_eq!(rows.len(), 2);
-    }
-}
+#[path = "control_tests.rs"]
+mod tests;

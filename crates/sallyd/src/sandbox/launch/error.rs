@@ -83,8 +83,16 @@ pub enum LaunchError {
 }
 
 impl LaunchError {
-    /// A short reason for the `sandbox.refuse` audit entry.
-    pub(super) fn reason(&self) -> &'static str {
+    /// The `detail` of the `sandbox.refuse` entry: the error, capped. A control client is told
+    /// exactly this, escaped (architect Q88).
+    #[must_use]
+    pub(crate) fn detail(&self) -> String {
+        super::capped(&self.to_string())
+    }
+
+    /// A short reason for the `sandbox.refuse` audit entry, and the control reply's reason.
+    #[must_use]
+    pub(crate) fn reason(&self) -> &'static str {
         match self {
             Self::Scan(ScanError::SocketInMount { .. }) => "socket-in-mount",
             Self::Scan(ScanError::TooManyShields { .. } | ScanError::Limit { .. }) => "scan-limit",

@@ -85,6 +85,12 @@ impl Hub {
         }
     }
 
+    /// How many watchers are attached.
+    #[cfg(test)]
+    pub(crate) fn count(&self) -> usize {
+        self.attached.load(Ordering::SeqCst)
+    }
+
     fn lock(&self) -> MutexGuard<'_, Vec<Watcher>> {
         self.watchers.lock().unwrap_or_else(PoisonError::into_inner)
     }

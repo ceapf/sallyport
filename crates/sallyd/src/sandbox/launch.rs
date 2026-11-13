@@ -417,7 +417,7 @@ impl Launcher {
             .args(json!({
                 "role": "workspace",
                 "reason": e.reason(),
-                "detail": capped(&e.to_string()),
+                "detail": e.detail(),
                 "cleanup": capped(&cleanup),
             }));
         match self.audit(entry, level).await {
