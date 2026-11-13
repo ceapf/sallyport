@@ -88,10 +88,11 @@ fn create(state: &Path) -> Result<Installation, InstallError> {
     // Never through a symlink, as startup opens it (O_RDONLY is 0; the wrapper adds O_CLOEXEC).
     let dir = sally_core::fd::open(state, OFlags::DIRECTORY | OFlags::NOFOLLOW, Mode::empty())
         .map_err(|e| fail(state, "cannot be opened", Some(e.into())))?;
-    // Only a crash before the rename leaves it, and no start has used the id in it.
-    match rustix::fs::unlinkat(&dir, TEMP_FILE, AtFlags::empty()) {
-        Ok(()) | Err(Errno::NOENT) => {}
-        Err(e) => return Err(fail(&temp, "cannot be removed", Some(e.into()))),
+    // Only a crash before the link leaves it, and no start has used the id in it.
+    if let Err(e) = rustix::fs::unlinkat(&dir, TEMP_FILE, AtFlags::empty())
+        && e != Errno::NOENT
+    {
+        return Err(fail(&temp, "cannot be removed", Some(e.into())));
     }
     let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL;
     let fd = sally_core::fd::openat(&dir, TEMP_FILE, flags, Mode::from_raw_mode(0o600))

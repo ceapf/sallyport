@@ -81,6 +81,11 @@ impl Oplog {
     /// A log written to `out` by a writer thread of its own.
     #[must_use]
     pub fn new(out: impl Write + Send + 'static) -> Self {
+        Self::start(out)
+    }
+
+    /// [`Oplog::new`]'s body: the queue, the shared state and the writer thread.
+    fn start(out: impl Write + Send + 'static) -> Self {
         let (tx, rx) = sync_channel(QUEUE);
         let shared = Arc::new(Shared {
             redactor: RwLock::new(Arc::new(Redactor::default())),
