@@ -203,7 +203,7 @@ const BASIC_PLACEHOLDER: &str = "{basic}";
 const MAX_BASIC_USER: usize = 256;
 /// Env names a placeholder may never take (compared case-insensitively): Sallyport's own
 /// variables, the dynamic loader, git config injection, and anything proxy-, CA- or
-/// socket-related (AMENDMENTS-01 §4 sets the proxy and CA variables itself).
+/// socket-related (`sallyd` sets the proxy and CA variables itself: ARCHITECTURE §3, §7).
 const RESERVED_ENV_PREFIXES: [&str; 3] = ["SALLY_", "LD_", "GIT_CONFIG"];
 const RESERVED_ENV_SUBSTRINGS: [&str; 5] = ["PROXY", "CA_BUNDLE", "CAINFO", "CERT", "SOCK"];
 const RESERVED_ENV_NAMES: [&str; 9] = [

@@ -592,7 +592,7 @@ fn args_exactly_at_the_limit_are_kept() {
 }
 
 proptest! {
-    /// B1: the base64 of ANY string containing the secret is caught, in either alphabet, with
+    /// ARCHITECTURE §7 (Redaction): the base64 of ANY string containing the secret is caught, in either alphabet, with
     /// or without padding.
     #[test]
     fn base64_of_any_string_containing_the_secret_is_redacted(

@@ -257,7 +257,7 @@ filter (no loopback/private/link-local/host-own) and requires
     basic_user: x-access-token    # required with {basic}: {basic} = base64(basic_user:secret)
   expose_env: GH_TOKEN            # optional: placeholder env var in the workspace
 ```
-Injection happens **only inside TLS the proxy terminates** (AMENDMENTS-01 §4): on `CONNECT` to a
+Injection happens **only inside TLS the proxy terminates** (`ARCHITECTURE.md §7`): on `CONNECT` to a
 grant host the proxy presents a leaf from a per-session, name-constrained CA, injects, and
 re-originates TLS to the verified upstream. Allowed hosts without a grant are spliced untouched.
 Every plain-HTTP request, to a grant host or any other, is refused 405 `plain-http-unsupported`
@@ -383,7 +383,7 @@ validation — otherwise `mount-changed`/`is-symlink` (RT-FS-06).
 | `network.max_request_bytes`/`max_response_bytes` | `sallyd::egress::server::intercept` body caps (Task 9a-2: intercepted requests only; a spliced tunnel is opaque; body bytes after chunk decoding, per message) | each intercepted request and response | 413 request / 502 response, audit `egress.limit` |
 | `secrets[].name` | validator checks store; `sallyd::egress::inject` reads the grants' values from the store at launch (Task 9a-3) | validate + launch + each matching request | reject if missing; at launch `sandbox.refuse` `secret-missing` (`secret-store` when the store cannot be read) |
 | `secrets[].inject.host` | validator (exact host, must be allowed) + inject (a grant's credential is set on its own host only; every intercepted response is redacted with every secret of the session, and its `egress.response` entry names the secrets redacted and the bytes) | validate + launch + request | reject; at launch `sandbox.refuse` `secret-filler` when the session's forms hold every filler candidate |
-| `secrets[].inject.header/format/basic_user` | validator + inject (TLS-terminated grant hosts only; every client copy of the header is dropped, then the grant's value set once the request is audited; `{basic}` refuses the launch, `basic-unsupported`, until Task 9b) | validate + launch + request | reject; plain HTTP to any host → 405 `plain-http-unsupported`; a grant that cannot be injected → `sandbox.refuse` `secret-grant` |
+| `secrets[].inject.header/format/basic_user` | validator + inject (TLS-terminated grant hosts only; every client copy of the header is dropped, then the grant's value set once the request is audited; `{basic}` renders RFC 7617's padded base64 of `basic_user:secret`, Task 9b; the placeholder and `basic_user` pairing is checked again at launch) | validate + launch + request | reject; plain HTTP to any host → 405 `plain-http-unsupported`; a grant that cannot be injected → `sandbox.refuse` `secret-grant` |
 | `secrets[].expose_env` | validator (name rule) + workspace `--env NAME=sallyport-placeholder` | validate + launch | reject |
 | `tools.builtin` | `sallyd::tools` per session: `tools/list` shows the granted tools; the grant is checked before arguments or paths (Task 11, architect ruling Q28); `fetch` is not offered until #75 | each `tools/call` on `agent.sock` | `isError: true`, `denied: tool_not_granted` (a granted `fetch`: `tool_unavailable`), audit `tool.deny` |
 | `tools.shell` | `sallyd::tools::exec` → `podman exec` after policy; 300 s and 64 KiB per stream, the call killed past the limit | each shell call | deny / pending / run |
@@ -430,7 +430,7 @@ never on message text); the field path uses `a.b[0].c` form.
 | `unacknowledged-wildcard` | `"*"` without the ack flag |
 | `network-disabled` | secrets with `network.mode: none` |
 | `secret-missing` / `secret-host-not-allowed` | name not in store (at validation; at launch also a `sandbox.refuse` reason, Task 9a-3) / no exact allow rule for the inject host |
-| `secret-store` / `basic-unsupported` / `secret-grant` / `secret-filler` | launch refusals (`sandbox.refuse`, Task 9a-3): the secrets store cannot be read / a `{basic}` grant (until Task 9b, #80) / a grant whose header or rendered value cannot be sent, two grants on one header of one host, or a form of the secret too long to redact / every redaction filler candidate occurs in a form of the session's secrets (names no secret) |
+| `secret-store` / `secret-grant` / `secret-filler` | launch refusals (`sandbox.refuse`, Task 9a-3): the secrets store cannot be read / a grant whose format and `basic_user` do not pair (exactly one placeholder; `basic_user` exactly with `{basic}`), whose header or rendered value cannot be sent, two grants on one header of one host, or a form of the secret too long to redact / every redaction filler candidate occurs in a form of the session's secrets (names no secret). (`basic-unsupported`, Task 9a-3's refusal of `{basic}`, was deleted in Task 9b.) |
 | `secret-like-env` | MCP env name looks like a secret |
 | `bad-header` / `bad-format` | injection header/format invalid |
 | `mount-changed` | launch-time re-check: mount root replaced since validation |

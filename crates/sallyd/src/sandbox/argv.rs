@@ -26,7 +26,7 @@ pub(super) const SOCKETS_GUEST: &str = "/run/sallyport";
 pub(super) const PROXY_URL: &str = "http://127.0.0.1:3128";
 /// `secrets[].expose_env` value: a public constant, never the secret (MANIFEST_SPEC).
 pub(super) const PLACEHOLDER: &str = "sallyport-placeholder";
-/// Trust bundles for the session CA when the proxy intercepts TLS (AMENDMENTS-01 §4).
+/// Trust bundles for the session CA when the proxy intercepts TLS (ARCHITECTURE §7).
 pub(super) const CA_BUNDLE: &str = "/run/sallyport/ca-bundle.pem";
 pub(super) const SESSION_CA: &str = "/run/sallyport/session-ca.pem";
 pub(super) const CA_BUNDLE_VARS: [&str; 7] = [

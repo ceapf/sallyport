@@ -1,4 +1,4 @@
-//! Redaction of secret values in audit arguments (SI-3, SI-4; AMENDMENTS-02 B1).
+//! Redaction of secret values in audit arguments (SI-3, SI-4; ARCHITECTURE §7, Redaction).
 //!
 //! For every secret the redactor knows the raw value, its percent-encoding, and its base64 in
 //! all three alignments and both alphabets, trimmed to the characters that depend only on the

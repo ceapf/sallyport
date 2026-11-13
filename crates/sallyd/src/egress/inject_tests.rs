@@ -317,7 +317,7 @@ fn the_redaction_covers_every_secret_its_forms_and_each_rendered_value() {
     assert_eq!(r.longest(), 32);
 }
 
-/// AMENDMENTS-02 B1 (architect ruling A2): a `{basic}` grant's redaction covers the rendered
+/// Architect ruling A2 (ARCHITECTURE §7): a `{basic}` grant's redaction covers the rendered
 /// value, the whole blob with its padding, and the blob with the padding stripped. Each check
 /// covers bytes the secret's own forms cannot: the `Basic ` prefix, and the blob's first
 /// characters (the user's) and its last.

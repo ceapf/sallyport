@@ -59,7 +59,7 @@ const FORMS_MANIFEST: &str = "network:\n  mode: proxy\n  allow:\n    - host: moc
                               header: Authorization, format: \"Basic {basic}\", basic_user: git}\n";
 
 /// The `{basic}` grant hosts of [`FORMS_MANIFEST`] and their users: one, two and three bytes,
-/// so the secret sits at all three base64 alignments inside the blob (AMENDMENTS-02 B1).
+/// so the secret sits at all three base64 alignments inside the blob (RT-SEC-12).
 const BASIC_HOSTS: [(&str, &str); 3] = [
     ("b1.mock.test", "x"),
     ("b2.mock.test", "ab"),

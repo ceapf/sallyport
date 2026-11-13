@@ -1,5 +1,5 @@
-//! Credential injection inside intercepted tunnels (Task 9a-3; AMENDMENTS-01 §4, maintainer
-//! decision 5, architect Q27 and D7–D13).
+//! Credential injection inside intercepted tunnels (Tasks 9a-3 and 9b; ARCHITECTURE §7,
+//! maintainer decision 5, architect Q27, D7–D13 and A2–A3).
 //!
 //! [`Credentials`] is the only holder of secret values in the proxy, and it cannot exist without
 //! the response redaction of exactly those values (Q27: one constructor, no `Default`). Each
@@ -21,7 +21,7 @@ use super::redact::{Redaction, RedactionError, TooLong};
 
 /// The placeholder for the secret itself.
 const VALUE: &str = "{value}";
-/// The placeholder for `base64(basic_user:secret)` (Task 9b, AMENDMENTS-01 §4 schemes).
+/// The placeholder for `base64(basic_user:secret)` (Task 9b; MANIFEST_SPEC `secrets[]`).
 const BASIC: &str = "{basic}";
 
 /// Where a session's secret values come from (architect D7): a constructor argument of the
@@ -294,7 +294,7 @@ struct Rendered {
 /// The grant's header value: its format with its one placeholder replaced, by splitting at the
 /// placeholder (architect D11), never by a replace that could recurse. `{value}` takes the
 /// secret; `{basic}` takes [`basic_credential`] of `basic_user` and the secret, and adds that
-/// blob, padded and unpadded, to the forms (AMENDMENTS-02 B1). The pairing of placeholder and
+/// blob, padded and unpadded, to the forms (ARCHITECTURE §7). The pairing of placeholder and
 /// user is checked again here (architect ruling A2).
 fn render(s: &Spec, secret: &Secret<String>) -> Result<Rendered, CredentialsError> {
     let refused = || CredentialsError::Format(s.name.clone());

@@ -667,7 +667,7 @@ fn case() -> impl Strategy<Value = (Named, Vec<u8>, Vec<usize>)> {
 }
 
 /// One secret under the store's value rules (printable, no control characters), and a body
-/// holding its sally-core forms and AMENDMENTS-02 B1's `base64(prefix ‖ secret ‖ suffix)` in
+/// holding its sally-core forms and `base64(prefix ‖ secret ‖ suffix)` (ARCHITECTURE §7) in
 /// both alphabets, between noise.
 fn b1_case() -> impl Strategy<Value = (String, Vec<String>, Vec<u8>, Vec<usize>)> {
     (
@@ -714,7 +714,7 @@ fn split_run(r: &Arc<Redaction>, body: &[u8], cuts: &[usize]) -> (Vec<u8>, Tally
 }
 
 proptest! {
-    /// Decision 7 with the forms the proxy uses (architect D3): no sally-core form and no B1
+    /// Decision 7 with the forms the proxy uses (architect D3): no sally-core form and no
     /// base64 of a string containing the secret survives any split, and the length is
     /// unchanged.
     #[test]
