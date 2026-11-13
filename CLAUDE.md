@@ -187,6 +187,10 @@ Two sessions may work in two worktrees at once; container tests are run-scoped
 - A lane never touches the other lane's branch.
 - Shared files (`CLAUDE.md`, `REDTEAM_SUITE.md`, `.cargo/mutants.toml`, `Cargo.lock`): expect a
   rebase conflict and resolve it by keeping both sides' entries.
+- Resolve rebase conflicts by hand; never `-X theirs` or `-X ours`. After every rebase, before
+  any test or push, prove nothing of main's was lost. Every file the lane did not mean to change
+  (not in `git diff --name-only <old-base> <pre-rebase-head>`) must be identical to main's copy.
+  In files both sides changed, every line missing from main's copy must be one the lane removed.
 
 ## Public repository rules
 
