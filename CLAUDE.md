@@ -218,6 +218,10 @@ issues, comments and CI output.
   same way (never assumed), naming the command:
   `gh run list --workflow nightly.yml --limit 1 --json conclusion,createdAt,databaseId --jq
   '.[0] | "\(.conclusion) \(.createdAt) \(.databaseId)"'`.
+- Never dispatch a nightly while one is running or queued. Check first with
+  `gh run list --workflow nightly.yml --limit 3 --json status,databaseId`; any status other than
+  `completed` means wait. A running nightly always finishes (`cancel-in-progress: false`), but
+  GitHub keeps only one pending run per group, so a second dispatch replaces a queued one.
 - Standing merge rule: you may merge PRs **you authored from branches in this repository** when CI
   is green, the required reviews have run with findings fixed or deferred by TODO, and the task is
   in the approved plan. Never merge a PR carrying a checkpoint deliverable until the maintainer
