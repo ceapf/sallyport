@@ -16,7 +16,7 @@ use tokio::sync::watch;
 
 use super::agent::{WRITE_TIMEOUT, error_object, failure};
 use super::frame::{self, Frame};
-use super::listen::{self, Server, until_true};
+use super::listen::{self, Peer, Server, until_true};
 use super::mcp::CONTROL_METHODS;
 use super::message::{self, INVALID_REQUEST, METHOD_NOT_FOUND, Message};
 use super::record::{Recorder, escape};
@@ -130,7 +130,7 @@ impl Control {
 }
 
 impl Server for Control {
-    fn serve(self: Arc<Self>, stream: UnixStream) -> impl Future<Output = ()> + Send {
+    fn serve(self: Arc<Self>, stream: UnixStream, _: Peer) -> impl Future<Output = ()> + Send {
         self.serve_stream(stream)
     }
 

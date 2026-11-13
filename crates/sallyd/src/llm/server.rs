@@ -38,7 +38,7 @@ use super::body::{self, Chat};
 use super::head::{self, Head, Parsed};
 use super::io::{Gate, Io};
 use super::reply::{self, Out};
-use crate::rpc::listen::{self, Server, until_true};
+use crate::rpc::listen::{self, Peer, Server, until_true};
 use crate::rpc::rate::Rate;
 use crate::rpc::record::{Recorder, escape};
 
@@ -430,7 +430,8 @@ impl<B: Backend> Llm<B> {
 }
 
 impl<B: Backend> Server for Llm<B> {
-    fn serve(self: Arc<Self>, stream: UnixStream) -> impl Future<Output = ()> + Send {
+    /// The peer passed the uid check; `llm.sock` needs nothing more of it.
+    fn serve(self: Arc<Self>, stream: UnixStream, _: Peer) -> impl Future<Output = ()> + Send {
         self.serve_stream(stream)
     }
 

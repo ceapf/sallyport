@@ -37,7 +37,7 @@ use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 
 use super::frame::{self, Frame};
-use super::listen::{self, Server, until_true};
+use super::listen::{self, Peer, Server, until_true};
 use super::mcp::{self, Call, Era, Note, SERVER_LIMIT, Tool, ToolOutcome};
 use super::message::{
     self, INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, Id, METHOD_NOT_FOUND, Message,
@@ -417,7 +417,8 @@ impl<T: ToolHandler> Agent<T> {
 }
 
 impl<T: ToolHandler> Server for Agent<T> {
-    fn serve(self: Arc<Self>, stream: UnixStream) -> impl Future<Output = ()> + Send {
+    /// The peer passed the uid check; the session socket needs nothing more of it.
+    fn serve(self: Arc<Self>, stream: UnixStream, _: Peer) -> impl Future<Output = ()> + Send {
         self.serve_stream(stream)
     }
 
