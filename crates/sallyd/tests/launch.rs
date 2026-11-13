@@ -9,7 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use sallyd::sandbox::{Expect, LaunchError, check_in_container};
+use sallyd::sandbox::{Expect, LaunchError, Sweep, check_in_container};
 
 mod common;
 use common::container::*;
@@ -627,7 +627,7 @@ fn orphans_of_a_previous_sallyd_are_removed() {
         // A session live in this launcher is never an orphan.
         assert!(
             x.launcher
-                .remove_orphans(&x.scope)
+                .remove_orphans(&x.scope, Sweep::Startup)
                 .await
                 .unwrap()
                 .is_empty()
@@ -635,10 +635,79 @@ fn orphans_of_a_previous_sallyd_are_removed() {
         assert!(exists(&name));
         // The next sallyd starts with no live sessions and removes it.
         let next = Lx::new();
-        let removed = next.launcher.remove_orphans(&x.scope).await.unwrap();
+        let removed = next
+            .launcher
+            .remove_orphans(&x.scope, Sweep::Startup)
+            .await
+            .unwrap();
         assert_eq!(removed, std::slice::from_ref(&name));
         assert!(!exists(&name));
         assert_eq!(next.events.list(), ["sandbox.orphan_removed"]);
+        assert_eq!(
+            next.events.args("sandbox.orphan_removed").unwrap()["sweep"],
+            "startup"
+        );
+    });
+}
+
+/// RT-AG-08b, architect Q61 (security review M4): a session container that appears after the
+/// startup sweep (a `podman create` a killed `sallyd` left running) is removed by the periodic
+/// sweep within one period, audited first, while a live session's container survives the same
+/// sweeps. Without the sweep it would hold mounts the overlap rule does not know.
+#[test]
+fn rt_ag_08b_a_late_orphan_is_swept_while_a_live_session_stays() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let v =
+            x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "rw")]));
+        let live = x.launch(&v, "live").await.unwrap();
+        let sweeping = tokio::spawn(sallyd::daemon::sweep::every(
+            x.launcher.clone(),
+            x.scope.clone(),
+            Duration::from_millis(500),
+            sallyd::oplog::Oplog::new(std::io::sink()),
+        ));
+        let orphan = format!("sp-ws-{}-late0rphan", x.scope);
+        let image = test_image();
+        let made = podman(&[
+            "create",
+            "--pull=never",
+            "--network=none",
+            "--name",
+            &orphan,
+            image.as_str(),
+        ]);
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        let end = std::time::Instant::now() + Duration::from_secs(30);
+        while exists(&orphan) {
+            assert!(
+                std::time::Instant::now() < end,
+                "the late orphan was never swept"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // Two more periods: the live session is never taken for an orphan.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        sweeping.abort();
+        assert!(exists(live.name()));
+        let swept = x.events.args("sandbox.orphan_removed").unwrap();
+        assert_eq!(
+            (swept["container"].as_str(), swept["sweep"].as_str()),
+            (Some(orphan.as_str()), Some("periodic"))
+        );
+        assert_eq!(
+            x.events
+                .list()
+                .iter()
+                .filter(|e| *e == "sandbox.orphan_removed")
+                .count(),
+            1
+        );
+        x.stop(live).await;
     });
 }
 

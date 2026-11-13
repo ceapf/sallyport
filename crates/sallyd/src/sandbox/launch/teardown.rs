@@ -13,17 +13,44 @@ use super::{
 use crate::sandbox::commands::rm_args;
 use crate::sandbox::types::SessionPaths;
 
+/// Which orphan sweep runs (architect Q61), named in each `sandbox.orphan_removed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sweep {
+    /// Once, under the single-instance lock, before `control.sock` is bound.
+    Startup,
+    /// Every `daemon::sweep::ORPHAN_SWEEP` after that.
+    Periodic,
+}
+
+impl Sweep {
+    /// The wire name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Periodic => "periodic",
+        }
+    }
+}
+
 impl Launcher {
-    /// Removes session containers a previous `sallyd` left behind (`sp-ws-<scope>[-…]`,
-    /// `sp-h-<scope>[-…]`), never a session live in this launcher, so the overlap rule starts
-    /// from what is really running. `sallyd` (`daemon::serve`) calls it with an empty scope
-    /// while it holds the single-instance lock (the `flock` on its runtime directory,
-    /// `daemon::startup`) and before it binds `control.sock`, so "a previous sallyd" is exact.
-    /// Audits each removal.
+    /// Removes session containers no live session of this launcher owns (`sp-ws-<scope>[-…]`,
+    /// `sp-h-<scope>[-…]`), so the overlap rule starts from what is really running. `sallyd`
+    /// (`daemon::serve`) calls it with an empty scope while it holds the single-instance lock
+    /// (the `flock` on its runtime directory, `daemon::startup`) and before it binds
+    /// `control.sock`, then periodically (`daemon::sweep`, architect Q61): a `podman create` a
+    /// killed `sallyd` left running can make its container after the startup sweep. A launch
+    /// reserves its id before it creates anything and keeps it until its container is confirmed
+    /// gone, and ids are never reused, so no sweep removes a launch in progress. Audits each
+    /// removal before it.
     ///
     /// # Errors
     /// [`LaunchError`] if podman cannot list or remove them.
-    pub async fn remove_orphans(&self, scope: &str) -> Result<Vec<String>, LaunchError> {
+    pub async fn remove_orphans(
+        &self,
+        scope: &str,
+        sweep: Sweep,
+    ) -> Result<Vec<String>, LaunchError> {
         let out = self
             .run(
                 "ps",
@@ -50,7 +77,7 @@ impl Launcher {
             self.audit(
                 NewEntry::new(Actor::Sallyd, "sandbox.orphan_removed")
                     .decision("deny")
-                    .args(json!({"container": name})),
+                    .args(json!({"container": name, "sweep": sweep.as_str()})),
                 AuditLevel::default(),
             )
             .await?;

@@ -197,6 +197,26 @@ fn a_second_sallyd_exits_already_running() {
     assert!(!env.state().join("control.sock").exists());
 }
 
+/// Security review M3: SIGHUP and SIGQUIT stop `sallyd` as SIGTERM does (cleanly, `control.sock`
+/// removed), never by their default action.
+#[test]
+fn hangup_and_quit_stop_cleanly() {
+    for (sig, name) in [
+        (rustix::process::Signal::HUP, "SIGHUP"),
+        (rustix::process::Signal::QUIT, "SIGQUIT"),
+    ] {
+        let env = Env::new();
+        let mut d = env.start();
+        d.signal(sig);
+        let out = d.finish();
+        let log = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{name}: {log}");
+        assert!(log.contains(&format!("why=\"{name}\"")), "{log}");
+        assert!(log.contains("\"stopped\""), "{log}");
+        assert!(!env.state().join("control.sock").exists());
+    }
+}
+
 /// Q42 steps 1–5 and 8, on the running daemon: umask 077, no core dumps, not dumpable (the
 /// entries under its `/proc/<pid>` belong to root; the directory itself keeps the task's owner),
 /// the locked directory 0700, and `control.sock` 0600, bound through `/proc/self/fd` although

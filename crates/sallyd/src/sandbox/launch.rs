@@ -56,6 +56,7 @@ mod teardown;
 
 use error::join_err;
 pub use error::{LaunchError, StopError};
+pub use teardown::Sweep;
 
 /// Longest free-text value in an audit entry (CLAUDE.md: nothing above 4 KiB is logged).
 const AUDIT_TEXT_CAP: usize = 4096;

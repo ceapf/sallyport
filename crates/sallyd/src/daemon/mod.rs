@@ -4,7 +4,9 @@
 pub mod crash;
 pub mod process;
 pub mod serve;
+pub mod stale;
 pub mod startup;
+pub mod sweep;
 
 /// tokio's blocking-pool size for the daemon. Stuck name lookups take at most
 /// [`crate::egress::net::MAX_LOOKUPS`] of these threads; audit appends, file walks and the rest

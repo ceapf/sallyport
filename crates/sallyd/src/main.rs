@@ -12,12 +12,15 @@ const LOG_FLUSH: Duration = Duration::from_secs(2);
 
 fn main() -> ExitCode {
     let log = Oplog::stderr();
-    let code = match serve::run(&log) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
+    // A panic on this thread still flushes the log (the panic hook wrote its line).
+    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| serve::run(&log)));
+    let code = match ran {
+        Ok(Ok(())) => ExitCode::SUCCESS,
+        Ok(Err(e)) => {
             log.error("daemon", "sallyd stopped", &[("error", &e.to_string())]);
             ExitCode::FAILURE
         }
+        Err(_) => ExitCode::FAILURE,
     };
     log.flush(LOG_FLUSH);
     code

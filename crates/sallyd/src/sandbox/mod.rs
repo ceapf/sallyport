@@ -35,7 +35,7 @@ pub use inside::Mismatch;
 #[doc(hidden)]
 pub use inside::{Expect, check_in_container};
 pub use launch::{
-    AuditSink, LaunchError, Launcher, LauncherParts, Running, SharedAudit, StopError,
+    AuditSink, LaunchError, Launcher, LauncherParts, Running, SharedAudit, StopError, Sweep,
     WorkspaceRequest,
 };
 pub use overlap::{Claim, Conflict, ReserveError, Sessions, claims};

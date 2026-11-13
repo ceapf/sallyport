@@ -4,15 +4,20 @@
 //! 1. umask 077, no core dumps, not dumpable; then the panic hook that writes through the
 //!    oplog. 2. Refuse root and set-id. 3. Check `$XDG_RUNTIME_DIR`, then create, check and
 //!    `flock` its `sallyport/` directory for the process's life (one `sallyd` per user).
-//! 4. Under the lock: `config.toml`, the audit writer, `NOFILE` raised (the launcher's fd budget
-//!    is fixed when it is built, so this comes before it), hermetic podman, `remove_orphans`
-//!    (a failure refuses start), then the stale `sessions/` socket directories and the stale
-//!    `control.sock` are removed. 5. `control.sock` is bound last, through the locked directory's
-//!    fd, 0600.
+//! 4. Under the lock: `config.toml` (a regular file, not followed through a symlink, never
+//!    blocking on a FIFO), the audit writer, `NOFILE` raised (the launcher's fd budget is fixed
+//!    when it is built, so this comes before it), the signal handlers, hermetic podman,
+//!    `remove_orphans` (a failure refuses start), then the stale `sessions/` socket directories
+//!    and the stale `control.sock` are removed relative to the locked directory's fd, in a
+//!    bounded walk (`daemon::stale`). 5. `control.sock` is bound last, through that fd, 0600.
+//!    6. The periodic orphan sweep starts (`daemon::sweep`, architect Q61).
 //!
-//! Shutdown (SIGTERM, SIGINT, or a panic in a task that is not a session's): `control.sock` is
-//! closed first, then every session is stopped `shutdown`. A container not confirmed gone, or a
-//! panic, makes `sallyd` exit non-zero.
+//! Shutdown (SIGTERM, SIGINT, SIGHUP, SIGQUIT, or a panic in a task that is not a session's;
+//! a signal that arrives during startup is handled once it is done): `control.sock` is closed
+//! first, then every session is stopped `shutdown`, all at once. A container not confirmed gone,
+//! or a panic, makes `sallyd` exit non-zero; so does a second signal during the shutdown, at
+//! once. TODO(#92): a container `sallyd` cannot stop because it was killed outright is bounded by
+//! nothing yet; a `podman --timeout` backstop follows this PR (architect Q60).
 
 use std::ffi::OsString;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -26,15 +31,15 @@ use tokio::net::UnixListener;
 use tokio::signal::unix::{SignalKind, signal};
 
 use super::crash::{CrashReporter, payload};
-use super::process;
 use super::startup::{self, STATE_DIR, StartError};
+use super::{process, stale, sweep};
 use crate::oplog::Oplog;
 use crate::rpc::control::Control;
 use crate::rpc::record::Recorder;
 use crate::sandbox::budget::session_budget;
 use crate::sandbox::{
     AuditSink, CheckedRuntime, DirError, DiskFloor, LaunchError, Launcher, LauncherParts, Podman,
-    PodmanError, PodmanHost, ScanLimits, Sessions, SharedAudit, UserIds, check_runtime_dir,
+    PodmanError, PodmanHost, ScanLimits, Sessions, SharedAudit, Sweep, UserIds, check_runtime_dir,
     resolve_podman,
 };
 use crate::session::lookup::SharedEgress;
@@ -93,6 +98,42 @@ pub enum DaemonError {
     /// Sessions whose containers could not be confirmed gone at shutdown.
     #[error("containers of sessions {0:?} could not be confirmed gone")]
     Unconfirmed(Vec<String>),
+    /// A second signal arrived while sessions were being stopped.
+    #[error("{0} during shutdown: stopped without waiting for the sessions")]
+    Interrupted(&'static str),
+}
+
+/// How long the runtime's remaining blocking work may delay the exit.
+const EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The signals that stop `sallyd`, installed before anything is started.
+struct Signals {
+    term: tokio::signal::unix::Signal,
+    int: tokio::signal::unix::Signal,
+    hup: tokio::signal::unix::Signal,
+    quit: tokio::signal::unix::Signal,
+}
+
+impl Signals {
+    fn install() -> Result<Self, DaemonError> {
+        let on = |k: SignalKind, what: &'static str| signal(k).map_err(io(what));
+        Ok(Self {
+            term: on(SignalKind::terminate(), "SIGTERM handler")?,
+            int: on(SignalKind::interrupt(), "SIGINT handler")?,
+            hup: on(SignalKind::hangup(), "SIGHUP handler")?,
+            quit: on(SignalKind::quit(), "SIGQUIT handler")?,
+        })
+    }
+
+    /// The next signal's name.
+    async fn next(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.term.recv() => "SIGTERM",
+            _ = self.int.recv() => "SIGINT",
+            _ = self.hup.recv() => "SIGHUP",
+            _ = self.quit.recv() => "SIGQUIT",
+        }
+    }
 }
 
 fn io(what: &'static str) -> impl FnOnce(std::io::Error) -> DaemonError {
@@ -171,7 +212,10 @@ pub fn run(log: &Oplog) -> Result<(), DaemonError> {
         ],
     );
     let rt = super::runtime().map_err(io("tokio runtime"))?;
-    rt.block_on(serve(log, &dirs, &config, audit, &lock, nofile))
+    let end = rt.block_on(serve(log, &dirs, &config, audit, &lock, nofile));
+    // After a second signal, work still on the blocking pool must not hold the exit.
+    rt.shutdown_timeout(EXIT_WAIT);
+    end
 }
 
 /// The panic hook: one oplog line per panic, in any thread (a session task's panic is also
@@ -190,17 +234,27 @@ fn panic_hook(log: Oplog) {
     }));
 }
 
-/// `config.toml`, or the defaults when it does not exist. Read through one bounded read.
+/// `config.toml`, or the defaults when it does not exist. Opened without following a symlink and
+/// without blocking (a FIFO would hold startup), then required to be a regular file; read
+/// through one bounded read (security review L2).
 fn read_config(path: &Path) -> Result<Config, DaemonError> {
+    use rustix::fs::{FileType, Mode, OFlags};
     let fail = |msg: String| DaemonError::Config {
         path: path.display().to_string(),
         msg,
     };
-    let file = match std::fs::File::open(path) {
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let fd = match sally_core::fd::open(path, flags, Mode::empty()) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
+        Err(rustix::io::Errno::NOENT) => return Ok(Config::default()),
+        Err(rustix::io::Errno::LOOP) => return Err(fail("a symlink is not followed".into())),
         Err(e) => return Err(fail(e.to_string())),
     };
+    let st = rustix::fs::fstat(&fd).map_err(|e| fail(e.to_string()))?;
+    if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
+        return Err(fail("not a regular file".into()));
+    }
+    let file = std::fs::File::from(fd);
     let mut text = String::new();
     let cap = u64::try_from(MAX_CONFIG_BYTES).unwrap_or(u64::MAX) + 1;
     std::io::Read::read_to_string(&mut std::io::Read::take(file, cap), &mut text)
@@ -216,6 +270,9 @@ async fn serve(
     lock: &OwnedFd,
     nofile: u64,
 ) -> Result<(), DaemonError> {
+    // First, so a signal during startup is not the default action (death, no cleanup): it
+    // waits here and is handled once `control.sock` is bound (security review M3).
+    let mut signals = Signals::install()?;
     let ids = UserIds {
         uid: rustix::process::geteuid().as_raw(),
         gid: rustix::process::getegid().as_raw(),
@@ -234,7 +291,7 @@ async fn serve(
         oplog: log.clone(),
     });
     let removed = launcher
-        .remove_orphans("")
+        .remove_orphans("", Sweep::Startup)
         .await
         .map_err(DaemonError::Orphans)?;
     log.info(
@@ -243,16 +300,17 @@ async fn serve(
         &[("count", &removed.len().to_string())],
     );
     let state = dirs.runtime.join(STATE_DIR);
-    let stale = state.clone();
-    tokio::task::spawn_blocking(move || remove_stale(&stale))
+    let dir = lock.try_clone().map_err(io("the locked directory"))?;
+    tokio::task::spawn_blocking(move || stale::remove(&dir, CONTROL_SOCK))
         .await
         .map_err(|e| DaemonError::Io {
             what: "removing stale sockets",
             source: std::io::Error::other(e.to_string()),
-        })??;
+        })?
+        .map_err(io("removing stale sockets"))?;
     let (crash, mut crashes) = CrashReporter::channel();
     let registry = Registry::new(RegistryParts {
-        launcher,
+        launcher: Arc::clone(&launcher),
         audit: Arc::clone(&audit),
         podman,
         ids,
@@ -270,21 +328,36 @@ async fn serve(
         String::new(),
         AuditLevel::default(),
     )))
-    .listen(bind_control(lock)?, ids.uid, crash);
+    .listen(bind_control(lock)?, ids.uid, crash.clone());
     log.info(LOG, "serving", &[("socket", CONTROL_SOCK)]);
+    let sweeping = crash.spawn(
+        "sweep",
+        sweep::every(launcher, String::new(), sweep::ORPHAN_SWEEP, log.clone()),
+    );
 
-    let mut term = signal(SignalKind::terminate()).map_err(io("SIGTERM handler"))?;
-    let mut int = signal(SignalKind::interrupt()).map_err(io("SIGINT handler"))?;
     let crashed = tokio::select! {
-        _ = term.recv() => None,
-        _ = int.recv() => None,
-        Some(c) = crashes.recv() => Some(c),
+        s = signals.next() => {
+            log.info(LOG, "shutting down", &[("why", s)]);
+            None
+        }
+        Some(c) = crashes.recv() => {
+            log.info(LOG, "shutting down", &[("why", c.task)]);
+            Some(c)
+        }
     };
-    let why = crashed.as_ref().map_or("signal", |c| c.task);
-    log.info(LOG, "shutting down", &[("why", why)]);
-    control.shutdown().await;
-    let _ = rustix::fs::unlinkat(lock, CONTROL_SOCK, rustix::fs::AtFlags::empty());
-    let unconfirmed = registry.shutdown().await;
+    sweeping.abort();
+    let stopping = async {
+        control.shutdown().await;
+        let _ = rustix::fs::unlinkat(lock, CONTROL_SOCK, rustix::fs::AtFlags::empty());
+        registry.shutdown().await
+    };
+    let unconfirmed = tokio::select! {
+        u = stopping => u,
+        s = signals.next() => {
+            log.error(LOG, "second signal: stopping now", &[("signal", s)]);
+            return Err(DaemonError::Interrupted(s));
+        }
+    };
     if !unconfirmed.is_empty() {
         log.error(
             LOG,
@@ -329,22 +402,6 @@ async fn podman(dirs: &Dirs, config: &Config) -> Result<(Podman, CheckedRuntime)
     })?
 }
 
-/// Removes what a previous `sallyd` left in the runtime directory: the session socket
-/// directories (`sessions/`) and `control.sock`. The staged data under the data directory is
-/// kept for review.
-fn remove_stale(state: &Path) -> Result<(), DaemonError> {
-    match std::fs::remove_dir_all(state.join("sessions")) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(io("removing stale session sockets")(e)),
-    }
-    match std::fs::remove_file(state.join(CONTROL_SOCK)) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(io("removing a stale control.sock")(e)),
-    }
-}
-
 /// Binds `control.sock` in the locked directory, through its fd (`/proc/self/fd/N`), 0600.
 fn bind_control(dir: &OwnedFd) -> Result<UnixListener, DaemonError> {
     let path = Path::new("/proc/self/fd")
@@ -356,4 +413,63 @@ fn bind_control(dir: &OwnedFd) -> Result<UnixListener, DaemonError> {
     l.set_nonblocking(true)
         .map_err(io("control.sock nonblocking"))?;
     UnixListener::from_std(l).map_err(io("control.sock listener"))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/serve-tests")
+            .join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn refusal(path: &Path) -> String {
+        match read_config(path) {
+            Err(DaemonError::Config { msg, .. }) => msg,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Security review L2: only a regular file is read; a FIFO is refused at once instead of
+    /// blocking startup, and neither a symlink nor a directory is read.
+    #[test]
+    fn the_config_is_a_regular_file_never_a_fifo_or_a_symlink() {
+        let d = scratch("config");
+        let file = d.join("config.toml");
+        assert_eq!(
+            read_config(&file).unwrap().sandbox.podman_path,
+            Config::default().sandbox.podman_path,
+            "missing: the defaults"
+        );
+        std::fs::write(&file, "[sandbox]\nruntime_path = \"/opt/crun\"\n").unwrap();
+        assert_eq!(
+            read_config(&file).unwrap().sandbox.runtime_path,
+            Some(PathBuf::from("/opt/crun"))
+        );
+        let link = d.join("link.toml");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert_eq!(refusal(&link), "a symlink is not followed");
+        assert_eq!(refusal(&d), "not a regular file");
+        let fifo = d.join("fifo.toml");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(refusal(&fifo)));
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("reading a FIFO config blocked");
+        assert_eq!(got, "not a regular file");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
 }

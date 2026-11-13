@@ -271,8 +271,11 @@ are released only once the container is confirmed gone.
    still conflicts. No sandbox ever holds write access to an ancestor, a descendant or the same
    directory as another session's mount, so no live sandbox can swap what another session's
    launch scan pinned. `Launcher::remove_orphans` removes `sp-ws-*`/`sp-h-*` containers a
-   previous `sallyd` left running (audited `sandbox.orphan_removed`); `sallyd` calls it before
-   it accepts the first launch.
+   previous `sallyd` left running (audited `sandbox.orphan_removed` with `sweep: startup`);
+   `sallyd` calls it before it accepts the first launch, then every 60 s (`sweep: periodic`,
+   architect Q61): a `podman create` a killed `sallyd` left running can make its container
+   after the startup sweep. A launch reserves its id before it creates anything, so no sweep
+   takes a launch in progress; a failed periodic sweep is an oplog line, retried at the next.
 2. **Checks.** The runtime binary and the podman binary are re-checked (B5). Everything podman
    reads from Sallyport's state is re-checked too: the state directory is private, `hooks/` and
    `config/` are empty, `mounts.conf` is empty, and `containers.conf` is byte-identical to what
@@ -699,7 +702,10 @@ TODO(#28): the harness container and `llm.sock` (Task 13, Task 12 PR C).
 - `request`: a client asked.
 - `timeout`: `runtime.timeout`; `session.timeout` is audited first.
 - `crash`: a session task panicked; the oplog line comes first, then `session.crash`.
-- `shutdown`: SIGTERM or SIGINT; `control.sock` is closed first.
+- `shutdown`: SIGTERM, SIGINT, SIGHUP or SIGQUIT (handlers installed before startup work, so a
+  signal during it is handled once `control.sock` is bound); `control.sock` is closed first,
+  then every session stops at once. A second signal meanwhile exits non-zero at once.
+  TODO(#92): a `podman --timeout` backstop for a `sallyd` killed outright (Q60).
 - `start-failed`.
 - `exited`: the container ended on its own. The registry checks the init's `/proc/<pid>` fd
   every 250 ms (Q62); a lookup through it fails once that process is gone, even if its pid is
