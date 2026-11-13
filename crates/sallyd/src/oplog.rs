@@ -420,13 +420,23 @@ mod tests {
             log.info("t", "line", &[("i", &i.to_string())]);
         }
         assert!(start.elapsed() < Duration::from_secs(5));
-        assert!(log.dropped() >= 49, "{}", log.dropped());
+        let lost = log.dropped();
+        assert!(lost >= 49, "{lost}");
         drop(held);
-        log.info("t", "after", &[]);
+        // Nothing is logged until the queue has drained: a line logged while it is still full
+        // would be dropped too and reported in a second note.
+        assert!(log.flush(Duration::from_secs(5)));
         let text = wait_for(&sink, "lines dropped");
         // The note counts what was lost, once.
         assert_eq!(text.matches("lines dropped").count(), 1, "{text}");
-        assert!(!text.contains("count=\"0\""), "{text}");
+        assert!(text.contains(&format!("count=\"{lost}\"")), "{text}");
+        log.info("t", "after", &[]);
+        let text = wait_for(&sink, "\"after\"");
+        assert_eq!(
+            text.matches("lines dropped").count(),
+            1,
+            "no note for nothing: {text}"
+        );
     }
 
     /// `flush` returns once every queued line is written, and gives up at its limit on a stuck

@@ -192,6 +192,7 @@ mod tests {
             for _ in 0..SESSION_LOOKUPS {
                 release.send(()).unwrap();
             }
+            drop(release);
             for h in held {
                 assert!(h.await.unwrap().is_ok());
             }
@@ -225,6 +226,9 @@ mod tests {
             for _ in 0..MAX_LOOKUPS {
                 release.send(()).unwrap();
             }
+            // A lookup that starts only now returns at once: a wrong share fails the test
+            // below instead of hanging it.
+            drop(release);
             for h in held {
                 assert!(h.await.unwrap().is_ok());
             }
