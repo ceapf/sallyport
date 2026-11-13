@@ -182,6 +182,9 @@ impl Recorder {
             })
         })
         .await;
+        if wrote.is_err() {
+            self.refused("", "audit write panicked");
+        }
         matches!(wrote, Ok(Wrote::Yes))
     }
 
@@ -574,6 +577,31 @@ mod tests {
         let text = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
         assert!(text.contains("entry refused after session.stop"), "{text}");
         assert!(text.contains("approval.decide"), "{text}");
+    }
+
+    /// A sink write that panics is a failed write with a note of its own (the next write then
+    /// reads the poisoned order).
+    #[tokio::test]
+    async fn a_panicking_sink_write_is_noted() {
+        struct Panics;
+        impl AuditSink for Panics {
+            fn append(
+                &self,
+                _: NewEntry,
+                _: AuditLevel,
+            ) -> Result<(), sally_core::audit::AuditError> {
+                panic!("the sink panicked")
+            }
+        }
+        let lines = Lines::default();
+        let log = Oplog::new(lines.clone());
+        let rec =
+            Recorder::new(Arc::new(Panics), "sess-a".into(), AuditLevel::Full).logging(log.clone());
+        assert!(!rec.append(note(&rec, "tool.run")).await);
+        assert!(log.flush(std::time::Duration::from_secs(5)));
+        let text = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("audit write panicked"), "{text}");
+        assert!(text.contains("sess-a"), "{text}");
     }
 
     /// A poisoned `order` refuses the write too, but its note says so: it is not a stop.
