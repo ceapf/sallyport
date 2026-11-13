@@ -575,6 +575,8 @@ impl Lx {
             data: self.f.root.join("home/.local/share/sallyport"),
             default_image,
             oplog,
+            // The production hub with no watcher: every prompt is denied `no-approver`.
+            approver: Arc::new(sallyd::approvals::hub::Hub::default()),
             // A supervisor panic shows as a missing stop in the test; nobody reads these.
             crash: sallyd::daemon::crash::CrashReporter::channel().0,
             scope: self.scope.clone(),

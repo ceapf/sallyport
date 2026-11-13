@@ -3,6 +3,7 @@
 pub mod action;
 pub mod glob;
 pub mod handler;
+pub mod hub;
 pub mod policy;
 pub mod queue;
 pub mod render;

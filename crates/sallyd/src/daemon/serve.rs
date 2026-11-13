@@ -33,6 +33,8 @@ use tokio::signal::unix::{SignalKind, signal};
 use super::crash::{CrashReporter, payload};
 use super::startup::{self, STATE_DIR, StartError};
 use super::{process, stale, sweep};
+use crate::approvals::Approver;
+use crate::approvals::hub::Hub;
 use crate::oplog::Oplog;
 use crate::rpc::control::Control;
 use crate::rpc::record::Recorder;
@@ -337,6 +339,8 @@ async fn serve(
         })?
         .map_err(io("removing stale sockets"))?;
     let (crash, mut crashes) = CrashReporter::channel();
+    // The one approver: every session's desk tells it, control watchers hear it (Q73).
+    let hub = Arc::new(Hub::default());
     let registry = Registry::new(RegistryParts {
         launcher: Arc::clone(&launcher),
         audit: Arc::clone(&audit),
@@ -348,6 +352,7 @@ async fn serve(
         // `runtime.image` is refused `no-default-image`. TODO(#88): the bundled image.
         default_image: None,
         oplog: log.clone(),
+        approver: Arc::clone(&hub) as Arc<dyn Approver>,
         crash: crash.clone(),
         scope: String::new(),
     });
