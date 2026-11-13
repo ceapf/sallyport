@@ -19,7 +19,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sally_core::audit::Redactor;
-use sally_core::text::escape_capped;
+use sally_core::text::escape_quoted_capped;
 
 /// Largest value (and message) after escaping.
 pub const MAX_VALUE: usize = 4096;
@@ -182,14 +182,16 @@ fn now() -> String {
     format!("{}.{:03}", d.as_secs(), d.subsec_millis())
 }
 
-/// One neutralized text: redacted, escaped, capped, with `"` escaped too (values are quoted).
+/// One neutralized text: redacted, then escaped with `"` escaped too (values are quoted), then
+/// capped; the cap measures the escaped text.
 fn clean(raw: &str, redactor: &Redactor) -> String {
     let redacted = redactor.redact_str(raw);
-    escape_capped(redacted.as_bytes(), MAX_VALUE).replace('"', "\\x22")
+    escape_quoted_capped(redacted.as_bytes(), MAX_VALUE)
 }
 
-/// The line for one event, newline included. `component` and the field keys are the caller's
-/// constants; they are escaped anyway.
+/// The line for one event, newline included. `ts`, `component` and the field keys are the
+/// caller's own; they are cleaned anyway. The head holds three cleaned texts, so it always fits
+/// [`MAX_LINE`]; only fields are dropped.
 #[must_use]
 pub fn format_line(
     ts: &str,
@@ -199,13 +201,13 @@ pub fn format_line(
     fields: &[(&str, &str)],
     redactor: &Redactor,
 ) -> String {
-    let head = format!(
-        "{ts} {} {} \"{}\"",
+    let mut line = format!(
+        "{} {} {} \"{}\"",
+        clean(ts, redactor),
         level.as_str(),
         clean(component, redactor).replace(' ', "_"),
         clean(msg, redactor)
     );
-    let mut line = escape_capped(head.as_bytes(), MAX_LINE);
     for (i, (k, v)) in fields.iter().enumerate() {
         let key = clean(k, redactor).replace(' ', "_");
         let field = format!(" {key}=\"{}\"", clean(v, redactor));
@@ -264,6 +266,36 @@ mod tests {
         assert!(l.starts_with("1 info c_d "), "{l}");
         let body = l.trim_end_matches('\n');
         assert!(body.bytes().all(|b| (b' '..=b'~').contains(&b)), "{l}");
+    }
+
+    #[test]
+    fn backslashes_and_quotes_are_escaped_exactly_once() {
+        let l = format_line(
+            "1",
+            Level::Info,
+            "c",
+            "a\\b\"c",
+            &[("k", "d\\e\"f")],
+            &none(),
+        );
+        assert_eq!(l, "1 info c \"a\\\\b\\x22c\" k=\"d\\\\e\\x22f\"\n");
+    }
+
+    #[test]
+    fn a_value_of_quotes_keeps_its_cap() {
+        let quotes = "\"".repeat(MAX_VALUE);
+        let l = format_line("1", Level::Info, "c", &quotes, &[("k", &quotes)], &none());
+        let shown = MAX_VALUE / 4;
+        let cut = format!("{}...(+{} bytes)", "\\x22".repeat(shown), MAX_VALUE - shown);
+        assert_eq!(l, format!("1 info c \"{cut}\" k=\"{cut}\"\n"));
+    }
+
+    #[test]
+    fn the_largest_head_fits_the_line() {
+        let big = "\u{e9}".repeat(MAX_VALUE);
+        let l = format_line(&big, Level::Error, &big, &big, &[("k", "v")], &none());
+        assert!(l.ends_with(" k=\"v\"\n"), "{}", l.len());
+        assert!(l.len() <= MAX_LINE + 1);
     }
 
     #[test]
