@@ -328,12 +328,32 @@ fn mock3() -> String {
     common::egress::canary("MOCK3_TOKEN")
 }
 
-const LABEL: &str = "[REDACTED:GITHUB_TOKEN]";
+/// The GitHub grant's rendered header value, the run an echo of it covers.
+fn rendered() -> String {
+    format!("Bearer {}", gh())
+}
+
+/// `upstream` as the sandbox must see it: each echo of the rendered value replaced by the
+/// session's filler (`*`: no form of these canaries holds it), at its offset, at its length.
+fn filled(upstream: &str) -> String {
+    upstream.replace(&rendered(), &"*".repeat(rendered().len()))
+}
+
+/// The `egress.response` entries of a stopped session, by host.
+fn responses(lx: &Lx, host: &str) -> Vec<serde_json::Value> {
+    lx.events
+        .all()
+        .into_iter()
+        .filter(|(e, a)| e == "egress.response" && a["host"] == host)
+        .map(|(_, a)| a)
+        .collect()
+}
 
 /// RT-SEC-03: injection scope. Controls: `Credentials::prepare`, called with the tunnel's own host
 /// (`intercept::forward`); the route decision (`Route::Splice` for `mock2.test`); the redaction
 /// of the response (`redact::Redacted`). Setting every grant on every host fails the mock2/mock3
-/// assertions; skipping the redaction fails the label assertion.
+/// assertions; skipping the redaction fails the filler assertion; intercepting `mock2.test`
+/// gives it an `egress.response`.
 #[test]
 fn rt_sec_03_a_credential_reaches_only_its_own_grant_host() {
     rt().block_on(async {
@@ -381,10 +401,14 @@ fn rt_sec_03_a_credential_reaches_only_its_own_grant_host() {
         // The sandbox's view of the echo: redacted, same length as the upstream sent.
         assert!(out.starts_with("HTTP/1.1 200 OK"), "{out}");
         assert!(!out.contains(&gh()), "{out}");
-        assert!(out.contains(LABEL), "{out}");
         let (body, n) = body_and_length(&out);
-        assert_eq!((body.len(), n), (seen[0].len(), seen[0].len()));
+        assert_eq!(body, filled(&seen[0]));
+        assert_eq!(n, seen[0].len());
         lx.stop(r).await;
+        // Each intercepted response has its entry; the spliced one has none (architect Q13).
+        assert_eq!(responses(&lx, "mock.test").len(), 1);
+        assert_eq!(responses(&lx, "mock3.test").len(), 1);
+        assert!(responses(&lx, "mock2.test").is_empty());
     });
 }
 
@@ -488,8 +512,10 @@ fn rt_sec_05_a_redirect_is_returned_unfollowed_and_its_target_gets_no_credential
 }
 
 /// RT-SEC-06: the upstream echoes the credential in its body and in a response header; both
-/// reach the sandbox as same-length filler beginning with the label. Controls: `redact::headers`
-/// (the header) and `redact::Redacted` (the body), with the forms built by `Credentials::new`.
+/// reach the sandbox as a run of the session's filler at the echo's offset and length, and the
+/// response's `egress.response` names the secret and those bytes. Controls: `redact::headers`
+/// (the header), `redact::Redacted` (the body), with the forms built by `Credentials::new`; the
+/// per-secret count in `redact::Stream` and the append in `intercept_report` (the entry).
 #[test]
 fn rt_sec_06_an_echo_in_body_and_header_is_redacted_at_the_same_length() {
     rt().block_on(async {
@@ -507,13 +533,20 @@ fn rt_sec_06_an_echo_in_body_and_header_is_redacted_at_the_same_length() {
         assert!(seen[0].contains(&gh()), "{}", seen[0]);
         assert!(!out.contains(&gh()), "{out}");
         let echoed = header_values(&out, "x-echo-authorization");
-        assert_eq!(echoed.len(), 1, "{out}");
-        assert!(echoed[0].starts_with(LABEL), "{out}");
-        assert_eq!(echoed[0].len(), "Bearer ".len() + gh().len());
+        assert_eq!(echoed, [filled(&rendered())], "{out}");
         let (body, n) = body_and_length(&out);
-        assert!(body.contains(LABEL), "{body}");
-        assert_eq!((body.len(), n), (seen[0].len(), seen[0].len()));
+        assert_eq!(body, filled(&seen[0]));
+        assert_eq!(n, seen[0].len());
         lx.stop(r).await;
+        let entries = responses(&lx, "mock.test");
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        let bytes = 2 * rendered().len() as u64;
+        assert_eq!(
+            entries[0]["redacted"],
+            json!([{"secret": "secret:GITHUB_TOKEN", "bytes": bytes}])
+        );
+        assert_eq!(entries[0]["redacted_bytes"], json!(bytes));
+        assert_eq!(entries[0]["end"], json!("complete"));
     });
 }
 
@@ -550,7 +583,9 @@ fn rt_sec_06b_compression_is_stripped_and_an_encoded_echo_is_refused() {
         assert!(plain.starts_with("HTTP/1.1 200 OK"), "{plain}");
         assert!(header_values(&plain, "content-encoding").is_empty());
         assert!(plain.contains("GET /echo-headers HTTP/1.1"), "{plain}");
-        assert!(plain.contains(LABEL) && !plain.contains(&gh()), "{plain}");
+        assert!(!plain.contains(&gh()), "{plain}");
+        let (body, _) = body_and_length(&plain);
+        assert_eq!(body, filled(&seen[0]));
         assert!(encoded.starts_with("HTTP/1.1 502 "), "{encoded}");
         assert!(encoded.contains("upstream-encoded"), "{encoded}");
         assert!(!encoded.contains("GZIPPED"), "{encoded}");

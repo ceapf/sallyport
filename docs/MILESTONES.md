@@ -43,7 +43,7 @@ Tasks
 14. `/security-scan`; security-reviewer full pass on `crates/`; `/code-review`; doc-updater (haiku) for README quickstart; `docs/reports/M1.md` — per routing
 
 Acceptance
-- `sally sandbox run --manifest manifests/examples/coding-agent.yaml -- sh` yields a shell that: cannot resolve DNS, cannot open TCP to anything, *can* `curl -x http://127.0.0.1:3128 https://pypi.org/simple/` and gets 403 from the proxy for `https://example.org/`; sees only `/workspace/myproject`; cannot find the canary secret anywhere; `curl -x … http://api.github.com/user` against the mock upstream shows the injected header upstream and `[REDACTED:GITHUB_TOKEN]` in any echo.
+- `sally sandbox run --manifest manifests/examples/coding-agent.yaml -- sh` yields a shell that: cannot resolve DNS, cannot open TCP to anything, *can* `curl -x http://127.0.0.1:3128 https://pypi.org/simple/` and gets 403 from the proxy for `https://example.org/`; sees only `/workspace/myproject`; cannot find the canary secret anywhere; `curl -x … http://api.github.com/user` against the mock upstream shows the injected header upstream, any echo of it replaced by filler of the same length, and the response's `egress.response` audit entry naming `secret:GITHUB_TOKEN` and the bytes redacted.
 - `sally audit verify` passes; tampering a byte fails it.
 - Snapshot argv contains none of the forbidden flags.
 - Red-team must pass: RT-FS-01..11, RT-NET-01..11, RT-SEC-01..08, RT-AG-01..06, RT-AG-08, RT-AG-09, RT-AUD-01..02, RT-MAN-01..03, RT-SUP-01.

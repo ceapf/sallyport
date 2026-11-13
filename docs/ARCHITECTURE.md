@@ -664,6 +664,7 @@ sequenceDiagram
     X-->>E: 200 + body (no Content-Encoding or identity, plain or chunked)
     E->>E: check response head (no Content-Encoding but identity, no 101); redact header lines; cap the body; never follow 3xx
     E-->>P: response, body redacted as it streams (same length)
+    E->>E: audit egress.response {host, port, target, status, end, redacted_bytes, redacted} before the body's end goes out
     E->>E: audit egress.close {host, port, address, bytes_up, bytes_down, end, intercept, requests, statuses}
 ```
 An allowed host without a grant is spliced: after `egress.allow {…, intercept: false}` and the
@@ -805,7 +806,8 @@ sallyport/
   slot or admission extra meanwhile, so a refused connection ends at most 3 s after its
   decision. `head-timeout` gets no reply and no drain. Residual: a client still sending past the
   drain bound may lose the reply through the shim (#76); its entry is not lost.
-- **Egress audit events** (Task 8). Written at every `audit.level`, each before its effect:
+- **Egress audit events** (Task 8). Written at every `audit.level`, each before its effect;
+  `egress.response` and `egress.close` are records of what happened, written as below:
   - `egress.allow` (decision `allow`), before the first dial and the `200`: `{host, port,
     addresses, intercept}` — the addresses that passed the filter, at most 16, in the order they
     are tried; `intercept` is true for a grant host (Task 9a-2).
@@ -814,6 +816,18 @@ sallyport/
     target escaped and cut as below; `injected` lists `secret:NAME` for each grant set on the
     request (Task 9a-3; never a value). The grant headers are built before this entry and set
     only after it is written (architect D13, ruling Q4); a failed append drops them unsent.
+  - `egress.response` (no decision; intercepted tunnels only), one per response whose head is
+    forwarded (refusals have their own entry instead): `{host, port, target, target_bytes,
+    target_cut, status, end, redacted_bytes, redacted}`; `redacted` lists, in grant order,
+    `{secret: "secret:NAME", bytes}` for each secret whose forms covered emitted bytes of the
+    header values and body together (a byte two secrets cover counts for both), `[]` when none;
+    `redacted_bytes` is the filler bytes in all; `end` is `complete`, the tunnel's end for a cut
+    (`limit`, `upstream-closed`, `error`) or `dropped`. It is appended before the body's end
+    reaches the client (before the head, for a body known empty: HEAD, 204, 304); a failed append
+    withholds that end and the tunnel ends `error`. A body dropped before its end (client gone,
+    idle, session stop) still gets its entry, from a task, with the counts so far; it may land
+    after `egress.close` (#72). Residual: redacted bytes streamed mid-body precede the entry
+    (Task 9a-3, architect Q13, superseding D13's "no redaction count").
   - `egress.deny` (decision `deny`), before the reply: `{reason, target, target_bytes,
     target_cut}` (the request-target escaped and cut at 256 bytes, never a header), or `{reason,
     head_bytes}` when no target was parsed; `filter: "host-addresses-unavailable"` when the
@@ -900,7 +914,8 @@ sallyport/
     the grants' values through the starter's `SecretSource` (production: the 0600 store file;
     every other value is dropped, wiped, before `prepare` returns): a missing one refuses the
     launch (`secret-missing`), an unreadable store too (`secret-store`), a grant that cannot be
-    injected as well (`secret-grant`). `Credentials` holds each grant's rendered header value as
+    injected or redacted as well (`secret-grant`), and a session whose forms hold every filler
+    candidate (`secret-filler`). `Credentials` holds each grant's rendered header value as
     a `Secret` and the redaction of every form of every session secret (sally-core's
     `secret_forms`, as the audit redactor, plus each rendered value); it has one constructor and
     `Interception::new` refuses leaves and credentials naming different hosts. Each request builds
@@ -909,11 +924,14 @@ sallyport/
     line hyper writes (`name: value`); a covered byte in the name or the `: ` refuses it
     (`upstream-echoed-secret`), otherwise the value is redacted in place. The body passes through
     the redactor outside the cap: every byte any occurrence covers (found in the original bytes)
-    becomes the label `[REDACTED:NAME]` cut to the run, then `*`, so lengths and framing never
-    change (decision 2). The redactor holds back the last `longest form − 1` bytes until more
-    arrive or the response completes (decision 3): a streamed response lags by that much; a cut
-    or failed response drops them, wiped. Spliced hosts are never scanned (they never get a
-    secret).
+    becomes the session's filler, the first of `* # ~ ^ | ! $ @` no form holds (a session where
+    every one occurs is refused `secret-filler`), so lengths and framing never change and no form
+    survives (decisions 2 and 7 as ruled R2; architect Q6, Q7). The forms are sally-core's
+    `SessionForms`, built once and read in place (Q11). A form in a header name or its `: ` is
+    also looked for in any ASCII case. The redactor holds back the last `longest form − 1` bytes
+    until more arrive or the response completes (decision 3): a streamed response lags by that
+    much; a cut or failed response drops them, wiped. Spliced hosts are never scanned (they never
+    get a secret).
   - Limits: 100 headers either way. Head size, exact: a request head (request line and blank
     line included) passes iff it is at most 7168 bytes (7 KiB) and is refused from 7169 (431,
     `egress.limit head-too-large`); a response head passes iff at most 61440 bytes (60 KiB) and
@@ -962,7 +980,7 @@ sallyport/
   an error, never skipped. Certificates the verifier cannot use are skipped and counted; none
   usable is an error. Any error refuses the launch (`sandbox.refuse` reason `trust-roots`; a CA or
   file failure is `session-ca`; the credentials, read first, refuse with `secret-missing`,
-  `secret-store`, `basic-unsupported` or `secret-grant`: Task 9a-3). One load feeds the upstream verifier and `ca-bundle.pem`. The
+  `secret-store`, `basic-unsupported`, `secret-grant` or `secret-filler`: Task 9a-3). One load feeds the upstream verifier and `ca-bundle.pem`. The
   file list and owner are constructor arguments of the egress starter (Task 8 decision 10);
   production passes these. Doctor V17 applies the same checks.
 - **RPC and LLM audit events** (Task 7). All are written at every `audit.level` except
@@ -1074,7 +1092,8 @@ sallyport/
   characters that do not depend on neighbouring bytes (patterns under 12 characters skipped), so
   the base64 of any string containing the secret is caught (AMENDMENTS-02 B1). Matches become
   `[REDACTED:NAME]`. The token proxy's response redaction uses the same forms
-  (`sally-core::audit::secret_forms`) with a same-length filler (Task 9a-3).
+  (`sally-core::audit::secret_forms`, held per session in `SessionForms`) with a same-length
+  filler and no name (Task 9a-3).
 - **Tauri bridge**: Rust side exposes one command `rpc(method: String, params: Value)` that
   forwards to `control.sock` **only** for methods in a compile-time allowlist (no
   `secrets.list` of values exists anyway). Capabilities file grants `core:default` only.
