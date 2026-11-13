@@ -11,8 +11,23 @@
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
+use sally_core::manifest::{MountMode, ValidatedManifest};
+
 use super::profiles::write_profiles;
 use super::types::{OverlayDirs, SessionPaths};
+
+/// The manifest indices of `v`'s `staged` mounts: the only `stage/<n>` directories a session
+/// gets. The staged-changes listing trusts that set (architect Q83), so this is where "only
+/// staged mounts are listed" holds.
+#[must_use]
+pub fn staged_indices(v: &ValidatedManifest) -> Vec<usize> {
+    v.mounts()
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.mode == MountMode::Staged)
+        .map(|(i, _)| i)
+        .collect()
+}
 
 /// Why a session directory could not be prepared.
 #[derive(Debug, thiserror::Error)]
@@ -225,6 +240,48 @@ mod tests {
 
     fn msg<T: std::fmt::Debug>(r: Result<T, DirError>) -> String {
         r.unwrap_err().msg
+    }
+
+    /// A manifest with `modes[i]` for mount `~/m<i>`. Under target/: the denylist refuses `/tmp`.
+    fn manifest(tag: &str, modes: &[&str]) -> ValidatedManifest {
+        use sally_core::manifest::{HostEnv, load};
+        let home = std::env::current_dir()
+            .unwrap()
+            .join("../../target/dirs-unit")
+            .join(format!("{}-{tag}", std::process::id()));
+        let mut body = String::from(
+            "apiVersion: sallyport/v1\nkind: Manifest\nname: t\nmodel:\n  ref: any\n\
+             filesystem:\n  mounts:\n",
+        );
+        for (i, mode) in modes.iter().enumerate() {
+            std::fs::create_dir_all(home.join(format!("m{i}"))).unwrap();
+            body.push_str(&format!(
+                "    - {{host: \"~/m{i}\", guest: /workspace/m{i}, mode: {mode}}}\n"
+            ));
+        }
+        let env = HostEnv {
+            home: home.clone(),
+            other_homes: Vec::new(),
+            xdg_config_home: None,
+            xdg_data_home: None,
+            xdg_runtime_dir: None,
+            podman_storage: Vec::new(),
+            nproc: 8,
+            mem_bytes: 16 << 30,
+        };
+        let v = load(&body, &env, &std::collections::BTreeSet::new())
+            .unwrap()
+            .manifest;
+        let _ = std::fs::remove_dir_all(&home);
+        v
+    }
+
+    #[test]
+    fn only_staged_mounts_get_a_stage_index() {
+        let v = manifest("mixed", &["rw", "staged", "ro", "staged"]);
+        assert_eq!(staged_indices(&v), [1, 3]);
+        let v = manifest("none", &["rw", "ro"]);
+        assert_eq!(staged_indices(&v), Vec::<usize>::new());
     }
 
     /// Each check of `private`, alone: an existing entry with and without `fresh`, and an

@@ -16,7 +16,7 @@ use sallyd::daemon::crash::CrashReporter;
 use sallyd::rpc::agent::ToolHandler;
 use sallyd::rpc::mcp::ToolOutcome;
 use sallyd::rpc::record::Recorder;
-use sallyd::sandbox::{DiskFloor, Running, staged_changes};
+use sallyd::sandbox::{DiskFloor, Running};
 use sallyd::tools::exec::PodmanExec;
 use sallyd::tools::ops::Ops;
 use sallyd::tools::shell::{Runner, Status};
@@ -430,7 +430,7 @@ fn file_tools_write_where_the_workspace_writes() {
             .await;
         assert!(!out.is_error, "{}", out.text);
         assert_eq!(tree_state(&st), before);
-        let changes: Vec<String> = staged_changes(&v, &x.paths("files"))
+        let changes: Vec<String> = common::changes(&x.paths("files"))
             .unwrap()
             .into_iter()
             .map(|c| format!("{} {:?}", c.path.display(), c.kind))

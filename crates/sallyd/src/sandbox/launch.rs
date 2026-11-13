@@ -41,7 +41,7 @@ use crate::egress::net::{EgressError, EgressHandle, EgressStarter, NET_SOCK, Ses
 use super::argv::workspace_argv;
 use super::budget::session_cost;
 use super::commands::container_id;
-use super::dirs::SessionDirs;
+use super::dirs::{SessionDirs, staged_indices};
 use super::disk::DiskFloor;
 use super::inside::{Expect, check_in_container};
 use super::overlap::{Sessions, claims};
@@ -551,14 +551,7 @@ impl Launcher {
         scan: &LaunchScan,
         progress: &mut Progress,
     ) -> Result<Vec<String>, LaunchError> {
-        let staged: Vec<usize> = req
-            .manifest
-            .mounts()
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| m.mode == MountMode::Staged)
-            .map(|(i, _)| i)
-            .collect();
+        let staged = staged_indices(&req.manifest);
         let overlays = scan.git().iter().map(|g| g.dirs().len()).sum();
         let (paths, xdg) = (req.paths.clone(), self.xdg_runtime_dir.clone());
         let created =

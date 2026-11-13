@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use sallyd::sandbox::{
     ChangeKind, PinKind, ScanError, ScanLimits, SessionDirs, VerifiedModel, check_runtime_dir,
-    claims, scan_mounts, staged_changes,
+    claims, scan_mounts, staged_indices,
 };
 
 mod common;
@@ -464,21 +464,25 @@ fn pending_paths_are_bounded_at_exactly_16_mib() {
     assert!(e.to_string().contains("bytes of pending paths"), "{e}");
 }
 
-/// `staged_changes` lists the upper directories of `staged` mounts only, tagged by mount: an
-/// upper directory at a `rw` mount's index is not a change (the RT-FS-15 listing, host side).
+/// Only a `staged` mount gets a stage directory, so only it is listed (the RT-FS-15 listing,
+/// host side). The listing reads no manifest (architect Q81) and lists every stage directory;
+/// the guarantee is where those are made (`staged_indices`, architect Q83): for a `rw` mount at
+/// 0 and a `staged` one at 1, `stage/1` exists and `stage/0` does not.
 #[test]
-fn staged_changes_list_only_staged_mounts() {
+fn only_staged_mounts_get_a_stage_dir_and_a_listing() {
     let f = Fx::new();
     let v = f.load(&mounts(&[
         mount("~/code/other", "/workspace/o", "rw"),
         mount("~/code/myproject", "/workspace/p", "staged"),
     ]));
-    for (n, name) in [(0, "not-staged.txt"), (1, "new.txt")] {
-        let upper = f.paths.stage(n).upper;
-        std::fs::create_dir_all(&upper).unwrap();
-        std::fs::write(upper.join(name), "x").unwrap();
-    }
-    let found: Vec<_> = staged_changes(&v, &f.paths)
+    let xdg = f.root.join("run");
+    std::fs::set_permissions(&xdg, std::fs::Permissions::from_mode(0o700)).unwrap();
+    SessionDirs::create(&f.paths, &xdg, &staged_indices(&v), 0).unwrap();
+    let stage = f.paths.data_root().join("stage");
+    assert!(stage.join("1").is_dir());
+    assert!(!stage.join("0").exists());
+    std::fs::write(f.paths.stage(1).upper.join("new.txt"), "x").unwrap();
+    let found: Vec<_> = changes(&f.paths)
         .unwrap()
         .into_iter()
         .map(|c| (c.mount, c.path.display().to_string(), c.kind))
