@@ -357,13 +357,23 @@ async fn exchange(sock: &Path, lines: &[Value]) -> Vec<Value> {
 /// RT-AG-08 (foreign-id clause) through the registry, B live (#61): a request on A's
 /// `agent.sock` naming B's session id in the arguments, in `_meta`, in `params` or as an extra
 /// member reaches only A's tool handler, and every entry it causes carries A's id, never B's.
+/// A and B grant `fs_list` over different directories at the same guest path, so the listing
+/// shows whose tools served the call.
 #[test]
 fn rt_ag_08_a_foreign_session_id_reaches_only_its_own_session() {
     rt().block_on(async {
         let r = registry();
-        let v = Arc::new(r.x.f.load(""));
-        let a = r.reg.start(Arc::clone(&v)).await.unwrap();
-        let b = r.reg.start(v).await.unwrap();
+        let session = |dir: &str, file: &str| {
+            let at = r.x.f.root.join(format!("home/code/{dir}"));
+            std::fs::create_dir_all(&at).unwrap();
+            std::fs::write(at.join(file), b"x").unwrap();
+            Arc::new(r.x.f.load(&format!(
+                "{}tools:\n  builtin: [fs_list]\n",
+                mounts(&[mount(&format!("~/code/{dir}"), "/workspace/p", "ro")])
+            )))
+        };
+        let a = r.reg.start(session("rt-a", "only-a.txt")).await.unwrap();
+        let b = r.reg.start(session("rt-b", "only-b.txt")).await.unwrap();
         let sock = r.x.session_paths(&a.id).harness_sockets().join(AGENT_SOCK);
         let meta = json!({
             "io.modelcontextprotocol/protocolVersion": "2026-07-28",
@@ -378,7 +388,10 @@ fn rt_ag_08_a_foreign_session_id_reaches_only_its_own_session() {
             &[
                 json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                        "params": {"_meta": foreign, "name": "fs_list",
-                                  "arguments": {"session": b.id}}}),
+                                  "arguments": {"path": "/workspace/p"}}}),
+                json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                       "params": {"_meta": meta, "name": "fs_list",
+                                  "arguments": {"path": "/workspace/p", "session": b.id}}}),
                 json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
                        "params": {"_meta": meta, "name": "fs_list", "session": b.id}}),
                 json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "session": b.id,
@@ -386,12 +399,17 @@ fn rt_ag_08_a_foreign_session_id_reaches_only_its_own_session() {
             ],
         )
         .await;
-        // The first is a call (A's tools deny an ungranted tool); the others are malformed.
-        assert_eq!(replies[0]["result"]["isError"], json!(true), "{replies:?}");
-        assert!(replies[1].get("error").is_some(), "{replies:?}");
+        // B's id in `_meta`: served by A's tools over A's mount. In the arguments: a denied call
+        // (the tool's arguments are strict). In `params` or the request: malformed.
+        assert_eq!(replies[0]["result"]["isError"], json!(false), "{replies:?}");
+        let listing = replies[0]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(listing.contains("only-a.txt"), "{listing}");
+        assert!(!listing.contains("only-b.txt"), "{listing}");
+        assert_eq!(replies[1]["result"]["isError"], json!(true), "{replies:?}");
         assert!(replies[2].get("error").is_some(), "{replies:?}");
+        assert!(replies[3].get("error").is_some(), "{replies:?}");
         let caused: Vec<String> = r.sink.debug.lock().unwrap()[mark..].to_vec();
-        assert!(caused.len() >= 3, "{caused:#?}");
+        assert!(caused.len() >= 4, "{caused:#?}");
         let own = format!("session: Some({:?})", a.id);
         assert!(caused.iter().all(|d| d.contains(&own)), "{caused:#?}");
         let theirs = format!("session: Some({:?})", b.id);
