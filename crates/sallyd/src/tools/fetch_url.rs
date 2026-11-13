@@ -8,6 +8,7 @@
 //! `https://host[:port]/path[?query]`, the port written only when it is not 443. The request
 //! target sent upstream is exactly its path-and-query part, so what the human approves is what
 //! goes on the wire (SI-5). The canonical form parses to itself.
+#![deny(clippy::indexing_slicing)]
 
 use crate::egress::authority::{self, AuthorityError};
 
@@ -127,22 +128,15 @@ fn after_scheme(url: &str) -> Result<&str, UrlError> {
 /// RFC 3986 path and query characters and `%XX` only (so no fragment, space or control byte),
 /// and no `.` or `..` path segment.
 fn check_target(target: &str) -> Result<(), UrlError> {
-    let b = target.as_bytes();
-    let mut i = 0usize;
-    while let Some(&c) = b.get(i) {
-        if c == b'%' {
-            let hex = |at: usize| b.get(at).is_some_and(u8::is_ascii_hexdigit);
-            if !(hex(i + 1) && hex(i + 2)) {
-                return Err(UrlError::Malformed);
-            }
-            i += 3;
-            continue;
-        }
-        let allowed = c.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@/?".contains(&c);
-        if !allowed {
-            return Err(UrlError::Malformed);
-        }
-        i += 1;
+    // No index arithmetic: each step takes its bytes off the front (rust review L3).
+    let mut rest = target.as_bytes();
+    while let Some((&c, tail)) = rest.split_first() {
+        rest = match (c, tail) {
+            (b'%', [h, l, more @ ..]) if h.is_ascii_hexdigit() && l.is_ascii_hexdigit() => more,
+            (b'%', _) => return Err(UrlError::Malformed),
+            _ if c.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@/?".contains(&c) => tail,
+            _ => return Err(UrlError::Malformed),
+        };
     }
     let path = target.split_once('?').map_or(target, |(p, _)| p);
     if path.split('/').any(|s| s == "." || s == "..") {

@@ -7,6 +7,7 @@
 //! `200` is the response, a redirect included: nothing is followed, nothing decompressed. The
 //! whole call is bounded by [`FETCH_TIMEOUT`]; past it the client half is dropped and the proxy
 //! writes its own close entry.
+#![deny(clippy::indexing_slicing)]
 
 use http_body_util::{BodyExt as _, Full};
 use hyper::body::Bytes;
@@ -176,6 +177,7 @@ async fn reply_head<S: AsyncRead + Unpin>(s: &mut S) -> Vec<u8> {
 /// The proxy's reason from its refusal body, or `egress-refused`.
 async fn refusal<S: AsyncRead + Unpin>(s: &mut S) -> &'static str {
     let mut body = Vec::new();
+    // A broken or short read leaves what arrived; anything unreadable is `egress-refused`.
     let _ = s.take(MAX_REFUSAL).read_to_end(&mut body).await;
     std::str::from_utf8(&body)
         .ok()

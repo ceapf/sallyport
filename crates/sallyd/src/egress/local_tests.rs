@@ -45,6 +45,8 @@ async fn entries_of_a_broker_originated_connection_carry_its_origin_and_no_other
             )
             .unwrap();
             s.append(entry(None), AuditLevel::default()).unwrap();
+            s.append(entry(Some(json!(["kept"]))), AuditLevel::default())
+                .unwrap();
         })
         .await;
     let plain = sink(&inner);
@@ -63,6 +65,7 @@ async fn entries_of_a_broker_originated_connection_carry_its_origin_and_no_other
         vec![
             json!({"host": "a.mock.test", "origin": origin}),
             json!({"origin": origin}),
+            json!({"args": ["kept"], "origin": origin}),
             json!({"host": "b.mock.test"}),
         ]
     );

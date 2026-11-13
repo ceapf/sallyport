@@ -38,8 +38,15 @@ impl Connector for RigConnector {
         self.tls.choose(if self.swap { other } else { host })
     }
 
-    fn grants(&self, _: &str) -> HostGrants {
-        HostGrants::default()
+    /// The rig's one grant: `T0` into `Authorization` on [`HOST`].
+    fn grants(&self, host: &str) -> HostGrants {
+        if host != HOST {
+            return HostGrants::default();
+        }
+        HostGrants {
+            headers: vec!["authorization".into()],
+            names: vec!["secret:T0".into()],
+        }
     }
 }
 
@@ -283,6 +290,12 @@ async fn the_body_is_cut_at_the_cap_and_kept_whole_up_to_it() {
         .await
         .unwrap();
     assert_eq!((whole.body.len(), whole.truncated), (100, false));
+    // Rust review L6: a body far past the cap ends the call at the cap (bounded well below
+    // FETCH_TIMEOUT by `get`), not once the upstream is done.
+    let big = get(&c, &format!("https://{HOST}/len/{}", 8 << 20), 10)
+        .await
+        .unwrap();
+    assert_eq!((big.body.len(), big.truncated), (10, true));
 }
 
 /// The real gate and tools (`tools/tests.rs`) with `fetch` going out through the rig's proxy.
@@ -317,34 +330,42 @@ async fn rt_ag_14_fetch_a_write_reaches_the_upstream_only_once_approved() {
         limits: wide(),
         ..Opts::default()
     });
-    let f = gated(&r, Duration::from_millis(400));
+    // A short approval timeout for the timeout leg only, a long one for the human legs (rust
+    // review M1: a loaded runner must not turn a deny or an approve into a timeout).
+    let short = gated(&r, Duration::from_millis(400));
+    let f = gated(&r, Duration::from_secs(30));
     let post = json!({"url": format!("https://{HOST}/echo"), "method": "POST",
-                      "body_b64": "c2VjcmV0IG5vdGVz"});
+                      "headers": [["X-Trace", "t-1"]], "body_b64": "c2VjcmV0IG5vdGVz"});
     let nothing_sent = |when: &str| {
         assert_eq!(*r.dials.lock().unwrap(), 0, "{when}: dialled");
         assert!(r.seen().is_empty(), "{when}: sent upstream");
         assert!(r.sink.events().is_empty(), "{when}: an egress entry");
     };
     // Timeout.
-    let h = call(&f, post.clone());
-    f.until_shown(1).await;
+    let h = call(&short, post.clone());
+    short.until_shown(1).await;
     nothing_sent("pending");
     assert_eq!(bounded("timeout", h).await.unwrap(), "denied: timeout");
     nothing_sent("after the timeout");
-    // Deny.
+    // Deny. The prompt shows the canonical URL and the harness's header, and names the
+    // credential the proxy adds, never its value (architect rulings Q3, Q4).
     let h = call(&f, post.clone());
-    let p = f.until_shown(2).await;
+    let p = f.until_shown(1).await;
     assert!(
         p.action
             .starts_with(&format!("fetch \"POST\" \"https://{HOST}/echo\""))
     );
+    assert!(p.full.contains("\"X-Trace\": \"t-1\""), "{}", p.full);
+    let note = p.note.clone().unwrap();
+    assert!(note.contains("secret:T0"), "{note}");
+    assert!(!note.contains(&value(0)) && !p.full.contains(&value(0)));
     nothing_sent("pending again");
     f.desk.decide(&p.id, Decision::Deny, ME).await.unwrap();
     assert_eq!(bounded("deny", h).await.unwrap(), "denied: denied");
     nothing_sent("after the deny");
     // Approve: exactly one request.
     let h = call(&f, post.clone());
-    let p = f.until_shown(3).await;
+    let p = f.until_shown(2).await;
     nothing_sent("pending a third time");
     f.desk.decide(&p.id, Decision::Approve, ME).await.unwrap();
     let out: Value = serde_json::from_str(&bounded("approve", h).await.unwrap()).unwrap();
@@ -357,6 +378,7 @@ async fn rt_ag_14_fetch_a_write_reaches_the_upstream_only_once_approved() {
     );
     assert_eq!(r.seen().len(), 1);
     assert!(r.seen()[0].ends_with("secret notes"));
+    assert!(r.seen()[0].contains("x-trace: t-1\r\n"), "{}", r.seen()[0]);
     // The approval is single-use.
     assert!(f.desk.decide(&p.id, Decision::Approve, ME).await.is_err());
     assert_eq!(r.seen().len(), 1, "a reused approval sends nothing");
@@ -367,8 +389,39 @@ async fn rt_ag_14_fetch_a_write_reaches_the_upstream_only_once_approved() {
     )
     .await;
     assert!(got.starts_with("{\"body\":\"ok\""), "{got}");
-    assert_eq!(f.prompts().len(), 3);
+    assert_eq!(f.prompts().len(), 2);
     assert_eq!(r.seen().len(), 2);
+}
+
+/// Security review M1: the grant host's header is refused at prepare, on that host only, so no
+/// ticket shows a header the proxy would drop; nothing is dialled for it.
+#[tokio::test]
+async fn the_grant_hosts_header_is_refused_at_prepare_on_that_host_only() {
+    let r = rig(Opts {
+        limits: wide(),
+        ..Opts::default()
+    });
+    let f = gated(&r, Duration::from_secs(30));
+    for name in ["Authorization", "authorization"] {
+        let got = f
+            .text(
+                "fetch",
+                json!({"url": format!("https://{HOST}/"), "headers": [[name, "x"]]}),
+            )
+            .await;
+        assert_eq!(got, "denied: bad-arguments", "{name}");
+    }
+    assert_eq!(*r.dials.lock().unwrap(), 0);
+    // Elsewhere it is the harness's own header: prepared and sent (the rig's upstream only
+    // answers TLS for its host, so this one fails after the dial, not at prepare).
+    let other = f
+        .text(
+            "fetch",
+            json!({"url": "https://other.mock.test/", "headers": [["Authorization", "x"]]}),
+        )
+        .await;
+    assert!(other.starts_with("failed: "), "{other}");
+    assert_eq!(*r.dials.lock().unwrap(), 1);
 }
 
 /// Architect ruling Q7: `tool.run` before anything goes out, at the lowest audit level too, and

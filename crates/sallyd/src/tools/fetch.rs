@@ -5,7 +5,8 @@
 //!
 //! - **Request** ([`check`]): the URL ([`super::fetch_url`]); a method of 1 to [`MAX_METHOD`]
 //!   upper-case letters, never `CONNECT` or `TRACE`; at most [`MAX_HEADERS`] headers, each a
-//!   token name and a value of visible ASCII, spaces and tabs (no leading or trailing blank);
+//!   token name (once, in any case; sent lower-case, as HTTP/1.1 names are case-insensitive)
+//!   and a value of visible ASCII, spaces and tabs (no leading or trailing blank);
 //!   no header the proxy would drop or refuse (its own predicate, plus `HTTP2-Settings` and the
 //!   host's grant header names), so the ticket never shows a header that is not sent; a body of at
 //!   most `network.max_request_bytes`; and a head that fits [`MAX_REQUEST_HEAD`] as sent.
@@ -77,7 +78,7 @@ pub fn check(
     if !method_ok(method) || headers.len() > MAX_HEADERS {
         return Err(BAD);
     }
-    if !headers.iter().all(|(n, v)| header_ok(n, v, grants)) {
+    if !headers.iter().all(|(n, v)| header_ok(n, v, grants)) || repeated(headers) {
         return Err(BAD);
     }
     if body_len > max_body {
@@ -87,6 +88,17 @@ pub fn check(
         return Err("head-too-large");
     }
     Ok(u)
+}
+
+/// Whether a header name occurs twice, in any case: hyper groups repeated names, so the order
+/// sent would not be the order shown (security review L1).
+fn repeated(headers: &[(String, String)]) -> bool {
+    let mut names: Vec<String> = headers
+        .iter()
+        .map(|(n, _)| n.to_ascii_lowercase())
+        .collect();
+    names.sort_unstable();
+    names.windows(2).any(|w| w.first() == w.last())
 }
 
 /// 1 to [`MAX_METHOD`] upper-case ASCII letters; not `CONNECT` or `TRACE`.
@@ -159,7 +171,7 @@ pub fn reply_headers(h: &HeaderMap) -> Vec<(String, String)> {
 }
 
 /// The reply body: status, headers, the body as UTF-8 or base64, its length and whether it was
-/// cut at the cap.
+/// cut at the cap. A text body cut inside a character is not UTF-8, so it goes as base64.
 #[must_use]
 pub fn reply(status: u16, headers: &[(String, String)], body: Vec<u8>, truncated: bool) -> Value {
     let bytes = body.len();

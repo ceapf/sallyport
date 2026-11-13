@@ -117,6 +117,13 @@ fn every_header_the_proxy_drops_and_the_grant_headers_are_refused_in_any_case() 
     ] {
         assert_eq!(c("GET", &[(n, "1")]), Err(BAD), "{n}");
     }
+    // A name given twice, in any case, is refused; distinct names pass.
+    assert_eq!(
+        c("GET", &[("X-A", "1"), ("X-B", "2"), ("x-a", "3")]),
+        Err(BAD)
+    );
+    assert_eq!(c("GET", &[("X-A", "1"), ("X-A", "1")]), Err(BAD));
+    assert!(c("GET", &[("X-A", "1"), ("X-B", "1"), ("X-AB", "1")]).is_ok());
     // Another host's grant header passes.
     assert!(check(URL, "GET", &h(&[("X-Key", "1")]), 0, MAX, &[]).is_ok());
 }

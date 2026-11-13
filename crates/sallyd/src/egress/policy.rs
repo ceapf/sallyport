@@ -445,7 +445,33 @@ mod tests {
 
     #[test]
     fn every_reason_is_listed_once_and_read_back_from_its_code() {
+        // No `_` arm: a new reason does not compile here until it is placed, and in `ALL`.
+        let index = |r: Reason| match r {
+            Reason::HostNotAllowed => 0,
+            Reason::PortNotAllowed => 1,
+            Reason::IpLiteral => 2,
+            Reason::IpRangeDenied => 3,
+            Reason::ResolveFailed => 4,
+            Reason::ConnectFailed => 5,
+            Reason::PlainHttpUnsupported => 6,
+            Reason::GrantHostUnavailable => 7,
+            Reason::TooManyConnections => 8,
+            Reason::HeadTooLarge => 9,
+            Reason::HeadTimeout => 10,
+            Reason::Malformed => 11,
+            Reason::HostMismatch => 12,
+            Reason::UpgradeRefused => 13,
+            Reason::MethodRefused => 14,
+            Reason::RequestTooLarge => 15,
+            Reason::ResponseTooLarge => 16,
+            Reason::UpstreamEncoded => 17,
+            Reason::UpstreamTlsFailed => 18,
+            Reason::UpstreamClosed => 19,
+            Reason::UpstreamMalformed => 20,
+            Reason::UpstreamEchoedSecret => 21,
+        };
         for (i, r) in Reason::ALL.into_iter().enumerate() {
+            assert_eq!(index(r), i, "{r:?} out of place in ALL");
             assert_eq!(Reason::from_code(r.as_str()), Some(r));
             assert!(!Reason::ALL[..i].contains(&r), "{r:?} listed twice");
         }

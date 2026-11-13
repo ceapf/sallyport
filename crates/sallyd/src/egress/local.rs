@@ -67,9 +67,11 @@ struct Tagged {
 
 impl AuditSink for Tagged {
     fn append(&self, entry: NewEntry, level: AuditLevel) -> Result<(), AuditError> {
+        // Every egress entry has an object; anything else is kept whole under `args`.
         let mut args = match entry.arguments() {
             Value::Object(o) => o.clone(),
-            _ => Map::new(),
+            Value::Null => Map::new(),
+            other => Map::from_iter([("args".to_owned(), other.clone())]),
         };
         args.insert("origin".to_owned(), self.origin.clone());
         self.inner.append(entry.args(Value::Object(args)), level)
