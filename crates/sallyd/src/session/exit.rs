@@ -2,9 +2,10 @@
 //!
 //! The launcher opens the container init's `/proc/<pid>` directory right after the mount check
 //! on that pid; a lookup through that fd fails once the process is gone, even if the pid is
-//! reused (architect Q29). So the registry asks it every [`EXIT_POLL`]: no `podman wait` child
-//! per session and no extra podman state. (A pidfd would wake at once, but tokio 1.54 offers no
-//! safe way left to register one: `AsyncFd::new` is deprecated for its `unsafe` replacement.)
+//! reused (architect Q29). So the registry asks it every [`EXIT_POLL`] (250 ms, architect Q62:
+//! an exit is noticed within a fraction of a second): no `podman wait` child per session and no
+//! extra podman state. (A pidfd would wake at once, but tokio 1.54 offers no safe way left to
+//! register one: `AsyncFd::new` is deprecated for its `unsafe` replacement.)
 
 use std::io;
 use std::os::fd::OwnedFd;
@@ -14,7 +15,7 @@ use std::time::Duration;
 use rustix::fs::{AtFlags, statat};
 
 /// How often a session's init is checked.
-pub const EXIT_POLL: Duration = Duration::from_secs(1);
+pub const EXIT_POLL: Duration = Duration::from_millis(250);
 
 /// The init process of a running container, watched for its exit.
 #[derive(Debug)]
@@ -65,10 +66,27 @@ mod tests {
     use super::*;
     use std::process::{Child, Command};
 
-    fn sleeper() -> (Child, Arc<OwnedFd>) {
-        let child = Command::new("sleep").arg("30").spawn().unwrap();
+    /// A `sleep` that a failed assertion cannot leak: killed and reaped on drop.
+    struct Sleeper(Child);
+
+    impl Sleeper {
+        fn kill(&mut self) {
+            self.0.kill().unwrap();
+            self.0.wait().unwrap();
+        }
+    }
+
+    impl Drop for Sleeper {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn sleeper() -> (Sleeper, Arc<OwnedFd>) {
+        let child = Sleeper(Command::new("sleep").arg("30").spawn().unwrap());
         let dir = sally_core::fd::open(
-            format!("/proc/{}", child.id()).as_str(),
+            format!("/proc/{}", child.0.id()).as_str(),
             rustix::fs::OFlags::PATH | rustix::fs::OFlags::DIRECTORY,
             rustix::fs::Mode::empty(),
         )
@@ -77,8 +95,14 @@ mod tests {
     }
 
     #[test]
-    fn the_poll_is_one_second() {
-        assert_eq!(EXIT_POLL, Duration::from_secs(1));
+    fn the_poll_is_a_quarter_second() {
+        assert_eq!(EXIT_POLL, Duration::from_millis(250));
+    }
+
+    /// The maintainer's bound: an exit is noticed within a fraction of a second.
+    #[test]
+    fn an_exit_is_noticed_within_a_second() {
+        assert!(EXIT_POLL < Duration::from_secs(1));
     }
 
     #[tokio::test]
@@ -88,8 +112,7 @@ mod tests {
         let period = Duration::from_millis(20);
         let early = tokio::time::timeout(Duration::from_millis(200), exit.exited_every(period));
         assert!(early.await.is_err(), "reported a live process as exited");
-        child.kill().unwrap();
-        child.wait().unwrap();
+        child.kill();
         tokio::time::timeout(Duration::from_secs(5), exit.exited_every(period))
             .await
             .unwrap();
@@ -101,8 +124,7 @@ mod tests {
         let exit = Exit::watch(dir).unwrap();
         let early = tokio::time::timeout(Duration::from_millis(300), exit.exited());
         assert!(early.await.is_err(), "reported a live process as exited");
-        child.kill().unwrap();
-        child.wait().unwrap();
+        child.kill();
         tokio::time::timeout(EXIT_POLL * 3, exit.exited())
             .await
             .unwrap();
@@ -112,8 +134,7 @@ mod tests {
     fn a_process_already_gone_is_refused() {
         let (mut child, dir) = sleeper();
         assert!(alive(&dir));
-        child.kill().unwrap();
-        child.wait().unwrap();
+        child.kill();
         assert!(!alive(&dir));
         let e = Exit::watch(dir).unwrap_err();
         assert_eq!(

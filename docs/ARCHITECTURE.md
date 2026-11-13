@@ -702,7 +702,8 @@ TODO(#28): the harness container and `llm.sock` (Task 13, Task 12 PR C).
 - `shutdown`: SIGTERM or SIGINT; `control.sock` is closed first.
 - `start-failed`.
 - `exited`: the container ended on its own. The registry checks the init's `/proc/<pid>` fd
-  every second; a lookup through it fails once that process is gone, even if its pid is reused.
+  every 250 ms (Q62); a lookup through it fails once that process is gone, even if its pid is
+  reused.
 
 **Stop order:** `session.stop` is audited first. Then the agent listener stops, which drops calls
 still waiting on an approval: each counts as a deny. Then `Launcher::stop` runs, retried up to 3
