@@ -2,7 +2,7 @@
 CARGO ?= cargo --locked
 MUSL  := x86_64-unknown-linux-musl
 
-.PHONY: lint fmt clippy deny forbid-unsafe test test-scripts nextest coverage mutants mutants-wide-core mutants-wide-sallyd mutants-wide-shim zizmor shim shim-check fuzz redteam redteam-gpu e2e-gpu doctor
+.PHONY: lint fmt clippy deny forbid-unsafe test test-scripts nextest coverage mutants mutants-wide-core mutants-wide-sallyd mutants-wide-shim mutants-wide-cli zizmor shim shim-check fuzz redteam redteam-gpu e2e-gpu doctor
 
 lint: fmt clippy forbid-unsafe deny
 
@@ -134,17 +134,22 @@ MUTANTS_WIDE_SALLYD := $(addprefix crates/sallyd/src/sandbox/,argv.rs check.rs t
                        $(addprefix crates/sallyd/src/egress/,addr.rs authority.rs head.rs policy.rs server.rs \
                        hostaddrs.rs tunnel.rs net.rs ca.rs roots.rs rewrite.rs intercept.rs \
                        intercept_tls.rs intercept_report.rs meter.rs inject.rs redact.rs local.rs) \
-                       $(addprefix crates/sallyd/src/rpc/,agent.rs control.rs frame.rs json.rs listen.rs mcp.rs \
-                       message.rs rate.rs record.rs) \
+                       $(addprefix crates/sallyd/src/rpc/,agent.rs control.rs control_methods.rs frame.rs \
+                       json.rs listen.rs mcp.rs message.rs rate.rs record.rs) \
                        $(addprefix crates/sallyd/src/llm/,body.rs head.rs io.rs reply.rs server.rs) \
-                       $(addprefix crates/sallyd/src/approvals/,action.rs glob.rs handler.rs policy.rs \
-                       queue.rs render.rs) \
+                       $(addprefix crates/sallyd/src/approvals/,action.rs glob.rs handler.rs hub.rs \
+                       policy.rs queue.rs render.rs) \
                        $(addprefix crates/sallyd/src/tools/,args.rs path.rs tag.rs fs.rs shell.rs procs.rs \
                        mod.rs dac.rs ops.rs fetch.rs fetch_url.rs fetch_client.rs)
 MUTANTS_WIDE_SHIM := $(addprefix crates/sally-shim/src/,args.rs relay.rs)
+# The CLI (architect Q78 mutation scope): the clean-check, the frame client, the commands' output
+# and the approve loop; its clap definitions and main.rs are out. Its tests start no container
+# (a fake daemon on a Unix socket).
+MUTANTS_WIDE_CLI := $(addprefix crates/sally-cli/src/,clean.rs client.rs commands.rs approve.rs)
 MUTANTS_WIDE_TESTS_CORE :=
 MUTANTS_WIDE_TESTS_SALLYD := --lib --test=argv --test=scan
 MUTANTS_WIDE_TESTS_SHIM := --lib --test=relay
+MUTANTS_WIDE_TESTS_CLI := --lib --test=cli
 MUTANTS_SHARD ?=
 MUTANTS_OUT ?=
 # $(1) package, $(2) files, $(3) cargo test args
@@ -159,6 +164,8 @@ mutants-wide-sallyd:
 	$(call mutants_wide,sallyd,$(MUTANTS_WIDE_SALLYD),$(MUTANTS_WIDE_TESTS_SALLYD))
 mutants-wide-shim:
 	$(call mutants_wide,sally-shim,$(MUTANTS_WIDE_SHIM),$(MUTANTS_WIDE_TESTS_SHIM))
+mutants-wide-cli:
+	$(call mutants_wide,sally-cli,$(MUTANTS_WIDE_CLI),$(MUTANTS_WIDE_TESTS_CLI))
 
 # GitHub Actions static analysis.
 zizmor:
