@@ -76,6 +76,27 @@ enum Why {
     Other(StopReason),
 }
 
+impl Why {
+    /// The first of: a request (or the registry gone: shutdown), the timeout, a crash, the
+    /// container's exit.
+    async fn first(
+        requests: &mut mpsc::Receiver<Request>,
+        timeout: Duration,
+        crashes: &mut CrashReceiver,
+        exit: &Exit,
+    ) -> Self {
+        tokio::select! {
+            r = requests.recv() => match r {
+                Some((r, reply)) => Self::Asked(r, reply),
+                None => Self::Other(StopReason::Shutdown),
+            },
+            () = tokio::time::sleep(timeout) => Self::Other(StopReason::Timeout),
+            Some(c) = crashes.recv() => Self::Crashed(c),
+            () = exit.exited() => Self::Other(StopReason::Exited),
+        }
+    }
+}
+
 impl Registry {
     pub(super) async fn supervise(self: std::sync::Arc<Self>, s: Supervised) {
         let Supervised {
@@ -94,17 +115,7 @@ impl Registry {
         } = s;
         let why = match first {
             Some(r) => Why::Other(r),
-            None => {
-                tokio::select! {
-                    r = requests.recv() => match r {
-                        Some((r, reply)) => Why::Asked(r, reply),
-                        None => Why::Other(StopReason::Shutdown),
-                    },
-                    () = tokio::time::sleep(timeout) => Why::Other(StopReason::Timeout),
-                    Some(c) = crashes.recv() => Why::Crashed(c),
-                    () = exit.exited() => Why::Other(StopReason::Exited),
-                }
-            }
+            None => Why::first(&mut requests, timeout, &mut crashes, &exit).await,
         };
         // 1. Before any await.
         ops.close();
@@ -140,30 +151,8 @@ impl Registry {
             }
         };
         let ((), in_flight) = tokio::join!(listener, ops.drained(STOP_DRAIN));
-        // A panic during the stop is audited before the seal (Q67); the reason stays.
-        while let Ok(c) = crashes.try_recv() {
-            self.crashed(&record, &c).await;
-        }
-        // 6. The seal: after `session.stop` no entry of the session's handle is written.
-        let stop = record
-            .entry(Actor::Sallyd, "session.stop", None)
-            .args(json!({"reason": reason.as_str(), "in_flight": in_flight}));
-        let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let sealed = record.seal(stop, wait).await;
-        if !sealed.written {
-            self.p.oplog.error(
-                LOG,
-                "session entry not audited",
-                &[("session", &sid), ("event", "session.stop")],
-            );
-        }
-        if sealed.late > 0 {
-            self.p.oplog.error(
-                LOG,
-                "session entries still being written at session.stop",
-                &[("session", &sid), ("late", &sealed.late.to_string())],
-            );
-        }
+        self.seal_session(&record, &mut crashes, (reason, in_flight), deadline)
+            .await;
         if in_flight > 0 {
             self.wait_out(&sid, &ops, &mut replies, &mut requests, in_flight)
                 .await;
@@ -177,6 +166,44 @@ impl Registry {
                 LOG,
                 "session task panicked during its stop",
                 &[("task", c.task), ("payload", &c.payload)],
+            );
+        }
+    }
+
+    /// The end of step 5 and step 6. A panic reported during the drain is audited
+    /// `session.crash` (Q67; the reason stays), then the seal writes `session.stop {reason,
+    /// in_flight}` within what is left of `deadline` (Q63), after which no entry of the
+    /// session's handle is written. A panic reported after this check (during the seal's wait,
+    /// or later) cannot follow `session.stop`, so it is an oplog line only, written once the
+    /// container is stopped (ruling 1; security review PS-L4).
+    async fn seal_session(
+        &self,
+        record: &Recorder,
+        crashes: &mut CrashReceiver,
+        (reason, in_flight): (StopReason, usize),
+        deadline: tokio::time::Instant,
+    ) {
+        while let Ok(c) = crashes.try_recv() {
+            self.crashed(record, &c).await;
+        }
+        let stop = record
+            .entry(Actor::Sallyd, "session.stop", None)
+            .args(json!({"reason": reason.as_str(), "in_flight": in_flight}));
+        let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let sealed = record.seal(stop, wait).await;
+        let sid = record.session();
+        if !sealed.written {
+            self.p.oplog.error(
+                LOG,
+                "session entry not audited",
+                &[("session", sid), ("event", "session.stop")],
+            );
+        }
+        if sealed.late > 0 {
+            self.p.oplog.error(
+                LOG,
+                "session entries still being written at session.stop",
+                &[("session", sid), ("late", &sealed.late.to_string())],
             );
         }
     }
