@@ -77,6 +77,9 @@ If a task seems to require breaking one of these, **stop and ask**. Do not imple
 ### Mutation scope ("zero survivors" means these files)
 
 Rule: a file is in scope when its security decisions can be tested without starting a container.
+cargo-mutants never mutates a function named `new`, so in scope decision logic never lives in
+one: `new` is a delegating call or a plain struct literal (guard test in
+`sally-core/tests/mutants_config.rs`; today's offenders are allowlisted until Task 13, #87).
 Orchestration that only container tests can prove (`sandbox/launch.rs`, `launch/teardown.rs`,
 `watchdog.rs`, `commands.rs`, `inside.rs`, `tools/exec.rs`) stays with the `rt_` tests. Per mutant only
 container-free tests run: unit tests, all of sally-core's `tests/`, `sallyd` `argv` + `scan`,

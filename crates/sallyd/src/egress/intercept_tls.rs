@@ -42,6 +42,11 @@ impl Interception {
     /// [`CaError::Unmatched`] when the leaves and the credentials name different hosts;
     /// [`CaError::Generate`] when rustls refuses a configuration or a leaf.
     pub fn new(tls: SessionTls, roots: Roots, credentials: Credentials) -> Result<Self, CaError> {
+        Self::build(tls, roots, credentials)
+    }
+
+    /// [`Self::new`]'s work, in a function cargo-mutants mutates (it leaves `new` alone; #87).
+    fn build(tls: SessionTls, roots: Roots, credentials: Credentials) -> Result<Self, CaError> {
         hosts_match(&tls, &credentials)?;
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut upstream = ClientConfig::builder_with_provider(Arc::clone(&provider))

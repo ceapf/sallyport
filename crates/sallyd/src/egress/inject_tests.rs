@@ -209,12 +209,10 @@ fn the_largest_store_value_builds() {
 }
 
 /// The bound covers the longest form of the largest store value (its percent-encoding, three
-/// bytes per byte) plus the longest format the manifest accepts (1024 bytes).
-#[test]
-fn max_form_covers_the_longest_form_and_format() {
-    use sally_core::secrets::MAX_VALUE_BYTES;
-    assert!(3 * MAX_VALUE_BYTES + 1024 <= super::super::redact::MAX_FORM);
-}
+/// bytes per byte) plus the longest format the manifest accepts (1024 bytes). Checked when the
+/// tests compile, so a smaller bound does not build.
+const _: () =
+    assert!(3 * sally_core::secrets::MAX_VALUE_BYTES + 1024 <= super::super::redact::MAX_FORM);
 
 #[test]
 fn the_redaction_covers_every_secret_its_forms_and_each_rendered_value() {

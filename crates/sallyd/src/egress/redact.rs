@@ -300,6 +300,11 @@ pub struct Redacted<B> {
 impl<B> Redacted<B> {
     /// Redacts `inner` with `redaction`.
     pub fn new(inner: B, redaction: &Arc<Redaction>) -> Self {
+        Self::over(inner, redaction)
+    }
+
+    /// [`Self::new`]'s work, in a function cargo-mutants mutates (it leaves `new` alone; #87).
+    fn over(inner: B, redaction: &Arc<Redaction>) -> Self {
         Self {
             inner,
             stream: redaction.stream(),

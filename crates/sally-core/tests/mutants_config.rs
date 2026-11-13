@@ -92,16 +92,39 @@ fn constants(text: &str) -> Vec<(&'static str, String)> {
     out
 }
 
-/// `src` with the contents of string and char literals blanked (same length), so a brace or a
-/// `|` inside one is not read as code. Lifetimes (`'a`) are left alone.
+/// `src` with the contents of string and char literals and of comments blanked (same length,
+/// newlines kept), so a brace, a quote or a `|` inside one is not read as code. Lifetimes (`'a`)
+/// are left alone.
 fn strip_literals(src: &str) -> String {
     let chars: Vec<char> = src.chars().collect();
     let mut out = String::with_capacity(src.len());
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        if c == '/' && matches!(next, Some('/' | '*')) {
+            let end = if next == Some('/') {
+                chars[i..]
+                    .iter()
+                    .position(|&q| q == '\n')
+                    .map_or(chars.len(), |n| i + n)
+            } else {
+                (i + 2..chars.len().saturating_sub(1))
+                    .find(|&j| chars[j] == '*' && chars[j + 1] == '/')
+                    .map_or(chars.len(), |j| j + 2)
+            };
+            out.extend(
+                chars[i..end]
+                    .iter()
+                    .map(|&q| if q == '\n' { q } else { ' ' }),
+            );
+            i = end;
+            continue;
+        }
         let starts_word = i == 0 || !is_ident(chars[i - 1]);
-        let raw_hashes = (c == 'r' && starts_word)
+        // `br"…"` too: the `r` follows a `b` that starts the word.
+        let byte_raw = i > 0 && chars[i - 1] == 'b' && (i == 1 || !is_ident(chars[i - 2]));
+        let raw_hashes = (c == 'r' && (starts_word || byte_raw))
             .then(|| chars[i + 1..].iter().take_while(|&&h| h == '#').count())
             .filter(|&n| chars.get(i + 1 + n) == Some(&'"'));
         if let Some(n) = raw_hashes {
@@ -114,7 +137,7 @@ fn strip_literals(src: &str) -> String {
             i = end + close.len();
         } else if c == '"' {
             let mut j = i + 1;
-            while chars[j] != '"' {
+            while chars.get(j).expect("unterminated string") != &'"' {
                 j += if chars[j] == '\\' { 2 } else { 1 };
             }
             out.push_str(&" ".repeat(j + 1 - i));
@@ -420,6 +443,370 @@ fn literals_do_not_end_a_function_or_add_operands() {
     let body = function(&stripped, "f", "self-test");
     assert!(body.ends_with("OFlags::DIRECTORY }"), "{body}");
     assert_operands(body, &[], "self-test");
+}
+
+/// The files in mutation scope: the `--file` lists of the Makefile's mutation targets
+/// (`MUTANTS_FILES` and the three `MUTANTS_WIDE_*`), with `$(addprefix …)` and `dir/*.rs`
+/// expanded, so a file added to a list is covered at once.
+fn mutation_scope() -> Vec<String> {
+    let make = std::fs::read_to_string(root().join("Makefile")).unwrap();
+    let vars = [
+        "MUTANTS_FILES",
+        "MUTANTS_WIDE_CORE",
+        "MUTANTS_WIDE_SALLYD",
+        "MUTANTS_WIDE_SHIM",
+    ];
+    let files: Vec<String> = vars.iter().flat_map(|v| make_list(&make, v)).collect();
+    assert!(files.len() >= 60, "the Makefile lists moved: {files:?}");
+    files
+}
+
+/// The paths `var := …` names in `make` (continuation lines joined, `dir/*.rs` expanded).
+fn make_list(make: &str, var: &str) -> Vec<String> {
+    let head = format!("{var} := ");
+    let at = make
+        .find(&head)
+        .unwrap_or_else(|| panic!("Makefile: no `{head}`"));
+    let mut def = String::new();
+    for line in make[at + head.len()..].lines() {
+        if let Some(more) = line.strip_suffix('\\') {
+            def.push_str(more);
+            def.push(' ');
+        } else {
+            def.push_str(line);
+            break;
+        }
+    }
+    let mut out = Vec::new();
+    let mut rest = def.trim_start();
+    while !rest.is_empty() {
+        if let Some(inner) = rest.strip_prefix("$(addprefix ") {
+            let close = inner.find(')').expect("addprefix: no `)`");
+            let (prefix, list) = inner[..close].split_once(',').expect("addprefix: no `,`");
+            out.extend(list.split_whitespace().map(|f| format!("{prefix}{f}")));
+            rest = inner[close + 1..].trim_start();
+        } else {
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            out.push(rest[..end].to_owned());
+            rest = rest[end..].trim_start();
+        }
+    }
+    out.into_iter().flat_map(expand_rs_glob).collect()
+}
+
+/// `dir/*.rs` as the sorted `.rs` files of `dir`; any other path as itself.
+fn expand_rs_glob(path: String) -> Vec<String> {
+    let Some(dir) = path.strip_suffix("/*.rs") else {
+        return vec![path];
+    };
+    let mut files: Vec<String> = std::fs::read_dir(root().join(dir))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.ends_with(".rs"))
+        .map(|n| format!("{dir}/{n}"))
+        .collect();
+    files.sort();
+    files
+}
+
+/// `src` (stripped) with every inline `#[cfg(test)]` module's body blanked: test helpers may
+/// hold logic in a `fn new`, product code may not.
+fn without_test_modules(src: &str) -> String {
+    let mut out = src.to_owned();
+    let mut from = 0;
+    while let Some(at) = out[from..].find("#[cfg(test)]").map(|i| from + i) {
+        let after = at + "#[cfg(test)]".len();
+        let item = out[after..].trim_start();
+        let is_mod = ["mod ", "pub mod ", "pub(crate) mod "]
+            .iter()
+            .any(|p| item.starts_with(p));
+        let open = out[after..].find(['{', ';']).map(|i| after + i);
+        if let (true, Some(open)) = (is_mod, open)
+            && out[open..].starts_with('{')
+        {
+            let close = matching_brace(&out, open);
+            out.replace_range(open..=close, &" ".repeat(close + 1 - open));
+        }
+        from = after;
+    }
+    out
+}
+
+/// The index of the `}` closing the `{` at `open`.
+fn matching_brace(src: &str, open: usize) -> usize {
+    let mut depth = 0usize;
+    for (i, c) in src[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return open + i;
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unbalanced braces after byte {open}");
+}
+
+/// Each `fn new` with a body in `src` (stripped): the type its `impl` block is for, and the body
+/// between its braces.
+fn news(src: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (at, _) in src.match_indices("fn new") {
+        let after = &src[at + "fn new".len()..];
+        let word_start = at == 0 || !src[..at].ends_with(is_ident);
+        if !word_start || !matches!(after.chars().next(), Some('(' | '<')) {
+            continue;
+        }
+        let Some(open) = after
+            .find(['{', ';'])
+            .filter(|&i| after[i..].starts_with('{'))
+        else {
+            continue; // a trait's declaration: no body
+        };
+        let open = at + "fn new".len() + open;
+        let close = matching_brace(src, open);
+        out.push((impl_type(&src[..at]), src[open + 1..close].to_owned()));
+    }
+    out
+}
+
+/// The type of the last `impl` block opened in `before`: the path after `for` when there is
+/// one, its last segment, without generics.
+fn impl_type(before: &str) -> String {
+    let line = before
+        .lines()
+        .rev()
+        .map(str::trim_start)
+        .find(|l| l.starts_with("impl"))
+        .unwrap_or("impl ?");
+    let mut rest = line.trim_start_matches("impl").trim_start();
+    if rest.starts_with('<') {
+        let mut depth = 0usize;
+        let end = rest
+            .char_indices()
+            .find(|&(_, c)| {
+                depth = match c {
+                    '<' => depth + 1,
+                    '>' => depth - 1,
+                    _ => depth,
+                };
+                depth == 0
+            })
+            .map_or(rest.len(), |(i, _)| i + 1);
+        rest = rest[end..].trim_start();
+    }
+    if let Some((_, ty)) = rest.split_once(" for ") {
+        rest = ty;
+    }
+    let path: String = rest
+        .chars()
+        .take_while(|&c| is_ident(c) || c == ':')
+        .collect();
+    path.rsplit("::").next().unwrap_or_default().to_owned()
+}
+
+/// Why `body` (a stripped `fn new` body) holds decision logic, or `None` for a delegating call
+/// or a plain struct literal. Mechanical and conservative: a statement, `?`, a control-flow
+/// keyword, a closure, a `!` that is not a macro's, a binary operator (rustfmt spaces every
+/// one), or a method call other than a conversion. A false positive is fixed by delegating to
+/// a named function, never by allowlisting (architect Q12).
+fn logic_in(body: &str) -> Option<String> {
+    const OPERATORS: [&str; 18] = [
+        " + ", " - ", " * ", " / ", " % ", " == ", " != ", " < ", " > ", " <= ", " >= ", " && ",
+        " || ", " & ", " | ", " ^ ", " << ", " >> ",
+    ];
+    const KEYWORDS: [&str; 8] = [
+        "if", "else", "match", "for", "while", "loop", "let", "return",
+    ];
+    const CONVERSIONS: [&str; 6] = [
+        "into",
+        "clone",
+        "to_owned",
+        "to_string",
+        "as_ref",
+        "into_iter",
+    ];
+    let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let spaced = format!(" {flat} ");
+    if flat.contains(';') {
+        return Some("a statement".into());
+    }
+    if flat.contains('?') {
+        return Some("`?`".into());
+    }
+    if let Some(op) = OPERATORS.iter().find(|op| spaced.contains(*op)) {
+        return Some(format!("the operator `{}`", op.trim()));
+    }
+    if flat.contains('|') {
+        return Some("a closure".into());
+    }
+    let words: Vec<&str> = flat
+        .split(|c: char| !is_ident(c))
+        .filter(|w| !w.is_empty())
+        .collect();
+    if let Some(k) = KEYWORDS.iter().find(|k| words.contains(k)) {
+        return Some(format!("`{k}`"));
+    }
+    let chars: Vec<char> = flat.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        let prev = i.checked_sub(1).map(|p| chars[p]);
+        if c == '!' && !prev.is_some_and(is_ident) {
+            return Some("`!`".into());
+        }
+        if c == '.' && prev.is_some_and(|p| p != '.') && chars.get(i + 1) != Some(&'.') {
+            let name: String = chars[i + 1..]
+                .iter()
+                .take_while(|&&q| is_ident(q))
+                .collect();
+            let call = chars.get(i + 1 + name.chars().count()) == Some(&'(');
+            if call && !CONVERSIONS.contains(&name.as_str()) {
+                return Some(format!("the method call `.{name}(…)`"));
+            }
+        }
+    }
+    None
+}
+
+/// `fn new` bodies in mutation scope that hold logic today, by file and `impl` type (never by
+/// line). cargo-mutants never mutates a function named `new` (Task 9a-3, Q1), so their logic is
+/// untested by the nightly. Task 13 moves each into a named function and empties this list; an
+/// entry that is clean or gone fails the guard, so the list only shrinks.
+const NEW_WITH_LOGIC: [(&str, &str); 10] = [
+    ("crates/sally-core/src/manifest/paths.rs", "Denylist"), // TODO(#87)
+    ("crates/sallyd/src/sandbox/argv.rs", "Argv"),           // TODO(#87)
+    ("crates/sallyd/src/sandbox/types.rs", "SessionPaths"),  // TODO(#87)
+    ("crates/sallyd/src/sandbox/scan.rs", "Walk"),           // TODO(#87)
+    ("crates/sallyd/src/sandbox/changes.rs", "Walk"),        // TODO(#87)
+    ("crates/sallyd/src/rpc/listen.rs", "Dir"),              // TODO(#87)
+    ("crates/sallyd/src/rpc/rate.rs", "Rate"),               // TODO(#87)
+    ("crates/sallyd/src/approvals/action.rs", "Payload"),    // TODO(#87)
+    ("crates/sallyd/src/approvals/queue.rs", "Ticket"),      // TODO(#87)
+    ("crates/sallyd/src/approvals/render.rs", "Prompt"),     // TODO(#87)
+];
+
+/// Architect Q12 (R3): decision logic never lives in a function named `new` in mutation scope.
+#[test]
+fn no_fn_new_in_mutation_scope_holds_logic() {
+    let mut found = Vec::new();
+    let mut used = Vec::new();
+    for file in mutation_scope() {
+        let src =
+            std::fs::read_to_string(root().join(&file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+        let code = without_test_modules(&strip_literals(&src));
+        for (ty, body) in news(&code) {
+            let Some(why) = logic_in(&body) else { continue };
+            match NEW_WITH_LOGIC.iter().find(|(f, t)| *f == file && *t == ty) {
+                Some(entry) => used.push(*entry),
+                None => found.push(format!("{file}: {ty}::new holds {why}")),
+            }
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "move this logic into a named function (CLAUDE.md):\n{}",
+        found.join("\n")
+    );
+    let stale: Vec<_> = NEW_WITH_LOGIC
+        .iter()
+        .filter(|e| !used.contains(e))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "clean or gone, remove from NEW_WITH_LOGIC: {stale:?}"
+    );
+}
+
+#[test]
+fn the_guard_reads_the_makefile_lists_and_their_globs() {
+    let make = "A := x/y.rs \\\n     $(addprefix p/,a.rs b.rs) \\\n     z.rs\nB := q.rs\n";
+    assert_eq!(make_list(make, "A"), ["x/y.rs", "p/a.rs", "p/b.rs", "z.rs"]);
+    assert_eq!(make_list(make, "B"), ["q.rs"]);
+    let scope = mutation_scope();
+    assert!(
+        scope
+            .iter()
+            .any(|f| f.ends_with("manifest/validate/mod.rs")),
+        "glob"
+    );
+    assert!(scope.contains(&"crates/sallyd/src/egress/redact.rs".to_owned()));
+}
+
+#[test]
+fn the_guard_finds_each_fn_new_with_its_impl_type() {
+    let src = strip_literals(
+        "impl<T: X> Foo<T> {\n    pub fn new(a: T) -> Self { Self::build(a) }\n}\n\
+         impl Bar for Baz { fn new_ish() {} }\n\
+         trait Q { fn new() -> Self; }\n\
+         impl Default for Baz {\n    fn new() -> Self {\n        // if a comment\n        \
+         Self { a: \"if\" }\n    }\n}\n\
+         #[cfg(test)]\nmod tests {\n    impl T { fn new() -> u8 { if x { 1 } else { 2 } } }\n}\n",
+    );
+    let found = news(&without_test_modules(&src));
+    let types: Vec<&str> = found.iter().map(|(t, _)| t.as_str()).collect();
+    assert_eq!(types, ["Foo", "Baz"]);
+    assert!(
+        found.iter().all(|(_, b)| logic_in(b).is_none()),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn a_delegating_call_or_a_plain_struct_literal_is_no_logic() {
+    for body in [
+        " Self::from_forms(secrets) ",
+        " Self { a, b: Vec::new(), c: Arc::new(Mutex::new(State::default())), d: x.into() } ",
+        " Self { inner, stream: redaction.stream_of(&r), ..Self::default() } ",
+        " Self { n: vec![], m: format!(\"x\") } ",
+    ] {
+        let body = body.replace("stream_of", "clone");
+        assert_eq!(logic_in(&strip_literals(&body)), None, "{body}");
+    }
+}
+
+#[test]
+#[should_panic(expected = "holds")]
+fn the_guard_refuses_a_branch() {
+    refuse(" if a { Self { a } } else { Self { a: 0 } } ");
+}
+
+#[test]
+#[should_panic(expected = "holds")]
+fn the_guard_refuses_a_statement() {
+    refuse(" let a = 1; Self { a } ");
+}
+
+#[test]
+#[should_panic(expected = "holds")]
+fn the_guard_refuses_an_operator() {
+    refuse(" Self { burst: rate * 2 } ");
+}
+
+#[test]
+#[should_panic(expected = "holds")]
+fn the_guard_refuses_a_method_call() {
+    refuse(" Self { burst: rate.max(1) } ");
+}
+
+#[test]
+#[should_panic(expected = "holds")]
+fn the_guard_refuses_a_closure_and_a_not() {
+    refuse(" Self { v: x.into_iter().filter(|f| !f.is_empty()).collect() } ");
+}
+
+#[test]
+#[should_panic(expected = "holds")]
+fn the_guard_refuses_a_question_mark() {
+    refuse(" Ok(Self { v: parse(x)? }) ");
+}
+
+/// Panics with "holds …" when `body` holds logic.
+fn refuse(body: &str) {
+    if let Some(why) = logic_in(&strip_literals(body)) {
+        panic!("holds {why}");
+    }
 }
 
 /// `src` defines `fn name` as a test that runs: the line is code (not a comment), and the

@@ -58,6 +58,11 @@ impl Default for Redactor {
 impl Redactor {
     /// Builds the pattern set for `(name, value)` pairs. Empty values are ignored.
     pub fn new<'a>(secrets: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+        Self::build(secrets)
+    }
+
+    /// [`Self::new`]'s work, in a function cargo-mutants mutates (it leaves `new` alone; #87).
+    fn build<'a>(secrets: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
         let mut count = 0;
         let mut patterns: Vec<Pattern> = Vec::new();
         for (name, value) in secrets {

@@ -129,6 +129,11 @@ impl Limits {
     /// body caps.
     #[must_use]
     pub fn new(max_connections: usize) -> Self {
+        Self::documented(max_connections)
+    }
+
+    /// [`Self::new`]'s work, in a function cargo-mutants mutates (it leaves `new` alone; #87).
+    fn documented(max_connections: usize) -> Self {
         let net = sally_core::manifest::Network::default();
         Self {
             head: HEAD_TIMEOUT,

@@ -6,6 +6,9 @@
 # Each one matches by file, function and operator, never by line or column (the `\d+:\d+` stays
 # a wildcard), and its group carries the reason. crates/sally-core/tests/mutants_config.rs
 # enforces that form and proves the `|` -> `^` group.
+# cargo-mutants never mutates a function named `new` (no exclusion needed, and none covers it):
+# mutants_config.rs `no_fn_new_in_mutation_scope_holds_logic` keeps logic out of them.
+# TODO(#87): Task 13 empties that test's allowlist.
 exclude_re = [
   # Equivalent: `|` -> `^` over flag constants that are pairwise disjoint gives the same value.
   # Proof: mutants_config.rs `xor_exclusions_combine_disjoint_flags` reads each function below
