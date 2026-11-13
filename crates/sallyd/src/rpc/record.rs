@@ -84,12 +84,21 @@ impl Seal {
     }
 
     /// Appends under `order`, unless the last entry is already written. A poisoned `order`
-    /// reads as sealed.
-    fn write(&self, sink: &dyn AuditSink, entry: NewEntry, level: AuditLevel) -> Wrote {
+    /// refuses too. Each refusal is passed to `refused` (event, why) here, on the blocking
+    /// call, so a caller that went away does not lose it.
+    fn write(
+        &self,
+        sink: &dyn AuditSink,
+        entry: NewEntry,
+        level: AuditLevel,
+        refused: impl FnOnce(&str, &str),
+    ) -> Wrote {
         let Ok(sealed) = self.order.lock() else {
-            return Wrote::Sealed;
+            refused(entry.event(), "entry refused: audit order lock poisoned");
+            return Wrote::Poisoned;
         };
         if *sealed {
+            refused(entry.event(), "entry refused after session.stop");
             Wrote::Sealed
         } else if sink.append(entry, level).is_ok() {
             Wrote::Yes
@@ -116,6 +125,8 @@ enum Wrote {
     Failed,
     /// Refused: the session's last entry is written.
     Sealed,
+    /// Refused: a write panicked while holding `order`.
+    Poisoned,
 }
 
 impl std::fmt::Debug for Recorder {
@@ -159,33 +170,27 @@ impl Recorder {
     /// entry is (or is being) written: the caller then has no effect. A caller that goes away
     /// leaves its write running, still counted by [`seal`](Self::seal).
     pub async fn append(&self, entry: NewEntry) -> bool {
-        let event = entry.event().to_owned();
         let Some(writing) = self.seal.begin() else {
-            self.refused(&event);
+            self.refused(entry.event(), "entry refused after session.stop");
             return false;
         };
-        let (sink, level) = (Arc::clone(&self.audit), self.level);
+        let rec = self.clone();
         let wrote = tokio::task::spawn_blocking(move || {
             let w = writing;
-            w.0.write(sink.as_ref(), entry, level)
+            w.0.write(rec.audit.as_ref(), entry, rec.level, |event, why| {
+                rec.refused(event, why);
+            })
         })
         .await;
-        match wrote {
-            Ok(Wrote::Yes) => true,
-            Ok(Wrote::Sealed) => {
-                self.refused(&event);
-                false
-            }
-            Ok(Wrote::Failed) | Err(_) => false,
-        }
+        matches!(wrote, Ok(Wrote::Yes))
     }
 
-    /// The oplog line of a write the seal refused: the session and the event, nothing else.
-    fn refused(&self, event: &str) {
+    /// The oplog line of a refused write: why, the session and the event, nothing else.
+    fn refused(&self, event: &str, why: &str) {
         if let Some(log) = &self.log {
             log.error(
                 "audit",
-                "entry refused after session.stop",
+                why,
                 &[("session", &self.session), ("event", event)],
             );
         }
@@ -211,7 +216,9 @@ impl Recorder {
     /// write after it fails, in this recorder and all its clones. A write still in flight at
     /// the bound either landed before `last` or fails. Sealed even when `last` is not written.
     /// A second seal writes nothing; so does the control socket's recorder (no session), which
-    /// is never sealed.
+    /// is never sealed. `bound` covers only the drain: writing `last` then waits for `order`,
+    /// which a write stuck inside the sink holds. A stuck sink is the shared audit writer, which
+    /// stalls every session's entries anyway (security review PS-L5).
     pub async fn seal(&self, last: NewEntry, bound: std::time::Duration) -> Sealed {
         if self.session.is_empty() {
             return Sealed {
@@ -265,6 +272,7 @@ mod tests {
             format!("{rec:?}"),
             r#"Recorder { session: "sess-a", level: Full, .. }"#
         );
+        assert_eq!(rec.session(), "sess-a");
     }
 
     fn note(rec: &Recorder, event: &str) -> NewEntry {
@@ -413,24 +421,26 @@ mod tests {
         let (sink, rec) = crate::rpc::testkit::recorder("sess-a");
         let seal = Seal::new();
         let e = || NewEntry::new(Actor::Sallyd, "tool.result");
-        assert_eq!(seal.write(sink.as_ref(), e(), AuditLevel::Full), Wrote::Yes);
+        let notes = Mutex::new(Vec::new());
+        let note = |ev: &str, why: &str| notes.lock().unwrap().push(format!("{ev}: {why}"));
+        let w = |e| seal.write(sink.as_ref(), e, AuditLevel::Full, note);
+        assert_eq!(w(e()), Wrote::Yes);
         sink.set_failing(true);
-        assert_eq!(
-            seal.write(sink.as_ref(), e(), AuditLevel::Full),
-            Wrote::Failed
-        );
+        assert_eq!(w(e()), Wrote::Failed);
         sink.set_failing(false);
         *seal.order.lock().unwrap() = true;
-        assert_eq!(
-            seal.write(sink.as_ref(), e(), AuditLevel::Full),
-            Wrote::Sealed
-        );
+        assert_eq!(w(e()), Wrote::Sealed);
         assert_eq!(sink.events(), ["tool.result"]);
+        assert_eq!(
+            *notes.lock().unwrap(),
+            ["tool.result: entry refused after session.stop"],
+            "only the refusal is noted"
+        );
         drop(rec);
     }
 
     #[test]
-    fn a_poisoned_order_reads_as_sealed() {
+    fn a_poisoned_order_refuses_the_write() {
         let (sink, _) = crate::rpc::testkit::recorder("sess-a");
         let seal = Arc::new(Seal::new());
         let s = Arc::clone(&seal);
@@ -441,8 +451,8 @@ mod tests {
         .join();
         let e = NewEntry::new(Actor::Sallyd, "tool.result");
         assert_eq!(
-            seal.write(sink.as_ref(), e, AuditLevel::Full),
-            Wrote::Sealed
+            seal.write(sink.as_ref(), e, AuditLevel::Full, |_, _| {}),
+            Wrote::Poisoned
         );
         assert!(sink.events().is_empty());
     }
@@ -536,6 +546,62 @@ mod tests {
         assert!(log.flush(std::time::Duration::from_secs(5)));
         let text = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
         assert!(text.contains("approval.decide"), "{text}");
+    }
+
+    /// The note is written by the blocking write itself: a caller aborted while its write waits
+    /// (the #91 case) still leaves the line when the seal refuses that write.
+    // The test holds `order` while the write waits for it on the blocking pool, on purpose.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn an_aborted_callers_refused_write_is_still_noted() {
+        let (sink, rec) = crate::rpc::testkit::recorder("sess-a");
+        let lines = Lines::default();
+        let log = Oplog::new(lines.clone());
+        let rec = rec.logging(log.clone());
+        let mut held = rec.seal.order.lock().unwrap();
+        let caller = tokio::spawn({
+            let rec = rec.clone();
+            async move { rec.append(note(&rec, "approval.decide")).await }
+        });
+        writing(&rec, 1).await;
+        caller.abort();
+        let _ = caller.await;
+        *held = true;
+        drop(held);
+        writing(&rec, 0).await;
+        assert!(sink.events().is_empty());
+        assert!(log.flush(std::time::Duration::from_secs(5)));
+        let text = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("entry refused after session.stop"), "{text}");
+        assert!(text.contains("approval.decide"), "{text}");
+    }
+
+    /// A poisoned `order` refuses the write too, but its note says so: it is not a stop.
+    #[tokio::test]
+    async fn a_poisoned_order_is_noted_as_such() {
+        let (sink, rec) = crate::rpc::testkit::recorder("sess-a");
+        let lines = Lines::default();
+        let log = Oplog::new(lines.clone());
+        let rec = rec.logging(log.clone());
+        let seal = Arc::clone(&rec.seal);
+        let _ = std::thread::spawn(move || {
+            let _held = seal.order.lock().unwrap();
+            panic!("a write panicked");
+        })
+        .join();
+        assert!(!rec.append(note(&rec, "tool.run")).await);
+        assert!(sink.events().is_empty());
+        assert!(log.flush(std::time::Duration::from_secs(5)));
+        let text = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            text.contains("entry refused: audit order lock poisoned"),
+            "{text}"
+        );
+        assert!(!text.contains("after session.stop"), "{text}");
+        assert!(
+            text.contains("tool.run") && text.contains("sess-a"),
+            "{text}"
+        );
     }
 
     #[tokio::test]
