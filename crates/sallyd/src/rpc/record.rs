@@ -319,7 +319,7 @@ mod tests {
     #[tokio::test]
     async fn a_write_in_flight_at_the_seal_lands_before_the_last_entry() {
         let (sink, rec) = crate::rpc::testkit::recorder("sess-a");
-        sink.hold(true);
+        let held = sink.held();
         let slow = tokio::spawn({
             let rec = rec.clone();
             async move { rec.append(note(&rec, "approval.withdraw")).await }
@@ -340,7 +340,7 @@ mod tests {
             !seal.is_finished(),
             "the seal waits for the write in flight"
         );
-        sink.hold(false);
+        drop(held);
         assert!(slow.await.unwrap());
         assert_eq!(
             seal.await.unwrap(),
@@ -355,7 +355,7 @@ mod tests {
     #[tokio::test]
     async fn a_dropped_caller_still_counts_until_its_write_ends() {
         let (sink, rec) = crate::rpc::testkit::recorder("sess-a");
-        sink.hold(true);
+        let held = sink.held();
         let caller = tokio::spawn({
             let rec = rec.clone();
             async move { rec.append(note(&rec, "tool.result")).await }
@@ -369,7 +369,7 @@ mod tests {
             1,
             "the write is still running"
         );
-        sink.hold(false);
+        drop(held);
         writing(&rec, 0).await;
         assert_eq!(sink.events(), ["tool.result"]);
     }
@@ -378,7 +378,7 @@ mod tests {
     async fn past_the_bound_a_write_not_yet_begun_fails_and_never_follows_the_last_entry() {
         let (sink, rec) = crate::rpc::testkit::recorder("sess-a");
         // One write waits inside the sink holding the order; a second waits behind it.
-        sink.hold(true);
+        let held = sink.held();
         let first = tokio::spawn({
             let rec = rec.clone();
             async move { rec.append(note(&rec, "tool.run")).await }
@@ -400,7 +400,7 @@ mod tests {
             }
         });
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        sink.hold(false);
+        drop(held);
         let sealed = seal.await.unwrap();
         assert!(sealed.written);
         assert_eq!(sealed.late, 2, "both were still in flight at the bound");

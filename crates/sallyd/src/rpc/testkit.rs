@@ -88,6 +88,22 @@ impl Sink {
     pub fn set_failing(&self, fail: bool) {
         self.fail.store(fail, std::sync::atomic::Ordering::SeqCst);
     }
+
+    /// Holds appends until the guard is dropped, also when the test panics: a write blocked in
+    /// the sink never outlives the test, whose runtime would wait for it.
+    pub fn held(self: &Arc<Self>) -> Held {
+        self.hold(true);
+        Held(Arc::clone(self))
+    }
+}
+
+/// See [`Sink::held`].
+pub struct Held(Arc<Sink>);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.0.hold(false);
+    }
 }
 
 /// A sink and a recorder for `session` writing into it.

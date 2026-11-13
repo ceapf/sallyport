@@ -311,7 +311,13 @@ async fn an_expiry_that_cannot_be_written_is_unrecorded() {
 async fn a_failed_pending_entry_shows_nothing_and_runs_nothing() {
     let f = fx(5);
     f.sink.set_failing(true);
-    let r = f.gate.admit(shell(1, &["ls"]), None, None).await;
+    // Bounded: if the failed entry were taken as written, the prompt would wait for a decision.
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        f.gate.admit(shell(1, &["ls"]), None, None),
+    )
+    .await
+    .expect("the admission waited: the failed pending entry was taken as written");
     assert_eq!(r, Err(Refusal::Unrecorded));
     assert!(f.fake.requested.lock().unwrap().is_empty());
     // The approver was never shown it, so it is not told it closed.
