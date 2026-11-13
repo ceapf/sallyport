@@ -227,6 +227,25 @@ fn a_tally_counts_emitted_bytes_only() {
     assert_eq!(s.tally().total(), 4);
 }
 
+/// Re-review L2: a secret never counted equals one counted zero; a different total or any
+/// different count is unequal.
+#[test]
+fn tallies_are_equal_only_when_every_count_and_the_total_are() {
+    let tally = |bytes: &[u64], total| Tally {
+        bytes: bytes.to_vec(),
+        total,
+    };
+    assert_eq!(tally(&[], 0), tally(&[0], 0));
+    assert_eq!(tally(&[3], 3), tally(&[3, 0], 3));
+    assert_ne!(tally(&[3], 3), tally(&[3], 4), "the total");
+    assert_ne!(tally(&[3, 1], 4), tally(&[3, 0], 4), "a count");
+    assert_ne!(
+        tally(&[3], 3),
+        tally(&[3, 1], 3),
+        "a count past the shorter list"
+    );
+}
+
 #[test]
 fn a_scan_reports_the_first_covered_byte() {
     let r = redaction(&[("A", &["*secret"])]);
@@ -525,6 +544,25 @@ fn header_values_are_redacted_in_place_counted_and_others_kept() {
     assert_eq!(
         r.named(&tally),
         [("GITHUB_TOKEN".into(), TOKEN.len() as u64)]
+    );
+}
+
+/// The check behind `in_lead_any_case` (architect D5): a first covered byte in the name or the
+/// separator refuses the header; one at the value's first byte or later is redacted, unless the
+/// result is no header value.
+#[test]
+fn a_covered_byte_before_the_value_is_refused_and_at_it_redacted() {
+    let line = b"x: ##v";
+    assert_eq!(redacted_value(line, 2, 3), Err(Echoed), "in the separator");
+    assert_eq!(
+        redacted_value(line, 3, 3),
+        Ok(HeaderValue::from_static("##v")),
+        "at the value"
+    );
+    assert_eq!(
+        redacted_value(b"x: #\n", 3, 3),
+        Err(Echoed),
+        "no header value"
     );
 }
 

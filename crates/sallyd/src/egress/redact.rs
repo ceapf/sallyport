@@ -673,14 +673,23 @@ pub fn headers(r: &Arc<Redaction>, headers: &HeaderMap) -> Result<(HeaderMap, Ta
         let scan = r.scan(&line);
         let v = match scan.first {
             None => value.clone(),
-            Some(at) if at < as_u64(lead) => return Err(Echoed),
-            Some(_) => HeaderValue::from_bytes(scan.bytes.get(lead..).unwrap_or_default())
-                .map_err(|_| Echoed)?,
+            Some(first) => redacted_value(&scan.bytes, first, lead)?,
         };
         tally.add(&scan.tally);
         out.append(name.clone(), v);
     }
     Ok((out, tally))
+}
+
+/// The value of a redacted header `line` whose first covered byte is at `first`: [`Echoed`]
+/// when that byte lies in the name or separator (its first `lead` bytes) or what follows them
+/// is no header value. [`in_lead_any_case`] refuses such a line first; this check stands on
+/// its own.
+fn redacted_value(line: &[u8], first: u64, lead: usize) -> Result<HeaderValue, Echoed> {
+    if first < as_u64(lead) {
+        return Err(Echoed);
+    }
+    HeaderValue::from_bytes(line.get(lead..).unwrap_or_default()).map_err(|_| Echoed)
 }
 
 /// Whether a form occurs in `line`, ignoring ASCII case, starting within its first `lead`
