@@ -67,18 +67,85 @@ impl Env {
     }
 
     /// Starts `sallyd` and waits until `control.sock` exists.
-    fn start(&self) -> Child {
-        let mut child = self.sallyd().spawn().unwrap();
+    fn start(&self) -> Guard {
+        let mut child = Guard::spawn(self.sallyd());
         let sock = self.state().join("control.sock");
         let end = Instant::now() + Duration::from_secs(60);
         while !sock.exists() {
-            if let Some(status) = child.try_wait().unwrap() {
-                panic!("sallyd exited {status}: {}", stderr(child));
+            if let Some(status) = child.try_wait() {
+                panic!("sallyd exited {status}: {}", child.stderr());
             }
             assert!(Instant::now() < end, "control.sock never appeared");
             std::thread::sleep(Duration::from_millis(50));
         }
         child
+    }
+}
+
+/// A child process (`sallyd`, or strace running it) that a failed assertion cannot leak: on drop
+/// its own children and then it are killed and reaped, so no `sallyd` keeps its lock.
+struct Guard(Option<Child>);
+
+impl Guard {
+    fn spawn(mut c: Command) -> Self {
+        Self(Some(c.spawn().unwrap()))
+    }
+
+    fn child(&mut self) -> &mut Child {
+        self.0.as_mut().unwrap()
+    }
+
+    fn id(&mut self) -> u32 {
+        self.child().id()
+    }
+
+    fn try_wait(&mut self) -> Option<std::process::ExitStatus> {
+        self.child().try_wait().unwrap()
+    }
+
+    /// Waits for the exit; its status and stderr.
+    fn finish(mut self) -> std::process::Output {
+        self.0.take().unwrap().wait_with_output().unwrap()
+    }
+
+    fn stderr(self) -> String {
+        String::from_utf8_lossy(&self.finish().stderr).into_owned()
+    }
+
+    /// The pids of its direct children.
+    fn children(&mut self) -> Vec<i32> {
+        let id = self.id();
+        std::fs::read_to_string(format!("/proc/{id}/task/{id}/children"))
+            .unwrap_or_default()
+            .split_whitespace()
+            .filter_map(|p| p.parse().ok())
+            .collect()
+    }
+
+    fn signal(&mut self, s: rustix::process::Signal) {
+        signal(i32::try_from(self.id()).unwrap(), s);
+    }
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        if self.0.is_none() {
+            return;
+        }
+        // A tracee outlives a killed strace: its children go first.
+        for p in self.children() {
+            signal(p, rustix::process::Signal::KILL);
+        }
+        if let Some(mut c) = self.0.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+fn signal(pid: i32, s: rustix::process::Signal) {
+    if let Some(p) = rustix::process::Pid::from_raw(pid) {
+        let _ = rustix::process::kill_process(p, s);
     }
 }
 
@@ -96,13 +163,8 @@ impl Drop for Env {
     }
 }
 
-fn stderr(child: Child) -> String {
-    String::from_utf8_lossy(&child.wait_with_output().unwrap().stderr).into_owned()
-}
-
-fn terminate(child: &Child) {
-    let pid = rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
-    rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
+fn terminate(child: &mut Guard) {
+    child.signal(rustix::process::Signal::TERM);
 }
 
 /// The value of `field:` in `/proc/<pid>/status`.
@@ -121,14 +183,14 @@ fn status_field(pid: u32, field: &str) -> String {
 #[test]
 fn a_second_sallyd_exits_already_running() {
     let env = Env::new();
-    let first = env.start();
+    let mut first = env.start();
     let second = env.sallyd().output().unwrap();
     assert!(!second.status.success());
     let err = String::from_utf8_lossy(&second.stderr);
     assert!(err.contains("already running"), "{err}");
     assert!(env.state().join("control.sock").exists());
-    terminate(&first);
-    let out = first.wait_with_output().unwrap();
+    terminate(&mut first);
+    let out = first.finish();
     let log = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{log}");
     assert!(log.contains("\"stopped\""), "{log}");
@@ -142,7 +204,7 @@ fn a_second_sallyd_exits_already_running() {
 #[test]
 fn the_running_daemon_is_hardened() {
     let env = Env::new();
-    let child = env.start();
+    let mut child = env.start();
     let pid = child.id();
     assert_eq!(status_field(pid, "Umask"), "0077");
     let limits = std::fs::read_to_string(format!("/proc/{pid}/limits")).unwrap();
@@ -163,8 +225,8 @@ fn the_running_daemon_is_hardened() {
     let mode = |p: &Path| std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777;
     assert_eq!(mode(&env.state()), 0o700);
     assert_eq!(mode(&env.state().join("control.sock")), 0o600);
-    terminate(&child);
-    assert!(child.wait_with_output().unwrap().status.success());
+    terminate(&mut child);
+    assert!(child.finish().status.success());
 }
 
 /// Q42: a stale `control.sock` and stale session socket directories from a previous `sallyd`
@@ -177,7 +239,7 @@ fn stale_sockets_are_removed_at_startup() {
     std::fs::write(env.state().join("control.sock"), b"stale").unwrap();
     // `start` returns once control.sock exists; the stale file is a regular file, so wait for a
     // socket.
-    let mut child = env.sallyd().spawn().unwrap();
+    let mut child = Guard::spawn(env.sallyd());
     let sock = env.state().join("control.sock");
     let end = Instant::now() + Duration::from_secs(60);
     loop {
@@ -185,15 +247,15 @@ fn stale_sockets_are_removed_at_startup() {
         if std::fs::symlink_metadata(&sock).is_ok_and(|m| m.file_type().is_socket()) {
             break;
         }
-        if let Some(status) = child.try_wait().unwrap() {
-            panic!("sallyd exited {status}: {}", stderr(child));
+        if let Some(status) = child.try_wait() {
+            panic!("sallyd exited {status}: {}", child.stderr());
         }
         assert!(Instant::now() < end, "control.sock never became a socket");
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(!env.state().join("sessions").exists());
-    terminate(&child);
-    assert!(child.wait_with_output().unwrap().status.success());
+    terminate(&mut child);
+    assert!(child.finish().status.success());
 }
 
 /// Q42 step 4: a runtime directory others can enter is refused, and nothing is bound.
@@ -212,7 +274,8 @@ fn a_loose_state_directory_refuses_start() {
 /// A trace line that could be (or prepare) an outbound connection: an IP socket, a connect to a
 /// non-loopback address, or a connect whose address strace could not read. A non-dumpable
 /// `sallyd` cannot have its memory read, so its addresses show as pointers: what cannot be shown
-/// to be loopback counts. `socket()` arguments are plain integers and always decode.
+/// to be loopback counts. `socket()` arguments are plain integers and always decode. A decoded
+/// Unix or netlink address (podman's helpers ask the kernel over netlink) stays on the machine.
 fn outbound(line: &str) -> bool {
     if line.contains("socket(AF_INET") {
         return true;
@@ -220,7 +283,7 @@ fn outbound(line: &str) -> bool {
     if !line.contains("connect(") {
         return false;
     }
-    if line.contains("AF_UNIX") {
+    if line.contains("sa_family=AF_UNIX") || line.contains("sa_family=AF_NETLINK") {
         return false;
     }
     let loopback = ["inet_addr(\"127.", "\"::1\"", "\"::ffff:127."];
@@ -231,6 +294,7 @@ fn outbound(line: &str) -> bool {
 fn only_unix_and_loopback_lines_pass_the_trace_filter() {
     let unix = r#"7 connect(5, {sa_family=AF_UNIX, sun_path="/x"}, 110) = 0"#;
     let unix_socket = "7 socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0) = 5";
+    let netlink = "7 connect(5, {sa_family=AF_NETLINK, nl_pid=0, nl_groups=00000000}, 12) = 0";
     let lo4 = r#"7 connect(5, {sa_family=AF_INET, sin_port=htons(1), sin_addr=inet_addr("127.0.0.1")}, 16) = 0"#;
     let lo6 = r#"7 connect(5, {sa_family=AF_INET6, sin6_port=htons(1), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "::1", &sin6_addr), sin6_scope_id=0}, 28) = 0"#;
     let out4 = r#"7 connect(5, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("192.0.2.1")}, 16) = 0"#;
@@ -238,7 +302,7 @@ fn only_unix_and_loopback_lines_pass_the_trace_filter() {
     let unread = "7 connect(11, 0x7fff45e25100, 16) = 0";
     let ip4 = "7 socket(AF_INET, SOCK_DGRAM|SOCK_CLOEXEC, IPPROTO_IP) = 5";
     let ip6 = "7 socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP) = 5";
-    for l in [unix, unix_socket, lo4, lo6] {
+    for l in [unix, unix_socket, netlink, lo4, lo6] {
         assert!(!outbound(l), "{l}");
     }
     for l in [out4, out6, unread, ip4, ip6] {
@@ -277,12 +341,12 @@ fn rt_net_11_an_idle_sallyd_connects_nowhere() {
         ])
         .arg(&trace)
         .arg(env!("CARGO_BIN_EXE_sallyd"));
-    let mut tracer = env.command(strace).spawn().unwrap();
+    let mut tracer = Guard::spawn(env.command(strace));
     let started = Instant::now();
     let sock = env.state().join("control.sock");
     while !sock.exists() {
-        if let Some(status) = tracer.try_wait().unwrap() {
-            panic!("strace exited {status}: {}", stderr(tracer));
+        if let Some(status) = tracer.try_wait() {
+            panic!("strace exited {status}: {}", tracer.stderr());
         }
         assert!(
             started.elapsed() < Duration::from_secs(60),
@@ -292,17 +356,9 @@ fn rt_net_11_an_idle_sallyd_connects_nowhere() {
     }
     std::thread::sleep(Duration::from_secs(60).saturating_sub(started.elapsed()));
     // sallyd is strace's one child; SIGTERM goes to it, and strace exits with it.
-    let children = format!("/proc/{0}/task/{0}/children", tracer.id());
-    let sallyd: u32 = std::fs::read_to_string(children)
-        .unwrap()
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .parse()
-        .unwrap();
-    let pid = rustix::process::Pid::from_raw(i32::try_from(sallyd).unwrap()).unwrap();
-    rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
-    let out = tracer.wait_with_output().unwrap();
+    let sallyd = *tracer.children().first().expect("strace runs sallyd");
+    signal(sallyd, rustix::process::Signal::TERM);
+    let out = tracer.finish();
     assert!(
         out.status.success(),
         "{}",

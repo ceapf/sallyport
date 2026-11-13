@@ -111,6 +111,7 @@ mod tests {
     use super::*;
     use crate::egress::server::Resolver;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -124,7 +125,7 @@ mod tests {
     #[test]
     fn a_session_egress_uses_the_starters_lookup() {
         crate::daemon::runtime().unwrap().block_on(async {
-            let (inner, _release) = stuck();
+            let (inner, _release, _) = stuck();
             let starter = SharedEgress::new(inner);
             assert!(format!("{starter:?}").starts_with("SharedEgress"));
             let got = starter
@@ -138,21 +139,32 @@ mod tests {
     }
 
     /// A lookup that blocks until released (names starting with `slow`) and answers at once
-    /// otherwise.
-    fn stuck() -> (Lookup, mpsc::Sender<()>) {
+    /// otherwise. The counter is how many slow lookups are inside it, every permit held.
+    fn stuck() -> (Lookup, mpsc::Sender<()>, Arc<AtomicUsize>) {
         let (tx, rx) = mpsc::channel::<()>();
         let rx = Arc::new(Mutex::new(rx));
+        let entered = Arc::new(AtomicUsize::new(0));
+        let inside = Arc::clone(&entered);
         let lookup: Lookup = Arc::new(move |name: &str, _port: u16| {
             if name.starts_with("slow") {
+                inside.fetch_add(1, Ordering::SeqCst);
                 let _ = rx.lock().unwrap().recv();
             }
             Ok(vec![SocketAddr::from(([192, 0, 2, 1], 443))])
         });
-        (lookup, tx)
+        (lookup, tx, entered)
     }
 
-    async fn settle() {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    /// Waits until `n` slow lookups are inside, or fails after 10 s.
+    async fn entered(count: &AtomicUsize, n: usize) {
+        let end = tokio::time::Instant::now() + Duration::from_secs(10);
+        while count.load(Ordering::SeqCst) < n {
+            assert!(
+                tokio::time::Instant::now() < end,
+                "{n} lookups never started"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
     }
 
     /// #47: session 1 saturates its share; its next lookup fails at once while session 2 still
@@ -160,7 +172,7 @@ mod tests {
     #[test]
     fn one_session_cannot_take_another_sessions_lookups() {
         crate::daemon::runtime().unwrap().block_on(async {
-            let (inner, release) = stuck();
+            let (inner, release, inside) = stuck();
             let lookup = globally_bounded(Arc::new(Semaphore::new(MAX_LOOKUPS)), inner);
             let (s1, s2) = (
                 Arc::new(session_resolver(&lookup)),
@@ -173,7 +185,7 @@ mod tests {
                     async move { r.resolve("slow.test", 443).await },
                 ));
             }
-            settle().await;
+            entered(&inside, SESSION_LOOKUPS).await;
             let e = s1.resolve("fast.test", 443).await.unwrap_err();
             assert_eq!(e.kind(), io::ErrorKind::WouldBlock, "{e}");
             assert_eq!(s2.resolve("fast.test", 443).await.unwrap().len(), 1);
@@ -193,7 +205,7 @@ mod tests {
     #[test]
     fn the_global_bound_holds_across_sessions() {
         crate::daemon::runtime().unwrap().block_on(async {
-            let (inner, release) = stuck();
+            let (inner, release, inside) = stuck();
             let lookup = globally_bounded(Arc::new(Semaphore::new(MAX_LOOKUPS)), inner);
             let mut held = Vec::new();
             for _ in 0..4 {
@@ -205,7 +217,7 @@ mod tests {
                     ));
                 }
             }
-            settle().await;
+            entered(&inside, MAX_LOOKUPS).await;
             let fifth = session_resolver(&lookup);
             let e = fifth.resolve("fast.test", 443).await.unwrap_err();
             assert_eq!(e.kind(), io::ErrorKind::WouldBlock, "{e}");
