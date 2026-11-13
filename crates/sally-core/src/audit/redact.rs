@@ -207,14 +207,10 @@ impl SessionForms {
     ) -> Arc<Self> {
         let mut secrets: Vec<(String, Vec<Secret<String>>)> = Vec::new();
         for (name, value, extra) in entries {
-            let at = match secrets.iter().position(|(n, _)| n == name) {
-                Some(at) => at,
-                None => {
-                    secrets.push((name.to_owned(), Vec::new()));
-                    secrets.len() - 1
-                }
-            };
-            let Some((_, forms)) = secrets.get_mut(at) else {
+            if !secrets.iter().any(|(n, _)| n == name) {
+                secrets.push((name.to_owned(), Vec::new()));
+            }
+            let Some((_, forms)) = secrets.iter_mut().find(|(n, _)| n == name) else {
                 continue;
             };
             for form in secret_forms(value.expose()).into_iter().chain(extra) {
