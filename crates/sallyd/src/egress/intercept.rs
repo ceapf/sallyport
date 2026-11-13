@@ -41,11 +41,12 @@ use super::super::head::MAX_HEAD;
 use super::super::inject::Credentials;
 use super::super::meter::{BodyEnd, BoxError, Capped, Counts, Meter, OnEnd};
 use super::super::policy::Reason;
-use super::super::redact::{self, Redacted};
+use super::super::redact::{self, Ending, OnRedacted, Redacted};
 use super::super::rewrite;
 use super::super::tunnel::{Activity, End, Totals};
 use super::intercept_tls::HostTls;
 use super::{Cleared, Dialer, ESTABLISHED, HostAddrs, Proxy, REPLY_TIMEOUT, Resolver, write_reply};
+use report::ResponseReport;
 
 /// Largest upstream response head (architect Q45); more is `response-too-large`.
 pub const MAX_RESPONSE_HEAD: usize = 64 * 1024;
@@ -201,7 +202,7 @@ impl State {
 /// A response body: a refusal's text, or the upstream's body under the response cap, redacted.
 enum Out {
     Reply(Option<Bytes>),
-    Upstream(Redacted<Capped<Incoming>>),
+    Upstream(Box<Redacted<Capped<Incoming>>>),
 }
 
 impl Body for Out {
@@ -650,7 +651,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
             Err(reason) => return self.refuse_inside(st, reason, target, None).await,
         };
         let redaction = st.credentials.redaction();
-        let Ok(headers) = redact::headers(redaction, &headers) else {
+        let Ok((headers, head_tally)) = redact::headers(redaction, &headers) else {
             return self
                 .refuse_inside(st, Reason::UpstreamEchoedSecret, target, None)
                 .await;
@@ -673,7 +674,27 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
             level: self.level,
         };
         let capped = Capped::new(body, self.limits.max_response, Arc::new(on_end));
-        let mut out = Response::new(Out::Upstream(Redacted::new(capped, redaction)));
+        let report = Arc::new(ResponseReport {
+            state: Arc::clone(st),
+            entry: Mutex::new(Some(self.entry("egress.response", None))),
+            target: target.to_owned(),
+            status: rp.status,
+            redaction: Arc::clone(redaction),
+            sink: Arc::clone(&self.audit),
+            level: self.level,
+        });
+        // A body known empty now (HEAD, 204, 304) is never polled: its entry is written here,
+        // before the head goes out (architect Q13).
+        let empty = capped.is_end_stream();
+        if empty
+            && let Some(work) = report.ended(Ending::Complete, head_tally.clone())
+            && !work.await
+        {
+            return Err(Box::new(redact::Unreported));
+        }
+        let body = Redacted::new(capped, redaction, head_tally, report);
+        let body = if empty { body.reported() } else { body };
+        let mut out = Response::new(Out::Upstream(Box::new(body)));
         *out.status_mut() = rp.status;
         *out.headers_mut() = headers;
         Ok(out)
@@ -837,6 +858,9 @@ fn inside_args(a: &Authority, reason: Reason, target: &str, part: Option<&str>) 
     }
     v
 }
+
+#[path = "intercept_report.rs"]
+mod report;
 
 #[cfg(test)]
 #[path = "intercept_tests.rs"]

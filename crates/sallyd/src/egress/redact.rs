@@ -1,13 +1,17 @@
-//! Response redaction inside intercepted tunnels (Task 9a-3; maintainer decisions 2, 3 and 7,
-//! architect D1–D5).
+//! Response redaction inside intercepted tunnels (Task 9a-3; maintainer decisions 2, 3 and 7 as
+//! ruled R2, architect D2–D5 and Q6–Q13).
 //!
-//! Every byte covered by an occurrence of any form of any of the session's secrets is replaced,
-//! and nothing else: the output has the input's length, so framing and `Content-Length` never
-//! change (decision 2). Occurrences are found in the *original* bytes and their union is
-//! replaced, so overlapping forms of two secrets are both removed whole. A maximal run of
-//! covered bytes is filled with the label `[REDACTED:NAME]` of the occurrence that starts it
-//! (earliest start, then the longest form, then the first form given: architect D1), cut to the
-//! run's length, then `*` up to its end.
+//! Every byte covered by an occurrence of any form of any of the session's secrets is replaced
+//! by the session's filler byte, and nothing else: the output has the input's length, so framing
+//! and `Content-Length` never change (decision 2). Occurrences are found in the *original* bytes
+//! and their union is replaced, so overlapping forms of two secrets are both removed whole.
+//!
+//! The filler is the first of [`FILLERS`] that occurs in no form of the session (architect Q7);
+//! a session where every candidate occurs is refused ([`RedactionError::NoFiller`]). So no form
+//! survives redaction (decision 7, literal): an occurrence in the output that touches a replaced
+//! byte holds the filler, which no form holds; one that touches none is the input's own bytes,
+//! so it was found and replaced. The domain is one body, or one header line as [`headers`] scans
+//! it (architect Q6).
 //!
 //! [`Stream`] does the same over a body that arrives in pieces: it holds back the last
 //! `longest - 1` bytes (decision 3), the most an occurrence that is not yet complete can have
@@ -16,30 +20,30 @@
 //! scans only the windows that end in the new piece: an occurrence wholly inside the bytes held
 //! before was marked by an earlier push. The bytes it holds may be part of a secret: they are
 //! wiped when the stream drops, and a growing buffer wipes the one it replaces.
+//!
+//! A stream also counts, per secret, the emitted bytes that any occurrence of that secret's forms
+//! covers, and the emitted filler bytes in all ([`Tally`]); the response's `egress.response`
+//! entry carries them, names and counts only (architect Q13). Its memory for this is bounded by
+//! the bytes it holds, never by the body's length.
 #![deny(clippy::indexing_slicing)]
 
-use std::cmp::Reverse;
 use std::fmt;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 
 use hyper::body::{Body, Bytes, Frame, SizeHint};
 use hyper::http::header::{HeaderMap, HeaderValue};
-use sally_core::secrets::Secret;
+use sally_core::audit::SessionForms;
 use zeroize::{Zeroize, Zeroizing};
 
 use super::meter::BoxError;
 
-/// Fills a covered run past its label.
-const PAD: u8 = b'*';
-/// A held byte no occurrence covers.
-const UNCOVERED: u32 = 0;
-/// A held byte some occurrence covers, none starting at it. Otherwise a mark is `k + 1` for the
-/// best-ranked form `k` that starts at the byte: the forms are sorted by architect D1's rank
-/// (longer first, then the order given), so the lowest `k` wins. Only a run's first byte needs
-/// its label, and every occurrence covering that byte starts at it.
-const COVERED: u32 = u32::MAX;
+/// The filler candidates, in the order tried (architect Q7). Each is visible ASCII, so a
+/// redacted header value stays a header value; and no encoding the forms use (base64,
+/// percent-encoding, JSON escaping) produces one unless the raw value holds it.
+pub const FILLERS: [u8; 8] = *b"*#~^|!$@";
 /// The longest form a redaction accepts: a store value is at most 8 KiB, its longest form (the
 /// percent-encoding) three times that, and the injected header value adds its format's text.
 pub const MAX_FORM: usize = 32 * 1024;
@@ -49,63 +53,71 @@ pub const MAX_FORM: usize = 32 * 1024;
 #[error("secret {0}: a form is longer than {MAX_FORM} bytes")]
 pub struct TooLong(pub String);
 
-/// One form of one secret, and the index of that secret's label.
-struct Form {
-    bytes: Secret<Vec<u8>>,
-    label: usize,
+/// Why a session's forms cannot be redacted.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RedactionError {
+    /// A form is longer than [`MAX_FORM`].
+    #[error(transparent)]
+    TooLong(#[from] TooLong),
+    /// Every filler candidate occurs in some form (architect Q8): no filler could be told from
+    /// a secret. Names no secret: it is a property of them all.
+    #[error("no redaction filler: every candidate occurs in a secret form")]
+    NoFiller,
 }
 
-/// The forms of a session's secrets and their labels. Built once per session; shared by every
-/// tunnel's streams.
+/// The forms of a session's secrets, read in place (architect Q11), and the session's filler.
+/// Built once per session; shared by every tunnel's streams.
 pub struct Redaction {
-    forms: Vec<Form>,
-    labels: Vec<String>,
+    forms: Arc<SessionForms>,
+    filler: u8,
     longest: usize,
 }
 
 impl fmt::Debug for Redaction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Redaction")
-            .field("labels", &self.labels)
-            .field("forms", &self.forms.len())
+            .field("forms", &self.forms)
+            .field("filler", &char::from(self.filler))
             .field("longest", &self.longest)
             .finish()
     }
 }
 
 impl Redaction {
-    /// The redaction of `(name, forms)` pairs. Empty forms are ignored; a name with no form
-    /// keeps its label but never matches.
+    /// The redaction of `forms`, with the first filler candidate none of them holds.
     ///
     /// # Errors
-    /// [`TooLong`] when a form is longer than [`MAX_FORM`].
-    pub fn new(secrets: Vec<(String, Vec<Secret<Vec<u8>>>)>) -> Result<Self, TooLong> {
-        Self::from_forms(secrets)
-    }
-
-    /// [`Self::new`]'s work, in a function cargo-mutants mutates (it leaves `new` alone).
-    fn from_forms(secrets: Vec<(String, Vec<Secret<Vec<u8>>>)>) -> Result<Self, TooLong> {
-        let mut forms = Vec::new();
-        let mut labels = Vec::with_capacity(secrets.len());
-        for (label, (name, list)) in secrets.into_iter().enumerate() {
-            for bytes in list {
-                if bytes.expose().len() > MAX_FORM {
-                    return Err(TooLong(name));
+    /// [`RedactionError::TooLong`] when a form is longer than [`MAX_FORM`] (checked first);
+    /// [`RedactionError::NoFiller`] when every candidate occurs in a form.
+    pub fn of(forms: Arc<SessionForms>) -> Result<Self, RedactionError> {
+        let mut longest = 0;
+        for (name, list) in forms.secrets() {
+            for form in list {
+                let len = form.expose().len();
+                if len > MAX_FORM {
+                    return Err(TooLong(name.to_owned()).into());
                 }
-                if !bytes.expose().is_empty() {
-                    forms.push(Form { bytes, label });
-                }
+                longest = longest.max(len);
             }
-            labels.push(format!("[REDACTED:{name}]"));
         }
-        // Architect D1's rank: the longer form first, then the order given (a stable sort).
-        forms.sort_by_key(|f| Reverse(f.bytes.expose().len()));
-        let longest = forms.first().map_or(0, |f| f.bytes.expose().len());
+        let filler = filler_for(&forms).ok_or(RedactionError::NoFiller)?;
         Ok(Self {
             forms,
-            labels,
+            filler,
             longest,
         })
+    }
+
+    /// The forms this redaction reads (the same allocation the session built).
+    #[must_use]
+    pub const fn forms(&self) -> &Arc<SessionForms> {
+        &self.forms
+    }
+
+    /// The byte every covered byte becomes.
+    #[must_use]
+    pub const fn filler(&self) -> u8 {
+        self.filler
     }
 
     /// The longest form, in bytes: a stream holds back one byte less.
@@ -117,16 +129,20 @@ impl Redaction {
     /// `data` with every covered byte replaced.
     #[must_use]
     pub fn bytes(self: &Arc<Self>, data: &[u8]) -> Vec<u8> {
-        self.scan(data).0
+        self.scan(data).bytes
     }
 
-    /// `data` with every covered byte replaced, and the offset of the first covered byte.
+    /// `data` redacted, with the offset of its first covered byte and what was redacted.
     #[must_use]
-    pub fn scan(self: &Arc<Self>, data: &[u8]) -> (Vec<u8>, Option<u64>) {
+    pub fn scan(self: &Arc<Self>, data: &[u8]) -> Scan {
         let mut s = self.stream();
-        let mut out = s.push(data);
-        out.extend(s.finish());
-        (out, s.first_covered())
+        let mut bytes = s.push(data);
+        bytes.extend(s.finish());
+        Scan {
+            bytes,
+            first: s.first_covered(),
+            tally: s.tally().clone(),
+        }
     }
 
     /// A stream over one body.
@@ -135,43 +151,83 @@ impl Redaction {
         Stream {
             redaction: Arc::clone(self),
             held: Zeroizing::new(Vec::new()),
-            marks: Vec::new(),
+            covered: Vec::new(),
+            pending: Vec::new(),
             base: 0,
-            run: None,
             first: None,
+            tally: Tally::default(),
         }
     }
 
-    /// The filler byte `at` bytes into a run labelled `label`.
-    fn filler(&self, label: usize, at: usize) -> u8 {
-        self.labels
-            .get(label)
-            .and_then(|l| l.as_bytes().get(at))
-            .copied()
-            .unwrap_or(PAD)
-    }
-
-    /// The label of the run that starts at a byte marked `mark` (form `mark - 1` starts there).
-    fn label(&self, mark: u32) -> usize {
-        usize::try_from(mark.wrapping_sub(1))
-            .ok()
-            .and_then(|k| self.forms.get(k))
-            .map_or(0, |f| f.label)
+    /// Each secret's name with its count in `tally`, in grant order, the secrets with none left
+    /// out.
+    #[must_use]
+    pub fn named(&self, tally: &Tally) -> Vec<(String, u64)> {
+        self.forms
+            .secrets()
+            .zip(tally.bytes.iter().chain(std::iter::repeat(&0)))
+            .filter(|(_, n)| **n > 0)
+            .map(|((name, _), n)| (name.to_owned(), *n))
+            .collect()
     }
 }
 
-/// The mark of form `k` starting at a byte.
-fn rank(k: usize) -> u32 {
-    u32::try_from(k)
-        .ok()
-        .and_then(|k| k.checked_add(1))
-        .filter(|m| *m != COVERED)
-        .unwrap_or(COVERED)
+/// The first of [`FILLERS`] that no form of `forms` holds.
+fn filler_for(forms: &SessionForms) -> Option<u8> {
+    FILLERS.iter().copied().find(|c| {
+        !forms
+            .secrets()
+            .flat_map(|(_, list)| list)
+            .any(|f| f.expose().as_bytes().contains(c))
+    })
 }
 
-/// A start mark `new` merged into a byte's mark `old`: the best-ranked start wins.
-fn best(old: u32, new: u32) -> u32 {
-    if old == UNCOVERED { new } else { old.min(new) }
+/// [`Redaction::scan`]'s result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scan {
+    /// The redacted bytes.
+    pub bytes: Vec<u8>,
+    /// The offset of the first covered byte.
+    pub first: Option<u64>,
+    /// What was redacted.
+    pub tally: Tally,
+}
+
+/// What a stream redacted: per secret (in grant order), the emitted bytes any occurrence of its
+/// forms covers, and the emitted filler bytes in all (architect Q13). A byte two secrets cover
+/// counts for both, so each secret's count is at most the total and the total at most their sum.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Tally {
+    bytes: Vec<u64>,
+    total: u64,
+}
+
+impl Tally {
+    /// The bytes redacted in all.
+    #[must_use]
+    pub const fn total(&self) -> u64 {
+        self.total
+    }
+
+    /// Adds `other`'s counts to these (a response's header lines and its body).
+    pub fn add(&mut self, other: &Self) {
+        if self.bytes.len() < other.bytes.len() {
+            self.bytes.resize(other.bytes.len(), 0);
+        }
+        for (mine, theirs) in self.bytes.iter_mut().zip(&other.bytes) {
+            *mine = mine.saturating_add(*theirs);
+        }
+        self.total = self.total.saturating_add(other.total);
+    }
+
+    fn count(&mut self, secret: usize, n: u64) {
+        if self.bytes.len() <= secret {
+            self.bytes.resize(secret.saturating_add(1), 0);
+        }
+        if let Some(c) = self.bytes.get_mut(secret) {
+            *c = c.saturating_add(n);
+        }
+    }
 }
 
 /// One body's redaction, fed in pieces.
@@ -179,14 +235,16 @@ pub struct Stream {
     redaction: Arc<Redaction>,
     /// Bytes not yet emitted, as received; wiped on drop.
     held: Zeroizing<Vec<u8>>,
-    /// Per held byte: [`UNCOVERED`], [`COVERED`], or the start mark of the best form there.
-    marks: Vec<u32>,
+    /// Per held byte: whether an occurrence covers it.
+    covered: Vec<bool>,
+    /// Per secret: the stream ranges `[start, end)` its occurrences cover and that are not yet
+    /// emitted, sorted and merged.
+    pending: Vec<Vec<(u64, u64)>>,
     /// The stream offset of `held[0]`.
     base: u64,
-    /// The run the last emitted byte belongs to: its label and the next byte's offset in it.
-    run: Option<(usize, usize)>,
     /// The stream offset of the first covered byte emitted.
     first: Option<u64>,
+    tally: Tally,
 }
 
 impl fmt::Debug for Stream {
@@ -194,6 +252,7 @@ impl fmt::Debug for Stream {
         f.debug_struct("Stream")
             .field("held", &self.held.len())
             .field("base", &self.base)
+            .field("tally", &self.tally)
             .finish_non_exhaustive()
     }
 }
@@ -204,7 +263,7 @@ impl Stream {
     pub fn push(&mut self, piece: &[u8]) -> Vec<u8> {
         let before = self.held.len();
         append_wiped(&mut self.held, piece);
-        self.marks.resize(self.held.len(), UNCOVERED);
+        self.covered.resize(self.held.len(), false);
         self.mark(before);
         let keep = self.redaction.longest.saturating_sub(1);
         self.emit(self.held.len().saturating_sub(keep))
@@ -222,93 +281,255 @@ impl Stream {
         self.first
     }
 
+    /// What the bytes emitted so far redacted.
+    #[must_use]
+    pub const fn tally(&self) -> &Tally {
+        &self.tally
+    }
+
     /// Bytes held back, not yet emitted.
     #[must_use]
     pub fn held(&self) -> usize {
         self.held.len()
     }
 
-    /// Drops everything held, wiped: the body failed or was cut, so nothing more is emitted.
+    /// Drops everything held, wiped and uncounted: the body failed or was cut, so nothing more
+    /// is emitted.
     pub fn discard(&mut self) {
         self.held.zeroize();
-        self.marks.clear();
+        self.covered.clear();
+        self.pending.clear();
     }
 
     /// Marks every byte that an occurrence lying wholly inside `held` and ending after its first
-    /// `before` bytes covers (the others were marked by earlier pushes).
+    /// `before` bytes covers (the others were marked by earlier pushes), and records the
+    /// occurrence's range for its secret.
     fn mark(&mut self, before: usize) {
-        for (k, form) in self.redaction.forms.iter().enumerate() {
-            let needle = form.bytes.expose().as_slice();
-            let from = before.saturating_sub(needle.len().saturating_sub(1));
-            let Some(tail) = self.held.get(from..) else {
-                continue;
-            };
-            for (j, window) in tail.windows(needle.len()).enumerate() {
-                if window != needle {
+        let redaction = Arc::clone(&self.redaction);
+        for (secret, (_, forms)) in redaction.forms.secrets().enumerate() {
+            for form in forms {
+                let needle = form.expose().as_bytes();
+                let from = before.saturating_sub(needle.len().saturating_sub(1));
+                let Some(tail) = self.held.get(from..) else {
                     continue;
-                }
-                let start = from.saturating_add(j);
-                if let Some(m) = self.marks.get_mut(start) {
-                    *m = best(*m, rank(k));
-                }
-                let rest = self.marks.iter_mut().skip(start.saturating_add(1));
-                for m in rest.take(needle.len().saturating_sub(1)) {
-                    if *m == UNCOVERED {
-                        *m = COVERED;
+                };
+                let mut found = Vec::new();
+                for (j, window) in tail.windows(needle.len()).enumerate() {
+                    if window == needle {
+                        found.push(from.saturating_add(j));
                     }
+                }
+                for start in found {
+                    self.cover(secret, start, needle.len());
                 }
             }
         }
     }
 
-    /// Emits the first `n` held bytes, covered ones as filler.
+    /// An occurrence of `secret` covers `len` held bytes from `start`.
+    fn cover(&mut self, secret: usize, start: usize, len: usize) {
+        for c in self.covered.iter_mut().skip(start).take(len) {
+            *c = true;
+        }
+        if self.pending.len() <= secret {
+            self.pending.resize_with(secret.saturating_add(1), Vec::new);
+        }
+        let at = self.base.saturating_add(as_u64(start));
+        let range = (at, at.saturating_add(as_u64(len)));
+        if let Some(ranges) = self.pending.get_mut(secret) {
+            ranges.push(range);
+            ranges.sort_unstable();
+            let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+            for &(s, e) in ranges.iter() {
+                match merged.last_mut() {
+                    Some(last) if s <= last.1 => last.1 = last.1.max(e),
+                    _ => merged.push((s, e)),
+                }
+            }
+            *ranges = merged;
+        }
+    }
+
+    /// Emits the first `n` held bytes, covered ones as the filler, and counts them.
     fn emit(&mut self, n: usize) -> Vec<u8> {
+        let filler = self.redaction.filler;
         let mut out = Vec::with_capacity(n);
-        for (i, (byte, mark)) in self.held.iter().zip(&self.marks).take(n).enumerate() {
-            if *mark == UNCOVERED {
-                self.run = None;
-                out.push(*byte);
+        for (i, (byte, covered)) in self.held.iter().zip(&self.covered).take(n).enumerate() {
+            if *covered {
+                self.first
+                    .get_or_insert(self.base.saturating_add(as_u64(i)));
+                self.tally.total = self.tally.total.saturating_add(1);
+                out.push(filler);
             } else {
-                let pos = self
-                    .base
-                    .saturating_add(u64::try_from(i).unwrap_or(u64::MAX));
-                self.first.get_or_insert(pos);
-                let (label, at) = self.run.unwrap_or((self.redaction.label(*mark), 0));
-                out.push(self.redaction.filler(label, at));
-                self.run = Some((label, at.saturating_add(1)));
+                out.push(*byte);
+            }
+        }
+        let end = self.base.saturating_add(as_u64(n));
+        for (secret, ranges) in self.pending.iter_mut().enumerate() {
+            let mut emitted = 0u64;
+            ranges.retain_mut(|(s, e)| {
+                emitted = emitted.saturating_add((*e).min(end).saturating_sub(*s));
+                *s = (*s).max(end);
+                *e > end
+            });
+            if emitted > 0 {
+                self.tally.count(secret, emitted);
             }
         }
         self.held.drain(..n);
-        self.marks.drain(..n);
-        self.base = self
-            .base
-            .saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+        self.covered.drain(..n);
+        self.base = end;
         out
     }
+}
+
+fn as_u64(n: usize) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX)
+}
+
+/// How a [`Redacted`] body ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ending {
+    /// The upstream body ended and everything was emitted.
+    Complete,
+    /// The body failed or was cut at its cap; what was held is discarded.
+    Cut,
+    /// The body was dropped before it ended (the client went away, the tunnel timed out or the
+    /// session stopped).
+    Dropped,
+}
+
+/// The work [`OnRedacted::ended`] returns: `true` once it succeeded.
+pub type Report = Pin<Box<dyn Future<Output = bool> + Send>>;
+
+/// Told once when a [`Redacted`] body ends or is dropped, with what it redacted (architect
+/// Q13: the response's `egress.response` entry).
+pub trait OnRedacted: Send + Sync + 'static {
+    /// The body ended `how`, having redacted `tally`. For [`Ending::Complete`] and
+    /// [`Ending::Cut`] the returned work finishes before the end reaches the client, and a
+    /// `false` turns the end into an error. For [`Ending::Dropped`] there is nobody to wait: the
+    /// returned work is dropped, so an implementation spawns what must still happen.
+    fn ended(&self, how: Ending, tally: Tally) -> Option<Report>;
+}
+
+/// The error a [`Redacted`] body stops with when its end could not be reported.
+#[derive(Debug, thiserror::Error)]
+#[error("the response's audit entry could not be written")]
+pub struct Unreported;
+
+/// What a [`Redacted`] body returns once its end is reported.
+enum Tail {
+    Data(Bytes),
+    End,
+    Error(BoxError),
 }
 
 /// A response body redacted as it streams (architect D2). It wraps the capped body, so the cap
 /// counts upstream bytes. Data frames pass through the [`Stream`]; any other frame is dropped. A
 /// complete end flushes what is held; an error (the body failed or was cut at its cap) discards
-/// it, wiped, and passes the error on.
+/// it, wiped. Either way the end is reported ([`OnRedacted`]) before it reaches the client, and
+/// a body dropped before its end reports that too.
 pub struct Redacted<B> {
     inner: B,
     stream: Stream,
+    /// What the response's header lines redacted.
+    seed: Tally,
+    on_end: Arc<dyn OnRedacted>,
+    reported: bool,
+    /// The report in flight and what follows it.
+    reporting: Option<(Report, Tail)>,
+    /// The final data frame went out; the end follows.
+    last: bool,
     done: bool,
 }
 
 impl<B> Redacted<B> {
-    /// Redacts `inner` with `redaction`.
-    pub fn new(inner: B, redaction: &Arc<Redaction>) -> Self {
-        Self::over(inner, redaction)
+    /// Redacts `inner` with `redaction`; `seed` is what the head's redaction counted.
+    pub fn new(
+        inner: B,
+        redaction: &Arc<Redaction>,
+        seed: Tally,
+        on_end: Arc<dyn OnRedacted>,
+    ) -> Self {
+        Self::over(inner, redaction, seed, on_end)
     }
 
     /// [`Self::new`]'s work, in a function cargo-mutants mutates (it leaves `new` alone; #87).
-    fn over(inner: B, redaction: &Arc<Redaction>) -> Self {
+    fn over(
+        inner: B,
+        redaction: &Arc<Redaction>,
+        seed: Tally,
+        on_end: Arc<dyn OnRedacted>,
+    ) -> Self {
         Self {
             inner,
             stream: redaction.stream(),
+            seed,
+            on_end,
+            reported: false,
+            reporting: None,
+            last: false,
             done: false,
+        }
+    }
+
+    /// The end was reported already (a body known empty at head time, whose entry the head's
+    /// handler wrote): nothing more is reported.
+    #[must_use]
+    pub const fn reported(mut self) -> Self {
+        self.reported = true;
+        self
+    }
+
+    /// Reports `how` (once). With work to wait for, keeps it and `tail` and returns `None`;
+    /// otherwise returns what `tail` releases.
+    fn report(
+        &mut self,
+        how: Ending,
+        tail: Tail,
+    ) -> Option<Option<Result<Frame<Bytes>, BoxError>>> {
+        let mut tally = self.seed.clone();
+        tally.add(self.stream.tally());
+        let work = if self.reported {
+            None
+        } else {
+            self.reported = true;
+            self.on_end.ended(how, tally)
+        };
+        match work {
+            Some(w) => {
+                self.reporting = Some((w, tail));
+                None
+            }
+            None => Some(self.release(tail)),
+        }
+    }
+
+    fn release(&mut self, tail: Tail) -> Option<Result<Frame<Bytes>, BoxError>> {
+        match tail {
+            Tail::Data(b) => {
+                self.last = true;
+                Some(Ok(Frame::data(b)))
+            }
+            Tail::End => {
+                self.done = true;
+                None
+            }
+            Tail::Error(e) => {
+                self.done = true;
+                Some(Err(e))
+            }
+        }
+    }
+}
+
+impl<B> Drop for Redacted<B> {
+    fn drop(&mut self) {
+        if !self.reported {
+            self.reported = true;
+            let mut tally = self.seed.clone();
+            tally.add(self.stream.tally());
+            drop(self.on_end.ended(Ending::Dropped, tally));
         }
     }
 }
@@ -325,7 +546,25 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
         let this = self.get_mut();
-        while !this.done {
+        loop {
+            if let Some((work, _)) = this.reporting.as_mut() {
+                let ok = ready!(work.as_mut().poll(cx));
+                let Some((_, tail)) = this.reporting.take() else {
+                    continue;
+                };
+                if !ok {
+                    this.done = true;
+                    return Poll::Ready(Some(Err(Box::new(Unreported))));
+                }
+                return Poll::Ready(this.release(tail));
+            }
+            if this.done {
+                return Poll::Ready(None);
+            }
+            if this.last {
+                this.done = true;
+                return Poll::Ready(None);
+            }
             match ready!(Pin::new(&mut this.inner).poll_frame(cx)) {
                 Some(Ok(frame)) => {
                     let Ok(data) = frame.into_data() else {
@@ -337,26 +576,36 @@ where
                     }
                 }
                 Some(Err(e)) => {
-                    this.done = true;
                     this.stream.discard();
-                    return Poll::Ready(Some(Err(e)));
+                    if let Some(now) = this.report(Ending::Cut, Tail::Error(e)) {
+                        return Poll::Ready(now);
+                    }
                 }
                 None => {
-                    this.done = true;
                     let out = this.stream.finish();
-                    if !out.is_empty() {
-                        return Poll::Ready(Some(Ok(Frame::data(Bytes::from(out)))));
+                    let tail = if out.is_empty() {
+                        Tail::End
+                    } else {
+                        Tail::Data(Bytes::from(out))
+                    };
+                    if let Some(now) = this.report(Ending::Complete, tail) {
+                        return Poll::Ready(now);
                     }
                 }
             }
         }
-        Poll::Ready(None)
     }
 
-    /// Ended, or nothing more can come: the inner body is at its end and nothing is held (an
-    /// empty body, such as a 304's, is then known empty before it is polled, as hyper needs).
+    /// Ended, or nothing more can come: the end is reported, the inner body is at its end and
+    /// nothing is held (an empty body, such as a 304's, is then known empty before it is
+    /// polled, as hyper needs).
     fn is_end_stream(&self) -> bool {
-        self.done || (self.stream.held() == 0 && self.inner.is_end_stream())
+        self.done
+            || (self.reported
+                && self.reporting.is_none()
+                && !self.last
+                && self.stream.held() == 0
+                && self.inner.is_end_stream())
     }
 
     fn size_hint(&self) -> SizeHint {
@@ -364,7 +613,7 @@ where
             return SizeHint::with_exact(0);
         }
         let inner = self.inner.size_hint();
-        let held = u64::try_from(self.stream.held()).unwrap_or(u64::MAX);
+        let held = as_u64(self.stream.held());
         let mut hint = SizeHint::new();
         hint.set_lower(inner.lower().saturating_add(held));
         if let Some(upper) = inner.upper() {
@@ -380,32 +629,49 @@ where
 #[error("a response header echoes a secret where it cannot be redacted")]
 pub struct Echoed;
 
-/// The response headers with every value redacted, each header scanned as the line hyper writes
-/// (`name: value`, the name lower-cased), so a form that straddles the name and the value is
-/// found (architect D5).
+/// The response headers with every value redacted, and what was redacted. Each header is
+/// scanned as the line hyper writes (`name: value`, the name lower-cased), so a form that
+/// straddles the name and the value is found (architect D5); a form is also looked for in the
+/// name and separator ignoring ASCII case, since hyper lower-cases what the upstream sent
+/// (security review L2).
 ///
 /// # Errors
 /// [`Echoed`] when a covered byte lies in a name or its separator, or a redacted value is no
 /// header value.
-pub fn headers(r: &Arc<Redaction>, headers: &HeaderMap) -> Result<HeaderMap, Echoed> {
+pub fn headers(r: &Arc<Redaction>, headers: &HeaderMap) -> Result<(HeaderMap, Tally), Echoed> {
     let mut out = HeaderMap::with_capacity(headers.len());
+    let mut tally = Tally::default();
     for (name, value) in headers {
         let lead = name.as_str().len().saturating_add(2);
-        let mut line = Vec::with_capacity(lead.saturating_add(value.len()));
+        let mut line = Zeroizing::new(Vec::with_capacity(lead.saturating_add(value.len())));
         line.extend_from_slice(name.as_str().as_bytes());
         line.extend_from_slice(b": ");
         line.extend_from_slice(value.as_bytes());
-        let (redacted, first) = r.scan(&line);
-        line.zeroize();
-        let v = match first {
+        if in_lead_any_case(r, &line, lead) {
+            return Err(Echoed);
+        }
+        let scan = r.scan(&line);
+        let v = match scan.first {
             None => value.clone(),
-            Some(at) if at < u64::try_from(lead).unwrap_or(u64::MAX) => return Err(Echoed),
-            Some(_) => HeaderValue::from_bytes(redacted.get(lead..).unwrap_or_default())
+            Some(at) if at < as_u64(lead) => return Err(Echoed),
+            Some(_) => HeaderValue::from_bytes(scan.bytes.get(lead..).unwrap_or_default())
                 .map_err(|_| Echoed)?,
         };
+        tally.add(&scan.tally);
         out.append(name.clone(), v);
     }
-    Ok(out)
+    Ok((out, tally))
+}
+
+/// Whether a form occurs in `line`, ignoring ASCII case, starting within its first `lead`
+/// bytes (the name and the separator).
+fn in_lead_any_case(r: &Redaction, line: &[u8], lead: usize) -> bool {
+    r.forms.secrets().flat_map(|(_, list)| list).any(|form| {
+        let needle = form.expose().as_bytes();
+        line.windows(needle.len().max(1))
+            .take(lead)
+            .any(|w| !needle.is_empty() && w.eq_ignore_ascii_case(needle))
+    })
 }
 
 /// Appends `piece` to `held`; a buffer too small is replaced by a larger one and the old one is

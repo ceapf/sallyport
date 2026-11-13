@@ -682,6 +682,13 @@ mod tests {
         );
         let basic = LaunchError::Egress(CredentialsError::Basic("GH".into()).into());
         assert_eq!(basic.reason(), "basic-unsupported");
+        // Architect Q8: a collective refusal, so its own reason and no secret named.
+        let filler = LaunchError::Egress(CredentialsError::NoFiller.into());
+        assert_eq!(filler.reason(), "secret-filler");
+        assert_eq!(
+            filler.to_string(),
+            "network: no redaction filler: every candidate occurs in a secret form"
+        );
         for other in [
             CredentialsError::Format("GH".into()),
             CredentialsError::Header("GH".into()),

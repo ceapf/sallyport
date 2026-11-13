@@ -241,8 +241,8 @@ fn a_session_with_a_ca_gets_its_files_leaves_and_roots() {
         h.get("x-key-1").unwrap(),
         format!("Bearer {}", value(1)).as_str()
     );
-    assert_eq!(c.redaction().scan(value(2).as_bytes()).1, Some(0));
-    assert_eq!(c.redaction().scan(value(3).as_bytes()).1, None);
+    assert_eq!(c.redaction().scan(value(2).as_bytes()).first, Some(0));
+    assert_eq!(c.redaction().scan(value(3).as_bytes()).first, None);
     assert_eq!(i.roots.store.len(), 1);
     assert_eq!(i.roots.pem, root_pem);
     let v = i.tls.validity;

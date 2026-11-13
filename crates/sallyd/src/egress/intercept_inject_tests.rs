@@ -65,10 +65,10 @@ async fn an_echoed_credential_is_redacted_in_headers_and_across_body_writes() {
     let up = &r.seen()[0];
     assert!(up.contains(&format!("Bearer {secret}")), "{up}");
     assert!(!up.contains("attacker"), "{up}");
-    // The client sees no form of it, the label instead, and the length the upstream sent.
+    // The client sees no form of it, filler at its offset and length instead, and the length
+    // the upstream sent.
     assert!(!out.contains(&secret), "{out}");
-    let label = "[REDACTED:T0]";
-    let fill = |n: usize| format!("{label}{}", "*".repeat(n - label.len()));
+    let fill = |n: usize| "*".repeat(n);
     // The rendered header value (`Bearer <value>`) is a form of its own, so it goes whole.
     let rendered = "Bearer ".len() + secret.len();
     assert!(
@@ -81,6 +81,15 @@ async fn an_echoed_credential_is_redacted_in_headers_and_across_body_writes() {
         out.contains(&format!("content-length: {}\r\n", body.len())),
         "{out}"
     );
+    // Architect Q13: the response's entry names the secret and the bytes, header and body.
+    let entry = r.sink.args("egress.response");
+    let bytes = (rendered + secret.len()) as u64;
+    assert_eq!(
+        entry["redacted"],
+        json!([{"secret": "secret:T0", "bytes": bytes}])
+    );
+    assert_eq!(entry["redacted_bytes"], json!(bytes));
+    assert_eq!(entry["end"], json!("complete"));
 }
 
 /// The same over a chunked response whose chunks split the value.
@@ -111,11 +120,7 @@ async fn a_chunked_echo_split_inside_the_value_is_redacted() {
         body.push_str(&tail[..n]);
         rest = &tail[n + 2..];
     }
-    assert_eq!(body.len(), secret.len() + 2);
-    assert!(
-        body.starts_with("x[REDACTED:T0]*") && body.ends_with("*y"),
-        "{body}"
-    );
+    assert_eq!(body, format!("x{}y", "*".repeat(secret.len())));
 }
 
 /// Architect D5: a form reaching into a header name is refused before anything is forwarded.
@@ -228,4 +233,106 @@ async fn an_encoded_response_is_refused_unforwarded_and_identity_passes() {
     assert!(out.starts_with("HTTP/1.1 200 "), "{out}");
     assert!(out.contains("content-encoding: Identity\r\n"), "{out}");
     assert!(out.ends_with("\r\n\r\nbody"), "{out}");
+}
+
+/// Architect Q13 (b2): the response's entry is written before its end reaches the client; when
+/// it cannot be, the end never does and the tunnel ends `error`.
+#[tokio::test]
+async fn a_response_whose_entry_fails_never_completes() {
+    let r = rig(Opts {
+        handler: Arc::new(echo_split),
+        limits: roomy(),
+        fail_on: Some("egress.response"),
+        ..Opts::default()
+    });
+    let out = r.talk(&get("/echo", "")).await;
+    let fill = "*".repeat(value(0).len());
+    assert!(out.starts_with("HTTP/1.1 200 "), "{out}");
+    assert!(!out.ends_with(&format!("{fill}\"}}")), "{out}");
+    assert!(!out.contains(&value(0)), "{out}");
+    assert_eq!(r.sink.args("egress.close")["end"], json!("error"));
+}
+
+/// Architect Q13 (b3): a client that reads the redacted bytes and goes away cannot suppress the
+/// entry; it says the body was dropped and counts what was redacted so far.
+#[tokio::test]
+async fn a_client_that_drops_a_redacted_body_still_gets_it_recorded() {
+    let r = echoing(Arc::new(|req: &str| {
+        let token = token(req);
+        let pad = "z".repeat(80);
+        let pauses = PAUSE.repeat(30);
+        Some(format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\n{token}{pad}{pauses}rest"
+        ))
+    }));
+    let (head, tls, task) = r.open(443).await;
+    let mut tls = tls.unwrap_or_else(|| panic!("not opened: {head}"));
+    tls.write_all(get("/echo", "").as_bytes()).await.unwrap();
+    let want = "*".repeat(value(0).len());
+    let mut got = Vec::new();
+    bounded("reading the redacted part", async {
+        let mut buf = [0u8; 512];
+        while !String::from_utf8_lossy(&got).contains(&want) {
+            let n = tls.read(&mut buf).await.unwrap();
+            assert!(n > 0, "closed early");
+            got.extend_from_slice(&buf[..n]);
+        }
+    })
+    .await;
+    drop(tls);
+    join(task).await;
+    bounded("the dropped body's entry", async {
+        while !r.sink.events().iter().any(|e| e == "egress.response") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let entry = r.sink.args("egress.response");
+    assert_eq!(entry["end"], json!("dropped"));
+    let n = value(0).len() as u64;
+    assert_eq!(
+        entry["redacted"],
+        json!([{"secret": "secret:T0", "bytes": n}])
+    );
+}
+
+/// Architect Q13 (b1): a body known empty at its head (here a 304) gets its entry before the
+/// head goes out; if it cannot be written, no head goes out.
+#[tokio::test]
+async fn an_empty_response_is_recorded_before_its_head() {
+    let not_modified: Handler =
+        Arc::new(|_| Some("HTTP/1.1 304 Not Modified\r\nContent-Length: 10\r\n\r\n".into()));
+    let r = echoing(Arc::clone(&not_modified));
+    let out = r.talk(&get("/echo", "")).await;
+    assert!(out.starts_with("HTTP/1.1 304 "), "{out}");
+    let entry = r.sink.args("egress.response");
+    assert_eq!(
+        (&entry["status"], &entry["end"]),
+        (&json!(304), &json!("complete"))
+    );
+    let failing = rig(Opts {
+        handler: not_modified,
+        limits: roomy(),
+        fail_on: Some("egress.response"),
+        ..Opts::default()
+    });
+    let out = failing.talk(&get("/echo", "")).await;
+    assert!(!out.contains("304"), "{out}");
+}
+
+/// Architect Q13: one `egress.response` per response the tunnel forwarded, as many as
+/// `egress.close` counts in `statuses`.
+#[tokio::test]
+async fn each_forwarded_response_has_its_entry() {
+    let r = echoing(Arc::new(echo_split));
+    let two = format!("{}{}", get("/echo", ""), get("/echo", ""));
+    let _ = r.talk(&two).await;
+    let responses = r
+        .sink
+        .events()
+        .iter()
+        .filter(|e| *e == "egress.response")
+        .count();
+    assert_eq!(responses, 2);
+    assert_eq!(r.sink.args("egress.close")["statuses"], json!({"2xx": 2}));
 }

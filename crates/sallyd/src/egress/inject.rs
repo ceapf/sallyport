@@ -13,10 +13,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use hyper::http::header::{HeaderMap, HeaderName, HeaderValue};
+use sally_core::audit::SessionForms;
 use sally_core::manifest::{ValidatedManifest, parse_hostname};
 use sally_core::secrets::{Secret, SecretStore, SecretsError};
 
-use super::redact::{Redaction, TooLong};
+use super::redact::{Redaction, RedactionError, TooLong};
 
 /// The placeholder Task 9a-3 renders.
 const VALUE: &str = "{value}";
@@ -122,6 +123,10 @@ pub enum CredentialsError {
     /// A form of the secret is too long to redact.
     #[error(transparent)]
     TooLong(#[from] TooLong),
+    /// Every redaction filler candidate occurs in a form of the session's secrets (architect
+    /// Q8). Names no secret: it is a property of them all.
+    #[error("no redaction filler: every candidate occurs in a secret form")]
+    NoFiller,
 }
 
 /// One grant's injection.
@@ -296,28 +301,24 @@ fn render(s: &Spec, value: &Secret<String>) -> Result<Secret<String>, Credential
     Ok(Secret::new(out))
 }
 
-/// One label per secret, in grant order; its forms (sally-core's, architect D3) and each value
-/// rendered from it.
+/// The session's forms, one secret per grant name in grant order: sally-core's forms of its
+/// value (architect D3) and each header value rendered from it, built once and read in place by
+/// the redaction (architect Q11). Each injection keeps its own copy of its rendered value, a
+/// [`Secret`] wiped on drop like the forms.
 fn redaction(
     injections: &[Injection],
     values: &[(String, Secret<String>)],
-) -> Result<Redaction, TooLong> {
-    let mut secrets: Vec<(String, Vec<Secret<Vec<u8>>>)> = Vec::new();
-    for i in injections {
-        if !secrets.iter().any(|(n, _)| *n == i.secret)
-            && let Some((_, v)) = values.iter().find(|(n, _)| *n == i.secret)
-        {
-            let forms = sally_core::audit::secret_forms(v.expose())
-                .iter()
-                .map(|f| Secret::new(f.expose().as_bytes().to_vec()))
-                .collect();
-            secrets.push((i.secret.clone(), forms));
-        }
-        if let Some((_, forms)) = secrets.iter_mut().find(|(n, _)| *n == i.secret) {
-            forms.push(Secret::new(i.value.expose().as_bytes().to_vec()));
-        }
-    }
-    Redaction::new(secrets)
+) -> Result<Redaction, CredentialsError> {
+    let entries = injections.iter().filter_map(|i| {
+        values.iter().find(|(n, _)| *n == i.secret).map(|(_, v)| {
+            let rendered = Secret::new(i.value.expose().clone());
+            (i.secret.as_str(), v, vec![rendered])
+        })
+    });
+    Redaction::of(SessionForms::build(entries)).map_err(|e| match e {
+        RedactionError::TooLong(t) => CredentialsError::TooLong(t),
+        RedactionError::NoFiller => CredentialsError::NoFiller,
+    })
 }
 
 #[cfg(test)]

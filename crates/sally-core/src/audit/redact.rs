@@ -13,6 +13,7 @@
 
 use std::borrow::Cow;
 use std::fmt;
+use std::sync::Arc;
 
 use serde_json::{Map, Value};
 use zeroize::Zeroizing;
@@ -171,6 +172,67 @@ impl Redactor {
     }
 }
 
+/// The forms of one session's secrets, built once at launch and shared, never copied: the type
+/// can only be held through the [`Arc`] [`SessionForms::build`] returns, it has no `Clone`,
+/// `Default` or `Serialize`, and every form is a [`Secret`], so the bytes are wiped when the last
+/// holder drops. The egress proxy's response redaction reads them in place.
+///
+/// TODO(#81): the session registry registers the same `Arc` with the audit writer's redactor at
+/// session start and drops it at stop (lane B, after Task 9a-3).
+pub struct SessionForms {
+    secrets: Vec<(String, Vec<Secret<String>>)>,
+}
+
+impl fmt::Debug for SessionForms {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let names: Vec<(&str, usize)> = self
+            .secrets
+            .iter()
+            .map(|(n, forms)| (n.as_str(), forms.len()))
+            .collect();
+        f.debug_struct("SessionForms")
+            .field("secrets", &names)
+            .finish()
+    }
+}
+
+impl SessionForms {
+    /// The forms of each `(name, value, extra)`: [`secret_forms`] of the value, then the `extra`
+    /// forms the caller adds (such as the header value rendered from it). Names keep their first
+    /// position; an entry repeating a name adds its forms to that name. Empty forms, and a form
+    /// a name already has, are dropped (wiped).
+    #[must_use]
+    pub fn build<'a>(
+        entries: impl IntoIterator<Item = (&'a str, &'a Secret<String>, Vec<Secret<String>>)>,
+    ) -> Arc<Self> {
+        let mut secrets: Vec<(String, Vec<Secret<String>>)> = Vec::new();
+        for (name, value, extra) in entries {
+            let at = match secrets.iter().position(|(n, _)| n == name) {
+                Some(at) => at,
+                None => {
+                    secrets.push((name.to_owned(), Vec::new()));
+                    secrets.len() - 1
+                }
+            };
+            let Some((_, forms)) = secrets.get_mut(at) else {
+                continue;
+            };
+            for form in secret_forms(value.expose()).into_iter().chain(extra) {
+                let known = forms.iter().any(|f| f.expose() == form.expose());
+                if !form.expose().is_empty() && !known {
+                    forms.push(form);
+                }
+            }
+        }
+        Arc::new(Self { secrets })
+    }
+
+    /// Each secret's name and its forms, in the order built.
+    pub fn secrets(&self) -> impl Iterator<Item = (&str, &[Secret<String>])> {
+        self.secrets.iter().map(|(n, f)| (n.as_str(), f.as_slice()))
+    }
+}
+
 /// Every form of `value` the audit redactor replaces: the raw value, its percent-encodings, its
 /// JSON-escaped form, and its trimmed base64 in both alphabets at all three alignments (forms
 /// shorter than [`MIN_BASE64_PATTERN`] characters left out). Each form appears once; an empty
@@ -278,4 +340,61 @@ fn percent_encode(bytes: &[u8], upper: bool, plus_space: bool, safe: &[u8]) -> Z
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+
+    use super::*;
+
+    fn s(v: &str) -> Secret<String> {
+        Secret::new(v.to_owned())
+    }
+
+    fn exposed(f: &SessionForms) -> Vec<(String, Vec<String>)> {
+        f.secrets()
+            .map(|(n, forms)| {
+                let forms = forms.iter().map(|x| x.expose().clone()).collect();
+                (n.to_owned(), forms)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn session_forms_hold_each_secrets_forms_then_its_extras_once() {
+        let a = s("a value/with space");
+        let b = s("b-value");
+        let f = SessionForms::build([
+            ("A", &a, vec![s("Bearer a value/with space")]),
+            ("B", &b, vec![s(""), s("b-value")]),
+            ("A", &a, vec![s("Bearer a value/with space"), s("Token x")]),
+        ]);
+        let got = exposed(&f);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, "A");
+        let mut want: Vec<String> = secret_forms("a value/with space")
+            .iter()
+            .map(|x| x.expose().clone())
+            .collect();
+        want.push("Bearer a value/with space".into());
+        want.push("Token x".into());
+        assert_eq!(got[0].1, want);
+        assert_eq!(got[1], ("B".to_owned(), vec!["b-value".to_owned()]));
+    }
+
+    #[test]
+    fn an_empty_value_has_only_its_extras() {
+        let e = s("");
+        let f = SessionForms::build([("E", &e, vec![s("x")])]);
+        assert_eq!(exposed(&f), [("E".to_owned(), vec!["x".to_owned()])]);
+    }
+
+    #[test]
+    fn session_forms_debug_names_secrets_and_counts_only() {
+        let v = s("never-printed-value");
+        let text = format!("{:?}", SessionForms::build([("N", &v, vec![])]));
+        assert!(text.contains("\"N\""), "{text}");
+        assert!(!text.contains("never-printed"), "{text}");
+    }
 }

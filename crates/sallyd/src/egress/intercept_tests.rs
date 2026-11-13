@@ -57,13 +57,25 @@ async fn a_grant_host_is_intercepted_rewritten_forwarded_and_audited_in_order() 
     );
     assert_eq!(
         r.sink.events(),
-        ["egress.allow", "egress.request", "egress.close"]
+        [
+            "egress.allow",
+            "egress.request",
+            "egress.response",
+            "egress.close"
+        ]
     );
     assert_eq!(r.sink.args("egress.allow")["intercept"], json!(true));
     assert_eq!(
         r.sink.args("egress.request"),
         json!({"host": HOST, "port": 443, "method": "GET", "target": "/echo",
                "target_bytes": 5, "target_cut": false, "injected": ["secret:T0"]})
+    );
+    // Architect Q13: one entry per forwarded response, `redacted: []` when nothing was covered.
+    assert_eq!(
+        r.sink.args("egress.response"),
+        json!({"host": HOST, "port": 443, "target": "/echo", "target_bytes": 5,
+               "target_cut": false, "status": 200, "end": "complete", "redacted_bytes": 0,
+               "redacted": []})
     );
     let close = r.sink.args("egress.close");
     assert_eq!(close["intercept"], json!(true));
@@ -279,10 +291,13 @@ async fn a_streamed_response_one_over_the_cap_is_cut_after_its_audit_entry() {
             "egress.allow",
             "egress.request",
             "egress.limit",
+            "egress.response",
             "egress.close"
         ]
     );
     assert_eq!(r.sink.args("egress.close")["end"], json!("limit"));
+    // Architect Q13: the cut response's entry, after its limit entry, says how it ended.
+    assert_eq!(r.sink.args("egress.response")["end"], json!("limit"));
 }
 
 #[tokio::test]

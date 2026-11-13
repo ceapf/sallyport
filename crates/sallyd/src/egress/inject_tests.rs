@@ -232,13 +232,13 @@ fn the_redaction_covers_every_secret_its_forms_and_each_rendered_value() {
         format!("tok {gh} end"),
         format!("k={}", value("KEY")),
     ] {
-        let (out, first) = r.scan(echo.as_bytes());
-        assert_eq!(first, Some(0), "{echo}");
-        assert_eq!(out.len(), echo.len());
-        assert!(!String::from_utf8_lossy(&out).contains(&gh));
+        let s = r.scan(echo.as_bytes());
+        assert_eq!(s.first, Some(0), "{echo}");
+        assert_eq!(s.bytes.len(), echo.len());
+        assert!(!String::from_utf8_lossy(&s.bytes).contains(&gh));
     }
     // A value no grant names is not kept, so it is not redacted.
-    assert_eq!(r.scan(value("UNUSED").as_bytes()).1, None);
+    assert_eq!(r.scan(value("UNUSED").as_bytes()).first, None);
     // The longest form: the 24-byte KEY value's base64 at alignment 0 (32 characters), longer
     // than "tok " + GH's value + " end" (31).
     assert_eq!((value("KEY").len(), gh.len() + 8), (24, 31));
