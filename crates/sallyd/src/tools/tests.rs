@@ -1211,6 +1211,30 @@ async fn a_write_parked_at_the_exec_gate_aborts_at_the_stop() {
     assert!(!rw.join("x").exists(), "an aborted write landed");
 }
 
+/// Q59 (b): the last check before the effect. A write that waited at the gate while the session's
+/// operations closed (the stop signal not raised yet) does not begin once the gate is free.
+#[tokio::test]
+async fn a_write_that_gets_the_gate_after_the_close_aborts() {
+    let f = Arc::new(fx("parked-close", opts(all_modes())));
+    let rw = f.dir("/workspace/rw").to_owned();
+    let held = Arc::clone(&f.gate).lock_owned().await;
+    let f2 = Arc::clone(&f);
+    let h = tokio::spawn(async move {
+        f2.call(
+            "fs_write",
+            json!({"path": "/workspace/rw/x", "content_b64": "aGk="}),
+        )
+        .await
+    });
+    f.until_run().await;
+    f.ops.close();
+    drop(held);
+    let out = h.await.unwrap().unwrap();
+    assert_eq!(out.text, "failed: session-stopping");
+    assert_eq!(f.sink.last("tool.result")["outcome"], "aborted");
+    assert!(!rw.join("x").exists(), "a write began after the close");
+}
+
 /// Q59: the run section is its own task, so a caller dropped while its write waits at the gate
 /// (a connection aborted after its grace) loses neither the effect nor its `tool.result`.
 #[tokio::test]

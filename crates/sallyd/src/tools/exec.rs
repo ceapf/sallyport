@@ -252,10 +252,15 @@ impl Runner for PodmanExec {
             stderr: take(&stderr),
         };
         let gate = tokio::select! {
-            g = Arc::clone(&me.gate).lock_owned() => g,
+            biased;
             // Nothing started yet: nothing to kill.
             () = me.ops.stopped() => return out(Status::Killed(SESSION_STOP)),
+            g = Arc::clone(&me.gate).lock_owned() => g,
         };
+        // Closed (the stop has begun): nothing new starts, as for a write.
+        if me.ops.is_closed() {
+            return out(Status::Killed(SESSION_STOP));
+        }
         let Some(Some(before)) = blocking(me, |i| i.snapshot()).await else {
             return out(Status::Failed(
                 "cannot list the container's processes".into(),

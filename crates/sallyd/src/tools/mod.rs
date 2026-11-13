@@ -365,8 +365,9 @@ impl<R: Runner> Core<R> {
             None
         } else {
             tokio::select! {
-                g = Arc::clone(&self.gate).lock_owned() => Some(g),
+                biased;
                 () = self.ops.stopped() => return self.aborted(b).await,
+                g = Arc::clone(&self.gate).lock_owned() => Some(g),
             }
         };
         // The last point before the effect: once it begins it runs to its end.

@@ -63,21 +63,18 @@ impl Ops {
     #[must_use]
     pub fn enter(&self) -> Option<Op> {
         let mut entered = false;
-        self.state.send_if_modified(|s| {
-            if s.closed {
-                return false;
+        self.state.send_modify(|s| {
+            if !s.closed {
+                s.count = s.count.saturating_add(1);
+                entered = true;
             }
-            s.count = s.count.saturating_add(1);
-            entered = true;
-            true
         });
         entered.then(|| Op { ops: self.clone() })
     }
 
     /// No operation enters from now on. Idempotent.
     pub fn close(&self) {
-        self.state
-            .send_if_modified(|s| !std::mem::replace(&mut s.closed, true));
+        self.state.send_modify(|s| s.closed = true);
     }
 
     /// Whether [`close`](Self::close) (or [`stop`](Self::stop)) was called.
@@ -88,11 +85,9 @@ impl Ops {
 
     /// Closes and raises the stop signal: operations in flight end as soon as they can.
     pub fn stop(&self) {
-        self.state.send_if_modified(|s| {
-            let was = (s.closed, s.stopping);
+        self.state.send_modify(|s| {
             s.closed = true;
             s.stopping = true;
-            was != (true, true)
         });
     }
 

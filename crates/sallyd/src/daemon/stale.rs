@@ -15,7 +15,7 @@ use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 
 /// The session socket directories, under the locked directory.
-pub const SESSIONS: &str = "sessions";
+pub const SESSIONS: &CStr = c"sessions";
 /// Entries removed at most.
 pub const MAX_ENTRIES: usize = 4096;
 /// Directory levels below `sessions/` walked at most.
@@ -27,7 +27,7 @@ pub const MAX_DEPTH: usize = 8;
 /// The first failure, or a tree past the bounds.
 pub fn remove(dir: &OwnedFd, control: &str) -> io::Result<()> {
     let mut left = MAX_ENTRIES;
-    remove_tree(dir, c"sessions", 0, &mut left)?;
+    remove_tree(dir, SESSIONS, 0, &mut left)?;
     match rustix::fs::unlinkat(dir, control, AtFlags::empty()) {
         Ok(()) | Err(Errno::NOENT) => Ok(()),
         Err(e) => Err(e.into()),
@@ -36,8 +36,9 @@ pub fn remove(dir: &OwnedFd, control: &str) -> io::Result<()> {
 
 fn too_big(what: String) -> io::Error {
     io::Error::other(format!(
-        "{SESSIONS}/ holds {what}; remove it by hand (sallyd removes at most {MAX_ENTRIES} \
-         entries, {MAX_DEPTH} levels deep)"
+        "{}/ holds {what}; remove it by hand (sallyd removes at most {MAX_ENTRIES} entries, \
+         {MAX_DEPTH} levels deep)",
+        SESSIONS.to_string_lossy()
     ))
 }
 
@@ -105,7 +106,7 @@ mod tests {
     #[test]
     fn the_bounds_are_pinned() {
         assert_eq!((MAX_ENTRIES, MAX_DEPTH), (4096, 8));
-        assert_eq!(SESSIONS, "sessions");
+        assert_eq!(SESSIONS, c"sessions");
     }
 
     #[test]
@@ -159,6 +160,9 @@ mod tests {
         }
         let e = remove(&fd, "control.sock").unwrap_err();
         assert!(e.to_string().contains("more than 4096 entries"), "{e}");
+        assert!(e.to_string().starts_with("sessions/ holds"), "{e}");
+        // Refused before anything is removed: the listing is counted first.
+        assert_eq!(std::fs::read_dir(&s).unwrap().count(), MAX_ENTRIES);
         std::fs::remove_dir_all(&d).unwrap();
     }
 
