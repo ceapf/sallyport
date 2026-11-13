@@ -59,12 +59,7 @@ fn remove_tree(dir: &impl AsFd, name: &CStr, depth: usize, left: &mut usize) -> 
     if depth > MAX_DEPTH {
         return Err(too_big(format!("a tree deeper than {MAX_DEPTH} levels")));
     }
-    let sub = sally_core::fd::openat(
-        dir,
-        name,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?;
+    let sub = open_dir(dir, name)?;
     let mut names: Vec<CString> = Vec::new();
     for entry in rustix::fs::Dir::read_from(&sub)? {
         let n = entry?.file_name().to_owned();
@@ -80,6 +75,18 @@ fn remove_tree(dir: &impl AsFd, name: &CStr, depth: usize, left: &mut usize) -> 
         remove_tree(&sub, n, depth.saturating_add(1), left)?;
     }
     Ok(rustix::fs::unlinkat(dir, name, AtFlags::REMOVEDIR)?)
+}
+
+/// Opens the directory `name` in `dir` to list it: a symlink (`ELOOP`) or anything but a
+/// directory (`ENOTDIR`) is refused, whatever the stat before it saw. The wrapper adds
+/// `O_CLOEXEC`.
+fn open_dir(dir: &impl AsFd, name: &CStr) -> Result<OwnedFd, Errno> {
+    sally_core::fd::openat(
+        dir,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
 }
 
 #[cfg(test)]
@@ -141,6 +148,52 @@ mod tests {
         remove(&fd, "control.sock").unwrap();
         assert!(d.join("real/f").exists());
         assert!(std::fs::symlink_metadata(d.join("sessions")).is_err());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    // The walk stats each name without following it and opens only what was a directory, so
+    // the open itself is reached with a symlink or a file only if an entry is swapped between
+    // the two. `open_dir` refuses both on its own: it never follows a symlink out of the tree,
+    // and never opens a file (a FIFO would block) as a directory to list.
+    #[test]
+    fn the_directory_open_refuses_a_symlink_and_a_non_directory() {
+        let (d, fd) = scratch("open");
+        std::fs::create_dir_all(d.join("outside")).unwrap();
+        std::fs::write(d.join("outside/precious"), b"p").unwrap();
+        std::os::unix::fs::symlink(d.join("outside"), d.join("escape")).unwrap();
+        std::fs::write(d.join("file"), b"f").unwrap();
+        std::fs::create_dir(d.join("dir")).unwrap();
+        // With O_NOFOLLOW the symlink itself is the object, and it is not a directory: ENOTDIR.
+        // Without O_NOFOLLOW the open succeeds; without O_DIRECTORY it fails with ELOOP.
+        let e = open_dir(&fd, c"escape").unwrap_err();
+        assert_eq!(
+            e,
+            Errno::NOTDIR,
+            "a symlink to a directory is never followed"
+        );
+        let e = open_dir(&fd, c"file").unwrap_err();
+        assert_eq!(e, Errno::NOTDIR, "a file is never opened as a directory");
+        let sub = open_dir(&fd, c"dir").unwrap();
+        let flags = rustix::io::fcntl_getfd(&sub).unwrap();
+        assert!(flags.contains(rustix::io::FdFlags::CLOEXEC));
+        assert!(d.join("outside/precious").exists());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    // The locked directory itself must be a directory: given a file's fd, nothing is removed.
+    #[test]
+    fn a_root_that_is_not_a_directory_is_refused() {
+        let (d, _fd) = scratch("root");
+        std::fs::write(d.join("not-a-dir"), b"x").unwrap();
+        let file = sally_core::fd::open(
+            d.join("not-a-dir").as_path(),
+            OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let e = remove(&file, "control.sock").unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(Errno::NOTDIR.raw_os_error()), "{e}");
+        assert_eq!(std::fs::read(d.join("not-a-dir")).unwrap(), b"x");
         std::fs::remove_dir_all(&d).unwrap();
     }
 

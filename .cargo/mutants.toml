@@ -20,6 +20,7 @@ exclude_re = [
   'crates/sallyd/src/daemon/startup\.rs:\d+:\d+: replace \| with \^ in open_state_dir$',
   'crates/sallyd/src/daemon/install\.rs:\d+:\d+: replace \| with \^ in load_or_create$',
   'crates/sallyd/src/daemon/install\.rs:\d+:\d+: replace \| with \^ in create$',
+  'crates/sallyd/src/daemon/stale\.rs:\d+:\d+: replace \| with \^ in open_dir$',
   'crates/sallyd/src/egress/ca\.rs:\d+:\d+: replace \| with \^ in write_files$',
   'crates/sallyd/src/egress/ca\.rs:\d+:\d+: replace \| with \^ in write_new$',
   'crates/sallyd/src/egress/net\.rs:\d+:\d+: replace \| with \^ in bind$',
