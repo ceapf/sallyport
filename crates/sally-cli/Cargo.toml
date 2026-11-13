@@ -10,3 +10,26 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[lib]
+name = "sally_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sally"
+path = "src/main.rs"
+
+[dependencies]
+# Argument parsing for the `sally` binary (architect Q78): derive, no colour, no suggestions
+# (default-features off); `help`, `usage` and `error-context` keep its messages readable.
+clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+# The shared escaper the clean-check falls back to (architect Q50, Q80); the manifest size cap.
+sally-core = { path = "../sally-core", version = "0.1.0" }
+# The control socket's wire types, shared with sallyd (architect Q78).
+sally-proto = { path = "../sally-proto", version = "0.1.0" }
+# `net`: SO_PEERCRED, the socket's owner checked before a byte is sent; `termios`: tcflush of
+# typed-ahead input before each approval answer (architect Q80); `process`: the own uid.
+rustix = { version = "1.1.6", default-features = false, features = ["net", "process", "std", "termios"] }
+serde = "1.0.229"
+serde_json = "1.0.154"
+thiserror = "2.0.21"
