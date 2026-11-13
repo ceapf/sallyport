@@ -71,7 +71,7 @@ fn an_entry_that_exits_at_once_refuses_the_launch() {
         let v =
             x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "rw")]));
         let mut req = x.request(&v, "exit");
-        req.default_image = exiting_image();
+        req.default_image = Some(exiting_image());
         let paths = req.paths.clone();
         let e = x.launcher.launch_workspace(req).await.unwrap_err();
         assert!(matches!(e, LaunchError::NotRunning(_)), "{e}");
@@ -81,6 +81,30 @@ fn an_entry_that_exits_at_once_refuses_the_launch() {
         assert!(!exists(&format!("sp-ws-{}", paths.id().as_str())));
         assert!(!paths.data_root().exists() && !paths.socket_root().exists());
         let r = x.launch(&v, "after-exit").await.unwrap();
+        x.stop(r).await;
+    });
+}
+
+/// Architect Q58: with no bundled image, a manifest without `runtime.image` is refused
+/// `no-default-image` before anything is reserved or created: one `sandbox.refuse`, no
+/// `sandbox.launch`, no directories, and the same writable mount launches next.
+#[test]
+fn no_default_image_refuses_before_anything_is_reserved() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let v =
+            x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "rw")]));
+        let mut req = x.request(&v, "noimg");
+        req.default_image = None;
+        let paths = req.paths.clone();
+        let e = x.launcher.launch_workspace(req).await.unwrap_err();
+        assert!(matches!(e, LaunchError::NoDefaultImage), "{e}");
+        assert_eq!(x.events.list(), ["sandbox.refuse"]);
+        let refuse = x.events.args("sandbox.refuse").unwrap();
+        assert_eq!(refuse["reason"], "no-default-image", "{refuse}");
+        assert_eq!(refuse["cleanup"], "nothing to clean up", "{refuse}");
+        assert!(!paths.data_root().exists() && !paths.socket_root().exists());
+        let r = x.launch(&v, "after-noimg").await.unwrap();
         x.stop(r).await;
     });
 }

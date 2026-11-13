@@ -71,8 +71,9 @@ pub struct RegistryParts {
     pub sockets: PathBuf,
     /// `~/.local/share/sallyport`.
     pub data: PathBuf,
-    /// The bundled workspace image.
-    pub default_image: ImageRef,
+    /// The bundled workspace image; `None` until one is installed (architect Q58, TODO(#88)):
+    /// the launcher then refuses a manifest without `runtime.image`.
+    pub default_image: Option<ImageRef>,
     /// The operational log.
     pub oplog: Oplog,
     /// The daemon's crash reporter: a panic in a supervisor is not a session's, so `sallyd`

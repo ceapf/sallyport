@@ -22,11 +22,25 @@ use common::*;
 
 // ---- snapshots: workspace, every mount mode -------------------------------------------------
 
+/// Architect Q58: with no bundled default, a manifest without `runtime.image` gets no argv; a
+/// manifest that names one is unaffected.
+#[test]
+fn no_default_image_and_no_manifest_image_is_refused() {
+    let f = Fx::new();
+    let v = f.load("");
+    let e = workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), None).unwrap_err();
+    assert!(matches!(e, ArgvError::Input(_)), "{e}");
+    assert!(e.to_string().contains("runtime.image"), "{e}");
+    let named = f.load(&format!("runtime:\n  image: {}\n", ws_image().as_str()));
+    let a = workspace_argv(&f.common, &f.paths, &named, &f.scan(&named), None).unwrap();
+    assert!(a.iter().any(|x| x == ws_image().as_str()), "{a:?}");
+}
+
 #[test]
 fn snapshot_workspace_ro_no_network() {
     let f = Fx::new();
     let v = f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "ro")]));
-    let a = workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), &ws_image()).unwrap();
+    let a = workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), Some(&ws_image())).unwrap();
     insta::assert_snapshot!("workspace-ro", f.redact(&a));
 }
 
@@ -39,7 +53,7 @@ fn snapshot_workspace_rw_with_git_overlays_and_pointer_files() {
         &["sub/module/.git"],
     );
     let v = f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "rw")]));
-    let a = workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), &ws_image()).unwrap();
+    let a = workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), Some(&ws_image())).unwrap();
     insta::assert_snapshot!("workspace-rw-git", f.redact(&a));
 }
 
@@ -51,7 +65,7 @@ fn snapshot_workspace_brokered_is_a_read_only_bind() {
         "/workspace/r",
         "brokered",
     )]));
-    let a = workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), &ws_image()).unwrap();
+    let a = workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), Some(&ws_image())).unwrap();
     insta::assert_snapshot!("workspace-brokered", f.redact(&a));
 }
 
@@ -65,7 +79,7 @@ fn snapshot_workspace_staged_mounts_and_proxy() {
             mount("~/code/other", "/workspace/o", "staged"),
         ])
     ));
-    let a = workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), &ws_image()).unwrap();
+    let a = workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), Some(&ws_image())).unwrap();
     insta::assert_snapshot!("workspace-staged-proxy", f.redact(&a));
 }
 
@@ -81,7 +95,7 @@ fn snapshot_workspace_all_modes_secrets_and_custom_image() {
             mount("~/Documents/research", "/workspace/r", "staged"),
         ])
     ));
-    let a = workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), &ws_image()).unwrap();
+    let a = workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), Some(&ws_image())).unwrap();
     insta::assert_snapshot!("workspace-all-modes-secrets", f.redact(&a));
 }
 
@@ -102,7 +116,7 @@ fn ca_variables_follow_the_session_ca_condition_and_name_its_files() {
     for (body, expect) in cases {
         let v = f.load(&body);
         assert_eq!(wanted(v.manifest()), expect, "{body}");
-        let a = workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), &ws_image()).unwrap();
+        let a = workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), Some(&ws_image())).unwrap();
         let bundle = format!("SSL_CERT_FILE=/run/sallyport/{BUNDLE_FILE}");
         let node = format!("NODE_EXTRA_CA_CERTS=/run/sallyport/{CA_FILE}");
         assert_eq!(a.contains(&bundle), expect, "{body}: {a:?}");
@@ -174,7 +188,7 @@ fn every_argv(f: &Fx) -> Vec<Vec<String>> {
         ])
     ));
     vec![
-        workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), &ws_image()).unwrap(),
+        workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), Some(&ws_image())).unwrap(),
         harness_argv(&f.common, &f.paths, &v, &image("harness", D0)).unwrap(),
         inference_argv(&f.common, &inference(f, true, None)).unwrap(),
     ]
@@ -260,7 +274,7 @@ fn git_overlays_land_in_session_scratch_and_never_touch_the_host_git() {
     let f = Fx::new();
     f.tree("code/myproject", &[".git"], &[]);
     let v = f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "rw")]));
-    let a = workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), &ws_image()).unwrap();
+    let a = workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), Some(&ws_image())).unwrap();
     let host_git = f
         .root
         .join("home/code/myproject/.git")
@@ -293,7 +307,7 @@ fn nested_git_parents_are_pinned_by_self_binds() {
         &["sub/module/.git"],
     );
     let v = f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "rw")]));
-    let a = workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), &ws_image()).unwrap();
+    let a = workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), Some(&ws_image())).unwrap();
     let host = f.root.join("home/code/myproject").display().to_string();
     let self_binds: Vec<&str> = a
         .iter()
@@ -322,7 +336,7 @@ fn an_rw_mount_without_git_entries_gets_an_empty_scan() {
     let scan = f.scan(&v);
     assert_eq!(scan.git().len(), 1);
     assert!(scan.git()[0].dirs().is_empty() && scan.git()[0].files().is_empty());
-    workspace_argv(&f.common, &f.paths, &v, &scan, &ws_image()).unwrap();
+    workspace_argv(&f.common, &f.paths, &v, &scan, Some(&ws_image())).unwrap();
 }
 
 // ---- builder refuses bad input ------------------------------------------------------------------
@@ -383,7 +397,7 @@ fn inference_refuses_a_model_or_socket_path_that_would_break_the_mount_syntax() 
 /// A workspace argv with one `ro` mount and the policy a hand-written caller would give it.
 fn base(f: &Fx) -> (Vec<String>, Allowed) {
     let v = f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "ro")]));
-    let a = workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), &ws_image()).unwrap();
+    let a = workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), Some(&ws_image())).unwrap();
     (a, allowed(f, Role::Workspace, Grant::Ro))
 }
 
@@ -1075,7 +1089,7 @@ fn every_mount_mix_builds_and_passes_the_checker() {
             let scan = f.scan(&v);
             let rw = mix.iter().filter(|m| **m == "rw").count();
             assert_eq!(scan.git().len(), rw);
-            let a = workspace_argv(&f.common, &f.paths, &v, &scan, &ws_image()).unwrap();
+            let a = workspace_argv(&f.common, &f.paths, &v, &scan, Some(&ws_image())).unwrap();
             // mounts + per rw scan (overlay, parent self-bind, pointer file) + sockets
             assert_eq!(
                 a.iter().filter(|x| *x == "-v").count(),

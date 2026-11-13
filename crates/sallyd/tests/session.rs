@@ -13,7 +13,7 @@ use sally_core::audit::{AuditError, NewEntry};
 use sally_core::manifest::AuditLevel;
 use sallyd::oplog::Oplog;
 use sallyd::rpc::listen::CrashReporter;
-use sallyd::sandbox::AuditSink;
+use sallyd::sandbox::{AuditSink, LaunchError};
 use sallyd::session::{AGENT_SOCK, Registry, RegistryParts, StartError, StopOutcome, StopReason};
 
 mod common;
@@ -48,6 +48,10 @@ struct Rx {
 }
 
 fn registry() -> Rx {
+    registry_with(Some(test_image()))
+}
+
+fn registry_with(default_image: Option<sallyd::sandbox::ImageRef>) -> Rx {
     let x = Lx::new();
     let sockets = x.xdg.join("sallyport");
     let sink = Arc::new(Hooked {
@@ -62,7 +66,7 @@ fn registry() -> Rx {
         ids: ids(),
         sockets,
         data: x.f.root.join("home/.local/share/sallyport"),
-        default_image: test_image(),
+        default_image,
         oplog: Oplog::new(std::io::sink()),
         // A supervisor panic would fail the test through a missing stop; nobody reads these.
         crash: CrashReporter::channel().0,
@@ -183,6 +187,24 @@ fn an_unaudited_session_start_binds_nothing_and_stops_the_workspace() {
         let names = podman(&["ps", "-a", "--format", "{{.Names}}"]);
         let names = String::from_utf8_lossy(&names.stdout);
         assert!(!names.contains(&r.x.scope), "{names}");
+    });
+}
+
+/// Architect Q58: with no bundled image, a manifest without `runtime.image` fails at the
+/// launcher: no `session.start`, no socket, nothing listed.
+#[test]
+fn no_default_image_starts_nothing() {
+    rt().block_on(async {
+        let r = registry_with(None);
+        let v = Arc::new(r.x.f.load(""));
+        let e = r.reg.start(v).await.unwrap_err();
+        assert!(
+            matches!(e, StartError::Launch(LaunchError::NoDefaultImage)),
+            "{e}"
+        );
+        assert_eq!(session_events(&r.x), ["sandbox.refuse"]);
+        assert!(agent_socks(&r.sink.sockets).is_empty());
+        assert!(r.reg.list().is_empty());
     });
 }
 

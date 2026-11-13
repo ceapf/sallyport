@@ -554,7 +554,7 @@ impl Lx {
         WorkspaceRequest {
             paths: self.paths(tag),
             manifest: Arc::new(v.clone()),
-            default_image: test_image(),
+            default_image: Some(test_image()),
             // A watchdog panic is not what these tests watch; nobody reads the reports.
             crash: sallyd::rpc::listen::CrashReporter::channel().0,
         }

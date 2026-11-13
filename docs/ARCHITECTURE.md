@@ -259,6 +259,10 @@ and removes only the directories this launch created: an id whose directories ex
 before anything is created, so a stopped session's kept `stage/` is never touched. The claims
 are released only once the container is confirmed gone.
 
+0. **Image** (architect Q58). The workspace image is resolved first: the manifest's
+   `runtime.image`, else the bundled default. While no bundled image is installed (#88) the
+   default is absent, and a manifest without `runtime.image` is refused `no-default-image`
+   before anything is reserved or created.
 1. **Overlap rule** (AMENDMENTS-02 B4, RT-AG-08b). Two live sessions may mount overlapping host
    directories (the same directory, or one inside the other) only when neither mount is `rw` or
    `brokered`. Overlap is decided by path and by identity. Each claim carries the

@@ -307,8 +307,8 @@ fn a_scan_is_bound_to_its_manifest() {
     let b = f.load(&mounts(&[mount("~/code/other", "/workspace/p", "rw")]));
     let scan = f.scan(&a);
     assert!(scan.is_for(&a) && !scan.is_for(&b));
-    let e =
-        sallyd::sandbox::workspace_argv(&f.common, &f.paths, &b, &scan, &ws_image()).unwrap_err();
+    let e = sallyd::sandbox::workspace_argv(&f.common, &f.paths, &b, &scan, Some(&ws_image()))
+        .unwrap_err();
     assert!(e.to_string().contains("another manifest"), "{e}");
     assert!(scan.recheck_host(&b).is_err());
 }

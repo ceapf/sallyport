@@ -189,8 +189,10 @@ pub struct WorkspaceRequest {
     pub paths: SessionPaths,
     /// The validated manifest.
     pub manifest: Arc<ValidatedManifest>,
-    /// The bundled workspace image, used when the manifest names none.
-    pub default_image: ImageRef,
+    /// The bundled workspace image, used when the manifest names none. `None` while no bundled
+    /// image is installed: such a launch is refused `no-default-image` before anything is
+    /// reserved (architect Q58; TODO(#88)).
+    pub default_image: Option<ImageRef>,
     /// The session's crash reporter: a panic in its disk watchdog is reported here (architect
     /// Q47).
     pub crash: CrashReporter,
@@ -323,6 +325,15 @@ impl Launcher {
     ) -> Result<(Running, Option<WatchPlan>), LaunchError> {
         let level = req.manifest.manifest().audit.level;
         let sid = req.paths.id().as_str().to_owned();
+        // Step 0 (architect Q58): the image, before anything is reserved or created.
+        let image = match req.image() {
+            Ok(i) => i,
+            Err(e) => {
+                return Err(self
+                    .refused(&sid, e, level, "nothing to clean up".into())
+                    .await);
+            }
+        };
         let v = Arc::clone(&req.manifest);
         let fds = session_cost(req.manifest.manifest().network.max_connections);
         let reserved = match blocking(move || claims(&v).map_err(LaunchError::Claims)).await {
@@ -338,7 +349,10 @@ impl Launcher {
                 .await);
         }
         let mut progress = Progress::default();
-        match self.launch_reserved(&req, level, &mut progress).await {
+        match self
+            .launch_reserved(&req, &image, level, &mut progress)
+            .await
+        {
             Ok(r) => Ok(r),
             Err(e) => {
                 let cleanup = self.clean_failed(&req.paths, &progress).await;
@@ -389,11 +403,12 @@ impl Launcher {
     async fn launch_reserved(
         &self,
         req: &WorkspaceRequest,
+        image: &ImageRef,
         level: AuditLevel,
         progress: &mut Progress,
     ) -> Result<(Running, Option<WatchPlan>), LaunchError> {
         let (runtime, scan, plan) = self.check_and_scan(req).await?;
-        let image = req.image();
+        let image = image.as_str();
         self.image_present(image).await?;
         let argv = self.dirs_and_argv(req, runtime, &scan, progress).await?;
         let egress = self.start_egress(req).await?;
@@ -539,7 +554,7 @@ impl Launcher {
             &req.paths,
             &req.manifest,
             scan,
-            &req.default_image,
+            req.default_image.as_ref(),
         )?)
     }
 
@@ -685,6 +700,18 @@ mod tests {
         );
         let dup = LaunchError::from(ReserveError::Duplicate("a".into()));
         assert_eq!(dup.reason(), "overlap");
+    }
+
+    /// Architect Q58: no manifest image and no bundled default.
+    #[test]
+    fn a_missing_default_image_has_its_own_reason() {
+        let e = LaunchError::NoDefaultImage;
+        assert_eq!(e.reason(), "no-default-image");
+        assert_eq!(
+            e.to_string(),
+            "runtime.image: no bundled workspace image is installed; the manifest must name a \
+             digest-pinned image"
+        );
     }
 
     #[test]
