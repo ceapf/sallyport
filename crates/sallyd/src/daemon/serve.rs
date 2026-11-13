@@ -42,7 +42,7 @@ use crate::sandbox::{
     LauncherParts, Podman, PodmanError, PodmanHost, ScanLimits, Sessions, SharedAudit, Sweep,
     UserIds, check_runtime_dir, resolve_podman,
 };
-use crate::session::lookup::SharedEgress;
+use crate::session::lookup::{NoSecrets, SharedEgress};
 use crate::session::{Registry, RegistryParts};
 
 /// The trusted clients' socket in the locked runtime directory.
@@ -308,7 +308,13 @@ async fn serve(
         audit: Arc::clone(&audit),
         limits: ScanLimits::default(),
         disk_floor: DiskFloor::default(),
-        egress: Arc::new(SharedEgress::default()),
+        // PR A has no secret set (maintainer): a source with no values refuses every grant
+        // `secret-missing`. TODO(#99): `StoreFile { path: dirs.config_home.join(
+        // "sallyport/secrets.toml") }`, with the #85 redactor swap and PR C's `sally secrets`.
+        egress: Arc::new(SharedEgress::new(
+            Arc::new(crate::egress::net::getaddrinfo),
+            Arc::new(NoSecrets),
+        )),
         oplog: log.clone(),
         installation,
     });

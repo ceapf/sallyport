@@ -1003,6 +1003,7 @@ sallyport/
   - Credentials and redaction (Tasks 9a-3 and 9b, `egress::inject`, `egress::redact`;
     maintainer decisions 1–7, architect D1–D13, A1–A3). At launch, a session with grants reads
     the grants' values through the starter's `SecretSource` (production: the 0600 store file;
+    until #99 the daemon wires a source with no values, so every grant is refused `secret-missing`;
     every other value is dropped, wiped, before `prepare` returns): a missing one refuses the
     launch (`secret-missing`), an unreadable store too (`secret-store`), a grant that cannot be
     injected or redacted as well (`secret-grant`), and a session whose forms hold every filler

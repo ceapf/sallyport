@@ -16,11 +16,13 @@ use std::sync::Arc;
 
 use tokio::sync::Semaphore;
 
+use crate::egress::inject::SecretSource;
 use crate::egress::net::{
     Egress, EgressError, EgressHandle, EgressStarter, Lookup, MAX_LOOKUPS, ProcHostAddrs,
-    SessionEgress, SystemResolver, TcpDialer, getaddrinfo,
+    SessionEgress, SystemResolver, TcpDialer,
 };
 use crate::egress::roots::BundleFiles;
+use sally_core::secrets::{Secret, SecretsError};
 
 /// Lookups one session may have in flight: a quarter of the daemon's.
 pub const SESSION_LOOKUPS: usize = MAX_LOOKUPS / 4;
@@ -51,14 +53,29 @@ pub(crate) fn session_resolver(lookup: &Lookup) -> SystemResolver {
     )
 }
 
-/// The production starter: system resolver, plain TCP, `/proc` host addresses and the default
-/// trust-root files, with a fresh per-session resolver for every session.
+/// A secrets source that holds no value, so every secret grant is refused `secret-missing`
+/// before anything is created. PR A wires it in production: the secret set is outside PR A
+/// (maintainer), and values must not be loaded before the redactor swap of #85.
+/// TODO(#99): replace it with the store file, `<config_home>/sallyport/secrets.toml`.
+#[derive(Debug, Clone, Copy)]
+pub struct NoSecrets;
+
+impl SecretSource for NoSecrets {
+    fn load(&self, _names: &[String]) -> Result<Vec<(String, Secret<String>)>, SecretsError> {
+        Ok(Vec::new())
+    }
+}
+
+/// The production starter: system resolver, plain TCP, `/proc` host addresses, the default
+/// trust-root files and the named secrets source, with a fresh per-session resolver for every
+/// session. No `Default`: the secrets source is always named (architect D7).
 #[derive(Clone)]
 pub struct SharedEgress {
     lookup: Lookup,
     dialer: Arc<TcpDialer>,
     host: Arc<ProcHostAddrs>,
     roots: BundleFiles,
+    secrets: Arc<dyn SecretSource>,
 }
 
 impl std::fmt::Debug for SharedEgress {
@@ -67,21 +84,17 @@ impl std::fmt::Debug for SharedEgress {
     }
 }
 
-impl Default for SharedEgress {
-    fn default() -> Self {
-        Self::new(Arc::new(getaddrinfo))
-    }
-}
-
 impl SharedEgress {
-    /// A starter over `lookup`, bounded by one global set of [`MAX_LOOKUPS`] slots.
+    /// A starter over `lookup`, bounded by one global set of [`MAX_LOOKUPS`] slots, reading
+    /// secret values from `secrets`.
     #[must_use]
-    pub fn new(lookup: Lookup) -> Self {
+    pub fn new(lookup: Lookup, secrets: Arc<dyn SecretSource>) -> Self {
         Self {
             lookup: globally_bounded(Arc::new(Semaphore::new(MAX_LOOKUPS)), lookup),
             dialer: Arc::new(TcpDialer),
             host: Arc::new(ProcHostAddrs::default()),
             roots: BundleFiles::default(),
+            secrets,
         }
     }
 
@@ -91,6 +104,7 @@ impl SharedEgress {
             dialer: Arc::clone(&self.dialer),
             host: Arc::clone(&self.host),
             roots: self.roots.clone(),
+            secrets: Arc::clone(&self.secrets),
         }
     }
 }
@@ -126,7 +140,7 @@ mod tests {
     fn a_session_egress_uses_the_starters_lookup() {
         crate::daemon::runtime().unwrap().block_on(async {
             let (inner, _release, _) = stuck();
-            let starter = SharedEgress::new(inner);
+            let starter = SharedEgress::new(inner, Arc::new(NoSecrets));
             assert!(format!("{starter:?}").starts_with("SharedEgress"));
             let got = starter
                 .session()
@@ -136,6 +150,22 @@ mod tests {
                 .unwrap();
             assert_eq!(got, [SocketAddr::from(([192, 0, 2, 1], 443))]);
         });
+    }
+
+    /// PR A's production source holds no value: every grant is refused `secret-missing`.
+    #[test]
+    fn no_secrets_holds_no_value() {
+        let got = NoSecrets.load(&["GH".into()]).unwrap();
+        assert!(got.is_empty());
+    }
+
+    /// Each session's egress reads secrets through the starter's own source.
+    #[test]
+    fn a_session_egress_uses_the_starters_secret_source() {
+        let src: Arc<dyn SecretSource> = Arc::new(crate::egress::inject::testing::Fixed::default());
+        let starter =
+            SharedEgress::new(Arc::new(crate::egress::net::getaddrinfo), Arc::clone(&src));
+        assert!(Arc::ptr_eq(&starter.session().secrets, &src));
     }
 
     /// A lookup that blocks until released (names starting with `slow`) and answers at once
