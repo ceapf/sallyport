@@ -1,7 +1,8 @@
 //! The built-in tools behind the approvals gate (ARCHITECTURE §4.3; Task 11): `fs_list`,
-//! `fs_read`, `fs_write`, `fs_delete` and `shell`, as one [`Executor`].
+//! `fs_read`, `fs_write`, `fs_delete`, `shell` and `fetch` (#75), as one [`Executor`].
 //!
-//! - **List.** `tools/list` shows the tools the manifest grants, never `fetch` (#75).
+//! - **List.** `tools/list` shows the tools the manifest grants; `fetch` only with a way out
+//!   ([`FetchParts`]), else a granted call is `tool_unavailable` (#75 ruling Q8).
 //! - **Prepare** (no effect): the grant first, so an ungranted tool is `tool_not_granted` and no
 //!   existence oracle (architect ruling Q28); then the arguments (`args.rs`), the path
 //!   (`path.rs`), a `.git` component for writes and deletes (`protected-path`, #19), and the
@@ -131,7 +132,8 @@ pub struct Parts<R> {
     /// Runs `shell` commands ([`exec::PodmanExec`] in production).
     pub shell: R,
     /// The way out for `fetch`: `None` leaves a granted `fetch` unlisted and `tool_unavailable`
-    /// (architect ruling Q8: a session without a proxy, or without trust roots).
+    /// (architect ruling Q8: a session without a proxy, or without trust roots). TODO(#103):
+    /// production passes the session's `EgressHandle::connector` once it builds the tools.
     pub fetch: Option<FetchParts>,
 }
 
