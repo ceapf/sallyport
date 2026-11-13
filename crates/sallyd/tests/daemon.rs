@@ -197,6 +197,92 @@ fn a_second_sallyd_exits_already_running() {
     assert!(!env.state().join("control.sock").exists());
 }
 
+/// RT-FS-15 through the CLI against the real daemon (architect Q79, Q81): a session's kept stage
+/// (one stopped before this `sallyd` started) is listed through `control.sock` by the CLI's own
+/// code, its sandbox-chosen names escaped: the exact bytes `sally session changes` prints.
+/// Also the control socket's wiring in `serve`: the sessions directory, an unknown session,
+/// a rejected manifest. Controls: `sallyd`'s path escaping (`control_methods::change`) for the
+/// bytes; the CLI's clean-check has its own test (sally-cli `tests/cli.rs`).
+#[test]
+fn rt_fs_15_a_kept_stage_is_listed_escaped_through_the_cli() {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::DirBuilderExt as _;
+    let env = Env::new();
+    let data = env.root.join("data/sallyport");
+    let upper = data.join("sessions/s-kept/stage/0/upper");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&upper)
+        .unwrap();
+    std::fs::write(
+        upper.join(std::ffi::OsStr::from_bytes(b"a\n\x1b[2J\xff")),
+        b"x",
+    )
+    .unwrap();
+    std::fs::write(upper.join("ok.txt"), b"x").unwrap();
+    let mut d = env.start();
+    let kept = || std::fs::read_dir(&upper).unwrap().count();
+    assert_eq!(kept(), 2, "startup left the kept stage alone (SI-11)");
+    let mut c = sally_cli::client::Client::connect(&env.state().join("control.sock")).unwrap();
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let mut o = sally_cli::commands::Out {
+        out: &mut out,
+        err: &mut err,
+    };
+    let code = sally_cli::commands::session_changes(&mut c, "s-kept", &mut o);
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "written mounts[0] a\\x0a\\x1b[2J\\xff\nwritten mounts[0] ok.txt\n",
+        "{}",
+        String::from_utf8_lossy(&err)
+    );
+    assert_eq!(code, sally_cli::EXIT_OK);
+    assert_eq!(kept(), 2, "listing changed nothing");
+    let mut o = sally_cli::commands::Out {
+        out: &mut Vec::new(),
+        err: &mut err,
+    };
+    assert_eq!(
+        sally_cli::commands::session_changes(&mut c, "s-gone", &mut o),
+        sally_cli::EXIT_REFUSED
+    );
+    assert_eq!(
+        sally_cli::commands::session_list(&mut c, &mut o),
+        sally_cli::EXIT_OK
+    );
+    let refused = c.call(
+        "sessions.create",
+        serde_json::json!({"manifest": "bogus: 1\n"}),
+    );
+    assert!(
+        matches!(&refused, Err(sally_cli::client::Error::Refused(d)) if d.reason == "manifest-invalid"),
+        "{refused:?}"
+    );
+    let err = String::from_utf8(err).unwrap();
+    assert_eq!(err, "sally: refused: unknown-session\n");
+    drop(c);
+    terminate(&mut d);
+    let out = d.finish();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let audit = std::fs::read_to_string(
+        std::fs::read_dir(data.join("audit"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "jsonl"))
+            .expect("the audit log"),
+    )
+    .unwrap();
+    for event in ["rpc.request", "session.refuse", "manifest.refuse"] {
+        assert!(audit.contains(&format!("\"{event}\"")), "{event}: {audit}");
+    }
+}
+
 /// Security re-review S3, architect Q61/Q64: `serve` starts the periodic orphan sweep, at its
 /// production period, after it serves; and the installation id whose label the sweep matches is
 /// kept 0600 in this daemon's own (private) state directory. Control: the `crash.spawn` of the

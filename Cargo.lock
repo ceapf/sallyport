@@ -1014,6 +1014,7 @@ dependencies = [
  "rustix",
  "rustls",
  "rustls-pki-types",
+ "sally-cli",
  "sally-core",
  "sally-proto",
  "serde",

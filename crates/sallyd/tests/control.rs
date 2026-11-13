@@ -178,6 +178,89 @@ fn a_session_runs_from_create_to_stop_over_control() {
     });
 }
 
+/// RT-FS-15 through the CLI, live and after the stop (architect Q79, Q81, Q90): a name the
+/// sandbox chose (`\n`, an escape sequence, a byte that is not UTF-8) is listed by the CLI's own
+/// code over a real `control.sock` (its peer check runs) as exactly the escaped bytes `sally
+/// session changes` prints. Controls: `sallyd`'s path escaping (`control_methods::change`); the
+/// CLI's clean-check has its own test (sally-cli `tests/cli.rs`).
+/// TODO(#106): the same through the `sallyd` binary once a daemon test can have an image.
+#[test]
+fn rt_fs_15_a_live_session_s_changes_are_listed_escaped_through_the_cli() {
+    let c = cx();
+    std::fs::create_dir_all(c.x.f.root.join("home/code/fs15")).unwrap();
+    let dir = std::env::temp_dir().join(format!("sp-ctl-fs15-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("control.sock");
+    let me = rustix::process::getuid().as_raw();
+    // The server on a runtime of its own; the CLI (blocking) on this thread.
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let (control, sock) = (Arc::clone(&c.control), path.clone());
+    let server = std::thread::spawn(move || {
+        rt().block_on(async move {
+            let (crash, _crashes) = sallyd::daemon::crash::CrashReporter::channel();
+            let l = tokio::net::UnixListener::bind(&sock).unwrap();
+            let h = control.listen(l, me, crash);
+            ready_tx.send(()).unwrap();
+            let _ = stop_rx.await;
+            h.shutdown().await;
+        });
+    });
+    ready_rx.recv().unwrap();
+    let mut client = sally_cli::client::Client::connect(&path).unwrap();
+    let text = format!(
+        "{HEADER}{}",
+        mounts(&[mount("~/code/fs15", "/workspace/p", "staged")])
+    );
+    let s = client
+        .call("sessions.create", json!({"manifest": text}))
+        .unwrap();
+    let id = s["id"].as_str().unwrap().to_owned();
+    let container = s["container"].as_str().unwrap().to_owned();
+    let (code, out) = exec_in(
+        &container,
+        &[
+            "sh",
+            "-c",
+            "touch \"/workspace/p/$(printf 'a\\n\\033[2J\\377')\"",
+        ],
+    );
+    assert_eq!(code, 0, "{out}");
+    let list = |client: &mut sally_cli::client::Client| {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut o = sally_cli::commands::Out {
+            out: &mut out,
+            err: &mut err,
+        };
+        let code = sally_cli::commands::session_changes(client, &id, &mut o);
+        (
+            code,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
+    };
+    let want = "written mounts[0] a\\x0a\\x1b[2J\\xff\n";
+    let (code, out, err) = list(&mut client);
+    assert_eq!(
+        (code, out.as_str()),
+        (sally_cli::EXIT_OK, want),
+        "live: {err}"
+    );
+    let stopped = client.call("sessions.stop", json!({"id": id})).unwrap();
+    assert_eq!(stopped["id"], json!(id));
+    let (code, out, err) = list(&mut client);
+    assert_eq!(
+        (code, out.as_str()),
+        (sally_cli::EXIT_OK, want),
+        "after the stop: {err}"
+    );
+    drop(client);
+    stop_tx.send(()).unwrap();
+    server.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A connection to `sock` through a short `/proc/self/fd` path, and the directory fd that keeps
 /// the path valid.
 async fn agent(sock: &Path) -> (tokio::net::UnixStream, std::fs::File) {
