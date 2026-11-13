@@ -22,7 +22,7 @@ use crate::approvals::render::Prompt;
 use crate::rpc::agent::ToolHandler;
 use crate::rpc::testkit::{Sink, recorder};
 
-const ME: Client = Client { uid: 1000, pid: 7 };
+pub(crate) const ME: Client = Client { uid: 1000, pid: 7 };
 
 #[derive(Default)]
 struct Shown(StdMutex<Vec<Prompt>>);
@@ -87,12 +87,13 @@ fn spec(guest: &'static str, mode: MountMode) -> Spec {
     }
 }
 
-struct Fx {
+/// The tools behind a real gate; shared with the `fetch` tests on the egress rig.
+pub(crate) struct Fx {
     gated: Gated<Arc<Tools<Fake>>>,
     tools: Arc<Tools<Fake>>,
     queue: queue::Gate,
-    desk: Desk,
-    sink: Arc<Sink>,
+    pub(crate) desk: Desk,
+    pub(crate) sink: Arc<Sink>,
     shown: Arc<Shown>,
     /// Host directory of each mount, by guest root.
     dirs: Vec<(String, PathBuf)>,
@@ -119,14 +120,14 @@ impl Fx {
         &self.dirs.iter().find(|(g, _)| g == guest).unwrap().1
     }
 
-    async fn call(&self, name: &str, args: Value) -> Option<ToolOutcome> {
+    pub(crate) async fn call(&self, name: &str, args: Value) -> Option<ToolOutcome> {
         let n = self.gated.begin();
         self.gated
             .call(n, name.to_owned(), args.as_object().unwrap().clone())
             .await
     }
 
-    async fn text(&self, name: &str, args: Value) -> String {
+    pub(crate) async fn text(&self, name: &str, args: Value) -> String {
         self.call(name, args).await.unwrap().text
     }
 
@@ -141,12 +142,12 @@ impl Fx {
         self.tools.run(ticket).await
     }
 
-    fn prompts(&self) -> Vec<Prompt> {
+    pub(crate) fn prompts(&self) -> Vec<Prompt> {
         self.shown.0.lock().unwrap().clone()
     }
 
     /// Waits until `n` prompts were shown.
-    async fn until_shown(&self, n: usize) -> Prompt {
+    pub(crate) async fn until_shown(&self, n: usize) -> Prompt {
         until("a prompt", || self.prompts().len() >= n).await;
         self.prompts()[n - 1].clone()
     }
@@ -173,12 +174,19 @@ async fn until(what: &str, mut f: impl FnMut() -> bool) {
     }
 }
 
-struct Opts {
+pub(crate) struct Opts {
     builtin: Vec<BuiltinTool>,
     shell: ShellPolicy,
     destructive: bool,
     mounts: Vec<Spec>,
     out: Output,
+    pub(crate) fetch: Option<FetchParts>,
+    pub(crate) approval_timeout: Duration,
+}
+
+/// The fixture's defaults: every tool, `shell: allow`, no mount, no way out for `fetch`.
+pub(crate) fn opts_without_mounts() -> Opts {
+    opts(vec![])
 }
 
 fn opts(mounts: Vec<Spec>) -> Opts {
@@ -188,6 +196,8 @@ fn opts(mounts: Vec<Spec>) -> Opts {
         destructive: true,
         mounts,
         out: ok_output(),
+        fetch: None,
+        approval_timeout: Duration::from_secs(30),
     }
 }
 
@@ -202,7 +212,7 @@ fn scratch(name: &str) -> PathBuf {
     std::fs::canonicalize(&d).unwrap()
 }
 
-fn fx(name: &str, o: Opts) -> Fx {
+pub(crate) fn fx(name: &str, o: Opts) -> Fx {
     let base = scratch(name);
     let outside = base.join("outside");
     std::fs::create_dir(&outside).unwrap();
@@ -266,7 +276,7 @@ fn fx(name: &str, o: Opts) -> Fx {
         mcp: vec![],
     };
     let limits = Limits {
-        timeout: Duration::from_secs(30),
+        timeout: o.approval_timeout,
         // Burst room for RT-AG-07's five prompts (one new prompt per 2 s beyond the burst).
         max_pending: 8,
     };
@@ -299,7 +309,7 @@ fn fx(name: &str, o: Opts) -> Fx {
             sink: Arc::clone(&sink),
             rows_at_run: Arc::clone(&rows_at_run),
         },
-        fetch: None,
+        fetch: o.fetch,
     }));
     Fx {
         gated: Gated::new(gate.clone(), Arc::clone(&tools)),

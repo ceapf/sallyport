@@ -285,6 +285,129 @@ async fn the_body_is_cut_at_the_cap_and_kept_whole_up_to_it() {
     assert_eq!((whole.body.len(), whole.truncated), (100, false));
 }
 
+/// The real gate and tools (`tools/tests.rs`) with `fetch` going out through the rig's proxy.
+fn gated(r: &Rig, approval_timeout: Duration) -> Arc<crate::tools::tests::Fx> {
+    let mut o = crate::tools::tests::opts_without_mounts();
+    o.fetch = Some(crate::tools::FetchParts {
+        connector: Arc::new(connector(r, false)),
+        max_request: 1 << 20,
+        max_response: 1 << 20,
+    });
+    o.approval_timeout = approval_timeout;
+    Arc::new(crate::tools::tests::fx("fetch-rt", o))
+}
+
+/// Calls `fetch` with `args` on a task; the handle answers the call's reply text.
+fn call(f: &Arc<crate::tools::tests::Fx>, args: Value) -> tokio::task::JoinHandle<String> {
+    let f = Arc::clone(f);
+    tokio::spawn(async move { f.text("fetch", args).await })
+}
+
+/// RT-AG-14, fetch on the wire (architect ruling Q9): a `POST` with `fetch_writes: approve`
+/// stays pending with nothing dialled or sent upstream, is denied on timeout and on a human
+/// deny with nothing sent, reaches the upstream exactly once when approved, and its approval
+/// cannot be used again; a `GET` runs without a prompt. Fails without the approvals gate in
+/// front of `Tools::run` (the POST would reach the upstream before any decision).
+#[tokio::test]
+async fn rt_ag_14_fetch_a_write_reaches_the_upstream_only_once_approved() {
+    use crate::approvals::queue::Decision;
+    use crate::tools::tests::ME;
+    let r = rig(Opts {
+        handler: Arc::new(echo),
+        limits: wide(),
+        ..Opts::default()
+    });
+    let f = gated(&r, Duration::from_millis(400));
+    let post = json!({"url": format!("https://{HOST}/echo"), "method": "POST",
+                      "body_b64": "c2VjcmV0IG5vdGVz"});
+    let nothing_sent = |when: &str| {
+        assert_eq!(*r.dials.lock().unwrap(), 0, "{when}: dialled");
+        assert!(r.seen().is_empty(), "{when}: sent upstream");
+        assert!(r.sink.events().is_empty(), "{when}: an egress entry");
+    };
+    // Timeout.
+    let h = call(&f, post.clone());
+    f.until_shown(1).await;
+    nothing_sent("pending");
+    assert_eq!(bounded("timeout", h).await.unwrap(), "denied: timeout");
+    nothing_sent("after the timeout");
+    // Deny.
+    let h = call(&f, post.clone());
+    let p = f.until_shown(2).await;
+    assert!(
+        p.action
+            .starts_with(&format!("fetch \"POST\" \"https://{HOST}/echo\""))
+    );
+    nothing_sent("pending again");
+    f.desk.decide(&p.id, Decision::Deny, ME).await.unwrap();
+    assert_eq!(bounded("deny", h).await.unwrap(), "denied: denied");
+    nothing_sent("after the deny");
+    // Approve: exactly one request.
+    let h = call(&f, post.clone());
+    let p = f.until_shown(3).await;
+    nothing_sent("pending a third time");
+    f.desk.decide(&p.id, Decision::Approve, ME).await.unwrap();
+    let out: Value = serde_json::from_str(&bounded("approve", h).await.unwrap()).unwrap();
+    assert_eq!(out["status"], 200);
+    assert!(
+        out["body"]
+            .as_str()
+            .unwrap()
+            .starts_with("POST /echo HTTP/1.1")
+    );
+    assert_eq!(r.seen().len(), 1);
+    assert!(r.seen()[0].ends_with("secret notes"));
+    // The approval is single-use.
+    assert!(f.desk.decide(&p.id, Decision::Approve, ME).await.is_err());
+    assert_eq!(r.seen().len(), 1, "a reused approval sends nothing");
+    // A read runs without a prompt.
+    let got = bounded(
+        "get",
+        f.text("fetch", json!({"url": format!("https://{HOST}/")})),
+    )
+    .await;
+    assert!(got.starts_with("{\"body\":\"ok\""), "{got}");
+    assert_eq!(f.prompts().len(), 3);
+    assert_eq!(r.seen().len(), 2);
+}
+
+/// Architect ruling Q7: `tool.run` before anything goes out, at the lowest audit level too, and
+/// `tool.result` before the reply; the proxy's entries carry the call as their origin.
+#[tokio::test]
+async fn a_fetch_is_audited_before_it_goes_out_and_before_its_reply() {
+    let r = rig(Opts {
+        handler: Arc::new(echo),
+        limits: wide(),
+        ..Opts::default()
+    });
+    let f = gated(&r, Duration::from_secs(30));
+    let got = bounded(
+        "get",
+        f.text("fetch", json!({"url": format!("https://{HOST}/redirect")})),
+    )
+    .await;
+    let v: Value = serde_json::from_str(&got).unwrap();
+    assert!((300..400).contains(&v["status"].as_u64().unwrap()));
+    assert_eq!(v["headers"][0][0], "location");
+    let tool = f.sink.events();
+    assert_eq!(tool, ["tool.run", "tool.result"]);
+    let run = f.sink.last("tool.run");
+    assert_eq!(
+        (run["host"].clone(), run["port"].clone()),
+        (json!(HOST), json!(443))
+    );
+    let result = f.sink.last("tool.result");
+    assert_eq!(result["outcome"], "ok");
+    assert_eq!(result["status"], v["status"]);
+    let call = run["call"].clone();
+    assert_eq!(r.sink.args("egress.allow")["origin"]["call"], call);
+    // Refused at prepare: no entry of the proxy, a deny of the tools.
+    let bad = f
+        .text("fetch", json!({"url": "http://plain.mock.test/"}))
+        .await;
+    assert_eq!(bad, "denied: url-not-https");
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_response_that_never_comes_fails_at_the_timeout() {
     let r = rig(Opts {

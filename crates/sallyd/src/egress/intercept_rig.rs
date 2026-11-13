@@ -468,7 +468,12 @@ impl Rig {
 
     /// As [`Self::talk`], with `raw` sent in two writes split at `at`, 50 ms apart.
     pub(super) async fn talk_split(&self, raw: &str, at: usize) -> String {
-        let (head, tls, task) = self.open(443).await;
+        self.talk_at(443, raw, at).await
+    }
+
+    /// As [`Self::talk_split`], through a `CONNECT` to `port`.
+    pub(super) async fn talk_at(&self, port: u16, raw: &str, at: usize) -> String {
+        let (head, tls, task) = self.open(port).await;
         let mut tls = tls.unwrap_or_else(|| panic!("not opened: {head}"));
         let (first, rest) = raw.as_bytes().split_at(at);
         bounded("writing the request", async {
