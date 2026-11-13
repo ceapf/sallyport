@@ -11,6 +11,19 @@ use super::*;
 use crate::rpc::mcp::{META_CAPABILITIES, META_VERSION, MODERN};
 use crate::rpc::testkit::{Sink, recorder};
 
+/// Waits until `counter` reaches `n`; panics after 10 s of wall time. A call that is never
+/// dispatched (say every append fails) fails the test instead of spinning for ever.
+async fn reach(counter: &AtomicUsize, n: usize) {
+    let end = std::time::Instant::now() + Duration::from_secs(10);
+    while counter.load(Ordering::SeqCst) < n {
+        assert!(
+            std::time::Instant::now() < end,
+            "the counter never reached {n}"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
 /// A handler that answers `echo` at once and holds `block` until released.
 #[derive(Default)]
 struct Fake {
@@ -414,9 +427,7 @@ async fn a_cancel_suppresses_the_reply_but_never_stops_the_handler() {
     let (agent, fake, sink) = setup();
     let mut c = start(&agent);
     c.send(&call(7, "block")).await;
-    while fake.calls.load(Ordering::SeqCst) == 0 {
-        tokio::task::yield_now().await;
-    }
+    reach(&fake.calls, 1).await;
     c.send(
         &json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 7}}),
     )
@@ -441,9 +452,7 @@ async fn a_cancel_suppresses_the_reply_but_never_stops_the_handler() {
     );
     fake.release.notify_one();
     // The handler ran to its end; its reply never comes; the slot comes back only now.
-    while fake.done.load(Ordering::SeqCst) == 0 {
-        tokio::task::yield_now().await;
-    }
+    reach(&fake.done, 1).await;
     assert!(c.quiet().await, "a cancelled call was answered");
     assert_eq!(agent.in_flight.available_permits(), MAX_IN_FLIGHT);
     // The id is free again.
@@ -456,9 +465,7 @@ async fn a_closed_connection_still_lets_its_calls_finish() {
     let (agent, fake, _) = setup();
     let mut c = start(&agent);
     c.send(&call(1, "block")).await;
-    while fake.calls.load(Ordering::SeqCst) == 0 {
-        tokio::task::yield_now().await;
-    }
+    reach(&fake.calls, 1).await;
     c.w.shutdown().await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(
@@ -492,9 +499,7 @@ async fn a_closed_connection_withdraws_only_its_unfinished_calls() {
     // A second cancel of the same call is not passed on twice.
     let mut c = start(&agent);
     c.send(&call(2, "block")).await;
-    while fake.calls.load(Ordering::SeqCst) < 2 {
-        tokio::task::yield_now().await;
-    }
+    reach(&fake.calls, 2).await;
     let cancel =
         json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 2}});
     c.send(&cancel).await;
@@ -519,9 +524,7 @@ async fn each_call_begins_once_and_runs_under_the_number_it_was_given() {
     assert_eq!(fake.numbers.lock().unwrap().as_slice(), [101, 103, 105]);
     // A refused call (a reused in-flight id) never begins.
     a.send(&call(9, "block")).await;
-    while fake.calls.load(Ordering::SeqCst) < 4 {
-        tokio::task::yield_now().await;
-    }
+    reach(&fake.calls, 4).await;
     let dup = a.call(&call(9, "echo")).await;
     assert_eq!(dup["error"]["code"], json!(INVALID_REQUEST));
     assert_eq!(fake.begun.load(Ordering::SeqCst), 4);
@@ -533,9 +536,7 @@ async fn a_call_whose_handler_could_not_write_an_entry_gets_no_reply() {
     let (agent, fake, _) = setup();
     let mut c = start(&agent);
     c.send(&call(1, "unrecorded")).await;
-    while fake.done.load(Ordering::SeqCst) == 0 {
-        tokio::task::yield_now().await;
-    }
+    reach(&fake.done, 1).await;
     assert!(c.quiet().await, "an unrecorded call was answered");
     // The connection and the slot are fine.
     let r = c.call(&call(2, "echo")).await;
@@ -570,9 +571,7 @@ async fn in_flight_calls_are_capped_per_session() {
         a.send(&call(i, "block")).await;
         b.send(&call(i, "block")).await;
     }
-    while fake.calls.load(Ordering::SeqCst) < MAX_IN_FLIGHT {
-        tokio::task::yield_now().await;
-    }
+    reach(&fake.calls, MAX_IN_FLIGHT).await;
     // The 17th, on either connection, is refused before it is dispatched.
     let e = b.call(&call(100, "echo")).await;
     assert_eq!(e["error"]["code"], json!(SERVER_LIMIT));
@@ -877,9 +876,7 @@ async fn session_teardown_drops_in_flight_calls() {
         let mut msg = serde_json::to_vec(&call(1, "block")).unwrap();
         msg.push(b'\n');
         s.write_all(&msg).await.unwrap();
-        while fake.calls.load(Ordering::SeqCst) < 1 {
-            tokio::task::yield_now().await;
-        }
+        reach(&fake.calls, 1).await;
         assert_eq!(agent.in_flight.available_permits(), MAX_IN_FLIGHT - 1);
         if orderly {
             let down = tokio::spawn(h.shutdown());
