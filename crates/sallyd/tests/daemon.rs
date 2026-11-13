@@ -205,12 +205,8 @@ fn a_second_sallyd_exits_already_running() {
 fn the_daemon_starts_its_orphan_sweep_with_its_own_installation_id() {
     let env = Env::new();
     let mut d = env.start();
+    // `start` returned once control.sock exists, which serve binds after the id is created.
     let id_file = env.root.join("data/sallyport/installation");
-    let end = Instant::now() + Duration::from_secs(10);
-    while !id_file.exists() {
-        assert!(Instant::now() < end, "no installation id file");
-        std::thread::sleep(Duration::from_millis(50));
-    }
     // The sweep's first line is written as soon as its task runs, before its first period.
     std::thread::sleep(Duration::from_millis(500));
     terminate(&mut d);

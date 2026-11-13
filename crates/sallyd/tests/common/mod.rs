@@ -11,6 +11,7 @@ use sally_core::manifest::{HostEnv, ValidatedManifest, load};
 pub mod container;
 pub mod egress;
 pub mod forms;
+pub mod locks;
 pub mod mock_model;
 pub mod search;
 
