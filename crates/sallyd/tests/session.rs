@@ -614,6 +614,76 @@ fn rt_ag_15_an_rpc_entry_being_written_at_the_stop_lands_before_session_stop() {
     });
 }
 
+/// Security re-review S6, architect Q68: the session's operations close before anything else
+/// in its stop (Q59 step 1). Two-phase hold: the `shell` call's `rpc.request` is held first, so
+/// the call is past its last write before the tools when the stop comes; then the supervisor is
+/// held in its `session.crash` append (step 2), with the listener still up, while that
+/// `rpc.request` lands. The call reaches the tools during step 2 and is denied
+/// `session-stopping`: no `tool.run`, no effect, and its `tool.deny` precedes `session.stop`.
+/// Control: `ops.close()` before the first await in `session/supervise.rs` (without it the call
+/// enters, and `tool.run` is written). Each held write holds the seal's order, so the call's
+/// later entries are checked after the release.
+#[test]
+fn rt_ag_15_a_call_during_the_stop_is_denied_before_anything_runs() {
+    rt().block_on(async {
+        let r = registry();
+        let at = r.x.f.root.join("home/code/rt15c");
+        std::fs::create_dir_all(&at).unwrap();
+        let v = Arc::new(r.x.f.load(&format!(
+            "{}tools:\n  builtin: [shell]\n  shell: allow\n",
+            mounts(&[mount("~/code/rt15c", "/workspace/p", "rw")])
+        )));
+        let s = r.reg.start(v).await.unwrap();
+        let sock = r.x.session_paths(&s.id).harness_sockets().join(AGENT_SOCK);
+        let (mut conn, _dir) = connect(&sock).await;
+        // Phase 1: the call's `rpc.request` waits in the sink, holding the seal's order.
+        r.x.events.hold(&["rpc.request", "session.crash"]);
+        let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"_meta": meta(), "name": "shell",
+                       "arguments": {"cmd": ["touch", "/workspace/p/made"],
+                                     "cwd": "/workspace/p"}}});
+        conn.write_all(format!("{call}\n").as_bytes())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // The stop: the supervisor closes the operations; its `session.crash` waits for the order.
+        let crash = r.reg.reporter(&s.id).expect("the session's reporter");
+        crash.spawn("tool", async { panic!("a session task panicked") });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Phase 2: `rpc.request` lands; `session.crash` takes the order and waits in the sink,
+        // so the supervisor is held in step 2 while the call goes on to the tools.
+        r.x.events.hold(&["session.crash"]);
+        until(
+            "the call's rpc.request lands",
+            Duration::from_secs(10),
+            || r.x.events.list().iter().any(|e| e == "rpc.request"),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(!r.x.events.list().contains(&"session.stop".to_owned()));
+        r.x.events.hold(&[]);
+        until("the session ends", Duration::from_secs(60), || {
+            !exists(&s.container)
+        })
+        .await;
+        let all = r.x.events.all();
+        let (stop_at, after) = after_stop(&r.x);
+        assert!(after.is_empty(), "after session.stop: {after:?}");
+        assert_eq!(all[stop_at].1["reason"], "crash", "{all:#?}");
+        let denied = all
+            .iter()
+            .position(|(e, a)| e == "tool.deny" && a["code"] == "session-stopping")
+            .unwrap_or_else(|| panic!("no tool.deny session-stopping: {all:#?}"));
+        assert!(denied < stop_at, "{all:#?}");
+        assert!(
+            !all.iter().any(|(e, _)| e == "tool.run"),
+            "the call ran: {all:#?}"
+        );
+        assert!(!at.join("made").exists(), "the command had an effect");
+        drop(conn);
+    });
+}
+
 /// An oplog writer the test reads back.
 #[derive(Clone, Default)]
 struct Lines(Arc<Mutex<Vec<u8>>>);
