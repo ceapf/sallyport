@@ -13,15 +13,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use hyper::http::header::{HeaderMap, HeaderName, HeaderValue};
-use sally_core::audit::SessionForms;
+use sally_core::audit::{SessionForms, basic_credential};
 use sally_core::manifest::{ValidatedManifest, parse_hostname};
 use sally_core::secrets::{Secret, SecretStore, SecretsError};
 
 use super::redact::{Redaction, RedactionError, TooLong};
 
-/// The placeholder Task 9a-3 renders.
+/// The placeholder for the secret itself.
 const VALUE: &str = "{value}";
-/// The placeholder Task 9b adds (architect D11: refused until then).
+/// The placeholder for `base64(basic_user:secret)` (Task 9b, AMENDMENTS-01 §4 schemes).
 const BASIC: &str = "{basic}";
 
 /// Where a session's secret values come from (architect D7): a constructor argument of the
@@ -68,6 +68,8 @@ pub struct Spec {
     pub header: String,
     /// The header value's template.
     pub format: String,
+    /// The user of a `{basic}` format; `None` with `{value}`.
+    pub basic_user: Option<String>,
 }
 
 impl Spec {
@@ -85,15 +87,10 @@ impl Spec {
                     host,
                     header: s.inject.header.clone(),
                     format: s.inject.format.clone(),
+                    basic_user: s.inject.basic_user.clone(),
                 })
             })
             .collect()
-    }
-
-    /// Whether the format uses `{basic}`, which Task 9a-3 does not render.
-    #[must_use]
-    pub fn is_basic(&self) -> bool {
-        self.format.contains(BASIC)
     }
 }
 
@@ -103,11 +100,12 @@ pub enum CredentialsError {
     /// A grant's secret is not among the values given.
     #[error("secret {0}: not in the secrets store")]
     Missing(String),
-    /// A grant's format uses `{basic}` (Task 9b; TODO(#80)).
-    #[error("secret {0}: {{basic}} formats are not supported yet")]
-    Basic(String),
-    /// A grant's format does not hold exactly one `{value}`.
-    #[error("secret {0}: the format must hold exactly one {{value}}")]
+    /// A grant's format does not hold exactly one placeholder, or its `basic_user` does not pair
+    /// with it (architect ruling A2: the validator's rule, checked again).
+    #[error(
+        "secret {0}: the format must hold exactly one {{value}}, or one {{basic}} with a \
+         basic_user that is not empty and holds no ':'"
+    )]
     Format(String),
     /// Two grants inject the same header (case-insensitively) on the same host.
     #[error("host {host}: header {header} is injected twice")]
@@ -177,6 +175,7 @@ impl Credentials {
         values: Vec<(String, Secret<String>)>,
     ) -> Result<Self, CredentialsError> {
         let mut injections: Vec<Injection> = Vec::with_capacity(specs.len());
+        let mut extras: Vec<Vec<Secret<String>>> = Vec::with_capacity(specs.len());
         for s in specs {
             let value = values
                 .iter()
@@ -194,7 +193,10 @@ impl Credentials {
                     header: header.as_str().to_owned(),
                 });
             }
-            let rendered = render(s, value)?;
+            let Rendered {
+                value: rendered,
+                forms,
+            } = render(s, value)?;
             if HeaderValue::from_str(rendered.expose()).is_err() {
                 return Err(CredentialsError::Header(s.name.clone()));
             }
@@ -204,8 +206,9 @@ impl Credentials {
                 secret: s.name.clone(),
                 value: rendered,
             });
+            extras.push(forms);
         }
-        let redaction = Arc::new(redaction(&injections, &values)?);
+        let redaction = Arc::new(redaction(&injections, extras, &values)?);
         Ok(Self {
             injections,
             redaction,
@@ -282,38 +285,59 @@ impl Prepared {
     }
 }
 
-/// The grant's header value: its format with the one `{value}` replaced by the secret, by
-/// splitting at the placeholder (architect D11), never by a replace that could recurse.
-fn render(s: &Spec, value: &Secret<String>) -> Result<Secret<String>, CredentialsError> {
-    if s.is_basic() {
-        return Err(CredentialsError::Basic(s.name.clone()));
-    }
-    let (prefix, suffix) = s
-        .format
-        .split_once(VALUE)
-        .filter(|(_, rest)| !rest.contains(VALUE))
-        .ok_or_else(|| CredentialsError::Format(s.name.clone()))?;
-    let v = value.expose();
-    let mut out = String::with_capacity(prefix.len() + v.len() + suffix.len());
+/// A grant's header value, and the forms of it its redaction adds to the secret's own.
+struct Rendered {
+    value: Secret<String>,
+    forms: Vec<Secret<String>>,
+}
+
+/// The grant's header value: its format with its one placeholder replaced, by splitting at the
+/// placeholder (architect D11), never by a replace that could recurse. `{value}` takes the
+/// secret; `{basic}` takes [`basic_credential`] of `basic_user` and the secret, and adds that
+/// blob, padded and unpadded, to the forms (AMENDMENTS-02 B1). The pairing of placeholder and
+/// user is checked again here (architect ruling A2).
+fn render(s: &Spec, secret: &Secret<String>) -> Result<Rendered, CredentialsError> {
+    let refused = || CredentialsError::Format(s.name.clone());
+    let placeholders = (
+        s.format.matches(VALUE).count(),
+        s.format.matches(BASIC).count(),
+    );
+    let (placeholder, blob) = match (placeholders, s.basic_user.as_deref()) {
+        ((1, 0), None) => (VALUE, None),
+        ((0, 1), Some(user)) if !user.is_empty() && !user.contains(':') => {
+            (BASIC, Some(basic_credential(user, secret.expose())))
+        }
+        _ => return Err(refused()),
+    };
+    let (prefix, suffix) = s.format.split_once(placeholder).ok_or_else(refused)?;
+    let middle = blob.as_ref().map_or(secret.expose(), Secret::expose);
+    let mut out = String::with_capacity(prefix.len() + middle.len() + suffix.len());
     out.push_str(prefix);
-    out.push_str(v);
+    out.push_str(middle);
     out.push_str(suffix);
-    Ok(Secret::new(out))
+    let value = Secret::new(out);
+    let mut forms = vec![Secret::new(value.expose().clone())];
+    if let Some(blob) = blob {
+        forms.push(Secret::new(blob.expose().trim_end_matches('=').to_owned()));
+        forms.push(blob);
+    }
+    Ok(Rendered { value, forms })
 }
 
 /// The session's forms, one secret per grant name in grant order: sally-core's forms of its
-/// value (architect D3) and each header value rendered from it, built once and read in place by
-/// the redaction (architect Q11). Each injection keeps its own copy of its rendered value, a
-/// [`Secret`] wiped on drop like the forms.
+/// value (architect D3) and each grant's [`Rendered::forms`] (its rendered header value, and a
+/// `{basic}` blob), built once and read in place by the redaction (architect Q11). Each
+/// injection keeps its own copy of its rendered value, a [`Secret`] wiped on drop like the forms.
 fn redaction(
     injections: &[Injection],
+    extras: Vec<Vec<Secret<String>>>,
     values: &[(String, Secret<String>)],
 ) -> Result<Redaction, CredentialsError> {
-    let entries = injections.iter().filter_map(|i| {
-        values.iter().find(|(n, _)| *n == i.secret).map(|(_, v)| {
-            let rendered = Secret::new(i.value.expose().clone());
-            (i.secret.as_str(), v, vec![rendered])
-        })
+    let entries = injections.iter().zip(extras).filter_map(|(i, forms)| {
+        values
+            .iter()
+            .find(|(n, _)| *n == i.secret)
+            .map(|(_, v)| (i.secret.as_str(), v, forms))
     });
     Redaction::of(SessionForms::build(entries)).map_err(|e| match e {
         RedactionError::TooLong(t) => CredentialsError::TooLong(t),
@@ -346,6 +370,7 @@ pub(crate) mod testing {
                 host: (*h).to_owned(),
                 header: "Authorization".into(),
                 format: "Bearer {value}".into(),
+                basic_user: None,
             })
             .collect();
         let values = (0..hosts.len())

@@ -63,9 +63,11 @@ fn session_settings_carry_the_ca_condition_and_the_timeout() {
         mem_bytes: 16 << 30,
     };
     let head = "apiVersion: sallyport/v1\nkind: Manifest\nname: t\nmodel:\n  ref: any\n\
-                runtime:\n  timeout: 90m\nnetwork:\n  mode: proxy\n  allow:\n    - host: a.mock.test\n";
+                runtime:\n  timeout: 90m\nnetwork:\n  mode: proxy\n  allow:\n    - host: a.mock.test\n    - host: b.mock.test\n";
     let grant = "secrets:\n  - name: GITHUB_TOKEN\n    inject: {host: a.mock.test, \
-                 header: Authorization, format: \"Bearer {value}\"}\n";
+                 header: Authorization, format: \"Bearer {value}\"}\n  \
+                 - name: GITHUB_TOKEN\n    inject: {host: b.mock.test, header: Authorization, \
+                 format: \"Basic {basic}\", basic_user: x-access-token}\n";
     let names: std::collections::BTreeSet<String> = ["GITHUB_TOKEN".to_owned()].into();
     for (body, ca) in [(format!("{head}{grant}"), true), (head.to_owned(), false)] {
         let v = load(&body, &env, &names).unwrap().manifest;
@@ -76,12 +78,22 @@ fn session_settings_carry_the_ca_condition_and_the_timeout() {
         assert!(s.interception.is_none());
         // Task 9a-3: the grants as the proxy needs them, names and text only.
         let want = if ca {
-            vec![Spec {
-                name: "GITHUB_TOKEN".into(),
-                host: "a.mock.test".into(),
-                header: "Authorization".into(),
-                format: "Bearer {value}".into(),
-            }]
+            vec![
+                Spec {
+                    name: "GITHUB_TOKEN".into(),
+                    host: "a.mock.test".into(),
+                    header: "Authorization".into(),
+                    format: "Bearer {value}".into(),
+                    basic_user: None,
+                },
+                Spec {
+                    name: "GITHUB_TOKEN".into(),
+                    host: "b.mock.test".into(),
+                    header: "Authorization".into(),
+                    format: "Basic {basic}".into(),
+                    basic_user: Some("x-access-token".into()),
+                },
+            ]
         } else {
             Vec::new()
         };
@@ -149,6 +161,7 @@ fn spec(i: usize, host: &str) -> Spec {
         host: host.to_owned(),
         header: format!("X-Key-{i}"),
         format: "Bearer {value}".into(),
+        basic_user: None,
     }
 }
 
@@ -326,24 +339,41 @@ fn an_unreadable_store_refuses_the_session() {
     assert!(entries(&ws).is_empty());
 }
 
-/// Architect D11: a `{basic}` grant refuses the session before the store is opened (here the
-/// store is unreadable, so opening it would fail differently).
+/// Task 9b (#80, ruling A3): a session with a `{basic}` grant prepares from the store and
+/// injects the grant's blob; a `{basic}` grant without its user is a credentials refusal.
 #[test]
-fn a_basic_grant_is_refused_before_the_store_is_opened() {
+fn a_basic_grant_prepares_and_injects_its_blob() {
     let dir = scratch("basic");
-    let path = store(&dir, 2);
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let ws = dir.join("ws");
+    std::fs::create_dir(&ws).unwrap();
     let (roots, _) = roots_file(&dir);
     let mut specs = vec![spec(0, "a.mock.test"), spec(1, "b.mock.test")];
     specs[1].format = "Basic {basic}".into();
-    let e = starter_with(roots, path)
-        .prepare(&dir, session_of(true, specs))
+    specs[1].basic_user = Some("x-access-token".into());
+    let s = starter(&dir, roots)
+        .prepare(&ws, session_of(true, specs.clone()))
+        .unwrap();
+    let c = s.interception.as_ref().unwrap().credentials();
+    let mut h = hyper::http::HeaderMap::new();
+    c.prepare("b.mock.test").apply(&mut h);
+    let blob = sally_core::audit::basic_credential("x-access-token", &value(1));
+    assert_eq!(
+        h.get("x-key-1").unwrap(),
+        format!("Basic {}", blob.expose()).as_str()
+    );
+    specs[1].basic_user = None;
+    let (roots, _) = roots_file(&dir);
+    let other = dir.join("ws2");
+    std::fs::create_dir(&other).unwrap();
+    let e = starter(&dir, roots)
+        .prepare(&other, session_of(true, specs))
         .err()
         .unwrap();
     assert!(
-        matches!(&e, EgressError::Credentials(CredentialsError::Basic(n)) if n == "G1"),
+        matches!(&e, EgressError::Credentials(CredentialsError::Format(n)) if n == "G1"),
         "{e}"
     );
+    assert!(entries(&other).is_empty());
 }
 
 /// Decision 5 (architect D8): the credentials live with the session's proxy and are gone (their

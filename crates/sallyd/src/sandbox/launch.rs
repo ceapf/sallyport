@@ -663,9 +663,10 @@ mod tests {
         assert!(e.to_string().starts_with("network: net.sock: "), "{e}");
     }
 
-    /// Task 9a-3 (architect D7, D11): each refusal of a session's credentials names its cause.
+    /// Task 9a-3 (architect D7): each refusal of a session's credentials names its cause; a
+    /// malformed `{basic}` grant is a `secret-grant` like any other (Task 9b, ruling A3).
     #[test]
-    fn a_missing_secret_an_unreadable_store_and_a_basic_grant_have_their_own_reasons() {
+    fn a_missing_secret_and_an_unreadable_store_have_their_own_reasons() {
         use crate::egress::inject::CredentialsError;
         use sally_core::secrets::SecretsError;
         let missing = LaunchError::Egress(CredentialsError::Missing("GH".into()).into());
@@ -680,8 +681,6 @@ mod tests {
             store.to_string().starts_with("network: secrets store: "),
             "{store}"
         );
-        let basic = LaunchError::Egress(CredentialsError::Basic("GH".into()).into());
-        assert_eq!(basic.reason(), "basic-unsupported");
         // Architect Q8: a collective refusal, so its own reason and no secret named.
         let filler = LaunchError::Egress(CredentialsError::NoFiller.into());
         assert_eq!(filler.reason(), "secret-filler");

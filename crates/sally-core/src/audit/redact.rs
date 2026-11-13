@@ -8,8 +8,8 @@
 //! `[REDACTED:NAME]`.
 //!
 //! [`secret_forms`] gives the same forms to the token proxy's response redaction, so the two
-//! cannot drift; the proxy adds the grant-specific ones itself (the injected header value from
-//! Task 9a-3, the `{basic}` blob from Task 9b).
+//! cannot drift; the proxy adds the grant-specific ones itself: each injected header value, and
+//! for a `{basic}` grant its [`basic_credential`] blob, padded and unpadded.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -296,6 +296,32 @@ fn forms(bytes: &[u8], raw: &str) -> Vec<String> {
     out
 }
 
+/// The `{basic}` credential of a grant: RFC 7617's padded standard base64 of
+/// `user ":" secret`, the value a `Basic {basic}` header carries. It lives here, beside
+/// [`secret_forms`], so the proxy renders it and redacts it with the one base64 encoder of the
+/// workspace (architect ruling A2). Every intermediate is sized up front and wiped on drop.
+#[must_use]
+pub fn basic_credential(user: &str, secret: &str) -> Secret<String> {
+    let mut joined = Zeroizing::new(Vec::with_capacity(
+        user.len().saturating_add(1).saturating_add(secret.len()),
+    ));
+    joined.extend_from_slice(user.as_bytes());
+    joined.push(b':');
+    joined.extend_from_slice(secret.as_bytes());
+    let mut encoded = base64_padded(&joined);
+    Secret::new(std::mem::take(&mut *encoded))
+}
+
+/// Standard base64 with `=` padding to a multiple of four. The unpadded encoding is sized for
+/// the padded length, so the padding never reallocates.
+fn base64_padded(data: &[u8]) -> Zeroizing<String> {
+    let mut out = base64_no_pad(data, STANDARD);
+    while !out.len().is_multiple_of(4) {
+        out.push('=');
+    }
+    out
+}
+
 /// Base64 without padding, in a buffer sized for it and wiped on drop.
 fn base64_no_pad(data: &[u8], alphabet: &[u8; 64]) -> Zeroizing<String> {
     let mut out = Zeroizing::new(String::with_capacity(
@@ -384,6 +410,37 @@ mod tests {
         let e = s("");
         let f = SessionForms::build([("E", &e, vec![s("x")])]);
         assert_eq!(exposed(&f), [("E".to_owned(), vec!["x".to_owned()])]);
+    }
+
+    /// RFC 4648 §10: every padding case (none, one `=`, two `=`) against independent vectors
+    /// (architect ruling A2 condition 3).
+    #[test]
+    fn padded_base64_matches_the_rfc_4648_vectors() {
+        for (data, want) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64_padded(data.as_bytes()).as_str(), want, "{data}");
+        }
+    }
+
+    /// RFC 7617 §2's example, and the user/secret split at the first byte of the secret.
+    #[test]
+    fn a_basic_credential_is_the_padded_base64_of_user_colon_secret() {
+        assert_eq!(
+            basic_credential("Aladdin", "open sesame").expose(),
+            "QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
+        );
+        // The user's bytes come first; three, four, five and six bytes in all.
+        assert_eq!(basic_credential("f", "o").expose(), "Zjpv");
+        assert_eq!(basic_credential("ab", "c").expose(), "YWI6Yw==");
+        assert_eq!(basic_credential("ab", "cd").expose(), "YWI6Y2Q=");
+        assert_eq!(basic_credential("git", "xy").expose(), "Z2l0Onh5");
     }
 
     #[test]

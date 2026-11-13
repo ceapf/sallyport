@@ -43,7 +43,8 @@ use super::meter::BoxError;
 
 /// The filler candidates, in the order tried (architect Q7). Each is visible ASCII, so a
 /// redacted header value stays a header value; and no encoding the forms use (base64,
-/// percent-encoding, JSON escaping) produces one unless the raw value holds it.
+/// percent-encoding, JSON escaping, a `{basic}` blob's padded standard base64) produces one
+/// unless the raw value holds it.
 pub const FILLERS: [u8; 8] = *b"*#~^|!$@";
 /// The longest form a redaction accepts: a store value is at most 8 KiB, its longest form (the
 /// percent-encoding) three times that, and the injected header value adds its format's text.

@@ -100,9 +100,6 @@ impl LaunchError {
             Self::Egress(EgressError::Credentials(CredentialsError::Missing(_))) => {
                 "secret-missing"
             }
-            Self::Egress(EgressError::Credentials(CredentialsError::Basic(_))) => {
-                "basic-unsupported"
-            }
             Self::Egress(EgressError::Credentials(CredentialsError::NoFiller)) => "secret-filler",
             Self::Egress(EgressError::Credentials(
                 CredentialsError::Format(_)
