@@ -259,8 +259,8 @@ pub struct Gate {
     inner: Arc<Inner>,
 }
 
-/// The answering half (held by control-side code only).
-// TODO(#65): Task 12 serves `approvals.list`/`approvals.decide` on control.sock from this.
+/// The answering half (held by control-side code only): `approvals.list`, `approvals.watch`
+/// and `approvals.decide` on `control.sock` read and answer it (architect Q85).
 #[derive(Clone)]
 pub struct Desk {
     inner: Arc<Inner>,
