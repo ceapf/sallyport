@@ -7,8 +7,8 @@
 //!
 //! Overlay lower layers cannot be compared this way (an overlay reports its own device); they are
 //! re-checked on the host just before `podman create` ([`super::LaunchScan::recheck_host`]), and
-//! the overlap rule keeps every other live sandbox from writing there. Blocking I/O.
-//! TODO(#17): a launcher-level `sandbox.mount_mismatch` test (Task 6c if cheap, else Task 13).
+//! the overlap rule keeps every other live sandbox from writing there. Blocking I/O. The
+//! launcher-level test is `a_mount_swapped_during_init_is_a_mismatch` in `tests/launch.rs`.
 
 use rustix::fd::AsFd;
 use rustix::fs::{Mode, OFlags, ResolveFlags};

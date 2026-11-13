@@ -49,6 +49,7 @@ use super::scan::{LaunchScan, PinKind, ScanLimits, scan_mounts};
 use super::types::{CheckedRuntime, CommonArgs, ImageRef, SessionPaths, UserIds};
 use super::watchdog::{Target, WatchPlan, Watchdog, watch_plan};
 use crate::daemon::crash::CrashReporter;
+use crate::oplog::Oplog;
 
 mod error;
 mod teardown;
@@ -219,6 +220,9 @@ pub struct LauncherParts {
     /// Starts each proxy-mode session's egress listener ([`crate::egress::net::SystemEgress`] in
     /// production; tests pass fakes through the same field).
     pub egress: Arc<dyn EgressStarter>,
+    /// The operational log: an audit entry that cannot be written while the launcher acts
+    /// anyway (a kill, a retried stop) gets an error line here (architect Q43).
+    pub oplog: Oplog,
 }
 
 /// Launches and tears down sandboxes for one `sallyd`. Shared as `Arc<Launcher>`.
@@ -232,6 +236,7 @@ pub struct Launcher {
     limits: ScanLimits,
     pub(super) disk_floor: DiskFloor,
     egress: Arc<dyn EgressStarter>,
+    oplog: Oplog,
     /// One stage walk at a time across all sessions, so a sandbox with a huge or deep tree
     /// cannot multiply `sallyd`'s open fds or blocking threads (6c-1 review M2/M3).
     pub(super) walks: Arc<tokio::sync::Semaphore>,
@@ -268,8 +273,19 @@ impl Launcher {
             limits: p.limits,
             disk_floor: p.disk_floor,
             egress: p.egress,
+            oplog: p.oplog,
             walks: Arc::new(tokio::sync::Semaphore::new(1)),
         })
+    }
+
+    /// The oplog line for an audit entry that could not be written while the launcher went on
+    /// (the action is still taken: a kill, a stop retry).
+    pub(super) fn unaudited(&self, event: &str, sid: &str) {
+        self.oplog.error(
+            "sandbox",
+            "audit entry not written",
+            &[("event", event), ("session", sid)],
+        );
     }
 
     pub(super) async fn audit(

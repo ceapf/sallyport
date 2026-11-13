@@ -16,9 +16,10 @@ use crate::sandbox::types::SessionPaths;
 impl Launcher {
     /// Removes session containers a previous `sallyd` left behind (`sp-ws-<scope>[-…]`,
     /// `sp-h-<scope>[-…]`), never a session live in this launcher, so the overlap rule starts
-    /// from what is really running. `sallyd` calls it with an empty scope before it accepts the
-    /// first launch. Audits each removal. TODO(#17): the single-instance lock that makes "a
-    /// previous sallyd" exact arrives with the control socket (Task 12).
+    /// from what is really running. `sallyd` (`daemon::serve`) calls it with an empty scope
+    /// while it holds the single-instance lock (the `flock` on its runtime directory,
+    /// `daemon::startup`) and before it binds `control.sock`, so "a previous sallyd" is exact.
+    /// Audits each removal.
     ///
     /// # Errors
     /// [`LaunchError`] if podman cannot list or remove them.
@@ -78,7 +79,9 @@ impl Launcher {
                         "container": e.running.name,
                         "detail": capped(&e.error.to_string()),
                     }));
-                let _ = self.audit(entry, e.running.level).await;
+                if self.audit(entry, e.running.level).await.is_err() {
+                    self.unaudited("sandbox.stop_failed", e.running.paths.id().as_str());
+                }
             }
             // `stop` also fails after the container is gone (scratch removal): nothing runs.
             if matches!(self.container_exists(&e.running.name).await, Ok(false)) {

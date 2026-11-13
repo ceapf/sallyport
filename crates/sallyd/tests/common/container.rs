@@ -524,6 +524,7 @@ impl Lx {
             limits: ScanLimits::default(),
             disk_floor: floor,
             egress: egress.clone(),
+            oplog: sallyd::oplog::Oplog::new(std::io::sink()),
         });
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

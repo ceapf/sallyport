@@ -16,8 +16,8 @@
 //! path, panics included, and a failed unpause kills it. A pause that fails because the container
 //! is gone ends the watchdog. A kill audits `session.resource_limit` first (SI-4), then kills and
 //! removes the container until it is confirmed gone, auditing `session.kill_failed` once if the
-//! first attempt fails. The kill happens even when an audit entry cannot be written; TODO(#17):
-//! Task 12 gives `sallyd` a logger, and that failure gets an error line.
+//! first attempt fails. The kill happens even when an audit entry cannot be written; that
+//! failure gets an error line in the oplog.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -217,7 +217,10 @@ impl Shared {
             .session(&self.target.sid)
             .decision("deny")
             .args(args);
-        let _ = self.launcher.audit(entry, self.target.level).await;
+        if self.launcher.audit(entry, self.target.level).await.is_err() {
+            self.launcher
+                .unaudited("session.resource_limit", &self.target.sid);
+        }
         kill(&self.launcher, &self.target).await;
     }
 }
@@ -530,7 +533,9 @@ async fn kill(launcher: &Launcher, t: &Target) {
                     "container": t.container,
                     "detail": capped(&detail),
                 }));
-            let _ = launcher.audit(entry, t.level).await;
+            if launcher.audit(entry, t.level).await.is_err() {
+                launcher.unaudited("session.kill_failed", &t.sid);
+            }
         }
         tokio::time::sleep(MIN_GAP).await;
     }

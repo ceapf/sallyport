@@ -204,8 +204,8 @@ impl Sessions {
         self.lock().held.contains_key(id)
     }
 
-    /// Forgets `id` and frees its descriptors (teardown).
-    pub fn release(&self, id: &str) {
+    /// Forgets `id` and frees its descriptors (teardown; only the launcher releases, #17).
+    pub(crate) fn release(&self, id: &str) {
         let mut live = self.lock();
         if let Some((_, fds)) = live.held.remove(id) {
             live.fds = live.fds.saturating_sub(fds);

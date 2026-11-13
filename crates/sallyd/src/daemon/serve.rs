@@ -231,6 +231,7 @@ async fn serve(
         limits: ScanLimits::default(),
         disk_floor: DiskFloor::default(),
         egress: Arc::new(SharedEgress::default()),
+        oplog: log.clone(),
     });
     let removed = launcher
         .remove_orphans("")
