@@ -748,6 +748,65 @@ fn no_data_can_leave_without_private_data_or_without_an_outward_channel() {
     assert!(!has_warning(&r, "network.allow", Code::DataCanLeave));
 }
 
+/// The sentence the finding gains when `fetch` is granted (maintainer, #75 part 2): GET and HEAD
+/// never prompt, whatever `fetch_writes` says, so the URL itself is an unprompted way out.
+const FETCH_GET_SENTENCE: &str =
+    "The fetch tool's GET requests are not prompted and can carry data out in the URL.";
+
+#[test]
+fn data_can_leave_says_fetch_gets_are_not_prompted_when_fetch_is_granted() {
+    let f = Fixture::new();
+    // An acknowledgement nothing needs is an error, so only `allow` carries one.
+    for (writes, ack) in [
+        ("approve", ""),
+        ("allow", "  acknowledge_unapproved: [fetch]\n"),
+    ] {
+        let body = format!(
+            "{}network:\n  mode: proxy\n  allow:\n    - host: pypi.org\n\
+             tools:\n  builtin: [fs_read, fetch]\n  fetch_writes: {writes}\n{ack}",
+            mount("~/code/myproject", "/workspace/p", "ro")
+        );
+        let r = f.load(&body);
+        let finding = match &r {
+            Ok(v) => v.warnings.iter().find(|d| d.code == Code::DataCanLeave),
+            Err(e) => panic!("{e:#?}"),
+        }
+        .map(|d| d.message.clone())
+        .unwrap_or_default();
+        assert!(
+            finding.ends_with(&format!("can be sent to pypi.org. {FETCH_GET_SENTENCE}")),
+            "{writes}: {finding}"
+        );
+        let s = summary(&r.unwrap().manifest);
+        let first = s.lines().next().unwrap();
+        assert_eq!(first, format!("[data-can-leave] {finding}"), "{writes}");
+    }
+}
+
+#[test]
+fn data_can_leave_says_nothing_of_fetch_when_fetch_is_not_granted() {
+    let f = Fixture::new();
+    let body = format!(
+        "{}network:\n  mode: proxy\n  allow:\n    - host: pypi.org\ntools:\n  builtin: [fs_read]\n",
+        mount("~/code/myproject", "/workspace/p", "ro")
+    );
+    let s = summary(&f.load(&body).unwrap().manifest);
+    let first = s.lines().next().unwrap();
+    assert!(first.starts_with("[data-can-leave] "), "{s}");
+    assert!(first.ends_with("can be sent to pypi.org."), "{s}");
+    assert!(!s.contains(FETCH_GET_SENTENCE), "{s}");
+    // Fetch granted but nothing private: no finding, so no sentence either.
+    let s = summary(
+        &f.load(
+            "network:\n  mode: proxy\n  allow:\n    - host: pypi.org\ntools:\n  builtin: [fetch]\n",
+        )
+        .unwrap()
+        .manifest,
+    );
+    assert!(!s.contains("[data-can-leave]"), "{s}");
+    assert!(!s.contains(FETCH_GET_SENTENCE), "{s}");
+}
+
 #[test]
 fn data_can_leave_names_unrestricted_egress_plainly() {
     let f = Fixture::new();

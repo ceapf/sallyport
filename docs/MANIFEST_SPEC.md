@@ -126,7 +126,9 @@ warning (path `network.allow`) and `summary()` opens with it, e.g.:
 [data-can-leave] Anything this agent reads — /home/u/code/p and whatever your GITHUB_TOKEN unlocks on api.github.com or github.com — can be sent to pypi.org, api.github.com (acting as you) and github.com (acting as you).
 ```
 
-Hosts with a secret grant are marked "acting as you". There is no acknowledge flag: this is the
+Hosts with a secret grant are marked "acting as you". When `fetch` is granted the finding ends
+with "The fetch tool's GET requests are not prompted and can carry data out in the URL.": GET and
+HEAD never prompt, whatever `tools.fetch_writes` says. There is no acknowledge flag: this is the
 normal shape of a useful agent, so the point is that the user sees it every time.
 
 ### Ranges and formats (checked by the validator)
