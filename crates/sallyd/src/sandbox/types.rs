@@ -128,11 +128,12 @@ impl Installation {
     }
 }
 
-/// `r` as a UUID v4: version nibble 4, variant bits 10.
-#[must_use]
-pub fn uuid_v4(mut r: [u8; 16]) -> String {
-    r[6] = (r[6] & 0x0f) | 0x40;
-    r[8] = (r[8] & 0x3f) | 0x80;
+/// `r` as a UUID v4: version nibble 4, variant bits 10. The bits are added to the masked byte
+/// (its high bits are clear, so `+` cannot carry): unlike `|`, no operator swap gives the same
+/// value.
+fn uuid_v4(mut r: [u8; 16]) -> String {
+    r[6] = 0x40 + (r[6] & 0x0f);
+    r[8] = 0x80 + (r[8] & 0x3f);
     let hex: String = r.iter().map(|b| format!("{b:02x}")).collect();
     format!(
         "{}-{}-{}-{}-{}",
@@ -391,5 +392,37 @@ impl VerifiedModel {
     #[must_use]
     pub fn identity(&self) -> (u64, u64) {
         (self.dev, self.ino)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uuid_v4_sets_the_version_and_variant_bits() {
+        assert_eq!(uuid_v4([0; 16]), "00000000-0000-4000-8000-000000000000");
+        assert_eq!(uuid_v4([0xff; 16]), "ffffffff-ffff-4fff-bfff-ffffffffffff");
+        let r: [u8; 16] = std::array::from_fn(|i| u8::try_from(i).unwrap() * 17);
+        assert_eq!(uuid_v4(r), "00112233-4455-4677-8899-aabbccddeeff");
+    }
+
+    // Whatever the random bytes, the version nibble is 4 and the variant bits are 10, and only
+    // those bits change: the low nibble of byte 6 and the low six bits of byte 8 are kept.
+    #[test]
+    fn every_byte_value_gets_the_version_and_variant_bits_and_keeps_the_rest() {
+        for b in 0..=u8::MAX {
+            let id = uuid_v4([b; 16]);
+            let byte = |at: usize| u8::from_str_radix(&id[at..at + 2], 16).unwrap();
+            assert_eq!(byte(14), 0x40 | (b & 0x0f), "{id}");
+            assert_eq!(byte(19), 0x80 | (b & 0x3f), "{id}");
+            assert!(Installation::parse(&id).is_ok(), "{id}");
+        }
+        for _ in 0..64 {
+            let id = Installation::fresh().unwrap();
+            assert_eq!(&id.as_str()[14..15], "4", "{}", id.as_str());
+            assert!("89ab".contains(&id.as_str()[19..20]), "{}", id.as_str());
+        }
     }
 }

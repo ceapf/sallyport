@@ -14,7 +14,7 @@ use proptest::prelude::*;
 use sally_core::manifest::{ByteSize, Cpus};
 use sallyd::sandbox::{
     Allowed, ArgvError, Grant, ImageRef, InferenceSpec, Installation, Role, SessionId, Source,
-    VerifiedModel, check_argv, harness_argv, inference_argv, uuid_v4, workspace_argv,
+    VerifiedModel, check_argv, harness_argv, inference_argv, workspace_argv,
 };
 
 mod common;
@@ -374,14 +374,6 @@ fn fresh_installation_ids_are_valid_and_differ() {
     let b = Installation::fresh().unwrap();
     assert!(Installation::parse(a.as_str()).is_ok());
     assert_ne!(a, b);
-}
-
-#[test]
-fn uuid_v4_sets_the_version_and_variant_bits() {
-    assert_eq!(uuid_v4([0; 16]), "00000000-0000-4000-8000-000000000000");
-    assert_eq!(uuid_v4([0xff; 16]), "ffffffff-ffff-4fff-bfff-ffffffffffff");
-    let r: [u8; 16] = std::array::from_fn(|i| u8::try_from(i).unwrap() * 17);
-    assert_eq!(uuid_v4(r), "00112233-4455-4677-8899-aabbccddeeff");
 }
 
 // ---- builder refuses bad input ------------------------------------------------------------------

@@ -45,5 +45,5 @@ pub use profiles::profile;
 pub use scan::{GitScan, LaunchScan, Pin, PinKind, ScanError, ScanLimits, scan_mounts};
 pub use types::{
     ArgvError, CheckedRuntime, CommonArgs, INSTALLATION_LABEL, ImageRef, InferenceSpec,
-    Installation, OverlayDirs, Role, SessionId, SessionPaths, UserIds, VerifiedModel, uuid_v4,
+    Installation, OverlayDirs, Role, SessionId, SessionPaths, UserIds, VerifiedModel,
 };
