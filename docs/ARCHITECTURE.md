@@ -968,7 +968,9 @@ sallyport/
   for a host that has a leaf, and the session's upstream trust roots only for any other host,
   never both. A session that grants `fetch` loads its upstream trust roots even without secret
   grants (no CA and no file then); without them its launch is refused. The proxy's
-  `egress.close` of a fetch may land after the call's `tool.result`.
+  `egress.close` of a fetch may land after the call's `tool.result`. Production wires it in
+  `session::Registry::agent` through `Running::fetch_connector` (#103), with the proxy's own
+  `network.max_*_bytes` caps; the launcher keeps the handle and its shutdown.
 - **Interception** (Task 9a-2, `egress::server::intercept`, `egress::rewrite`; lane decisions
   2–6, architect Q27–Q53). Only grant hosts are intercepted, on every allowed port: a grant host
   reached on 8443, say, gets its credential injected and its responses redacted exactly as on

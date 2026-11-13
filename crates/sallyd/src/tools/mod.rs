@@ -132,8 +132,8 @@ pub struct Parts<R> {
     /// Runs `shell` commands ([`exec::PodmanExec`] in production).
     pub shell: R,
     /// The way out for `fetch`: `None` leaves a granted `fetch` unlisted and `tool_unavailable`
-    /// (architect ruling Q8: a session without a proxy, or without trust roots). TODO(#103):
-    /// production passes the session's `EgressHandle::connector` once it builds the tools.
+    /// (architect ruling Q8: a session without a proxy, or without trust roots). Production
+    /// (`session::Registry`) passes `Running::fetch_connector` (#103).
     pub fetch: Option<FetchParts>,
 }
 

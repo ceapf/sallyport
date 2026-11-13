@@ -44,7 +44,7 @@ use crate::sandbox::{
 };
 use crate::tools::exec::PodmanExec;
 use crate::tools::ops::Ops;
-use crate::tools::{self, Parts, Tools};
+use crate::tools::{self, FetchParts, Parts, Tools};
 
 /// The session's tool socket in its harness socket directory.
 pub const AGENT_SOCK: &str = "agent.sock";
@@ -388,9 +388,13 @@ impl Registry {
             crash: crash.clone(),
             ids: self.p.ids,
             shell: PodmanExec::new(self.p.podman.clone(), running, ops.clone()),
-            // TODO(#103): the session proxy's connector; until then a granted fetch is
-            // unlisted and `tool_unavailable` (architect ruling Q8, fails closed).
-            fetch: None,
+            // No connector (no proxy, or no trust roots): a granted fetch stays unlisted and
+            // `tool_unavailable` (architect ruling Q8). Caps as the session proxy's (#103).
+            fetch: running.fetch_connector().map(|connector| FetchParts {
+                connector,
+                max_request: v.network.max_request_bytes.bytes(),
+                max_response: v.network.max_response_bytes.bytes(),
+            }),
         });
         (
             Arc::new(Agent::new(Gated::new(gate, tools), rec.clone())),
