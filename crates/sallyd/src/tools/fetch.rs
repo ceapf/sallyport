@@ -110,12 +110,9 @@ fn method_ok(m: &str) -> bool {
 }
 
 /// A token name the proxy forwards, and a value of visible ASCII, spaces and tabs with no
-/// leading or trailing blank.
+/// leading or trailing blank. `HeaderName` accepts exactly the RFC 9110 token characters (not
+/// empty), so it is the name check.
 fn header_ok(name: &str, value: &str, grants: &[String]) -> bool {
-    let token = !name.is_empty()
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b));
     let Ok(parsed) = HeaderName::from_bytes(name.as_bytes()) else {
         return false;
     };
@@ -124,10 +121,7 @@ fn header_ok(name: &str, value: &str, grants: &[String]) -> bool {
     let value_ok = v.iter().all(|&b| blank(b) || (0x21..=0x7e).contains(&b))
         && !v.first().is_some_and(|&b| blank(b))
         && !v.last().is_some_and(|&b| blank(b));
-    token
-        && value_ok
-        && !dropped_request_header(&parsed, grants)
-        && !REFUSED.contains(&parsed.as_str())
+    value_ok && !dropped_request_header(&parsed, grants) && !REFUSED.contains(&parsed.as_str())
 }
 
 /// The head the call sends, in bytes, at least as large as hyper writes it: the request line,

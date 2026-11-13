@@ -23,7 +23,7 @@ use super::fetch::{FETCH_TIMEOUT, host_header};
 use super::fetch_url::FetchUrl;
 use crate::egress::local::Connector;
 use crate::egress::policy::Reason;
-use crate::egress::server::upstream_builder;
+use crate::egress::server::{REPLY_TIMEOUT, upstream_builder};
 
 /// Longest reply head to `CONNECT` read back.
 const MAX_REPLY_HEAD: usize = 1024;
@@ -177,10 +177,75 @@ async fn reply_head<S: AsyncRead + Unpin>(s: &mut S) -> Vec<u8> {
 /// The proxy's reason from its refusal body, or `egress-refused`.
 async fn refusal<S: AsyncRead + Unpin>(s: &mut S) -> &'static str {
     let mut body = Vec::new();
-    // A broken or short read leaves what arrived; anything unreadable is `egress-refused`.
-    let _ = s.take(MAX_REFUSAL).read_to_end(&mut body).await;
+    // The proxy writes a refusal and closes within its reply timeout; a broken, short or late
+    // read leaves what arrived, and anything unreadable is `egress-refused`.
+    let mut limited = s.take(MAX_REFUSAL);
+    let _ = tokio::time::timeout(REPLY_TIMEOUT, limited.read_to_end(&mut body)).await;
     std::str::from_utf8(&body)
         .ok()
         .and_then(|t| Reason::from_code(t.strip_suffix('\n').unwrap_or(t)))
         .map_or("egress-refused", Reason::as_str)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+    use crate::tools::fetch_url;
+
+    fn framing(method: &str, body: &[u8]) -> Option<String> {
+        let u = fetch_url::parse("https://a.mock.test:8443/x?y").unwrap();
+        let r = request(&u, method, &[("x-a".into(), "1".into())], body).unwrap();
+        assert_eq!(r.uri(), "/x?y");
+        assert_eq!(r.headers()[HOST], "a.mock.test:8443");
+        assert_eq!(r.headers()["x-a"], "1");
+        r.headers()
+            .get(CONTENT_LENGTH)
+            .map(|v| v.to_str().unwrap().to_owned())
+    }
+
+    #[test]
+    fn only_a_get_or_head_without_a_body_goes_without_content_length() {
+        assert_eq!(framing("GET", b""), None);
+        assert_eq!(framing("HEAD", b""), None);
+        assert_eq!(framing("GET", b"hi"), Some("2".into()));
+        assert_eq!(framing("HEAD", b"hi"), Some("2".into()));
+        assert_eq!(framing("POST", b""), Some("0".into()));
+        assert_eq!(framing("DELETE", b"abc"), Some("3".into()));
+    }
+
+    #[tokio::test]
+    async fn the_reply_head_ends_at_its_blank_line_or_the_bound() {
+        let mut ok: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\nrest";
+        assert_eq!(
+            reply_head(&mut ok).await,
+            b"HTTP/1.1 200 Connection Established\r\n\r\n"
+        );
+        assert_eq!(ok, b"rest", "nothing past the head is read");
+        let long = vec![b'a'; MAX_REPLY_HEAD + 10];
+        assert_eq!(reply_head(&mut long.as_slice()).await.len(), MAX_REPLY_HEAD);
+        let mut short: &[u8] = b"HTTP/1.1 4";
+        assert_eq!(reply_head(&mut short).await, b"HTTP/1.1 4");
+    }
+
+    #[tokio::test]
+    async fn a_refusal_is_read_back_as_its_reason_or_egress_refused() {
+        for (body, code) in [
+            (&b"host-not-allowed\n"[..], "host-not-allowed"),
+            (b"port-not-allowed", "port-not-allowed"),
+            (b"Host-Not-Allowed\n", "egress-refused"),
+            (b"anything else\n", "egress-refused"),
+            (b"\xff\n", "egress-refused"),
+            (b"", "egress-refused"),
+        ] {
+            let mut s = body;
+            assert_eq!(refusal(&mut s).await, code, "{body:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_that_never_ends_is_read_for_the_reply_timeout_only() {
+        let (mut ours, _theirs) = tokio::io::duplex(64);
+        assert_eq!(refusal(&mut ours).await, "egress-refused");
+    }
 }

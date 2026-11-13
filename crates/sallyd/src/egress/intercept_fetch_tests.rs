@@ -414,12 +414,14 @@ async fn the_grant_hosts_header_is_refused_at_prepare_on_that_host_only() {
     assert_eq!(*r.dials.lock().unwrap(), 0);
     // Elsewhere it is the harness's own header: prepared and sent (the rig's upstream only
     // answers TLS for its host, so this one fails after the dial, not at prepare).
-    let other = f
-        .text(
+    let other = bounded(
+        "a fetch to another host",
+        f.text(
             "fetch",
             json!({"url": "https://other.mock.test/", "headers": [["Authorization", "x"]]}),
-        )
-        .await;
+        ),
+    )
+    .await;
     assert!(other.starts_with("failed: "), "{other}");
     assert_eq!(*r.dials.lock().unwrap(), 1);
 }

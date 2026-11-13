@@ -35,7 +35,7 @@ use super::server::{Interception, trusting, upstream_client};
 use crate::sandbox::AuditSink;
 
 /// Bytes buffered each way in an in-memory connection.
-pub const LOCAL_BUFFER: usize = 64 * 1024;
+pub const LOCAL_BUFFER: usize = 65_536;
 /// Connections opened but not yet taken by the accept loop.
 pub const LOCAL_QUEUE: usize = 8;
 

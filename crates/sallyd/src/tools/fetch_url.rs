@@ -133,7 +133,7 @@ fn check_target(target: &str) -> Result<(), UrlError> {
     while let Some((&c, tail)) = rest.split_first() {
         rest = match (c, tail) {
             (b'%', [h, l, more @ ..]) if h.is_ascii_hexdigit() && l.is_ascii_hexdigit() => more,
-            (b'%', _) => return Err(UrlError::Malformed),
+            // A broken escape falls through: `%` is not in the list below.
             _ if c.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@/?".contains(&c) => tail,
             _ => return Err(UrlError::Malformed),
         };
