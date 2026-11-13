@@ -174,8 +174,8 @@ impl Credentials {
         specs: &[Spec],
         values: Vec<(String, Secret<String>)>,
     ) -> Result<Self, CredentialsError> {
-        let mut injections: Vec<Injection> = Vec::with_capacity(specs.len());
-        let mut extras: Vec<Vec<Secret<String>>> = Vec::with_capacity(specs.len());
+        // Each injection with the forms its grant adds, paired so they cannot drift apart.
+        let mut granted: Vec<(Injection, Vec<Secret<String>>)> = Vec::with_capacity(specs.len());
         for s in specs {
             let value = values
                 .iter()
@@ -184,9 +184,9 @@ impl Credentials {
                 .ok_or_else(|| CredentialsError::Missing(s.name.clone()))?;
             let header = HeaderName::from_bytes(s.header.as_bytes())
                 .map_err(|_| CredentialsError::Header(s.name.clone()))?;
-            if injections
+            if granted
                 .iter()
-                .any(|i| i.host == s.host && i.header == header)
+                .any(|(i, _)| i.host == s.host && i.header == header)
             {
                 return Err(CredentialsError::Duplicate {
                     host: s.host.clone(),
@@ -200,14 +200,15 @@ impl Credentials {
             if HeaderValue::from_str(rendered.expose()).is_err() {
                 return Err(CredentialsError::Header(s.name.clone()));
             }
-            injections.push(Injection {
+            let injection = Injection {
                 host: s.host.clone(),
                 header,
                 secret: s.name.clone(),
                 value: rendered,
-            });
-            extras.push(forms);
+            };
+            granted.push((injection, forms));
         }
+        let (injections, extras): (Vec<Injection>, Vec<_>) = granted.into_iter().unzip();
         let redaction = Arc::new(redaction(&injections, extras, &values)?);
         Ok(Self {
             injections,

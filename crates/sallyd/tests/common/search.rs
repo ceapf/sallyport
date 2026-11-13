@@ -93,6 +93,21 @@ pub fn fixed_patterns(patterns: &[String]) -> String {
     s
 }
 
+/// A shell script that prints `unreadable <path>` for every file or directory under `dirs` the
+/// container's user may not read (a directory: may not list or enter), so a file search cannot
+/// pass by skipping what it may not open (Task 9b security review L3). `dirs` are the places
+/// `sallyd` or the sandbox writes, where an unreadable entry would hide a leak.
+pub fn unreadable_script(dirs: &[&str]) -> String {
+    let dirs = dirs.join(" ");
+    format!(
+        "for d in {dirs}; do find \"$d\" 2>/dev/null; done | while IFS= read -r p; do\n\
+           if [ -d \"$p\" ]; then [ -r \"$p\" ] && [ -x \"$p\" ] || echo \"unreadable $p\";\n\
+           else [ -r \"$p\" ] || echo \"unreadable $p\"; fi\n\
+         done\n\
+         exit 0\n"
+    )
+}
+
 /// The search's output as a sorted list of distinct lines.
 pub fn found(out: &str) -> Vec<String> {
     let mut v: Vec<String> = out.lines().map(str::to_owned).collect();

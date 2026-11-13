@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 
 use common::container::{Lx, SHIM_LOG, exec, exec_in, ids, net_image, rt, test_image};
 use common::egress::canary;
-use common::forms::{basic_forms, forms_of};
-use common::search::{Plants, Scope, fixed_patterns, found, search_script};
+use common::forms::{basic_blob, basic_forms, forms_of};
+use common::search::{Plants, Scope, fixed_patterns, found, search_script, unreadable_script};
 use sallyd::sandbox::{CommonArgs, Running, WorkspaceRequest, harness_argv};
 
 /// A `Bearer` grant exposed to the workspace as a placeholder (`GH_TOKEN`), and a `{basic}`
@@ -42,15 +42,27 @@ const SEARCH_MARK: &str = "sp-rt-sec-01-02-search";
 /// room for a loaded CI runner, and a search that is stuck still fails, naming the bound.
 const SEARCH_BOUND: Duration = Duration::from_secs(120);
 
-/// The planted throwaway value: holds the marker, so the marker pattern finds it; never a value
-/// of the store.
+/// The planted throwaway value that holds the marker, so the marker pattern finds it; never a
+/// value of the store.
 fn planted() -> String {
     format!("SALLY_CANARY_PLANTED_{}", std::process::id())
 }
 
-/// The marker, the search's own mark, and every form of every canary the session holds.
+/// A planted throwaway `{basic}` blob, without the marker: only its own pattern (an encoded
+/// form, with `+`, `/` or `=` in it) can find it, so the encoded patterns are proven to match in
+/// the container on every run (9b security review L2).
+fn planted_blob() -> String {
+    basic_blob("planted", &format!("{}/+?&= {}", planted(), "p".repeat(7)))
+}
+
+/// The marker, the search's own mark, the planted blob, and every form of every canary the
+/// session holds.
 fn patterns() -> Vec<String> {
-    let mut p = vec![SEARCH_MARK.to_owned(), "SALLY_CANARY".to_owned()];
+    let mut p = vec![
+        SEARCH_MARK.to_owned(),
+        "SALLY_CANARY".to_owned(),
+        planted_blob(),
+    ];
     for name in ["GITHUB_TOKEN", "GIT_TOKEN"] {
         p.extend(forms_of(&canary(name)));
     }
@@ -59,12 +71,18 @@ fn patterns() -> Vec<String> {
     p
 }
 
+/// Plants the marker in `/tmp/planted.txt`, and the blob in `/tmp/planted-blob.txt`, a process
+/// environment and a process command line.
 fn script(scope: Scope) -> String {
-    let files = format!("printf '%s' '{}' > /tmp/planted.txt\n", planted());
+    let files = format!(
+        "printf '%s' '{}' > /tmp/planted.txt\nprintf '%s' '{}' > /tmp/planted-blob.txt\n",
+        planted(),
+        planted_blob()
+    );
     let plants = Plants {
         files: &files,
         shm: &planted(),
-        process: &planted(),
+        process: &planted_blob(),
     };
     search_script(SEARCH_MARK, &plants, &fixed_patterns(&patterns()), scope)
 }
@@ -104,8 +122,10 @@ async fn harness(lx: &Lx, tag: &str) -> String {
     id
 }
 
-/// Runs `script` in the workspace `r` and in the harness `h`, each within [`SEARCH_BOUND`]:
-/// what each found.
+/// Runs `script` in the workspace `r` and in the harness `h`, both within [`SEARCH_BOUND`]:
+/// what each found. On expiry the test panics naming the bound; the blocking `podman exec`
+/// threads cannot be cancelled, so the run ends when the unwind drops `Lx`, whose `podman rm
+/// --force` ends both execs (a hung `podman` itself is left to nextest's own timeout).
 async fn search(r: &Running, h: &str, script: &str) -> [Vec<String>; 2] {
     let started = Instant::now();
     let (code, ws) = tokio::time::timeout(SEARCH_BOUND, exec(r, script))
@@ -130,8 +150,8 @@ async fn search(r: &Running, h: &str, script: &str) -> [Vec<String>; 2] {
 /// command line. Controls: the placeholder in `argv::PLACEHOLDER` is the only value `--env`
 /// carries (`expose_env`), and secret values live only in `sallyd` (`inject::Credentials`,
 /// read by `StoreFile` before the container exists): putting a value or a form of it in the
-/// workspace or harness argv or environment fails the test. The planted environment and command
-/// line are found in both (positive control).
+/// workspace or harness argv or environment fails the test. The blob planted in an environment
+/// and a command line is found in both (positive control, through an encoded pattern).
 #[test]
 fn rt_sec_01_no_process_environment_or_command_line_holds_a_secret() {
     rt().block_on(async {
@@ -152,7 +172,10 @@ fn rt_sec_01_no_process_environment_or_command_line_holds_a_secret() {
 /// directory is on the built-in mount denylist (RT-MAN-02 holds that half), and nothing `sallyd`
 /// writes into a sandbox (the CA files, the socket directories, the shim) carries a value:
 /// writing a value or a form of it anywhere a container can read fails the test. The planted
-/// file is found in both (positive control); `/dev/shm` keeps RT-SEC-10's tripwire.
+/// files (the marker, and a blob only an encoded pattern matches) are found in both (positive
+/// control); `/dev/shm` keeps RT-SEC-10's tripwire. Where `sallyd` and the sandbox write
+/// (`/run`, `/tmp`), nothing is unreadable to the container's user, so the search skips nothing
+/// there (9b security review L3).
 #[test]
 fn rt_sec_02_no_file_in_either_container_holds_a_secret() {
     rt().block_on(async {
@@ -160,8 +183,12 @@ fn rt_sec_02_no_file_in_either_container_holds_a_secret() {
         let r = session(&lx, "sec02").await;
         let h = harness(&lx, "sec02").await;
         let [ws, hs] = search(&r, &h, &script(Scope::Files)).await;
-        assert_eq!(ws, ["/tmp/planted.txt"], "workspace");
-        assert_eq!(hs, ["/tmp/planted.txt"], "harness");
+        let want = ["/tmp/planted-blob.txt", "/tmp/planted.txt"];
+        assert_eq!(ws, want, "workspace");
+        assert_eq!(hs, want, "harness");
+        let [ws, hs] = search(&r, &h, &unreadable_script(&["/run", "/tmp"])).await;
+        assert!(ws.is_empty(), "workspace: {ws:?}");
+        assert!(hs.is_empty(), "harness: {hs:?}");
         lx.stop(r).await;
     });
 }

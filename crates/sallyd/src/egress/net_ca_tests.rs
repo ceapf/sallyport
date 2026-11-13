@@ -63,7 +63,8 @@ fn session_settings_carry_the_ca_condition_and_the_timeout() {
         mem_bytes: 16 << 30,
     };
     let head = "apiVersion: sallyport/v1\nkind: Manifest\nname: t\nmodel:\n  ref: any\n\
-                runtime:\n  timeout: 90m\nnetwork:\n  mode: proxy\n  allow:\n    - host: a.mock.test\n    - host: b.mock.test\n";
+                runtime:\n  timeout: 90m\nnetwork:\n  mode: proxy\n  allow:\n    - host: a.mock.test\n    - host: b.mock.test\n  \
+                max_request_bytes: 3KiB\n  max_response_bytes: 5KiB\n";
     let grant = "secrets:\n  - name: GITHUB_TOKEN\n    inject: {host: a.mock.test, \
                  header: Authorization, format: \"Bearer {value}\"}\n  \
                  - name: GITHUB_TOKEN\n    inject: {host: b.mock.test, header: Authorization, \
@@ -75,6 +76,9 @@ fn session_settings_carry_the_ca_condition_and_the_timeout() {
         assert_eq!(s.ca, ca, "{body}");
         assert_eq!(s.ca, ca::wanted(v.manifest()));
         assert_eq!(s.timeout, Duration::from_secs(90 * 60));
+        // The manifest's body caps, request then response (MANIFEST_SPEC §3; 9b security
+        // review L1); `Limits::of_session` takes them from here.
+        assert_eq!(s.body_caps, (3 * 1024, 5 * 1024));
         assert!(s.interception.is_none());
         // Task 9a-3: the grants as the proxy needs them, names and text only.
         let want = if ca {

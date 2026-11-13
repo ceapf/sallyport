@@ -9,6 +9,11 @@
 //! shim relays to (architect Q47: the test image has no TLS client); the route decision and leaf
 //! selection under test sit in `sallyd`, identical from either end of the socket. The upstream is
 //! the in-process TLS mock of `common/egress.rs`, verified against a test CA.
+//!
+//! The file is longer than the 800-line soft ceiling on purpose: every row here shares one rig
+//! (session launch, `CONNECT` and TLS over `net.sock`, the mock's log, the audit events);
+//! splitting the file would only move that rig into `common` to share it between the halves
+//! (Task 9b rust review M2: reason recorded instead of a split).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;
@@ -386,8 +391,11 @@ fn decoded_body(resp: &str) -> String {
         if n == 0 {
             return out;
         }
-        out.push_str(&after[..n]);
-        rest = after[n..].strip_prefix("\r\n").expect("CRLF after a chunk");
+        let (Some(chunk), Some(tail)) = (after.get(..n), after.get(n..)) else {
+            panic!("a chunk of {n} bytes, {} left: {resp}", after.len());
+        };
+        out.push_str(chunk);
+        rest = tail.strip_prefix("\r\n").expect("CRLF after a chunk");
     }
 }
 
@@ -880,54 +888,16 @@ fn rt_sec_12_every_encoded_echo_split_across_chunks_is_redacted() {
         let seen = lx.egress.dialer.seen();
         assert_eq!(seen.len(), 2 * BASIC_HOSTS.len(), "{seen:?}");
         lx.stop(r).await;
-        let fill = |n: usize| "*".repeat(n);
         for (i, ((host, user), (forms, headers))) in BASIC_HOSTS.iter().zip(&outs).enumerate() {
-            let blob = basic_blob(user, &git());
-            let rendered = format!("Basic {blob}");
-            // Positive control: the grant host got the credential computed independently.
-            let req = &seen[2 * i];
+            let body = check_echo_forms(host, user, &seen[2 * i], forms);
+            let rendered = format!("Basic {}", basic_blob(user, &git()));
             assert_eq!(
-                header_values(req, "authorization"),
-                std::slice::from_ref(&rendered),
-                "{host}"
-            );
-            assert!(forms.starts_with("HTTP/1.1 200 OK"), "{forms}");
-            let body = decoded_body(forms);
-            let upstream = echo_body(&git(), &blob, req);
-            assert_eq!(body.len(), upstream.len(), "{host}: {body}");
-            for (o, u) in body.bytes().zip(upstream.bytes()) {
-                assert!(o == u || o == b'*', "{host}: {body}");
-            }
-            for f in forms_of(&git()).iter().chain(&basic_forms(user, &git())) {
-                assert!(!body.contains(f.as_str()), "{host}: {f} in {body}");
-            }
-            let lines = echo_lines(&git(), &blob);
-            let out_lines: Vec<&str> = body.split('\n').collect();
-            for ((up, kind), out) in lines.iter().zip(&out_lines) {
-                let covered = match kind {
-                    Line::Whole => 0..up.len(),
-                    Line::Core(range) => range.clone(),
-                    Line::AllButLast => 0..up.len() - 1,
-                };
-                assert_eq!(out.len(), up.len(), "{host}: {out}");
-                assert_eq!(
-                    &out[covered.clone()],
-                    fill(covered.len()),
-                    "{host}: {up} -> {out}"
-                );
-            }
-            // The echoed request: the whole rendered value, `Basic ` included, is filler.
-            let echoed = &body[body.len() - req.len()..];
-            assert_eq!(
-                header_values(echoed, "authorization"),
-                [fill(rendered.len())]
-            );
-            assert_eq!(
-                header_values(&outs[i].1, "x-echo-authorization"),
-                [fill(rendered.len())],
+                header_values(headers, "x-echo-authorization"),
+                ["*".repeat(rendered.len())],
                 "{headers}"
             );
-            assert!(!headers.contains(blob.trim_end_matches('=')), "{headers}");
+            let bare = rendered["Basic ".len()..].trim_end_matches('=');
+            assert!(!headers.contains(bare), "{headers}");
             let entries = responses(&lx, host);
             assert_eq!(entries.len(), 2, "{entries:?}");
             let n = body.bytes().filter(|b| *b == b'*').count() as u64;
@@ -940,4 +910,49 @@ fn rt_sec_12_every_encoded_echo_split_across_chunks_is_redacted() {
             assert_eq!(entries[0]["end"], json!("complete"));
         }
     });
+}
+
+/// RT-SEC-12's checks of one `/echo-forms` exchange: `req` is what the grant host `host` (user
+/// `user`) received, `forms` what the sandbox got back. Returns the decoded body.
+fn check_echo_forms(host: &str, user: &str, req: &str, forms: &str) -> String {
+    let fill = |n: usize| "*".repeat(n);
+    let blob = basic_blob(user, &git());
+    let rendered = format!("Basic {blob}");
+    // Positive control: the grant host got the credential computed independently.
+    assert_eq!(
+        header_values(req, "authorization"),
+        std::slice::from_ref(&rendered),
+        "{host}"
+    );
+    assert!(forms.starts_with("HTTP/1.1 200 OK"), "{forms}");
+    let body = decoded_body(forms);
+    let upstream = echo_body(&git(), &blob, req);
+    assert_eq!(body.len(), upstream.len(), "{host}: {body}");
+    for (o, u) in body.bytes().zip(upstream.bytes()) {
+        assert!(o == u || o == b'*', "{host}: {body}");
+    }
+    for f in forms_of(&git()).iter().chain(&basic_forms(user, &git())) {
+        assert!(!body.contains(f.as_str()), "{host}: {f} in {body}");
+    }
+    let out_lines: Vec<&str> = body.split('\n').collect();
+    for ((up, kind), out) in echo_lines(&git(), &blob).iter().zip(&out_lines) {
+        let covered = match kind {
+            Line::Whole => 0..up.len(),
+            Line::Core(range) => range.clone(),
+            Line::AllButLast => 0..up.len() - 1,
+        };
+        assert_eq!(out.len(), up.len(), "{host}: {out}");
+        assert_eq!(
+            &out[covered.clone()],
+            fill(covered.len()),
+            "{host}: {up} -> {out}"
+        );
+    }
+    // The echoed request: the whole rendered value, `Basic ` included, is filler.
+    let echoed = &body[body.len() - req.len()..];
+    assert_eq!(
+        header_values(echoed, "authorization"),
+        [fill(rendered.len())]
+    );
+    body
 }

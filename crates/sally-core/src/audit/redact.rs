@@ -300,6 +300,8 @@ fn forms(bytes: &[u8], raw: &str) -> Vec<String> {
 /// `user ":" secret`, the value a `Basic {basic}` header carries. It lives here, beside
 /// [`secret_forms`], so the proxy renders it and redacts it with the one base64 encoder of the
 /// workspace (architect ruling A2). Every intermediate is sized up front and wiped on drop.
+/// The caller checks `user` (not empty, no `:`; the manifest validator and the proxy's `render`
+/// both do): this function encodes whatever it is given.
 #[must_use]
 pub fn basic_credential(user: &str, secret: &str) -> Secret<String> {
     let mut joined = Zeroizing::new(Vec::with_capacity(

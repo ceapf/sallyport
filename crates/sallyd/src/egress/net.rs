@@ -359,10 +359,10 @@ pub enum EgressError {
 /// (decision 10; Task 9a decision 6).
 pub trait EgressStarter: Send + Sync {
     /// For a session with a session CA ([`SessionEgress::ca`]): reads the grants' values from
-    /// the secrets source and builds the credentials, loads the upstream trust roots, mints the CA and its leaves, and writes
-    /// `ca-bundle.pem` and `session-ca.pem` into `dir` (the workspace socket directory), before
-    /// the container exists. Blocking: the launcher runs it off the runtime. Other sessions pass
-    /// through unchanged.
+    /// the secrets source and builds the credentials, loads the upstream trust roots, mints the
+    /// CA and its leaves, and writes `ca-bundle.pem` and `session-ca.pem` into `dir` (the
+    /// workspace socket directory), before the container exists. Blocking: the launcher runs it
+    /// off the runtime. Other sessions pass through unchanged.
     ///
     /// # Errors
     /// [`EgressError::Credentials`], [`EgressError::Store`], [`EgressError::Roots`],
