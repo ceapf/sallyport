@@ -126,6 +126,16 @@ case "$(cat "$STUB/rerun")" in
   none) echo "test result: ok. 0 passed; 0 failed; 0 ignored" ;;
   notrun) echo "sallyd disk ${*: -1}" >>"$SALLYPORT_TEST_NOT_RUN/list"
           echo "test result: ok. 1 passed; 0 failed; 0 ignored" ;;
+  # Lists itself again, but the build failed: the failure is the verdict.
+  failnotrun) echo "sallyd disk ${*: -1}" >>"$SALLYPORT_TEST_NOT_RUN/list"; exit 101 ;;
+  # A re-run that reads its stdin must find nothing there (not the rest of the list).
+  stdin) if IFS= read -r x; then echo "ate $x" >>"$STUB/log"; fi
+         echo "test result: ok. 1 passed; 0 failed; 0 ignored" ;;
+  # The wrapper is terminated during the re-run, whose child would create a container late.
+  # (TERM: the test starts the wrapper in the background, where INT is ignored.)
+  signal) while [ ! -s "$STUB/wrapper" ]; do sleep 0.1; done
+          (sleep 2; echo late >>"$STUB/containers") &
+          kill -TERM "$(cat "$STUB/wrapper")"; wait ;;
 esac
 EOF
 chmod +x "$tmp/cargo"
@@ -164,6 +174,42 @@ check "still not run names the test and the lock" grep -q 'did not run.*rt_ag_09
 
 notrun none "$lists"
 check "a re-run that ran no test: exit 6 (got $rc)" test "$rc" -eq 6
+
+# Review fixes (PS-L1, PS-L2/PR-M3, PR-M2, rc first).
+notrun failnotrun "$lists"
+check "a failed re-run that listed itself keeps its status (got $rc)" test "$rc" -eq 101
+
+two='echo "sallyd disk rt_ag_09_one" >>"$SALLYPORT_TEST_NOT_RUN/list";
+     echo "sallyd disk rt_ag_09_two" >>"$SALLYPORT_TEST_NOT_RUN/list";'
+notrun stdin "$two"
+check "a re-run reading stdin: exit 0 (got $rc)" test "$rc" -eq 0
+check "every listed test is re-run though one reads stdin" test "$(grep -c '^cargo' "$tmp/s/log")" -eq 2
+check "a re-run's stdin is empty" bash -c "! grep -q '^ate' '$tmp/s/log'"
+
+notrun pass "printf '%s' 'sallyd disk rt_ag_09_one' >>\"\$SALLYPORT_TEST_NOT_RUN/list\""
+check "a last line without a newline: exit 0 (got $rc)" test "$rc" -eq 0
+check "a last line without a newline is re-run" grep -qx 'cargo test -p sallyd --test disk -- --exact rt_ag_09_one' "$tmp/s/log"
+
+for bad in 'sallyd disk -x' 'sallyd --test a' '-p disk a' 'sallyd disk rt_ag_09_one
+
+'; do
+  notrun pass "printf '%s' '$bad' >>\"\$SALLYPORT_TEST_NOT_RUN/list\""
+  check "a field starting with a dash, or a blank line, exits 6: '$bad' (got $rc)" test "$rc" -eq 6
+  check "and re-runs nothing: '$bad'" bash -c "! grep -q '^cargo' '$tmp/s/log' 2>/dev/null"
+done
+
+rm -rf "$tmp/s" && mkdir "$tmp/s"
+: >"$tmp/s/containers"; : >"$tmp/s/images"; : >"$tmp/s/stuck"
+echo signal >"$tmp/s/rerun"
+rc=0
+STUB="$tmp/s" SALLYPORT_PODMAN="$tmp/podman" SALLYPORT_CARGO="$tmp/cargo" \
+  XDG_RUNTIME_DIR="$tmp/xdg" bash "$run" bash -c "$lists" >"$tmp/out" 2>&1 &
+echo $! >"$tmp/s/wrapper"
+wait $! || rc=$?
+sleep 3
+check "a run interrupted in its re-run exits non-zero (got $rc)" test "$rc" -ne 0
+check "an interrupted re-run stops its children" bash -c "! grep -qx late '$tmp/s/containers'"
+check "an interrupted re-run leaves no list directory" bash -c "! ls -d '$tmp/xdg/sallyport-test/not-run.'* 2>/dev/null"
 
 for bad in 'sallyd disk' 'sallyd disk a b' 'sallyd disk a;b' 'sallyd ../x a' 'sallyd disk $(id)'; do
   notrun pass "printf '%s\n' '$bad' >>\"\$SALLYPORT_TEST_NOT_RUN/list\""

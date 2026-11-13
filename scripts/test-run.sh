@@ -115,35 +115,45 @@ finish() {
   exit "$rc"
 }
 
-# The tests listed in <dir>/list, one `<package> <binary> <test>` per line, deduplicated. A
-# malformed line fails (exit 6): it is never skipped.
+# The tests listed in <dir>/list, one `<package> <binary> <test>` per line, deduplicated. The
+# deduplicated text is what is checked and returned, last line included with or without its
+# newline. A malformed line (a field not of [A-Za-z0-9_-] or starting with `-`, a blank line)
+# fails (exit 6): it is never skipped.
 listed() {
-  local f="$1/list" line
+  local f="$1/list" line out
   [ -s "$f" ] || return 0
-  while IFS= read -r line; do
-    [[ "$line" =~ ^[A-Za-z0-9_-]+\ [A-Za-z0-9_-]+\ [A-Za-z0-9_-]+$ ]] || {
+  out="$(sort -u "$f")"
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ "$line" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*\ [A-Za-z0-9_][A-Za-z0-9_-]*\ [A-Za-z0-9_][A-Za-z0-9_-]*$ ]] || {
       echo "test-run: malformed not-run line: $line" >&2
       return 6
     }
-  done <"$f"
-  sort -u "$f"
+  done <<<"$out"
+  printf '%s\n' "$out"
 }
 
-# rerun <package> <binary> <test>: runs that one test with a fresh list. 0 only when exactly one
-# test ran and passed and it did not list itself again (then 6); a failure keeps its status.
+# rerun <package> <binary> <test>: runs that one test with a fresh list (inside $notrun, so the
+# run's end removes it). Like the command: its own process group, which a signal stops, and
+# stdin from /dev/null (it never reads the rest of the list). A failure keeps its status;
+# otherwise 0 only when exactly one test ran and passed and it did not list itself again (6).
 rerun() {
-  local again out rc=0
-  again="$(mktemp -d "$locks/not-run.XXXXXXXX")"
-  out="$(SALLYPORT_TEST_NOT_RUN="$again" "$cargo_bin" test -p "$1" --test "$2" -- --exact "$3" 2>&1)" ||
-    rc=$?
-  printf '%s\n' "$out"
+  local again rc=0
+  again="$(mktemp -d "$notrun/again.XXXXXXXX")"
+  set -m
+  SALLYPORT_TEST_NOT_RUN="$again" "$cargo_bin" test -p "$1" --test "$2" -- --exact "$3" \
+    >"$again/out" 2>&1 </dev/null &
+  child=$!
+  set +m
+  wait "$child" || rc=$?
+  child=
+  cat -- "$again/out"
+  if [ "$rc" -ne 0 ]; then
+    return "$rc"
+  fi
   if [ -s "$again/list" ]; then
-    rm -rf -- "$again"
     return 6
   fi
-  rm -rf -- "$again"
-  [ "$rc" -eq 0 ] || return "$rc"
-  grep -qE '^test result: ok\. 1 passed;' <<<"$out" || {
+  grep -qE '^test result: ok\. 1 passed;' "$again/out" || {
     echo "test-run: the re-run of $3 did not run exactly one test" >&2
     return 6
   }
