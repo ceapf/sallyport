@@ -96,6 +96,9 @@ fn hop_by_hop_proxy_and_encoding_headers_are_dropped() {
         ("expect", "100-continue"),
         ("accept-encoding", "gzip"),
         ("content-length", "3"),
+        ("range", "bytes=0-3"),
+        ("if-range", "\"etag\""),
+        ("request-range", "bytes=0-3"),
         ("x-kept", "1"),
     ])
     .unwrap();
@@ -290,8 +293,6 @@ fn identity_responses_pass_without_hop_by_hop_headers() {
     chunked.extend_from_slice(&HOP_BY_HOP);
     let out = response(StatusCode::FOUND, &heads(&chunked)).unwrap();
     assert_eq!(names(&out), ["content-type", "location"]);
-    let identity = heads(&[("content-encoding", "Identity")]);
-    assert!(response(StatusCode::OK, &identity).is_ok());
 }
 
 /// Architect ruling R4 (9a-2 review): a response framed two ways, or with two lengths, is
@@ -322,17 +323,43 @@ fn ambiguous_response_framing_is_upstream_malformed() {
     );
 }
 
+/// Allow (R1, architect Q10): no `Content-Encoding`, or exactly one `identity` in any case,
+/// forwarded unchanged.
+#[test]
+fn an_identity_content_encoding_passes_unchanged() {
+    for v in ["identity", "IDENTITY", "Identity"] {
+        let h = heads(&[("content-encoding", v), ("content-length", "4")]);
+        let out = response(StatusCode::OK, &h).unwrap();
+        assert_eq!(out.get(header::CONTENT_ENCODING).unwrap(), v);
+    }
+    let none = heads(&[("content-length", "4")]);
+    assert!(response(StatusCode::OK, &none).is_ok());
+}
+
 #[test]
 fn encoded_or_upgraded_responses_are_refused() {
     assert_eq!(
         response(StatusCode::SWITCHING_PROTOCOLS, &HeaderMap::new()),
         Err(Reason::UpstreamEncoded)
     );
-    let bad: [&[(&str, &str)]; 6] = [
+    // Task 9a-3 (decision 1 as relaxed by R1, architect Q10): any Content-Encoding but one
+    // `identity`.
+    let bad: [&[(&str, &str)]; 11] = [
         &[("content-encoding", "gzip")],
+        &[("content-encoding", "x-identity")],
+        &[("content-encoding", "")],
         &[("content-encoding", "identity, gzip")],
+        &[("content-encoding", "identity, identity")],
         &[
             ("content-encoding", "identity"),
+            ("content-encoding", "identity"),
+        ],
+        &[
+            ("content-encoding", "identity"),
+            ("content-encoding", "gzip"),
+        ],
+        &[
+            ("content-encoding", "gzip"),
             ("content-encoding", "identity"),
         ],
         &[("transfer-encoding", "gzip, chunked")],

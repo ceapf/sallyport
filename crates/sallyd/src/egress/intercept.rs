@@ -10,8 +10,14 @@
 //! except a head hyper refuses itself (too large, unparsable): hyper answers first, and the entry
 //! follows when its connection future returns (architect Q45, a recorded deviation).
 //!
-//! No secret reaches this module (Q27 (1)): the proxy holds the leaves' keys and header names
-//! only. Task 9a-3 adds injection here, constructible only together with response redaction.
+//! Task 9a-3: the grant headers are built from the session's [`Credentials`] before the request's
+//! `egress.request` entry and set only after that entry is written (architect D13, ruling Q4),
+//! and every response head and body goes through the credentials' redaction (decisions 2 and 3;
+//! architect D2, D4, D5). Secret values stay inside `Credentials` and the redaction; this module
+//! never reads one.
+//!
+//! The file is long on purpose: one tunnel's state machine is kept together (architect Q3); its
+//! TLS setup moved out to `intercept_tls.rs` under #73.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -22,8 +28,7 @@ use hyper::body::{Body, Bytes, Frame, Incoming, SizeHint};
 use hyper::http::{HeaderValue, Method, Request, Response, StatusCode, Version, header};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
-use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
-use rustls::sign::{CertifiedKey, SingleCertAndKey};
+use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ServerConfig};
 use sally_core::audit::NewEntry;
 use serde_json::{Value, json};
@@ -32,17 +37,17 @@ use tokio::time::Instant;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use super::super::authority::{Authority, escape_target};
-use super::super::ca::{CaError, Leaf, SessionTls};
 use super::super::head::MAX_HEAD;
+use super::super::inject::Credentials;
 use super::super::meter::{BodyEnd, BoxError, Capped, Counts, Meter, OnEnd};
 use super::super::policy::Reason;
+use super::super::redact::{self, Ending, OnRedacted, Redacted};
 use super::super::rewrite;
-use super::super::roots::Roots;
 use super::super::tunnel::{Activity, End, Totals};
+use super::intercept_tls::HostTls;
 use super::{Cleared, Dialer, ESTABLISHED, HostAddrs, Proxy, REPLY_TIMEOUT, Resolver, write_reply};
+use report::ResponseReport;
 
-/// The only ALPN protocol offered either way (decision 4).
-const HTTP_1_1: &[u8] = b"http/1.1";
 /// Largest upstream response head (architect Q45); more is `response-too-large`.
 pub const MAX_RESPONSE_HEAD: usize = 64 * 1024;
 /// Header lines a head may have, either way.
@@ -56,95 +61,6 @@ const MAX_HEADERS: usize = 100;
 /// [`MAX_HEAD`] or [`MAX_RESPONSE_HEAD`].
 const REQUEST_READ: usize = 1024;
 const RESPONSE_READ: usize = 4096;
-
-// TODO(#73): move the TLS setup (`Interception`, `HostTls`, `certified`, `tls_error`) to
-// `intercept_tls.rs` as the first commit of Task 9a-3.
-
-/// What the proxy intercepts grant hosts with (Task 9a): the session CA's leaves and the upstream
-/// trust roots, and the TLS configurations built from them. It holds no secret store and no
-/// credential (architect Q27 (1)).
-#[derive(Debug)]
-pub struct Interception {
-    /// The session CA and one leaf per grant host; the CA key is already gone.
-    pub tls: SessionTls,
-    /// The upstream verifier's roots.
-    pub roots: Roots,
-    upstream: Arc<ClientConfig>,
-    servers: Vec<(String, Arc<ServerConfig>)>,
-}
-
-impl Interception {
-    /// Builds the upstream client configuration (rustls defaults: TLS 1.2 and 1.3, the given
-    /// roots, ALPN `http/1.1`) and one server configuration per leaf.
-    ///
-    /// # Errors
-    /// [`CaError::Generate`] when rustls refuses a configuration or a leaf.
-    pub fn new(tls: SessionTls, roots: Roots) -> Result<Self, CaError> {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let mut upstream = ClientConfig::builder_with_provider(Arc::clone(&provider))
-            .with_safe_default_protocol_versions()
-            .map_err(tls_error)?
-            .with_root_certificates(Arc::clone(&roots.store))
-            .with_no_client_auth();
-        upstream.alpn_protocols = vec![HTTP_1_1.to_vec()];
-        let mut servers = Vec::with_capacity(tls.leaves.len());
-        for leaf in &tls.leaves {
-            let mut cfg = ServerConfig::builder_with_provider(Arc::clone(&provider))
-                .with_safe_default_protocol_versions()
-                .map_err(tls_error)?
-                .with_no_client_auth()
-                .with_cert_resolver(Arc::new(SingleCertAndKey::from(certified(leaf)?)));
-            cfg.alpn_protocols = vec![HTTP_1_1.to_vec()];
-            servers.push((leaf.host.clone(), Arc::new(cfg)));
-        }
-        Ok(Self {
-            tls,
-            roots,
-            upstream: Arc::new(upstream),
-            servers,
-        })
-    }
-
-    /// The server configuration presenting `host`'s leaf, if the session CA made one.
-    #[must_use]
-    pub fn server(&self, host: &str) -> Option<Arc<ServerConfig>> {
-        self.servers
-            .iter()
-            .find(|(h, _)| h == host)
-            .map(|(_, c)| Arc::clone(c))
-    }
-
-    /// What intercepting `host` takes, if the session CA made its leaf.
-    pub(super) fn host_tls(&self, host: &str) -> Option<HostTls> {
-        Some(HostTls {
-            server: self.server(host)?,
-            upstream: Arc::clone(&self.upstream),
-        })
-    }
-}
-
-/// The TLS configurations a cleared grant host is intercepted with: its leaf toward the client,
-/// the verifying client configuration toward the upstream.
-pub(super) struct HostTls {
-    server: Arc<ServerConfig>,
-    upstream: Arc<ClientConfig>,
-}
-
-/// The leaf and its signing key, read from the leaf's DER key in place (architect ruling R7):
-/// the proxy makes no copy of the key bytes of its own; the only plain copy outside ring is the
-/// leaf's `Secret`, wiped when the session ends. ring's parsed key and rustls's objects built
-/// from it are freed, not wiped (THREAT_MODEL, Session CA limits (3); TODO(#69)).
-fn certified(leaf: &Leaf) -> Result<CertifiedKey, CaError> {
-    let der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf.key.expose().as_slice()));
-    let key = rustls::crypto::ring::sign::any_supported_type(&der).map_err(tls_error)?;
-    let ck = CertifiedKey::new(vec![leaf.cert.clone()], key);
-    ck.keys_match().map_err(tls_error)?;
-    Ok(ck)
-}
-
-fn tls_error(e: rustls::Error) -> CaError {
-    CaError::Generate(e.to_string())
-}
 
 /// What an intercepted tunnel's `egress.close` adds: its requests and their status classes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -173,7 +89,10 @@ impl Summary {
 struct State {
     auth: Authority,
     used: SocketAddr,
+    /// The header names of the host's grants: every client copy is dropped (Q40).
     grants: Vec<String>,
+    /// The session's credentials and their redaction.
+    credentials: Arc<Credentials>,
     raw: Counts,
     plain: Counts,
     act: Arc<Activity>,
@@ -192,11 +111,18 @@ struct State {
 }
 
 impl State {
-    fn new(auth: Authority, used: SocketAddr, grants: Vec<String>, act: Arc<Activity>) -> Self {
+    fn new(
+        auth: Authority,
+        used: SocketAddr,
+        grants: Vec<String>,
+        credentials: Arc<Credentials>,
+        act: Arc<Activity>,
+    ) -> Self {
         Self {
             auth,
             used,
             grants,
+            credentials,
             raw: Counts::default(),
             plain: Counts::default(),
             act,
@@ -273,10 +199,10 @@ impl State {
     }
 }
 
-/// A response body: a refusal's text, or the upstream's body under the response cap.
+/// A response body: a refusal's text, or the upstream's body under the response cap, redacted.
 enum Out {
     Reply(Option<Bytes>),
-    Upstream(Capped<Incoming>),
+    Upstream(Box<Redacted<Capped<Incoming>>>),
 }
 
 impl Body for Out {
@@ -407,6 +333,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         let HostTls {
             server,
             upstream: client_cfg,
+            credentials,
         } = host_tls;
         let act = Arc::new(Activity::new());
         let upstream = Meter::new(
@@ -421,7 +348,13 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         };
         let opened = tokio::time::timeout(REPLY_TIMEOUT, client.write_all(ESTABLISHED)).await;
         let grants = self.policy.grant_headers(&c.auth.host);
-        let st = Arc::new(State::new(c.auth, used, grants, Arc::clone(&act)));
+        let st = Arc::new(State::new(
+            c.auth,
+            used,
+            grants,
+            credentials,
+            Arc::clone(&act),
+        ));
         let end = if matches!(opened, Ok(Ok(()))) {
             let raw = Meter::new(client, c.rest, st.raw.clone(), Some(act));
             tokio::select! {
@@ -602,29 +535,38 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
 
     /// Forwards a checked request. The sender lock is held from `ready()` to `send_request`: a
     /// request is audited and counted only once the upstream connection is known to take it
-    /// (architect ruling R1).
+    /// (architect ruling R1). The grant headers are built before its `egress.request` entry
+    /// (which names exactly them) and set only once that entry is written, right before the
+    /// request is built (architect D13, ruling Q4); a failed append drops them unsent.
     async fn forward(
         &self,
         st: &Arc<State>,
         sender: &Sender,
         parts: hyper::http::request::Parts,
         body: Incoming,
-        headers: hyper::http::HeaderMap,
+        mut headers: hyper::http::HeaderMap,
         target: &str,
     ) -> Result<Response<Out>, BoxError> {
         let mut sender = sender.lock().await;
         if let Some(reply) = self.upstream_ready(st, &mut sender).await {
             return reply;
         }
+        let grants = st.credentials.prepare(&st.auth.host);
         let audited = self
             .entry("egress.request", Some("allow"))
-            .args(request_args(&st.auth, &parts.method, target));
+            .args(request_args(
+                &st.auth,
+                &parts.method,
+                target,
+                grants.names(),
+            ));
         // TODO(#72): on a session stop this append may land after `egress.close`.
         if !self.append(audited).await {
             st.set_end(End::Error);
             return Err("audit append failed".into());
         }
         st.requests.fetch_add(1, Ordering::Relaxed);
+        grants.apply(&mut headers);
         let capped = Capped::new(body, self.limits.max_request, self.request_end(st, target));
         let up = upstream_request(capped, parts, headers)?;
         let sent = sender.send_request(up).await;
@@ -692,9 +634,11 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         }
     }
 
-    /// The response head: checked (Q30), its declared length against the cap (Q35), then the
-    /// body streamed back under the cap. The declared length is the one hyper decoded (none for
-    /// HEAD, 204 or 304, whatever their `Content-Length` says: architect ruling R5).
+    /// The response head: checked (Q30), its headers redacted (architect D5), its declared length
+    /// against the cap (Q35), then the body streamed back under the cap and redacted (decisions
+    /// 2 and 3). The declared length is the one hyper decoded (none for HEAD, 204 or 304,
+    /// whatever their `Content-Length` says: architect ruling R5). The upstream's reason phrase
+    /// is never forwarded: the client gets hyper's canonical one.
     async fn respond(
         &self,
         st: &Arc<State>,
@@ -705,6 +649,12 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         let headers = match rewrite::response(rp.status, &rp.headers) {
             Ok(h) => h,
             Err(reason) => return self.refuse_inside(st, reason, target, None).await,
+        };
+        let redaction = st.credentials.redaction();
+        let Ok((headers, head_tally)) = redact::headers(redaction, &headers) else {
+            return self
+                .refuse_inside(st, Reason::UpstreamEchoedSecret, target, None)
+                .await;
         };
         if !rewrite::within(body.size_hint().exact(), self.limits.max_response) {
             return self
@@ -723,11 +673,28 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
             limit: Mutex::new(Some((over, Arc::clone(&self.audit)))),
             level: self.level,
         };
-        let mut out = Response::new(Out::Upstream(Capped::new(
-            body,
-            self.limits.max_response,
-            Arc::new(on_end),
-        )));
+        let capped = Capped::new(body, self.limits.max_response, Arc::new(on_end));
+        let report = Arc::new(ResponseReport {
+            state: Arc::clone(st),
+            entry: Mutex::new(Some(self.entry("egress.response", None))),
+            target: target.to_owned(),
+            status: rp.status,
+            redaction: Arc::clone(redaction),
+            sink: Arc::clone(&self.audit),
+            level: self.level,
+        });
+        // A body known empty now (HEAD, 204, 304) is never polled: its entry is written here,
+        // before the head goes out (architect Q13).
+        let empty = capped.is_end_stream();
+        if empty
+            && let Some(work) = report.ended(Ending::Complete, head_tally.clone())
+            && !work.await
+        {
+            return Err(Box::new(redact::Unreported));
+        }
+        let body = Redacted::new(capped, redaction, head_tally, report);
+        let body = if empty { body.reported() } else { body };
+        let mut out = Response::new(Out::Upstream(Box::new(body)));
         *out.status_mut() = rp.status;
         *out.headers_mut() = headers;
         Ok(out)
@@ -859,8 +826,9 @@ fn reply_response(reason: Reason) -> Response<Out> {
     r
 }
 
-/// Arguments of `egress.request` (Q34). Nothing is injected in Task 9a-2.
-fn request_args(a: &Authority, method: &Method, target: &str) -> Value {
+/// Arguments of `egress.request` (Q34): `injected` lists the grants set on the request as
+/// `secret:NAME`, never a value (Task 9a-3, architect D9, D13).
+fn request_args(a: &Authority, method: &Method, target: &str, injected: &[String]) -> Value {
     let (method, _, _) = escape_target(method.as_str().as_bytes());
     let (text, bytes, cut) = escape_target(target.as_bytes());
     json!({
@@ -870,7 +838,7 @@ fn request_args(a: &Authority, method: &Method, target: &str) -> Value {
         "target": text,
         "target_bytes": bytes,
         "target_cut": cut,
-        "injected": [],
+        "injected": injected,
     })
 }
 
@@ -890,6 +858,9 @@ fn inside_args(a: &Authority, reason: Reason, target: &str, part: Option<&str>) 
     }
     v
 }
+
+#[path = "intercept_report.rs"]
+mod report;
 
 #[cfg(test)]
 #[path = "intercept_tests.rs"]

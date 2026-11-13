@@ -7,13 +7,16 @@
 //! collision-prone (the store warns when a value is under 16 bytes). Matches are replaced by
 //! `[REDACTED:NAME]`.
 //!
-//! Grant-specific forms (the injected header value, the `{basic}` blob) belong to the token
-//! proxy and are added there (M1 task 9b).
+//! [`secret_forms`] gives the same forms to the token proxy's response redaction, so the two
+//! cannot drift; the proxy adds the grant-specific ones itself (the injected header value from
+//! Task 9a-3, the `{basic}` blob from Task 9b).
 
 use std::borrow::Cow;
 use std::fmt;
+use std::sync::Arc;
 
 use serde_json::{Map, Value};
+use zeroize::Zeroizing;
 
 use crate::secrets::Secret;
 
@@ -56,6 +59,11 @@ impl Default for Redactor {
 impl Redactor {
     /// Builds the pattern set for `(name, value)` pairs. Empty values are ignored.
     pub fn new<'a>(secrets: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+        Self::build(secrets)
+    }
+
+    /// [`Self::new`]'s work, in a function cargo-mutants mutates (it leaves `new` alone; #87).
+    fn build<'a>(secrets: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
         let mut count = 0;
         let mut patterns: Vec<Pattern> = Vec::new();
         for (name, value) in secrets {
@@ -164,7 +172,81 @@ impl Redactor {
     }
 }
 
-/// Every form of a secret worth redacting.
+/// The forms of one session's secrets, built once at launch and shared, never copied: the type
+/// can only be held through the [`Arc`] [`SessionForms::build`] returns, it has no `Clone`,
+/// `Default` or `Serialize`, and every form is a [`Secret`], so the bytes are wiped when the last
+/// holder drops. The egress proxy's response redaction reads them in place.
+///
+/// TODO(#81): the session registry registers the same `Arc` with the audit writer's redactor at
+/// session start and drops it at stop (lane B, after Task 9a-3).
+pub struct SessionForms {
+    secrets: Vec<(String, Vec<Secret<String>>)>,
+}
+
+impl fmt::Debug for SessionForms {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let names: Vec<(&str, usize)> = self
+            .secrets
+            .iter()
+            .map(|(n, forms)| (n.as_str(), forms.len()))
+            .collect();
+        f.debug_struct("SessionForms")
+            .field("secrets", &names)
+            .finish()
+    }
+}
+
+impl SessionForms {
+    /// The forms of each `(name, value, extra)`: [`secret_forms`] of the value, then the `extra`
+    /// forms the caller adds (such as the header value rendered from it). Names keep their first
+    /// position; an entry repeating a name adds its forms to that name. Empty forms, and a form
+    /// a name already has, are dropped (wiped).
+    #[must_use]
+    pub fn build<'a>(
+        entries: impl IntoIterator<Item = (&'a str, &'a Secret<String>, Vec<Secret<String>>)>,
+    ) -> Arc<Self> {
+        let mut secrets: Vec<(String, Vec<Secret<String>>)> = Vec::new();
+        for (name, value, extra) in entries {
+            if !secrets.iter().any(|(n, _)| n == name) {
+                secrets.push((name.to_owned(), Vec::new()));
+            }
+            let Some((_, forms)) = secrets.iter_mut().find(|(n, _)| n == name) else {
+                continue;
+            };
+            for form in secret_forms(value.expose()).into_iter().chain(extra) {
+                let known = forms.iter().any(|f| f.expose() == form.expose());
+                if !form.expose().is_empty() && !known {
+                    forms.push(form);
+                }
+            }
+        }
+        Arc::new(Self { secrets })
+    }
+
+    /// Each secret's name and its forms, in the order built.
+    pub fn secrets(&self) -> impl Iterator<Item = (&str, &[Secret<String>])> {
+        self.secrets.iter().map(|(n, f)| (n.as_str(), f.as_slice()))
+    }
+}
+
+/// Every form of `value` the audit redactor replaces: the raw value, its percent-encodings, its
+/// JSON-escaped form, and its trimmed base64 in both alphabets at all three alignments (forms
+/// shorter than [`MIN_BASE64_PATTERN`] characters left out). Each form appears once; an empty
+/// value has none.
+#[must_use]
+pub fn secret_forms(value: &str) -> Vec<Secret<String>> {
+    if value.is_empty() {
+        return Vec::new();
+    }
+    forms(value.as_bytes(), value)
+        .into_iter()
+        .map(Secret::new)
+        .collect()
+}
+
+/// Every form of a secret worth redacting. Every intermediate that holds the secret or an
+/// encoding of it is sized up front (so it never reallocates and leaves a copy behind) and wiped
+/// when dropped; a form already in the list is dropped, wiped, too (Task 9a-3 review M1).
 fn forms(bytes: &[u8], raw: &str) -> Vec<String> {
     let mut out = vec![raw.to_owned()];
     // Percent-encoding as real encoders produce it: both hex cases, `+` for space (forms), and
@@ -173,23 +255,29 @@ fn forms(bytes: &[u8], raw: &str) -> Vec<String> {
     for safe in [&b""[..], b"/", b"!'()*"] {
         for plus_space in [false, true] {
             for upper in [true, false] {
-                let pct = percent_encode(bytes, upper, plus_space, safe);
-                if !out.contains(&pct) {
-                    out.push(pct);
+                let mut pct = percent_encode(bytes, upper, plus_space, safe);
+                if !out.contains(&*pct) {
+                    out.push(std::mem::take(&mut *pct));
                 }
             }
         }
     }
-    // The secret as it appears inside a JSON string (quotes and backslashes escaped).
-    if let Ok(json) = serde_json::to_string(raw)
-        && let Some(inner) = json.strip_prefix('"').and_then(|j| j.strip_suffix('"'))
+    // The secret as it appears inside a JSON string (quotes and backslashes escaped): at most
+    // six bytes per input byte (`\u00XX`) plus the quotes.
+    let mut json = Zeroizing::new(Vec::with_capacity(
+        bytes.len().saturating_mul(6).saturating_add(2),
+    ));
+    if serde_json::to_writer(&mut *json, raw).is_ok()
+        && let Ok(text) = std::str::from_utf8(&json)
+        && let Some(inner) = text.strip_prefix('"').and_then(|j| j.strip_suffix('"'))
         && !out.iter().any(|o| o == inner)
     {
         out.push(inner.to_owned());
     }
     for alphabet in [STANDARD, URL_SAFE] {
         for lead in 0..3usize {
-            let mut data = vec![0u8; lead];
+            let mut data = Zeroizing::new(Vec::with_capacity(lead.saturating_add(bytes.len())));
+            data.resize(lead, 0);
             data.extend_from_slice(bytes);
             let encoded = base64_no_pad(&data, alphabet);
             // Characters wholly inside the secret's bits: from the first char that starts at
@@ -208,8 +296,11 @@ fn forms(bytes: &[u8], raw: &str) -> Vec<String> {
     out
 }
 
-fn base64_no_pad(data: &[u8], alphabet: &[u8; 64]) -> String {
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+/// Base64 without padding, in a buffer sized for it and wiped on drop.
+fn base64_no_pad(data: &[u8], alphabet: &[u8; 64]) -> Zeroizing<String> {
+    let mut out = Zeroizing::new(String::with_capacity(
+        data.len().div_ceil(3).saturating_mul(4),
+    ));
     for chunk in data.chunks(3) {
         let byte = |i: usize| chunk.get(i).copied().unwrap_or(0);
         let n = u32::from_be_bytes([0, byte(0), byte(1), byte(2)]);
@@ -224,18 +315,82 @@ fn base64_no_pad(data: &[u8], alphabet: &[u8; 64]) -> String {
 
 /// RFC 3986 unreserved characters and `safe` kept, everything else `%XX` (a space is `+` when
 /// `plus_space`, as in `application/x-www-form-urlencoded`).
-fn percent_encode(bytes: &[u8], upper: bool, plus_space: bool, safe: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len());
+/// The result is sized for the worst case (every byte `%XX`) and wiped on drop.
+fn percent_encode(bytes: &[u8], upper: bool, plus_space: bool, safe: &[u8]) -> Zeroizing<String> {
+    let digits: &[u8; 16] = if upper {
+        b"0123456789ABCDEF"
+    } else {
+        b"0123456789abcdef"
+    };
+    let hex = |n: u8| char::from(digits.get(usize::from(n & 15)).copied().unwrap_or(b'0'));
+    let mut out = Zeroizing::new(String::with_capacity(bytes.len().saturating_mul(3)));
     for &b in bytes {
         if b.is_ascii_alphanumeric() || b"-._~".contains(&b) || safe.contains(&b) {
             out.push(char::from(b));
         } else if plus_space && b == b' ' {
             out.push('+');
-        } else if upper {
-            out.push_str(&format!("%{b:02X}"));
         } else {
-            out.push_str(&format!("%{b:02x}"));
+            out.push('%');
+            out.push(hex(b >> 4));
+            out.push(hex(b));
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+
+    use super::*;
+
+    fn s(v: &str) -> Secret<String> {
+        Secret::new(v.to_owned())
+    }
+
+    fn exposed(f: &SessionForms) -> Vec<(String, Vec<String>)> {
+        f.secrets()
+            .map(|(n, forms)| {
+                let forms = forms.iter().map(|x| x.expose().clone()).collect();
+                (n.to_owned(), forms)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn session_forms_hold_each_secrets_forms_then_its_extras_once() {
+        let a = s("a value/with space");
+        let b = s("b-value");
+        let f = SessionForms::build([
+            ("A", &a, vec![s("Bearer a value/with space")]),
+            ("B", &b, vec![s(""), s("b-value")]),
+            ("A", &a, vec![s("Bearer a value/with space"), s("Token x")]),
+        ]);
+        let got = exposed(&f);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, "A");
+        let mut want: Vec<String> = secret_forms("a value/with space")
+            .iter()
+            .map(|x| x.expose().clone())
+            .collect();
+        want.push("Bearer a value/with space".into());
+        want.push("Token x".into());
+        assert_eq!(got[0].1, want);
+        assert_eq!(got[1], ("B".to_owned(), vec!["b-value".to_owned()]));
+    }
+
+    #[test]
+    fn an_empty_value_has_only_its_extras() {
+        let e = s("");
+        let f = SessionForms::build([("E", &e, vec![s("x")])]);
+        assert_eq!(exposed(&f), [("E".to_owned(), vec!["x".to_owned()])]);
+    }
+
+    #[test]
+    fn session_forms_debug_names_secrets_and_counts_only() {
+        let v = s("never-printed-value");
+        let text = format!("{:?}", SessionForms::build([("N", &v, vec![])]));
+        assert!(text.contains("\"N\""), "{text}");
+        assert!(!text.contains("never-printed"), "{text}");
+    }
 }

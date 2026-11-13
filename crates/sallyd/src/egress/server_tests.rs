@@ -385,7 +385,14 @@ async fn a_grant_host_without_its_own_leaf_is_refused() {
     let tls = SessionTls::mint(&["b.mock.test".to_owned()], v).unwrap();
     let rig = Setup {
         grants: vec!["a.mock.test".into(), "b.mock.test".into()],
-        interception: Some(Interception::new(tls, roots).unwrap()),
+        interception: Some(
+            Interception::new(
+                tls,
+                roots,
+                crate::egress::inject::testing::credentials(&["b.mock.test"]),
+            )
+            .unwrap(),
+        ),
         ..Setup::default()
     }
     .rig();
@@ -958,6 +965,20 @@ fn the_limits_are_pinned() {
     // A reply written after the stop (429, connect-failed, a pre-`200` 502) finishes and drains
     // within the grace the stop gives (architect ruling on the #71 drain, Q3).
     assert!(REPLY_TIMEOUT + DRAIN_TIMEOUT < crate::egress::net::STOP_GRACE);
+}
+
+/// A session's limits carry its own body caps (the manifest's `network.max_request_bytes` and
+/// `max_response_bytes`), not the defaults; the rest are the documented ones.
+#[test]
+fn a_session_gets_its_own_body_caps() {
+    assert_eq!(
+        Limits::of_session(7, (3, 5)),
+        Limits {
+            max_request: 3,
+            max_response: 5,
+            ..Limits::new(7)
+        }
+    );
 }
 
 #[test]

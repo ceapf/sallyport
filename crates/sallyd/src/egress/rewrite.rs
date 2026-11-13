@@ -1,11 +1,11 @@
 //! Request and response heads inside an intercepted tunnel (Task 9a-2, decision 5, architect
 //! Q29/Q30/Q41). Pure: each function reads a head hyper already parsed and returns the head to
-//! send on, or the reason it is refused. No secret reaches this module (Q27): the grant headers
-//! arrive as names only.
+//! send on, or the reason it is refused. No secret reaches this module, from Task 9a-3 on too
+//! (Q27): the grant headers arrive as names only.
 //!
 //! Request order (Q41): check the head as received, drop, then rebuild `Host` from the CONNECT
-//! authority. Task 9a-3 sets the injected header last, so a `Connection` token can never remove
-//! what the proxy adds.
+//! authority. The injected header is set after all of this, in `intercept.rs` once the request
+//! is audited (architect D13), so a `Connection` token can never remove what the proxy adds.
 
 use hyper::http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use hyper::http::{Method, StatusCode, Uri, Version};
@@ -15,8 +15,10 @@ use super::policy::Reason;
 
 /// Request headers dropped on the way upstream, besides `Connection`'s own tokens, every
 /// `Proxy-*` header and the grant headers (Q41). Framing (`Transfer-Encoding`, `Content-Length`)
-/// is dropped too: hyper's client frames the body it sends.
-const REQUEST_DROPPED: [HeaderName; 10] = [
+/// is dropped too: hyper's client frames the body it sends. `Range`, `If-Range` and the legacy
+/// `Request-Range` go too, so a secret an endpoint echoes cannot be fetched in pieces (Task
+/// 9a-3, decision 4; security review L3).
+const REQUEST_DROPPED: [HeaderName; 13] = [
     header::CONNECTION,
     HeaderName::from_static("keep-alive"),
     header::TE,
@@ -27,6 +29,9 @@ const REQUEST_DROPPED: [HeaderName; 10] = [
     header::CONTENT_LENGTH,
     header::HOST,
     header::UPGRADE,
+    header::RANGE,
+    header::IF_RANGE,
+    HeaderName::from_static("request-range"),
 ];
 
 /// Response headers dropped on the way to the client, besides `Connection`'s own tokens and
@@ -106,8 +111,10 @@ pub fn request(
 /// The client always gets a head without `Transfer-Encoding`: hyper's server frames the body.
 ///
 /// # Errors
-/// [`Reason::UpstreamEncoded`] for `101`, a `Content-Encoding` other than absent or one
-/// `identity`, or a `Transfer-Encoding` other than absent or one `chunked` (Q30); then
+/// [`Reason::UpstreamEncoded`] for `101`, a `Content-Encoding` other than absent or exactly one
+/// `identity` in any case (a body the redaction cannot read is never forwarded; Task 9a-3,
+/// decision 1 as relaxed by R1, architect Q10), or a `Transfer-Encoding` other than absent or
+/// one `chunked` (Q30); then
 /// [`Reason::UpstreamMalformed`] for `Transfer-Encoding` beside `Content-Length`, or a
 /// `Content-Length` other than one decimal value (two lines, or a list such as `6, 6`, which
 /// hyper accepts when the values agree: architect ruling R4, 9a-2 review).

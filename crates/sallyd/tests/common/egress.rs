@@ -152,9 +152,10 @@ impl Pki {
     }
 }
 
-/// The TLS mock HTTP server: one request at a time; `/echo-headers` returns the request it got,
-/// `/redirect` a 302 to `https://mock2.test/echo-headers`, `/echo-gzip` a gzip-encoded body,
-/// anything else `ok`.
+/// The TLS mock HTTP server: one request at a time; `/echo-headers` returns the request it got
+/// as its body and the request's `Authorization` value in an `X-Echo-Authorization` header
+/// (RT-SEC-06), `/redirect` a 302 to `https://mock2.test/echo-headers`, `/echo-gzip` a
+/// gzip-encoded body, anything else `ok`.
 async fn serve_tls(
     far: DuplexStream,
     cfg: Arc<rustls::ServerConfig>,
@@ -168,14 +169,28 @@ async fn serve_tls(
         seen.lock().unwrap().push(req.clone());
         let path = req.split(' ').nth(1).unwrap_or("/");
         let (status, extra, body) = match path {
-            "/echo-headers" => ("200 OK", "", req.clone()),
+            "/echo-headers" => {
+                let auth = req
+                    .split("\r\n")
+                    .find_map(|l| {
+                        let (n, v) = l.split_once(':')?;
+                        n.eq_ignore_ascii_case("authorization").then(|| v.trim())
+                    })
+                    .map(|v| format!("X-Echo-Authorization: {v}\r\n"))
+                    .unwrap_or_default();
+                ("200 OK", auth, req.clone())
+            }
             "/redirect" => (
                 "302 Found",
-                "Location: https://mock2.test/echo-headers\r\n",
+                "Location: https://mock2.test/echo-headers\r\n".into(),
                 String::new(),
             ),
-            "/echo-gzip" => ("200 OK", "Content-Encoding: gzip\r\n", "GZIPPED".into()),
-            _ => ("200 OK", "", "ok".into()),
+            "/echo-gzip" => (
+                "200 OK",
+                "Content-Encoding: gzip\r\n".into(),
+                "GZIPPED".into(),
+            ),
+            _ => ("200 OK", String::new(), "ok".into()),
         };
         let resp = format!(
             "HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\n\r\n{body}",
@@ -229,14 +244,41 @@ impl HostAddrs for Owned {
 /// The starter the fixtures hand the launcher.
 pub type FakeEgress = Egress<Names, Upstream, Owned>;
 
-/// A starter with no names, the echo and TLS upstreams, no own addresses, and as trust roots
-/// the test CA only: written to `dir/upstream-ca.pem` (0644, owned by the test user, the owner
-/// the starter is built to require; production passes the system bundle and uid 0).
+/// The secrets the fixtures' store holds (the names the test manifests grant).
+pub const STORED: [&str; 2] = ["GITHUB_TOKEN", "MOCK3_TOKEN"];
+
+/// The canary value the fixtures' store holds for `name`: assembled at runtime, so no
+/// credential-shaped literal is in the tree; `CANARY` makes it easy to grep for (RT-SEC-07).
+pub fn canary(name: &str) -> String {
+    format!("SALLY_CANARY_{name}_{}", "c0ffee".repeat(4))
+}
+
+/// The production secrets store file, 0600 in a 0700 directory of its own (`egress-secrets`,
+/// so no test that makes its own `secrets` directory collides), holding [`canary`] for each of
+/// [`STORED`] (architect D12: container tests use the production source).
+pub fn canary_store(dir: &Path) -> std::path::PathBuf {
+    let sub = dir.join("egress-secrets");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = sub.join("secrets.toml");
+    let mut store = sally_core::secrets::SecretStore::empty(path.clone());
+    for name in STORED {
+        store.set(name, canary(name)).unwrap();
+    }
+    store.save().unwrap();
+    path
+}
+
+/// A starter with no names, the echo and TLS upstreams, no own addresses, as trust roots the
+/// test CA only: written to `dir/upstream-ca.pem` (0644, owned by the test user, the owner the
+/// starter is built to require; production passes the system bundle and uid 0), and as secrets
+/// source the production store file at [`canary_store`].
 pub fn fake_egress(dir: &Path) -> Arc<FakeEgress> {
     let pki = Pki::new();
     let roots = dir.join("upstream-ca.pem");
     std::fs::write(&roots, &pki.ca_pem).unwrap();
     std::fs::set_permissions(&roots, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let secrets = canary_store(dir);
     Arc::new(Egress {
         resolver: Arc::new(Names::default()),
         dialer: Arc::new(Upstream {
@@ -249,5 +291,6 @@ pub fn fake_egress(dir: &Path) -> Arc<FakeEgress> {
             paths: vec![roots],
             owner: rustix::process::getuid().as_raw(),
         },
+        secrets: Arc::new(sallyd::egress::inject::StoreFile { path: secrets }),
     })
 }

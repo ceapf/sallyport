@@ -658,12 +658,13 @@ sequenceDiagram
     P->>E: GET /user (HTTP/1.1)
     E->>E: check head (origin-form, one Host = CONNECT authority, no TRACE, no Upgrade, framing)
     E->>E: drop hop-by-hop, Proxy-*, Accept-Encoding, every client Authorization; rebuild Host
-    E->>E: audit egress.request {host, port, method, target, injected}
-    Note over E: 9a-3: set Authorization from the secret (last), only with response redaction
+    E->>E: audit egress.request {host, port, method, target, injected: ["secret:NAME"]}
+    E->>E: set Authorization from the credentials (after the entry, last)
     E->>X: GET /user (same upstream connection for the next request)
-    X-->>E: 200 + body (identity, plain or chunked)
-    E->>E: check response head (no Content-Encoding, no 101); cap the body; never follow 3xx
-    E-->>P: response (9a-3: redacted)
+    X-->>E: 200 + body (no Content-Encoding or identity, plain or chunked)
+    E->>E: check response head (no Content-Encoding but identity, no 101); redact header lines; cap the body; never follow 3xx
+    E-->>P: response, body redacted as it streams (same length)
+    E->>E: audit egress.response {host, port, target, status, end, redacted_bytes, redacted} before the body's end goes out
     E->>E: audit egress.close {host, port, address, bytes_up, bytes_down, end, intercept, requests, statuses}
 ```
 An allowed host without a grant is spliced: after `egress.allow {…, intercept: false}` and the
@@ -805,13 +806,28 @@ sallyport/
   slot or admission extra meanwhile, so a refused connection ends at most 3 s after its
   decision. `head-timeout` gets no reply and no drain. Residual: a client still sending past the
   drain bound may lose the reply through the shim (#76); its entry is not lost.
-- **Egress audit events** (Task 8). Written at every `audit.level`, each before its effect:
+- **Egress audit events** (Task 8). Written at every `audit.level`, each before its effect;
+  `egress.response` and `egress.close` are records of what happened, written as below:
   - `egress.allow` (decision `allow`), before the first dial and the `200`: `{host, port,
     addresses, intercept}` — the addresses that passed the filter, at most 16, in the order they
     are tried; `intercept` is true for a grant host (Task 9a-2).
   - `egress.request` (decision `allow`, intercepted tunnels only), before the head goes
     upstream: `{host, port, method, target, target_bytes, target_cut, injected}`; method and
-    target escaped and cut as below; `injected` lists `secret:NAME` (empty until Task 9a-3).
+    target escaped and cut as below; `injected` lists `secret:NAME` for each grant set on the
+    request (Task 9a-3; never a value). The grant headers are built before this entry and set
+    only after it is written (architect D13, ruling Q4); a failed append drops them unsent.
+  - `egress.response` (no decision; intercepted tunnels only), one per response whose head is
+    forwarded (refusals have their own entry instead): `{host, port, target, target_bytes,
+    target_cut, status, end, redacted_bytes, redacted}`; `redacted` lists, in grant order,
+    `{secret: "secret:NAME", bytes}` for each secret whose forms covered emitted bytes of the
+    header values and body together (a byte two secrets cover counts for both), `[]` when none;
+    `redacted_bytes` is the filler bytes in all; `end` is `complete`, the tunnel's end for a cut
+    (`limit`, `upstream-closed`, `error`) or `dropped`. It is appended before the body's end
+    reaches the client (before the head, for a body known empty: HEAD, 204, 304); a failed append
+    withholds that end and the tunnel ends `error`. A body dropped before its end (client gone,
+    idle, session stop) still gets its entry, from a task, with the counts so far; it may land
+    after `egress.close` (#72). Residual: redacted bytes streamed mid-body precede the entry
+    (Task 9a-3, architect Q13, superseding D13's "no redaction count").
   - `egress.deny` (decision `deny`), before the reply: `{reason, target, target_bytes,
     target_cut}` (the request-target escaped and cut at 256 bytes, never a header), or `{reason,
     head_bytes}` when no target was parsed; `filter: "host-addresses-unavailable"` when the
@@ -842,7 +858,9 @@ sallyport/
     `ip-literal`, `ip-range-denied`, `grant-host-unavailable` (a grant host the proxy holds no
     session-CA leaf for: never spliced), `upgrade-refused`; 502 `resolve-failed`,
     `connect-failed`, `upstream-tls-failed`, `upstream-encoded`, `upstream-malformed`,
-    `upstream-closed`, `response-too-large`; 405 `plain-http-unsupported`; 413
+    `upstream-closed`, `response-too-large`, `upstream-echoed-secret` (a form of a session secret
+    in a response header's name or across its `: `; `egress.deny`, nothing forwarded; Task 9a-3,
+    architect D5); 405 `plain-http-unsupported`; 413
     `request-too-large`; 405 `method-refused` (`TRACE` inside a tunnel); 421 `host-mismatch`;
     429 `too-many-connections`; 431 `head-too-large`;
     `head-timeout` (no reply); 400 `malformed`. Replies never echo the target; in-tunnel replies
@@ -864,27 +882,56 @@ sallyport/
     target only (absolute, authority and `*` forms are 400 `malformed`), exactly one `Host`,
     normalized like a CONNECT target and naming the CONNECT host (port omitted only when the
     CONNECT port is 443), else 421 `host-mismatch` (400 if unparsable); `TRACE` is 405
-    `method-refused` (`egress.deny`: it would echo the request, and from 9a-3 its credential,
-    back into the sandbox); methods match ASCII case-insensitively; any `Upgrade`, `HTTP2-Settings` or
+    `method-refused` (`egress.deny`: it would echo the request, and its credential, back into
+    the sandbox); methods match ASCII case-insensitively; any `Upgrade`, `HTTP2-Settings` or
     `Connection: upgrade` is 403 `upgrade-refused`; `Transfer-Encoding` absent or one field that
     is case-insensitively `chunked`, never beside `Content-Length`, which is at most one decimal
     value; `Expect` absent or `100-continue`; (2) drop `Connection` and every header it names,
-    `Keep-Alive`, every `Proxy-*`, `TE`, `Trailer`, `Expect`, `Accept-Encoding`, the client's
-    framing headers and every client copy of each grant header of the host; (3) rebuild `Host`
-    from the CONNECT authority; (4) Task 9a-3 sets the injected header last. hyper's client sets
+    `Keep-Alive`, every `Proxy-*`, `TE`, `Trailer`, `Expect`, `Accept-Encoding`, `Range`,
+    `If-Range`, `Request-Range` (so an echoed secret cannot be fetched in pieces: decision 4),
+    the client's framing headers and every client copy of each grant header of the host; (3)
+    rebuild `Host` from the CONNECT authority; (4) once `egress.request` is written, set each of
+    the host's grant headers (built before the entry), last (Task 9a-3, D13, Q4). hyper's client sets
     the upstream framing itself; the proxy adds no `Via`, `Forwarded` or `X-Forwarded-*`. hyper's
     server resolves two framings before the proxy sees a head: with `Transfer-Encoding` and
     `Content-Length` it discards `Content-Length` and reads chunked; equal duplicate
     `Content-Length` values merge; unequal or malformed ones it answers 400 itself (architect
     Q51; such a request counts as chunked for the cap).
-  - Response rules: `101`, any `Upgrade`, a `Content-Encoding` other than absent or one
-    `identity`, or a `Transfer-Encoding` other than absent or one `chunked` is 502
+  - Response rules: `101`, any `Upgrade`, a `Content-Encoding` other than exactly one
+    `identity` in any case (a body the redaction cannot read is never forwarded; decision 1 as
+    relaxed by R1, architect Q10; an `identity` header is forwarded unchanged), or a
+    `Transfer-Encoding` other than absent or one `chunked` is 502
     `upstream-encoded` and the body is never forwarded (Q30); an unparsable head, a
     `Transfer-Encoding` beside a `Content-Length`, or a `Content-Length` other than one decimal
     value (two lines, or a list such as `6, 6`, which hyper's client accepts when the values agree)
     is 502 `upstream-malformed`, body never forwarded (9a-2 review R4). `Connection` and what it names, `Keep-Alive`, `Proxy-*`, `TE`,
     `Trailer`, `Transfer-Encoding` and `Upgrade` are dropped. Redirects are returned, never
-    followed. Trailers are never forwarded in either direction.
+    followed. Trailers are never forwarded in either direction. The client gets hyper's canonical
+    reason phrase, never the upstream's.
+  - Credentials and redaction (Task 9a-3, `egress::inject`, `egress::redact`; maintainer
+    decisions 1–7, architect D1–D13). At launch, a session with grants refuses a `{basic}`
+    grant (`basic-unsupported`, until 9b: #80) before the secrets store is opened, then reads
+    the grants' values through the starter's `SecretSource` (production: the 0600 store file;
+    every other value is dropped, wiped, before `prepare` returns): a missing one refuses the
+    launch (`secret-missing`), an unreadable store too (`secret-store`), a grant that cannot be
+    injected or redacted as well (`secret-grant`), and a session whose forms hold every filler
+    candidate (`secret-filler`). `Credentials` holds each grant's rendered header value as
+    a `Secret` and the redaction of every form of every session secret (sally-core's
+    `secret_forms`, as the audit redactor, plus each rendered value); it has one constructor and
+    `Interception::new` refuses leaves and credentials naming different hosts. Each request builds
+    a sensitive `HeaderValue`; everything drops with the session's proxy. Every response on every
+    grant host is redacted with every secret of the session (D4): each header is scanned as the
+    line hyper writes (`name: value`); a covered byte in the name or the `: ` refuses it
+    (`upstream-echoed-secret`), otherwise the value is redacted in place. The body passes through
+    the redactor outside the cap: every byte any occurrence covers (found in the original bytes)
+    becomes the session's filler, the first of `* # ~ ^ | ! $ @` no form holds (a session where
+    every one occurs is refused `secret-filler`), so lengths and framing never change and no form
+    survives (decisions 2 and 7 as ruled R2; architect Q6, Q7). The forms are sally-core's
+    `SessionForms`, built once and read in place (Q11). A form in a header name or its `: ` is
+    also looked for in any ASCII case. The redactor holds back the last `longest form − 1` bytes
+    until more arrive or the response completes (decision 3): a streamed response lags by that
+    much; a cut or failed response drops them, wiped. Spliced hosts are never scanned (they never
+    get a secret).
   - Limits: 100 headers either way. Head size, exact: a request head (request line and blank
     line included) passes iff it is at most 7168 bytes (7 KiB) and is refused from 7169 (431,
     `egress.limit head-too-large`); a response head passes iff at most 61440 bytes (60 KiB) and
@@ -932,7 +979,8 @@ sallyport/
   root, not group- or other-writable, and at most 4 MiB; a file that exists but fails a check is
   an error, never skipped. Certificates the verifier cannot use are skipped and counted; none
   usable is an error. Any error refuses the launch (`sandbox.refuse` reason `trust-roots`; a CA or
-  file failure is `session-ca`). One load feeds the upstream verifier and `ca-bundle.pem`. The
+  file failure is `session-ca`; the credentials, read first, refuse with `secret-missing`,
+  `secret-store`, `basic-unsupported`, `secret-grant` or `secret-filler`: Task 9a-3). One load feeds the upstream verifier and `ca-bundle.pem`. The
   file list and owner are constructor arguments of the egress starter (Task 8 decision 10);
   production passes these. Doctor V17 applies the same checks.
 - **RPC and LLM audit events** (Task 7). All are written at every `audit.level` except
@@ -1043,7 +1091,9 @@ sallyport/
   cases, and `+` for space), and its base64 in three alignments and both alphabets trimmed to the
   characters that do not depend on neighbouring bytes (patterns under 12 characters skipped), so
   the base64 of any string containing the secret is caught (AMENDMENTS-02 B1). Matches become
-  `[REDACTED:NAME]`.
+  `[REDACTED:NAME]`. The token proxy's response redaction uses the same forms
+  (`sally-core::audit::secret_forms`, held per session in `SessionForms`) with a same-length
+  filler and no name (Task 9a-3).
 - **Tauri bridge**: Rust side exposes one command `rpc(method: String, params: Value)` that
   forwards to `control.sock` **only** for methods in a compile-time allowlist (no
   `secrets.list` of values exists anyway). Capabilities file grants `core:default` only.
@@ -1074,7 +1124,7 @@ decisions need a container and its `rt_` tests hold it) with a **zero-survivor g
 control. cargo-mutants runs with `TMPDIR` under `target/` because `/tmp` is denylisted.
 
 Dev-dependencies: `insta` (summary and diagnostic snapshots; review changes with
-`cargo insta review`) and `proptest` (wildcard matcher, host-pattern round trip; redaction
-windows in task 9b). Dependabot opens weekly PRs for cargo (workspace and `fuzz/`) and GitHub
+`cargo insta review`) and `proptest` (wildcard matcher, host-pattern round trip; the token
+proxy's streaming redaction under any split, Task 9a-3). Dependabot opens weekly PRs for cargo (workspace and `fuzz/`) and GitHub
 Actions; nothing auto-merges. Release provenance (build attestations, cosign) is M6.
 

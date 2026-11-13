@@ -129,6 +129,11 @@ impl Limits {
     /// body caps.
     #[must_use]
     pub fn new(max_connections: usize) -> Self {
+        Self::documented(max_connections)
+    }
+
+    /// [`Self::new`]'s work, in a function cargo-mutants mutates (it leaves `new` alone; #87).
+    fn documented(max_connections: usize) -> Self {
         let net = sally_core::manifest::Network::default();
         Self {
             head: HEAD_TIMEOUT,
@@ -138,6 +143,17 @@ impl Limits {
             max_connections,
             max_request: net.max_request_bytes.bytes(),
             max_response: net.max_response_bytes.bytes(),
+        }
+    }
+
+    /// A session's limits: the documented ones with its connection cap and its own body caps
+    /// `(max_request, max_response)` (`network.max_request_bytes`, `max_response_bytes`).
+    #[must_use]
+    pub fn of_session(max_connections: usize, body_caps: (u64, u64)) -> Self {
+        Self {
+            max_request: body_caps.0,
+            max_response: body_caps.1,
+            ..Self::documented(max_connections)
         }
     }
 
@@ -156,7 +172,10 @@ fn permits(n: usize) -> usize {
 
 #[path = "intercept.rs"]
 mod intercept;
-pub use intercept::{Interception, MAX_RESPONSE_HEAD, Summary};
+#[path = "intercept_tls.rs"]
+mod intercept_tls;
+pub use intercept::{MAX_RESPONSE_HEAD, Summary};
+pub use intercept_tls::Interception;
 
 /// What a session's proxy is built from.
 pub struct Parts<R, D, H> {
@@ -230,7 +249,7 @@ struct Cleared {
     auth: Authority,
     pinned: Vec<SocketAddr>,
     /// For a grant host, the TLS configurations to intercept it with; `None` splices.
-    intercept: Option<intercept::HostTls>,
+    intercept: Option<intercept_tls::HostTls>,
     rest: Vec<u8>,
 }
 
@@ -343,7 +362,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
     async fn check(
         &self,
         a: &Authority,
-    ) -> Result<(Vec<SocketAddr>, Option<intercept::HostTls>), Refusal> {
+    ) -> Result<(Vec<SocketAddr>, Option<intercept_tls::HostTls>), Refusal> {
         let tls = match self.policy.decide(a)? {
             Route::Splice => None,
             Route::Intercept => Some(
