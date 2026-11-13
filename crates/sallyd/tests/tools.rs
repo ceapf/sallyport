@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use sally_core::manifest::{AuditLevel, ValidatedManifest};
 use sallyd::approvals::Gated;
 use sallyd::approvals::policy::Policy;
-use sallyd::approvals::queue::{self, Approver, Client, Decision, Desk, Limits};
+use sallyd::approvals::queue::{self, Approver, Client, Decision, Desk, Limits, Seen};
 use sallyd::approvals::render::Prompt;
 use sallyd::daemon::crash::CrashReporter;
 use sallyd::rpc::agent::ToolHandler;
@@ -33,11 +33,22 @@ const ME: Client = Client { uid: 1000, pid: 7 };
 struct Shown(Mutex<Vec<Prompt>>);
 
 impl Approver for Shown {
+    fn attached(&self) -> bool {
+        true
+    }
     fn requested(&self, p: &Prompt) {
         self.0.lock().unwrap().push(p.clone());
     }
     fn flood(&self, _: &str) {}
     fn closed(&self, _: &str) {}
+}
+
+/// What a client shown `p` sends with its answer (these prompts are never cut).
+fn seen(p: &Prompt) -> Seen<'_> {
+    Seen {
+        digest: &p.digest,
+        full_shown: false,
+    }
 }
 
 struct Session {
@@ -155,7 +166,10 @@ fn rt_ag_02_the_real_shell_runs_an_approved_command_once_and_nothing_else() {
         let t = touch.clone();
         let h = tokio::spawn(async move { s2.call("shell", t).await });
         let p = s.shown(2).await;
-        s.desk.decide(&p.id, Decision::Deny, ME).await.unwrap();
+        s.desk
+            .decide(&p.id, Decision::Deny, ME, seen(&p))
+            .await
+            .unwrap();
         assert_eq!(h.await.unwrap().text, "denied: denied");
         assert!(!host.join("x").exists(), "ran without approval");
         assert_eq!(runs(), 0);
@@ -164,7 +178,10 @@ fn rt_ag_02_the_real_shell_runs_an_approved_command_once_and_nothing_else() {
         let t = touch.clone();
         let h = tokio::spawn(async move { s2.call("shell", t).await });
         let p = s.shown(3).await;
-        s.desk.decide(&p.id, Decision::Approve, ME).await.unwrap();
+        s.desk
+            .decide(&p.id, Decision::Approve, ME, seen(&p))
+            .await
+            .unwrap();
         let out = h.await.unwrap();
         assert!(!out.is_error, "{}", out.text);
         assert!(host.join("x").exists());
@@ -173,12 +190,20 @@ fn rt_ag_02_the_real_shell_runs_an_approved_command_once_and_nothing_else() {
         assert_eq!(run["action_sha256"], p.digest.as_str());
         assert_eq!(run["approval"], p.id.as_str());
         // A replayed decision is refused; an identical call asks again under a new id.
-        assert!(s.desk.decide(&p.id, Decision::Approve, ME).await.is_err());
+        assert!(
+            s.desk
+                .decide(&p.id, Decision::Approve, ME, seen(&p))
+                .await
+                .is_err()
+        );
         let s2 = Arc::clone(&s);
         let h = tokio::spawn(async move { s2.call("shell", touch).await });
         let p2 = s.shown(4).await;
         assert_ne!(p2.id, p.id);
-        s.desk.decide(&p2.id, Decision::Deny, ME).await.unwrap();
+        s.desk
+            .decide(&p2.id, Decision::Deny, ME, seen(&p2))
+            .await
+            .unwrap();
         assert_eq!(h.await.unwrap().text, "denied: denied");
         assert_eq!(runs(), 1);
         x.stop(r).await;
@@ -488,7 +513,10 @@ fn rt_ag_05_the_sandbox_cannot_write_a_brokered_mount_itself() {
         });
         let p = s.shown(1).await;
         assert!(!notes.join("c").exists(), "written before approval");
-        s.desk.decide(&p.id, Decision::Approve, ME).await.unwrap();
+        s.desk
+            .decide(&p.id, Decision::Approve, ME, seen(&p))
+            .await
+            .unwrap();
         assert!(!h.await.unwrap().is_error);
         assert_eq!(std::fs::read(notes.join("c")).unwrap(), b"x\n");
         let (_, seen) = exec_in(r.container(), &["cat", "/workspace/notes/c"]);

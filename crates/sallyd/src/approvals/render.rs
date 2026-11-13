@@ -23,6 +23,10 @@ use super::action::{Action, Bound, Target, hex};
 pub const ACTION_CHARS: usize = 2000;
 /// Characters of the agent's note shown before the cut.
 pub const NOTE_CHARS: usize = 500;
+/// Most bytes of full action text a prompt carries to a client (architect Q74 (b)): the text is
+/// escaped ASCII and JSON at most doubles it, so a notification stays well inside the 1 MiB
+/// control frame. A longer action is never offered in full, and so can only be denied.
+pub const FULL_WIRE_BYTES: usize = 256 * 1024;
 
 /// One approval request, as shown to a human.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +71,14 @@ impl Prompt {
             note: note.map(note_text),
             risk_tags,
         }
+    }
+}
+
+impl Prompt {
+    /// The full action text a client may be sent, `None` past [`FULL_WIRE_BYTES`].
+    #[must_use]
+    pub fn full_on_wire(&self) -> Option<&str> {
+        (self.full.len() <= FULL_WIRE_BYTES).then_some(self.full.as_str())
     }
 }
 
@@ -389,6 +401,18 @@ mod tests {
             })
         };
         assert_ne!(lossy(b"\xff"), lossy(b"\xfe"));
+    }
+
+    /// The wire cap is inclusive: a full text of exactly the cap is offered, one byte more is
+    /// not (architect Q74 (b)); 256 KiB, so JSON's doubling stays inside a 1 MiB frame.
+    #[test]
+    fn the_full_text_goes_on_the_wire_up_to_its_cap() {
+        assert_eq!(FULL_WIRE_BYTES, 262_144);
+        let mut p = prompt(shell(&["ls"]), None);
+        p.full = "a".repeat(FULL_WIRE_BYTES);
+        assert_eq!(p.full_on_wire().map(str::len), Some(FULL_WIRE_BYTES));
+        p.full.push('a');
+        assert_eq!(p.full_on_wire(), None);
     }
 
     #[test]
