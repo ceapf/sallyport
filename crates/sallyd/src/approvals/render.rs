@@ -7,8 +7,9 @@
 //! character `\u{…}`. Nothing is normalized: what is shown is what runs. Each argv element and
 //! each path is quoted (`"` escaped), so element boundaries and empty arguments are visible.
 //!
-//! The action text is cut at [`ACTION_CHARS`] with an explicit `… (+N bytes, sha256 …)` tail,
-//! never inside an escape; the full text travels with the prompt so a client can reveal it.
+//! The action text is cut at [`ACTION_CHARS`] with an explicit `... (+N bytes, sha256 <hex>)`
+//! tail, all ASCII so a client's printable-ASCII check passes it (architect Q74), never inside an
+//! escape; the full text travels with the prompt so a client can reveal it.
 //! Text the model supplied (a reason, a description) is never part of the action: it is one
 //! line in its own field, cut at [`NOTE_CHARS`], and the terminal labels it as untrusted.
 
@@ -115,7 +116,7 @@ fn note_text(n: &str) -> String {
         let sha = hex(&Sha256::digest(n.as_bytes()));
         let _ = write!(
             out,
-            "… (+{} bytes, sha256 {sha})",
+            "... (+{} bytes, sha256 {sha})",
             n.len().saturating_sub(used)
         );
     }
@@ -217,7 +218,7 @@ pub(crate) fn cut(text: &str, max: usize) -> (String, bool) {
     let shown = text.get(..at).unwrap_or_default();
     let rest = text.len().saturating_sub(at);
     let sha = hex(&Sha256::digest(text.as_bytes()));
-    (format!("{shown}… (+{rest} bytes, sha256 {sha})"), true)
+    (format!("{shown}... (+{rest} bytes, sha256 {sha})"), true)
 }
 
 /// The largest offset at most `max` that does not fall inside a `\…` escape of `text`.
@@ -401,7 +402,7 @@ mod tests {
         let rest = full.len() - ACTION_CHARS;
         assert_eq!(
             p.action,
-            format!("{}… (+{rest} bytes, sha256 {sha})", &full[..ACTION_CHARS])
+            format!("{}... (+{rest} bytes, sha256 {sha})", &full[..ACTION_CHARS])
         );
         let short = prompt(shell(&["ls"]), None);
         assert!(!short.truncated);
@@ -411,7 +412,7 @@ mod tests {
     #[test]
     fn the_cut_falls_exactly_at_the_bound_or_before_an_escape() {
         assert_eq!(cut("abc", 3), ("abc".to_owned(), false));
-        assert!(cut("abcd", 3).0.starts_with("abc… (+1 bytes"));
+        assert!(cut("abcd", 3).0.starts_with("abc... (+1 bytes"));
         // Never inside `\x1b`, `\u{202e}` or `\\`.
         for (text, max, kept) in [
             ("ab\\x1bcd", 4, "ab"),
@@ -424,7 +425,7 @@ mod tests {
             let (shown, cut_) = cut(text, max);
             assert!(cut_, "{text}");
             assert!(
-                shown.starts_with(&format!("{kept}…")),
+                shown.starts_with(&format!("{kept}... (+")),
                 "{text} {max}: {shown}"
             );
         }
@@ -445,7 +446,7 @@ mod tests {
         let shown = "n".repeat(NOTE_CHARS - 2);
         assert_eq!(
             long.note.unwrap(),
-            format!("\"{shown}\"… (+2 bytes, sha256 {sha})")
+            format!("\"{shown}\"... (+2 bytes, sha256 {sha})")
         );
         // Exactly NOTE_CHARS with both quotes: shown whole.
         let fits = "n".repeat(NOTE_CHARS - 2);
@@ -457,7 +458,7 @@ mod tests {
         let p = prompt(shell(&["ls"]), Some(&"\x1b".repeat(100_000)));
         let note = p.note.unwrap();
         assert!(note.len() < NOTE_CHARS + 100, "{}", note.len());
-        assert!(note.contains("… (+"));
+        assert!(note.contains("... (+"));
     }
 
     #[test]
@@ -515,11 +516,12 @@ mod tests {
             let text = terminal(&p);
             // One logical line per field: no raw control character survives.
             assert!(!text.chars().any(|c| c.is_control() && c != '\n'), "{name}");
-            assert!(text.replace('…', "").is_ascii(), "{name}");
+            // All ASCII, the cut's tail included (architect Q74: a client's clean-check passes it).
+            assert!(text.is_ascii(), "{name}");
             // A quote in an argument stays inside its argument.
             assert!(!p.action.contains("x\"]"), "{name}");
             // A cut never splits an escape.
-            if let Some((shown, _)) = p.action.split_once('…') {
+            if let Some((shown, _)) = p.action.rsplit_once("... (+") {
                 for partial in ["\\", "\\x", "\\x1"] {
                     assert!(!shown.ends_with(partial), "{name}: {shown}");
                 }

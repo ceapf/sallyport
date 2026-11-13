@@ -913,7 +913,7 @@ async fn the_pending_entry_stays_under_the_writer_bound_in_the_worst_case() {
     let e = f.sink.last("tool.pending");
     let len = e.to_string().len();
     assert!(len < 4096, "{len}");
-    assert!(e["action"].as_str().unwrap().contains("… (+"));
+    assert!(e["action"].as_str().unwrap().contains("... (+"));
     let id = f.desk.list().remove(0).id.clone();
     f.desk.decide(&id, Decision::Deny, ME).await.unwrap();
     let _ = h.await;
