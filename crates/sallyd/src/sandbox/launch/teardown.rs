@@ -65,7 +65,7 @@ impl Launcher {
             self.audit(
                 NewEntry::new(Actor::Sallyd, "sandbox.orphan_removed")
                     .decision("deny")
-                    .args(json!({"container": o.name, "sweep": sweep.as_str()})),
+                    .args(json!({"container": o.name, "id": o.container, "sweep": sweep.as_str()})),
                 AuditLevel::default(),
             )
             .await?;

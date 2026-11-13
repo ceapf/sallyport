@@ -733,6 +733,12 @@ fn rt_ag_08b_a_late_orphan_is_swept_while_a_live_session_and_foreign_containers_
             (swept["container"].as_str(), swept["sweep"].as_str()),
             (Some(orphan.as_str()), Some("periodic"))
         );
+        // The entry names the ID `rm` was given (security re-review L3).
+        let id = swept["id"].as_str().unwrap_or_default();
+        assert!(
+            id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{swept}"
+        );
         assert_eq!(
             x.events
                 .list()

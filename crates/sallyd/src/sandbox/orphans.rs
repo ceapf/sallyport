@@ -53,8 +53,15 @@ pub struct Orphan {
     pub id: String,
 }
 
-/// One parsed listing line: the ID, the name and the labels (`None` for `null`).
-type Line = (String, String, Option<serde_json::Map<String, Value>>);
+/// One parsed listing line. Named fields, so the ID and the name cannot be swapped.
+struct Listed {
+    /// The full container ID.
+    container: String,
+    /// The container name.
+    name: String,
+    /// The labels (`None` for `null`).
+    labels: Option<serde_json::Map<String, Value>>,
+}
 
 /// The orphans in `listing` (the output of [`ps_args`]).
 ///
@@ -72,8 +79,11 @@ pub fn orphans(
         if line.trim().is_empty() {
             continue;
         }
-        let (container, name, labels) =
-            parse_line(line).ok_or_else(|| format!("ps line {}: malformed", n + 1))?;
+        let Listed {
+            container,
+            name,
+            labels,
+        } = parse_line(line).ok_or_else(|| format!("ps line {}: malformed", n + 1))?;
         let ours = labels
             .as_ref()
             .and_then(|l| l.get(INSTALLATION_LABEL))
@@ -102,7 +112,7 @@ pub fn orphans(
 }
 
 /// `<string: full ID> <string> <object|null>` and nothing else.
-fn parse_line(line: &str) -> Option<Line> {
+fn parse_line(line: &str) -> Option<Listed> {
     let mut values = serde_json::Deserializer::from_str(line).into_iter::<Value>();
     let mut string = || match values.next()?.ok()? {
         Value::String(s) => Some(s),
@@ -115,7 +125,11 @@ fn parse_line(line: &str) -> Option<Line> {
         Value::Null => None,
         _ => return None,
     };
-    values.next().is_none().then_some((container, name, labels))
+    values.next().is_none().then_some(Listed {
+        container,
+        name,
+        labels,
+    })
 }
 
 /// 64 lowercase hex digits, as `podman ps --no-trunc` prints an ID.
