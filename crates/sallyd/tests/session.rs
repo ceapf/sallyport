@@ -48,6 +48,18 @@ struct Rx {
     x: Lx,
     reg: Arc<Registry>,
     sink: Arc<Hooked>,
+    /// The registry's operational log.
+    log: Lines,
+}
+
+impl Rx {
+    /// Waits until the operational log holds `needle`; panics after 10 s.
+    async fn until_logged(&self, needle: &str) {
+        until(needle, Duration::from_secs(10), || {
+            String::from_utf8_lossy(&self.log.0.lock().unwrap()).contains(needle)
+        })
+        .await;
+    }
 }
 
 fn registry() -> Rx {
@@ -62,8 +74,13 @@ fn registry_with(default_image: Option<sallyd::sandbox::ImageRef>) -> Rx {
         hook: Mutex::new(None),
         debug: Mutex::new(Vec::new()),
     });
-    let reg = x.registry(sink.clone(), default_image);
-    Rx { x, reg, sink }
+    let log = Lines::default();
+    let reg = x.registry_logged(
+        sink.clone(),
+        default_image,
+        sallyd::oplog::Oplog::new(log.clone()),
+    );
+    Rx { x, reg, sink, log }
 }
 
 /// The `agent.sock` files under `root` (`sessions/<id>/harness/agent.sock`).
@@ -590,7 +607,7 @@ fn rt_ag_15_an_rpc_entry_being_written_at_the_stop_lands_before_session_stop() {
         conn.write_all(format!("{call}\n").as_bytes())
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        r.x.events.until_parked("rpc.request", 1).await;
         let reg = Arc::clone(&r.reg);
         let id = s.id.clone();
         let stop = tokio::spawn(async move { reg.stop(&id, StopReason::Request).await });
@@ -645,11 +662,14 @@ fn rt_ag_15_a_call_during_the_stop_is_denied_before_anything_runs() {
         conn.write_all(format!("{call}\n").as_bytes())
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        r.x.events.until_parked("rpc.request", 1).await;
         // The stop: the supervisor closes the operations; its `session.crash` waits for the order.
         let crash = r.reg.reporter(&s.id).expect("the session's reporter");
         crash.spawn("tool", async { panic!("a session task panicked") });
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // The supervisor closes the operations (step 1, before any await), then logs the panic
+        // and appends `session.crash`, which waits for the order the parked `rpc.request` holds
+        // (so it cannot park yet): the oplog line shows step 1 is done.
+        r.until_logged("session task panicked").await;
         // Phase 2: `rpc.request` lands; `session.crash` takes the order and waits in the sink,
         // so the supervisor is held in step 2 while the call goes on to the tools.
         r.x.events.hold(&["session.crash"]);
@@ -659,6 +679,9 @@ fn rt_ag_15_a_call_during_the_stop_is_denied_before_anything_runs() {
             || r.x.events.list().iter().any(|e| e == "rpc.request"),
         )
         .await;
+        r.x.events.until_parked("session.crash", 1).await;
+        // The call goes on to the tools meanwhile; its entries wait for the order, so there is
+        // nothing to observe until the release: give it the time.
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert!(!r.x.events.list().contains(&"session.stop".to_owned()));
         r.x.events.hold(&[]);
@@ -743,7 +766,7 @@ fn rt_ag_15_an_operation_past_the_drain_and_a_panic_during_the_stop_end_before_s
                 == 1
         })
         .await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        x.events.until_parked("tool.run", 1).await;
         let stopping = {
             let reg = Arc::clone(&reg);
             let id = s.id.clone();

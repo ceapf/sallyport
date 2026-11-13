@@ -447,12 +447,25 @@ pub struct Events(
     Mutex<Vec<&'static str>>,
     /// Appends of these events wait (outside every lock) until released.
     Mutex<Vec<&'static str>>,
+    /// The event of each append waiting in a hold now, one per append.
+    Mutex<Vec<String>>,
 );
 
 impl AuditSink for Events {
     fn append(&self, e: NewEntry, _: AuditLevel) -> Result<(), AuditError> {
+        let mut parked = false;
         while self.2.lock().unwrap().contains(&e.event()) {
+            if !parked {
+                parked = true;
+                self.3.lock().unwrap().push(e.event().to_owned());
+            }
             std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if parked {
+            let mut p = self.3.lock().unwrap();
+            if let Some(at) = p.iter().position(|x| x == e.event()) {
+                p.remove(at);
+            }
         }
         if self.1.lock().unwrap().contains(&e.event()) {
             return Err(AuditError::InvalidEntry("fake failure"));
@@ -474,6 +487,29 @@ impl Events {
     #[allow(dead_code)] // Not every test binary that includes this module holds appends.
     pub fn hold(&self, events: &[&'static str]) {
         *self.2.lock().unwrap() = events.to_vec();
+    }
+
+    /// Waits until `n` appends of `event` are waiting in a hold; panics after 10 s.
+    #[allow(dead_code)] // Not every test binary that includes this module holds appends.
+    pub async fn until_parked(&self, event: &str, n: usize) {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let now = self
+                .3
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| *e == event)
+                .count();
+            if now == n {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < end,
+                "{n} appends of {event} never waited in the hold ({now} do)"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     }
 
     pub fn list(&self) -> Vec<String> {
