@@ -274,7 +274,11 @@ impl Registry {
         };
         let level = v.audit.level;
         let ops = Ops::new();
-        let (agent, desk) = self.agent(&manifest, &running, &sid, level, &ops, &crash);
+        // The session's one audit handle (ruling 1, Q63): its stop seals it with `session.stop`.
+        // TODO(#28): the `llm.sock` server (PR C) takes a clone of it.
+        let record = Recorder::new(Arc::clone(&self.p.audit), sid.clone(), level)
+            .logging(self.p.oplog.clone());
+        let (agent, desk) = self.agent(&manifest, &running, &record, &ops, &crash);
         let start = NewEntry::new(Actor::Sallyd, "session.start")
             .session(&sid)
             .decision("allow")
@@ -287,11 +291,12 @@ impl Registry {
             self.p
                 .oplog
                 .error(LOG, "session.start not audited", &[("session", &sid)]);
-            // The entry may have reached the log before the error (L6): close it, best effort.
+            // The entry may have reached the log before the error (L6): close it, best effort,
+            // through the seal, `session.stop`'s one writer. Nothing of the session runs yet.
             let stop = NewEntry::new(Actor::Sallyd, "session.stop")
                 .session(&sid)
                 .args(json!({"reason": StopReason::StartFailed.as_str(), "in_flight": 0}));
-            let _ = self.audit(stop, level).await;
+            let _ = record.seal(stop, Duration::ZERO).await;
             self.discard(running, &v.name).await;
             return Err(e);
         }
@@ -316,19 +321,20 @@ impl Registry {
             Live {
                 info: info.clone(),
                 desk: Some(desk.clone()),
-                crash: Some(crash),
+                crash: Some(crash.clone()),
                 requests: tx.clone(),
             },
         );
         let s = Supervised {
             sid: sid.clone(),
-            level,
+            record,
             timeout: Duration::from_secs(v.runtime.timeout.as_secs()),
             running,
             agent: handle,
             desk,
             ops,
             exit,
+            crash,
             crashes,
             requests: rx,
             first,
@@ -359,13 +365,12 @@ impl Registry {
         &self,
         manifest: &Arc<ValidatedManifest>,
         running: &Running,
-        sid: &str,
-        level: AuditLevel,
+        rec: &Recorder,
         ops: &Ops,
         crash: &CrashReporter,
     ) -> (Arc<Agent<Gated<Tools<PodmanExec>>>>, Desk) {
         let v = manifest.manifest();
-        let rec = Recorder::new(Arc::clone(&self.p.audit), sid.to_owned(), level);
+        let sid = running.paths().id().as_str();
         // TODO(#65): PR B gives the desk an approver that notifies control-side clients.
         let (gate, desk) = queue::new(
             sid.to_owned(),
@@ -384,7 +389,10 @@ impl Registry {
             ids: self.p.ids,
             shell: PodmanExec::new(self.p.podman.clone(), running, ops.clone()),
         });
-        (Arc::new(Agent::new(Gated::new(gate, tools), rec)), desk)
+        (
+            Arc::new(Agent::new(Gated::new(gate, tools), rec.clone())),
+            desk,
+        )
     }
 
     /// Stops a workspace whose session never started (no `session.start`, so no
@@ -417,7 +425,13 @@ impl Registry {
         );
         let this = Arc::clone(self);
         self.p.crash.spawn("session", async move {
-            this.retry_stop(sid, *r, Vec::new(), rx, StopReason::StartFailed)
+            // Its bounded round has just failed: the next one waits for a request (R6).
+            let mut rx = rx;
+            let replies: Vec<Reply> = match rx.recv().await {
+                Some((_, reply)) => reply.into_iter().collect(),
+                None => Vec::new(),
+            };
+            this.retry_stop(sid, *r, replies, rx, StopReason::StartFailed)
                 .await;
         });
     }
@@ -468,26 +482,31 @@ impl Registry {
         }
     }
 
-    /// Refuses new sessions and stops every live one (`shutdown`), all at once. The ids of
-    /// sessions whose container could not be confirmed gone; `sallyd` then exits non-zero.
-    pub async fn shutdown(&self) -> Vec<String> {
+    /// Refuses new sessions and stops every live one (`shutdown`), all at once: each session is
+    /// asked in a task of its own, so one with a full request queue delays no other (R7). The
+    /// ids of sessions whose container could not be confirmed gone; `sallyd` then exits
+    /// non-zero.
+    pub async fn shutdown(self: &Arc<Self>) -> Vec<String> {
         self.closing.store(true, Ordering::SeqCst);
         // Waits out every start already past its check; later ones see `closing`.
         drop(self.starts.write().await);
         let ids: Vec<String> = self.live().keys().cloned().collect();
-        let mut asked = Vec::new();
-        let mut unconfirmed = Vec::new();
+        let mut asks = tokio::task::JoinSet::new();
+        let mut names = HashMap::new();
         for id in ids {
-            match self.ask(&id, StopReason::Shutdown).await {
-                Ok(a) => asked.push(a),
-                Err(Some(StopOutcome::Failed(_))) => unconfirmed.push(id),
-                Err(_) => {}
-            }
+            let this = Arc::clone(self);
+            let sid = id.clone();
+            let task = asks.spawn(async move { this.stop(&sid, StopReason::Shutdown).await });
+            names.insert(task.id(), id);
         }
-        for a in asked {
-            let id = a.id.clone();
-            if let StopOutcome::Failed(_) = self.answer(a).await {
-                unconfirmed.push(id);
+        let mut unconfirmed = Vec::new();
+        while let Some(done) = asks.join_next_with_id().await {
+            let (task, confirmed) = match done {
+                Ok((task, outcome)) => (task, !matches!(outcome, Some(StopOutcome::Failed(_)))),
+                Err(e) => (e.id(), false),
+            };
+            if !confirmed {
+                unconfirmed.extend(names.remove(&task));
             }
         }
         unconfirmed.sort();

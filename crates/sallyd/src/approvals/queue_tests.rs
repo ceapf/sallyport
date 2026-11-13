@@ -52,6 +52,8 @@ struct Fx {
     desk: Desk,
     sink: Arc<Sink>,
     fake: Arc<Fake>,
+    /// The session's audit handle, which the session's stop seals.
+    rec: crate::rpc::record::Recorder,
 }
 
 fn fx(max_pending: usize) -> Fx {
@@ -66,13 +68,20 @@ fn fx_with(max_pending: usize, approver: bool) -> Fx {
         max_pending,
     };
     let a = approver.then(|| Arc::clone(&fake) as Arc<dyn Approver>);
-    let (gate, desk) = new("s-1".to_owned(), policy(), limits, rec, a);
+    let (gate, desk) = new("s-1".to_owned(), policy(), limits, rec.clone(), a);
     Fx {
         gate,
         desk,
         sink,
         fake,
+        rec,
     }
+}
+
+/// Writes the session's last entry, as the session's stop does.
+async fn seal(f: &Fx, bound: Duration) -> crate::rpc::record::Sealed {
+    let last = f.rec.entry(Actor::Sallyd, "session.stop", None);
+    f.rec.seal(last, bound).await
 }
 
 fn shell(call: u64, argv: &[&str]) -> Bound {
@@ -553,7 +562,7 @@ async fn the_session_stop_withdraws_every_prompt_and_queues_no_more() {
     let f = fx(5);
     let (a, ha) = asking(&f, shell(7, &["ls"])).await;
     let (b, hb) = asking(&f, shell(8, &["ls"])).await;
-    f.desk.stop().await;
+    f.desk.stop().await.unwrap();
     assert!(f.desk.list().is_empty());
     for h in [ha, hb] {
         assert_eq!(h.await.unwrap(), Err(Refusal::Denied("withdrawn")));
@@ -574,8 +583,56 @@ async fn the_session_stop_withdraws_every_prompt_and_queues_no_more() {
     assert_eq!(f.sink.last("approval.deny")["reason"], "session-stopping");
     assert_eq!(f.fake.requested.lock().unwrap().len(), shown, "never shown");
     // Stopping twice changes nothing.
-    f.desk.stop().await;
+    f.desk.stop().await.unwrap();
     assert_eq!(count(&f.sink, "approval.withdraw"), 2);
+}
+
+/// Security re-review S1 (ruling 1, PR A part 4): an approve whose `approval.decide` is being
+/// written when the session's last entry comes lands before `session.stop`, never after it.
+#[tokio::test]
+async fn an_approve_being_written_at_the_seal_lands_before_session_stop() {
+    let f = fx(5);
+    let (a, ha) = asking(&f, shell(7, &["ls"])).await;
+    f.sink.hold(true);
+    let desk = f.desk.clone();
+    let approve = tokio::spawn(async move { desk.decide(&a, Decision::Approve, ME).await });
+    until("the prompt is taken", || f.desk.list().is_empty()).await;
+    let sealing = {
+        let rec = f.rec.clone();
+        tokio::spawn(async move {
+            let last = rec.entry(Actor::Sallyd, "session.stop", None);
+            rec.seal(last, Duration::from_secs(5)).await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!sealing.is_finished(), "the seal waits for the decide");
+    f.sink.hold(false);
+    assert_eq!(approve.await.unwrap(), Ok(()));
+    assert!(ha.await.unwrap().is_ok());
+    assert!(sealing.await.unwrap().written);
+    let events = f.sink.events();
+    assert_eq!(events.last().map(String::as_str), Some("session.stop"));
+    assert!(events.contains(&"approval.decide".to_owned()), "{events:?}");
+}
+
+/// S1: a decide or a withdraw after the session's last entry writes nothing and has no effect:
+/// the approve is `Unrecorded`, its asker is denied, and the withdraw leaves no entry.
+#[tokio::test]
+async fn after_the_seal_a_decide_or_withdraw_writes_nothing_and_runs_nothing() {
+    let f = fx(5);
+    let (a, ha) = asking(&f, shell(7, &["ls"])).await;
+    let (b, hb) = asking(&f, shell(8, &["ls"])).await;
+    assert!(seal(&f, Duration::from_secs(1)).await.written);
+    assert_eq!(
+        f.desk.decide(&a, Decision::Approve, ME).await,
+        Err(DecideError::Unrecorded)
+    );
+    assert_eq!(ha.await.unwrap(), Err(Refusal::Unrecorded));
+    f.gate.withdraw(8, Withdraw::Closed).await;
+    let _ = hb.await.unwrap().unwrap_err();
+    let events = f.sink.events();
+    assert_eq!(events.last().map(String::as_str), Some("session.stop"));
+    drop(b);
 }
 
 /// A prompt queued but not yet shown when the stop comes is never shown: its asker leaves with
@@ -587,7 +644,7 @@ async fn a_prompt_not_yet_shown_at_the_stop_is_never_shown() {
     let Ok((id, _, _rx)) = f.gate.inner.queue(&b, None, vec![]) else {
         panic!("not queued");
     };
-    f.desk.stop().await;
+    f.desk.stop().await.unwrap();
     assert!(matches!(
         f.gate.inner.announce(&id),
         Err(NotQueued::Withdrawn(Withdraw::SessionStop))

@@ -9,22 +9,26 @@
 //! 4. the stop signal: a running shell is killed, a write or delete that has not begun aborts;
 //!    the agent listener shuts down meanwhile;
 //! 5. at most [`STOP_DRAIN`] for the operations in flight to end, each with its `tool.result`;
-//! 6. the one `session.stop {reason, in_flight}`;
+//!    a panic reported meanwhile is audited `session.crash` (Q67);
+//! 6. the seal (ruling 1, Q63): the session's audit handle stops admitting writes, those in
+//!    flight get what is left of the same deadline, then the one `session.stop {reason,
+//!    in_flight}` is written, and every later write of the handle fails (an oplog line names
+//!    its session and event);
 //! 7. `Launcher::stop`, retried a bounded number of times.
 //!
-//! So after `session.stop` with `in_flight: 0` no tool, approval or rpc entry of the session
-//! follows. TODO(#91): one path is still open: an entry of a connection task (outside a run
-//! section) whose append is in flight when the listener aborts that task at its grace.
-//! An operation still running past the bound is a file operation inside its blocking
-//! call, which is never cut: the stop then answers `Failed`, the session stays stop-failed with
-//! its claims and its watchdog, and the supervisor removes the container by itself once the
-//! operation returns (`in_flight: n`: at most n `tool.result` entries follow). A container that
-//! cannot be confirmed gone also stays stop-failed; a later request retries it.
+//! So after `session.stop` no tool, approval or rpc entry of the session is written, whatever
+//! its `in_flight`: a write in flight at the deadline lands before it or fails, and a failed
+//! write means no effect. Teardown entries (`sandbox.*`, the watchdog's, egress closes) may
+//! follow it; TODO(#94) adds `session.closed` after them. An operation still running past the
+//! bound is a file operation inside its blocking call, which is never cut: the stop then
+//! answers `Failed`, the session stays stop-failed with its claims and its watchdog, and the
+//! supervisor removes the container by itself once the operation returns (its `tool.result` is
+//! refused by the seal). A container that cannot be confirmed gone also stays stop-failed; a
+//! later request retries it.
 
 use std::time::Duration;
 
-use sally_core::audit::{Actor, NewEntry};
-use sally_core::manifest::AuditLevel;
+use sally_core::audit::Actor;
 use serde_json::json;
 use tokio::sync::mpsc;
 
@@ -32,8 +36,9 @@ use super::exit::Exit;
 use super::registry::{LOG, Registry, Reply, SessionState, StopOutcome};
 use super::types::StopReason;
 use crate::approvals::queue::Desk;
-use crate::daemon::crash::{Crash, CrashReceiver};
+use crate::daemon::crash::{Crash, CrashReceiver, CrashReporter};
 use crate::rpc::listen::Handle;
+use crate::rpc::record::Recorder;
 use crate::sandbox::Running;
 use crate::tools::ops::{Ops, STOP_DRAIN};
 
@@ -48,13 +53,16 @@ pub(super) type Request = (StopReason, Option<Reply>);
 /// What a session's supervisor owns.
 pub(super) struct Supervised {
     pub(super) sid: String,
-    pub(super) level: AuditLevel,
+    /// The session's audit handle, shared with its tools, desk and agent server.
+    pub(super) record: Recorder,
     pub(super) timeout: Duration,
     pub(super) running: Running,
     pub(super) agent: Option<Handle>,
     pub(super) desk: Desk,
     pub(super) ops: Ops,
     pub(super) exit: Exit,
+    /// The session's crash reporter, whose reports `crashes` receives.
+    pub(super) crash: CrashReporter,
     pub(super) crashes: CrashReceiver,
     pub(super) requests: mpsc::Receiver<Request>,
     /// Set when the session must end at once (`start-failed`).
@@ -72,13 +80,14 @@ impl Registry {
     pub(super) async fn supervise(self: std::sync::Arc<Self>, s: Supervised) {
         let Supervised {
             sid,
-            level,
+            record,
             timeout,
             running,
             agent,
             desk,
             ops,
             exit,
+            crash,
             mut crashes,
             mut requests,
             first,
@@ -106,37 +115,55 @@ impl Registry {
                 r
             }
             Why::Crashed(c) => {
-                self.crashed(&sid, level, &c).await;
+                self.crashed(&record, &c).await;
                 StopReason::Crash
             }
             Why::Other(r) => r,
         };
         if reason == StopReason::Timeout {
             self.note(
-                &sid,
-                level,
+                &record,
                 "session.timeout",
                 json!({"timeout_secs": timeout.as_secs()}),
             )
             .await;
         }
-        // 3, 4, 5.
-        desk.stop().await;
+        // 3, 4, 5. One deadline for the drain and the seal's wait (Q63).
+        if let Err(e) = desk.stop().await {
+            crash.joined("approvals", e);
+        }
         ops.stop();
+        let deadline = tokio::time::Instant::now() + STOP_DRAIN;
         let listener = async {
             if let Some(h) = agent {
                 h.shutdown().await;
             }
         };
         let ((), in_flight) = tokio::join!(listener, ops.drained(STOP_DRAIN));
-        // 6.
-        self.note(
-            &sid,
-            level,
-            "session.stop",
-            json!({"reason": reason.as_str(), "in_flight": in_flight}),
-        )
-        .await;
+        // A panic during the stop is audited before the seal (Q67); the reason stays.
+        while let Ok(c) = crashes.try_recv() {
+            self.crashed(&record, &c).await;
+        }
+        // 6. The seal: after `session.stop` no entry of the session's handle is written.
+        let stop = record
+            .entry(Actor::Sallyd, "session.stop", None)
+            .args(json!({"reason": reason.as_str(), "in_flight": in_flight}));
+        let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let sealed = record.seal(stop, wait).await;
+        if !sealed.written {
+            self.p.oplog.error(
+                LOG,
+                "session entry not audited",
+                &[("session", &sid), ("event", "session.stop")],
+            );
+        }
+        if sealed.late > 0 {
+            self.p.oplog.error(
+                LOG,
+                "session entries still being written at session.stop",
+                &[("session", &sid), ("late", &sealed.late.to_string())],
+            );
+        }
         if in_flight > 0 {
             self.wait_out(&sid, &ops, &mut replies, &mut requests, in_flight)
                 .await;
@@ -155,7 +182,8 @@ impl Registry {
     }
 
     /// Operations still run past the drain: the session stays stop-failed, every request is
-    /// answered `Failed`, until the last one returns.
+    /// answered `Failed`, until the last one returns. TODO(#96): a Shutdown request is answered
+    /// `Failed` too, so the container outlives `sallyd` until the next startup sweep (Q66).
     async fn wait_out(
         &self,
         sid: &str,
@@ -243,7 +271,13 @@ impl Registry {
                         let _ = r.send(StopOutcome::Failed(why.clone()));
                     }
                     match requests.recv().await {
-                        Some((_, reply)) => replies.extend(reply),
+                        Some((_, reply)) => {
+                            replies.extend(reply);
+                            // Requests queued meanwhile share this round (R5).
+                            while let Ok((_, reply)) = requests.try_recv() {
+                                replies.extend(reply);
+                            }
+                        }
                         // Unreachable while the registry holds the sender; retry anyway.
                         None => tokio::time::sleep(STOP_RETRY).await,
                     }
@@ -280,38 +314,33 @@ impl Registry {
     }
 
     /// Q47: the oplog line, then `session.crash`. A failed append still ends the session.
-    async fn crashed(&self, sid: &str, level: AuditLevel, c: &Crash) {
+    async fn crashed(&self, record: &Recorder, c: &Crash) {
         self.p.oplog.error(
             LOG,
             "session task panicked",
-            &[("session", sid), ("task", c.task), ("payload", &c.payload)],
+            &[
+                ("session", record.session()),
+                ("task", c.task),
+                ("payload", &c.payload),
+            ],
         );
         self.note(
-            sid,
-            level,
+            record,
             "session.crash",
             json!({"task": c.task, "reason": "panic", "payload": c.payload}),
         )
         .await;
     }
 
-    /// A session entry of sallyd's; a failed append is an oplog line and changes nothing else.
-    async fn note(
-        &self,
-        sid: &str,
-        level: AuditLevel,
-        event: &'static str,
-        args: serde_json::Value,
-    ) {
-        let mut entry = NewEntry::new(Actor::Sallyd, event).session(sid).args(args);
-        if event != "session.stop" {
-            entry = entry.decision("deny");
-        }
-        if self.audit(entry, level).await.is_err() {
+    /// A `deny` session entry of sallyd's, through the session's handle; a failed append is an
+    /// oplog line and changes nothing else.
+    async fn note(&self, record: &Recorder, event: &'static str, args: serde_json::Value) {
+        let entry = record.entry(Actor::Sallyd, event, Some("deny")).args(args);
+        if !record.append(entry).await {
             self.p.oplog.error(
                 LOG,
                 "session entry not audited",
-                &[("session", sid), ("event", event)],
+                &[("session", record.session()), ("event", event)],
             );
         }
     }

@@ -533,3 +533,204 @@ fn rt_ag_15_nothing_of_a_session_follows_its_stop() {
         drop(conn);
     });
 }
+
+/// Entries the harness's own actions cause (sealed at `session.stop`, ruling 1 / Q63).
+fn agent_originated(event: &str) -> bool {
+    ["tool.", "approval.", "rpc."]
+        .iter()
+        .any(|p| event.starts_with(p))
+}
+
+/// The agent-originated entries after `session.stop`, which must be none.
+fn after_stop(x: &Lx) -> (usize, Vec<String>) {
+    let all = x.events.list();
+    let stop = all
+        .iter()
+        .position(|e| e == "session.stop")
+        .expect("session.stop");
+    let after = all[stop + 1..]
+        .iter()
+        .filter(|e| agent_originated(e))
+        .cloned()
+        .collect();
+    (stop, after)
+}
+
+/// A connection to `sock` through a short `/proc/self/fd` path, and the directory fd that keeps
+/// the path valid.
+async fn connect(sock: &Path) -> (tokio::net::UnixStream, std::fs::File) {
+    let dir = std::fs::File::open(sock.parent().unwrap()).unwrap();
+    let short = Path::new("/proc/self/fd")
+        .join(std::os::fd::AsRawFd::as_raw_fd(&dir).to_string())
+        .join(AGENT_SOCK);
+    (tokio::net::UnixStream::connect(&short).await.unwrap(), dir)
+}
+
+fn meta() -> Value {
+    json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {},
+    })
+}
+
+/// #91 (ruling 1, Q63): a connection task's `rpc.request` whose append is still running when the
+/// listener aborts the task at its grace lands before `session.stop`, never after it. Control:
+/// the seal (`session.stop` written through the session's handle after its writes in flight).
+#[test]
+fn rt_ag_15_an_rpc_entry_being_written_at_the_stop_lands_before_session_stop() {
+    rt().block_on(async {
+        let r = registry();
+        let v = Arc::new(r.x.f.load("tools:\n  builtin: [fs_list]\n"));
+        let s = r.reg.start(v).await.unwrap();
+        let sock = r.x.session_paths(&s.id).harness_sockets().join(AGENT_SOCK);
+        let (mut conn, _dir) = connect(&sock).await;
+        r.x.events.hold(&["rpc.request"]);
+        let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list",
+                          "params": {"_meta": meta()}});
+        conn.write_all(format!("{call}\n").as_bytes())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let reg = Arc::clone(&r.reg);
+        let id = s.id.clone();
+        let stop = tokio::spawn(async move { reg.stop(&id, StopReason::Request).await });
+        // Past the listener's grace (2 s), which aborts the connection task.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !r.x.events.list().contains(&"session.stop".to_owned()),
+            "session.stop was written while an entry of the session was still being written"
+        );
+        r.x.events.hold(&[]);
+        assert_eq!(stop.await.unwrap(), Some(StopOutcome::Stopped));
+        let (stop_at, after) = after_stop(&r.x);
+        let all = r.x.events.list();
+        let request = all
+            .iter()
+            .position(|e| e == "rpc.request")
+            .expect("rpc.request");
+        assert!(request < stop_at, "{all:?}");
+        assert!(after.is_empty(), "after session.stop: {after:?}");
+        drop(conn);
+    });
+}
+
+/// An oplog writer the test reads back.
+#[derive(Clone, Default)]
+struct Lines(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Lines {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Ruling 1 with `in_flight > 0` (Q63), and Q67. A write whose `tool.run` append is still
+/// running past the drain keeps the operation in flight: `session.stop {in_flight: 1}` follows
+/// that `tool.run`, the stop answers failed, the write aborts without touching the file, and its
+/// `tool.result` is refused by the seal (an oplog line names it). A session task that panics
+/// during this request stop is audited `session.crash` before `session.stop`, whose reason stays
+/// `request`. Nothing agent-originated follows `session.stop`; the supervisor then removes the
+/// container by itself.
+#[test]
+fn an_operation_past_the_drain_and_a_panic_during_the_stop_end_before_session_stop() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let sink = Arc::new(Hooked {
+            events: x.events.clone(),
+            sockets: x.xdg.join("sallyport/sessions"),
+            hook: Mutex::new(None),
+            debug: Mutex::new(Vec::new()),
+        });
+        let lines = Lines::default();
+        let log = sallyd::oplog::Oplog::new(lines.clone());
+        let reg = x.registry_logged(sink, Some(test_image()), log.clone());
+        let at = x.f.root.join("home/code/rt15b");
+        std::fs::create_dir_all(&at).unwrap();
+        let v = Arc::new(x.f.load(&format!(
+            "{}tools:\n  builtin: [fs_write]\n",
+            mounts(&[mount("~/code/rt15b", "/workspace/p", "rw")])
+        )));
+        let s = reg.start(v).await.unwrap();
+        let sock = x.session_paths(&s.id).harness_sockets().join(AGENT_SOCK);
+        let (mut conn, _dir) = connect(&sock).await;
+        x.events.hold(&["tool.run"]);
+        let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"_meta": meta(), "name": "fs_write",
+                       "arguments": {"path": "/workspace/p/late.txt", "content_b64": "bGF0ZQ=="}}});
+        conn.write_all(format!("{call}\n").as_bytes())
+            .await
+            .unwrap();
+        until("the write's section runs", Duration::from_secs(10), || {
+            x.events
+                .list()
+                .iter()
+                .filter(|e| *e == "rpc.request")
+                .count()
+                == 1
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let stopping = {
+            let reg = Arc::clone(&reg);
+            let id = s.id.clone();
+            tokio::spawn(async move { reg.stop(&id, StopReason::Request).await })
+        };
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let crash = reg.reporter(&s.id).expect("the session's reporter");
+        crash.spawn("tool", async {
+            panic!("a tool task panicked during the stop")
+        });
+        // Past the drain (5 s): the operation is still in flight, its entry still being written.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(!x.events.list().contains(&"session.stop".to_owned()));
+        x.events.hold(&[]);
+        let outcome = stopping.await.unwrap();
+        assert!(
+            matches!(outcome, Some(StopOutcome::Failed(ref w)) if w.contains("1 operations")),
+            "{outcome:?}"
+        );
+        until("the container is gone", Duration::from_secs(60), || {
+            !exists(&s.container)
+        })
+        .await;
+        let all = x.events.all();
+        let (stop_at, after) = after_stop(&x);
+        assert!(after.is_empty(), "after session.stop: {after:?}");
+        assert_eq!(all[stop_at].1["in_flight"], 1, "{all:#?}");
+        assert_eq!(all[stop_at].1["reason"], "request", "{all:#?}");
+        let run = all
+            .iter()
+            .position(|(e, _)| e == "tool.run")
+            .expect("tool.run");
+        let crashed = all
+            .iter()
+            .position(|(e, _)| e == "session.crash")
+            .expect("session.crash");
+        assert!(run < stop_at && crashed < stop_at, "{all:#?}");
+        assert_eq!(all[crashed].1["task"], "tool");
+        assert!(
+            !at.join("late.txt").exists(),
+            "the aborted write touched the file"
+        );
+        // Its `tool.result` races the seal for the order once the hold ends: either it landed
+        // before `session.stop` (as aborted) or the seal refused it with an oplog line (the
+        // refusal itself is pinned in `rpc::record`'s unit tests).
+        assert!(log.flush(Duration::from_secs(5)));
+        let text = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
+        let refused = text
+            .lines()
+            .any(|l| l.contains("entry refused after session.stop") && l.contains("tool.result"));
+        match all.iter().position(|(e, _)| e == "tool.result") {
+            Some(i) => {
+                assert!(i < stop_at, "{all:#?}");
+                assert_eq!(all[i].1["outcome"], "aborted", "{all:#?}");
+            }
+            None => assert!(refused, "{text}"),
+        }
+        drop(conn);
+    });
+}

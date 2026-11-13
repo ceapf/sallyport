@@ -1,6 +1,8 @@
 //! The pending queue: the [`Gate`] a tool handler asks, the [`Desk`] a host client answers
 //! (SI-5; maintainer's Task 10 decisions 1–7; architect rulings Q19, Q22–Q25).
 //!
+//! TODO(#93): over the 800-line ceiling; a move-only split follows PR A.
+//!
 //! - **Who answers.** [`new`] returns the two halves apart. The tool handler behind `agent.sock`
 //!   holds only the `Gate` (ask, withdraw); the `Desk` (list, decide) belongs to control-side
 //!   code (Task 12 wires `approvals.list`/`approvals.decide` on `control.sock`, with the client
@@ -445,7 +447,11 @@ impl Desk {
     /// with `approval.withdraw` (`session-stop`) and its asker is denied; a prompt not yet shown
     /// never is; no call queues from now on (`approval.deny session-stopping`). Once it has
     /// taken the prompts it finishes in its own task, so dropping this future loses no entry.
-    pub async fn stop(&self) {
+    ///
+    /// # Errors
+    /// The task's [`JoinError`](tokio::task::JoinError) when it panicked, for the session's
+    /// crash reporter (R8).
+    pub async fn stop(&self) -> Result<(), tokio::task::JoinError> {
         let taken: Vec<Entry> = {
             let mut st = self.inner.state();
             st.stopping = true;
@@ -474,7 +480,7 @@ impl Desk {
                 inner.close(e, answer);
             }
         });
-        let _ = task.await;
+        task.await
     }
 
     /// The prompts waiting for an answer.

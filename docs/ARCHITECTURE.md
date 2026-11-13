@@ -160,6 +160,7 @@ podman --runtime <checked runtime_path>          # AMENDMENTS-02 B5: never the d
   --hooks-dir <data>/podman/hooks                # empty, Sallyport-owned (#11)
   --default-mounts-file <data>/podman/mounts.conf  # empty: no system mounts.conf (6b review)
   create --rm --name sp-{ws|h|infer}-<id>
+  --label sallyport.installation=<installation id>   # Q64: the orphan sweeps match it
   --pull=never --http-proxy=false --log-driver=none --ulimit core=0   # AMENDMENTS-01 §6.1
   --network=none --no-hosts          # NOT --dns=none: Podman 4.9 rejects it with --network=none (preflight V4)
   --read-only --read-only-tmpfs=false
@@ -271,11 +272,18 @@ are released only once the container is confirmed gone.
    still conflicts. No sandbox ever holds write access to an ancestor, a descendant or the same
    directory as another session's mount, so no live sandbox can swap what another session's
    launch scan pinned. `Launcher::remove_orphans` removes `sp-ws-*`/`sp-h-*` containers a
-   previous `sallyd` left running (audited `sandbox.orphan_removed` with `sweep: startup`);
-   `sallyd` calls it before it accepts the first launch, then every 60 s (`sweep: periodic`,
-   architect Q61): a `podman create` a killed `sallyd` left running can make its container
-   after the startup sweep. A launch reserves its id before it creates anything, so no sweep
-   takes a launch in progress; a failed periodic sweep is an oplog line, retried at the next.
+   previous `sallyd` of this installation left running (audited `sandbox.orphan_removed` with
+   `sweep: startup`); `sallyd` calls it before it accepts the first launch, then every 60 s
+   (`sweep: periodic`, architect Q61): a `podman create` a killed `sallyd` left running can make
+   its container after the startup sweep. A container is removed only if it carries this
+   installation's label (`sallyport.installation`, a UUID v4 kept 0600 as `installation` in
+   the state directory, created once under the single-instance lock and never regenerated;
+   architect Q64), has a session container's name and no live session owns it. One without the
+   label (another daemon's, a test run's, or one made before the label existed) is never
+   removed. The label is compared in `sandbox::orphans`, after podman's own label filter. A
+   launch reserves its id before it creates anything, so no sweep takes a launch in progress; a
+   container a stop removes during the sweep drops out of its second listing; a failed periodic
+   sweep is an oplog line, retried at the next.
 2. **Checks.** The runtime binary and the podman binary are re-checked (B5). Everything podman
    reads from Sallyport's state is re-checked too: the state directory is private, `hooks/` and
    `config/` are empty, `mounts.conf` is empty, and `containers.conf` is byte-identical to what
@@ -722,18 +730,36 @@ further effect):
    its `tool.result`), and a write or delete that has not begun aborts (`outcome: aborted`). The
    agent listener shuts down meanwhile.
 5. At most 5 s (`STOP_DRAIN`) for the operations in flight to end, each with its `tool.result`.
-6. The one `session.stop {reason, in_flight}`.
+   A session task that panics meanwhile is audited `session.crash` (Q67), so `session.crash`
+   may precede a `session.stop` of any reason; the reason stays the first one.
+6. The seal, then the one `session.stop {reason, in_flight}` (ruling 1, Q63). The session's
+   audit handle (one per session, shared by its tools, approvals desk and agent server) stops
+   admitting writes; writes already in flight get what is left of the same 5 s deadline; then
+   `session.stop` is written, and every later write of that handle fails. A write still in
+   flight at the deadline either lands before `session.stop` or fails, and a failed write has
+   no effect and no reply. A refused write is an oplog line naming only the session and the
+   event. `session.stop` has no other writer (the best-effort `start-failed` one included).
 7. `Launcher::stop`, retried up to 3 times.
+
+So after `session.stop` nothing agent-originated of the session is written: no `tool.*`,
+`approval.*` or `rpc.*` entry, whatever its `in_flight`. Teardown entries may follow it:
+`sandbox.*` (`sandbox.stop` always does), the watchdog's (`session.resource_limit`,
+`session.kill_failed`) and egress closes (#95). TODO(#94): a final `session.closed`, written
+once teardown has finished, becomes the last entry of a session. A panic reported after the
+seal is an oplog line only.
 
 A file operation already inside its blocking call is never cut. One still running after the
 drain leaves `in_flight > 0`: the stop answers failed and the session stays stop-failed until
-it returns; then the supervisor removes the container by itself. Residual risk: a hung file
-system under a mount keeps an idle container (listener closed, shells killed, nothing new can
-start) until that operation returns. A container that cannot be confirmed gone, whether its
-session started or not, also leaves the session listed as stop-failed. It keeps its claims and
-its disk watchdog until a later stop succeeds. At shutdown, which stops every session at once,
-it makes `sallyd` exit non-zero. A failed `session.start` append is followed by a best-effort
-`session.stop` (`start-failed`), since the entry may have reached the log.
+it returns; then the supervisor removes the container by itself. Its `tool.result` is refused
+by the seal (an oplog line names it), so `in_flight: n` counts the `tool.run` entries that have
+no result. Residual risk: a hung file system under a mount keeps an idle container (listener
+closed, shells killed, nothing new can start) until that operation returns; if `sallyd` shuts
+down meanwhile, the container outlives it with no watchdog until the next start's sweep
+(TODO(#96), Q66). A container that cannot be confirmed gone, whether its session started or
+not, also leaves the session listed as stop-failed. It keeps its claims and its disk watchdog
+until a later stop succeeds. At shutdown, which stops every session at once, it makes `sallyd`
+exit non-zero. A failed `session.start` append is followed by a best-effort `session.stop`
+(`start-failed`), since the entry may have reached the log.
 
 ## 6. Repository structure
 
@@ -1143,7 +1169,8 @@ sallyport/
     Each call's section from `tool.run`/`tool.read` to `tool.result` is a task of its own
     counted by the session's stop (Q59): a caller that goes away loses neither the effect nor
     the entry. A `tool.run` with no `tool.result` before the session's `session.stop` happens
-    only when that entry carries `in_flight > 0` (the result follows it) or the session crashed.
+    only when that entry carries `in_flight > 0` (the result is not written: the seal refuses
+    it, and an oplog line names it; Q63) or a `session.crash` precedes it (Q67).
   - `tool.read` (harness, `allow`), after the bytes are in the broker and before the reply:
     action fields, `mode`, and `offset`, `len`, `size`, `bytes`, `sha256` (`fs_read`) or
     `entries`, `truncated`, `sha256` of the listing (`fs_list`), or `code`. Stricter than §4.3's
