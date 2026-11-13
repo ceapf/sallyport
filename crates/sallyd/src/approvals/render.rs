@@ -192,27 +192,19 @@ fn quoted(s: &str) -> String {
     out
 }
 
-/// `s` with everything outside printable ASCII escaped (see the module docs).
+/// `s` with everything outside printable ASCII escaped (see the module docs): the shared
+/// escaper, [`sally_core::text::escape`] (architect ruling Q50).
 #[must_use]
 pub fn escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        push_escaped(&mut out, c);
-    }
-    out
+    sally_core::text::escape(s.as_bytes())
 }
 
+/// One character through the shared escaper, for the quoted and capped forms built here.
 fn push_escaped(out: &mut String, c: char) {
-    match c {
-        '\\' => out.push_str("\\\\"),
-        ' '..='~' => out.push(c),
-        '\0'..='\x7f' => {
-            let _ = write!(out, "\\x{:02x}", u32::from(c));
-        }
-        _ => {
-            let _ = write!(out, "\\u{{{:x}}}", u32::from(c));
-        }
-    }
+    let mut buf = [0u8; 4];
+    out.push_str(&sally_core::text::escape(
+        c.encode_utf8(&mut buf).as_bytes(),
+    ));
 }
 
 /// `text` (escaped ASCII) cut at `max` characters, never inside an escape, with an explicit tail
