@@ -38,6 +38,7 @@ use serde_json::json;
 use crate::egress::net::{EgressError, EgressHandle, EgressStarter, NET_SOCK, SessionEgress};
 
 use super::argv::workspace_argv;
+use super::budget::session_cost;
 use super::commands::container_id;
 use super::dirs::SessionDirs;
 use super::disk::DiskFloor;
@@ -45,14 +46,17 @@ use super::inside::{Expect, check_in_container};
 use super::overlap::{Sessions, claims};
 use super::podman::{Podman, PodmanError};
 use super::scan::{LaunchScan, PinKind, ScanLimits, scan_mounts};
-use super::types::{CheckedRuntime, CommonArgs, ImageRef, SessionPaths, UserIds};
+use super::types::{CheckedRuntime, CommonArgs, ImageRef, Installation, SessionPaths, UserIds};
 use super::watchdog::{Target, WatchPlan, Watchdog, watch_plan};
+use crate::daemon::crash::CrashReporter;
+use crate::oplog::Oplog;
 
 mod error;
 mod teardown;
 
 use error::join_err;
 pub use error::{LaunchError, StopError};
+pub use teardown::Sweep;
 
 /// Longest free-text value in an audit entry (CLAUDE.md: nothing above 4 KiB is logged).
 const AUDIT_TEXT_CAP: usize = 4096;
@@ -62,8 +66,6 @@ const AUDIT_TEXT_CAP: usize = 4096;
 const START_GRACE: Duration = Duration::from_millis(250);
 /// How often a launch nobody received retries its `stop`.
 const STOP_RETRY: Duration = Duration::from_secs(2);
-/// Container name prefixes of the session roles this launcher creates.
-const SESSION_PREFIXES: [&str; 2] = ["sp-ws-", "sp-h-"];
 
 /// Where audit entries go. Appends are blocking file I/O; the launcher calls them from
 /// `spawn_blocking`.
@@ -187,8 +189,13 @@ pub struct WorkspaceRequest {
     pub paths: SessionPaths,
     /// The validated manifest.
     pub manifest: Arc<ValidatedManifest>,
-    /// The bundled workspace image, used when the manifest names none.
-    pub default_image: ImageRef,
+    /// The bundled workspace image, used when the manifest names none. `None` while no bundled
+    /// image is installed: such a launch is refused `no-default-image` before anything is
+    /// reserved (architect Q58; TODO(#88)).
+    pub default_image: Option<ImageRef>,
+    /// The session's crash reporter: a panic in its disk watchdog is reported here (architect
+    /// Q47).
+    pub crash: CrashReporter,
 }
 
 /// Where a launcher's collaborators come from.
@@ -212,6 +219,12 @@ pub struct LauncherParts {
     /// Starts each proxy-mode session's egress listener ([`crate::egress::net::SystemEgress`] in
     /// production; tests pass fakes through the same field).
     pub egress: Arc<dyn EgressStarter>,
+    /// The operational log: an audit entry that cannot be written while the launcher acts
+    /// anyway (a kill, a retried stop) gets an error line here (architect Q43).
+    pub oplog: Oplog,
+    /// This installation's id (`daemon::install`): the label of every container this launcher
+    /// creates, and the only one its orphan sweeps remove (Q64).
+    pub installation: Installation,
 }
 
 /// Launches and tears down sandboxes for one `sallyd`. Shared as `Arc<Launcher>`.
@@ -225,6 +238,8 @@ pub struct Launcher {
     limits: ScanLimits,
     pub(super) disk_floor: DiskFloor,
     egress: Arc<dyn EgressStarter>,
+    oplog: Oplog,
+    pub(super) installation: Installation,
     /// One stage walk at a time across all sessions, so a sandbox with a huge or deep tree
     /// cannot multiply `sallyd`'s open fds or blocking threads (6c-1 review M2/M3).
     pub(super) walks: Arc<tokio::sync::Semaphore>,
@@ -261,8 +276,20 @@ impl Launcher {
             limits: p.limits,
             disk_floor: p.disk_floor,
             egress: p.egress,
+            oplog: p.oplog,
+            installation: p.installation,
             walks: Arc::new(tokio::sync::Semaphore::new(1)),
         })
+    }
+
+    /// The oplog line for an audit entry that could not be written while the launcher went on
+    /// (the action is still taken: a kill, a stop retry).
+    pub(super) fn unaudited(&self, event: &str, sid: &str) {
+        self.oplog.error(
+            "sandbox",
+            "audit entry not written",
+            &[("event", event), ("session", sid)],
+        );
     }
 
     pub(super) async fn audit(
@@ -290,6 +317,7 @@ impl Launcher {
     ) -> Result<Running, LaunchError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let this = Arc::clone(self);
+        let crash = req.crash.clone();
         tokio::spawn(async move {
             let result = this.launch(req).await.map(|(mut r, plan)| {
                 r.watchdog = plan.map(|plan| {
@@ -299,7 +327,7 @@ impl Launcher {
                         level: r.level,
                         exec_gate: Arc::clone(&r.exec_gate),
                     };
-                    Watchdog::spawn(&this, target, plan)
+                    Watchdog::spawn(&this, target, plan, &crash)
                 });
                 r
             });
@@ -317,9 +345,22 @@ impl Launcher {
     ) -> Result<(Running, Option<WatchPlan>), LaunchError> {
         let level = req.manifest.manifest().audit.level;
         let sid = req.paths.id().as_str().to_owned();
+        // Step 0 (architect Q58): the image, before anything is reserved or created.
+        let image = match req.image() {
+            Ok(i) => i,
+            Err(e) => {
+                return Err(self
+                    .refused(&sid, e, level, "nothing to clean up".into())
+                    .await);
+            }
+        };
         let v = Arc::clone(&req.manifest);
+        let fds = session_cost(req.manifest.manifest().network.max_connections);
         let reserved = match blocking(move || claims(&v).map_err(LaunchError::Claims)).await {
-            Ok(c) => self.sessions.reserve(&sid, c).map_err(LaunchError::from),
+            Ok(c) => self
+                .sessions
+                .reserve(&sid, c, fds)
+                .map_err(LaunchError::from),
             Err(e) => Err(e),
         };
         if let Err(e) = reserved {
@@ -328,7 +369,10 @@ impl Launcher {
                 .await);
         }
         let mut progress = Progress::default();
-        match self.launch_reserved(&req, level, &mut progress).await {
+        match self
+            .launch_reserved(&req, &image, level, &mut progress)
+            .await
+        {
             Ok(r) => Ok(r),
             Err(e) => {
                 let cleanup = self.clean_failed(&req.paths, &progress).await;
@@ -379,11 +423,12 @@ impl Launcher {
     async fn launch_reserved(
         &self,
         req: &WorkspaceRequest,
+        image: &ImageRef,
         level: AuditLevel,
         progress: &mut Progress,
     ) -> Result<(Running, Option<WatchPlan>), LaunchError> {
         let (runtime, scan, plan) = self.check_and_scan(req).await?;
-        let image = req.image();
+        let image = image.as_str();
         self.image_present(image).await?;
         let argv = self.dirs_and_argv(req, runtime, &scan, progress).await?;
         let egress = self.start_egress(req).await?;
@@ -523,13 +568,14 @@ impl Launcher {
             profiles: dirs.profiles().to_owned(),
             hooks_dir: self.podman.hooks_dir(),
             mounts_file: self.podman.mounts_file(),
+            installation: self.installation.clone(),
         };
         Ok(workspace_argv(
             &common,
             &req.paths,
             &req.manifest,
             scan,
-            &req.default_image,
+            req.default_image.as_ref(),
         )?)
     }
 
@@ -654,6 +700,39 @@ mod tests {
             assert!(matches!(e, LaunchError::NotRunning(_)), "{bad:?}");
             assert_eq!(e.reason(), "not-running");
         }
+    }
+
+    /// #48 (architect Q45): a session over the descriptor budget is refused `fd-budget`, the
+    /// message naming needed, free and limit; an overlap keeps its own reason.
+    #[test]
+    fn an_fd_budget_refusal_has_its_own_reason() {
+        use crate::sandbox::budget::FdRefusal;
+        use crate::sandbox::overlap::ReserveError;
+        let e = LaunchError::from(ReserveError::FdBudget(FdRefusal {
+            needed: 256,
+            free: 100,
+            limit: 512,
+        }));
+        assert_eq!(e.reason(), "fd-budget");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("256") && msg.contains("100") && msg.contains("512"),
+            "{msg}"
+        );
+        let dup = LaunchError::from(ReserveError::Duplicate("a".into()));
+        assert_eq!(dup.reason(), "overlap");
+    }
+
+    /// Architect Q58: no manifest image and no bundled default.
+    #[test]
+    fn a_missing_default_image_has_its_own_reason() {
+        let e = LaunchError::NoDefaultImage;
+        assert_eq!(e.reason(), "no-default-image");
+        assert_eq!(
+            e.to_string(),
+            "runtime.image: no bundled workspace image is installed; the manifest must name a \
+             digest-pinned image"
+        );
     }
 
     #[test]

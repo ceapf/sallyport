@@ -37,7 +37,9 @@ serde_json = "1.0.154"
 # Already in the tree through sally-core: the sha256 of llm.sock bodies in audit entries.
 sha2 = "0.11.1"
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", default-features = false, features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
+# `signal`: SIGTERM/SIGINT shutdown (Task 12); signal-hook-registry is already in the tree through
+# `process`, so no new crate.
+tokio = { version = "1.54.1", default-features = false, features = ["io-util", "macros", "net", "process", "rt", "signal", "sync", "time"] }
 # Task 9a-2: TLS termination and re-origination inside intercepted tunnels.
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
 # Already in the tree through sally-core: wipes the response bytes the redactor holds back

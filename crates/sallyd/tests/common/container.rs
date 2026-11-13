@@ -4,7 +4,7 @@
 //! These tests never skip: without podman or the base image they fail. CI pulls the base image
 //! by digest first (`ci.yml`); the test images are built from it offline.
 
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -12,10 +12,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use sally_core::audit::{AuditError, NewEntry};
 use sally_core::manifest::{AuditLevel, ValidatedManifest};
 use sallyd::sandbox::{
-    AuditSink, CheckedRuntime, CommonArgs, DiskFloor, ImageRef, LaunchError, Launcher,
-    LauncherParts, Podman, PodmanHost, Running, ScanLimits, SessionDirs, SessionId, SessionPaths,
-    Sessions, UserIds, WorkspaceRequest, resolve_podman,
+    AuditSink, CheckedRuntime, CommonArgs, DiskFloor, ImageRef, Installation, LaunchError,
+    Launcher, LauncherParts, Podman, PodmanHost, Running, ScanLimits, SessionDirs, SessionId,
+    SessionPaths, Sessions, UserIds, WorkspaceRequest, resolve_podman,
 };
+
+use sallyd::session::{Registry, RegistryParts};
 
 use super::Fx;
 
@@ -106,120 +108,7 @@ pub fn image_run() -> &'static str {
     }
 }
 
-/// `<xdg>/sallyport-test`, created 0700. Panics unless both it and `xdg` are real directories
-/// owned by this user with no group or other access (architect Q23): the locks are shared by
-/// every worktree of this user, so nobody else may plant or hold them.
-pub fn lock_dir_in(xdg: &Path) -> PathBuf {
-    let private = |d: &Path| {
-        sallyd::sandbox::check_runtime_dir(d)
-            .unwrap_or_else(|e| panic!("test lock directory {}: {e}", d.display()));
-    };
-    private(xdg);
-    let dir = xdg.join("sallyport-test");
-    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => panic!("{}: {e}", dir.display()),
-    }
-    private(&dir);
-    dir
-}
-
-/// Where the lock `name` lives: `$XDG_RUNTIME_DIR/sallyport-test/<name>.lock`. Read at run time,
-/// no fallback: a per-worktree place would let two worktrees' disk tests overlap.
-pub fn lock_path(name: &str) -> PathBuf {
-    let xdg = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .expect("XDG_RUNTIME_DIR must be set to an absolute path");
-    lock_dir_in(&xdg).join(format!("{name}.lock"))
-}
-
-/// Opens (creating) a lock file without truncating it, and never through a symlink.
-pub fn open_lock(path: &Path) -> std::fs::File {
-    use std::os::unix::fs::OpenOptionsExt;
-    let nofollow = i32::try_from(rustix::fs::OFlags::NOFOLLOW.bits()).unwrap();
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .custom_flags(nofollow)
-        .open(path)
-        .unwrap_or_else(|e| panic!("lock {}: {e}", path.display()))
-}
-
-/// How long a disk-floor test waits for the [`disk_free_lock`] (maintainer, 9a-2 part 4).
-pub const DISK_FREE_WAIT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
-
-/// The `disk-free` lock, exclusive. A local mutation run holds it shared for its whole length
-/// (`scripts/disk-lock.sh`): its tree copies and builds move the free space that the disk-floor
-/// writer tests set their floor against. Those tests take it exclusively, before the I/O lock.
-/// Past [`DISK_FREE_WAIT`] the test fails naming the lock. Back-to-back mutation runs in both
-/// lanes can starve it (shared holders win over a polling exclusive one); that ends in the same
-/// named failure, never a hang.
-pub fn disk_free_lock() -> std::fs::File {
-    lock_exclusive_within(
-        &lock_path("disk-free"),
-        DISK_FREE_WAIT,
-        "a local mutation run (scripts/disk-lock.sh) in either lane",
-    )
-}
-
-/// An exclusive `flock` on `path`, waited for at most `wait`. While it waits it says so once on
-/// stderr, naming the lock and its likely `holder`; past `wait` it panics with the same names.
-pub fn lock_exclusive_within(
-    path: &Path,
-    wait: std::time::Duration,
-    holder: &str,
-) -> std::fs::File {
-    let f = open_lock(path);
-    let started = std::time::Instant::now();
-    let mut told = false;
-    loop {
-        match rustix::fs::flock(&f, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => return f,
-            Err(rustix::io::Errno::WOULDBLOCK) => {}
-            Err(e) => panic!("lock {}: {e}", path.display()),
-        }
-        assert!(
-            started.elapsed() < wait,
-            "the lock {} was not free within {wait:?}; likely holder: {holder}",
-            path.display()
-        );
-        if !told {
-            eprintln!(
-                "waiting up to {wait:?} for the lock {}; likely holder: {holder}",
-                path.display()
-            );
-            told = true;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-}
-
-/// An exclusive or shared `flock` on [`lock_path`]`(name)`, held until the file is dropped. It
-/// works across worktrees, nextest's processes and `cargo test`'s threads alike. Order: the
-/// disk-free lock ([`disk_free_lock`]), then the I/O lock, then the image lock; `build` never
-/// takes the I/O lock.
-pub fn lock(name: &str, exclusive: bool) -> std::fs::File {
-    let f = open_lock(&lock_path(name));
-    let op = if exclusive {
-        rustix::fs::FlockOperation::LockExclusive
-    } else {
-        rustix::fs::FlockOperation::LockShared
-    };
-    rustix::fs::flock(&f, op).unwrap();
-    f
-}
-
-/// The I/O lock: ordinary container tests share it; tests that write hundreds of MiB at full
-/// speed take it exclusively, so their disk saturation never stalls another test's container
-/// (seen on CI: `podman rm` timing out on a process blocked in I/O). The lock is per user, so
-/// two worktrees share it. `flock` gives a waiting exclusive holder no priority: if two runs'
-/// shared holders ever starve a disk test, add a turnstile lock rather than a longer timeout
-/// (architect Q23 (6); not seen in the two-worktree proof).
-pub fn io_lock(exclusive: bool) -> std::fs::File {
-    lock("container-io", exclusive)
-}
+pub use super::locks::*;
 
 /// Builds `localhost/<name>:<run>-<input key>` once and returns that tag and
 /// `localhost/<name>@sha256:…`.
@@ -374,12 +263,37 @@ pub fn exiting_image() -> ImageRef {
     ImageRef::parse(r).unwrap()
 }
 
-/// Records every audit entry's event name and arguments.
+/// Records every audit entry's event name and arguments; appends of the events named by
+/// [`Events::fail`] fail, unrecorded.
 #[derive(Default)]
-pub struct Events(Mutex<Vec<(String, serde_json::Value)>>);
+pub struct Events(
+    Mutex<Vec<(String, serde_json::Value)>>,
+    Mutex<Vec<&'static str>>,
+    /// Appends of these events wait (outside every lock) until released.
+    Mutex<Vec<&'static str>>,
+    /// The event of each append waiting in a hold now, one per append.
+    Mutex<Vec<String>>,
+);
 
 impl AuditSink for Events {
     fn append(&self, e: NewEntry, _: AuditLevel) -> Result<(), AuditError> {
+        let mut parked = false;
+        while self.2.lock().unwrap().contains(&e.event()) {
+            if !parked {
+                parked = true;
+                self.3.lock().unwrap().push(e.event().to_owned());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if parked {
+            let mut p = self.3.lock().unwrap();
+            if let Some(at) = p.iter().position(|x| x == e.event()) {
+                p.remove(at);
+            }
+        }
+        if self.1.lock().unwrap().contains(&e.event()) {
+            return Err(AuditError::InvalidEntry("fake failure"));
+        }
         let args = e.arguments().clone();
         self.0.lock().unwrap().push((e.event().to_owned(), args));
         Ok(())
@@ -387,6 +301,41 @@ impl AuditSink for Events {
 }
 
 impl Events {
+    /// From now on, appends of `events` fail (an empty list: none does).
+    #[allow(dead_code)] // Not every test binary that includes this module fails appends.
+    pub fn fail(&self, events: &[&'static str]) {
+        *self.1.lock().unwrap() = events.to_vec();
+    }
+
+    /// From now on, appends of `events` wait until released (an empty list: none does).
+    #[allow(dead_code)] // Not every test binary that includes this module holds appends.
+    pub fn hold(&self, events: &[&'static str]) {
+        *self.2.lock().unwrap() = events.to_vec();
+    }
+
+    /// Waits until `n` appends of `event` are waiting in a hold; panics after 10 s.
+    #[allow(dead_code)] // Not every test binary that includes this module holds appends.
+    pub async fn until_parked(&self, event: &str, n: usize) {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let now = self
+                .3
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| *e == event)
+                .count();
+            if now == n {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < end,
+                "{n} appends of {event} never waited in the hold ({now} do)"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
     pub fn list(&self) -> Vec<String> {
         self.0
             .lock()
@@ -426,6 +375,8 @@ pub struct Lx {
     /// (architect Q24), so every container name carries the run and `Drop` and the wrapper's
     /// sweep remove only their own.
     pub scope: String,
+    /// This fixture's installation id: the label of every container its launcher creates.
+    pub installation: Installation,
     /// The shared I/O lock ([`io_lock`]); released after `Drop` has removed the containers.
     _io: Option<std::fs::File>,
 }
@@ -487,6 +438,20 @@ impl Lx {
         Self::build(None, None, None, floor, None)
     }
 
+    /// The next `sallyd` of this fixture's installation (same id, so the same label): a new
+    /// launcher with no live sessions, as after a crash (architect Q64).
+    #[allow(dead_code)] // Only the orphan tests play a second sallyd.
+    pub fn next_sallyd(&self) -> Self {
+        Self::build_as(
+            None,
+            None,
+            None,
+            DiskFloor::default(),
+            Some(io_lock(false)),
+            Some(self.installation.clone()),
+        )
+    }
+
     fn build(
         podman_home: Option<PathBuf>,
         runtime: Option<&Path>,
@@ -494,6 +459,20 @@ impl Lx {
         floor: DiskFloor,
         io: Option<std::fs::File>,
     ) -> Self {
+        Self::build_as(podman_home, runtime, podman_bin, floor, io, None)
+    }
+
+    /// `installation`: `None` for a fresh one, so no two fixtures sweep each other's containers.
+    fn build_as(
+        podman_home: Option<PathBuf>,
+        runtime: Option<&Path>,
+        podman_bin: Option<PathBuf>,
+        floor: DiskFloor,
+        io: Option<std::fs::File>,
+        installation: Option<Installation>,
+    ) -> Self {
+        let installation =
+            installation.unwrap_or_else(|| Installation::fresh().expect("an installation id"));
         let f = Fx::new();
         let xdg = f.root.join("run");
         std::fs::set_permissions(&xdg, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -518,11 +497,14 @@ impl Lx {
             runtime: runtime.clone(),
             ids: ids(),
             xdg_runtime_dir: xdg.clone(),
-            sessions: Arc::new(Sessions::default()),
+            // Well past what the test sessions need; the budget is unit-tested in `overlap.rs`.
+            sessions: Arc::new(Sessions::new(1 << 20)),
             audit: events.clone(),
             limits: ScanLimits::default(),
             disk_floor: floor,
             egress: egress.clone(),
+            oplog: sallyd::oplog::Oplog::new(std::io::sink()),
+            installation: installation.clone(),
         });
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -535,25 +517,68 @@ impl Lx {
             xdg,
             egress,
             scope: format!("t{}-{}-{n}", run_id(), std::process::id()),
+            installation,
             _io: io,
         }
     }
 
     pub fn paths(&self, tag: &str) -> SessionPaths {
-        let id = SessionId::parse(&format!("{}-{tag}", self.scope)).unwrap();
+        self.session_paths(&format!("{}-{tag}", self.scope))
+    }
+
+    /// The directories of session `id` (one the registry made, or [`Lx::paths`]).
+    pub fn session_paths(&self, id: &str) -> SessionPaths {
         SessionPaths::new(
-            id,
+            SessionId::parse(id).unwrap(),
             &self.xdg.join("sallyport"),
             &self.f.root.join("home/.local/share/sallyport"),
         )
         .unwrap()
     }
 
+    /// A session registry over this fixture's launcher, appending to `audit`, its session ids
+    /// scoped like [`Lx::paths`] (so `Drop` removes its containers).
+    pub fn registry(
+        &self,
+        audit: Arc<dyn AuditSink>,
+        default_image: Option<ImageRef>,
+    ) -> Arc<Registry> {
+        self.registry_logged(
+            audit,
+            default_image,
+            sallyd::oplog::Oplog::new(std::io::sink()),
+        )
+    }
+
+    /// [`registry`](Self::registry) with its operational log written to `oplog`.
+    pub fn registry_logged(
+        &self,
+        audit: Arc<dyn AuditSink>,
+        default_image: Option<ImageRef>,
+        oplog: sallyd::oplog::Oplog,
+    ) -> Arc<Registry> {
+        Registry::new(RegistryParts {
+            launcher: self.launcher.clone(),
+            audit,
+            podman: self.podman.clone(),
+            ids: ids(),
+            sockets: self.xdg.join("sallyport"),
+            data: self.f.root.join("home/.local/share/sallyport"),
+            default_image,
+            oplog,
+            // A supervisor panic shows as a missing stop in the test; nobody reads these.
+            crash: sallyd::daemon::crash::CrashReporter::channel().0,
+            scope: self.scope.clone(),
+        })
+    }
+
     pub fn request(&self, v: &ValidatedManifest, tag: &str) -> WorkspaceRequest {
         WorkspaceRequest {
             paths: self.paths(tag),
             manifest: Arc::new(v.clone()),
-            default_image: test_image(),
+            default_image: Some(test_image()),
+            // A watchdog panic is not what these tests watch; nobody reads the reports.
+            crash: sallyd::daemon::crash::CrashReporter::channel().0,
         }
     }
 
@@ -573,6 +598,7 @@ impl Lx {
             profiles: dirs.profiles().to_owned(),
             hooks_dir: self.podman.hooks_dir(),
             mounts_file: self.podman.mounts_file(),
+            installation: self.installation.clone(),
         }
     }
 

@@ -47,6 +47,13 @@ pub enum LaunchError {
     /// The pinned image is not in local storage (`images.rs`).
     #[error("runtime.image: {0}")]
     ImageMissing(String),
+    /// The manifest names no `runtime.image` and no bundled workspace image is installed
+    /// (architect Q58). TODO(#88): the bundled image and its digest source.
+    #[error(
+        "runtime.image: no bundled workspace image is installed; the manifest must name a \
+         digest-pinned image"
+    )]
+    NoDefaultImage,
     /// A podman command failed.
     #[error("podman {verb}: {msg}")]
     Command {
@@ -82,6 +89,7 @@ impl LaunchError {
             Self::Scan(ScanError::SocketInMount { .. }) => "socket-in-mount",
             Self::Scan(ScanError::TooManyShields { .. } | ScanError::Limit { .. }) => "scan-limit",
             Self::Scan(_) | Self::Claims(_) => "mount-changed",
+            Self::Overlap(ReserveError::FdBudget(_)) => "fd-budget",
             Self::Overlap(_) => "overlap",
             Self::Dirs(_) => "session-dir",
             Self::Argv(_) => "argv",
@@ -90,6 +98,7 @@ impl LaunchError {
             Self::NotRunning(_) => "not-running",
             Self::DiskSpace(_) => "disk-floor",
             Self::ImageMissing(_) => "digest-mismatch",
+            Self::NoDefaultImage => "no-default-image",
             Self::Command { .. } => "podman",
             Self::Audit(_) | Self::Unaudited { .. } => "audit",
             Self::Internal(_) => "internal",

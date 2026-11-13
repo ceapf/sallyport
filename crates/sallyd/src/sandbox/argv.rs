@@ -15,7 +15,8 @@ use sally_core::manifest::{ByteSize, MountMode, NetworkMode, ValidatedManifest};
 use super::check::{Allowed, Grant, Source, check_argv};
 use super::scan::{GitScan, LaunchScan};
 use super::types::{
-    ArgvError, CommonArgs, ImageRef, InferenceSpec, OverlayDirs, Role, SessionPaths, input,
+    ArgvError, CommonArgs, INSTALLATION_LABEL, ImageRef, InferenceSpec, OverlayDirs, Role,
+    SessionPaths, input,
 };
 
 /// The entry point baked into the workspace and harness images.
@@ -125,6 +126,11 @@ impl Argv {
             "--rm",
         ]);
         a.push(["--name", &name]);
+        // Q64: the orphan sweeps remove only this installation's containers.
+        a.push([
+            "--label",
+            &format!("{INSTALLATION_LABEL}={}", c.installation.as_str()),
+        ]);
         // AMENDMENTS-01 §6.1: never contact a registry, never inherit host proxies, keep no logs,
         // write no core files.
         a.push([
@@ -211,6 +217,7 @@ fn allowed(c: &CommonArgs, role: Role, sources: Vec<Source>, scratch: Option<&Pa
         profiles: c.profiles.clone(),
         sources,
         scratch: scratch.map(Path::to_owned),
+        installation: c.installation.clone(),
     }
 }
 
@@ -231,15 +238,18 @@ fn source(path: &Path, guest: &str, grant: Grant) -> Source {
 /// every `.git` file a read-only bind, and every directory between the mount root and either is
 /// bound onto itself so it cannot be renamed away from under its shield (EBUSY).
 ///
+/// `default_image` is the bundled workspace image, used when the manifest names none; `None`
+/// while no bundled image is installed (architect Q58).
+///
 /// # Errors
-/// [`ArgvError::Input`] for a malformed input; [`ArgvError::Forbidden`] if the result fails
-/// [`check_argv`] (a bug).
+/// [`ArgvError::Input`] for a malformed input, or for no image at all; [`ArgvError::Forbidden`]
+/// if the result fails [`check_argv`] (a bug).
 pub fn workspace_argv(
     c: &CommonArgs,
     paths: &SessionPaths,
     v: &ValidatedManifest,
     scan: &LaunchScan,
-    default_image: &ImageRef,
+    default_image: Option<&ImageRef>,
 ) -> Result<Vec<String>, ArgvError> {
     let m = v.manifest();
     if !scan.is_for(v) {
@@ -263,9 +273,15 @@ pub fn workspace_argv(
         "ro",
     );
     sources.push(source(&sockets, SOCKETS_GUEST, Grant::Ro));
-    let image = match &m.runtime.image {
-        Some(i) => ImageRef::parse(i).map_err(|e| field_err("runtime.image", e))?,
-        None => default_image.clone(),
+    let image = match (&m.runtime.image, default_image) {
+        (Some(i), _) => ImageRef::parse(i).map_err(|e| field_err("runtime.image", e))?,
+        (None, Some(d)) => d.clone(),
+        (None, None) => {
+            return input(
+                "runtime.image: no bundled workspace image is installed; the manifest must \
+                 name a digest-pinned image",
+            );
+        }
     };
     a.push([image.as_str(), ENTRY, "--idle"]);
     a.finish(&allowed(

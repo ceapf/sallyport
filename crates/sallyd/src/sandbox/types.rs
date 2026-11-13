@@ -75,6 +75,76 @@ impl SessionId {
     }
 }
 
+/// The container label naming the installation that created a container (architect Q64).
+pub const INSTALLATION_LABEL: &str = "sallyport.installation";
+
+/// The id of one Sallyport installation (one state directory): a random UUID v4 in its
+/// lowercase hyphenated form. Every container the launcher creates carries it as
+/// [`INSTALLATION_LABEL`], and the orphan sweeps remove only containers that carry this
+/// installation's id (Q64), never another daemon's or a test run's. It never leaves the
+/// machine and never reaches the audit log (SI-12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Installation(String);
+
+impl Installation {
+    /// Validates an id: 36 characters, `xxxxxxxx-xxxx-4xxx-[89ab]xxx-xxxxxxxxxxxx`, lowercase
+    /// hex.
+    ///
+    /// # Errors
+    /// [`ArgvError::Input`] otherwise.
+    pub fn parse(s: &str) -> Result<Self, ArgvError> {
+        let b = s.as_bytes();
+        let shape = b.len() == 36
+            && b.iter().enumerate().all(|(i, c)| match i {
+                8 | 13 | 18 | 23 => *c == b'-',
+                _ => c.is_ascii_digit() || (b'a'..=b'f').contains(c),
+            })
+            && b.get(14) == Some(&b'4')
+            && b.get(19).is_some_and(|c| b"89ab".contains(c));
+        if shape {
+            Ok(Self(s.to_owned()))
+        } else {
+            input("installation id must be a lowercase UUID v4")
+        }
+    }
+
+    /// A fresh id from getrandom(2).
+    ///
+    /// # Errors
+    /// The getrandom error, or a short read.
+    pub fn fresh() -> std::io::Result<Self> {
+        let mut r = [0u8; 16];
+        let n = rustix::rand::getrandom(&mut r, rustix::rand::GetRandomFlags::empty())?;
+        if n != r.len() {
+            return Err(std::io::Error::other("getrandom returned a short read"));
+        }
+        Self::parse(&uuid_v4(r)).map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
+    /// The id.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// `r` as a UUID v4: version nibble 4, variant bits 10. The bits are added to the masked byte
+/// (its high bits are clear, so `+` cannot carry): unlike `|`, no operator swap gives the same
+/// value.
+fn uuid_v4(mut r: [u8; 16]) -> String {
+    r[6] = 0x40 + (r[6] & 0x0f);
+    r[8] = 0x80 + (r[8] & 0x3f);
+    let hex: String = r.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
+}
+
 /// An image pinned by digest (SI-11), in the grammar of
 /// [`sally_core::manifest::is_pinned_image_ref`]: never a Podman transport such as `dir:`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,6 +220,8 @@ pub struct CommonArgs {
     /// Sallyport's empty mounts file, passed as `--default-mounts-file` so no system
     /// `mounts.conf` adds a mount (6b security review M4).
     pub mounts_file: PathBuf,
+    /// This installation's id, the container's [`INSTALLATION_LABEL`] (Q64).
+    pub installation: Installation,
 }
 
 /// Host directories of one session (ARCHITECTURE §3.1, AMENDMENTS-01 §2, AMENDMENTS-02 B2).
@@ -320,5 +392,37 @@ impl VerifiedModel {
     #[must_use]
     pub fn identity(&self) -> (u64, u64) {
         (self.dev, self.ino)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uuid_v4_sets_the_version_and_variant_bits() {
+        assert_eq!(uuid_v4([0; 16]), "00000000-0000-4000-8000-000000000000");
+        assert_eq!(uuid_v4([0xff; 16]), "ffffffff-ffff-4fff-bfff-ffffffffffff");
+        let r: [u8; 16] = std::array::from_fn(|i| u8::try_from(i).unwrap() * 17);
+        assert_eq!(uuid_v4(r), "00112233-4455-4677-8899-aabbccddeeff");
+    }
+
+    // Whatever the random bytes, the version nibble is 4 and the variant bits are 10, and only
+    // those bits change: the low nibble of byte 6 and the low six bits of byte 8 are kept.
+    #[test]
+    fn every_byte_value_gets_the_version_and_variant_bits_and_keeps_the_rest() {
+        for b in 0..=u8::MAX {
+            let id = uuid_v4([b; 16]);
+            let byte = |at: usize| u8::from_str_radix(&id[at..at + 2], 16).unwrap();
+            assert_eq!(byte(14), 0x40 | (b & 0x0f), "{id}");
+            assert_eq!(byte(19), 0x80 | (b & 0x3f), "{id}");
+            assert!(Installation::parse(&id).is_ok(), "{id}");
+        }
+        for _ in 0..64 {
+            let id = Installation::fresh().unwrap();
+            assert_eq!(&id.as_str()[14..15], "4", "{}", id.as_str());
+            assert!("89ab".contains(&id.as_str()[19..20]), "{}", id.as_str());
+        }
     }
 }

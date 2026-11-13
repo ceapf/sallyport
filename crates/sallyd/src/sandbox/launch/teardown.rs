@@ -6,57 +6,83 @@ use sally_core::audit::{Actor, NewEntry};
 use sally_core::manifest::AuditLevel;
 use serde_json::json;
 
-use super::{
-    LaunchError, Launcher, Progress, Running, SESSION_PREFIXES, STOP_RETRY, StopError, blocking,
-    capped,
-};
+use super::{LaunchError, Launcher, Progress, Running, STOP_RETRY, StopError, blocking, capped};
 use crate::sandbox::commands::rm_args;
+use crate::sandbox::orphans::{Orphan, orphans, ps_args};
 use crate::sandbox::types::SessionPaths;
 
+/// Which orphan sweep runs (architect Q61), named in each `sandbox.orphan_removed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sweep {
+    /// Once, under the single-instance lock, before `control.sock` is bound.
+    Startup,
+    /// Every `daemon::sweep::ORPHAN_SWEEP` after that.
+    Periodic,
+}
+
+impl Sweep {
+    /// The wire name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Periodic => "periodic",
+        }
+    }
+}
+
 impl Launcher {
-    /// Removes session containers a previous `sallyd` left behind (`sp-ws-<scope>[-…]`,
-    /// `sp-h-<scope>[-…]`), never a session live in this launcher, so the overlap rule starts
-    /// from what is really running. `sallyd` calls it with an empty scope before it accepts the
-    /// first launch. Audits each removal. TODO(#17): the single-instance lock that makes "a
-    /// previous sallyd" exact arrives with the control socket (Task 12).
+    /// Removes this installation's session containers that no live session of this launcher
+    /// owns (`sp-ws-<scope>[-…]`, `sp-h-<scope>[-…]`, labelled with this installation's id:
+    /// [`crate::sandbox::orphans`], architect Q64), so the overlap rule starts from what is
+    /// really running. A container without that label (another daemon's, a test run's) is never
+    /// removed. `sallyd` (`daemon::serve`) calls it with an empty scope while it holds the
+    /// single-instance lock (the `flock` on its runtime directory, `daemon::startup`) and before
+    /// it binds `control.sock`, then periodically (`daemon::sweep`, architect Q61): a `podman
+    /// create` a killed `sallyd` of this installation left running can make its container after
+    /// the startup sweep. A launch reserves its id before it creates anything and keeps it until
+    /// its container is confirmed gone, and ids are never reused, so no sweep removes a launch in
+    /// progress. A container that a stop removes between the listing and the liveness check is
+    /// no longer listed by the second look, so it is neither audited nor removed (S7). Audits
+    /// each removal before it.
     ///
     /// # Errors
-    /// [`LaunchError`] if podman cannot list or remove them.
-    pub async fn remove_orphans(&self, scope: &str) -> Result<Vec<String>, LaunchError> {
-        let out = self
-            .run(
-                "ps",
-                [
-                    "ps".into(),
-                    "--all".into(),
-                    "--format".into(),
-                    "{{.Names}}".into(),
-                ],
-            )
-            .await?;
+    /// [`LaunchError`] if podman cannot list or remove them, or a listing line is malformed.
+    pub async fn remove_orphans(
+        &self,
+        scope: &str,
+        sweep: Sweep,
+    ) -> Result<Vec<String>, LaunchError> {
+        let found = self.list_orphans(scope).await?;
+        if found.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Not live now and still there: an orphan, since a stopped session's id stays live until
+        // its container is confirmed gone.
+        let still = self.list_orphans(scope).await?;
         let mut removed = Vec::new();
-        for name in out.lines().map(str::trim) {
-            let Some(id) = SESSION_PREFIXES
-                .iter()
-                .find_map(|p| name.strip_prefix(p))
-                .filter(|id| plain_name(id) && in_scope(id, scope))
-            else {
-                continue;
-            };
-            if self.sessions.is_live(id) {
-                continue;
-            }
+        for o in found.into_iter().filter(|o| still.contains(o)) {
             self.audit(
                 NewEntry::new(Actor::Sallyd, "sandbox.orphan_removed")
                     .decision("deny")
-                    .args(json!({"container": name})),
+                    .args(json!({"container": o.name, "id": o.container, "sweep": sweep.as_str()})),
                 AuditLevel::default(),
             )
             .await?;
-            self.run("rm", rm_args(name)).await?;
-            removed.push(name.to_owned());
+            // By ID: a name re-used since the listing is another container (PS-L5).
+            self.run("rm", rm_args(&o.container)).await?;
+            removed.push(o.name);
         }
         Ok(removed)
+    }
+
+    /// This installation's containers in `scope` that no live session owns.
+    async fn list_orphans(&self, scope: &str) -> Result<Vec<Orphan>, LaunchError> {
+        let out = self.run("ps", ps_args(&self.installation)).await?;
+        orphans(&out, &self.installation, scope, |id| {
+            self.sessions.is_live(id)
+        })
+        .map_err(|msg| LaunchError::Command { verb: "ps", msg })
     }
 
     /// Stops a launch nobody received, retrying until the container is gone. Meanwhile the
@@ -78,7 +104,9 @@ impl Launcher {
                         "container": e.running.name,
                         "detail": capped(&e.error.to_string()),
                     }));
-                let _ = self.audit(entry, e.running.level).await;
+                if self.audit(entry, e.running.level).await.is_err() {
+                    self.unaudited("sandbox.stop_failed", e.running.paths.id().as_str());
+                }
             }
             // `stop` also fails after the container is gone (scratch removal): nothing runs.
             if matches!(self.container_exists(&e.running.name).await, Ok(false)) {
@@ -180,39 +208,5 @@ impl Launcher {
             Err(e) => Err(LaunchError::Internal(format!("{}: {e}", sockets.display()))),
         })
         .await
-    }
-}
-
-/// `id` is `scope` itself or starts with `scope-`; an empty scope covers every id.
-fn in_scope(id: &str, scope: &str) -> bool {
-    scope.is_empty() || id == scope || id.strip_prefix(scope).is_some_and(|r| r.starts_with('-'))
-}
-
-/// `[a-z0-9-]`, as session ids are.
-fn plain_name(s: &str) -> bool {
-    !s.is_empty()
-        && s.bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn orphan_scope_ends_at_a_dash() {
-        assert!(in_scope("t1-1-a", "t1-1"));
-        assert!(in_scope("t1-1", "t1-1"));
-        assert!(in_scope("anything", ""));
-        assert!(!in_scope("t1-10-a", "t1-1"));
-        assert!(!in_scope("t1-1a", "t1-1"));
-    }
-
-    #[test]
-    fn orphan_names_are_plain() {
-        assert!(plain_name("t1-0-a"));
-        for bad in ["", "A", "a b", "a/b", "a;b"] {
-            assert!(!plain_name(bad), "{bad:?}");
-        }
     }
 }

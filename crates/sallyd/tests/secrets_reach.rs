@@ -91,7 +91,8 @@ async fn session(lx: &Lx, tag: &str) -> Running {
     let req = WorkspaceRequest {
         paths: lx.paths(tag),
         manifest: Arc::new(lx.f.load(MANIFEST)),
-        default_image: net_image(),
+        default_image: Some(net_image()),
+        crash: sallyd::daemon::crash::CrashReporter::channel().0,
     };
     let r = lx.launcher.launch_workspace(req).await.expect("launch");
     for _ in 0..100 {
@@ -114,6 +115,7 @@ async fn harness(lx: &Lx, tag: &str) -> String {
         profiles: paths.data_root().join("profiles"),
         hooks_dir: lx.podman.hooks_dir(),
         mounts_file: lx.podman.mounts_file(),
+        installation: lx.installation.clone(),
     };
     let argv = harness_argv(&common, &paths, &v, &test_image()).unwrap();
     let id = lx.hermetic(&argv).await;

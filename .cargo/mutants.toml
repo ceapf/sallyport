@@ -17,6 +17,10 @@ exclude_re = [
   'crates/sally-core/src/audit/writer\.rs:\d+:\d+: replace \| with \^ in take_lock$',
   'crates/sally-core/src/audit/writer\.rs:\d+:\d+: replace \| with \^ in open_log$',
   'crates/sally-core/src/secrets/store\.rs:\d+:\d+: replace \| with \^ in SecretStore::open$',
+  'crates/sallyd/src/daemon/startup\.rs:\d+:\d+: replace \| with \^ in open_state_dir$',
+  'crates/sallyd/src/daemon/install\.rs:\d+:\d+: replace \| with \^ in load_or_create$',
+  'crates/sallyd/src/daemon/install\.rs:\d+:\d+: replace \| with \^ in create$',
+  'crates/sallyd/src/daemon/stale\.rs:\d+:\d+: replace \| with \^ in open_dir$',
   'crates/sallyd/src/egress/ca\.rs:\d+:\d+: replace \| with \^ in write_files$',
   'crates/sallyd/src/egress/ca\.rs:\d+:\d+: replace \| with \^ in write_new$',
   'crates/sallyd/src/egress/net\.rs:\d+:\d+: replace \| with \^ in bind$',
@@ -73,4 +77,9 @@ exclude_re = [
   # Same value (rule i): `Value::default()` is `Value::Null`, which is what visit_unit returns
   # (architect ruling Q13, Task 7). Proof: json.rs `null_parses_to_the_default_value`.
   '''crates/sallyd/src/rpc/json\.rs:\d+:\d+: replace <impl Visitor<'de> for StrictVisitor>::visit_unit -> Result<Value, E> with Ok\(Default::default\(\)\)$''',
+  # Same value (rule i): NoSecrets::load returns an empty Vec, written Ok(Vec::new()); the mutant
+  # writes the same empty Vec as Ok(vec![]) (architect ruling Q70, Task 12). TODO(#99): remove
+  # this entry when the store file replaces NoSecrets.
+  # Proof: lookup.rs `no_secrets_holds_no_value`.
+  'crates/sallyd/src/session/lookup\.rs:\d+:\d+: replace <impl SecretSource for NoSecrets>::load -> Result<Vec<\(String, Secret<String>\)>, SecretsError> with Ok\(vec!\[\]\)$',
 ]

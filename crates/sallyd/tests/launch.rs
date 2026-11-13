@@ -9,7 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use sallyd::sandbox::{Expect, LaunchError, check_in_container};
+use sallyd::sandbox::{Expect, LaunchError, Sweep, check_in_container};
 
 mod common;
 use common::container::*;
@@ -71,7 +71,7 @@ fn an_entry_that_exits_at_once_refuses_the_launch() {
         let v =
             x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "rw")]));
         let mut req = x.request(&v, "exit");
-        req.default_image = exiting_image();
+        req.default_image = Some(exiting_image());
         let paths = req.paths.clone();
         let e = x.launcher.launch_workspace(req).await.unwrap_err();
         assert!(matches!(e, LaunchError::NotRunning(_)), "{e}");
@@ -81,6 +81,30 @@ fn an_entry_that_exits_at_once_refuses_the_launch() {
         assert!(!exists(&format!("sp-ws-{}", paths.id().as_str())));
         assert!(!paths.data_root().exists() && !paths.socket_root().exists());
         let r = x.launch(&v, "after-exit").await.unwrap();
+        x.stop(r).await;
+    });
+}
+
+/// Architect Q58: with no bundled image, a manifest without `runtime.image` is refused
+/// `no-default-image` before anything is reserved or created: one `sandbox.refuse`, no
+/// `sandbox.launch`, no directories, and the same writable mount launches next.
+#[test]
+fn no_default_image_refuses_before_anything_is_reserved() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let v =
+            x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "rw")]));
+        let mut req = x.request(&v, "noimg");
+        req.default_image = None;
+        let paths = req.paths.clone();
+        let e = x.launcher.launch_workspace(req).await.unwrap_err();
+        assert!(matches!(e, LaunchError::NoDefaultImage), "{e}");
+        assert_eq!(x.events.list(), ["sandbox.refuse"]);
+        let refuse = x.events.args("sandbox.refuse").unwrap();
+        assert_eq!(refuse["reason"], "no-default-image", "{refuse}");
+        assert_eq!(refuse["cleanup"], "nothing to clean up", "{refuse}");
+        assert!(!paths.data_root().exists() && !paths.socket_root().exists());
+        let r = x.launch(&v, "after-noimg").await.unwrap();
         x.stop(r).await;
     });
 }
@@ -603,18 +627,127 @@ fn orphans_of_a_previous_sallyd_are_removed() {
         // A session live in this launcher is never an orphan.
         assert!(
             x.launcher
-                .remove_orphans(&x.scope)
+                .remove_orphans(&x.scope, Sweep::Startup)
                 .await
                 .unwrap()
                 .is_empty()
         );
         assert!(exists(&name));
-        // The next sallyd starts with no live sessions and removes it.
-        let next = Lx::new();
-        let removed = next.launcher.remove_orphans(&x.scope).await.unwrap();
+        // Another daemon (another installation) never takes it.
+        let stranger = Lx::new();
+        assert!(
+            stranger
+                .launcher
+                .remove_orphans(&x.scope, Sweep::Startup)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(exists(&name));
+        // The next sallyd of this installation starts with no live sessions and removes it.
+        let next = x.next_sallyd();
+        let removed = next
+            .launcher
+            .remove_orphans(&x.scope, Sweep::Startup)
+            .await
+            .unwrap();
         assert_eq!(removed, std::slice::from_ref(&name));
         assert!(!exists(&name));
         assert_eq!(next.events.list(), ["sandbox.orphan_removed"]);
+        assert_eq!(
+            next.events.args("sandbox.orphan_removed").unwrap()["sweep"],
+            "startup"
+        );
+    });
+}
+
+/// `podman create` of a session-named container out of band, with `label` if given.
+fn create_out_of_band(name: &str, label: Option<&str>) {
+    let image = test_image();
+    let mut args = vec!["create", "--pull=never", "--network=none", "--name", name];
+    let label = label.map(|id| format!("sallyport.installation={id}"));
+    if let Some(l) = &label {
+        args.extend(["--label", l.as_str()]);
+    }
+    args.push(image.as_str());
+    let made = podman(&args);
+    assert!(
+        made.status.success(),
+        "{}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+}
+
+/// RT-AG-08b, architect Q61 (security review M4) and Q64: a session container of this
+/// installation that appears after the startup sweep (a `podman create` a killed `sallyd` left
+/// running) is removed by the periodic sweep within one period, audited first, while a live
+/// session's container survives the same sweeps. Without the sweep it would hold mounts the
+/// overlap rule does not know. A foreign container with a session name survives every sweep:
+/// one with no label (another daemon's, a test run's) and one with another installation's id.
+/// Controls: the sweep loop and `is_live` (the late orphan, the live session); the label match
+/// (the two foreign containers), both layers together: podman's `--filter label=` and the
+/// comparison in `sandbox::orphans`. Removing one layer alone leaves the other refusing them,
+/// so each is pinned by its own unit test in `sandbox::orphans` (the listing asks podman for
+/// the label; only this installation's containers match).
+#[test]
+fn rt_ag_08b_a_late_orphan_is_swept_while_a_live_session_and_foreign_containers_stay() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let v =
+            x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "rw")]));
+        let live = x.launch(&v, "live").await.unwrap();
+        let unlabelled = format!("sp-ws-{}-f0reign", x.scope);
+        let other = format!("sp-ws-{}-0ther", x.scope);
+        create_out_of_band(&unlabelled, None);
+        create_out_of_band(&other, Some("0123abcd-ef01-4234-8567-89abcdef0123"));
+        let sweeping = tokio::spawn(sallyd::daemon::sweep::every(
+            x.launcher.clone(),
+            x.scope.clone(),
+            Duration::from_millis(500),
+            sallyd::oplog::Oplog::new(std::io::sink()),
+        ));
+        let orphan = format!("sp-ws-{}-late0rphan", x.scope);
+        create_out_of_band(&orphan, Some(x.installation.as_str()));
+        let end = std::time::Instant::now() + Duration::from_secs(30);
+        while exists(&orphan) {
+            assert!(
+                std::time::Instant::now() < end,
+                "the late orphan was never swept"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // Two more periods: the live session and the foreign containers are never taken.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        sweeping.abort();
+        assert!(exists(live.name()));
+        assert!(
+            exists(&unlabelled),
+            "a container without the label was swept"
+        );
+        assert!(exists(&other), "another installation's container was swept");
+        for name in [&unlabelled, &other] {
+            assert!(podman(&["rm", name]).status.success());
+        }
+        let swept = x.events.args("sandbox.orphan_removed").unwrap();
+        assert_eq!(
+            (swept["container"].as_str(), swept["sweep"].as_str()),
+            (Some(orphan.as_str()), Some("periodic"))
+        );
+        // The entry names the ID `rm` was given (security re-review L3).
+        let id = swept["id"].as_str().unwrap_or_default();
+        assert!(
+            id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{swept}"
+        );
+        assert_eq!(
+            x.events
+                .list()
+                .iter()
+                .filter(|e| *e == "sandbox.orphan_removed")
+                .count(),
+            1
+        );
+        x.stop(live).await;
     });
 }
 

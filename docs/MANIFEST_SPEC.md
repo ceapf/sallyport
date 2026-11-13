@@ -435,6 +435,7 @@ never on message text); the field path uses `a.b[0].c` form.
 | `bad-header` / `bad-format` | injection header/format invalid |
 | `mount-changed` | launch-time re-check: mount root replaced since validation |
 | `digest-mismatch` | launch refusal (`sandbox.refuse`): the pinned image is not in local storage, or the local image does not carry the pinned digest (`sallyd::sandbox::images`); images are never pulled |
+| `no-default-image` | launch refusal (`sandbox.refuse`): the manifest names no `runtime.image` and no bundled workspace image is installed (#88); nothing is reserved or created (architect Q58) |
 | `unacknowledged-risk` | an `acknowledge_*` flag is needed (§1.1) |
 | `protected-path` | writable mount inside `.git`; also the broker's denial code for protected-path writes |
 | `socket-in-mount` | launch-time bounded scan found a Unix socket in a mount tree (sandbox driver, task 6) |

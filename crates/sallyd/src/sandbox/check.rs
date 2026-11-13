@@ -14,12 +14,13 @@ use super::argv::{
     CA_BUNDLE, CA_BUNDLE_VARS, ENTRY, HARNESS_API_KEY, INFER_SOCKET, MODEL_GUEST, OPENAI_BASE_URL,
     PLACEHOLDER, PROXY_URL, PROXY_VARS, SESSION_CA,
 };
-use super::types::{ArgvError, ImageRef, Role, UserIds};
+use super::types::{ArgvError, INSTALLATION_LABEL, ImageRef, Installation, Role, UserIds};
 
 /// Options written `--flag value`, as two tokens; `--flag=value` is refused, so the argv has one
 /// spelling and does not depend on how podman parses either form.
-const SPACE_FLAGS: [&str; 13] = [
+const SPACE_FLAGS: [&str; 14] = [
     "--name",
+    "--label",
     "--ulimit",
     "--tmpfs",
     "--security-opt",
@@ -50,9 +51,10 @@ const BARE_FLAGS: [&str; 4] = ["--rm", "--no-hosts", "--read-only", "--init"];
 const REPEATABLE: [&str; 3] = ["-v", "--env", "--security-opt"];
 /// Options every role must carry exactly once (`--security-opt` is counted per kind in
 /// [`require`]).
-const REQUIRED: [&str; 18] = [
+const REQUIRED: [&str; 19] = [
     "--rm",
     "--name",
+    "--label",
     "--pull",
     "--http-proxy",
     "--log-driver",
@@ -117,6 +119,8 @@ pub struct Allowed {
     pub sources: Vec<Source>,
     /// Where overlay upper and work directories may live; `None` forbids overlays.
     pub scratch: Option<PathBuf>,
+    /// The one `--label` allowed: [`INSTALLATION_LABEL`]`=<this id>` (Q64).
+    pub installation: Installation,
 }
 
 fn forbid<T>(msg: impl Into<String>) -> Result<T, ArgvError> {
@@ -293,6 +297,7 @@ fn check_option(
         ("--device", _) if a.role == Role::Inference => fixed(GPU_DEVICE),
         ("--security-opt", Some(v)) => security_opt(v, a),
         ("--name", Some(v)) => ok(name_ok(v, a.role)),
+        ("--label", _) => fixed(&format!("{INSTALLATION_LABEL}={}", a.installation.as_str())),
         ("--pids-limit", Some(v)) => ok(positive(v)),
         ("--cpus", Some(v)) => ok(cpus_ok(v)),
         ("--memory", Some(v)) => {

@@ -1,8 +1,8 @@
 //! The seccomp profiles (ARCHITECTURE §3.4), embedded in the binary (#10). At launch they are
 //! written into the session's 0700 directory, so no file outside Sallyport's control decides what
 //! a sandbox may call. `scripts/gen_seccomp.py` derives them from containers-common's default
-//! profile; the tests here check the properties independently of the generator. TODO(#17):
-//! container red-team tests RT-NET-12 (socket families) and RT-FS-17 (namespaces), Task 6c.
+//! profile; the tests here check the properties independently of the generator. The container
+//! red-team tests are RT-NET-12 (socket families) and RT-FS-17 (namespaces).
 
 use std::io::Write as _;
 use std::os::fd::AsFd;

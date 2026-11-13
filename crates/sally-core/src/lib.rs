@@ -11,3 +11,4 @@ pub mod fd;
 mod fsutil;
 pub mod manifest;
 pub mod secrets;
+pub mod text;

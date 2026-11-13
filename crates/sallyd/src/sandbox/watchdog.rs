@@ -16,8 +16,8 @@
 //! path, panics included, and a failed unpause kills it. A pause that fails because the container
 //! is gone ends the watchdog. A kill audits `session.resource_limit` first (SI-4), then kills and
 //! removes the container until it is confirmed gone, auditing `session.kill_failed` once if the
-//! first attempt fails. The kill happens even when an audit entry cannot be written; TODO(#17):
-//! Task 12 gives `sallyd` a logger, and that failure gets an error line.
+//! first attempt fails. The kill happens even when an audit entry cannot be written; that
+//! failure gets an error line in the oplog.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -32,6 +32,7 @@ use super::launch::{LaunchError, Launcher, capped};
 use super::scan::LaunchScan;
 use super::stage::{Area, StageBounds, Verdict, measure};
 use super::types::SessionPaths;
+use crate::daemon::crash::CrashReporter;
 
 /// How often the floor task reads free space.
 pub(super) const FLOOR_POLL: Duration = Duration::from_millis(250);
@@ -216,7 +217,10 @@ impl Shared {
             .session(&self.target.sid)
             .decision("deny")
             .args(args);
-        let _ = self.launcher.audit(entry, self.target.level).await;
+        if self.launcher.audit(entry, self.target.level).await.is_err() {
+            self.launcher
+                .unaudited("session.resource_limit", &self.target.sid);
+        }
         kill(&self.launcher, &self.target).await;
     }
 }
@@ -224,13 +228,19 @@ impl Shared {
 /// A running watchdog. Dropping it stops both tasks and any walk in progress.
 #[derive(Debug)]
 pub(super) struct Watchdog {
-    tasks: Vec<tokio::task::JoinHandle<()>>,
+    tasks: Vec<tokio::task::AbortHandle>,
     cancel: Arc<AtomicBool>,
 }
 
 impl Watchdog {
-    /// Starts the watchdog of a started session.
-    pub(super) fn spawn(launcher: &Arc<Launcher>, target: Target, plan: WatchPlan) -> Self {
+    /// Starts the watchdog of a started session; a panic in either task is reported to `crash`
+    /// as `watchdog` (architect Q47).
+    pub(super) fn spawn(
+        launcher: &Arc<Launcher>,
+        target: Target,
+        plan: WatchPlan,
+        crash: &CrashReporter,
+    ) -> Self {
         let cancel = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(Shared {
             launcher: Arc::clone(launcher),
@@ -246,12 +256,12 @@ impl Watchdog {
                 (watch, Mutex::new(account))
             }),
         });
-        let mut tasks = vec![tokio::spawn(floor_task(
-            Arc::clone(&shared),
-            Arc::new(plan.watched),
-        ))];
+        let mut tasks = vec![crash.spawn(
+            "watchdog",
+            floor_task(Arc::clone(&shared), Arc::new(plan.watched)),
+        )];
         if shared.stage.is_some() {
-            tasks.push(tokio::spawn(stage_task(shared)));
+            tasks.push(crash.spawn("watchdog", stage_task(shared)));
         }
         Self { tasks, cancel }
     }
@@ -523,7 +533,9 @@ async fn kill(launcher: &Launcher, t: &Target) {
                     "container": t.container,
                     "detail": capped(&detail),
                 }));
-            let _ = launcher.audit(entry, t.level).await;
+            if launcher.audit(entry, t.level).await.is_err() {
+                launcher.unaudited("session.kill_failed", &t.sid);
+            }
         }
         tokio::time::sleep(MIN_GAP).await;
     }

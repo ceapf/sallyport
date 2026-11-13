@@ -42,9 +42,15 @@ impl Control {
         }
     }
 
-    /// Serves `listener` (`control.sock`) for peers with `uid`.
-    pub fn listen(self: Arc<Self>, listener: tokio::net::UnixListener, uid: u32) -> listen::Handle {
-        listen::spawn(listener, self, MAX_CONNECTIONS, uid)
+    /// Serves `listener` (`control.sock`) for peers with `uid`; a panicking connection is
+    /// reported to the daemon's `crash` reporter (it stops every session).
+    pub fn listen(
+        self: Arc<Self>,
+        listener: tokio::net::UnixListener,
+        uid: u32,
+        crash: listen::CrashReporter,
+    ) -> listen::Handle {
+        listen::spawn(listener, self, MAX_CONNECTIONS, uid, "control.sock", crash)
     }
 
     /// Serves one stream to its end.
@@ -212,8 +218,15 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         let (sink, rec) = recorder("");
         let me = rustix::process::getuid().as_raw();
-        let h =
-            crate::rpc::listen::spawn(listener, Arc::new(Control::new(rec)), 1, me.wrapping_add(1));
+        let (crash, _crashes) = crate::rpc::listen::CrashReporter::channel();
+        let h = crate::rpc::listen::spawn(
+            listener,
+            Arc::new(Control::new(rec)),
+            1,
+            me.wrapping_add(1),
+            "control.sock",
+            crash,
+        );
         let mut s = UnixStream::connect(&path).await.unwrap();
         let _ = s.write_all(b"{}\n").await;
         let mut out = Vec::new();

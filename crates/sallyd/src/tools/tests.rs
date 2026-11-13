@@ -100,6 +100,10 @@ struct Fx {
     gate: Arc<tokio::sync::Mutex<()>>,
     ran: Ran,
     rows_at_run: Arc<AtomicUsize>,
+    /// The session's operations, as its stop sees them.
+    ops: Ops,
+    /// Panics of the tools' own tasks.
+    crashes: StdMutex<crate::daemon::crash::CrashReceiver>,
     /// The fixture's scratch directory, removed on drop.
     base: PathBuf,
 }
@@ -276,11 +280,15 @@ fn fx(name: &str, o: Opts) -> Fx {
     let ran = Arc::new(StdMutex::new(Vec::new()));
     let rows_at_run = Arc::new(AtomicUsize::new(0));
     let exec_gate = Arc::new(tokio::sync::Mutex::new(()));
+    let ops = Ops::new();
+    let (crash, crashes) = crate::daemon::crash::CrashReporter::channel();
     let tools = Arc::new(Tools::new(Parts {
         builtin: o.builtin,
         mounts,
         record: rec,
         exec_gate: Arc::clone(&exec_gate),
+        ops: ops.clone(),
+        crash,
         ids: UserIds {
             uid: rustix::process::getuid().as_raw(),
             gid: rustix::process::getgid().as_raw(),
@@ -304,6 +312,8 @@ fn fx(name: &str, o: Opts) -> Fx {
         gate: exec_gate,
         ran,
         rows_at_run,
+        ops,
+        crashes: StdMutex::new(crashes),
         base,
     }
 }
@@ -1138,4 +1148,201 @@ impl<R: Runner> Executor for Arc<Tools<R>> {
     async fn run(&self, t: Ticket) -> Option<ToolOutcome> {
         Tools::run(self, t).await
     }
+}
+
+/// Q59: once the session's operations are closed, a call the policy lets run is denied
+/// `session-stopping` with its `tool.deny`; no `tool.run`, and the runner is never asked.
+#[tokio::test]
+async fn a_call_after_the_close_is_denied_and_nothing_runs() {
+    let f = fx("closed", opts(all_modes()));
+    f.ops.close();
+    let out = f.call("shell", json!({"cmd": ["ls"]})).await.unwrap();
+    assert_eq!(
+        (out.is_error, out.text.as_str()),
+        (true, "denied: session-stopping")
+    );
+    let ev = f.sink.events();
+    assert!(!ev.iter().any(|e| e == "tool.run"), "{ev:?}");
+    let d = f.sink.last("tool.deny");
+    assert_eq!(
+        (d["code"].as_str(), d["tool"].as_str()),
+        (Some("session-stopping"), Some("shell"))
+    );
+    assert!(f.ran.lock().unwrap().is_empty());
+    assert_eq!(f.ops.in_flight(), 0);
+}
+
+/// Q59 (b): a write parked at the exec gate when the stop comes never begins: `tool.result`
+/// `aborted` (`session-stop`), and the file is not touched, even once the gate is free.
+#[tokio::test]
+async fn a_write_parked_at_the_exec_gate_aborts_at_the_stop() {
+    let f = Arc::new(fx("parked-stop", opts(all_modes())));
+    let rw = f.dir("/workspace/rw").to_owned();
+    let held = Arc::clone(&f.gate).lock_owned().await;
+    let f2 = Arc::clone(&f);
+    let h = tokio::spawn(async move {
+        f2.call(
+            "fs_write",
+            json!({"path": "/workspace/rw/x", "content_b64": "aGk="}),
+        )
+        .await
+    });
+    f.until_run().await;
+    assert_eq!(f.ops.in_flight(), 1);
+    f.ops.stop();
+    assert_eq!(f.ops.drained(Duration::from_secs(5)).await, 0);
+    let out = h.await.unwrap().unwrap();
+    assert_eq!(
+        (out.is_error, out.text.as_str()),
+        (true, "failed: session-stopping")
+    );
+    let r = f.sink.last("tool.result");
+    assert_eq!(
+        (
+            r["outcome"].as_str(),
+            r["reason"].as_str(),
+            r["tool"].as_str()
+        ),
+        (Some("aborted"), Some("session-stop"), Some("fs_write"))
+    );
+    assert!(r["action_sha256"].is_string() && r["call"].is_u64(), "{r}");
+    drop(held);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!rw.join("x").exists(), "an aborted write landed");
+}
+
+/// Q59 (b): the last check before the effect. A write that waited at the gate while the session's
+/// operations closed (the stop signal not raised yet) does not begin once the gate is free.
+#[tokio::test]
+async fn a_write_that_gets_the_gate_after_the_close_aborts() {
+    let f = Arc::new(fx("parked-close", opts(all_modes())));
+    let rw = f.dir("/workspace/rw").to_owned();
+    let held = Arc::clone(&f.gate).lock_owned().await;
+    let f2 = Arc::clone(&f);
+    let h = tokio::spawn(async move {
+        f2.call(
+            "fs_write",
+            json!({"path": "/workspace/rw/x", "content_b64": "aGk="}),
+        )
+        .await
+    });
+    f.until_run().await;
+    f.ops.close();
+    drop(held);
+    let out = h.await.unwrap().unwrap();
+    assert_eq!(out.text, "failed: session-stopping");
+    assert_eq!(f.sink.last("tool.result")["outcome"], "aborted");
+    assert!(!rw.join("x").exists(), "a write began after the close");
+}
+
+/// Q59: the run section is its own task, so a caller dropped while its write waits at the gate
+/// (a connection aborted after its grace) loses neither the effect nor its `tool.result`.
+#[tokio::test]
+async fn a_parked_write_whose_caller_is_gone_still_lands_and_is_recorded() {
+    let f = Arc::new(fx("parked-gone", opts(all_modes())));
+    let rw = f.dir("/workspace/rw").to_owned();
+    let held = Arc::clone(&f.gate).lock_owned().await;
+    let f2 = Arc::clone(&f);
+    let h = tokio::spawn(async move {
+        f2.call(
+            "fs_write",
+            json!({"path": "/workspace/rw/x", "content_b64": "aGk="}),
+        )
+        .await
+    });
+    f.until_run().await;
+    h.abort();
+    let _ = h.await;
+    assert_eq!(f.ops.in_flight(), 1, "the operation outlives its caller");
+    drop(held);
+    until("tool.result", || {
+        f.sink.events().iter().any(|e| e == "tool.result")
+    })
+    .await;
+    assert_eq!(f.sink.last("tool.result")["outcome"], "ok");
+    assert_eq!(std::fs::read(rw.join("x")).unwrap(), b"hi");
+    assert_eq!(f.ops.drained(Duration::from_secs(5)).await, 0);
+    assert!(f.crashes.lock().unwrap().try_recv().is_err(), "no panic");
+}
+
+/// Q59 (c), (d): a command the stop killed is recorded as the runner reports it.
+#[tokio::test]
+async fn a_shell_the_stop_killed_is_recorded_as_such() {
+    let mut o = opts(vec![]);
+    o.out = Output {
+        status: Status::Killed("session-stop"),
+        stdout: captured(b"partial"),
+        stderr: Captured::default(),
+    };
+    let f = fx("shell-stop", o);
+    let out = f
+        .call("shell", json!({"cmd": ["sleep", "1000"]}))
+        .await
+        .unwrap();
+    assert!(out.is_error);
+    let r = f.sink.last("tool.result");
+    assert_eq!(
+        (&r["killed"], &r["exit"]),
+        (&json!("session-stop"), &Value::Null)
+    );
+    assert_eq!(r["stdout"]["bytes"], 7);
+    assert_eq!(f.ops.in_flight(), 0);
+}
+
+/// Q59: a panic inside a tool's run section is reported to the session's crash receiver (and so
+/// ends the session `crash`); the caller gets no reply and the operation is not left counted.
+#[tokio::test]
+async fn a_panicking_run_is_reported_and_ends_its_operation() {
+    struct Boom;
+    impl Runner for Boom {
+        async fn run(&self, _: &[String], _: &str) -> Output {
+            panic!("runner");
+        }
+    }
+    let (_sink, rec) = recorder("s-boom");
+    let (gate, _desk) = queue::new(
+        "s-boom".to_owned(),
+        Policy {
+            builtin: vec![BuiltinTool::Shell],
+            shell: ShellPolicy::Allow,
+            destructive_requires_approval: false,
+            fetch_writes: FetchWrites::Approve,
+            mounts: vec![],
+            mcp: vec![],
+        },
+        Limits {
+            timeout: Duration::from_secs(30),
+            max_pending: 8,
+        },
+        rec.clone(),
+        None,
+    );
+    let ops = Ops::new();
+    let (crash, mut crashes) = crate::daemon::crash::CrashReporter::channel();
+    let tools = Tools::new(Parts {
+        builtin: vec![BuiltinTool::Shell],
+        mounts: vec![],
+        record: rec,
+        exec_gate: Arc::new(tokio::sync::Mutex::new(())),
+        ops: ops.clone(),
+        crash,
+        ids: UserIds { uid: 1, gid: 1 },
+        shell: Boom,
+    });
+    let b = Bound {
+        session: "s-boom".into(),
+        call: gate.begin(),
+        action: Action::Shell {
+            argv: vec!["ls".into()],
+            cwd: "/".into(),
+        },
+    };
+    let ticket = gate.admit(b, None, Some(false)).await.unwrap();
+    assert!(tools.run(ticket).await.is_none());
+    let c = tokio::time::timeout(Duration::from_secs(5), crashes.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(c.task, "tool");
+    assert_eq!(ops.in_flight(), 0);
 }

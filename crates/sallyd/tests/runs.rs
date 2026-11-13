@@ -141,6 +141,74 @@ fn a_bounded_lock_fails_naming_the_lock_once_its_wait_runs_out() {
     std::fs::remove_dir_all(&d).unwrap();
 }
 
+/// Ruling 3 / Q65: a bounded wait that runs out is `None` from the `try_` form (the caller then
+/// lists the test as not run).
+#[test]
+fn a_bounded_try_lock_gives_none_once_its_wait_runs_out() {
+    let d = scratch("trybounded");
+    let path = lock_dir_in(&d).join("disk-free.lock");
+    let holder = open_lock(&path);
+    rustix::fs::flock(&holder, rustix::fs::FlockOperation::LockShared).unwrap();
+    let wait = std::time::Duration::from_millis(300);
+    let started = std::time::Instant::now();
+    assert!(try_lock_exclusive_within(&path, wait, "a test").is_none());
+    assert!(started.elapsed() >= wait);
+    drop(holder);
+    assert!(try_lock_exclusive_within(&path, wait, "a test").is_some());
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+fn panic_text(r: std::thread::Result<()>) -> String {
+    let e = r.unwrap_err();
+    e.downcast_ref::<String>()
+        .cloned()
+        .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+        .unwrap_or_default()
+}
+
+/// Under the wrapper, a test that could not run lists itself (`<package> <binary> <test>`) and
+/// returns; not under it, it panics with the reason, as before.
+#[test]
+fn a_test_that_could_not_run_lists_itself_only_under_the_wrapper() {
+    let d = scratch("notrun");
+    record_not_run_in(Some(&d), "rt_ag_09_x", "the lock was not free");
+    record_not_run_in(Some(&d), "rt_ag_09_y", "the lock was not free");
+    assert_eq!(
+        std::fs::read_to_string(d.join("list")).unwrap(),
+        "sallyd runs rt_ag_09_x\nsallyd runs rt_ag_09_y\n"
+    );
+    let meta = std::fs::metadata(d.join("list")).unwrap();
+    assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    let r = std::panic::catch_unwind(|| record_not_run_in(None, "rt_ag_09_x", "the lock X"));
+    assert!(panic_text(r).contains("the lock X"));
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+/// Fail closed: a list directory open to others, a list that cannot be written (here a
+/// directory in its place) or a malformed test name panics instead of passing silently.
+#[test]
+fn a_not_run_list_that_cannot_be_trusted_or_written_panics() {
+    let d = scratch("notrun-bad");
+    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let r = std::panic::catch_unwind(|| record_not_run_in(Some(&d), "t", "why"));
+    assert!(panic_text(r).contains("not-run directory"));
+    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::create_dir(d.join("list")).unwrap();
+    let r = std::panic::catch_unwind(|| record_not_run_in(Some(&d), "t", "why"));
+    assert!(panic_text(r).contains("could not list it as not run"));
+    std::fs::remove_dir(d.join("list")).unwrap();
+    std::os::unix::fs::symlink(d.join("elsewhere"), d.join("list")).unwrap();
+    let r = std::panic::catch_unwind(|| record_not_run_in(Some(&d), "t", "why"));
+    assert!(panic_text(r).contains("could not list it as not run"));
+    assert!(!d.join("elsewhere").exists(), "followed a symlink");
+    std::fs::remove_file(d.join("list")).unwrap();
+    for bad in ["", "a b", "a-b", "a\nb"] {
+        let r = std::panic::catch_unwind(|| record_not_run_in(Some(&d), bad, "why"));
+        assert!(panic_text(r).contains("not a test name"), "{bad:?}");
+    }
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
 #[test]
 fn a_lock_directory_open_to_others_or_a_symlink_is_refused() {
     let d = scratch("loose");

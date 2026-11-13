@@ -88,14 +88,14 @@ container-free tests run: unit tests, all of sally-core's `tests/`, `sallyd` `ar
   `manifest/host.rs`, `config.rs`.
 - `make mutants-wide-{core,sallyd,shim}` (sharded): sally-core `manifest/{image,hostenv,parse,
   summary,units}.rs`, `secrets/{store,secret}.rs`, `audit/{entry,redact,verify,writer,layout}.rs`,
-  `fsutil.rs`, `fd.rs`; sallyd `sandbox/{argv,check,types,profiles,overlap,scan,images,changes,dirs,
-  podman,disk,stage}.rs`, `sandbox/launch/error.rs`, `egress/{addr,authority,head,policy,server,
+  `fsutil.rs`, `fd.rs`, `text.rs`; sallyd `sandbox/{argv,check,types,profiles,overlap,scan,images,
+  changes,dirs,podman,disk,stage,budget,orphans}.rs`, `sandbox/launch/error.rs`,
+  `daemon/{mod,crash,startup,stale,install}.rs`,
+  `oplog.rs`, `session/{lookup,types,exit}.rs`, `egress/{addr,authority,head,policy,server,
   hostaddrs,tunnel,net,ca,roots,rewrite,intercept,intercept_tls,intercept_report,meter,inject,
-  redact}.rs` (net.rs
-  tests stay hermetic: nothing leaves the machine),
-  `rpc/{agent,control,frame,json,listen,mcp,message,rate,record}.rs`,
+  redact}.rs` (net.rs tests stay hermetic: nothing leaves the machine), `rpc/{agent,control,frame,json,listen,mcp,message,rate,record}.rs`,
   `llm/{body,head,io,reply,server}.rs`, `approvals/{action,glob,handler,policy,queue,render}.rs`,
-  `tools/{args,path,tag,fs,shell,procs,mod,dac}.rs`; sally-shim `args.rs`, `relay.rs`.
+  `tools/{args,path,tag,fs,shell,procs,mod,dac,ops}.rs`; sally-shim `args.rs`, `relay.rs`.
 
 ## Agent / model routing (ECC)
 
@@ -178,13 +178,19 @@ Two sessions may work in two worktrees at once; container tests are run-scoped
   branch.
 - A local mutation run (through the `make mutants*` targets, never bare `cargo mutants`) holds
   the per-user `disk-free` lock (shared); the disk-floor writer tests
-  take it exclusively, so they wait for a mutation run in either lane to end (at most 20 minutes,
-  then they fail naming the lock). Local mutation runs cover only the files a branch touches;
-  full runs belong to the nightly.
+  take it exclusively, so they wait for a mutation run in either lane to end (at most 20 minutes).
+  One that times out has not run, which is not a failure: `scripts/test-run.sh` re-runs it once
+  at the end of the suite and exits 6 if it still cannot run. Local mutation runs cover only the
+  files a branch touches; full runs belong to the nightly. They go one file at a time, one run
+  per file, so the lock is released between files.
 - Merges still go one at a time.
 - A lane never touches the other lane's branch.
 - Shared files (`CLAUDE.md`, `REDTEAM_SUITE.md`, `.cargo/mutants.toml`, `Cargo.lock`): expect a
   rebase conflict and resolve it by keeping both sides' entries.
+- Resolve rebase conflicts by hand; never `-X theirs` or `-X ours`. After every rebase, before
+  any test or push, prove nothing of main's was lost. Every file the lane did not mean to change
+  (not in `git diff --name-only <old-base> <pre-rebase-head>`) must be identical to main's copy.
+  In files both sides changed, every line missing from main's copy must be one the lane removed.
 
 ## Public repository rules
 

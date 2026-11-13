@@ -4,7 +4,7 @@
 
 | Layer | Choice | Notes |
 |---|---|---|
-| Broker, sandbox orchestration, model validation, proxies, CLI | **Rust** (`tokio`, `hyper` 1.x + `rustls`, `rustix` for `openat2`, `rusqlite`, `serde`, `schemars`, `clap`, `tracing`) | Memory safety exactly where untrusted bytes are parsed. `#![forbid(unsafe_code)]` in every crate. |
+| Broker, sandbox orchestration, model validation, proxies, CLI | **Rust** (`tokio`, `hyper` 1.x + `rustls`, `rustix` for `openat2`, `rusqlite`, `serde`, `schemars`, `clap`, `tracing`; `sallyd`'s own log is the in-tree `sallyd::oplog`, §2.1) | Memory safety exactly where untrusted bytes are parsed. `#![forbid(unsafe_code)]` in every crate. |
 | Desktop shell + UI | **Tauri v2** + React + TypeScript (Vite) | Kept. The Rust side of Tauri is a *thin client* of `sallyd`; the webview gets no fs/shell plugins. |
 | Inference | **llama.cpp `llama-server`** in our own CUDA image | Kept. Pinned commit, built with `-DCMAKE_CUDA_ARCHITECTURES="86;89;120"`, CUDA 12.9. Prebuilt images lack sm_120. |
 | Sandboxing | **Podman rootless + crun**, GPU via CDI | See THREAT_MODEL §6 for why not gVisor/microVM on WSL2 in v1. |
@@ -85,6 +85,8 @@ flowchart LR
 | `sallyd::rpc` | `control.sock` (trusted methods, §4.1) and per-session `agent.sock` (the MCP subset, §4.2); bounded NDJSON framing, duplicate-key-refusing JSON, per-session rate and connection caps, `SO_PEERCRED` UID check before a byte is read, an audit entry before every reply | **yes** |
 | `sallyd::llm` | Per-session `llm.sock` (§4.4): HTTP/1.1 through hyper; the broker reads and decides on the head itself and gates hyper's writes; strict body allowlist; the model backend is a constructor argument (M3 wires the engine) | **yes** |
 | `sallyd::session` | Lifecycle: validate → ensure inference loaded → create socket dir → launch agent → wire → monitor → teardown (always, even on panic — `Drop` guard) | yes |
+| `sallyd::daemon` | Startup (Task 12, architect Q42): umask 077, no core dumps, non-dumpable, refuse root and set-id, the `$XDG_RUNTIME_DIR/sallyport` fd checked and `flock`ed for life (one `sallyd` per user), `NOFILE` raised; the crash reporter that turns a session task's panic into `session.crash` (Q47) | **yes** |
+| `sallyd::oplog` | The operational log on stderr (Q43): in-tree, no `tracing` subscriber. Diagnostics only, after the audit entry; each value redacted, escaped (`sally-core::text`) and capped at 4 KiB, the line at 16 KiB; a bounded queue and a writer thread, so logging never blocks. Never manifests, argv, bodies, model output or environment | yes |
 | `sallyd::infer` | Pool of at most one loaded model (v1); start/stop inference container; forward OpenAI-compatible requests over `infer.sock`; validate request JSON (allowed fields, size caps); stream back | yes |
 | `sallyd::tools` | The built-in tools as the approvals `Executor` (§4.3, Task 11): `path` (guest path → mount + canonical rel), `args`, `fs` (openat2 beneath a checked root: the host pin for `brokered`/`ro`, the workspace's own view through the container init's `/proc/<pid>/root` for `rw`/`staged`), `tag` (destructive tagger), `shell` + `exec` (`podman exec` runner; finds, limits and kills the call's processes through pidfds), `procs`. `fetch` follows (#75) | **yes** |
 | `sallyd::approvals` | Queue, canonicalization, rendering sanitization, single-use IDs, timeout, flood control, notifications to UI/CLI | **yes** |
@@ -158,6 +160,7 @@ podman --runtime <checked runtime_path>          # AMENDMENTS-02 B5: never the d
   --hooks-dir <data>/podman/hooks                # empty, Sallyport-owned (#11)
   --default-mounts-file <data>/podman/mounts.conf  # empty: no system mounts.conf (6b review)
   create --rm --name sp-{ws|h|infer}-<id>
+  --label sallyport.installation=<installation id>   # Q64: the orphan sweeps match it
   --pull=never --http-proxy=false --log-driver=none --ulimit core=0   # AMENDMENTS-01 §6.1
   --network=none --no-hosts          # NOT --dns=none: Podman 4.9 rejects it with --network=none (preflight V4)
   --read-only --read-only-tmpfs=false
@@ -257,6 +260,10 @@ and removes only the directories this launch created: an id whose directories ex
 before anything is created, so a stopped session's kept `stage/` is never touched. The claims
 are released only once the container is confirmed gone.
 
+0. **Image** (architect Q58). The workspace image is resolved first: the manifest's
+   `runtime.image`, else the bundled default. While no bundled image is installed (#88) the
+   default is absent, and a manifest without `runtime.image` is refused `no-default-image`
+   before anything is reserved or created.
 1. **Overlap rule** (AMENDMENTS-02 B4, RT-AG-08b). Two live sessions may mount overlapping host
    directories (the same directory, or one inside the other) only when neither mount is `rw` or
    `brokered`. Overlap is decided by path and by identity. Each claim carries the
@@ -265,8 +272,19 @@ are released only once the container is confirmed gone.
    still conflicts. No sandbox ever holds write access to an ancestor, a descendant or the same
    directory as another session's mount, so no live sandbox can swap what another session's
    launch scan pinned. `Launcher::remove_orphans` removes `sp-ws-*`/`sp-h-*` containers a
-   previous `sallyd` left running (audited `sandbox.orphan_removed`); `sallyd` calls it before
-   it accepts the first launch.
+   previous `sallyd` of this installation left running (audited `sandbox.orphan_removed` with
+   the name, the full ID it removes by, and `sweep: startup`); `sallyd` calls it before it accepts the first launch, then every 60 s
+   (`sweep: periodic`, architect Q61): a `podman create` a killed `sallyd` left running can make
+   its container after the startup sweep. A container is removed only if it carries this
+   installation's label (`sallyport.installation`, a UUID v4 kept 0600 as `installation` in
+   the state directory, created once under the single-instance lock, crash-safe (written and
+   synced as `installation.new`, linked into place, which never replaces anything, directory
+   synced), and never regenerated; architect Q64), has a session container's name and no live session owns it. One without the
+   label (another daemon's, a test run's, or one made before the label existed) is never
+   removed. The label is compared in `sandbox::orphans`, after podman's own label filter. A
+   launch reserves its id before it creates anything, so no sweep takes a launch in progress; a
+   container a stop removes during the sweep drops out of its second listing; a failed periodic
+   sweep is an oplog line, retried at the next.
 2. **Checks.** The runtime binary and the podman binary are re-checked (B5). Everything podman
    reads from Sallyport's state is re-checked too: the state directory is private, `hooks/` and
    `config/` are empty, `mounts.conf` is empty, and `containers.conf` is byte-identical to what
@@ -671,11 +689,78 @@ An allowed host without a grant is spliced: after `egress.allow {…, intercept:
 `200`, the proxy copies bytes and never sees the plaintext. Plain-HTTP requests are refused 405
 `plain-http-unsupported` before policy (Task 8), grant host or not.
 
-### 5.4 Session start
-`sessions.create` → validate manifest (again) → resolve model → `infer.load` if needed (Z2 up,
-health check over `infer.sock`) → create session dir + `agent.sock` (+ `net.sock`) → re-check
-mounts (TOCTOU) → `podman run` Z3 → wait for harness `session.info` within 30 s → `running`.
-Teardown on stop/timeout/crash: `podman kill`, remove session dir, audit `session.stop`.
+### 5.4 Session start and stop
+The session registry (`sallyd::session`, Task 12, architect Q57) owns every live session.
+
+**Start**, in this order:
+1. `launch_workspace` (§3.5): the image, the overlap claims and fd budget reserved,
+   `sandbox.launch` audited, the workspace container started. A failed launch is the
+   launcher's `sandbox.refuse` only, with no `session.start` and no `session.stop`.
+2. The container's init is watched for exit.
+3. Approvals, tools and the agent server are built in memory.
+4. Audit `session.start` (`model: {kind: "none"}` until a session can have a model).
+5. Bind `agent.sock` (0600) in the session's harness socket directory and serve it.
+
+A failed `session.start` append binds nothing and stops the workspace. Any failure after it
+ends the session with reason `start-failed`. Every `session.start` gets exactly one
+`session.stop`.
+
+TODO(#28): the harness container and `llm.sock` (Task 13, Task 12 PR C).
+
+**Stop reasons:**
+- `request`: a client asked.
+- `timeout`: `runtime.timeout`; `session.timeout` is audited first.
+- `crash`: a session task panicked; the oplog line comes first, then `session.crash`.
+- `shutdown`: SIGTERM, SIGINT, SIGHUP or SIGQUIT (handlers installed before startup work, so a
+  signal during it is handled once `control.sock` is bound); `control.sock` is closed first,
+  then every session stops at once. A second signal meanwhile exits non-zero at once.
+  TODO(#92): a `podman --timeout` backstop for a `sallyd` killed outright (Q60).
+- `start-failed`.
+- `exited`: the container ended on its own. The registry checks the init's `/proc/<pid>` fd
+  every 250 ms (Q62); a lookup through it fails once that process is gone, even if its pid is
+  reused.
+
+**Stop order** (Q57, amended by Q59: once a stop returns, nothing from the session has any
+further effect):
+1. The session's operations close, before anything else: a call that reaches the tools from now
+   on is denied `session-stopping`.
+2. `session.timeout` or `session.crash`, for those reasons.
+3. Every pending prompt is withdrawn (`approval.withdraw`, `session-stop`); no call queues after
+   it.
+4. The stop signal: a running `shell` is killed (`killed: session-stop`, the kill finished before
+   its `tool.result`), and a write or delete that has not begun aborts (`outcome: aborted`). The
+   agent listener shuts down meanwhile.
+5. At most 5 s (`STOP_DRAIN`) for the operations in flight to end, each with its `tool.result`.
+   A session task that panics meanwhile is audited `session.crash` (Q67), so `session.crash`
+   may precede a `session.stop` of any reason; the reason stays the first one.
+6. The seal, then the one `session.stop {reason, in_flight}` (ruling 1, Q63). The session's
+   audit handle (one per session, shared by its tools, approvals desk and agent server) stops
+   admitting writes; writes already in flight get what is left of the same 5 s deadline; then
+   `session.stop` is written, and every later write of that handle fails. A write still in
+   flight at the deadline either lands before `session.stop` or fails, and a failed write has
+   no effect and no reply. A refused write is an oplog line naming only the session and the
+   event. `session.stop` has no other writer (the best-effort `start-failed` one included).
+7. `Launcher::stop`, retried up to 3 times.
+
+So after `session.stop` nothing agent-originated of the session is written: no `tool.*`,
+`approval.*` or `rpc.*` entry, whatever its `in_flight`. Teardown entries may follow it:
+`sandbox.*` (`sandbox.stop` always does), the watchdog's (`session.resource_limit`,
+`session.kill_failed`) and egress closes (#95). TODO(#94): a final `session.closed`, written
+once teardown has finished, becomes the last entry of a session. A panic reported after the
+seal is an oplog line only.
+
+A file operation already inside its blocking call is never cut. One still running after the
+drain leaves `in_flight > 0`: the stop answers failed and the session stays stop-failed until
+it returns; then the supervisor removes the container by itself. Its `tool.result` is refused
+by the seal (an oplog line names it), so `in_flight: n` counts the `tool.run` entries that have
+no result. Residual risk: a hung file system under a mount keeps an idle container (listener
+closed, shells killed, nothing new can start) until that operation returns; if `sallyd` shuts
+down meanwhile, the container outlives it with no watchdog until the next start's sweep
+(TODO(#96), Q66). A container that cannot be confirmed gone, whether its session started or
+not, also leaves the session listed as stop-failed. It keeps its claims and its disk watchdog
+until a later stop succeeds. At shutdown, which stops every session at once, it makes `sallyd`
+exit non-zero. A failed `session.start` append is followed by a best-effort `session.stop`
+(`start-failed`), since the entry may have reached the log.
 
 ## 6. Repository structure
 
@@ -794,12 +879,19 @@ sallyport/
   session; a lookup that finds no free slot is `resolve-failed` at once (never queued), and a
   slot stays taken until its call returns, even after the 5 s timeout. Lookups and audit appends
   share tokio's blocking pool, so stuck lookups take at most 64 of its threads and never delay
-  the audit log while the pool is larger (the daemon's runtime must keep it so: #47). One
-  resolver serves every session. Residual: one session
-  can hold every slot for about a resolver timeout (#47). Each session's accept loop holds at
-  most `max_connections + 64` accepted connections (the extra ones are answered 429); past that
-  it stops accepting until one ends. Residual: descriptors are not yet bounded across sessions
-  (#48). After a refusal reply (every pre-tunnel refusal, the 429 included, and the 502s written
+  the audit log: the daemon's runtime (`sallyd::daemon::runtime`) has 512 blocking threads, a
+  relation its test pins (#47, architect Q44). Each session also has a share of its own, 16 =
+  64 / 4 lookups at once (`sallyd::session::lookup`), so one session naming slow-resolving hosts
+  cannot take every slot; both bounds hold, and a slot is held only while a lookup is in flight.
+  A lookup over either bound is `resolve-failed` at once. Making both numbers configurable: #86.
+  Each session's accept loop holds at most `max_connections + 64` accepted connections (the
+  extra ones are answered 429); past that it stops accepting until one ends. Descriptors are
+  bounded across sessions (#48, architect Q45): `sallyd` raises its soft `NOFILE` to the hard
+  limit (at most 2^20), and sessions together may reserve half of it. A session costs
+  `2 * (network.max_connections + 64) + 64` (the proxy's two descriptors per connection, plus
+  `agent.sock`/`llm.sock` connections and exec pipes); it is reserved with the overlap claims, in
+  one step, and a session over the budget is refused `fd-budget` before anything is created.
+  After a refusal reply (every pre-tunnel refusal, the 429 included, and the 502s written
   before a `200`) the proxy closes its sending half and discards client input until its end,
   256 KiB or 1 s in total (`DRAIN_BYTES`, `DRAIN_TIMEOUT`), then closes (#71). The bytes are
   never parsed, stored or audited, and the entry is already written. The connection keeps its
@@ -911,6 +1003,7 @@ sallyport/
   - Credentials and redaction (Tasks 9a-3 and 9b, `egress::inject`, `egress::redact`;
     maintainer decisions 1–7, architect D1–D13, A1–A3). At launch, a session with grants reads
     the grants' values through the starter's `SecretSource` (production: the 0600 store file;
+    until #99 the daemon wires a source with no values, so every grant is refused `secret-missing`;
     every other value is dropped, wiped, before `prepare` returns): a missing one refuses the
     launch (`secret-missing`), an unreadable store too (`secret-store`), a grant that cannot be
     injected or redacted as well (`secret-grant`), and a session whose forms hold every filler
@@ -1046,10 +1139,13 @@ sallyport/
     {uid, pid}`, `via` (the id whose `deny_all_session` took it); `refuse` with `reason:
     unknown-id` for an id that is not waiting.
   - `approval.expire` (sallyd, `deny`): `{id, call, reason: timeout}`.
-  - `approval.withdraw` (harness for a cancel, sallyd for a closed connection; `deny`): `{id,
-    call, reason}`; `id` is null when the cancel or close came before the call reached the
-    queue (it is kept until the call ends, so that call is never shown). A wait dropped by
-    teardown leaves the queue at once with no entry. Only live calls (begun, not yet ended)
+  - `approval.withdraw` (harness for a cancel, sallyd for a closed connection or the session's
+    stop; `deny`): `{id, call, reason}` with `reason` `cancel`, `closed` or `session-stop`; `id`
+    is null when the cancel or close came before the call reached the queue (it is kept until
+    the call ends, so that call is never shown). The session's stop withdraws every pending
+    prompt before its `session.stop` (Q59), and from then on no call queues (`approval.deny
+    session-stopping`). A wait dropped by teardown leaves the queue at once with no entry; since
+    the stop withdraws first, that is only a crash's path. Only live calls (begun, not yet ended)
     keep a withdraw, so the harness cannot grow that state. Decisions of a session run one at
     a time; one that has taken its prompt finishes in its own task, so a dropped caller loses no
     entry. A `deny_all_session` latches first, then writes its entry and denies every other
@@ -1057,20 +1153,26 @@ sallyport/
     client is told `audit-failed`. A panic under the queue's
     lock latches the session.
   - `approval.deny` (sallyd): action fields and `reason` (`approval-flood`, `session-denied`,
-    `no-approver`, `id-unavailable`).
+    `no-approver`, `id-unavailable`, `session-stopping`).
   - `approval.flood` (sallyd): `{max_pending}`, once per episode.
   - `tool.deny` (sallyd): action fields (or `{call, tool}` when no action could be built) and
-    `code`.
+    `code`; `session-stopping` for a call that reaches the tools once the session's stop has
+    begun (Q59).
 - **Tool events** (Task 11, #62; architect ruling Q34), at every `audit.level`; a failed append
   runs nothing more and answers nothing:
   - `tool.run` (harness, `allow`), before the effect and before any blocking section: action
     fields, `approval` (the id, or null when the policy needed none); for files `mode`, and for a
     write `bytes` and `sha256`. The command and paths are in `action`, escaped and bounded.
   - `tool.result` (sallyd), after it: `{call, tool, action_sha256}` and `outcome` (`ok`,
-    `failed` with `code`) for files; for `shell` `exit` or `killed` (`timeout`,
-    `start-timeout`), `stdout`/`stderr` `{bytes, kept, sha256 (of the kept bytes), cut}`, and
-    `error` (escaped, cut) when podman could not run. Never output or content. A `tool.run` with
-    no `tool.result` before the session's stop entry means teardown interrupted the call.
+    `failed` with `code`, or `aborted` with `reason: session-stop` for a write or delete the
+    session's stop kept from beginning) for files; for `shell` `exit` or `killed` (`timeout`,
+    `start-timeout`, `session-stop`), `stdout`/`stderr` `{bytes, kept, sha256 (of the kept
+    bytes), cut}`, and `error` (escaped, cut) when podman could not run. Never output or content.
+    Each call's section from `tool.run`/`tool.read` to `tool.result` is a task of its own
+    counted by the session's stop (Q59): a caller that goes away loses neither the effect nor
+    the entry. A `tool.run` with no `tool.result` before the session's `session.stop` happens
+    only when that entry carries `in_flight > 0` (the result is not written: the seal refuses
+    it, and an oplog line names it; Q63) or a `session.crash` precedes it (Q67).
   - `tool.read` (harness, `allow`), after the bytes are in the broker and before the reply:
     action fields, `mode`, and `offset`, `len`, `size`, `bytes`, `sha256` (`fs_read`) or
     `entries`, `truncated`, `sha256` of the listing (`fs_list`), or `code`. Stricter than §4.3's

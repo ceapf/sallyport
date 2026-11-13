@@ -106,10 +106,13 @@ mutants:
 MUTANTS_WIDE_CORE := $(addprefix crates/sally-core/src/,manifest/image.rs manifest/hostenv.rs \
                      manifest/parse.rs manifest/summary.rs manifest/units.rs secrets/store.rs \
                      secrets/secret.rs audit/entry.rs audit/redact.rs audit/verify.rs \
-                     audit/writer.rs audit/layout.rs fsutil.rs fd.rs)
+                     audit/writer.rs audit/layout.rs fsutil.rs fd.rs text.rs)
 MUTANTS_WIDE_SALLYD := $(addprefix crates/sallyd/src/sandbox/,argv.rs check.rs types.rs profiles.rs \
                        overlap.rs scan.rs images.rs changes.rs dirs.rs podman.rs disk.rs stage.rs \
-                       launch/error.rs) \
+                       launch/error.rs budget.rs orphans.rs) \
+                       $(addprefix crates/sallyd/src/daemon/,mod.rs crash.rs startup.rs stale.rs install.rs) \
+                       crates/sallyd/src/oplog.rs \
+                       $(addprefix crates/sallyd/src/session/,lookup.rs types.rs exit.rs) \
                        $(addprefix crates/sallyd/src/egress/,addr.rs authority.rs head.rs policy.rs server.rs \
                        hostaddrs.rs tunnel.rs net.rs ca.rs roots.rs rewrite.rs intercept.rs \
                        intercept_tls.rs intercept_report.rs meter.rs inject.rs redact.rs) \
@@ -119,7 +122,7 @@ MUTANTS_WIDE_SALLYD := $(addprefix crates/sallyd/src/sandbox/,argv.rs check.rs t
                        $(addprefix crates/sallyd/src/approvals/,action.rs glob.rs handler.rs policy.rs \
                        queue.rs render.rs) \
                        $(addprefix crates/sallyd/src/tools/,args.rs path.rs tag.rs fs.rs shell.rs procs.rs \
-                       mod.rs dac.rs)
+                       mod.rs dac.rs ops.rs)
 MUTANTS_WIDE_SHIM := $(addprefix crates/sally-shim/src/,args.rs relay.rs)
 MUTANTS_WIDE_TESTS_CORE :=
 MUTANTS_WIDE_TESTS_SALLYD := --lib --test=argv --test=scan

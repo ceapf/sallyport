@@ -7,15 +7,20 @@
 
 use super::commands::Stored;
 use super::launch::{LaunchError, Launcher, WorkspaceRequest};
+use super::types::ImageRef;
 
 impl WorkspaceRequest {
     /// The workspace image: the manifest's `runtime.image`, or the bundled default.
-    pub(super) fn image(&self) -> &str {
-        let m = self.manifest.manifest();
-        m.runtime
-            .image
-            .as_deref()
-            .unwrap_or(self.default_image.as_str())
+    ///
+    /// # Errors
+    /// [`LaunchError::NoDefaultImage`] when there is neither (architect Q58);
+    /// [`LaunchError::Argv`] for a manifest image that is not a pinned reference.
+    pub(super) fn image(&self) -> Result<ImageRef, LaunchError> {
+        match (&self.manifest.manifest().runtime.image, &self.default_image) {
+            (Some(i), _) => Ok(ImageRef::parse(i)?),
+            (None, Some(d)) => Ok(d.clone()),
+            (None, None) => Err(LaunchError::NoDefaultImage),
+        }
     }
 }
 
@@ -115,7 +120,8 @@ mod tests {
         }
     }
 
-    /// The manifest's `runtime.image` wins; without one the bundled default is used.
+    /// The manifest's `runtime.image` wins; without one the bundled default is used, and with
+    /// no default either the launch is refused `no-default-image` (architect Q58).
     #[test]
     fn the_workspace_image_is_the_manifests_else_the_default() {
         #![allow(clippy::unwrap_used)]
@@ -123,7 +129,7 @@ mod tests {
 
         use sally_core::manifest::{HostEnv, load};
 
-        use super::super::launch::WorkspaceRequest;
+        use super::super::launch::{LaunchError, WorkspaceRequest};
         use super::super::types::{ImageRef, SessionId, SessionPaths};
 
         let env = HostEnv {
@@ -139,7 +145,7 @@ mod tests {
         let header = "apiVersion: sallyport/v1\nkind: Manifest\nname: t\nmodel:\n  ref: any\n";
         let custom = format!("ghcr.io/x/tools@{D}");
         let default = format!("ghcr.io/sallyport/workspace@{D}");
-        let request = |body: &str| WorkspaceRequest {
+        let request = |body: &str, default: Option<&str>| WorkspaceRequest {
             paths: SessionPaths::new(
                 SessionId::parse("s-1").unwrap(),
                 "/s".as_ref(),
@@ -155,10 +161,17 @@ mod tests {
                 .unwrap()
                 .manifest,
             ),
-            default_image: ImageRef::parse(&default).unwrap(),
+            default_image: default.map(|d| ImageRef::parse(d).unwrap()),
+            crash: crate::daemon::crash::CrashReporter::channel().0,
         };
-        let named = request(&format!("runtime:\n  image: {custom}\n"));
-        assert_eq!(named.image(), custom);
-        assert_eq!(request("").image(), default);
+        let named = format!("runtime:\n  image: {custom}\n");
+        for d in [Some(default.as_str()), None] {
+            assert_eq!(request(&named, d).image().unwrap().as_str(), custom);
+        }
+        let bundled = request("", Some(&default)).image().unwrap();
+        assert_eq!(bundled.as_str(), default);
+        let e = request("", None).image().unwrap_err();
+        assert!(matches!(e, LaunchError::NoDefaultImage), "{e}");
+        assert!(e.to_string().starts_with("runtime.image: "), "{e}");
     }
 }

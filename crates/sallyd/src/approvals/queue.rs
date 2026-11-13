@@ -1,6 +1,8 @@
 //! The pending queue: the [`Gate`] a tool handler asks, the [`Desk`] a host client answers
 //! (SI-5; maintainer's Task 10 decisions 1–7; architect rulings Q19, Q22–Q25).
 //!
+//! TODO(#93): over the 800-line ceiling; a move-only split follows PR A.
+//!
 //! - **Who answers.** [`new`] returns the two halves apart. The tool handler behind `agent.sock`
 //!   holds only the `Gate` (ask, withdraw); the `Desk` (list, decide) belongs to control-side
 //!   code (Task 12 wires `approvals.list`/`approvals.decide` on `control.sock`, with the client
@@ -44,6 +46,7 @@ use super::render::{self, Prompt};
 use crate::rpc::agent::Withdraw;
 use crate::rpc::rate::Rate;
 use crate::rpc::record::{Recorder, escape};
+use crate::tools::STOPPING;
 
 /// One new prompt per this interval, on average (architect ruling Q22; tunable).
 pub const REFILL: Duration = Duration::from_secs(2);
@@ -189,6 +192,8 @@ struct State {
     /// Live calls withdrawn before they reached the queue (so at most the live ones).
     withdrawn: HashMap<u64, Withdraw>,
     latched: bool,
+    /// The session is stopping: nothing queues any more (architect Q59).
+    stopping: bool,
     flooding: bool,
     rate: Rate,
 }
@@ -249,6 +254,7 @@ pub fn new(
             live: HashSet::new(),
             withdrawn: HashMap::new(),
             latched: false,
+            stopping: false,
             flooding: false,
             rate: Rate::every(REFILL, burst),
         }),
@@ -437,6 +443,46 @@ impl Gate {
 }
 
 impl Desk {
+    /// The session is stopping (architect Q59 (a) step 3): every shown prompt leaves the queue
+    /// with `approval.withdraw` (`session-stop`) and its asker is denied; a prompt not yet shown
+    /// never is; no call queues from now on (`approval.deny session-stopping`). Once it has
+    /// taken the prompts it finishes in its own task, so dropping this future loses no entry.
+    ///
+    /// # Errors
+    /// The task's [`JoinError`](tokio::task::JoinError) when it panicked, for the session's
+    /// crash reporter (R8).
+    pub async fn stop(&self) -> Result<(), tokio::task::JoinError> {
+        let taken: Vec<Entry> = {
+            let mut st = self.inner.state();
+            st.stopping = true;
+            let (shown, unshown): (Vec<Entry>, Vec<Entry>) =
+                st.pending.drain(..).partition(|e| e.announced);
+            st.pending = unshown;
+            for e in &mut st.pending {
+                e.withdrawn.get_or_insert(Withdraw::SessionStop);
+            }
+            shown
+        };
+        let inner = Arc::clone(&self.inner);
+        let task = tokio::spawn(async move {
+            let (actor, reason) = withdraw_by(Withdraw::SessionStop);
+            for e in taken {
+                let args = json!({"id": e.id, "call": e.call, "reason": reason});
+                let entry = inner
+                    .record
+                    .entry(actor, "approval.withdraw", Some("deny"))
+                    .args(args);
+                let answer = if inner.record.append(entry).await {
+                    Answer::Withdrawn
+                } else {
+                    Answer::Unrecorded
+                };
+                inner.close(e, answer);
+            }
+        });
+        task.await
+    }
+
     /// The prompts waiting for an answer.
     #[must_use]
     pub fn list(&self) -> Vec<Arc<Prompt>> {
@@ -569,6 +615,9 @@ impl Inner {
         }
         if let Some(&why) = st.withdrawn.get(&bound.call) {
             return Err(NotQueued::Withdrawn(why));
+        }
+        if st.stopping {
+            return Err(NotQueued::Deny(STOPPING, false));
         }
         if st.latched {
             return Err(NotQueued::Deny("session-denied", false));
@@ -750,6 +799,7 @@ fn withdraw_by(why: Withdraw) -> (Actor, &'static str) {
     match why {
         Withdraw::Cancel => (Actor::Harness, "cancel"),
         Withdraw::Closed => (Actor::Sallyd, "closed"),
+        Withdraw::SessionStop => (Actor::Sallyd, "session-stop"),
     }
 }
 

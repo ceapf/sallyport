@@ -35,13 +35,13 @@ rc=0; bash "$lock" 2>/dev/null || rc=$?
 # The Rust side takes the same lock, and every disk-floor test that sets a floor below the free
 # space takes it first, except the admission test (architect ruling D1: its stage_size is the
 # maximum, so freed space cannot admit it). A new floor test without the lock fails here.
-grep -qF 'lock_path("disk-free")' "$root/crates/sallyd/tests/common/container.rs" ||
-  fail "container.rs does not take lock_path(\"disk-free\")"
+grep -qF 'lock_path("disk-free")' "$root/crates/sallyd/tests/common/locks.rs" ||
+  fail "locks.rs does not take lock_path(\"disk-free\")"
 unlocked="$(awk '
   /^fn / { if (name != "" && floor && !locked) print name; name = $2; sub(/\(.*/, "", name);
            floor = 0; locked = 0; next }
   /floor_below_free\(/ { floor = 1 }
-  /floor_serial\(\)/ { locked = 1 }
+  /floor_serial\(/ { locked = 1 }
   END { if (name != "" && floor && !locked) print name }
 ' "$root/crates/sallyd/tests/disk.rs" | grep -vx 'floor_below_free' || true)"
 [ "$unlocked" = "a_launch_without_room_for_stage_size_above_the_floor_is_refused" ] ||

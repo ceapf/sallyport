@@ -3,8 +3,11 @@
 #![warn(missing_docs)]
 
 pub mod approvals;
+pub mod daemon;
 pub mod egress;
 pub mod llm;
+pub mod oplog;
 pub mod rpc;
 pub mod sandbox;
+pub mod session;
 pub mod tools;
