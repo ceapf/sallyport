@@ -11,7 +11,7 @@
 use std::io::{self, Read, Write};
 use std::path::Path;
 
-use rustix::fs::{AtFlags, FileType, Mode, OFlags, RenameFlags};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::sandbox::Installation;
@@ -23,24 +23,24 @@ const TEMP_FILE: &str = "installation.new";
 /// Bytes read at most: an id, a newline, and one more so that a longer file is seen.
 const READ_CAP: u64 = 38;
 
-/// Why the installation id could not be read or made.
+/// Why the installation id could not be read or made. The message names the OS error too: the
+/// daemon logs the message, not a source chain.
 #[derive(Debug, thiserror::Error)]
-#[error("{path}: {msg}")]
+#[error("{path}: {msg}{}", .os.as_ref().map_or(String::new(), |e| format!(": {e}")))]
 pub struct InstallError {
     /// The file or directory.
     pub path: String,
     /// What is wrong.
     pub msg: String,
     /// The OS error behind it, if any.
-    #[source]
-    pub source: Option<io::Error>,
+    pub os: Option<io::Error>,
 }
 
-fn fail(path: &Path, msg: impl Into<String>, source: Option<io::Error>) -> InstallError {
+fn fail(path: &Path, msg: impl Into<String>, os: Option<io::Error>) -> InstallError {
     InstallError {
         path: path.display().to_string(),
         msg: msg.into(),
-        source,
+        os,
     }
 }
 
@@ -76,16 +76,17 @@ pub fn load_or_create(state: &Path) -> Result<Installation, InstallError> {
     Installation::parse(id).map_err(|e| fail(&path, e.to_string(), None))
 }
 
-/// Writes a fresh id to [`TEMP_FILE`] (created exclusively, 0600) and syncs it, renames it to
-/// [`INSTALLATION_FILE`] without replacing anything there (a file or a symlink), then syncs the
-/// directory. A crash leaves no file or a whole one, never an empty one that would refuse every
-/// later start (security review PS-L3).
+/// Writes a fresh id to [`TEMP_FILE`] (created exclusively, 0600) and syncs it, links it as
+/// [`INSTALLATION_FILE`] (`link(2)` never replaces anything there, a file or a symlink, and
+/// works where `RENAME_NOREPLACE` does not, such as NFS), syncs the directory, then removes the
+/// temporary name. A crash leaves no file or a whole one, never an empty one that would refuse
+/// every later start (security review PS-L3).
 fn create(state: &Path) -> Result<Installation, InstallError> {
     let path = state.join(INSTALLATION_FILE);
     let temp = state.join(TEMP_FILE);
     let id = Installation::fresh().map_err(|e| fail(&path, e.to_string(), None))?;
-    // O_RDONLY is 0. The wrapper adds O_CLOEXEC.
-    let dir = sally_core::fd::open(state, OFlags::DIRECTORY, Mode::empty())
+    // Never through a symlink, as startup opens it (O_RDONLY is 0; the wrapper adds O_CLOEXEC).
+    let dir = sally_core::fd::open(state, OFlags::DIRECTORY | OFlags::NOFOLLOW, Mode::empty())
         .map_err(|e| fail(state, "cannot be opened", Some(e.into())))?;
     // Only a crash before the rename leaves it, and no start has used the id in it.
     match rustix::fs::unlinkat(&dir, TEMP_FILE, AtFlags::empty()) {
@@ -99,17 +100,11 @@ fn create(state: &Path) -> Result<Installation, InstallError> {
     f.write_all(format!("{}\n", id.as_str()).as_bytes())
         .and_then(|()| f.sync_all())
         .map_err(|e| fail(&temp, "cannot be written", Some(e)))?;
-    let moved = rustix::fs::renameat_with(
-        &dir,
-        TEMP_FILE,
-        &dir,
-        INSTALLATION_FILE,
-        RenameFlags::NOREPLACE,
-    );
-    if let Err(e) = moved {
-        let _ = rustix::fs::unlinkat(&dir, TEMP_FILE, AtFlags::empty());
-        return Err(fail(&path, "cannot be created", Some(e.into())));
-    }
+    let linked = rustix::fs::linkat(&dir, TEMP_FILE, &dir, INSTALLATION_FILE, AtFlags::empty());
+    // The temporary name goes either way. A failed unlink leaves a file no start reads, and
+    // the next create removes it first.
+    let _ = rustix::fs::unlinkat(&dir, TEMP_FILE, AtFlags::empty());
+    linked.map_err(|e| fail(&path, "cannot be created", Some(e.into())))?;
     rustix::fs::fsync(&dir).map_err(|e| fail(state, "cannot be synced", Some(e.into())))?;
     Ok(id)
 }
@@ -256,6 +251,30 @@ mod tests {
         assert!(std::fs::symlink_metadata(&temp).is_err());
         let mode = std::fs::metadata(d.join(INSTALLATION_FILE)).unwrap();
         assert_eq!(mode.permissions().mode() & 0o777, 0o600, "owner-only");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    // The startup error names the OS error: `main` logs only the message, not a source chain.
+    #[test]
+    fn an_os_error_is_named_in_the_message() {
+        let d = dir("perm");
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let e = load_or_create(&d).unwrap_err();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let text = e.to_string();
+        assert!(text.contains("cannot be created"), "{text}");
+        assert!(text.contains("os error 13"), "{text}");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    // The state directory is opened without following a symlink, as startup opens it.
+    #[test]
+    fn a_symlinked_state_directory_is_refused() {
+        let d = dir("statelink");
+        std::fs::create_dir(d.join("real")).unwrap();
+        std::os::unix::fs::symlink(d.join("real"), d.join("link")).unwrap();
+        assert!(create(&d.join("link")).is_err());
+        assert_eq!(std::fs::read_dir(d.join("real")).unwrap().count(), 0);
         std::fs::remove_dir_all(&d).unwrap();
     }
 
