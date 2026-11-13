@@ -97,6 +97,29 @@ impl Why {
     }
 }
 
+/// Steps 3, 4 and 5: prompts withdrawn, the stop signal, then at most [`STOP_DRAIN`] for the
+/// operations in flight while the agent listener shuts down. One deadline covers the drain and
+/// the seal's wait (Q63); it is returned with the operations still in flight.
+async fn drain(
+    desk: Desk,
+    crash: &CrashReporter,
+    ops: &Ops,
+    agent: Option<Handle>,
+) -> (tokio::time::Instant, usize) {
+    if let Err(e) = desk.stop().await {
+        crash.joined("approvals", e);
+    }
+    ops.stop();
+    let deadline = tokio::time::Instant::now() + STOP_DRAIN;
+    let listener = async {
+        if let Some(h) = agent {
+            h.shutdown().await;
+        }
+    };
+    let ((), in_flight) = tokio::join!(listener, ops.drained(STOP_DRAIN));
+    (deadline, in_flight)
+}
+
 impl Registry {
     pub(super) async fn supervise(self: std::sync::Arc<Self>, s: Supervised) {
         let Supervised {
@@ -120,38 +143,9 @@ impl Registry {
         // 1. Before any await.
         ops.close();
         let mut replies = Vec::new();
-        let reason = match why {
-            Why::Asked(r, reply) => {
-                replies.extend(reply);
-                r
-            }
-            Why::Crashed(c) => {
-                self.crashed(&record, &c).await;
-                StopReason::Crash
-            }
-            Why::Other(r) => r,
-        };
-        if reason == StopReason::Timeout {
-            self.note(
-                &record,
-                "session.timeout",
-                json!({"timeout_secs": timeout.as_secs()}),
-            )
-            .await;
-        }
-        // 3, 4, 5. One deadline for the drain and the seal's wait (Q63).
-        if let Err(e) = desk.stop().await {
-            crash.joined("approvals", e);
-        }
-        ops.stop();
-        let deadline = tokio::time::Instant::now() + STOP_DRAIN;
-        let listener = async {
-            if let Some(h) = agent {
-                h.shutdown().await;
-            }
-        };
-        let ((), in_flight) = tokio::join!(listener, ops.drained(STOP_DRAIN));
-        self.seal_session(&record, &mut crashes, (reason, in_flight), deadline)
+        let reason = self.reason(why, &record, timeout, &mut replies).await;
+        let (deadline, in_flight) = drain(desk, &crash, &ops, agent).await;
+        self.seal_session(&record, &mut crashes, reason, in_flight, deadline)
             .await;
         if in_flight > 0 {
             self.wait_out(&sid, &ops, &mut replies, &mut requests, in_flight)
@@ -170,6 +164,37 @@ impl Registry {
         }
     }
 
+    /// Step 2: the stop's reason, with its entry (`session.crash`, `session.timeout`). A
+    /// request's reply joins `replies`.
+    async fn reason(
+        &self,
+        why: Why,
+        record: &Recorder,
+        timeout: Duration,
+        replies: &mut Vec<Reply>,
+    ) -> StopReason {
+        let reason = match why {
+            Why::Asked(r, reply) => {
+                replies.extend(reply);
+                r
+            }
+            Why::Crashed(c) => {
+                self.crashed(record, &c).await;
+                StopReason::Crash
+            }
+            Why::Other(r) => r,
+        };
+        if reason == StopReason::Timeout {
+            self.note(
+                record,
+                "session.timeout",
+                json!({"timeout_secs": timeout.as_secs()}),
+            )
+            .await;
+        }
+        reason
+    }
+
     /// The end of step 5 and step 6. A panic reported during the drain is audited
     /// `session.crash` (Q67; the reason stays), then the seal writes `session.stop {reason,
     /// in_flight}` within what is left of `deadline` (Q63), after which no entry of the
@@ -180,7 +205,8 @@ impl Registry {
         &self,
         record: &Recorder,
         crashes: &mut CrashReceiver,
-        (reason, in_flight): (StopReason, usize),
+        reason: StopReason,
+        in_flight: usize,
         deadline: tokio::time::Instant,
     ) {
         while let Ok(c) = crashes.try_recv() {
