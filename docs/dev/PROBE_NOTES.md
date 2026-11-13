@@ -61,6 +61,11 @@ line per fact, with where it was found. Check a note again before relying on it 
 - `podman build` keeps intermediate layer images (`<none>` in `images -a`) unless
   `--layers=false`. `ps --filter name=` is an unanchored regex: match names with `grep -E '^…'`.
   (8-prC)
+- Labels on 4.9.3: `create --label k=v` is accepted with `--network=none`. `ps --all --format
+  json` gives each container's `Names` as an array and `Labels` as an object, or `null` when it
+  has none; an empty listing is `[]`. The template `{{index .Labels "k"}}` prints an empty value
+  for a missing label (`{{.Label "k"}}` is an error), but a label value can hold a newline, so
+  the sweep reads the JSON. (Task 12 PR A, ruling Q64)
 
 ## Kernel and namespaces
 

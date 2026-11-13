@@ -2,10 +2,13 @@
 //!
 //! A `sallyd` killed with SIGKILL cannot stop the `podman create` it had started, so that
 //! container can appear after the next `sallyd`'s startup sweep: unsupervised, holding mounts
-//! the overlap rule does not know. Every [`ORPHAN_SWEEP`] the daemon removes session containers
-//! no live session owns (`Launcher::remove_orphans`, each removal audited
-//! `sandbox.orphan_removed` with `sweep: periodic` before it). A failed sweep is an oplog line and
-//! is tried again at the next tick; only the startup sweep refuses to start.
+//! the overlap rule does not know. Every [`ORPHAN_SWEEP`] the daemon removes this installation's
+//! session containers that no live session owns (`Launcher::remove_orphans`, matched on the
+//! installation label, never by name alone: architect Q64; each removal audited
+//! `sandbox.orphan_removed` with `sweep: periodic` before it). A container without the label is
+//! never removed. A failed sweep is an oplog line and is tried again at the next tick; only the
+//! startup sweep refuses to start. The task's first act is the oplog line `orphan sweep started`,
+//! which `tests/daemon.rs` reads to prove `serve` starts it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +24,12 @@ const LOG: &str = "sweep";
 /// Sweeps `scope` (empty: every session container) every `period`, the first time one period
 /// from now; runs until dropped.
 pub async fn every(launcher: Arc<Launcher>, scope: String, period: Duration, log: Oplog) {
+    // First, inside the task: the daemon test reads it to prove the sweep was started (S3).
+    log.info(
+        LOG,
+        "orphan sweep started",
+        &[("period_secs", &period.as_secs().to_string())],
+    );
     let start = tokio::time::Instant::now() + period;
     let mut tick = tokio::time::interval_at(start, period);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

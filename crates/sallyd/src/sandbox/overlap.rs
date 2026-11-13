@@ -12,9 +12,9 @@
 //! The rule is a pure function ([`conflict`]); [`Sessions`] holds the live claims of this
 //! `sallyd` and reserves atomically, together with each session's file-descriptor budget (#48).
 //! One `sallyd` runs per user: it holds an exclusive `flock` on its runtime directory for life
-//! (architect Q42), and under that lock removes the containers a previous `sallyd` left behind
-//! ([`super::Launcher::remove_orphans`]) before the first launch, so in-process state is the
-//! whole picture.
+//! (architect Q42), and under that lock removes the containers a previous `sallyd` of this
+//! installation left behind ([`super::Launcher::remove_orphans`], matched on the installation
+//! label: architect Q64) before the first launch, so in-process state is the whole picture.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

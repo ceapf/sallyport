@@ -509,6 +509,7 @@ fn rt_sec_10_no_private_key_reaches_a_container_and_the_harness_gets_no_ca_file(
             profiles: paths.data_root().join("profiles"),
             hooks_dir: lx.podman.hooks_dir(),
             mounts_file: lx.podman.mounts_file(),
+            installation: lx.installation.clone(),
         };
         let argv = harness_argv(&common, &paths, &v, &test_image()).unwrap();
         let id = lx.hermetic(&argv).await;

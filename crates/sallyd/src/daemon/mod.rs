@@ -2,6 +2,7 @@
 //! lock, the crash reporter and the runtime.
 
 pub mod crash;
+pub mod install;
 pub mod process;
 pub mod serve;
 pub mod stale;

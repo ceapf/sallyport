@@ -38,9 +38,9 @@ use crate::rpc::control::Control;
 use crate::rpc::record::Recorder;
 use crate::sandbox::budget::session_budget;
 use crate::sandbox::{
-    AuditSink, CheckedRuntime, DirError, DiskFloor, LaunchError, Launcher, LauncherParts, Podman,
-    PodmanError, PodmanHost, ScanLimits, Sessions, SharedAudit, Sweep, UserIds, check_runtime_dir,
-    resolve_podman,
+    AuditSink, CheckedRuntime, DirError, DiskFloor, Installation, LaunchError, Launcher,
+    LauncherParts, Podman, PodmanError, PodmanHost, ScanLimits, Sessions, SharedAudit, Sweep,
+    UserIds, check_runtime_dir, resolve_podman,
 };
 use crate::session::lookup::SharedEgress;
 use crate::session::{Registry, RegistryParts};
@@ -74,6 +74,9 @@ pub enum DaemonError {
     /// The audit log could not be opened.
     #[error("audit: {0}")]
     Audit(#[from] AuditError),
+    /// This installation's id could not be read or made (architect Q64).
+    #[error(transparent)]
+    Installation(#[from] super::install::InstallError),
     /// Podman or the runtime failed a check.
     #[error(transparent)]
     Podman(#[from] PodmanError),
@@ -202,6 +205,8 @@ pub fn run(log: &Oplog) -> Result<(), DaemonError> {
     let config = read_config(&dirs.config_home.join("sallyport/config.toml"))?;
     let audit = AuditWriter::open(&dirs.state().join("audit"), Box::new(SystemClock))?;
     let audit: Arc<dyn AuditSink> = Arc::new(SharedAudit(Mutex::new(audit)));
+    // Under the single-instance lock, in the state directory the audit log just made.
+    let installation = super::install::load_or_create(&dirs.state())?;
     let nofile = process::raise_nofile()?;
     log.info(
         LOG,
@@ -212,10 +217,25 @@ pub fn run(log: &Oplog) -> Result<(), DaemonError> {
         ],
     );
     let rt = super::runtime().map_err(io("tokio runtime"))?;
-    let end = rt.block_on(serve(log, &dirs, &config, audit, &lock, nofile));
+    // A panic in `serve` is caught here, so the runtime is still shut down within EXIT_WAIT
+    // rather than dropped while unwinding, which waits for the blocking pool without bound (R9).
+    let end = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rt.block_on(serve(
+            log,
+            &dirs,
+            &config,
+            audit,
+            &lock,
+            nofile,
+            installation,
+        ))
+    }));
     // After a second signal, work still on the blocking pool must not hold the exit.
     rt.shutdown_timeout(EXIT_WAIT);
-    end
+    match end {
+        Ok(end) => end,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
 
 /// The panic hook: one oplog line per panic, in any thread (a session task's panic is also
@@ -269,6 +289,7 @@ async fn serve(
     audit: Arc<dyn AuditSink>,
     lock: &OwnedFd,
     nofile: u64,
+    installation: Installation,
 ) -> Result<(), DaemonError> {
     // First, so a signal during startup is not the default action (death, no cleanup): it
     // waits here and is handled once `control.sock` is bound (security review M3).
@@ -289,6 +310,7 @@ async fn serve(
         disk_floor: DiskFloor::default(),
         egress: Arc::new(SharedEgress::default()),
         oplog: log.clone(),
+        installation,
     });
     let removed = launcher
         .remove_orphans("", Sweep::Startup)

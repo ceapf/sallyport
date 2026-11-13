@@ -15,8 +15,8 @@ pub mod mock_model;
 pub mod search;
 
 use sallyd::sandbox::{
-    CheckedRuntime, CommonArgs, ImageRef, LaunchScan, ScanLimits, SessionId, SessionPaths, UserIds,
-    scan_mounts,
+    CheckedRuntime, CommonArgs, ImageRef, Installation, LaunchScan, ScanLimits, SessionId,
+    SessionPaths, UserIds, scan_mounts,
 };
 
 pub const D0: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -79,6 +79,8 @@ impl Fx {
             profiles: root.join("profiles"),
             hooks_dir: root.join("hooks"),
             mounts_file: root.join("mounts.conf"),
+            // Fixed, so the argv snapshots are stable; container fixtures use a fresh one.
+            installation: Installation::parse("00000000-0000-4000-8000-000000000001").unwrap(),
         };
         let paths = SessionPaths::new(
             SessionId::parse("s-0001").unwrap(),

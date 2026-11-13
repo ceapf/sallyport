@@ -13,8 +13,8 @@ use std::path::PathBuf;
 use proptest::prelude::*;
 use sally_core::manifest::{ByteSize, Cpus};
 use sallyd::sandbox::{
-    Allowed, ArgvError, Grant, ImageRef, InferenceSpec, Role, SessionId, Source, VerifiedModel,
-    check_argv, harness_argv, inference_argv, workspace_argv,
+    Allowed, ArgvError, Grant, ImageRef, InferenceSpec, Installation, Role, SessionId, Source,
+    VerifiedModel, check_argv, harness_argv, inference_argv, uuid_v4, workspace_argv,
 };
 
 mod common;
@@ -339,6 +339,51 @@ fn an_rw_mount_without_git_entries_gets_an_empty_scan() {
     workspace_argv(&f.common, &f.paths, &v, &scan, Some(&ws_image())).unwrap();
 }
 
+// ---- the installation id (architect Q64) ------------------------------------------------------
+
+#[test]
+fn installation_ids_are_lowercase_uuid_v4() {
+    let ok = "0123abcd-ef01-4234-8567-89abcdef0123";
+    assert_eq!(Installation::parse(ok).unwrap().as_str(), ok);
+    for v in ['8', '9', 'a', 'b'] {
+        let s = format!("0123abcd-ef01-4234-{v}567-89abcdef0123");
+        assert!(Installation::parse(&s).is_ok(), "{s}");
+    }
+    for bad in [
+        "",
+        "0123abcd-ef01-4234-8567-89abcdef012",   // short
+        "0123abcd-ef01-4234-8567-89abcdef01234", // long
+        "0123ABCD-ef01-4234-8567-89abcdef0123",  // uppercase
+        "0123abcd-ef01-3234-8567-89abcdef0123",  // version 3
+        "0123abcd-ef01-4234-c567-89abcdef0123",  // variant
+        "0123abcd-ef01-4234-7567-89abcdef0123",  // variant
+        "0123abcdxef01-4234-8567-89abcdef0123",  // separator
+        "0123abcd-ef01x4234-8567-89abcdef0123",
+        "0123abcd-ef01-4234x8567-89abcdef0123",
+        "0123abcd-ef01-4234-8567x89abcdef0123",
+        "0123abcd-ef01-4234-8567-89abcdef012g", // not hex
+        "0123abcd-ef01-4234-8567-89abcdef012\n",
+    ] {
+        assert!(Installation::parse(bad).is_err(), "{bad:?}");
+    }
+}
+
+#[test]
+fn fresh_installation_ids_are_valid_and_differ() {
+    let a = Installation::fresh().unwrap();
+    let b = Installation::fresh().unwrap();
+    assert!(Installation::parse(a.as_str()).is_ok());
+    assert_ne!(a, b);
+}
+
+#[test]
+fn uuid_v4_sets_the_version_and_variant_bits() {
+    assert_eq!(uuid_v4([0; 16]), "00000000-0000-4000-8000-000000000000");
+    assert_eq!(uuid_v4([0xff; 16]), "ffffffff-ffff-4fff-bfff-ffffffffffff");
+    let r: [u8; 16] = std::array::from_fn(|i| u8::try_from(i).unwrap() * 17);
+    assert_eq!(uuid_v4(r), "00112233-4455-4677-8899-aabbccddeeff");
+}
+
 // ---- builder refuses bad input ------------------------------------------------------------------
 
 #[test]
@@ -419,6 +464,7 @@ fn allowed(f: &Fx, role: Role, project: Grant) -> Allowed {
             src(f.paths.workspace_sockets(), "/run/sallyport", Grant::Ro),
         ],
         scratch: Some(f.paths.data_root().to_owned()),
+        installation: f.common.installation.clone(),
     }
 }
 
@@ -919,6 +965,42 @@ fn checker_keeps_overlay_scratch_disjoint() {
         &with(&rw_base, &["-v", &ov(".git", "git/0", "git/0/work")]),
         &rw,
         "work inside upper",
+    );
+}
+
+/// Q64: every container carries exactly one label, this installation's id; any other label,
+/// another installation's id or a malformed value is refused.
+#[test]
+fn checker_allows_only_this_installations_label() {
+    let f = Fx::new();
+    let (a, allowed) = base(&f);
+    let own = format!("sallyport.installation={}", f.common.installation.as_str());
+    assert!(
+        a.windows(2).any(|w| w[0] == "--label" && w[1] == own),
+        "{a:?}"
+    );
+    check_argv(&a, &allowed).unwrap();
+    let other = "sallyport.installation=0123abcd-ef01-4234-8567-89abcdef0123";
+    for bad in [
+        other,
+        "sallyport.installation=",
+        "sallyport.installation",
+        "other=x",
+        &format!("sallyport.installation={}x", f.common.installation.as_str()),
+        &format!("x.{own}"),
+    ] {
+        let swapped = replacing(&a, "--label", &["--label", bad]);
+        assert_forbidden(&swapped, &allowed, bad);
+    }
+    assert_forbidden(
+        &replacing(&a, "--label", &[&format!("--label={own}")]),
+        &allowed,
+        "eq",
+    );
+    assert_forbidden(
+        &with(&a, &["--label", "other=x"]),
+        &allowed,
+        "a second label",
     );
 }
 

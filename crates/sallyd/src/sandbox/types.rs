@@ -75,6 +75,75 @@ impl SessionId {
     }
 }
 
+/// The container label naming the installation that created a container (architect Q64).
+pub const INSTALLATION_LABEL: &str = "sallyport.installation";
+
+/// The id of one Sallyport installation (one state directory): a random UUID v4 in its
+/// lowercase hyphenated form. Every container the launcher creates carries it as
+/// [`INSTALLATION_LABEL`], and the orphan sweeps remove only containers that carry this
+/// installation's id (Q64), never another daemon's or a test run's. It never leaves the
+/// machine and never reaches the audit log (SI-12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Installation(String);
+
+impl Installation {
+    /// Validates an id: 36 characters, `xxxxxxxx-xxxx-4xxx-[89ab]xxx-xxxxxxxxxxxx`, lowercase
+    /// hex.
+    ///
+    /// # Errors
+    /// [`ArgvError::Input`] otherwise.
+    pub fn parse(s: &str) -> Result<Self, ArgvError> {
+        let b = s.as_bytes();
+        let shape = b.len() == 36
+            && b.iter().enumerate().all(|(i, c)| match i {
+                8 | 13 | 18 | 23 => *c == b'-',
+                _ => c.is_ascii_digit() || (b'a'..=b'f').contains(c),
+            })
+            && b.get(14) == Some(&b'4')
+            && b.get(19).is_some_and(|c| b"89ab".contains(c));
+        if shape {
+            Ok(Self(s.to_owned()))
+        } else {
+            input("installation id must be a lowercase UUID v4")
+        }
+    }
+
+    /// A fresh id from getrandom(2).
+    ///
+    /// # Errors
+    /// The getrandom error, or a short read.
+    pub fn fresh() -> std::io::Result<Self> {
+        let mut r = [0u8; 16];
+        let n = rustix::rand::getrandom(&mut r, rustix::rand::GetRandomFlags::empty())?;
+        if n != r.len() {
+            return Err(std::io::Error::other("getrandom returned a short read"));
+        }
+        Self::parse(&uuid_v4(r)).map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
+    /// The id.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// `r` as a UUID v4: version nibble 4, variant bits 10.
+#[must_use]
+pub fn uuid_v4(mut r: [u8; 16]) -> String {
+    r[6] = (r[6] & 0x0f) | 0x40;
+    r[8] = (r[8] & 0x3f) | 0x80;
+    let hex: String = r.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
+}
+
 /// An image pinned by digest (SI-11), in the grammar of
 /// [`sally_core::manifest::is_pinned_image_ref`]: never a Podman transport such as `dir:`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,6 +219,8 @@ pub struct CommonArgs {
     /// Sallyport's empty mounts file, passed as `--default-mounts-file` so no system
     /// `mounts.conf` adds a mount (6b security review M4).
     pub mounts_file: PathBuf,
+    /// This installation's id, the container's [`INSTALLATION_LABEL`] (Q64).
+    pub installation: Installation,
 }
 
 /// Host directories of one session (ARCHITECTURE §3.1, AMENDMENTS-01 §2, AMENDMENTS-02 B2).

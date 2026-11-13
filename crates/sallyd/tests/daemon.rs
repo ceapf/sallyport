@@ -197,6 +197,42 @@ fn a_second_sallyd_exits_already_running() {
     assert!(!env.state().join("control.sock").exists());
 }
 
+/// Security re-review S3, architect Q61/Q64: `serve` starts the periodic orphan sweep, at its
+/// production period, after it serves; and the installation id whose label the sweep matches is
+/// kept 0600 in this daemon's own (private) state directory. Control: the `crash.spawn` of the
+/// sweep in `serve`.
+#[test]
+fn the_daemon_starts_its_orphan_sweep_with_its_own_installation_id() {
+    let env = Env::new();
+    let mut d = env.start();
+    let id_file = env.root.join("data/sallyport/installation");
+    let end = Instant::now() + Duration::from_secs(10);
+    while !id_file.exists() {
+        assert!(Instant::now() < end, "no installation id file");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // The sweep's first line is written as soon as its task runs, before its first period.
+    std::thread::sleep(Duration::from_millis(500));
+    terminate(&mut d);
+    let out = d.finish();
+    let log = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{log}");
+    let serving = log.find("\"serving\"").expect("serving");
+    let sweep = log
+        .find("\"orphan sweep started\"")
+        .unwrap_or_else(|| panic!("the orphan sweep was never started: {log}"));
+    assert!(serving < sweep, "{log}");
+    let line = log[sweep..].lines().next().unwrap();
+    assert!(line.contains("period_secs=\"60\""), "{line}");
+    let meta = std::fs::metadata(&id_file).unwrap();
+    assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    let id = std::fs::read_to_string(&id_file).unwrap();
+    assert!(
+        sallyd::sandbox::Installation::parse(id.trim_end()).is_ok(),
+        "{id:?}"
+    );
+}
+
 /// Security review M3: SIGHUP and SIGQUIT stop `sallyd` as SIGTERM does (cleanly, `control.sock`
 /// removed), never by their default action.
 #[test]

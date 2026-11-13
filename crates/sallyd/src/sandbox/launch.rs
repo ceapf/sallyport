@@ -46,7 +46,7 @@ use super::inside::{Expect, check_in_container};
 use super::overlap::{Sessions, claims};
 use super::podman::{Podman, PodmanError};
 use super::scan::{LaunchScan, PinKind, ScanLimits, scan_mounts};
-use super::types::{CheckedRuntime, CommonArgs, ImageRef, SessionPaths, UserIds};
+use super::types::{CheckedRuntime, CommonArgs, ImageRef, Installation, SessionPaths, UserIds};
 use super::watchdog::{Target, WatchPlan, Watchdog, watch_plan};
 use crate::daemon::crash::CrashReporter;
 use crate::oplog::Oplog;
@@ -66,8 +66,6 @@ const AUDIT_TEXT_CAP: usize = 4096;
 const START_GRACE: Duration = Duration::from_millis(250);
 /// How often a launch nobody received retries its `stop`.
 const STOP_RETRY: Duration = Duration::from_secs(2);
-/// Container name prefixes of the session roles this launcher creates.
-const SESSION_PREFIXES: [&str; 2] = ["sp-ws-", "sp-h-"];
 
 /// Where audit entries go. Appends are blocking file I/O; the launcher calls them from
 /// `spawn_blocking`.
@@ -224,6 +222,9 @@ pub struct LauncherParts {
     /// The operational log: an audit entry that cannot be written while the launcher acts
     /// anyway (a kill, a retried stop) gets an error line here (architect Q43).
     pub oplog: Oplog,
+    /// This installation's id (`daemon::install`): the label of every container this launcher
+    /// creates, and the only one its orphan sweeps remove (Q64).
+    pub installation: Installation,
 }
 
 /// Launches and tears down sandboxes for one `sallyd`. Shared as `Arc<Launcher>`.
@@ -238,6 +239,7 @@ pub struct Launcher {
     pub(super) disk_floor: DiskFloor,
     egress: Arc<dyn EgressStarter>,
     oplog: Oplog,
+    pub(super) installation: Installation,
     /// One stage walk at a time across all sessions, so a sandbox with a huge or deep tree
     /// cannot multiply `sallyd`'s open fds or blocking threads (6c-1 review M2/M3).
     pub(super) walks: Arc<tokio::sync::Semaphore>,
@@ -275,6 +277,7 @@ impl Launcher {
             disk_floor: p.disk_floor,
             egress: p.egress,
             oplog: p.oplog,
+            installation: p.installation,
             walks: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
@@ -565,6 +568,7 @@ impl Launcher {
             profiles: dirs.profiles().to_owned(),
             hooks_dir: self.podman.hooks_dir(),
             mounts_file: self.podman.mounts_file(),
+            installation: self.installation.clone(),
         };
         Ok(workspace_argv(
             &common,

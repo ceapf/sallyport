@@ -16,6 +16,7 @@ mod disk;
 mod images;
 mod inside;
 mod launch;
+pub mod orphans;
 mod overlap;
 mod podman;
 mod profiles;
@@ -43,6 +44,6 @@ pub use podman::{PODMAN_PATH_VAR, Podman, PodmanError, PodmanHost, resolve_podma
 pub use profiles::profile;
 pub use scan::{GitScan, LaunchScan, Pin, PinKind, ScanError, ScanLimits, scan_mounts};
 pub use types::{
-    ArgvError, CheckedRuntime, CommonArgs, ImageRef, InferenceSpec, OverlayDirs, Role, SessionId,
-    SessionPaths, UserIds, VerifiedModel,
+    ArgvError, CheckedRuntime, CommonArgs, INSTALLATION_LABEL, ImageRef, InferenceSpec,
+    Installation, OverlayDirs, Role, SessionId, SessionPaths, UserIds, VerifiedModel, uuid_v4,
 };

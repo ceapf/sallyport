@@ -5,6 +5,9 @@
 //! these tests run on whatever filesystem holds the target directory. They place the floor a few
 //! hundred MiB below its current free space, so a full-speed writer crosses it quickly. There is
 //! no test-only path in the launcher. The fixture is `common::container`; these tests never skip.
+//! A floor writer test whose disk-free lock never came free has not run (ruling 3, Q65): under
+//! `scripts/test-run.sh` it lists itself and returns, so its first-pass PASS is not a verdict;
+//! the wrapper re-runs it once and exits 6 if it still cannot run. Outside the wrapper it fails.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::time::{Duration, Instant};
@@ -25,10 +28,12 @@ fn serial() -> std::fs::File {
 }
 
 /// The floor writer tests: the disk-free lock first (a mutation run in either lane frees and
-/// takes gigabytes and so moves their margin; architect ruling D1), then [`serial`].
-fn floor_serial() -> (std::fs::File, std::fs::File) {
-    let disk = disk_free_lock();
-    (disk, serial())
+/// takes gigabytes and so moves their margin; architect ruling D1), then [`serial`]. `None`:
+/// the lock never came free, so test `name` has not run; under the wrapper it is listed for a
+/// re-run (ruling 3, Q65) and the caller returns at once.
+fn floor_serial(name: &str) -> Option<(std::fs::File, std::fs::File)> {
+    let disk = disk_free_lock(name)?;
+    Some((disk, serial()))
 }
 
 /// Bytes available to unprivileged users on the filesystem of the test fixtures.
@@ -95,7 +100,11 @@ async fn write_until_killed(r: &Running, path: &str, room: u64) {
 /// The floor kills an `rw` writer: mounts that had no limit at all before.
 #[test]
 fn rt_ag_09_a_full_speed_writer_in_an_rw_mount_is_stopped_by_the_floor() {
-    let _serial = floor_serial();
+    let Some(_serial) =
+        floor_serial("rt_ag_09_a_full_speed_writer_in_an_rw_mount_is_stopped_by_the_floor")
+    else {
+        return;
+    };
     rt().block_on(async {
         let x = floor_below_free(512 * MIB);
         let v =
@@ -118,7 +127,11 @@ fn rt_ag_09_a_full_speed_writer_in_an_rw_mount_is_stopped_by_the_floor() {
 /// the margin after the launch (the floor reads the filesystem's own accounting).
 #[test]
 fn rt_ag_09_a_full_speed_writer_in_a_staged_mount_is_stopped_by_the_floor() {
-    let _serial = floor_serial();
+    let Some(_serial) =
+        floor_serial("rt_ag_09_a_full_speed_writer_in_a_staged_mount_is_stopped_by_the_floor")
+    else {
+        return;
+    };
     rt().block_on(async {
         let x = floor_below_free(2048 * MIB);
         let v = x.f.load(&format!(
@@ -241,7 +254,10 @@ fn rt_ag_09_rename_churn_does_not_evade_stage_size() {
 /// own growth keeps waking the other session's stage task, whose walks run alongside.
 #[test]
 fn rt_ag_09_a_busy_walk_does_not_delay_another_sessions_floor() {
-    let _serial = floor_serial();
+    let Some(_serial) = floor_serial("rt_ag_09_a_busy_walk_does_not_delay_another_sessions_floor")
+    else {
+        return;
+    };
     rt().block_on(async {
         let x = floor_below_free(768 * MIB);
         let tree = x.f.load(&format!(

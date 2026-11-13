@@ -195,6 +195,7 @@ async fn registry_harness(x: &Lx) -> (Arc<Registry>, SessionInfo, String) {
         profiles: paths.data_root().join("profiles"),
         hooks_dir: x.podman.hooks_dir(),
         mounts_file: x.podman.mounts_file(),
+        installation: x.installation.clone(),
     };
     let argv = harness_argv(&common, &paths, &v, &net_image()).unwrap();
     let container = x.create_and_start(argv).await;

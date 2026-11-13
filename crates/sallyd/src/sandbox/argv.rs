@@ -15,7 +15,8 @@ use sally_core::manifest::{ByteSize, MountMode, NetworkMode, ValidatedManifest};
 use super::check::{Allowed, Grant, Source, check_argv};
 use super::scan::{GitScan, LaunchScan};
 use super::types::{
-    ArgvError, CommonArgs, ImageRef, InferenceSpec, OverlayDirs, Role, SessionPaths, input,
+    ArgvError, CommonArgs, INSTALLATION_LABEL, ImageRef, InferenceSpec, OverlayDirs, Role,
+    SessionPaths, input,
 };
 
 /// The entry point baked into the workspace and harness images.
@@ -125,6 +126,11 @@ impl Argv {
             "--rm",
         ]);
         a.push(["--name", &name]);
+        // Q64: the orphan sweeps remove only this installation's containers.
+        a.push([
+            "--label",
+            &format!("{INSTALLATION_LABEL}={}", c.installation.as_str()),
+        ]);
         // AMENDMENTS-01 §6.1: never contact a registry, never inherit host proxies, keep no logs,
         // write no core files.
         a.push([
@@ -211,6 +217,7 @@ fn allowed(c: &CommonArgs, role: Role, sources: Vec<Source>, scratch: Option<&Pa
         profiles: c.profiles.clone(),
         sources,
         scratch: scratch.map(Path::to_owned),
+        installation: c.installation.clone(),
     }
 }
 

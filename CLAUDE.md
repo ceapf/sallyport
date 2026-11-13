@@ -89,7 +89,8 @@ container-free tests run: unit tests, all of sally-core's `tests/`, `sallyd` `ar
 - `make mutants-wide-{core,sallyd,shim}` (sharded): sally-core `manifest/{image,hostenv,parse,
   summary,units}.rs`, `secrets/{store,secret}.rs`, `audit/{entry,redact,verify,writer,layout}.rs`,
   `fsutil.rs`, `fd.rs`, `text.rs`; sallyd `sandbox/{argv,check,types,profiles,overlap,scan,images,
-  changes,dirs,podman,disk,stage,budget}.rs`, `sandbox/launch/error.rs`, `daemon/{mod,crash,startup,stale}.rs`,
+  changes,dirs,podman,disk,stage,budget,orphans}.rs`, `sandbox/launch/error.rs`,
+  `daemon/{mod,crash,startup,stale,install}.rs`,
   `oplog.rs`, `session/{lookup,types,exit}.rs`, `egress/{addr,authority,head,policy,server,
   hostaddrs,tunnel,net,ca,roots,rewrite,intercept,meter}.rs` (net.rs tests stay hermetic: nothing
   leaves the machine), `rpc/{agent,control,frame,json,listen,mcp,message,rate,record}.rs`,
@@ -175,11 +176,12 @@ Two sessions may work in two worktrees at once; container tests are run-scoped
   pushed as a backup when a session is saved (no PR). After a rebase, a lane may
   `git push --force-with-lease` its own unmerged branch; never `main`, never the other lane's
   branch.
-- A local mutation run (through the `make mutants*` targets, never bare `cargo mutants`) holds
-  the per-user `disk-free` lock (shared); the disk-floor writer tests
-  take it exclusively, so they wait for a mutation run in either lane to end (at most 20 minutes,
-  then they fail naming the lock). Local mutation runs cover only the files a branch touches;
-  full runs belong to the nightly.
+- A local mutation run holds the per-user `disk-free` lock (shared); the disk-floor writer tests
+  take it exclusively, so they wait for a mutation run in either lane to end (at most 20 minutes).
+  One that times out has not run, which is not a failure: `scripts/test-run.sh` re-runs it once
+  at the end of the suite and exits 6 if it still cannot run. Local mutation runs cover only the
+  files a branch touches; full runs belong to the nightly. They go one file at a time, one run
+  per file, so the lock is released between files.
 - Merges still go one at a time.
 - A lane never touches the other lane's branch.
 - Shared files (`CLAUDE.md`, `REDTEAM_SUITE.md`, `.cargo/mutants.toml`, `Cargo.lock`): expect a

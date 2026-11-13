@@ -633,8 +633,19 @@ fn orphans_of_a_previous_sallyd_are_removed() {
                 .is_empty()
         );
         assert!(exists(&name));
-        // The next sallyd starts with no live sessions and removes it.
-        let next = Lx::new();
+        // Another daemon (another installation) never takes it.
+        let stranger = Lx::new();
+        assert!(
+            stranger
+                .launcher
+                .remove_orphans(&x.scope, Sweep::Startup)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(exists(&name));
+        // The next sallyd of this installation starts with no live sessions and removes it.
+        let next = x.next_sallyd();
         let removed = next
             .launcher
             .remove_orphans(&x.scope, Sweep::Startup)
@@ -650,17 +661,42 @@ fn orphans_of_a_previous_sallyd_are_removed() {
     });
 }
 
-/// RT-AG-08b, architect Q61 (security review M4): a session container that appears after the
-/// startup sweep (a `podman create` a killed `sallyd` left running) is removed by the periodic
-/// sweep within one period, audited first, while a live session's container survives the same
-/// sweeps. Without the sweep it would hold mounts the overlap rule does not know.
+/// `podman create` of a session-named container out of band, with `label` if given.
+fn create_out_of_band(name: &str, label: Option<&str>) {
+    let image = test_image();
+    let mut args = vec!["create", "--pull=never", "--network=none", "--name", name];
+    let label = label.map(|id| format!("sallyport.installation={id}"));
+    if let Some(l) = &label {
+        args.extend(["--label", l.as_str()]);
+    }
+    args.push(image.as_str());
+    let made = podman(&args);
+    assert!(
+        made.status.success(),
+        "{}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+}
+
+/// RT-AG-08b, architect Q61 (security review M4) and Q64: a session container of this
+/// installation that appears after the startup sweep (a `podman create` a killed `sallyd` left
+/// running) is removed by the periodic sweep within one period, audited first, while a live
+/// session's container survives the same sweeps. Without the sweep it would hold mounts the
+/// overlap rule does not know. A foreign container with a session name survives every sweep:
+/// one with no label (another daemon's, a test run's) and one with another installation's id.
+/// Controls: the sweep loop and `is_live` (the late orphan, the live session); the label
+/// comparison in `sandbox::orphans` (the two foreign containers).
 #[test]
-fn rt_ag_08b_a_late_orphan_is_swept_while_a_live_session_stays() {
+fn rt_ag_08b_a_late_orphan_is_swept_while_a_live_session_and_foreign_containers_stay() {
     rt().block_on(async {
         let x = Lx::new();
         let v =
             x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "rw")]));
         let live = x.launch(&v, "live").await.unwrap();
+        let unlabelled = format!("sp-ws-{}-f0reign", x.scope);
+        let other = format!("sp-ws-{}-0ther", x.scope);
+        create_out_of_band(&unlabelled, None);
+        create_out_of_band(&other, Some("0123abcd-ef01-4234-8567-89abcdef0123"));
         let sweeping = tokio::spawn(sallyd::daemon::sweep::every(
             x.launcher.clone(),
             x.scope.clone(),
@@ -668,20 +704,7 @@ fn rt_ag_08b_a_late_orphan_is_swept_while_a_live_session_stays() {
             sallyd::oplog::Oplog::new(std::io::sink()),
         ));
         let orphan = format!("sp-ws-{}-late0rphan", x.scope);
-        let image = test_image();
-        let made = podman(&[
-            "create",
-            "--pull=never",
-            "--network=none",
-            "--name",
-            &orphan,
-            image.as_str(),
-        ]);
-        assert!(
-            made.status.success(),
-            "{}",
-            String::from_utf8_lossy(&made.stderr)
-        );
+        create_out_of_band(&orphan, Some(x.installation.as_str()));
         let end = std::time::Instant::now() + Duration::from_secs(30);
         while exists(&orphan) {
             assert!(
@@ -690,10 +713,18 @@ fn rt_ag_08b_a_late_orphan_is_swept_while_a_live_session_stays() {
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        // Two more periods: the live session is never taken for an orphan.
+        // Two more periods: the live session and the foreign containers are never taken.
         tokio::time::sleep(Duration::from_millis(1100)).await;
         sweeping.abort();
         assert!(exists(live.name()));
+        assert!(
+            exists(&unlabelled),
+            "a container without the label was swept"
+        );
+        assert!(exists(&other), "another installation's container was swept");
+        for name in [&unlabelled, &other] {
+            assert!(podman(&["rm", name]).status.success());
+        }
         let swept = x.events.args("sandbox.orphan_removed").unwrap();
         assert_eq!(
             (swept["container"].as_str(), swept["sweep"].as_str()),
