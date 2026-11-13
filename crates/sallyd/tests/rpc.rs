@@ -83,7 +83,7 @@ async fn harness(x: &Lx, tag: &str, script: &str) -> Harness {
     let sink: Arc<dyn AuditSink> = x.events.clone();
     let record = Recorder::new(sink, session, AuditLevel::Full);
     // A panic would surface as a failed exchange; nobody reads the reports here.
-    let (crash, _) = sallyd::rpc::listen::CrashReporter::channel();
+    let (crash, _) = sallyd::daemon::crash::CrashReporter::channel();
     let agent = Arc::new(Agent::new(Echo, record.clone())).listen(
         bind(&sockets.join("agent.sock")).unwrap(),
         uid,

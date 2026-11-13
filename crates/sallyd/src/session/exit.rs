@@ -25,7 +25,7 @@ pub struct Exit {
 
 /// The process `dir` (a `/proc/<pid>` directory) was opened for still exists.
 #[must_use]
-pub fn alive(dir: &OwnedFd) -> bool {
+pub(crate) fn alive(dir: &OwnedFd) -> bool {
     statat(dir, "stat", AtFlags::empty()).is_ok()
 }
 

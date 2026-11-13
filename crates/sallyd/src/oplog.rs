@@ -95,7 +95,10 @@ impl Oplog {
         Self { tx, shared }
     }
 
-    /// Replaces the redactor applied to every later line.
+    /// Replaces the redactor applied to every later line. TODO(#85): no caller outside tests yet;
+    /// once sessions load secrets, the registry swaps in the live sessions' union here and in the
+    /// `AuditWriter` at the same points (security review L3), so podman stderr or a panic payload
+    /// carrying a secret is redacted in the oplog too.
     pub fn set_redactor(&self, r: Arc<Redactor>) {
         *self
             .shared

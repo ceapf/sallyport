@@ -11,11 +11,11 @@ use crate::egress::server::ADMISSION_EXTRA;
 /// `llm.sock`, `net.sock`), the connections on `agent.sock` and `llm.sock`, a running `shell`
 /// command's pipes and process handles, and the watchdog's init directory and cgroup event
 /// files. Rounded up well past their sum (`fixed_part_covers_every_holder`).
-pub const SESSION_FIXED_FDS: u64 = 64;
+pub(crate) const SESSION_FIXED_FDS: u64 = 64;
 
 /// The budget the live sessions share: half of the raised soft `RLIMIT_NOFILE`.
 #[must_use]
-pub const fn session_budget(nofile: u64) -> u64 {
+pub(crate) const fn session_budget(nofile: u64) -> u64 {
     nofile / 2
 }
 
@@ -23,7 +23,7 @@ pub const fn session_budget(nofile: u64) -> u64 {
 /// upstream's), for `max_connections` plus the [`ADMISSION_EXTRA`] answered 429, plus
 /// [`SESSION_FIXED_FDS`].
 #[must_use]
-pub fn session_cost(max_connections: u32) -> u64 {
+pub(crate) fn session_cost(max_connections: u32) -> u64 {
     let extra = u64::try_from(ADMISSION_EXTRA).unwrap_or(u64::MAX);
     u64::from(max_connections)
         .saturating_add(extra)
@@ -51,7 +51,7 @@ pub struct FdRefusal {
 ///
 /// # Errors
 /// [`FdRefusal`] naming the three numbers.
-pub fn admit(limit: u64, used: u64, needed: u64) -> Result<(), FdRefusal> {
+pub(crate) fn admit(limit: u64, used: u64, needed: u64) -> Result<(), FdRefusal> {
     let free = limit.saturating_sub(used);
     if needed <= free {
         Ok(())

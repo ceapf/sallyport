@@ -28,7 +28,7 @@ pub const SESSION_LOOKUPS: usize = MAX_LOOKUPS / 4;
 /// A lookup that first takes one of `global`'s slots, without waiting, and holds it until the
 /// blocking `inner` call returns.
 #[must_use]
-pub fn globally_bounded(global: Arc<Semaphore>, inner: Lookup) -> Lookup {
+pub(crate) fn globally_bounded(global: Arc<Semaphore>, inner: Lookup) -> Lookup {
     Arc::new(
         move |name: &str, port: u16| -> io::Result<Vec<SocketAddr>> {
             let _slot = Arc::clone(&global).try_acquire_owned().map_err(|_| {
@@ -44,7 +44,7 @@ pub fn globally_bounded(global: Arc<Semaphore>, inner: Lookup) -> Lookup {
 
 /// A session's resolver: [`SESSION_LOOKUPS`] slots of its own over `lookup`.
 #[must_use]
-pub fn session_resolver(lookup: &Lookup) -> SystemResolver {
+pub(crate) fn session_resolver(lookup: &Lookup) -> SystemResolver {
     SystemResolver::new(
         Arc::new(Semaphore::new(SESSION_LOOKUPS)),
         Arc::clone(lookup),

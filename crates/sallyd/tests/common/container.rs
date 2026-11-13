@@ -587,7 +587,7 @@ impl Lx {
             default_image,
             oplog: sallyd::oplog::Oplog::new(std::io::sink()),
             // A supervisor panic shows as a missing stop in the test; nobody reads these.
-            crash: sallyd::rpc::listen::CrashReporter::channel().0,
+            crash: sallyd::daemon::crash::CrashReporter::channel().0,
             scope: self.scope.clone(),
         })
     }
@@ -598,7 +598,7 @@ impl Lx {
             manifest: Arc::new(v.clone()),
             default_image: Some(test_image()),
             // A watchdog panic is not what these tests watch; nobody reads the reports.
-            crash: sallyd::rpc::listen::CrashReporter::channel().0,
+            crash: sallyd::daemon::crash::CrashReporter::channel().0,
         }
     }
 

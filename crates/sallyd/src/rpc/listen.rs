@@ -13,7 +13,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
-pub use crate::daemon::crash::CrashReporter;
+pub(crate) use crate::daemon::crash::CrashReporter;
 
 /// Time the accept loop waits after a failed accept (EMFILE and similar).
 pub const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);

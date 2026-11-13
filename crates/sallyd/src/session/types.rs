@@ -5,7 +5,7 @@ use std::io;
 use crate::sandbox::SessionId;
 
 /// Random bytes in a session id: 64 bits, written as 16 lowercase hex digits.
-pub const ID_BYTES: usize = 8;
+pub(crate) const ID_BYTES: usize = 8;
 
 /// Why a session ended: the `reason` of its `session.stop` entry. Every `session.start` gets
 /// exactly one `session.stop`, with one of these.
@@ -43,14 +43,14 @@ impl StopReason {
 /// The session id written from `bytes`: lowercase hex, so it always meets
 /// [`SessionId::parse`].
 #[must_use]
-pub fn id_from(bytes: [u8; ID_BYTES]) -> String {
+pub(crate) fn id_from(bytes: [u8; ID_BYTES]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// The id `scope-<hex>`, or `<hex>` with an empty scope (production; a test fixture scopes
 /// its ids so that its cleanup finds its own containers).
 #[must_use]
-pub fn scoped_id(scope: &str, bytes: [u8; ID_BYTES]) -> String {
+pub(crate) fn scoped_id(scope: &str, bytes: [u8; ID_BYTES]) -> String {
     if scope.is_empty() {
         id_from(bytes)
     } else {
