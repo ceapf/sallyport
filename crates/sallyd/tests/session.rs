@@ -706,7 +706,7 @@ impl std::io::Write for Lines {
 /// `request`. Nothing agent-originated follows `session.stop`; the supervisor then removes the
 /// container by itself.
 #[test]
-fn an_operation_past_the_drain_and_a_panic_during_the_stop_end_before_session_stop() {
+fn rt_ag_15_an_operation_past_the_drain_and_a_panic_during_the_stop_end_before_session_stop() {
     rt().block_on(async {
         let x = Lx::new();
         let sink = Arc::new(Hooked {
