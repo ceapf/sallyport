@@ -438,11 +438,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> EgressStarter for Egress<R, D, H> {
             audit: s.audit,
             session: s.session,
             level: s.level,
-            limits: Limits {
-                max_request: s.body_caps.0,
-                max_response: s.body_caps.1,
-                ..Limits::new(s.max_connections)
-            },
+            limits: Limits::of_session(s.max_connections, s.body_caps),
             interception: s.interception,
         });
         Ok(serve(listener, Arc::new(proxy)))

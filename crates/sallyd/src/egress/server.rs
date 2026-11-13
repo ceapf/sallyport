@@ -146,6 +146,17 @@ impl Limits {
         }
     }
 
+    /// A session's limits: the documented ones with its connection cap and its own body caps
+    /// `(max_request, max_response)` (`network.max_request_bytes`, `max_response_bytes`).
+    #[must_use]
+    pub fn of_session(max_connections: usize, body_caps: (u64, u64)) -> Self {
+        Self {
+            max_request: body_caps.0,
+            max_response: body_caps.1,
+            ..Self::documented(max_connections)
+        }
+    }
+
     /// Accepted connections in flight at most: the cap plus [`ADMISSION_EXTRA`], within what a
     /// semaphore can hold.
     #[must_use]

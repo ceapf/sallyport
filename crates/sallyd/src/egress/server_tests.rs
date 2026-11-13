@@ -967,6 +967,20 @@ fn the_limits_are_pinned() {
     assert!(REPLY_TIMEOUT + DRAIN_TIMEOUT < crate::egress::net::STOP_GRACE);
 }
 
+/// A session's limits carry its own body caps (the manifest's `network.max_request_bytes` and
+/// `max_response_bytes`), not the defaults; the rest are the documented ones.
+#[test]
+fn a_session_gets_its_own_body_caps() {
+    assert_eq!(
+        Limits::of_session(7, (3, 5)),
+        Limits {
+            max_request: 3,
+            max_response: 5,
+            ..Limits::new(7)
+        }
+    );
+}
+
 #[test]
 fn the_in_flight_bound_is_the_cap_plus_sixty_four_and_never_overflows() {
     assert_eq!(Limits::new(8).in_flight(), 72);
