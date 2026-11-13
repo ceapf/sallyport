@@ -107,6 +107,13 @@ pub fn nofile_target(soft: Option<u64>, hard: Option<u64>) -> u64 {
     cap.max(soft.unwrap_or(0).min(cap))
 }
 
+/// Opens the state directory: never through a symlink, and never anything but a directory (an
+/// `O_RDONLY` open of a FIFO planted there would block until a writer came).
+fn open_state_dir(path: &Path) -> rustix::io::Result<OwnedFd> {
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    sally_core::fd::open(path, flags, Mode::empty())
+}
+
 /// Step 4–5: creates `<runtime>/sallyport` (0700; an existing one is fine), opens it without
 /// following a symlink, checks the opened directory, and takes the single-instance lock on that
 /// fd. The returned fd holds the lock for as long as it lives (close-on-exec: no child inherits
@@ -125,9 +132,7 @@ pub fn open_and_lock(runtime: &Path) -> Result<OwnedFd, StartError> {
         Ok(()) | Err(rustix::io::Errno::EXIST) => {}
         Err(e) => return Err(fail(format!("mkdir: {e}"))),
     }
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let dir = sally_core::fd::open(&path, flags, Mode::empty())
-        .map_err(|e| fail(format!("open: {e}")))?;
+    let dir = open_state_dir(&path).map_err(|e| fail(format!("open: {e}")))?;
     let st = rustix::fs::fstat(&dir).map_err(|e| fail(format!("fstat: {e}")))?;
     check_state_dir(st.st_mode, st.st_uid, rustix::process::geteuid().as_raw())
         .map_err(|why| fail(why.to_owned()))?;
@@ -217,6 +222,32 @@ mod tests {
         );
         drop(held);
         drop(open_and_lock(&rt).unwrap());
+        std::fs::remove_dir_all(&rt).unwrap();
+    }
+
+    /// A FIFO planted where the directory belongs is refused at once (`O_DIRECTORY`): an
+    /// `O_RDONLY` open of it would block startup until a writer came.
+    #[test]
+    fn a_fifo_in_place_of_the_state_dir_is_refused_without_blocking() {
+        let rt = scratch("fifo");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            rt.join(STATE_DIR),
+            rustix::fs::FileType::Fifo,
+            Mode::from_raw_mode(0o700),
+            0,
+        )
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let at = rt.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(open_and_lock(&at).map(drop));
+        });
+        let e = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the open blocked on the FIFO")
+            .unwrap_err();
+        assert!(e.to_string().contains("open: "), "{e}");
         std::fs::remove_dir_all(&rt).unwrap();
     }
 

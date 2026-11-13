@@ -120,6 +120,23 @@ mod tests {
         assert_eq!(SESSION_LOOKUPS, 16);
     }
 
+    /// Each session's egress resolves through the starter's own lookup (not a default one).
+    #[test]
+    fn a_session_egress_uses_the_starters_lookup() {
+        crate::daemon::runtime().unwrap().block_on(async {
+            let (inner, _release) = stuck();
+            let starter = SharedEgress::new(inner);
+            assert!(format!("{starter:?}").starts_with("SharedEgress"));
+            let got = starter
+                .session()
+                .resolver
+                .resolve("fast.test", 443)
+                .await
+                .unwrap();
+            assert_eq!(got, [SocketAddr::from(([192, 0, 2, 1], 443))]);
+        });
+    }
+
     /// A lookup that blocks until released (names starting with `slow`) and answers at once
     /// otherwise.
     fn stuck() -> (Lookup, mpsc::Sender<()>) {

@@ -78,10 +78,7 @@ pub fn payload(p: &(dyn Any + Send)) -> String {
         .copied()
         .or_else(|| p.downcast_ref::<String>().map(String::as_str))
         .unwrap_or("non-text panic payload");
-    let mut end = text.len().min(MAX_PAYLOAD);
-    while !text.is_char_boundary(end) {
-        end = end.saturating_sub(1);
-    }
+    let end = text.floor_char_boundary(MAX_PAYLOAD);
     text.get(..end).unwrap_or_default().to_owned()
 }
 

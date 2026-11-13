@@ -297,12 +297,28 @@ mod tests {
         let l = format_line("1", Level::Info, "c", "m", &fields, &none());
         assert!(l.len() <= MAX_LINE + 1, "{}", l.len());
         assert!(l.trim_end().ends_with("fields)"), "fields dropped whole");
-        // Exactly at the cap nothing is dropped.
+        // Exactly at the cap nothing is dropped; one byte more drops the last field.
         let head = format_line("1", Level::Info, "c", "m", &[], &none());
-        let room = MAX_LINE - (head.len() - 1) - " k=\"\"".len();
-        let fits = "c".repeat(room.min(MAX_VALUE));
-        let l = format_line("1", Level::Info, "c", "m", &[("k", &fits)], &none());
+        let wrap = " k=\"\"".len();
+        let mut room = MAX_LINE - (head.len() - 1);
+        let mut values = Vec::new();
+        while room > 0 {
+            let v = if room > 4000 + 2 * wrap {
+                4000
+            } else {
+                room - wrap
+            };
+            values.push("c".repeat(v));
+            room -= v + wrap;
+        }
+        let fields: Vec<(&str, &str)> = values.iter().map(|v| ("k", v.as_str())).collect();
+        let l = format_line("1", Level::Info, "c", "m", &fields, &none());
         assert!(!l.contains("...(+"), "{}", l.len());
+        assert_eq!(l.len(), MAX_LINE + 1);
+        values.last_mut().unwrap().push('c');
+        let fields: Vec<(&str, &str)> = values.iter().map(|v| ("k", v.as_str())).collect();
+        let l = format_line("1", Level::Info, "c", "m", &fields, &none());
+        assert!(l.trim_end().ends_with("...(+1 fields)"), "{}", l.len());
     }
 
     /// A writer that records lines, optionally blocking until released.
@@ -342,8 +358,15 @@ mod tests {
     fn lines_reach_the_writer_and_the_redactor_can_be_swapped() {
         let sink = Sink::default();
         let log = Oplog::new(sink.clone());
+        assert!(format!("{log:?}").starts_with("Oplog"));
         log.info("daemon", "ready", &[("v", "canary-123456789")]);
-        wait_for(&sink, "canary-123456789");
+        let first = wait_for(&sink, "canary-123456789");
+        // `<secs>.<millis>` since the epoch, and no drop note when nothing was dropped.
+        let ts = first.split(' ').next().unwrap();
+        let (secs, millis) = ts.split_once('.').unwrap();
+        assert!(secs.parse::<u64>().unwrap() > 1_700_000_000, "{ts}");
+        assert!(millis.len() == 3 && millis.parse::<u16>().is_ok(), "{ts}");
+        assert!(!first.contains("lines dropped"), "{first}");
         log.set_redactor(Arc::new(Redactor::new([("C", "canary-123456789")])));
         log.warn("daemon", "again", &[("v", "canary-123456789")]);
         let text = wait_for(&sink, "[REDACTED:C]");
@@ -365,7 +388,10 @@ mod tests {
         assert!(log.dropped() >= 49, "{}", log.dropped());
         drop(held);
         log.info("t", "after", &[]);
-        wait_for(&sink, "lines dropped");
+        let text = wait_for(&sink, "lines dropped");
+        // The note counts what was lost, once.
+        assert_eq!(text.matches("lines dropped").count(), 1, "{text}");
+        assert!(!text.contains("count=\"0\""), "{text}");
     }
 
     /// `flush` returns once every queued line is written, and gives up at its limit on a stuck
