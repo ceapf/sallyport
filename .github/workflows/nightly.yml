@@ -7,9 +7,11 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+# A running nightly always finishes: a new run waits instead of cancelling it (two runs were
+# lost that way). GitHub still keeps only one pending run per group.
 concurrency:
   group: nightly
-  cancel-in-progress: true
+  cancel-in-progress: false
 env:
   CARGO_TERM_COLOR: always
   CARGO_MUTANTS_VERSION: "27.1.0"
