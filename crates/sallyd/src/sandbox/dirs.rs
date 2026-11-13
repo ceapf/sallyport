@@ -29,6 +29,24 @@ pub fn staged_indices(v: &ValidatedManifest) -> Vec<usize> {
         .collect()
 }
 
+/// Opens `<data>/sessions`, the directory every session's data directory is made in, creating
+/// it (and `data`) 0700 if missing. The daemon opens it once at start; the staged-changes
+/// listing opens each session beneath this fd (architect Q81.1). It is checked like a session
+/// directory (a directory, not a symlink, the current user's, exactly 0700), then opened
+/// without following a symlink. Only the user could swap it in between, inside their own 0700
+/// state directory.
+///
+/// # Errors
+/// [`DirError`] naming the path.
+pub fn open_sessions(data: &Path) -> Result<rustix::fd::OwnedFd, DirError> {
+    use rustix::fs::{Mode, OFlags};
+    root_dir(data)?;
+    let dir = data.join("sessions");
+    private(&dir, false)?;
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW;
+    sally_core::fd::open(&dir, flags, Mode::empty()).or_else(|e| fail(&dir, e.to_string()))
+}
+
 /// Why a session directory could not be prepared.
 #[derive(Debug, thiserror::Error)]
 #[error("{path}: {msg}")]
@@ -333,5 +351,52 @@ mod tests {
         assert_eq!(mode & 0o777, 0o700);
         std::fs::set_permissions(&r, std::fs::Permissions::from_mode(0o720)).unwrap();
         assert!(msg(root_dir(&r)).contains("not writable by group or others"));
+    }
+
+    /// Architect Q81.1: the daemon's one `sessions/` fd, made 0700 if missing and the same
+    /// directory sessions are created in.
+    #[test]
+    fn the_sessions_dir_is_opened_once_and_made_0700() {
+        let s = Scratch::new("sessions");
+        let data = s.0.join("state");
+        let fd = open_sessions(&data).unwrap();
+        let dir = data.join("sessions");
+        let meta = std::fs::symlink_metadata(&dir).unwrap();
+        assert!(meta.is_dir());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+        let st = rustix::fs::fstat(&fd).unwrap();
+        assert_eq!((st.st_dev, st.st_ino), (meta.dev(), meta.ino()));
+        std::fs::create_dir(dir.join("a")).unwrap();
+        assert!(rustix::fs::statat(&fd, "a", rustix::fs::AtFlags::empty()).is_ok());
+        drop(fd);
+        assert!(open_sessions(&data).is_ok(), "an existing one is opened");
+    }
+
+    #[test]
+    fn a_sessions_symlink_or_loose_mode_is_refused() {
+        let s = Scratch::new("sessions-bad");
+        let real = s.0.join("real");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&real)
+            .unwrap();
+        let data = s.0.join("state");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&data)
+            .unwrap();
+        std::os::unix::fs::symlink(&real, data.join("sessions")).unwrap();
+        assert!(open_sessions(&data).is_err(), "a symlink is never followed");
+        std::fs::remove_file(data.join("sessions")).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(data.join("sessions"))
+            .unwrap();
+        std::fs::set_permissions(
+            data.join("sessions"),
+            std::fs::Permissions::from_mode(0o750),
+        )
+        .unwrap();
+        assert!(msg(open_sessions(&data)).contains("mode 0700"));
     }
 }

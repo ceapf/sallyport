@@ -28,7 +28,7 @@ mod watchdog;
 pub use argv::{harness_argv, inference_argv, workspace_argv};
 pub use changes::{Change, ChangeKind, ChangesError, session_changes};
 pub use check::{Allowed, Grant, Source, check_argv};
-pub use dirs::{DirError, SessionDirs, check_runtime_dir, staged_indices};
+pub use dirs::{DirError, SessionDirs, check_runtime_dir, open_sessions, staged_indices};
 pub use disk::DiskFloor;
 pub use inside::Mismatch;
 /// Public only for `tests/launch.rs`, which compares identities inside a real container; the
