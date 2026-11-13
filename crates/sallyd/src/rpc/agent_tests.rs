@@ -681,7 +681,7 @@ async fn the_rate_is_shared_by_a_sessions_connections() {
 /// only A's handler, and every entry carries A's id. Nothing here routes by session id, so the
 /// controls this pins are the envelope's member check (message 3), `tools/call`'s parameter
 /// check (message 2) and the recorder's session stamping; B's server is built but not served.
-// TODO(#61): send through Task 12's session registry with B live.
+/// The same requests through the session registry with B live: `tests/session.rs`.
 #[tokio::test]
 async fn rt_ag_08_a_foreign_session_id_reaches_only_its_own_session() {
     let (sink, rec_a) = recorder("sess-a");

@@ -17,6 +17,8 @@ use sallyd::sandbox::{
     Sessions, UserIds, WorkspaceRequest, resolve_podman,
 };
 
+use sallyd::session::{Registry, RegistryParts};
+
 use super::Fx;
 
 /// The base image CI pulls by digest; everything else is built from it without a network.
@@ -542,13 +544,39 @@ impl Lx {
     }
 
     pub fn paths(&self, tag: &str) -> SessionPaths {
-        let id = SessionId::parse(&format!("{}-{tag}", self.scope)).unwrap();
+        self.session_paths(&format!("{}-{tag}", self.scope))
+    }
+
+    /// The directories of session `id` (one the registry made, or [`Lx::paths`]).
+    pub fn session_paths(&self, id: &str) -> SessionPaths {
         SessionPaths::new(
-            id,
+            SessionId::parse(id).unwrap(),
             &self.xdg.join("sallyport"),
             &self.f.root.join("home/.local/share/sallyport"),
         )
         .unwrap()
+    }
+
+    /// A session registry over this fixture's launcher, appending to `audit`, its session ids
+    /// scoped like [`Lx::paths`] (so `Drop` removes its containers).
+    pub fn registry(
+        &self,
+        audit: Arc<dyn AuditSink>,
+        default_image: Option<ImageRef>,
+    ) -> Arc<Registry> {
+        Registry::new(RegistryParts {
+            launcher: self.launcher.clone(),
+            audit,
+            podman: self.podman.clone(),
+            ids: ids(),
+            sockets: self.xdg.join("sallyport"),
+            data: self.f.root.join("home/.local/share/sallyport"),
+            default_image,
+            oplog: sallyd::oplog::Oplog::new(std::io::sink()),
+            // A supervisor panic shows as a missing stop in the test; nobody reads these.
+            crash: sallyd::rpc::listen::CrashReporter::channel().0,
+            scope: self.scope.clone(),
+        })
     }
 
     pub fn request(&self, v: &ValidatedManifest, tag: &str) -> WorkspaceRequest {

@@ -11,10 +11,10 @@ use std::time::Duration;
 
 use sally_core::audit::{AuditError, NewEntry};
 use sally_core::manifest::AuditLevel;
-use sallyd::oplog::Oplog;
-use sallyd::rpc::listen::CrashReporter;
 use sallyd::sandbox::{AuditSink, LaunchError};
-use sallyd::session::{AGENT_SOCK, Registry, RegistryParts, StartError, StopOutcome, StopReason};
+use sallyd::session::{AGENT_SOCK, Registry, StartError, StopOutcome, StopReason};
+use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 mod common;
 use common::container::*;
@@ -22,12 +22,14 @@ use common::*;
 
 type Hook = Box<dyn Fn(&Path) -> Result<(), AuditError> + Send + Sync>;
 
-/// The registry's audit sink: forwards to the fixture's events, and runs `hook` (with the
-/// sessions' socket root) when `session.start` is appended, before it is recorded.
+/// The registry's audit sink: forwards to the fixture's events, keeps every entry's `Debug`
+/// form (which shows its session id), and runs `hook` (with the sessions' socket root) when
+/// `session.start` is appended, before it is recorded.
 struct Hooked {
     events: Arc<Events>,
     sockets: PathBuf,
     hook: Mutex<Option<Hook>>,
+    debug: Mutex<Vec<String>>,
 }
 
 impl AuditSink for Hooked {
@@ -37,6 +39,7 @@ impl AuditSink for Hooked {
         {
             h(&self.sockets)?;
         }
+        self.debug.lock().unwrap().push(format!("{e:?}"));
         self.events.append(e, level)
     }
 }
@@ -53,25 +56,13 @@ fn registry() -> Rx {
 
 fn registry_with(default_image: Option<sallyd::sandbox::ImageRef>) -> Rx {
     let x = Lx::new();
-    let sockets = x.xdg.join("sallyport");
     let sink = Arc::new(Hooked {
         events: x.events.clone(),
-        sockets: sockets.join("sessions"),
+        sockets: x.xdg.join("sallyport/sessions"),
         hook: Mutex::new(None),
+        debug: Mutex::new(Vec::new()),
     });
-    let reg = Registry::new(RegistryParts {
-        launcher: x.launcher.clone(),
-        audit: sink.clone(),
-        podman: x.podman.clone(),
-        ids: ids(),
-        sockets,
-        data: x.f.root.join("home/.local/share/sallyport"),
-        default_image,
-        oplog: Oplog::new(std::io::sink()),
-        // A supervisor panic would fail the test through a missing stop; nobody reads these.
-        crash: CrashReporter::channel().0,
-        scope: x.scope.clone(),
-    });
+    let reg = x.registry(sink.clone(), default_image);
     Rx { x, reg, sink }
 }
 
@@ -337,5 +328,79 @@ fn shutdown_stops_every_session_and_refuses_new_ones() {
         assert_eq!(stops(&r.x), ["shutdown", "shutdown"]);
         let e = r.reg.start(v).await.unwrap_err();
         assert!(matches!(e, StartError::ShuttingDown), "{e}");
+    });
+}
+
+/// Sends each of `lines` on `sock` and reads one reply line for each. Connects through an open
+/// fd of the socket's directory: the fixture's paths are longer than `SUN_LEN`.
+async fn exchange(sock: &Path, lines: &[Value]) -> Vec<Value> {
+    let dir = std::fs::File::open(sock.parent().unwrap()).unwrap();
+    let short = Path::new("/proc/self/fd")
+        .join(std::os::fd::AsRawFd::as_raw_fd(&dir).to_string())
+        .join(sock.file_name().unwrap());
+    let s = tokio::net::UnixStream::connect(&short).await.unwrap();
+    let (r, mut w) = s.into_split();
+    let mut r = BufReader::new(r);
+    let mut replies = Vec::new();
+    for l in lines {
+        w.write_all(format!("{l}\n").as_bytes()).await.unwrap();
+        let mut reply = String::new();
+        tokio::time::timeout(Duration::from_secs(10), r.read_line(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        replies.push(serde_json::from_str(&reply).unwrap());
+    }
+    replies
+}
+
+/// RT-AG-08 (foreign-id clause) through the registry, B live (#61): a request on A's
+/// `agent.sock` naming B's session id in the arguments, in `_meta`, in `params` or as an extra
+/// member reaches only A's tool handler, and every entry it causes carries A's id, never B's.
+#[test]
+fn rt_ag_08_a_foreign_session_id_reaches_only_its_own_session() {
+    rt().block_on(async {
+        let r = registry();
+        let v = Arc::new(r.x.f.load(""));
+        let a = r.reg.start(Arc::clone(&v)).await.unwrap();
+        let b = r.reg.start(v).await.unwrap();
+        let sock = r.x.session_paths(&a.id).harness_sockets().join(AGENT_SOCK);
+        let meta = json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+        let mut foreign = meta.clone();
+        foreign["session"] = json!(b.id);
+        foreign["io.modelcontextprotocol/sessionId"] = json!(b.id);
+        let mark = r.sink.debug.lock().unwrap().len();
+        let replies = exchange(
+            &sock,
+            &[
+                json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                       "params": {"_meta": foreign, "name": "fs_list",
+                                  "arguments": {"session": b.id}}}),
+                json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                       "params": {"_meta": meta, "name": "fs_list", "session": b.id}}),
+                json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "session": b.id,
+                       "params": {"_meta": meta, "name": "fs_list"}}),
+            ],
+        )
+        .await;
+        // The first is a call (A's tools deny an ungranted tool); the others are malformed.
+        assert_eq!(replies[0]["result"]["isError"], json!(true), "{replies:?}");
+        assert!(replies[1].get("error").is_some(), "{replies:?}");
+        assert!(replies[2].get("error").is_some(), "{replies:?}");
+        let caused: Vec<String> = r.sink.debug.lock().unwrap()[mark..].to_vec();
+        assert!(caused.len() >= 3, "{caused:#?}");
+        let own = format!("session: Some({:?})", a.id);
+        assert!(caused.iter().all(|d| d.contains(&own)), "{caused:#?}");
+        let theirs = format!("session: Some({:?})", b.id);
+        assert!(!caused.iter().any(|d| d.contains(&theirs)), "{caused:#?}");
+        for s in [&a, &b] {
+            assert_eq!(
+                r.reg.stop(&s.id, StopReason::Request).await,
+                Some(StopOutcome::Stopped)
+            );
+        }
     });
 }
