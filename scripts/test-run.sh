@@ -184,8 +184,17 @@ not_run() {
 }
 # Stop the whole command first (its process group: cargo, the test binaries, their children), so
 # nothing is created after the sweep (security review M1).
+# Every job is stopped, not only `child`: a signal that lands between a job's fork and
+# `child=$!` would otherwise leave it running past the sweep (security re-review L2). Each job
+# was started under `set -m`, so its pid is its process group.
 on_signal() {
-  [ -z "$child" ] || { kill -TERM -- "-$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; }
+  local p
+  for p in $child $(jobs -p); do
+    kill -TERM -- "-$p" 2>/dev/null || true
+  done
+  for p in $child $(jobs -p); do
+    wait "$p" 2>/dev/null || true
+  done
   exit "$1"
 }
 trap finish EXIT
