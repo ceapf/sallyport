@@ -42,7 +42,8 @@ pub struct Facts {
     pub runtime_dir: Option<Result<(u32, u32, bool), String>>,
     /// The effective uid.
     pub euid: u32,
-    /// Whether `~/.config/containers/storage.conf` exists.
+    /// Whether `containers/storage.conf` exists under the config home (`$XDG_CONFIG_HOME`, or
+    /// `~/.config`), where Podman reads it.
     pub storage_conf: bool,
 }
 
@@ -112,8 +113,8 @@ pub fn not_root(euid: u32) -> Verdict {
 pub fn storage_conf(exists: bool) -> Verdict {
     if exists {
         Verdict::Note(
-            "~/.config/containers/storage.conf exists: a non-default graphroot must move to the \
-             default location"
+            "containers/storage.conf exists in $XDG_CONFIG_HOME (or ~/.config): a non-default \
+             graphroot must move to the default location"
                 .into(),
         )
     } else {

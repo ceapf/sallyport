@@ -146,7 +146,7 @@ MUTANTS_WIDE_SHIM := $(addprefix crates/sally-shim/src/,args.rs relay.rs)
 # the approve loop, and the local commands (secrets, manifest/audit, doctor's decisions); its clap
 # definitions and main.rs are out. Its tests start no container (a fake daemon on a Unix socket).
 MUTANTS_WIDE_CLI := $(addprefix crates/sally-cli/src/,clean.rs client.rs commands.rs approve.rs \
-                    secrets.rs local.rs doctor.rs)
+                    secrets.rs local.rs doctor.rs usage.rs)
 MUTANTS_WIDE_TESTS_CORE :=
 MUTANTS_WIDE_TESTS_SALLYD := --lib --test=argv --test=scan
 MUTANTS_WIDE_TESTS_SHIM := --lib --test=relay

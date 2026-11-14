@@ -79,13 +79,50 @@ fn a_piped_value_is_bounded_non_empty_and_utf8() {
 }
 
 #[test]
-fn a_terminal_line_ends_at_its_newline() {
-    let mut r = &b"first\nsecond\n"[..];
-    assert_eq!(read_line(&mut r).unwrap().as_str(), "first");
-    assert_eq!(read_line(&mut r).unwrap().as_str(), "second");
-    assert_eq!(read_line(&mut r), Err(ValueError::Empty));
-    let over = format!("{}\n", value(MAX_VALUE_BYTES + 1));
-    assert_eq!(read_line(&mut over.as_bytes()), Err(ValueError::TooLong));
+fn a_terminal_line_ends_at_its_newline_or_eof() {
+    let mut r = &b"first\nsecond\nlast"[..];
+    assert_eq!(read_line(&mut r, None).unwrap().as_str(), "first");
+    assert_eq!(read_line(&mut r, None).unwrap().as_str(), "second");
+    assert_eq!(read_line(&mut r, None).unwrap().as_str(), "last");
+    assert_eq!(read_line(&mut r, None), Err(ValueError::Empty));
+}
+
+#[test]
+fn a_terminal_line_stops_at_the_cancel_byte() {
+    let mut r = &b"part\x03ial\n"[..];
+    assert_eq!(read_line(&mut r, Some(3)), Err(ValueError::Cancelled));
+    let mut r = &b"part\x03ial\n"[..];
+    assert!(read_line(&mut r, None).is_ok(), "no cancel byte, no cancel");
+}
+
+#[test]
+fn a_terminal_line_is_capped_below_the_kernel_line() {
+    let at = format!("{}\n", value(TTY_MAX_VALUE_BYTES));
+    assert_eq!(read_line(&mut at.as_bytes(), None).unwrap().len(), 4094);
+    let over = format!("{}\n", value(TTY_MAX_VALUE_BYTES + 1));
+    assert_eq!(
+        read_line(&mut over.as_bytes(), None),
+        Err(ValueError::TooLongForTerminal)
+    );
+}
+
+#[test]
+fn value_errors_exit_2_only_when_nothing_could_be_read() {
+    for e in [
+        ValueError::Terminal(String::new()),
+        ValueError::Read(String::new()),
+    ] {
+        assert_eq!(e.exit_code(), EXIT_FAILED, "{e:?}");
+    }
+    for e in [
+        ValueError::TooLong,
+        ValueError::NotUtf8,
+        ValueError::Empty,
+        ValueError::Cancelled,
+        ValueError::TooLongForTerminal,
+    ] {
+        assert_eq!(e.exit_code(), EXIT_REFUSED, "{e:?}");
+    }
 }
 
 #[test]
@@ -150,17 +187,21 @@ fn pty() -> (std::fs::File, std::fs::File) {
     (std::fs::File::from(controller), terminal)
 }
 
-/// Types `value` on the controller when the prompt is written, that is after echo is off.
-struct TypeAfterPrompt<'a> {
-    controller: &'a mut std::fs::File,
-    value: &'a [u8],
+/// Types `typed` on the controller when the prompt is written, that is after echo is off, and
+/// records the terminal's settings at that moment.
+struct TypeAfterPrompt {
+    controller: std::fs::File,
+    terminal: std::fs::File,
+    typed: Vec<u8>,
     prompt: Vec<u8>,
+    during: Option<rustix::termios::Termios>,
 }
 
-impl Write for TypeAfterPrompt<'_> {
+impl Write for TypeAfterPrompt {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if self.prompt.is_empty() {
-            self.controller.write_all(self.value)?;
+            self.during = rustix::termios::tcgetattr(&self.terminal).ok();
+            self.controller.write_all(&self.typed)?;
         }
         self.prompt.extend_from_slice(buf);
         Ok(buf.len())
@@ -170,39 +211,127 @@ impl Write for TypeAfterPrompt<'_> {
     }
 }
 
-#[test]
-fn a_terminal_value_is_read_without_echo_and_echo_comes_back() {
-    use rustix::termios::{LocalModes, tcgetattr};
-    let (mut controller, terminal) = pty();
-    assert!(
-        tcgetattr(&terminal)
-            .unwrap()
-            .local_modes
-            .contains(LocalModes::ECHO)
-    );
-    let mut err = TypeAfterPrompt {
-        controller: &mut controller,
-        value: b"s3cret-typed-value\n",
-        prompt: Vec::new(),
-    };
-    let got = read_terminal(&terminal, "value: ", &mut err).unwrap();
-    assert_eq!(got.as_str(), "s3cret-typed-value");
-    assert!(err.prompt.starts_with(b"value: "), "{:?}", err.prompt);
-    let modes = tcgetattr(&terminal).unwrap().local_modes;
+/// What one prompt on a fresh pty did.
+struct Typed {
+    got: Result<String, ValueError>,
+    before: rustix::termios::Termios,
+    during: rustix::termios::Termios,
+    after: rustix::termios::Termios,
+    /// What the terminal displayed.
+    shown: Vec<u8>,
+    /// Input still unread after the prompt returned.
+    left: Vec<u8>,
+}
+
+/// `read_terminal` on a fresh pty with `typed` typed at the prompt; bounded at 10 s so a
+/// terminal that never ends the line fails the test instead of hanging it.
+fn type_at_prompt(typed: &[u8]) -> Typed {
+    let typed = typed.to_vec();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use rustix::termios::tcgetattr;
+        let (mut controller, terminal) = pty();
+        let before = tcgetattr(&terminal).unwrap();
+        let mut err = TypeAfterPrompt {
+            controller: controller.try_clone().unwrap(),
+            terminal: terminal.try_clone().unwrap(),
+            typed,
+            prompt: Vec::new(),
+            during: None,
+        };
+        let got = read_terminal(&terminal, "value: ", &mut err).map(|v| v.to_string());
+        assert!(err.prompt.starts_with(b"value: "), "{:?}", err.prompt);
+        let after = tcgetattr(&terminal).unwrap();
+        rustix::fs::fcntl_setfl(&terminal, rustix::fs::OFlags::NONBLOCK).unwrap();
+        let mut left = Vec::new();
+        let _ = (&terminal).read_to_end(&mut left);
+        // Closing every handle on the terminal ends the controller's stream (EIO) once what
+        // is buffered has been read.
+        drop((terminal, err.terminal));
+        let mut shown = Vec::new();
+        let mut chunk = [0_u8; 256];
+        while let Ok(n @ 1..) = controller.read(&mut chunk) {
+            shown.extend_from_slice(&chunk[..n]);
+        }
+        let during = err.during.unwrap();
+        let _ = tx.send(Typed {
+            got,
+            before,
+            during,
+            after,
+            shown,
+            left,
+        });
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the prompt did not return within 10 s")
+}
+
+fn shown_contains(t: &Typed, needle: &[u8]) -> bool {
+    t.shown.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Everything the prompt changed is back: echo, signals, the line-end character.
+fn restored(t: &Typed) {
+    use rustix::termios::{LocalModes, SpecialCodeIndex};
+    let modes = t.after.local_modes;
     assert!(modes.contains(LocalModes::ECHO), "echo was not restored");
     assert!(modes.contains(LocalModes::ICANON | LocalModes::ISIG));
-    // What the terminal showed: nothing of the value. Closing the terminal ends the
-    // controller's stream (EIO) once what is buffered has been read.
-    drop(terminal);
-    let mut shown = Vec::new();
-    let mut chunk = [0_u8; 256];
-    while let Ok(n @ 1..) = controller.read(&mut chunk) {
-        shown.extend_from_slice(&chunk[..n]);
+    let veol = SpecialCodeIndex::VEOL;
+    assert_eq!(t.after.special_codes[veol], t.before.special_codes[veol]);
+}
+
+#[test]
+fn a_terminal_value_is_read_without_echo_or_signals_and_all_comes_back() {
+    use rustix::termios::{LocalModes, SpecialCodeIndex};
+    let t = type_at_prompt(b"s3cret-typed-value\n");
+    assert_eq!(t.got.as_deref(), Ok("s3cret-typed-value"));
+    assert!(!shown_contains(&t, b"s3cret"), "echoed: {:?}", t.shown);
+    assert!(!t.during.local_modes.contains(LocalModes::ECHO));
+    assert!(!t.during.local_modes.contains(LocalModes::ISIG));
+    assert!(t.during.local_modes.contains(LocalModes::ICANON));
+    let intr = t.before.special_codes[SpecialCodeIndex::VINTR];
+    assert_ne!(intr, 0);
+    assert_eq!(t.during.special_codes[SpecialCodeIndex::VEOL], intr);
+    restored(&t);
+}
+
+/// Architect Q112: Ctrl-C cancels the prompt (no signal), shows nothing, and restores all.
+#[test]
+fn ctrl_c_at_the_prompt_cancels_and_restores_echo() {
+    let t = type_at_prompt(b"partial\x03");
+    assert_eq!(t.got, Err(ValueError::Cancelled));
+    assert!(!shown_contains(&t, b"partial"), "echoed: {:?}", t.shown);
+    restored(&t);
+}
+
+#[test]
+fn an_empty_line_is_refused_and_echo_comes_back() {
+    let t = type_at_prompt(b"\n");
+    assert_eq!(t.got, Err(ValueError::Empty));
+    restored(&t);
+}
+
+/// The rest of a multi-line paste is discarded, never left for the shell to read and echo.
+#[test]
+fn the_rest_of_a_pasted_block_is_discarded() {
+    let t = type_at_prompt(b"first-line\nsecond-line\n");
+    assert_eq!(t.got.as_deref(), Ok("first-line"));
+    assert!(t.left.is_empty(), "left for the shell: {:?}", t.left);
+    restored(&t);
+}
+
+/// Architect Q114, probed: the kernel keeps 4095 bytes of a longer line, so 4094 is the most
+/// the prompt accepts; longer is refused, never stored cut.
+#[test]
+fn the_prompt_takes_4094_bytes_and_refuses_more() {
+    let at = type_at_prompt(format!("{}\n", "k".repeat(4094)).as_bytes());
+    assert_eq!(at.got, Ok("k".repeat(4094)));
+    for len in [4095, 5000, 8192] {
+        let t = type_at_prompt(format!("{}\n", "k".repeat(len)).as_bytes());
+        assert_eq!(t.got, Err(ValueError::TooLongForTerminal), "{len}");
+        restored(&t);
     }
-    assert!(
-        !shown.windows(6).any(|w| w == b"s3cret"),
-        "echoed: {shown:?}"
-    );
 }
 
 #[test]
@@ -241,7 +370,7 @@ fn the_argv_warning_names_history_rotation_and_both_ways_in() {
 }
 
 #[test]
-fn a_value_that_cannot_be_read_or_stored_is_refused_without_echo() {
+fn a_value_that_was_not_given_is_refused() {
     let s = Scratch::new("refuse");
     let mut read = || Err(ValueError::Empty);
     let (code, _, err) = run(|o| set(&s.store(), "A", &mut read, o));
@@ -249,6 +378,25 @@ fn a_value_that_cannot_be_read_or_stored_is_refused_without_echo() {
         (code, err.as_str()),
         (EXIT_REFUSED, "sally: no value was given\n")
     );
+    assert!(!s.store().exists());
+}
+
+/// Architect Q115: a terminal or stdin that cannot be read fails (2), nothing stored.
+#[test]
+fn a_value_that_could_not_be_read_fails() {
+    let s = Scratch::new("readfail");
+    let mut read = || Err(ValueError::Read("broken pipe".into()));
+    let (code, _, err) = run(|o| set(&s.store(), "A", &mut read, o));
+    assert_eq!(
+        (code, err.as_str()),
+        (EXIT_FAILED, "sally: stdin: broken pipe\n")
+    );
+    assert!(!s.store().exists());
+}
+
+#[test]
+fn a_value_the_store_refuses_is_refused_without_echo() {
+    let s = Scratch::new("refuse-store");
     // The store refuses a value with a control character.
     let mut read = || Ok(Zeroizing::new(format!("{}\u{7}", value(32))));
     let (code, _, err) = run(|o| set(&s.store(), "A", &mut read, o));

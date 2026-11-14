@@ -477,9 +477,12 @@ validate|summary` (an advisory verdict: `sallyd` validates again at `sessions.cr
 `secrets set|rm` write the store directly under its writers' lock: an exclusive `flock` on a
 separate 0600 `secrets.lock`, given up after 10 s with nothing changed. `save` writes a temp
 file in the same directory, fsyncs and renames, so a reader never sees a partial store. A value
-comes from a no-echo prompt or piped stdin, never argv or the environment. A secrets command
-line that does not parse is refused with a fixed message that repeats no argument. The
-`doctor.*`, `manifests.*`, `secrets.*` and `audit.*` methods above stay for the UI.
+comes from a no-echo prompt (at most 4094 bytes; Ctrl-C cancels it) or piped stdin, never argv
+or the environment; every secrets command turns core dumps off first. A command line that does
+not parse is refused with a fixed message that repeats no argument (architect Q113); a secrets
+line adds the shell-history warning. `audit verify` exits 0 verified, 1 failed verification, 2
+unreadable (Q115). The `doctor.*`, `manifests.*`, `secrets.*` and `audit.*` methods above stay
+for the UI.
 
 Task 12 serves seven of them (`sally_proto::method::ALL`: `sessions.create`, `.list`, `.stop`,
 `.changes`, `approvals.list`, `.decide`, `.watch`); every other method is `-32601` and recorded

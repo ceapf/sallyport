@@ -284,6 +284,44 @@ fn approve_without_a_terminal_exits_before_watching() {
     assert!(f.methods().is_empty(), "{:?}", f.methods());
 }
 
+/// Architect Q113: no parse error repeats an argument (one may be a secret value typed in the
+/// wrong place). Each line fails before any daemon is contacted.
+#[test]
+fn a_command_line_that_does_not_parse_repeats_no_argument() {
+    const MARK: &str = "MARKq7zX";
+    let f = Fake::new("parse", |req| result(req, json!({})));
+    let flag = format!("--{MARK}");
+    let lines: [&[&str]; 7] = [
+        &["session", "stop", "ID", MARK],
+        &["session", "list", &flag],
+        &["audit", "tail", "-n", MARK],
+        &[MARK],
+        &["manifest", MARK],
+        &["approvals", MARK],
+        &[&flag, "session", "list"],
+    ];
+    for args in lines {
+        let o = f.sally(args);
+        assert_eq!(o.status.code(), Some(2), "{args:?}");
+        let all = format!("{}{}", stdout(&o), stderr(&o));
+        assert!(!all.contains(MARK), "{args:?} printed it: {all}");
+        assert!(stderr(&o).contains("run `sally --help`"), "{all}");
+        assert!(!stderr(&o).contains("shell history"), "{all}");
+    }
+    assert!(f.methods().is_empty(), "{:?}", f.methods());
+}
+
+#[test]
+fn help_and_version_still_print() {
+    let f = Fake::new("help", |req| result(req, json!({})));
+    let o = f.sally(&["--help"]);
+    assert_eq!(o.status.code(), Some(0));
+    assert!(stdout(&o).contains("Usage: sally"), "{}", stdout(&o));
+    let o = f.sally(&["--version"]);
+    assert_eq!(o.status.code(), Some(0));
+    assert!(stdout(&o).starts_with("sally "), "{}", stdout(&o));
+}
+
 #[test]
 fn no_daemon_and_bad_arguments_fail_cleanly() {
     let f = Fake::new("gone", |req| result(req, json!({})));

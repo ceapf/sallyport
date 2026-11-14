@@ -3,12 +3,12 @@
 //!
 //! A value never comes from argv or the environment (SI-3). Piped stdin is one bounded read
 //! with one trailing newline removed; a terminal gets a prompt with echo off, restored on every
-//! return. Ctrl-C at that prompt ends the process with echo still off (no signal handler: it
-//! would need a dependency or `unsafe`); `stty echo` turns it back on. The value is read before
-//! the lock is taken, so no lock is held across a prompt. Messages never name the secret or
-//! show its value.
+//! return, Ctrl-C included: it cancels the prompt instead of killing the process (architect
+//! Q112). A signal from outside the terminal (SIGTERM, SIGHUP) still ends it with echo off;
+//! `stty echo` turns it back on. The value is read before the lock is taken, so no lock is
+//! held across a prompt. Messages never name the secret or show its value.
 
-use std::io::{BufRead, Read, Write};
+use std::io::{Read, Write};
 use std::path::Path;
 
 use sally_core::secrets::{MAX_VALUE_BYTES, SecretStore, SecretsError, is_secret_name};
@@ -32,12 +32,9 @@ secret.\nA value is never an argument. Run `sally secrets set NAME` and type it 
 (not shown), or pipe it on stdin: `sally secrets set NAME < file`.\nusage: sally secrets set \
 NAME | sally secrets list | sally secrets rm NAME";
 
-/// What `sally` prints instead of the argument parser's text, which quotes what it rejected.
-pub const NOT_UNDERSTOOD: &str = "sally: the secrets command was not understood; nothing changed";
-
-/// Whether a command line that did not parse gets [`NOT_UNDERSTOOD`] and [`ARGV_WARNING`]
-/// instead of the parser's text: any argument holding `secret` in any case, so `secret` and
-/// `Secrets` typos count too. A false match only costs a less specific message.
+/// Whether a command line that did not parse also gets [`ARGV_WARNING`] after the fixed parse
+/// error ([`crate::usage::parse_error`], architect Q113): any argument holding `secret` in any
+/// case, so `secret` and `Secrets` typos count too. A false match only adds the warning.
 #[must_use]
 pub fn names_secrets(args: &[std::ffi::OsString]) -> bool {
     args.iter().any(|a| {
@@ -46,6 +43,11 @@ pub fn names_secrets(args: &[std::ffi::OsString]) -> bool {
             .any(|w| w.eq_ignore_ascii_case(b"secret"))
     })
 }
+
+/// The longest value typed at the prompt (architect Q114). A canonical-mode terminal line holds
+/// at most 4095 bytes and the kernel drops the rest without an error, so a line of 4095 cannot
+/// be told from a cut one (probed: PROBE_NOTES). Longer values come on stdin.
+pub const TTY_MAX_VALUE_BYTES: usize = 4094;
 
 /// Why no value was read.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -65,6 +67,31 @@ pub enum ValueError {
     /// Reading stdin failed.
     #[error("stdin: {0}")]
     Read(String),
+    /// The interrupt character (Ctrl-C) was typed at the prompt.
+    #[error("cancelled; nothing stored")]
+    Cancelled,
+    /// Over [`TTY_MAX_VALUE_BYTES`] at the prompt.
+    #[error(
+        "the value is too long to type at the prompt (over {TTY_MAX_VALUE_BYTES} bytes); pipe it \
+         on stdin: `sally secrets set NAME < file`"
+    )]
+    TooLongForTerminal,
+}
+
+impl ValueError {
+    /// The exit code (architect Q115): 2 when the terminal or stdin could not be read, 1 when
+    /// what was given was refused or the prompt was cancelled.
+    #[must_use]
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::Terminal(_) | Self::Read(_) => EXIT_FAILED,
+            Self::TooLong
+            | Self::NotUtf8
+            | Self::Empty
+            | Self::Cancelled
+            | Self::TooLongForTerminal => EXIT_REFUSED,
+        }
+    }
 }
 
 /// Piped input: everything up to EOF (at most [`MAX_VALUE_BYTES`] plus a newline), with one
@@ -81,16 +108,35 @@ pub fn read_piped(r: &mut dyn Read) -> Result<Zeroizing<String>, ValueError> {
     finish(buf)
 }
 
-/// One line from a terminal (or any reader): up to the first `\n`, which is removed.
+/// One line typed at a terminal (architect Q112, Q114), read a byte at a time into wiped
+/// buffers: up to `\n` (removed) or EOF. The `cancel` byte ends it with
+/// [`ValueError::Cancelled`]; more than [`TTY_MAX_VALUE_BYTES`] is
+/// [`ValueError::TooLongForTerminal`], since the kernel would have cut the line silently.
 ///
 /// # Errors
 /// [`ValueError`].
-pub fn read_line(r: &mut dyn BufRead) -> Result<Zeroizing<String>, ValueError> {
-    let mut buf = Zeroizing::new(Vec::with_capacity(MAX_VALUE_BYTES.saturating_add(2)));
-    let cap = u64::try_from(MAX_VALUE_BYTES.saturating_add(2)).unwrap_or(u64::MAX);
-    r.take(cap)
-        .read_until(b'\n', &mut buf)
-        .map_err(|e| ValueError::Read(e.to_string()))?;
+pub fn read_line(r: &mut dyn Read, cancel: Option<u8>) -> Result<Zeroizing<String>, ValueError> {
+    let mut buf = Zeroizing::new(Vec::with_capacity(TTY_MAX_VALUE_BYTES.saturating_add(1)));
+    let mut byte = Zeroizing::new([0_u8; 1]);
+    loop {
+        match r.read(&mut *byte) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(ValueError::Read(e.to_string())),
+        }
+        let [b] = *byte;
+        if Some(b) == cancel {
+            return Err(ValueError::Cancelled);
+        }
+        if b == b'\n' {
+            break;
+        }
+        buf.push(b);
+        if buf.len() > TTY_MAX_VALUE_BYTES {
+            return Err(ValueError::TooLongForTerminal);
+        }
+    }
     finish(buf)
 }
 
@@ -115,8 +161,11 @@ fn finish(mut buf: Zeroizing<Vec<u8>>) -> Result<Zeroizing<String>, ValueError> 
     }
 }
 
-/// One line from the terminal `tty` with echo off, after `prompt` on `err`. Echo is restored
-/// on every return; if the terminal cannot be set up, nothing is read.
+/// One line from the terminal `tty` with echo off, after `prompt` on `err` (architect Q108,
+/// Q112). Line editing stays on. The terminal's interrupt character (Ctrl-C) ends the line as a
+/// cancel instead of a signal, so echo comes back after it too. On every return the saved
+/// settings are restored and unread input is discarded (the rest of a multi-line paste never
+/// reaches the shell). If the terminal cannot be set up, nothing is read.
 ///
 /// # Errors
 /// [`ValueError`].
@@ -125,22 +174,29 @@ pub fn read_terminal(
     prompt: &str,
     err: &mut dyn Write,
 ) -> Result<Zeroizing<String>, ValueError> {
-    use rustix::termios::{LocalModes, OptionalActions, tcgetattr, tcsetattr};
+    use rustix::termios::{LocalModes, OptionalActions, SpecialCodeIndex, tcgetattr, tcsetattr};
     struct Restore<'a>(&'a std::fs::File, rustix::termios::Termios);
     impl Drop for Restore<'_> {
         fn drop(&mut self) {
-            let _ = tcsetattr(self.0, OptionalActions::Now, &self.1);
+            let _ = tcsetattr(self.0, OptionalActions::Flush, &self.1);
         }
     }
     let term = |e: rustix::io::Errno| ValueError::Terminal(e.to_string());
     let saved = tcgetattr(tty).map_err(term)?;
     let mut quiet = saved.clone();
     quiet.local_modes.remove(LocalModes::ECHO);
+    // 0 is `_POSIX_VDISABLE` on Linux: no interrupt character, so signals stay as they are.
+    let cancel = Some(saved.special_codes[SpecialCodeIndex::VINTR]).filter(|c| *c != 0);
+    if let Some(c) = cancel {
+        quiet.local_modes.remove(LocalModes::ISIG);
+        quiet.special_codes[SpecialCodeIndex::VEOL] = c;
+    }
     tcsetattr(tty, OptionalActions::Now, &quiet).map_err(term)?;
     let _restore = Restore(tty, saved);
     let _ = write!(err, "{prompt}");
     let _ = err.flush();
-    let value = read_line(&mut std::io::BufReader::with_capacity(1, tty));
+    let mut reader = tty;
+    let value = read_line(&mut reader, cancel);
     let _ = writeln!(err);
     value
 }
@@ -171,7 +227,10 @@ pub fn set(
     }
     let mut value = match read() {
         Ok(v) => v,
-        Err(e) => return refused(o, &e.to_string()),
+        Err(e) => {
+            let _ = writeln!(o.err, "sally: {}", clean::line(&e.to_string()).text);
+            return e.exit_code();
+        }
     };
     let mut edit = || -> Result<bool, SecretsError> {
         let _lock = SecretStore::lock(path)?;

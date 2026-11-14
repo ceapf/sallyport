@@ -256,6 +256,75 @@ fn an_unusable_store_fails_every_subcommand_without_echo() {
     echoes_nothing(&o, &[NAME]);
 }
 
+/// Core dumps are off while `pid` runs: polled from its `/proc/<pid>/limits` (mode 0444),
+/// since the process sets them itself a moment after it starts.
+fn core_dumps_off(pid: u32) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let limits = std::fs::read_to_string(format!("/proc/{pid}/limits")).unwrap_or_default();
+        if limits.lines().any(|l| {
+            l.starts_with("Max core file size")
+                && l.split_whitespace().nth(4) == Some("0")
+                && l.split_whitespace().nth(5) == Some("0")
+        }) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    false
+}
+
+/// Security review MEDIUM-1: every secrets subcommand turns core dumps off before it holds
+/// plaintext. `set` is caught waiting for its value, `rm` waiting for a held lock.
+#[test]
+fn secrets_commands_run_with_core_dumps_off() {
+    let h = Home::new("harden");
+    let spawn = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_sally"))
+            .args(args)
+            .env_clear()
+            .env("HOME", &h.0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+    let mut set = spawn(&["secrets", "set", NAME]);
+    let off = core_dumps_off(set.id());
+    drop(set.stdin.take());
+    let _ = set.wait();
+    assert!(off, "set: core dumps were not turned off");
+    let lock = sally_core::secrets::SecretStore::lock(&h.store()).unwrap();
+    let mut rm = spawn(&["secrets", "rm", NAME]);
+    let off = core_dumps_off(rm.id());
+    drop(lock);
+    let _ = rm.wait();
+    assert!(off, "rm: core dumps were not turned off");
+}
+
+/// The piped form end to end: the value is read from fd 0, stored, and only the name listed.
+#[test]
+fn a_piped_value_is_stored_and_only_its_name_listed() {
+    let h = Home::new("piped");
+    let o = h.sally(
+        &["secrets", "set", NAME],
+        format!("{VALUE}-long-enough\n").as_bytes(),
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    echoes_nothing(&o, &[NAME, VALUE]);
+    let store = sally_core::secrets::SecretStore::open(&h.store()).unwrap();
+    assert_eq!(
+        store.get(NAME).unwrap().expose(),
+        &format!("{VALUE}-long-enough")
+    );
+    let o = h.sally(&["secrets", "list"], b"");
+    assert_eq!(
+        (o.status.code(), String::from_utf8_lossy(&o.stdout).as_ref()),
+        (Some(0), format!("{NAME}\n").as_str())
+    );
+}
+
 /// `$HOME` unset: the paths cannot be derived (exit 2), and nothing is echoed.
 #[test]
 fn set_without_a_home_fails_without_echo() {

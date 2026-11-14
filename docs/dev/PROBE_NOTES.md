@@ -82,6 +82,12 @@ line per fact, with where it was found. Check a note again before relying on it 
 
 ## Kernel and namespaces
 
+- A pty in canonical mode keeps at most 4095 bytes of a line and drops the rest without an
+  error; the newline still ends the line. A read of 4095 data bytes therefore cannot be told
+  from a cut line, so the `secrets set` prompt takes at most 4094 (`TTY_MAX_VALUE_BYTES`;
+  pinned by `the_prompt_takes_4094_bytes_and_refuses_more` at 4094, 4095, 5000 and 8192).
+  `tcsetattr(TCSAFLUSH)` on return discards the rest of a multi-line paste. (Task 12 PR C2, Q114)
+
 - In a `--network=none` sandbox: TCP/UDP to public addresses → ENETUNREACH; raw sockets → EPERM;
   ICMP ping sockets → EACCES at creation (`ping_group_range`); inference role → ENOSYS (seccomp).
   In a fresh netns with `lo` down, raw ICMPv6 send gives EADDRNOTAVAIL (99), not 101. (6c-2, NET-08)
