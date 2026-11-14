@@ -150,6 +150,9 @@ impl Launcher {
     /// removal) is reported too, but the session is released.
     pub async fn stop(&self, mut r: Running) -> Result<(), Box<StopError>> {
         let sid = r.paths.id().as_str().to_owned();
+        if let Some(w) = &r.watchdog {
+            w.last_reading().await;
+        }
         let audited = self
             .audit(
                 NewEntry::new(Actor::Sallyd, "sandbox.stop")

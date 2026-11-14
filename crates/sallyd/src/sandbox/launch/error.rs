@@ -44,6 +44,10 @@ pub enum LaunchError {
     /// `runtime.stage_size` on the state filesystem).
     #[error("not enough free disk space: {0}")]
     DiskSpace(String),
+    /// The container cgroup's `pids.events` or `memory.events` could not be opened or read
+    /// (architect Q48, Q105: fail closed, the detail names the step).
+    #[error("cgroup events: {0}")]
+    CgroupEvents(String),
     /// The pinned image is not in local storage (`images.rs`).
     #[error("runtime.image: {0}")]
     ImageMissing(String),
@@ -110,6 +114,7 @@ impl LaunchError {
             Self::MountMismatch(_) => "mount-mismatch",
             Self::NotRunning(_) => "not-running",
             Self::DiskSpace(_) => "disk-floor",
+            Self::CgroupEvents(_) => "cgroup-events",
             Self::ImageMissing(_) => "digest-mismatch",
             Self::NoDefaultImage => "no-default-image",
             Self::Command { .. } => "podman",
@@ -193,5 +198,17 @@ mod tests {
         let e = LaunchError::Lost(sid());
         assert_eq!(e.reason(), "start-failed");
         assert_eq!(e.detail(), "the launch task ended without a result");
+    }
+
+    /// Architect Q105: a launch whose cgroup event files cannot be opened is refused
+    /// `cgroup-events`, and the detail names the step that failed.
+    #[test]
+    fn unopenable_cgroup_events_refuse_naming_the_step() {
+        let e = LaunchError::CgroupEvents("memory.events: No such file or directory".into());
+        assert_eq!(e.reason(), "cgroup-events");
+        assert_eq!(
+            e.detail(),
+            "cgroup events: memory.events: No such file or directory"
+        );
     }
 }

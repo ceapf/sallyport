@@ -1,5 +1,16 @@
-//! A session's disk watchdog (#14; maintainer design after the 6c-1 reviews). Two tasks per
-//! session:
+//! A session's watchdog: the disk tasks (#14; maintainer design after the 6c-1 reviews) when the
+//! sandbox can write to the host disk, and the cgroup observer for every session.
+//!
+//! - **Observer** (#27, architect Q48): every [`EVENTS_POLL`] it re-reads the container cgroup's
+//!   `pids.events` and `memory.events` (`cgroup.rs`) and audits `session.resource_limit` for each
+//!   counter that grew (`pids-max`, `oom-kill`, with the counter's new value). It only observes:
+//!   the kernel already refused the fork or killed the process, and the session runs on. A kill by
+//!   the disk tasks reads the counters once more alongside the kill, and `Launcher::stop` once
+//!   more before the removal. A failed or slow read is logged once and the next tick reads
+//!   again; the observer ends when the cgroup is gone (`ENODEV`). Known gap: a rise in the last
+//!   second before a container ends on its own, or before a disk kill wins the race to its
+//!   cgroup, is not audited. `runtime.tmp_size` has no kernel event (a tmpfs returns ENOSPC):
+//!   it is contained, not audited.
 //!
 //! - **Floor** (the hard guarantee, `disk.rs`): every [`FLOOR_POLL`] it reads the free space of
 //!   every filesystem the sandbox can write to and kills the session when one is below the floor.
@@ -27,6 +38,7 @@ use sally_core::audit::{Actor, NewEntry};
 use sally_core::manifest::{AuditLevel, ByteSize, MountMode, ValidatedManifest};
 use serde_json::{Value, json};
 
+use super::cgroup::{Events, ReadError, Resource, cgroup_root, risen};
 use super::disk::{DiskFloor, Space, Watched, admits, below, watch};
 use super::launch::{LaunchError, Launcher, capped};
 use super::scan::LaunchScan;
@@ -42,6 +54,10 @@ const STATFS_TIMEOUT: Duration = Duration::from_secs(5);
 /// [`WALK_SPACING`] times its own duration. Also the kill retry interval.
 const MIN_GAP: Duration = Duration::from_secs(2);
 const WALK_SPACING: u32 = 4;
+/// How often the observer reads the cgroup's event counters (architect Q48).
+const EVENTS_POLL: Duration = Duration::from_secs(1);
+/// A read of the two event files that takes longer counts as unreadable.
+const EVENTS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What a session's stage task measures.
 #[derive(Debug, Clone)]
@@ -157,6 +173,41 @@ pub(super) fn watch_plan(
     }))
 }
 
+/// The container cgroup's event files and the counts last audited.
+#[derive(Debug)]
+pub(super) struct Observed {
+    events: Arc<Events>,
+    /// Held across a read and its entries, so each rise is audited once; a count is taken as
+    /// the new baseline only after its entry was attempted.
+    last: tokio::sync::Mutex<Vec<(Resource, u64)>>,
+}
+
+impl Observed {
+    /// Opens the event files of the cgroup the process of `init` (its `/proc/<pid>` directory)
+    /// is in and takes the first reading as the baseline. Blocking.
+    ///
+    /// # Errors
+    /// The step that failed, named (architect Q105).
+    pub(super) fn at_launch(init: &rustix::fd::OwnedFd) -> Result<Self, String> {
+        let root = cgroup_root()?;
+        let events = Events::open(init, &root)?;
+        let baseline = events.read().map_err(|e| e.to_string())?;
+        Ok(Self {
+            events: Arc::new(events),
+            last: tokio::sync::Mutex::new(baseline),
+        })
+    }
+}
+
+/// What a launch hands its watchdog.
+#[derive(Debug)]
+pub(super) struct Watch {
+    /// The disk tasks' plan, when the sandbox can write to the host disk.
+    pub plan: Option<WatchPlan>,
+    /// The cgroup observer's files.
+    pub observed: Observed,
+}
+
 /// The session a watchdog belongs to.
 #[derive(Debug, Clone)]
 pub(super) struct Target {
@@ -185,11 +236,45 @@ struct Shared {
     cancel: Arc<AtomicBool>,
     wake: tokio::sync::Notify,
     stage: Option<(StageWatch, Mutex<Account>)>,
+    observed: Observed,
 }
 
 impl Shared {
     fn ended(&self) -> bool {
         self.ended.load(Ordering::Relaxed)
+    }
+
+    /// Reads the cgroup's counters and audits `session.resource_limit` for each one that grew.
+    /// Observe only: nothing is killed.
+    async fn observe(&self) -> Result<(), ReadError> {
+        let mut last = self.observed.last.lock().await;
+        let events = Arc::clone(&self.observed.events);
+        let read = tokio::task::spawn_blocking(move || events.read());
+        let now = match tokio::time::timeout(EVENTS_TIMEOUT, read).await {
+            Ok(Ok(r)) => r?,
+            Ok(Err(e)) => return Err(ReadError::Failed(e.to_string())),
+            Err(_) => {
+                return Err(ReadError::Failed(format!(
+                    "the event files took longer than {} s",
+                    EVENTS_TIMEOUT.as_secs()
+                )));
+            }
+        };
+        for (resource, count) in risen(&last, &now) {
+            let entry = NewEntry::new(Actor::Sallyd, "session.resource_limit")
+                .session(&self.target.sid)
+                .decision("deny")
+                .args(json!({"role": "workspace", "resource": resource.name(),
+                    "reason": resource.reason(), "count": count}));
+            if self.launcher.audit(entry, self.target.level).await.is_err() {
+                self.launcher
+                    .unaudited("session.resource_limit", &self.target.sid);
+            }
+            if let Some(slot) = last.iter_mut().find(|(r, _)| *r == resource) {
+                slot.1 = count;
+            }
+        }
+        Ok(())
     }
 
     /// The floor task saw the state filesystem at `used` bytes: wake the stage task when growth
@@ -221,49 +306,105 @@ impl Shared {
             self.launcher
                 .unaudited("session.resource_limit", &self.target.sid);
         }
-        kill(&self.launcher, &self.target).await;
+        // The counters one last time, alongside the kill so it is never delayed: a read that
+        // loses the race to the cgroup's removal changes nothing.
+        let (_, ()) = tokio::join!(self.observe(), kill(&self.launcher, &self.target));
     }
 }
 
-/// A running watchdog. Dropping it stops both tasks and any walk in progress.
-#[derive(Debug)]
+/// A running watchdog. Dropping it stops every task and any walk in progress.
 pub(super) struct Watchdog {
     tasks: Vec<tokio::task::AbortHandle>,
     cancel: Arc<AtomicBool>,
+    shared: Arc<Shared>,
+}
+
+impl std::fmt::Debug for Watchdog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Watchdog")
+            .field("tasks", &self.tasks.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Watchdog {
-    /// Starts the watchdog of a started session; a panic in either task is reported to `crash`
-    /// as `watchdog` (architect Q47).
+    /// Starts the watchdog of a started session: the observer always, the disk tasks when
+    /// there is a `plan`. A panic in any task is reported to `crash` as `watchdog` (architect
+    /// Q47).
     pub(super) fn spawn(
         launcher: &Arc<Launcher>,
         target: Target,
-        plan: WatchPlan,
+        plan: Option<WatchPlan>,
+        observed: Observed,
         crash: &CrashReporter,
     ) -> Self {
         let cancel = Arc::new(AtomicBool::new(false));
+        let (watched, stage) = match plan {
+            Some(p) => (Some(p.watched), p.stage),
+            None => (None, None),
+        };
         let shared = Arc::new(Shared {
             launcher: Arc::clone(launcher),
             target,
             ended: AtomicBool::new(false),
             cancel: Arc::clone(&cancel),
             wake: tokio::sync::Notify::new(),
-            stage: plan.stage.map(|(watch, used)| {
+            stage: stage.map(|(watch, used)| {
                 let account = Account {
                     baseline: used,
                     measured: 0,
                 };
                 (watch, Mutex::new(account))
             }),
+            observed,
         });
-        let mut tasks = vec![crash.spawn(
-            "watchdog",
-            floor_task(Arc::clone(&shared), Arc::new(plan.watched)),
-        )];
-        if shared.stage.is_some() {
-            tasks.push(crash.spawn("watchdog", stage_task(shared)));
+        let mut tasks = vec![crash.spawn("watchdog", events_task(Arc::clone(&shared)))];
+        if let Some(w) = watched {
+            tasks.push(crash.spawn("watchdog", floor_task(Arc::clone(&shared), Arc::new(w))));
         }
-        Self { tasks, cancel }
+        if shared.stage.is_some() {
+            tasks.push(crash.spawn("watchdog", stage_task(Arc::clone(&shared))));
+        }
+        Self {
+            tasks,
+            cancel,
+            shared,
+        }
+    }
+
+    /// The cgroup's counters one last time, before the container is removed (architect Q48).
+    pub(super) async fn last_reading(&self) {
+        let s = &self.shared;
+        // A container that ended on its own has no cgroup left: nothing more to report.
+        if let Err(ReadError::Failed(detail)) = s.observe().await {
+            s.launcher
+                .events_unreadable(&s.target.sid, &capped(&detail));
+        }
+    }
+}
+
+/// Re-reads the cgroup's event counters every [`EVENTS_POLL`] until the session ends or its
+/// cgroup is gone. A failed or slow read is logged once and the next tick reads again.
+async fn events_task(s: Arc<Shared>) {
+    let mut tick = tokio::time::interval(EVENTS_POLL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut logged = false;
+    loop {
+        tick.tick().await;
+        if s.ended() {
+            return;
+        }
+        match s.observe().await {
+            Ok(()) => {}
+            Err(ReadError::Gone) => return,
+            Err(ReadError::Failed(detail)) => {
+                if !logged {
+                    logged = true;
+                    s.launcher
+                        .events_unreadable(&s.target.sid, &capped(&detail));
+                }
+            }
+        }
     }
 }
 
@@ -294,7 +435,6 @@ async fn spaces(watched: &Arc<Vec<Watched>>) -> Result<Vec<Space>, String> {
     }
 }
 
-// TODO(#26): kebab-case the reason values here and in `stage_task` (`disk-floor`, …).
 async fn floor_task(s: Arc<Shared>, watched: Arc<Vec<Watched>>) {
     let floor = s.launcher.disk_floor;
     let mut tick = tokio::time::interval(FLOOR_POLL);
@@ -308,14 +448,14 @@ async fn floor_task(s: Arc<Shared>, watched: Arc<Vec<Watched>>) {
             Ok(r) => r,
             Err(detail) => {
                 let args = json!({"role": "workspace", "resource": "disk",
-                    "reason": "disk_floor", "detail": capped(&detail)});
+                    "reason": "disk-floor", "detail": capped(&detail)});
                 return s.enforce(args).await;
             }
         };
         for (w, space) in watched.iter().zip(read) {
             if below(space, &floor) {
                 let args = json!({"role": "workspace", "resource": "disk",
-                    "reason": "disk_floor", "filesystem": w.label, "free": space.free,
+                    "reason": "disk-floor", "filesystem": w.label, "free": space.free,
                     "floor": floor.bytes(space.total)});
                 return s.enforce(args).await;
             }
@@ -422,7 +562,7 @@ async fn stage_task(s: Arc<Shared>) {
             Err(PauseError::Failed(detail)) => {
                 drop(gate);
                 return s
-                    .enforce(stage_args(watch, None, "pause_failed", &detail))
+                    .enforce(stage_args(watch, None, "pause-failed", &detail))
                     .await;
             }
         };
@@ -454,7 +594,7 @@ async fn stage_task(s: Arc<Shared>) {
                 if let Err(detail) = paused.resume().await {
                     drop(gate);
                     return s
-                        .enforce(stage_args(watch, None, "unpause_failed", &detail))
+                        .enforce(stage_args(watch, None, "unpause-failed", &detail))
                         .await;
                 }
             }
@@ -462,7 +602,7 @@ async fn stage_task(s: Arc<Shared>) {
             Verdict::Over { bytes, largest } => {
                 paused.keep();
                 drop(gate);
-                let mut args = stage_args(watch, Some(bytes), "stage_size", "");
+                let mut args = stage_args(watch, Some(bytes), "stage-size", "");
                 args["area"] = json!(largest);
                 return s.enforce(args).await;
             }

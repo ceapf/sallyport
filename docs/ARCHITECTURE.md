@@ -346,7 +346,7 @@ and of its `.git` overlays. Each session whose sandbox can do either gets two ta
     by an `O_PATH` fd.
   - Every 250 ms it reads `fstatfs`. When the space available to unprivileged users falls below
     the floor, `max(4 GiB, 5 %)` by default, the session is killed. The audit reason is
-    `disk_floor`, with the filesystem, the free bytes and the floor.
+    `disk-floor`, with the filesystem, the free bytes and the floor.
   - A `statfs` that fails or takes over 5 s fails closed.
   - A launch is refused (`disk-floor`) unless every watched filesystem has the floor free, plus
     `runtime.stage_size` on the state filesystem.
@@ -367,7 +367,7 @@ and of its `.git` overlays. Each session whose sandbox can do either gets two ta
     stops.
   - Because the sandbox is frozen, any error fails closed, including an entry that vanished.
   - Over the limit, unmeasurable, or past the deadline: that session is killed (reasons
-    `stage_size`, `unmeasurable`). The audit entry names the area: `filesystem.mounts[n]` or
+    `stage-size`, `unmeasurable`). The audit entry names the area: `filesystem.mounts[n]` or
     `filesystem.mounts[n].git[j]`, never a host path.
   - Walks of one session are at least 2 s apart, or four times the last walk's duration if that
     is longer.
@@ -375,16 +375,33 @@ and of its `.git` overlays. Each session whose sandbox can do either gets two ta
 **Freeze hygiene.**
 - A guard unpauses on every path except a kill, panics and cancellation included. If the unpause
   fails, the container is removed.
-- A failed `unpause` after a walk kills the session (`unpause_failed`).
-- A failed `pause` kills it (`pause_failed`), unless the container is gone; then the watchdog
+- A failed `unpause` after a walk kills the session (`unpause-failed`).
+- A failed `pause` kills it (`pause-failed`), unless the container is gone; then the watchdog
   ends.
 
 **Killing.** Every kill audits `session.resource_limit` first, then kills and removes the
 container, retrying every 2 s until it is confirmed gone. It audits `session.kill_failed` once if
 the first attempt fails. The kill happens even if an audit write fails.
 
+**Cgroup observer** (#27, architect Q48, every session). Between `podman init` and `podman
+start` (step 7), the launcher reads the init's `0::` line of `/proc/<pid>/cgroup` through the
+held `/proc/<pid>` fd (bounded, plain components only), checks that `/sys/fs/cgroup` is cgroup2,
+and opens `pids.events` and `memory.events` beneath it with `openat2(RESOLVE_BENEATH |
+RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)`. If any step fails, the launch is refused with
+`cgroup-events`, and the detail names the step. The watchdog's observer holds only those two fds.
+Every 1 s it re-reads them with `pread`, off the runtime, with a 5 s timeout. For each counter
+that grew it writes one `session.resource_limit {resource: "pids", reason: "pids-max", count}`
+or `{resource: "memory", reason: "oom-kill", count}`, where `count` is the counter's new value.
+It only observes: the kernel already refused the fork or killed the process, and the session
+runs on. A disk kill reads the counters once more alongside the kill, and `Launcher::stop` reads
+them once more before removal. A failed or slow read is logged once to the oplog, and the next
+tick reads again. The observer ends when the cgroup is gone (`ENODEV`). Known gap: a rise in the
+last second before a container ends on its own, or before a disk kill wins the race to its
+cgroup, is not audited. `runtime.tmp_size` has no kernel event (a tmpfs returns ENOSPC), so it
+is contained and not audited.
+
 Teardown stays with `Launcher::stop`, which keeps the staged data. Dropping the session's handle
-stops both tasks and any walk in progress. A launch nobody received is stopped with retries
+stops every watchdog task and any walk in progress. A launch nobody received is stopped with retries
 until its container is gone, and keeps its watchdog meanwhile.
 
 **Teardown** (`Launcher::stop`) audits `sandbox.stop`, then runs `podman rm --force --time 0`

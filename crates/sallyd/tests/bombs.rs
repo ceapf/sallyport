@@ -1,9 +1,10 @@
 //! RT-AG-09, the bombs: a fork bomb, a memory bomb and a `/tmp` filler are each contained by the
-//! session's limits (`runtime.pids`, `runtime.memory`, `runtime.tmp_size`). These prove
-//! containment only: no existing code observes these conditions, so their
-//! `session.resource_limit` audit entries are #27 (Task 12). The stage-size and floor parts of
-//! the row are in `disk.rs` and `launch.rs`. The fixture is `common::container`; these tests
-//! never skip.
+//! session's limits (`runtime.pids`, `runtime.memory`, `runtime.tmp_size`). The fork bomb and
+//! the memory bomb are also audited: the watchdog's cgroup observer writes
+//! `session.resource_limit` (`pids-max`, `oom-kill`) and the session runs on (#27, architect
+//! Q48). The `/tmp` filler is contained only: a tmpfs has no kernel event. The stage-size and
+//! floor parts of the row are in `disk.rs` and `launch.rs`. The fixture is `common::container`;
+//! these tests never skip.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::time::Duration;
@@ -54,13 +55,36 @@ fn event(text: &str, name: &str) -> u64 {
         .unwrap_or_else(|| panic!("{name} in {text}"))
 }
 
+/// The `session.resource_limit` entries naming `resource`, in order.
+fn limits(x: &Lx, resource: &str) -> Vec<serde_json::Value> {
+    x.events
+        .all()
+        .into_iter()
+        .filter(|(e, a)| e == "session.resource_limit" && a["resource"] == resource)
+        .map(|(_, a)| a)
+        .collect()
+}
+
+/// The observer polls every second: waits up to 5 s for a first entry naming `resource`.
+async fn first_limit(x: &Lx, resource: &str) -> serde_json::Value {
+    for _ in 0..50 {
+        if let Some(a) = limits(x, resource).into_iter().next() {
+            return a;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("no {resource} entry in {:?}", x.events.list());
+}
+
 /// A classic shell fork bomb runs for 3 s: the container's process count never exceeds
-/// `runtime.pids`, forks are refused (`pids.events` max), the host still forks, and the session
-/// stops cleanly.
+/// `runtime.pids`, forks are refused (`pids.events` max) and audited (`pids-max`, at most one
+/// entry per poll), the host still forks, and the session stops cleanly.
 #[test]
 fn rt_ag_09_a_fork_bomb_is_held_by_the_pids_limit() {
     rt().block_on(async {
         let x = Lx::new();
+        // Before the launch: the observer's first tick fires as soon as it is spawned.
+        let started = std::time::Instant::now();
         let r = launch_small(&x, "fork").await;
         let cg = cgroup(&x, &r).await;
         assert_eq!(read(&cg, "pids.max").trim(), PIDS.to_string());
@@ -83,12 +107,28 @@ fn rt_ag_09_a_fork_bomb_is_held_by_the_pids_limit() {
             let st = std::process::Command::new("true").status().unwrap();
             assert!(st.success(), "the host still forks");
         }
+        let a = first_limit(&x, "pids").await;
+        assert_eq!(
+            (&a["role"], &a["reason"]),
+            (&"workspace".into(), &"pids-max".into()),
+            "{a}"
+        );
+        assert!(a["count"].as_u64().unwrap() > 0, "{a}");
+        assert!(limits(&x, "memory").is_empty(), "{:?}", x.events.list());
         x.stop(r).await;
+        let polls = started.elapsed().as_secs() + 2;
+        let n = limits(&x, "pids").len() as u64;
+        assert!(n <= polls, "{n} entries in {polls} polls");
+        let counts: Vec<u64> = limits(&x, "pids")
+            .iter()
+            .map(|a| a["count"].as_u64().unwrap())
+            .collect();
+        assert!(counts.windows(2).all(|w| w[0] < w[1]), "{counts:?}");
     });
 }
 
 /// A memory bomb (a string that doubles until allocation fails) is OOM-killed inside the
-/// container; the session keeps running.
+/// container and audited (`oom-kill`); the session keeps running.
 #[test]
 fn rt_ag_09_a_memory_bomb_is_oom_killed_inside_the_container() {
     rt().block_on(async {
@@ -111,6 +151,9 @@ fn rt_ag_09_a_memory_bomb_is_oom_killed_inside_the_container() {
         let (code, events) = exec(&r, "cat /sys/fs/cgroup/memory.events").await;
         assert_eq!(code, 0, "{events}");
         assert!(event(&events, "oom_kill ") > 0, "{events}");
+        let a = first_limit(&x, "memory").await;
+        assert_eq!(a["reason"], "oom-kill", "{a}");
+        assert!(a["count"].as_u64().unwrap() >= 1, "{a}");
         let (code, out) = exec(&r, "echo alive").await;
         assert_eq!((code, out.trim()), (0, "alive"), "the session survives");
         x.stop(r).await;

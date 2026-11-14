@@ -8,6 +8,7 @@
 
 mod argv;
 pub mod budget;
+mod cgroup;
 mod changes;
 mod check;
 mod commands;
