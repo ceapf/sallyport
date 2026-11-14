@@ -792,3 +792,60 @@ fn fuzz_corpus_satisfies_the_no_leak_oracle() {
     }
     assert!(seen >= 3, "corpus went missing");
 }
+
+// ---- the writers' lock (architect Q108) ---------------------------------------------------
+
+/// Two editors, one holding the lock while the other starts: both changes survive. Without the
+/// lock the second opens the old snapshot, and the first's save (which comes last) drops the
+/// second's change.
+#[test]
+fn two_interleaved_edits_both_survive() {
+    let s = Scratch::new("lock-edits");
+    let path = s.store_path();
+    let held = SecretStore::lock(&path).unwrap();
+    let mut first = SecretStore::open(&path).unwrap();
+    first.set("FIRST", long("a")).unwrap();
+    let p2 = path.clone();
+    let second = std::thread::spawn(move || {
+        let _lock = SecretStore::lock(&p2).unwrap();
+        let mut st = SecretStore::open(&p2).unwrap();
+        st.set("SECOND", long("b")).unwrap();
+        st.save().unwrap();
+    });
+    // The second editor is blocked meanwhile; give it time to have opened if it were not.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    first.save().unwrap();
+    drop(held);
+    second.join().unwrap();
+    let st = SecretStore::open(&path).unwrap();
+    assert!(st.contains("FIRST") && st.contains("SECOND"));
+}
+
+#[test]
+fn the_lock_is_a_private_file_beside_the_store_and_creates_its_directory() {
+    let s = Scratch::new("lock-file");
+    let path = s.0.join("sub/secrets.toml");
+    let lock = SecretStore::lock(&path).unwrap();
+    assert_eq!(mode_of(&s.0.join("sub/secrets.lock")), 0o600);
+    assert_eq!(mode_of(&s.0.join("sub")), 0o700);
+    assert!(!path.exists(), "the lock creates no store");
+    drop(lock);
+}
+
+#[test]
+fn a_symlinked_lock_or_an_open_directory_is_refused() {
+    let s = Scratch::new("lock-refuse");
+    let path = s.store_path();
+    symlink(s.0.join("elsewhere"), s.0.join("secrets.lock")).unwrap();
+    assert!(matches!(
+        SecretStore::lock(&path),
+        Err(SecretsError::Permissions { .. })
+    ));
+    assert!(!s.0.join("elsewhere").exists());
+    std::fs::remove_file(s.0.join("secrets.lock")).unwrap();
+    std::fs::set_permissions(&s.0, std::fs::Permissions::from_mode(0o770)).unwrap();
+    assert!(matches!(
+        SecretStore::lock(&path),
+        Err(SecretsError::Permissions { .. })
+    ));
+}

@@ -22,18 +22,18 @@ pub struct Out<'a> {
 }
 
 /// Collects what a command printed and whether all of it passed the clean-check.
-struct Printer<'a, 'b> {
-    o: &'a mut Out<'b>,
+pub(crate) struct Printer<'a, 'b> {
+    pub(crate) o: &'a mut Out<'b>,
     dirty: bool,
 }
 
 impl<'a, 'b> Printer<'a, 'b> {
-    fn new(o: &'a mut Out<'b>) -> Self {
+    pub(crate) fn new(o: &'a mut Out<'b>) -> Self {
         Self { o, dirty: false }
     }
 
     /// One line built from `parts`, each checked.
-    fn line(&mut self, parts: &[&str]) {
+    pub(crate) fn line(&mut self, parts: &[&str]) {
         let mut s = String::new();
         for p in parts {
             let c = clean::line(p);
@@ -44,7 +44,7 @@ impl<'a, 'b> Printer<'a, 'b> {
     }
 
     /// Multi-line text, checked.
-    fn text(&mut self, t: &str) {
+    pub(crate) fn text(&mut self, t: &str) {
         let c = clean::text(t);
         self.dirty |= !c.clean;
         let _ = write!(self.o.out, "{}", c.text);
@@ -54,7 +54,7 @@ impl<'a, 'b> Printer<'a, 'b> {
     }
 
     /// `EXIT_OK`, or `EXIT_REFUSED` when something printed was not clean.
-    fn code(&self) -> u8 {
+    pub(crate) fn code(&self) -> u8 {
         if self.dirty { EXIT_REFUSED } else { EXIT_OK }
     }
 }
@@ -130,7 +130,7 @@ pub fn session_start(c: &mut Client, manifest: &Path, o: &mut Out<'_>) -> u8 {
 }
 
 /// The manifest's text, at most [`MAX_MANIFEST_BYTES`].
-fn read_manifest(path: &Path) -> Result<String, String> {
+pub(crate) fn read_manifest(path: &Path) -> Result<String, String> {
     let f = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let cap = u64::try_from(MAX_MANIFEST_BYTES)
         .unwrap_or(u64::MAX)

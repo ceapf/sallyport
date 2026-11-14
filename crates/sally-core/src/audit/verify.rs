@@ -197,7 +197,7 @@ fn check_head(head: Option<&Head>, last_seq: u64) -> Result<HeadStatus, VerifyEr
     }
 }
 
-enum Line {
+pub(super) enum Line {
     Complete,
     Unterminated,
     TooLong,
@@ -205,7 +205,7 @@ enum Line {
 }
 
 /// Reads one line into `buf` (newline stripped), never buffering more than the limit.
-fn read_line(r: &mut impl BufRead, buf: &mut Vec<u8>) -> std::io::Result<Line> {
+pub(super) fn read_line(r: &mut impl BufRead, buf: &mut Vec<u8>) -> std::io::Result<Line> {
     buf.clear();
     let limit = u64::try_from(MAX_LINE_BYTES + 2).unwrap_or(u64::MAX);
     let n = r.by_ref().take(limit).read_until(b'\n', buf)?;

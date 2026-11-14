@@ -66,7 +66,20 @@ fn a_frame_is_a_reply_or_a_note_and_nothing_else() {
 
 #[test]
 fn the_socket_is_under_the_runtime_dir() {
-    assert_eq!(SOCKET, "sallyport/control.sock");
+    let with = |runtime: Option<&str>| {
+        let p = sally_core::paths::Paths::from_lookup(|n| match n {
+            "HOME" => Some("/h".into()),
+            "XDG_RUNTIME_DIR" => runtime.map(Into::into),
+            _ => None,
+        })
+        .unwrap();
+        socket_path(&p)
+    };
+    assert_eq!(
+        with(Some("/r")).unwrap(),
+        std::path::Path::new("/r/sallyport/control.sock")
+    );
+    assert!(matches!(with(None), Err(Error::NoRuntimeDir)));
 }
 
 /// The bounds hold together: one largest note fits what a call holds, and so does everything

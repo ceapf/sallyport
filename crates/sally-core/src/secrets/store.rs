@@ -121,6 +121,13 @@ fn validate_value(value: &str) -> Result<(), SecretsError> {
     Ok(())
 }
 
+/// The writers' lock of a store ([`SecretStore::lock`]); released on drop.
+#[derive(Debug)]
+pub struct EditLock {
+    /// Held only for its `flock`, which closing the file releases.
+    _file: File,
+}
+
 /// The in-memory secrets store and its backing file.
 pub struct SecretStore {
     path: PathBuf,
@@ -265,6 +272,45 @@ impl SecretStore {
     /// Removes a secret from memory; returns whether it existed.
     pub fn remove(&mut self, name: &str) -> bool {
         self.entries.remove(name).is_some()
+    }
+
+    /// Takes the writers' lock for the store at `path`: an exclusive `flock` on `secrets.lock`
+    /// (the store's name with `.lock`) beside it, 0600, never through a symlink. Blocks until no
+    /// other writer holds it. An editor holds it across [`open`](Self::open), its changes and
+    /// [`save`](Self::save), so two editors cannot undo each other (architect Q108); readers
+    /// take no lock. Creates the directory with mode 0700 if missing.
+    ///
+    /// # Errors
+    /// [`SecretsError::Permissions`] if the directory is writable by group or others or the lock
+    /// is a symlink, [`SecretsError::Io`] otherwise.
+    pub fn lock(path: &Path) -> Result<EditLock, SecretsError> {
+        let lock = path.with_extension("lock");
+        let io_err = |e: std::io::Error| SecretsError::Io {
+            path: lock.display().to_string(),
+            source: e,
+        };
+        let dir = parent_of(path);
+        if !dir.exists() {
+            DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)
+                .map_err(io_err)?;
+        }
+        check_parent(path)?;
+        let fd = match crate::fd::open(
+            &lock,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::NOFOLLOW,
+            Mode::from_raw_mode(0o600),
+        ) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::LOOP) => return Err(perm(&lock, "is a symbolic link")),
+            Err(e) => return Err(io_err(e.into())),
+        };
+        let file = File::from(fd);
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)
+            .map_err(|e| io_err(e.into()))?;
+        Ok(EditLock { _file: file })
     }
 
     /// Writes the store atomically: a 0600 temporary file in the same directory, fsync, rename,
@@ -416,7 +462,7 @@ fn write_private(f: &mut File, bytes: &[u8]) -> std::io::Result<()> {
 /// Removes leftovers of a crashed save (`.<name>.<pid>.<n>.tmp`, regular, owned by us) from other
 /// processes: they hold plaintext, possibly of a secret the user has since removed. Best effort.
 /// A save in another live process that loses its temporary file fails cleanly (its rename
-/// errors); concurrent writers are unsupported anyway (see the module docs).
+/// errors); writers hold [`SecretStore::lock`], so only a writer that skipped it can lose one.
 fn sweep_stale_tmp(dir: &Path, name: &str) {
     let prefix = format!(".{name}.");
     let own = format!("{prefix}{}.", std::process::id());

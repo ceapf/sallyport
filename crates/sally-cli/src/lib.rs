@@ -10,6 +10,9 @@ pub mod approve;
 pub mod clean;
 pub mod client;
 pub mod commands;
+pub mod doctor;
+pub mod local;
+pub mod secrets;
 
 /// The command did what was asked.
 pub const EXIT_OK: u8 = 0;
