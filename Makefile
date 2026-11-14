@@ -150,7 +150,7 @@ MUTANTS_WIDE_CLI := $(addprefix crates/sally-cli/src/,clean.rs client.rs command
 MUTANTS_WIDE_TESTS_CORE :=
 MUTANTS_WIDE_TESTS_SALLYD := --lib --test=argv --test=scan
 MUTANTS_WIDE_TESTS_SHIM := --lib --test=relay
-MUTANTS_WIDE_TESTS_CLI := --lib --test=cli --test=secrets_argv
+MUTANTS_WIDE_TESTS_CLI := --lib --test=cli --test=secrets_argv --test=harden
 MUTANTS_SHARD ?=
 MUTANTS_OUT ?=
 # $(1) package, $(2) files, $(3) cargo test args

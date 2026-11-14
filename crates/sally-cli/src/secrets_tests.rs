@@ -133,6 +133,90 @@ fn an_illegal_name_is_a_usage_error_before_any_value_is_read() {
     assert!(err.ends_with(&format!("{ARGV_WARNING}\n")), "{err}");
 }
 
+/// A pseudo-terminal: (controller, terminal).
+fn pty() -> (std::fs::File, std::fs::File) {
+    use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+    use std::os::unix::fs::OpenOptionsExt;
+    let controller = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).unwrap();
+    grantpt(&controller).unwrap();
+    unlockpt(&controller).unwrap();
+    let name = ptsname(&controller, Vec::new()).unwrap();
+    let terminal = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(rustix::fs::OFlags::NOCTTY.bits().cast_signed())
+        .open(name.to_str().unwrap())
+        .unwrap();
+    (std::fs::File::from(controller), terminal)
+}
+
+/// Types `value` on the controller when the prompt is written, that is after echo is off.
+struct TypeAfterPrompt<'a> {
+    controller: &'a mut std::fs::File,
+    value: &'a [u8],
+    prompt: Vec<u8>,
+}
+
+impl Write for TypeAfterPrompt<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.prompt.is_empty() {
+            self.controller.write_all(self.value)?;
+        }
+        self.prompt.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_terminal_value_is_read_without_echo_and_echo_comes_back() {
+    use rustix::termios::{LocalModes, tcgetattr};
+    let (mut controller, terminal) = pty();
+    assert!(
+        tcgetattr(&terminal)
+            .unwrap()
+            .local_modes
+            .contains(LocalModes::ECHO)
+    );
+    let mut err = TypeAfterPrompt {
+        controller: &mut controller,
+        value: b"s3cret-typed-value\n",
+        prompt: Vec::new(),
+    };
+    let got = read_terminal(&terminal, "value: ", &mut err).unwrap();
+    assert_eq!(got.as_str(), "s3cret-typed-value");
+    assert!(err.prompt.starts_with(b"value: "), "{:?}", err.prompt);
+    let modes = tcgetattr(&terminal).unwrap().local_modes;
+    assert!(modes.contains(LocalModes::ECHO), "echo was not restored");
+    assert!(modes.contains(LocalModes::ICANON | LocalModes::ISIG));
+    // What the terminal showed: nothing of the value. Closing the terminal ends the
+    // controller's stream (EIO) once what is buffered has been read.
+    drop(terminal);
+    let mut shown = Vec::new();
+    let mut chunk = [0_u8; 256];
+    while let Ok(n @ 1..) = controller.read(&mut chunk) {
+        shown.extend_from_slice(&chunk[..n]);
+    }
+    assert!(
+        !shown.windows(6).any(|w| w == b"s3cret"),
+        "echoed: {shown:?}"
+    );
+}
+
+#[test]
+fn a_file_that_is_not_a_terminal_reads_nothing_and_prompts_nothing() {
+    let s = Scratch::new("notty");
+    let f = s.0.join("f");
+    std::fs::write(&f, "typed\n").unwrap();
+    let file = std::fs::File::open(&f).unwrap();
+    let mut err = Vec::new();
+    let got = read_terminal(&file, "value: ", &mut err);
+    assert!(matches!(got, Err(ValueError::Terminal(_))), "{got:?}");
+    assert!(err.is_empty());
+}
+
 #[test]
 fn a_command_line_naming_secrets_in_any_case_is_matched() {
     let args = |a: &[&str]| -> Vec<std::ffi::OsString> { a.iter().map(Into::into).collect() };

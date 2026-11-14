@@ -17,6 +17,20 @@ fn is_fail(v: &Verdict) -> bool {
 }
 
 #[test]
+fn a_small_fact_is_read_whole_up_to_its_cap() {
+    let d = std::env::temp_dir().join(format!("sc-doc-small-{}", std::process::id()));
+    std::fs::create_dir_all(&d).unwrap();
+    let short = d.join("short");
+    std::fs::write(&short, "6.6.87-generic\n").unwrap();
+    assert_eq!(read_small(&short).unwrap(), "6.6.87-generic\n");
+    let long = d.join("long");
+    std::fs::write(&long, "k".repeat(300)).unwrap();
+    assert_eq!(read_small(&long).unwrap(), "k".repeat(256));
+    assert!(read_small(&d.join("missing")).is_err());
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+#[test]
 fn a_ready_host_passes_every_check() {
     let (all, code) = verdicts(&good());
     assert_eq!(code, EXIT_OK);
