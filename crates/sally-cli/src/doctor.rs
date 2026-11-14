@@ -1,6 +1,6 @@
 //! `sally doctor` for M1 (architect Q106): host facts only. It starts nothing, pulls nothing and
 //! touches no network. Each check is a pure function over a fact the thin [`facts`] reads.
-//! `scripts/doctor.sh` stays the developer preflight. TODO(#DOCTOR_ISSUE): the container-backed
+//! `scripts/doctor.sh` stays the developer preflight. TODO(#119): the container-backed
 //! checks (a test container, the limits bind, runtime provenance) come with M6 task 4.
 
 use std::io::Read as _;

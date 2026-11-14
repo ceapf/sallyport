@@ -470,6 +470,17 @@ peer to be its own uid (architect Q78), and it reads replies under the same 1 Mi
 | `secrets.set` (name, value) / `secrets.list` (names only) / `secrets.remove` | store; values are write-only |
 | `audit.tail` (filter, follow) / `audit.verify` | log |
 
+In M1 the CLI runs `doctor` (host facts only; container checks are #119), `manifest
+validate|summary` (an advisory verdict: `sallyd` validates again at `sessions.create`),
+`audit verify|tail` (read-only, no `audit.lock`) and `secrets set|list|rm` itself, without
+`sallyd` (architect Q52, Q106–Q110). Paths come from `sally_core::paths`, as `sallyd`'s do.
+`secrets set|rm` write the store directly under its writers' lock: an exclusive `flock` on a
+separate 0600 `secrets.lock`, given up after 10 s with nothing changed. `save` writes a temp
+file in the same directory, fsyncs and renames, so a reader never sees a partial store. A value
+comes from a no-echo prompt or piped stdin, never argv or the environment. A secrets command
+line that does not parse is refused with a fixed message that repeats no argument. The
+`doctor.*`, `manifests.*`, `secrets.*` and `audit.*` methods above stay for the UI.
+
 Task 12 serves seven of them (`sally_proto::method::ALL`: `sessions.create`, `.list`, `.stop`,
 `.changes`, `approvals.list`, `.decide`, `.watch`); every other method is `-32601` and recorded
 `rpc.deny {socket: control}`, and no control method resolves on the session socket's table (a
@@ -876,7 +887,7 @@ sallyport/
 │   └── e2e/                         # GPU-local end-to-end (tiny model)
 ├── fuzz/                            # cargo-fuzz targets: gguf, safetensors, manifest, proxy request parser
 ├── scripts/
-│   ├── doctor.sh                    # V1–V9 checks (also surfaced via `sally doctor`)
+│   ├── doctor.sh                    # V1–V9 developer preflight (`sally doctor`: host facts, M6: more)
 │   └── install.sh                   # M6
 ├── docs/
 │   ├── 00_DECISIONS.md  01_SCOPE.md  ARCHITECTURE.md  MANIFEST_SPEC.md  MILESTONES.md
@@ -1295,7 +1306,7 @@ sallyport/
   (`sally-core::audit::secret_forms`, held per session in `SessionForms`) plus each grant's
   rendered value and `{basic}` blob, with a same-length filler and no name (Tasks 9a-3, 9b).
   A store value under 16 bytes is stored and reported short (`SHORT_SECRET_BYTES`: its base64
-  forms are few or none); `sally secrets set` warns about it (Task 12, TODO(#98)).
+  forms are few or none); `sally secrets set` warns about it (Task 12).
 - **Tauri bridge**: Rust side exposes one command `rpc(method: String, params: Value)` that
   forwards to `control.sock` **only** for methods in a compile-time allowlist (no
   `secrets.list` of values exists anyway). Capabilities file grants `core:default` only.

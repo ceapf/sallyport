@@ -101,6 +101,7 @@ fn report(r: &VerifyReport) -> String {
 }
 
 /// `sally audit tail [-n N]`: the newest entries, one line each, escaped (it does not verify).
+/// TODO(#120): `--follow` across rotation, and `--session`/`--event` filters.
 /// 1 when a line in the files read was not an entry, or the log could not be read.
 pub fn audit_tail(dir: &Path, n: usize, o: &mut Out<'_>) -> u8 {
     let t = match tail(dir, n) {
