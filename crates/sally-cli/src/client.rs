@@ -18,11 +18,9 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 
+use sally_core::paths::Paths;
 use sally_proto::{ErrorData, MAX_FRAME};
 use serde_json::{Value, json};
-
-/// The socket under `$XDG_RUNTIME_DIR`.
-pub const SOCKET: &str = "sallyport/control.sock";
 
 /// Frames read but not yet taken: the reader waits when this many are queued (architect Q91).
 /// TODO(#112): fold requested/closed pairs instead, so a busy session cannot get a reading
@@ -77,16 +75,12 @@ pub enum Error {
     Io(#[from] std::io::Error),
 }
 
-/// `$XDG_RUNTIME_DIR/sallyport/control.sock`.
+/// `$XDG_RUNTIME_DIR/sallyport/control.sock`, derived as `sallyd` derives it (architect Q107).
 ///
 /// # Errors
 /// [`Error::NoRuntimeDir`].
-pub fn socket_path() -> Result<PathBuf, Error> {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .map(|p| p.join(SOCKET))
-        .ok_or(Error::NoRuntimeDir)
+pub fn socket_path(paths: &Paths) -> Result<PathBuf, Error> {
+    paths.control_socket().map_err(|_| Error::NoRuntimeDir)
 }
 
 /// What one frame from `sallyd` is.

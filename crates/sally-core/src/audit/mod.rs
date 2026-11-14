@@ -27,6 +27,7 @@
 mod entry;
 mod layout;
 mod redact;
+mod tail;
 mod verify;
 mod writer;
 
@@ -43,5 +44,6 @@ pub fn parse_head(bytes: &[u8]) -> Result<(u64, String), VerifyErrorKind> {
     layout::Head::parse(bytes).map(|h| (h.seq, h.hash))
 }
 
+pub use tail::{MAX_TAIL, Tail, TailError, tail};
 pub use verify::{HeadStatus, VerifyError, VerifyReport, verify};
 pub use writer::{Appended, AuditError, AuditWriter, Clock, Detail, NewEntry, SystemClock};

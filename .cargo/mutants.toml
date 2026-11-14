@@ -22,6 +22,7 @@ exclude_re = [
   'crates/sally-core/src/audit/writer\.rs:\d+:\d+: replace \| with \^ in take_lock$',
   'crates/sally-core/src/audit/writer\.rs:\d+:\d+: replace \| with \^ in open_log$',
   'crates/sally-core/src/secrets/store\.rs:\d+:\d+: replace \| with \^ in SecretStore::open$',
+  'crates/sally-core/src/secrets/store\.rs:\d+:\d+: replace \| with \^ in open_lock_file$',
   'crates/sallyd/src/daemon/startup\.rs:\d+:\d+: replace \| with \^ in open_state_dir$',
   'crates/sallyd/src/daemon/install\.rs:\d+:\d+: replace \| with \^ in load_or_create$',
   'crates/sallyd/src/daemon/install\.rs:\d+:\d+: replace \| with \^ in create$',

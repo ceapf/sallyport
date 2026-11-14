@@ -124,7 +124,7 @@ mutants:
 MUTANTS_WIDE_CORE := $(addprefix crates/sally-core/src/,manifest/image.rs manifest/hostenv.rs \
                      manifest/parse.rs manifest/summary.rs manifest/units.rs secrets/store.rs \
                      secrets/secret.rs audit/entry.rs audit/redact.rs audit/verify.rs \
-                     audit/writer.rs audit/layout.rs fsutil.rs fd.rs text.rs)
+                     audit/writer.rs audit/layout.rs audit/tail.rs fsutil.rs fd.rs text.rs paths.rs)
 MUTANTS_WIDE_SALLYD := $(addprefix crates/sallyd/src/sandbox/,argv.rs check.rs types.rs profiles.rs \
                        overlap.rs scan.rs images.rs changes.rs cgroup.rs dirs.rs podman.rs disk.rs stage.rs \
                        launch/error.rs budget.rs orphans.rs) \
@@ -143,13 +143,14 @@ MUTANTS_WIDE_SALLYD := $(addprefix crates/sallyd/src/sandbox/,argv.rs check.rs t
                        mod.rs dac.rs ops.rs fetch.rs fetch_url.rs fetch_client.rs)
 MUTANTS_WIDE_SHIM := $(addprefix crates/sally-shim/src/,args.rs relay.rs)
 # The CLI (architect Q78 mutation scope): the clean-check, the frame client, the commands' output
-# and the approve loop; its clap definitions and main.rs are out. Its tests start no container
-# (a fake daemon on a Unix socket).
-MUTANTS_WIDE_CLI := $(addprefix crates/sally-cli/src/,clean.rs client.rs commands.rs approve.rs)
+# the approve loop, and the local commands (secrets, manifest/audit, doctor's decisions); its clap
+# definitions and main.rs are out. Its tests start no container (a fake daemon on a Unix socket).
+MUTANTS_WIDE_CLI := $(addprefix crates/sally-cli/src/,clean.rs client.rs commands.rs approve.rs \
+                    secrets.rs local.rs doctor.rs usage.rs)
 MUTANTS_WIDE_TESTS_CORE :=
 MUTANTS_WIDE_TESTS_SALLYD := --lib --test=argv --test=scan
 MUTANTS_WIDE_TESTS_SHIM := --lib --test=relay
-MUTANTS_WIDE_TESTS_CLI := --lib --test=cli
+MUTANTS_WIDE_TESTS_CLI := --lib --test=cli --test=secrets_argv --test=harden
 MUTANTS_SHARD ?=
 MUTANTS_OUT ?=
 # $(1) package, $(2) files, $(3) cargo test args

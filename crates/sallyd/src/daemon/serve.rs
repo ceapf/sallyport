@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex};
 use sally_core::audit::{AuditError, AuditWriter, SystemClock};
 use sally_core::config::{Config, MAX_CONFIG_BYTES, default_runtime_path, parse_config};
 use sally_core::manifest::{AuditLevel, HostEnv, HostEnvError};
+use sally_core::paths::{Paths, PathsError};
 use tokio::net::UnixListener;
 use tokio::signal::unix::{SignalKind, signal};
 
@@ -167,6 +168,8 @@ pub struct Dirs {
     pub config_home: PathBuf,
     /// `$PATH`, for finding `podman` when `config.toml` names none.
     pub path: Option<OsString>,
+    /// The derivation the CLI shares (`sally_core::paths`, architect Q107).
+    pub paths: Paths,
 }
 
 impl Dirs {
@@ -175,28 +178,27 @@ impl Dirs {
     /// # Errors
     /// [`DaemonError::Env`] when `$HOME` or `$XDG_RUNTIME_DIR` is missing or relative.
     pub fn from_env() -> Result<Self, DaemonError> {
-        let abs = |v: &str| {
-            std::env::var_os(v)
-                .map(PathBuf::from)
-                .filter(|p| p.is_absolute())
+        let env = |e| match e {
+            PathsError::Home => DaemonError::Env("HOME"),
+            PathsError::Runtime => DaemonError::Env("XDG_RUNTIME_DIR"),
         };
-        let home = abs("HOME").ok_or(DaemonError::Env("HOME"))?;
-        let runtime = abs("XDG_RUNTIME_DIR").ok_or(DaemonError::Env("XDG_RUNTIME_DIR"))?;
-        let data_home_var = abs("XDG_DATA_HOME");
+        let paths = Paths::from_env().map_err(env)?;
+        let runtime = paths.runtime().map_err(env)?.to_owned();
         Ok(Self {
-            data_home: data_home_var
-                .clone()
-                .unwrap_or_else(|| home.join(".local/share")),
-            config_home: abs("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config")),
-            home,
+            home: paths.home().to_owned(),
             runtime,
-            data_home_var,
+            data_home_var: std::env::var_os("XDG_DATA_HOME")
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute()),
+            data_home: paths.data_home().to_owned(),
+            config_home: paths.config_home().to_owned(),
             path: std::env::var_os("PATH"),
+            paths,
         })
     }
 
     fn state(&self) -> PathBuf {
-        self.data_home.join(STATE_DIR)
+        self.paths.state()
     }
 }
 
@@ -211,8 +213,8 @@ pub fn run(log: &Oplog) -> Result<(), DaemonError> {
     let dirs = Dirs::from_env()?;
     check_runtime_dir(&dirs.runtime)?;
     let lock = startup::open_and_lock(&dirs.runtime)?;
-    let config = read_config(&dirs.config_home.join("sallyport/config.toml"))?;
-    let audit = AuditWriter::open(&dirs.state().join("audit"), Box::new(SystemClock))?;
+    let config = read_config(&dirs.paths.config_file())?;
+    let audit = AuditWriter::open(&dirs.paths.audit(), Box::new(SystemClock))?;
     let audit: Arc<dyn AuditSink> = Arc::new(SharedAudit(Mutex::new(audit)));
     // Under the single-instance lock, in the state directory the audit log just made.
     let installation = super::install::load_or_create(&dirs.state())?;
@@ -475,6 +477,13 @@ fn bind_control(dir: &OwnedFd) -> Result<UnixListener, DaemonError> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// The CLI finds the socket through `sally_core::paths` (architect Q107): the names agree.
+    #[test]
+    fn the_socket_names_are_the_ones_the_cli_derives() {
+        assert_eq!(STATE_DIR, sally_core::paths::STATE_DIR);
+        assert_eq!(CONTROL_SOCK, sally_core::paths::CONTROL_SOCKET);
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let d = Path::new(env!("CARGO_MANIFEST_DIR"))

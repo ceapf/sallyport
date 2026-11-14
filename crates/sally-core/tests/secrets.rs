@@ -619,18 +619,33 @@ fn the_error_vocabulary_oracle_exempts_message_text_but_not_values() {
 
 // ---- review follow-ups --------------------------------------------------------------------
 
-#[test]
-fn open_refuses_a_fifo_without_blocking() {
-    let s = Scratch::new("fifo");
+fn mkfifo(p: &Path) {
     rustix::fs::mknodat(
         rustix::fs::CWD,
-        s.store_path(),
+        p,
         rustix::fs::FileType::Fifo,
         rustix::fs::Mode::from_raw_mode(0o600),
         0,
     )
     .unwrap();
-    let err = SecretStore::open(&s.store_path()).unwrap_err();
+}
+
+/// `f`'s result, or a failure (not a hang) if it takes more than 5 s.
+fn within_5s<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(5))
+        .expect("blocked for more than 5 s")
+}
+
+#[test]
+fn open_refuses_a_fifo_without_blocking() {
+    let s = Scratch::new("fifo");
+    mkfifo(&s.store_path());
+    let p = s.store_path();
+    let err = within_5s(move || SecretStore::open(&p).map(|_| ())).unwrap_err();
     assert!(matches!(err, SecretsError::Permissions { .. }), "{err:?}");
 }
 
@@ -791,4 +806,171 @@ fn fuzz_corpus_satisfies_the_no_leak_oracle() {
         }
     }
     assert!(seen >= 3, "corpus went missing");
+}
+
+// ---- the writers' lock (architect Q108) ---------------------------------------------------
+
+/// Two editors, one holding the lock while the other starts: both changes survive. Without the
+/// lock the second opens the old snapshot, and the first's save (which comes last) drops the
+/// second's change.
+#[test]
+fn two_interleaved_edits_both_survive() {
+    let s = Scratch::new("lock-edits");
+    let path = s.store_path();
+    let held = SecretStore::lock(&path).unwrap();
+    let mut first = SecretStore::open(&path).unwrap();
+    first.set("FIRST", long("a")).unwrap();
+    let p2 = path.clone();
+    let second = std::thread::spawn(move || {
+        let _lock = SecretStore::lock(&p2).unwrap();
+        let mut st = SecretStore::open(&p2).unwrap();
+        st.set("SECOND", long("b")).unwrap();
+        st.save().unwrap();
+    });
+    // The second editor is blocked meanwhile; give it time to have opened if it were not.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    first.save().unwrap();
+    drop(held);
+    second.join().unwrap();
+    let st = SecretStore::open(&path).unwrap();
+    assert!(st.contains("FIRST") && st.contains("SECOND"));
+}
+
+/// A lock another writer keeps is not waited on forever (maintainer, 2026-11-14): after the
+/// wait, a clear error naming the lock file and saying nothing changed.
+#[test]
+fn a_held_lock_times_out_with_a_clear_message() {
+    let s = Scratch::new("lock-held");
+    let path = s.store_path();
+    let held = SecretStore::lock(&path).unwrap();
+    let wait = std::time::Duration::from_millis(200);
+    let start = std::time::Instant::now();
+    let e = SecretStore::lock_within(&path, wait).unwrap_err();
+    let took = start.elapsed();
+    assert!(matches!(e, SecretsError::LockHeld { .. }), "{e:?}");
+    assert!(took >= wait, "gave up after {took:?}");
+    assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+    let msg = e.to_string();
+    for needle in ["secrets.lock", "another", "nothing changed", "0.2 s"] {
+        assert!(msg.contains(needle), "{needle:?} not in {msg}");
+    }
+    drop(held);
+    assert!(
+        SecretStore::lock_within(&path, wait).is_ok(),
+        "free once released"
+    );
+}
+
+/// A lock released during the wait is taken; a free lock is taken even with no wait at all.
+#[test]
+fn a_lock_released_within_the_wait_is_taken() {
+    let s = Scratch::new("lock-wait");
+    let path = s.store_path();
+    assert!(SecretStore::lock_within(&path, std::time::Duration::ZERO).is_ok());
+    let held = SecretStore::lock(&path).unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        drop(held);
+    });
+    let start = std::time::Instant::now();
+    let got = SecretStore::lock_within(&path, std::time::Duration::from_secs(5));
+    assert!(got.is_ok(), "{got:?}");
+    assert!(start.elapsed() >= std::time::Duration::from_millis(150));
+    release.join().unwrap();
+}
+
+/// With no wait, a held lock is refused after one try.
+#[test]
+fn a_held_lock_with_no_wait_is_refused_at_once() {
+    let s = Scratch::new("lock-zero");
+    let path = s.store_path();
+    let _held = SecretStore::lock(&path).unwrap();
+    let start = std::time::Instant::now();
+    let e = SecretStore::lock_within(&path, std::time::Duration::ZERO).unwrap_err();
+    assert!(matches!(e, SecretsError::LockHeld { .. }), "{e:?}");
+    assert!(start.elapsed() < std::time::Duration::from_secs(1));
+}
+
+/// A FIFO planted as the lock is refused, not opened (which would block past any timeout).
+#[test]
+fn a_fifo_lock_is_refused_without_blocking() {
+    let s = Scratch::new("lock-fifo");
+    mkfifo(&s.0.join("secrets.lock"));
+    let p = s.store_path();
+    let e = within_5s(move || SecretStore::lock(&p).map(|_| ())).unwrap_err();
+    assert!(matches!(e, SecretsError::Permissions { .. }), "{e:?}");
+}
+
+/// A lock someone made readable to others is set back to 0600; a directory is refused.
+#[test]
+fn an_open_lock_file_is_made_private_and_a_directory_is_refused() {
+    let s = Scratch::new("lock-mode");
+    let lock = s.0.join("secrets.lock");
+    std::fs::write(&lock, "").unwrap();
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
+    drop(SecretStore::lock(&s.store_path()).unwrap());
+    assert_eq!(mode_of(&lock), 0o600);
+    std::fs::remove_file(&lock).unwrap();
+    std::fs::create_dir(&lock).unwrap();
+    assert!(matches!(
+        SecretStore::lock(&s.store_path()),
+        Err(SecretsError::Io { .. })
+    ));
+}
+
+/// A FIFO lock that has a reader opens (no ENXIO), and the regular-file check refuses it.
+#[test]
+fn a_fifo_lock_with_a_reader_is_refused_as_not_a_regular_file() {
+    use std::os::unix::fs::OpenOptionsExt;
+    let s = Scratch::new("lock-fifo-rd");
+    let lock = s.0.join("secrets.lock");
+    mkfifo(&lock);
+    let _reader = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NONBLOCK.bits().cast_signed())
+        .open(&lock)
+        .unwrap();
+    let p = s.store_path();
+    let e = within_5s(move || SecretStore::lock(&p).map(|_| ())).unwrap_err();
+    assert!(
+        matches!(&e, SecretsError::Permissions { msg, .. } if msg == "is not a regular file"),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn the_default_lock_wait_is_ten_seconds() {
+    assert_eq!(
+        sally_core::secrets::LOCK_WAIT,
+        std::time::Duration::from_secs(10)
+    );
+}
+
+#[test]
+fn the_lock_is_a_private_file_beside_the_store_and_creates_its_directory() {
+    let s = Scratch::new("lock-file");
+    let path = s.0.join("sub/secrets.toml");
+    let lock = SecretStore::lock(&path).unwrap();
+    assert_eq!(mode_of(&s.0.join("sub/secrets.lock")), 0o600);
+    assert_eq!(mode_of(&s.0.join("sub")), 0o700);
+    assert!(!path.exists(), "the lock creates no store");
+    drop(lock);
+}
+
+#[test]
+fn a_symlinked_lock_or_an_open_directory_is_refused() {
+    let s = Scratch::new("lock-refuse");
+    let path = s.store_path();
+    symlink(s.0.join("elsewhere"), s.0.join("secrets.lock")).unwrap();
+    assert!(matches!(
+        SecretStore::lock(&path),
+        Err(SecretsError::Permissions { .. })
+    ));
+    assert!(!s.0.join("elsewhere").exists());
+    std::fs::remove_file(s.0.join("secrets.lock")).unwrap();
+    std::fs::set_permissions(&s.0, std::fs::Permissions::from_mode(0o770)).unwrap();
+    assert!(matches!(
+        SecretStore::lock(&path),
+        Err(SecretsError::Permissions { .. })
+    ));
 }

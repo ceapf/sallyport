@@ -446,7 +446,7 @@ fn literals_do_not_end_a_function_or_add_operands() {
 }
 
 /// The files in mutation scope: the `--file` lists of the Makefile's mutation targets
-/// (`MUTANTS_FILES` and the three `MUTANTS_WIDE_*`), with `$(addprefix …)` and `dir/*.rs`
+/// (`MUTANTS_FILES` and the four `MUTANTS_WIDE_*`), with `$(addprefix …)` and `dir/*.rs`
 /// expanded, so a file added to a list is covered at once.
 fn mutation_scope() -> Vec<String> {
     let make = std::fs::read_to_string(root().join("Makefile")).unwrap();
@@ -455,6 +455,7 @@ fn mutation_scope() -> Vec<String> {
         "MUTANTS_WIDE_CORE",
         "MUTANTS_WIDE_SALLYD",
         "MUTANTS_WIDE_SHIM",
+        "MUTANTS_WIDE_CLI",
     ];
     let files: Vec<String> = vars.iter().flat_map(|v| make_list(&make, v)).collect();
     assert!(files.len() >= 60, "the Makefile lists moved: {files:?}");

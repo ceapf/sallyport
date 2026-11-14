@@ -16,8 +16,12 @@ line per fact, with where it was found. Check a note again before relying on it 
   names that directory directly. There, `pids.events` and `memory.events` are owned by the user,
   mode 0444, and readable from the host. `max` went 0→1 after forks refused at `--pids-limit`,
   and `oom_kill` went 0→1 after an in-container OOM; the container kept running. `pread` at
-  offset 0 of a held fd reads the current counts. (Task 12 PR C1, #27; the CI result is noted
-  below once C1's run has read it.)
+  offset 0 of a held fd reads the current counts. (Task 12 PR C1, #27.) CI's rootless Podman
+  (GitHub's Ubuntu runner) reads them the same way: PR #118's `rust` and `redteam` jobs launched
+  sessions, and a launch refuses `cgroup-events` if any step fails (Q105).
+- `stat -f -c %T /sys/fs/cgroup` printing `cgroup2fs` agrees with `podman info --format
+  '{{.Host.CgroupsVersion}}'` printing `v2` on the dev host (WSL2, `cgroup_no_v1=all`).
+  `sally doctor` uses the statfs test, so it needs no podman. (Task 12 PR C2, Q106)
 - With only `--memory`, swap is unlimited beyond it on cgroup v2 hosts with swap (the OCI config
   showed swap = 2 × memory). Sallyport sets `--memory-swap` equal to `--memory`. (Checkpoint 3)
 - On an OOM kill, the container's conmon writes an empty `oom` file into the working directory of
@@ -77,6 +81,12 @@ line per fact, with where it was found. Check a note again before relying on it 
   between the listing and the removal; an ID cannot). (Task 12 PR A, review PS-L5)
 
 ## Kernel and namespaces
+
+- A pty in canonical mode keeps at most 4095 bytes of a line and drops the rest without an
+  error; the newline still ends the line. A read of 4095 data bytes therefore cannot be told
+  from a cut line, so the `secrets set` prompt takes at most 4094 (`TTY_MAX_VALUE_BYTES`;
+  pinned by `the_prompt_takes_4094_bytes_and_refuses_more` at 4094, 4095, 5000 and 8192).
+  `tcsetattr(TCSAFLUSH)` on return discards the rest of a multi-line paste. (Task 12 PR C2, Q114)
 
 - In a `--network=none` sandbox: TCP/UDP to public addresses → ENETUNREACH; raw sockets → EPERM;
   ICMP ping sockets → EACCES at creation (`ping_group_range`); inference role → ENOSYS (seccomp).

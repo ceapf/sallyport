@@ -959,12 +959,14 @@ name = "sally-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "jiff",
  "rustix",
  "sally-core",
  "sally-proto",
  "serde",
  "serde_json",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]

@@ -9,6 +9,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use rustix::fs::{Mode, OFlags};
 use zeroize::{Zeroize, Zeroizing};
@@ -22,8 +23,13 @@ pub const MAX_SECRETS: usize = 256;
 /// Longest secret value, in bytes.
 pub const MAX_VALUE_BYTES: usize = 8 * 1024;
 /// Values shorter than this are stored but flagged: redaction skips collision-prone short
-/// patterns (ARCHITECTURE §7, Redaction; the CLI's warning is TODO(#98)).
+/// patterns (ARCHITECTURE §7, Redaction); `sally secrets set` warns when it reports one.
 pub const SHORT_SECRET_BYTES: usize = 16;
+
+/// How long [`SecretStore::lock`] waits for another writer before giving up.
+pub const LOCK_WAIT: Duration = Duration::from_secs(10);
+/// How often a waiting writer retries the lock.
+const LOCK_RETRY: Duration = Duration::from_millis(50);
 
 const MAX_NAME_BYTES: usize = 64;
 /// Distinguishes temporary files of concurrent saves within one process.
@@ -60,6 +66,18 @@ pub enum SecretsError {
         path: String,
         /// What is wrong and how to fix it.
         msg: String,
+    },
+    /// Another writer kept the lock for the whole wait ([`SecretStore::lock_within`]).
+    #[error(
+        "{path}: another `sally secrets` command is changing the store; gave up after {:.1} s \
+         and nothing changed (try again when it ends)",
+        waited.as_secs_f64()
+    )]
+    LockHeld {
+        /// Host path of the lock file.
+        path: String,
+        /// How long this writer was willing to wait.
+        waited: Duration,
     },
     /// An I/O error.
     #[error("{path}: {source}")]
@@ -119,6 +137,13 @@ fn validate_value(value: &str) -> Result<(), SecretsError> {
         return bad("must not start or end with a space");
     }
     Ok(())
+}
+
+/// The writers' lock of a store ([`SecretStore::lock`]); released on drop.
+#[derive(Debug)]
+pub struct EditLock {
+    /// Held only for its `flock`, which closing the file releases.
+    _file: File,
 }
 
 /// The in-memory secrets store and its backing file.
@@ -267,6 +292,59 @@ impl SecretStore {
         self.entries.remove(name).is_some()
     }
 
+    /// Takes the writers' lock for the store at `path`: an exclusive `flock` on `secrets.lock`
+    /// (the store's name with `.lock`) beside it, 0600, never through a symlink, waiting at most
+    /// [`LOCK_WAIT`] for another writer. An editor holds it across [`open`](Self::open), its
+    /// changes and [`save`](Self::save), so two editors cannot undo each other (architect Q108);
+    /// readers take no lock. Creates the directory with mode 0700 if missing.
+    ///
+    /// # Errors
+    /// As [`lock_within`](Self::lock_within).
+    pub fn lock(path: &Path) -> Result<EditLock, SecretsError> {
+        Self::lock_within(path, LOCK_WAIT)
+    }
+
+    /// [`lock`](Self::lock), waiting at most `wait`: the lock is tried at once, then every
+    /// 50 ms until `wait` has passed (a free lock is taken even when `wait` is zero). Blocking:
+    /// it sleeps the calling thread, so async callers use `spawn_blocking`.
+    ///
+    /// # Errors
+    /// [`SecretsError::LockHeld`] when another writer kept it for the whole wait;
+    /// [`SecretsError::Permissions`] if the directory is writable by group or others, or the lock
+    /// is a symlink, not a regular file, or not the user's; [`SecretsError::Io`] otherwise.
+    pub fn lock_within(path: &Path, wait: Duration) -> Result<EditLock, SecretsError> {
+        let lock = path.with_extension("lock");
+        let io_err = |e: std::io::Error| SecretsError::Io {
+            path: lock.display().to_string(),
+            source: e,
+        };
+        let dir = parent_of(path);
+        if !dir.exists() {
+            DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)
+                .map_err(io_err)?;
+        }
+        check_parent(path)?;
+        let file = open_lock_file(&lock)?;
+        let start = Instant::now();
+        loop {
+            match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => return Ok(EditLock { _file: file }),
+                Err(rustix::io::Errno::WOULDBLOCK) => {}
+                Err(e) => return Err(io_err(e.into())),
+            }
+            let Some(left) = wait.checked_sub(start.elapsed()).filter(|l| !l.is_zero()) else {
+                return Err(SecretsError::LockHeld {
+                    path: lock.display().to_string(),
+                    waited: wait,
+                });
+            };
+            std::thread::sleep(left.min(LOCK_RETRY));
+        }
+    }
+
     /// Writes the store atomically: a 0600 temporary file in the same directory, fsync, rename,
     /// fsync of the directory. Creates the directory with mode 0700 if missing. A crash leaves
     /// either the old file or the new one.
@@ -351,6 +429,37 @@ impl crate::manifest::SecretCatalog for SecretStore {
     }
 }
 
+/// The writers' lock file: write-only, created 0600, never through a symlink, and without
+/// blocking on a FIFO (`ENXIO` when it has no reader); then it must be a regular file of the
+/// user's, and is set to 0600 so no one else can take it.
+fn open_lock_file(lock: &Path) -> Result<File, SecretsError> {
+    let io_err = |e: std::io::Error| SecretsError::Io {
+        path: lock.display().to_string(),
+        source: e,
+    };
+    let fd = match crate::fd::open(
+        lock,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::from_raw_mode(0o600),
+    ) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::LOOP) => return Err(perm(lock, "is a symbolic link")),
+        Err(rustix::io::Errno::NXIO) => return Err(perm(lock, "is not a regular file")),
+        Err(e) => return Err(io_err(e.into())),
+    };
+    let file = File::from(fd);
+    let meta = file.metadata().map_err(io_err)?;
+    if !meta.is_file() {
+        return Err(perm(lock, "is not a regular file"));
+    }
+    if meta.uid() != rustix::process::geteuid().as_raw() {
+        return Err(perm(lock, "is not owned by the current user"));
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(io_err)?;
+    Ok(file)
+}
+
 fn perm(path: &Path, msg: &str) -> SecretsError {
     SecretsError::Permissions {
         path: path.display().to_string(),
@@ -416,7 +525,7 @@ fn write_private(f: &mut File, bytes: &[u8]) -> std::io::Result<()> {
 /// Removes leftovers of a crashed save (`.<name>.<pid>.<n>.tmp`, regular, owned by us) from other
 /// processes: they hold plaintext, possibly of a secret the user has since removed. Best effort.
 /// A save in another live process that loses its temporary file fails cleanly (its rename
-/// errors); concurrent writers are unsupported anyway (see the module docs).
+/// errors); writers hold [`SecretStore::lock`], so only a writer that skipped it can lose one.
 fn sweep_stale_tmp(dir: &Path, name: &str) {
     let prefix = format!(".{name}.");
     let own = format!("{prefix}{}.", std::process::id());

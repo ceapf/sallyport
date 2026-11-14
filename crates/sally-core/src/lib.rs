@@ -10,5 +10,6 @@ pub mod config;
 pub mod fd;
 mod fsutil;
 pub mod manifest;
+pub mod paths;
 pub mod secrets;
 pub mod text;

@@ -28,8 +28,20 @@ sally-core = { path = "../sally-core", version = "0.1.0" }
 # The control socket's wire types, shared with sallyd (architect Q78).
 sally-proto = { path = "../sally-proto", version = "0.1.0" }
 # `net`: SO_PEERCRED, the socket's owner checked before a byte is sent; `termios`: tcflush of
-# typed-ahead input before each approval answer (architect Q80); `process`: the own uid.
-rustix = { version = "1.1.6", default-features = false, features = ["net", "process", "std", "termios"] }
+# typed-ahead input before each approval answer (architect Q80); `process`: the own uid;
+# `fs`: `sally doctor`'s statfs of /sys/fs/cgroup (architect Q106).
+rustix = { version = "1.1.6", default-features = false, features = ["fs", "net", "process", "std", "termios"] }
+# `sally secrets set`: the plaintext value is wiped from the CLI's buffers (architect Q108);
+# already in the tree through sally-core.
+zeroize = { version = "1.9.1", default-features = false, features = ["alloc"] }
 serde = "1.0.229"
 serde_json = "1.0.154"
 thiserror = "2.0.21"
+
+[dev-dependencies]
+# `pty`: a pseudo-terminal pair, so the no-echo prompt of `secrets set` is tested on a real
+# terminal (a feature of the crate above, not a new dependency).
+rustix = { version = "1.1.6", default-features = false, features = ["pty", "termios"] }
+# RT-AUD-01 through the binary: a log that rotates needs a clock set by hand, and the audit
+# writer's `Clock` returns a jiff `Timestamp` (already in the tree through sally-core).
+jiff = { version = "0.2.42", default-features = false, features = ["std"] }
