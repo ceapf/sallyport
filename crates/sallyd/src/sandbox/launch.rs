@@ -24,7 +24,11 @@
 //! timeout) cannot leave a half-built session, and a finished launch nobody receives is stopped.
 //! A failure removes the container by its name (even when `create` printed no id), removes only
 //! the directories this launch created, and keeps the session's overlap claims while a container
-//! might still exist. TODO(#15): the OCI config verifier runs between 6 and 7 (Task 14).
+//! might still exist.
+//!
+//! Between steps 6 and 7 the OCI config verifier (Task 14, `launch/verify.rs`, `sandbox::oci`)
+//! compares the config podman generated with the argv's intent; on a difference the container
+//! is removed and `sandbox.config_mismatch` is audited with the first differing field.
 
 use std::ffi::OsString;
 use std::path::PathBuf;

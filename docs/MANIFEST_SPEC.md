@@ -351,7 +351,7 @@ and, for a subtree rule, of every existing ancestor. A mount root with one of th
 `~/.ssh` "is the same directory as" it, and an alias of `~/.local` or of the home's parent
 "contains" a protected folder. An alias of a directory *inside* a protected folder is not
 detected: the same path-versus-filesystem ancestry gap as the overlap rule's re-review M-2
-(#17, Task 14).
+(open, optional: #17, #28).
 
 At launch the driver re-checks every mount root (`ValidatedManifest::recheck_mounts`): it must
 pass the same checks, have the same realpath, and be the same directory (`st_dev`/`st_ino`) as at
@@ -363,7 +363,7 @@ validation — otherwise `mount-changed`/`is-symlink` (RT-FS-06).
 |---|---|---|---|
 | `apiVersion`, `kind`, unknown fields | `sally-core::manifest::parse` | load | reject with field path |
 | `name` | parse | load | reject |
-| `runtime.image`, `harness.image` | validator (pinned) + `sallyd::sandbox::images` (`--pull=never`) | validate + launch | refuse unpinned refs; refuse if the digest is not present locally |
+| `runtime.image`, `harness.image` | validator (pinned) + `sallyd::sandbox::images` (`--pull=never`) | validate + launch | refuse unpinned refs; refuse if the digest is not present locally; refuse an image with an `Entrypoint` (`config-mismatch` on `process.args`, until #117) |
 | `runtime.cpus/memory/pids` | `sallyd::sandbox` → `podman run --cpus --memory --pids-limit`; the watchdog's cgroup observer re-reads `pids.events` `max` and `memory.events` `oom_kill` every 1 s (#27) | launch + runtime | out of range → reject at validate; the kernel refuses the fork or OOM-kills inside the container, the session runs on, audit `session.resource_limit` reason `pids-max` / `oom-kill` with the counter's value; launch refused `cgroup-events` if the files cannot be opened |
 | `runtime.timeout` | `sallyd::session` timer → `podman kill` | runtime | session stopped, audit `session.timeout` |
 | `runtime.tmp_size/tmp_exec` | `podman run --tmpfs /tmp:…` | launch | a full `/tmp` returns ENOSPC; contained, not audited (a tmpfs has no kernel event) |

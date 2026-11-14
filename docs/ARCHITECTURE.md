@@ -331,7 +331,19 @@ are released only once the container is confirmed gone.
    parent self-binds, `.git` pointer files) must show its pinned `st_dev:st_ino`. On a mismatch
    the container is removed and `sandbox.mount_mismatch` is audited. Overlay lower layers report
    the overlay's own device, so they rely on step 6's host re-check and on the overlap rule.
-   TODO(#15): the OCI config verifier runs here (Task 14).
+   Then the **OCI config verifier** (Task 14, RT-SUP-04, `sandbox::oci`): the config podman
+   generated (`podman unshare cat` of `OCIConfigPath`, at most 1 MiB, strictly parsed: a
+   repeated or unknown key anywhere is a mismatch) must equal what the argv builder recorded as
+   it pushed each flag, plus podman's own per-role additions, and nothing else: user and groups,
+   no capability in any set, `noNewPrivileges`, read-only root, seven own namespaces, the
+   keep-id map shape, the seccomp filter by content (the embedded profile converted for the
+   native architecture), exactly the mounts with their options (each overlay's `lowerdir`
+   included, parents before children), the args and environment as built plus the image's
+   `Env`/`WorkingDir`, rlimits, cgroup limits with swap equal to memory, `cgroupsPath` in the
+   systemd form only (doctor requires systemd), masked and read-only paths, annotations and
+   hostname. On a difference the container is removed and `sandbox.config_mismatch` is audited
+   with the first differing field (never a value of the environment or the command). GPU
+   inference is refused until M3 (#116); an image with an entrypoint until #117.
 8. `podman start`, then the **running check** (Task 6c): after a 250 ms grace, `podman inspect`
    must report the container running as the pid checked in step 7. `start` succeeds even when
    the entry point exits at once, and a container that exited is already gone (`--rm`). Either
