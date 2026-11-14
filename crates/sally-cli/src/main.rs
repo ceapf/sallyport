@@ -116,9 +116,18 @@ enum SessionCmd {
 }
 
 fn main() -> ExitCode {
-    let cli = match Cli::try_parse() {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let cli = match Cli::try_parse_from(&args) {
         Ok(c) => c,
         Err(e) => {
+            use clap::error::ErrorKind::{DisplayHelp, DisplayVersion};
+            let shown = matches!(e.kind(), DisplayHelp | DisplayVersion);
+            // The parser's text quotes the argument it rejected, which may be a secret value.
+            if !shown && secrets::names_secrets(args.get(1..).unwrap_or_default()) {
+                let n = secrets::NOT_UNDERSTOOD;
+                let _ = writeln!(std::io::stderr(), "{n}\n{}", secrets::ARGV_WARNING);
+                return ExitCode::from(EXIT_FAILED);
+            }
             let text = clean::text(&e.render().to_string()).text;
             if e.use_stderr() {
                 let _ = write!(std::io::stderr(), "{text}");

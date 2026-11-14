@@ -125,9 +125,35 @@ fn an_illegal_name_is_a_usage_error_before_any_value_is_read() {
     assert_eq!(code, EXIT_FAILED);
     assert!(!asked);
     assert!(!err.contains("lower"), "{err}");
+    assert!(err.ends_with(&format!("{ARGV_WARNING}\n")), "{err}");
     assert!(!s.store().exists());
-    let (code, _, _) = run(|o| rm(&s.store(), "lower", o));
+    let (code, _, err) = run(|o| rm(&s.store(), "lower", o));
     assert_eq!(code, EXIT_FAILED);
+    assert!(!err.contains("lower"), "{err}");
+    assert!(err.ends_with(&format!("{ARGV_WARNING}\n")), "{err}");
+}
+
+#[test]
+fn a_command_line_naming_secrets_in_any_case_is_matched() {
+    let args = |a: &[&str]| -> Vec<std::ffi::OsString> { a.iter().map(Into::into).collect() };
+    assert!(names_secrets(&args(&["secrets", "set", "A", "B"])));
+    assert!(names_secrets(&args(&["--x", "Secret"])));
+    assert!(names_secrets(&args(&["session", "my-SECRET.toml"])));
+    assert!(names_secrets(&args(&["secret"])));
+    assert!(!names_secrets(&args(&[
+        "secre",
+        "t",
+        "session",
+        "secr\u{e9}t"
+    ])));
+    assert!(!names_secrets(&args(&[])));
+}
+
+#[test]
+fn the_argv_warning_names_history_rotation_and_both_ways_in() {
+    for needle in ["shell history", "rotate", "sally secrets set NAME", "stdin"] {
+        assert!(ARGV_WARNING.contains(needle), "{needle}");
+    }
 }
 
 #[test]

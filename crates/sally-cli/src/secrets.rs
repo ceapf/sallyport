@@ -22,6 +22,31 @@ use crate::{EXIT_FAILED, EXIT_OK, EXIT_REFUSED, clean};
 pub const NOT_YET_USED: &str = "note: sessions cannot use stored secrets yet (#99); a manifest that \
                                 grants one is refused until then";
 
+/// Printed after a secrets command line that was not understood, or that gave an illegal name
+/// (maintainer ruling, 2026-11-14). It repeats no argument: a value typed where it does not
+/// belong is already in argv and may be in shell history, and must not reach the terminal or a
+/// log too.
+pub const ARGV_WARNING: &str = "\
+If a secret value was on that command line, it may now be in your shell history: rotate the \
+secret.\nA value is never an argument. Run `sally secrets set NAME` and type it at the prompt \
+(not shown), or pipe it on stdin: `sally secrets set NAME < file`.\nusage: sally secrets set \
+NAME | sally secrets list | sally secrets rm NAME";
+
+/// What `sally` prints instead of the argument parser's text, which quotes what it rejected.
+pub const NOT_UNDERSTOOD: &str = "sally: the secrets command was not understood; nothing changed";
+
+/// Whether a command line that did not parse gets [`NOT_UNDERSTOOD`] and [`ARGV_WARNING`]
+/// instead of the parser's text: any argument holding `secret` in any case, so `secret` and
+/// `Secrets` typos count too. A false match only costs a less specific message.
+#[must_use]
+pub fn names_secrets(args: &[std::ffi::OsString]) -> bool {
+    args.iter().any(|a| {
+        a.as_encoded_bytes()
+            .windows(b"secret".len())
+            .any(|w| w.eq_ignore_ascii_case(b"secret"))
+    })
+}
+
 /// Why no value was read.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ValueError {
@@ -206,8 +231,9 @@ pub fn rm(path: &Path, name: &str, o: &mut Out<'_>) -> u8 {
     }
 }
 
+/// An illegal name may be a value typed where the name goes: the shell-history warning too.
 fn usage(o: &mut Out<'_>, msg: &str) -> u8 {
-    let _ = writeln!(o.err, "sally: {}", clean::line(msg).text);
+    let _ = writeln!(o.err, "sally: {}\n{ARGV_WARNING}", clean::line(msg).text);
     EXIT_FAILED
 }
 
