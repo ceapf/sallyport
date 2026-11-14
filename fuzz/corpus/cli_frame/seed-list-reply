@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":1,"result":{"prompts":[{"id":"ap-1","session":"s-1","digest":"d","truncated":false,"text":"approval ap-1\n"}],"complete":true,"total":1}}

@@ -17,6 +17,9 @@ libfuzzer-sys = "0.4.13"
 httparse = "1.10.1"
 hyper = { version = "1.12.0", default-features = false }
 sally-core = { path = "../crates/sally-core", version = "0.1.0" }
+# cli_frame: the CLI's frame reader and decoder, and the wire types it reads.
+sally-cli = { path = "../crates/sally-cli", version = "0.1.0" }
+sally-proto = { path = "../crates/sally-proto", version = "0.1.0" }
 sallyd = { path = "../crates/sallyd", version = "0.1.0" }
 # Already in the tree through sallyd; builds the tool arguments object for `tool_args`.
 serde_json = "1.0.154"
@@ -104,6 +107,13 @@ bench = false
 [[bin]]
 name = "fetch_url"
 path = "fuzz_targets/fetch_url.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cli_frame"
+path = "fuzz_targets/cli_frame.rs"
 test = false
 doc = false
 bench = false

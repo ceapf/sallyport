@@ -65,28 +65,42 @@ pub trait SessionSet: Send + Sync + 'static {
     fn stop(&self, id: &str) -> impl Future<Output = Option<StopOutcome>> + Send;
 }
 
-/// One admitted control request.
+/// One admitted control request: the method with its strictly parsed params. Public for the
+/// `jsonrpc_message` fuzz target (architect Q96).
 #[derive(Debug)]
-pub(crate) enum Call {
+pub enum Call {
+    /// `sessions.create`.
     Create(CreateParams),
+    /// `sessions.list`.
     List,
+    /// `sessions.stop`, its id already canonical.
     Stop(SessionId),
+    /// `sessions.changes`, its id already canonical.
     Changes(SessionId),
+    /// `approvals.list`.
     Approvals,
+    /// `approvals.decide`.
     Decide(DecideParams),
+    /// `approvals.watch`.
     Watch,
 }
 
 /// Why a request was not admitted (`rpc.deny`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NotAdmitted {
+pub enum NotAdmitted {
+    /// Not one of [`CONTROL_METHODS`](super::mcp::CONTROL_METHODS).
     MethodNotFound,
+    /// Params with an unknown, missing or ill-typed field, or a session id that is not
+    /// canonical.
     InvalidParams,
 }
 
 impl Call {
     /// The call for `method` with `params`, strictly parsed.
-    pub(crate) fn parse(method: &str, params: Map<String, Value>) -> Result<Self, NotAdmitted> {
+    ///
+    /// # Errors
+    /// [`NotAdmitted`].
+    pub fn parse(method: &str, params: Map<String, Value>) -> Result<Self, NotAdmitted> {
         match method {
             method::SESSIONS_CREATE => Ok(Self::Create(params_of(params)?)),
             method::SESSIONS_LIST => params_of::<NoParams>(params).map(|_| Self::List),
@@ -100,7 +114,8 @@ impl Call {
     }
 
     /// The method name, from the fixed table.
-    pub(crate) fn method(&self) -> &'static str {
+    #[must_use]
+    pub fn method(&self) -> &'static str {
         match self {
             Self::Create(_) => method::SESSIONS_CREATE,
             Self::List => method::SESSIONS_LIST,
