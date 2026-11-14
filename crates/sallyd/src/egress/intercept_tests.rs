@@ -530,11 +530,13 @@ async fn a_request_head_under_its_guaranteed_size_passes() {
 /// The request head cut (ARCHITECTURE §7, architect 9a-2 part 2): exact at `MAX_HEAD -
 /// REQUEST_READ` (7168 bytes, request line and blank line included), whole or split, up to and
 /// past the 8 KiB buffer backstop. A refusal is hyper's own 431 (Q45): audited, nothing
-/// forwarded, the tunnel ended.
+/// forwarded, the tunnel ended. The cut is `MAX_REQUEST_HEAD`, the bound the `fetch` tool checks
+/// at prepare, so this proves that bound is the tunnel's real one.
 #[tokio::test]
 async fn request_heads_pass_up_to_7168_bytes_and_are_refused_from_7169() {
     let start = format!("GET /x HTTP/1.1\r\nHost: {HOST}\r\n");
-    let cut = MAX_HEAD - REQUEST_READ;
+    let cut = MAX_REQUEST_HEAD;
+    assert_eq!(cut, 7168);
     for total in [cut - 1, cut] {
         for at in [total, split_at(total)] {
             let r = rig(Opts::default());
