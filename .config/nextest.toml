@@ -4,9 +4,12 @@
 
 # Mutation runs (.cargo/mutants.toml `test_tool`, Makefile MUTANTS_ENV `NEXTEST_PROFILE`): a test
 # that runs past the limit is terminated and fails, so its mutant is caught in seconds instead of
-# holding the whole-mutant timeout (#82, architect ruling Q1).
-# limit = 30 s; every per-mutant-set test must stay under 3.75 s CI-loaded (floor 7.5 s,
-# maintainer, #82); split a slower test, never raise the limit; worst-case kill is 30 s + 10 s
-# grace.
+# holding the whole-mutant timeout (#82, architect rulings Q1 and R1).
+# limit = 30 s (7.5 s x 4). SLOW at 7.5 s is the maintainer's 4x floor; a SLOW in the unmutated
+# baseline fails the gate (scripts/mutants-gate.sh). Aim for under 3.75 s CI-loaded; split a
+# slower test, never raise the limit. Worst-case kill is 30 s + 10 s grace.
 [profile.mutants]
-slow-timeout = { period = "10s", terminate-after = 3 }
+slow-timeout = { period = "7500ms", terminate-after = 4 }
+# 4 test processes x 2 GiB data cap each (Makefile MUTANTS_DATA_CAP) = 8 GiB, half the runner's
+# memory; change the two together (architect ruling R2).
+test-threads = 4

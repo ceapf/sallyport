@@ -1247,10 +1247,13 @@ tools modules run in the wide job, `make mutants-wide-sallyd`, `tools::exec` exc
 decisions need a container and its `rt_` tests hold it) with a **zero-survivor gate**: a surviving mutant in a deny path is an untested
 control. cargo-mutants runs with `TMPDIR` under `target/` because `/tmp` is denylisted.
 Each mutant builds with the `mutants` cargo profile (the test profile without debug info) and
-runs its tests under nextest's `mutants` profile (`.config/nextest.toml`): a test past the 30 s
-per-test limit is terminated and its mutant counts as caught, and the gate lists it in the job
-summary. Every test process runs under `prlimit --data` (4 GiB), so a mutant that allocates without
-end fails its own test instead of exhausting the runner (#82).
+runs its tests under nextest's `mutants` profile (`.config/nextest.toml`, 4 test threads): a
+test past the 30 s per-test limit is terminated and its mutant counts as caught, and the gate
+lists it in the job summary. A test that runs past the 7.5 s slow period in the unmutated
+baseline fails the gate, which keeps the limit at least 4x the slowest test. Every test process
+runs under `prlimit --data` (2 GiB, so at most 8 GiB across the 4 threads), so a mutant that
+allocates without end fails its own test instead of exhausting the runner; the gate lists those
+too (#82).
 
 Dev-dependencies: `insta` (summary and diagnostic snapshots; review changes with
 `cargo insta review`) and `proptest` (wildcard matcher, host-pattern round trip; the token
