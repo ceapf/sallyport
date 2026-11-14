@@ -350,6 +350,8 @@ fn the_control_table_is_exactly_the_seven_methods() {
 #[test]
 fn frames_are_capped_at_1_mib() {
     assert_eq!(MAX_FRAME, 1_048_576);
+    // A refusal's code is JSON-RPC's first implementation-defined server error.
+    assert_eq!(REFUSED, -32_000);
 }
 
 /// Every method parses with its own params, names itself, and only the three reads are rated.

@@ -136,6 +136,13 @@ mod tests {
         Arc::new(Hub::default())
     }
 
+    #[test]
+    fn its_debug_names_how_many_are_attached() {
+        let h = hub();
+        let _w = h.watch();
+        assert_eq!(format!("{h:?}"), "Hub { attached: 1, .. }");
+    }
+
     fn prompt(id: &str) -> Prompt {
         Prompt {
             id: id.to_owned(),

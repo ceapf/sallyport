@@ -368,6 +368,9 @@ mod tests {
             sally_core::fd::open(&self.0, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
                 .unwrap()
         }
+        fn dir(&self, rel: &str) {
+            std::fs::create_dir_all(self.0.join(rel)).unwrap();
+        }
         fn list(&self, bounds: StageBounds) -> Result<Vec<(String, ChangeKind)>, String> {
             let found = list_upper(self.fd(), &mut Walk::new(bounds))?;
             let mut v: Vec<_> = found
@@ -394,6 +397,21 @@ mod tests {
             0,
         )
         .unwrap();
+    }
+
+    /// Each step of the listing opens one name beneath its directory: never its parent, never
+    /// through a symlinked directory. The names it is given are single canonical components,
+    /// so this holds even for a name it is never given.
+    #[test]
+    fn a_step_never_leaves_its_directory_or_follows_a_link() {
+        let t = Tmp::new("beneath");
+        t.dir("real/sub");
+        std::os::unix::fs::symlink("real", t.0.join("link")).unwrap();
+        let fd = t.fd();
+        assert!(beneath(&fd, "real/sub").is_ok(), "the control case opens");
+        assert_eq!(beneath(&fd, "..").unwrap_err(), Errno::XDEV);
+        assert_eq!(beneath(&fd, "link/sub").unwrap_err(), Errno::LOOP);
+        assert!(beneath(&fd, "link").is_err(), "a symlinked last step");
     }
 
     #[test]

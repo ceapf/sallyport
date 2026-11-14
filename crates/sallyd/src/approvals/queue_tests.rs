@@ -885,6 +885,17 @@ async fn the_oldest_prompt_leaving_keeps_the_rest_in_order() {
     }
 }
 
+/// A decision takes the prompt it names, not the first shown one.
+#[tokio::test(start_paused = true)]
+async fn a_decision_takes_the_prompt_it_names() {
+    let f = fx(5);
+    let (a, _ha) = asking(&f, shell(1, &["ls"])).await;
+    let (b, hb) = asking(&f, shell(2, &["ls"])).await;
+    decide(&f.desk, &b, Decision::Deny, ME).await.unwrap();
+    assert_eq!(hb.await.unwrap(), Err(Refusal::Denied("denied")));
+    assert_eq!(listed(&f), [a]);
+}
+
 /// Q97, the fifth removal site (security re-review LOW3): a prompt withdrawn before it is shown
 /// leaves at its announce, and the shown ones behind it keep their order.
 #[tokio::test(start_paused = true)]

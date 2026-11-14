@@ -19,7 +19,10 @@ struct Fake {
 
 impl Fake {
     fn new(tag: &str, reply: impl Fn(&Value) -> String + Send + 'static) -> Self {
-        let runtime = std::env::temp_dir().join(format!("sp-cli-t-{tag}-{}", std::process::id()));
+        // Short: the socket path below must fit SUN_LEN under a deep TMPDIR (the mutation runs'
+        // target/mutants-tmp), so tags stay short too.
+        let runtime = std::env::temp_dir().join(format!("sc-{tag}-{}", std::process::id()));
+        assert!(tag.len() <= 8, "tag {tag:?}: keep it short");
         let _ = std::fs::remove_dir_all(&runtime);
         std::fs::create_dir_all(runtime.join("sallyport")).unwrap();
         let listener = UnixListener::bind(runtime.join("sallyport/control.sock")).unwrap();
@@ -218,7 +221,7 @@ fn a_manifest_over_the_cap_is_never_sent() {
 
 #[test]
 fn approvals_lists_prompt_text_and_says_when_cut() {
-    let f = Fake::new("approvals", |req| {
+    let f = Fake::new("prompts", |req| {
         let p = json!({"id": "p1", "session": "s-1", "digest": "d", "truncated": false,
                        "text": "approval p1\n  action: run [\"ls\"]\n"});
         result(req, json!({"prompts": [p], "complete": false, "total": 3}))
