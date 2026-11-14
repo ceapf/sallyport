@@ -22,3 +22,10 @@ expect_used = "warn"
 [profile.release]
 # Untrusted-input parsers: arithmetic overflow must trap, never wrap silently.
 overflow-checks = true
+
+# Mutation runs only (.cargo/mutants.toml `profile`): the test profile without debug info. Each
+# mutant rebuilds the crate, and debug info is most of what the nightly runner's disk and link
+# memory hold for that (#82).
+[profile.mutants]
+inherits = "test"
+debug = false

@@ -151,14 +151,34 @@ fn budget() -> Duration {
     }
 }
 
-#[test]
-fn rt_man_01_mutated_manifests_never_panic_and_round_trip() {
-    let f = Fixture::new();
+// RT-MAN-01's 10 000 cases, split into four tests so no one of them runs long under the per-test
+// limit of mutation runs (#82, architect rulings Q2 and R3). Generation is separate from the part
+// filter: `mutated_cases` yields every case in order from one stream and knows nothing about
+// parts, so every part sees the identical inputs and a part can only choose which of them to
+// check. A block of one case per seed goes to part `(case / seeds) % PARTS`, so each part sees
+// every seed equally. The four parts together are the row's 10 000 cases; the macro list and
+// `rt_man_01_the_parts_cover_every_case_once` keep a part from going missing or doubling.
+const CASES: usize = 10_000;
+const PARTS: usize = 4;
+
+/// Every RT-MAN-01 case in order, as (case index, input), from the row's one stream.
+fn mutated_cases() -> impl Iterator<Item = (usize, Vec<u8>)> {
     let seeds = seeds();
     let mut rng = Rng(0x5A11_7090_2026_1109);
-    for case in 0..10_000 {
-        let seed = seeds[case % seeds.len()].as_bytes();
-        let input = mutate(&mut rng, seed);
+    (0..CASES).map(move |case| (case, mutate(&mut rng, seeds[case % seeds.len()].as_bytes())))
+}
+
+fn mutated_manifests_part(part: usize) {
+    assert!(part < PARTS, "part {part} of {PARTS}");
+    let f = Fixture::new();
+    let block = seeds().len();
+    let (mut seen, mut checked) = (0, 0);
+    for (case, input) in mutated_cases() {
+        seen += 1;
+        if (case / block) % PARTS != part {
+            continue;
+        }
+        checked += 1;
         if let Err(why) = check_case(&input, &f, budget()) {
             panic!(
                 "case {case}: {why}\ninput: {:?}",
@@ -166,6 +186,32 @@ fn rt_man_01_mutated_manifests_never_panic_and_round_trip() {
             );
         }
     }
+    assert_eq!((seen, checked), (CASES, CASES / PARTS), "part {part}");
+}
+
+macro_rules! rt_man_01_parts {
+    ($($name:ident = $part:literal),+ $(,)?) => {
+        /// The part indices the generated tests cover, in order.
+        const PART_INDICES: &[usize] = &[$($part),+];
+        $(
+            #[test]
+            fn $name() {
+                mutated_manifests_part($part);
+            }
+        )+
+    };
+}
+
+rt_man_01_parts! {
+    rt_man_01_mutated_manifests_never_panic_and_round_trip_part_0 = 0,
+    rt_man_01_mutated_manifests_never_panic_and_round_trip_part_1 = 1,
+    rt_man_01_mutated_manifests_never_panic_and_round_trip_part_2 = 2,
+    rt_man_01_mutated_manifests_never_panic_and_round_trip_part_3 = 3,
+}
+
+#[test]
+fn rt_man_01_the_parts_cover_every_case_once() {
+    assert_eq!(PART_INDICES, (0..PARTS).collect::<Vec<_>>());
 }
 
 #[test]

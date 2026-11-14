@@ -89,11 +89,29 @@ MUTANTS_FILES := crates/sally-core/src/manifest/validate/*.rs crates/sally-core/
 # TMPDIR move.
 MUTANTS_TMP := $(CURDIR)/target/mutants-tmp
 DISK_LOCK := bash scripts/disk-lock.sh
+# Every test process a mutation run starts goes through cargo's target runner, which caps its data
+# segment (RLIMIT_DATA: private writable mappings, touched or not, such as heap and thread
+# stacks; PROT_NONE reservations such as malloc arenas' do not count). A mutant that allocates
+# without end then fails its own test (caught) instead of exhausting the nightly runner (#82).
+# 2 GiB per test process x 4 nextest test threads (.config/nextest.toml) = 8 GiB, half the
+# runner's memory; change the two together (architect ruling R2). An address-space cap
+# (RLIMIT_AS) does not fit: a many-core machine's tokio runtimes and malloc arenas reserve far
+# more than they use.
+MUTANTS_DATA_CAP := 2147483648
+MUTANTS_HOST := $(shell rustc -vV | sed -n 's/^host: //p' | tr 'a-z-' 'A-Z_')
+# Without the host triple the runner variable is misnamed and cargo ignores it: no cap at all.
+mutants_host_check = $(if $(MUTANTS_HOST),,$(error MUTANTS_HOST is empty: `rustc -vV` gave no host, so the test memory cap would not apply))
+# Tests run under nextest (.cargo/mutants.toml `test_tool`); NEXTEST_PROFILE=mutants selects the
+# profile in .config/nextest.toml whose per-test limit terminates a hung test, so its mutant is
+# caught in seconds instead of holding cargo-mutants' whole-mutant timeout (#82). The target
+# runner applies under nextest too.
+MUTANTS_ENV := TMPDIR=$(MUTANTS_TMP) NEXTEST_PROFILE=mutants \
+               CARGO_TARGET_$(MUTANTS_HOST)_RUNNER='prlimit --data=$(MUTANTS_DATA_CAP) --'
 # The gate fails on missed mutants only; a timed-out mutant hangs a test, so it counts as
 # detected and goes to the job summary (maintainer ruling, #36; scripts/mutants-gate.sh).
 mutants:
-	mkdir -p $(MUTANTS_TMP)
-	TMPDIR=$(MUTANTS_TMP) $(DISK_LOCK) cargo mutants --package sally-core --no-shuffle $(foreach f,$(MUTANTS_FILES),--file '$(f)'); \
+	$(mutants_host_check)mkdir -p $(MUTANTS_TMP)
+	$(MUTANTS_ENV) $(DISK_LOCK) cargo mutants --package sally-core --no-shuffle $(foreach f,$(MUTANTS_FILES),--file '$(f)'); \
 	  bash scripts/mutants-gate.sh $$? mutants.out
 
 # The wider scope (CLAUDE.md "Mutation scope"): every other file whose security decisions can be
@@ -130,7 +148,7 @@ MUTANTS_WIDE_TESTS_SHIM := --lib --test=relay
 MUTANTS_SHARD ?=
 MUTANTS_OUT ?=
 # $(1) package, $(2) files, $(3) cargo test args
-mutants_wide = mkdir -p $(MUTANTS_TMP) && TMPDIR=$(MUTANTS_TMP) $(DISK_LOCK) cargo mutants --package $(1) \
+mutants_wide = $(mutants_host_check)mkdir -p $(MUTANTS_TMP) && $(MUTANTS_ENV) $(DISK_LOCK) cargo mutants --package $(1) \
   --no-shuffle $(if $(MUTANTS_SHARD),--shard $(MUTANTS_SHARD) --sharding round-robin) \
   $(if $(MUTANTS_OUT),--output $(MUTANTS_OUT)) $(foreach f,$(2),--file '$(f)') \
   $(foreach a,$(3),--cargo-test-arg=$(a)); \
