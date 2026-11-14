@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use sally_core::audit::{HeadStatus, VerifyReport, tail, verify};
+use sally_core::audit::{HeadStatus, VerifyErrorKind, VerifyReport, tail, verify};
 use sally_core::manifest::{Code, HostEnv, Rejected, Validated, load, summary};
 
 use crate::commands::{Out, Printer, read_manifest};
@@ -69,7 +69,10 @@ pub fn manifest_summary(path: &Path, o: &mut Out<'_>) -> u8 {
     p.code()
 }
 
-/// `sally audit verify`: 0 when the chain holds, 1 with the first bad `seq` otherwise.
+/// `sally audit verify` (architect Q115): 0 verified; 1 the log failed verification (the first
+/// bad `seq` is named); 2 the log could not be read (a missing directory, a file that cannot be
+/// opened, or one replaced by a directory or symlink). Scripts treat any non-zero as not
+/// verified.
 pub fn audit_verify(dir: &Path, o: &mut Out<'_>) -> u8 {
     match verify(dir) {
         Ok(r) => {
@@ -78,7 +81,11 @@ pub fn audit_verify(dir: &Path, o: &mut Out<'_>) -> u8 {
         }
         Err(e) => {
             let _ = writeln!(o.err, "sally: {}", clean::line(&e.to_string()).text);
-            EXIT_REFUSED
+            if e.kind == VerifyErrorKind::Unreadable {
+                EXIT_FAILED
+            } else {
+                EXIT_REFUSED
+            }
         }
     }
 }
@@ -102,14 +109,14 @@ fn report(r: &VerifyReport) -> String {
 
 /// `sally audit tail [-n N]`: the newest entries, one line each, escaped (it does not verify).
 /// TODO(#120): `--follow` across rotation, and `--session`/`--event` filters.
-/// 1 when a line in the files read was not an entry, or the log could not be read.
+/// 1 when a line in the files read was not an entry; 2 when the log could not be read
+/// (architect Q115).
 pub fn audit_tail(dir: &Path, n: usize, o: &mut Out<'_>) -> u8 {
     let t = match tail(dir, n) {
         Ok(t) => t,
         Err(e) => {
-            let msg = clean::line(&format!("{}: {e}", dir.display())).text;
-            let _ = writeln!(o.err, "sally: {msg}");
-            return EXIT_REFUSED;
+            let _ = writeln!(o.err, "sally: {}", clean::line(&e.to_string()).text);
+            return EXIT_FAILED;
         }
     };
     for l in &t.lines {

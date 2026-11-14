@@ -120,6 +120,23 @@ fn an_append_in_flight_is_skipped_and_bad_lines_are_counted() {
 fn a_missing_log_is_an_error_and_nothing_is_created() {
     let s = Scratch::new("missing");
     let e = tail(&s.dir(), 5).unwrap_err();
-    assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
+    assert_eq!(e.source.kind(), std::io::ErrorKind::NotFound);
+    assert_eq!(e.path, s.dir().display().to_string());
     assert!(!s.dir().exists());
+}
+
+/// A month file that cannot be read is named in the error, not the directory.
+#[test]
+fn an_unreadable_log_file_is_named() {
+    let s = Scratch::new("unreadable");
+    log(&s, 1, 0);
+    let file = std::fs::read_dir(s.dir())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .unwrap();
+    std::fs::remove_file(&file).unwrap();
+    std::fs::create_dir(&file).unwrap();
+    let e = tail(&s.dir(), 5).unwrap_err();
+    assert_eq!(e.path, file.display().to_string());
 }

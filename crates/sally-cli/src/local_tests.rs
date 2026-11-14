@@ -135,8 +135,24 @@ fn verify_reports_a_good_log_and_names_a_bad_one() {
     let (code, out, err) = run(|o| audit_verify(&s.audit(), o));
     assert_eq!((code, out.as_str()), (EXIT_REFUSED, ""));
     assert!(err.contains("seq 2"), "{err}");
-    let (code, _, _) = run(|o| audit_verify(&s.0.join("none"), o));
-    assert_eq!(code, EXIT_REFUSED);
+}
+
+/// Architect Q115: a log that cannot be read is exit 2, not a verdict.
+#[test]
+fn verify_of_a_log_that_cannot_be_read_fails() {
+    let s = Scratch::new("verify-io");
+    let (code, out, err) = run(|o| audit_verify(&s.0.join("none"), o));
+    assert_eq!((code, out.as_str()), (EXIT_FAILED, ""), "{err}");
+    s.log(2, "x");
+    let file = std::fs::read_dir(s.audit())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .unwrap();
+    std::fs::remove_file(&file).unwrap();
+    std::fs::create_dir(&file).unwrap();
+    let (code, _, err) = run(|o| audit_verify(&s.audit(), o));
+    assert_eq!(code, EXIT_FAILED, "{err}");
 }
 
 #[test]
@@ -177,6 +193,14 @@ fn tail_counts_lines_that_are_not_entries_and_fails() {
         err.starts_with("sally: 1 line(s) are not audit entries"),
         "{err}"
     );
-    let (code, _, _) = run(|o| audit_tail(&s.0.join("none"), 5, o));
-    assert_eq!(code, EXIT_REFUSED);
+}
+
+/// Architect Q115: a log that cannot be read is exit 2, and the error names the path.
+#[test]
+fn tail_of_a_log_that_cannot_be_read_fails_naming_it() {
+    let s = Scratch::new("tail-io");
+    let none = s.0.join("none");
+    let (code, out, err) = run(|o| audit_tail(&none, 5, o));
+    assert_eq!((code, out.as_str()), (EXIT_FAILED, ""));
+    assert!(err.contains(&none.display().to_string()), "{err}");
 }

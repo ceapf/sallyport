@@ -143,6 +143,19 @@ fn rt_aud_01_two_reordered_entries_are_named() {
     fails_at(&h.verify(), 2);
 }
 
+/// The chain across files: January's last entry cut while February stays. Caught by the
+/// walk's seq/prev-hash link, not by the head (whose seq still matches the log's end).
+#[test]
+fn rt_aud_01_a_cut_across_a_rotation_boundary_is_named() {
+    let h = Home::new("cross");
+    h.log(3, 2);
+    let jan = h.audit().join("audit-202601.jsonl");
+    let mut l = lines(&jan);
+    l.pop();
+    write_lines(&jan, &l);
+    fails_at(&h.verify(), 3);
+}
+
 #[test]
 fn rt_aud_01_truncation_at_a_rotation_boundary_is_named() {
     let h = Home::new("rot");

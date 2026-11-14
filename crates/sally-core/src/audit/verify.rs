@@ -142,7 +142,7 @@ fn walk_file(
         let at = |kind| fail(chain.next_seq, kind, name, Some(line_no));
         match read_line(&mut reader, &mut buf).map_err(|_| at(VerifyErrorKind::Unreadable))? {
             Line::Eof => return Ok(()),
-            Line::TooLong => return Err(at(VerifyErrorKind::LineTooLong)),
+            Line::TooLong { .. } => return Err(at(VerifyErrorKind::LineTooLong)),
             Line::Unterminated if last_file => {
                 chain.torn = true;
                 return Ok(());
@@ -200,7 +200,10 @@ fn check_head(head: Option<&Head>, last_seq: u64) -> Result<HeadStatus, VerifyEr
 pub(super) enum Line {
     Complete,
     Unterminated,
-    TooLong,
+    /// Over `MAX_LINE_BYTES`; `ended` when its newline was read too (else the rest is unread).
+    TooLong {
+        ended: bool,
+    },
     Eof,
 }
 
@@ -215,13 +218,13 @@ pub(super) fn read_line(r: &mut impl BufRead, buf: &mut Vec<u8>) -> std::io::Res
     if buf.last() == Some(&b'\n') {
         buf.pop();
         return Ok(if buf.len() > MAX_LINE_BYTES {
-            Line::TooLong
+            Line::TooLong { ended: true }
         } else {
             Line::Complete
         });
     }
     Ok(if u64::try_from(n).unwrap_or(u64::MAX) >= limit {
-        Line::TooLong
+        Line::TooLong { ended: false }
     } else {
         Line::Unterminated
     })
