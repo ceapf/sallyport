@@ -1,11 +1,10 @@
 //! RT-FS-15: in a `staged` mount the sandbox creates, modifies and deletes files, including
 //! `.vscode/settings.json` and a nested `sub/.git/config`. The host tree is identical during and
-//! after the session, and `staged_changes` lists exactly those paths. (The CLI wiring,
-//! `sally session changes`, is #20, Task 12.) The fixture is `common::container`; these tests
-//! never skip.
+//! after the session, and `session_changes` lists exactly those paths, from the session id
+//! alone (architect Q81). The fixture is `common::container`; these tests never skip.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use sallyd::sandbox::{ChangeKind, staged_changes};
+use sallyd::sandbox::ChangeKind;
 
 mod common;
 use common::container::*;
@@ -54,7 +53,7 @@ fn rt_fs_15_staged_changes_leave_the_host_untouched_and_are_listed() {
             ("sub/.git/config", w),
         ];
         let listed = || {
-            staged_changes(&v, &x.paths("fs15"))
+            changes(&x.paths("fs15"))
                 .unwrap()
                 .into_iter()
                 .map(|c| {
@@ -98,7 +97,7 @@ fn rt_fs_15_replaced_and_renamed_directories_are_listed() {
         assert_eq!(code, 0, "{out}");
         x.stop(r).await;
         assert_eq!(tree_state(&p), before, "the host tree");
-        let listed: Vec<_> = staged_changes(&v, &x.paths("fs15d"))
+        let listed: Vec<_> = changes(&x.paths("fs15d"))
             .unwrap()
             .into_iter()
             .map(|c| (c.path.display().to_string(), c.kind))

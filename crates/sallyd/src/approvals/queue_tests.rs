@@ -13,12 +13,38 @@ use crate::rpc::testkit::{Sink, recorder};
 /// Records what an approver is told.
 #[derive(Default)]
 pub(crate) struct Fake {
+    /// No client watches (architect Q73): `attached` answers false.
+    pub detached: std::sync::atomic::AtomicBool,
     pub requested: StdMutex<Vec<Prompt>>,
     pub floods: StdMutex<Vec<String>>,
     pub closed: StdMutex<Vec<String>>,
 }
 
+/// Decides `id` as a client shown the prompt in full would: with the prompt's own digest and
+/// `full_shown` (an id that is not waiting gets an empty digest, and so its own refusal).
+pub(crate) async fn decide(
+    desk: &Desk,
+    id: &str,
+    d: Decision,
+    client: Client,
+) -> Result<(), DecideError> {
+    let digest = desk
+        .list()
+        .iter()
+        .find(|p| p.id == id)
+        .map(|p| p.digest.clone())
+        .unwrap_or_default();
+    let seen = Seen {
+        digest: &digest,
+        full_shown: true,
+    };
+    desk.decide(id, d, client, seen).await
+}
+
 impl Approver for Fake {
+    fn attached(&self) -> bool {
+        !self.detached.load(SeqCst)
+    }
     fn requested(&self, p: &Prompt) {
         self.requested.lock().unwrap().push(p.clone());
     }
@@ -184,6 +210,129 @@ async fn with_no_approver_every_prompt_is_denied_and_audited() {
     assert!(f.desk.list().is_empty());
 }
 
+/// An approver with no client attached is no approver (architect Q73): the prompt is denied
+/// `no-approver`, audited, at the same place in the check order; attached again, it asks.
+#[tokio::test]
+async fn an_approver_with_no_client_attached_denies_no_approver() {
+    let f = fx(5);
+    f.fake.detached.store(true, SeqCst);
+    let r = f.gate.admit(shell(1, &["ls"]), None, None).await;
+    assert_eq!(r, Err(Refusal::Denied("no-approver")));
+    assert_eq!(f.sink.last("approval.deny")["reason"], "no-approver");
+    assert!(f.fake.requested.lock().unwrap().is_empty());
+    f.fake.detached.store(false, SeqCst);
+    let (id, h) = asking(&f, shell(2, &["ls"])).await;
+    decide(&f.desk, &id, Decision::Deny, ME).await.unwrap();
+    assert!(h.await.unwrap().is_err());
+}
+
+fn seen(digest: &str, full_shown: bool) -> Seen<'_> {
+    Seen { digest, full_shown }
+}
+
+/// An approval binds the digest the client was shown (architect Q74): a mismatch is refused and
+/// audited, the prompt stays pending, and a later approve with the right digest runs it. A deny
+/// needs only the id.
+#[tokio::test]
+async fn an_approve_with_another_digest_is_refused_and_leaves_the_prompt() {
+    let f = fx(5);
+    let b = shell(1, &["touch", "/workspace/x"]);
+    let (id, h) = asking(&f, b.clone()).await;
+    let wrong = f
+        .desk
+        .decide(
+            &id,
+            Decision::Approve,
+            ME,
+            seen("0".repeat(64).as_str(), true),
+        )
+        .await;
+    assert_eq!(wrong, Err(DecideError::DigestMismatch));
+    let last = f.sink.rows().pop().unwrap();
+    assert_eq!(
+        (last.event.as_str(), last.decision.as_deref()),
+        ("approval.decide", Some("refuse"))
+    );
+    assert_eq!(last.args["reason"], "digest-mismatch");
+    assert_eq!(last.args["id"], id.as_str());
+    assert_eq!(last.args["client"], json!({"uid": 1000, "pid": 42}));
+    assert_eq!(f.desk.list().len(), 1, "still pending");
+    let digest = b.digest();
+    f.desk
+        .decide(&id, Decision::Approve, ME, seen(&digest, false))
+        .await
+        .unwrap();
+    assert_eq!(h.await.unwrap().unwrap().bound(), &b);
+    // A deny with a wrong digest still denies.
+    let (id, h) = asking(&f, shell(2, &["ls"])).await;
+    f.desk
+        .decide(&id, Decision::Deny, ME, seen("x", false))
+        .await
+        .unwrap();
+    assert_eq!(h.await.unwrap(), Err(Refusal::Denied("denied")));
+}
+
+/// A cut prompt is approved only after its full text was shown (architect Q74, RT-UI-03 for the
+/// CLI): without `full_shown` the approve is refused and the prompt stays; with it, the entry
+/// records `full_shown`. A deny never needs it.
+#[tokio::test]
+async fn a_cut_prompt_is_approved_only_after_its_full_text_was_shown() {
+    let f = fx(5);
+    let long = "y".repeat(render::ACTION_CHARS);
+    let b = shell(1, &["echo", &long]);
+    let (id, h) = asking(&f, b.clone()).await;
+    assert!(f.desk.list()[0].truncated);
+    let digest = b.digest();
+    let r = f
+        .desk
+        .decide(&id, Decision::Approve, ME, seen(&digest, false))
+        .await;
+    assert_eq!(r, Err(DecideError::FullTextNotShown));
+    assert_eq!(
+        f.sink.last("approval.decide")["reason"],
+        "full-text-not-shown"
+    );
+    assert_eq!(f.desk.list().len(), 1, "still pending");
+    f.desk
+        .decide(&id, Decision::Approve, ME, seen(&digest, true))
+        .await
+        .unwrap();
+    assert!(h.await.unwrap().is_ok());
+    assert_eq!(f.sink.last("approval.decide")["full_shown"], true);
+    // An approve of a whole prompt records no claim.
+    let (id, h) = asking(&f, shell(2, &["ls"])).await;
+    decide(&f.desk, &id, Decision::Approve, ME).await.unwrap();
+    assert!(h.await.unwrap().is_ok());
+    assert!(f.sink.last("approval.decide").get("full_shown").is_none());
+    // A cut prompt is denied without the claim.
+    let (id, h) = asking(&f, shell(3, &["echo", &long])).await;
+    f.desk
+        .decide(&id, Decision::Deny, ME, seen("", false))
+        .await
+        .unwrap();
+    assert!(h.await.unwrap().is_err());
+}
+
+/// A full text over the wire cap is never sent, so the prompt cannot be approved at all; it can
+/// only be denied (architect Q74 (b)).
+#[tokio::test]
+async fn a_prompt_whose_full_text_is_over_the_wire_cap_is_deny_only() {
+    let f = fx(5);
+    let huge = "y".repeat(render::FULL_WIRE_BYTES);
+    let b = shell(1, &["echo", &huge]);
+    let (id, h) = asking(&f, b.clone()).await;
+    assert!(f.desk.list()[0].full_on_wire().is_none());
+    let digest = b.digest();
+    let r = f
+        .desk
+        .decide(&id, Decision::Approve, ME, seen(&digest, true))
+        .await;
+    assert_eq!(r, Err(DecideError::FullTextNotShown));
+    assert_eq!(f.desk.list().len(), 1);
+    decide(&f.desk, &id, Decision::Deny, ME).await.unwrap();
+    assert!(h.await.unwrap().is_err());
+}
+
 #[tokio::test]
 async fn approve_once_runs_the_askers_own_copy_and_the_id_is_single_use() {
     let f = fx(5);
@@ -196,7 +345,7 @@ async fn approve_once_runs_the_askers_own_copy_and_the_id_is_single_use() {
     let listed = f.desk.list();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].digest, b.digest());
-    f.desk.decide(&id, Decision::Approve, ME).await.unwrap();
+    decide(&f.desk, &id, Decision::Approve, ME).await.unwrap();
     let t = h.await.unwrap().unwrap();
     assert_eq!(t.bound(), &b);
     assert_eq!(t.approval(), Some(id.as_str()));
@@ -205,7 +354,7 @@ async fn approve_once_runs_the_askers_own_copy_and_the_id_is_single_use() {
     assert_eq!(d["client"], json!({"uid": 1000, "pid": 42}));
     assert_eq!(d["action_sha256"], b.digest());
     // Replay: the id is gone, and the refusal is audited.
-    let again = f.desk.decide(&id, Decision::Approve, ME).await;
+    let again = decide(&f.desk, &id, Decision::Approve, ME).await;
     assert_eq!(again, Err(DecideError::UnknownId));
     let last = f.sink.rows().pop().unwrap();
     assert_eq!(
@@ -222,8 +371,8 @@ async fn two_decisions_at_once_on_one_id_take_it_once() {
     let f = fx(5);
     let (id, h) = asking(&f, shell(1, &["ls"])).await;
     let (a, b) = tokio::join!(
-        f.desk.decide(&id, Decision::Approve, ME),
-        f.desk.decide(&id, Decision::Approve, ME)
+        decide(&f.desk, &id, Decision::Approve, ME),
+        decide(&f.desk, &id, Decision::Approve, ME)
     );
     let oks = [a, b].iter().filter(|r| r.is_ok()).count();
     assert_eq!(oks, 1);
@@ -242,11 +391,13 @@ async fn two_decisions_at_once_on_one_id_take_it_once() {
 async fn an_identical_later_call_asks_again_under_a_new_id() {
     let f = fx(5);
     let (first, h) = asking(&f, shell(1, &["ls"])).await;
-    f.desk.decide(&first, Decision::Approve, ME).await.unwrap();
+    decide(&f.desk, &first, Decision::Approve, ME)
+        .await
+        .unwrap();
     h.await.unwrap().unwrap();
     let (second, h) = asking(&f, shell(2, &["ls"])).await;
     assert_ne!(first, second);
-    f.desk.decide(&second, Decision::Deny, ME).await.unwrap();
+    decide(&f.desk, &second, Decision::Deny, ME).await.unwrap();
     assert_eq!(h.await.unwrap(), Err(Refusal::Denied("denied")));
     assert_eq!(f.sink.last("approval.decide")["id"], second.as_str());
 }
@@ -292,7 +443,7 @@ async fn a_prompt_nobody_answers_expires_as_a_denial() {
     assert_eq!(e["id"], id.as_str());
     assert_eq!(e["reason"], "timeout");
     assert_eq!(
-        f.desk.decide(&id, Decision::Approve, ME).await,
+        decide(&f.desk, &id, Decision::Approve, ME).await,
         Err(DecideError::UnknownId)
     );
     assert!(f.fake.closed.lock().unwrap().contains(&id));
@@ -330,12 +481,12 @@ async fn an_approval_that_cannot_be_written_is_not_given() {
     let f = fx(5);
     let (id, h) = asking(&f, shell(1, &["ls"])).await;
     f.sink.set_failing(true);
-    let r = f.desk.decide(&id, Decision::Approve, ME).await;
+    let r = decide(&f.desk, &id, Decision::Approve, ME).await;
     assert_eq!(r, Err(DecideError::Unrecorded));
     assert_eq!(h.await.unwrap(), Err(Refusal::Unrecorded));
     // And an unknown id whose refusal cannot be written says so.
     assert_eq!(
-        f.desk.decide("ap-x", Decision::Deny, ME).await,
+        decide(&f.desk, "ap-x", Decision::Deny, ME).await,
         Err(DecideError::Unrecorded)
     );
 }
@@ -348,7 +499,7 @@ async fn a_decision_whose_caller_is_dropped_still_completes() {
     f.sink.hold(true);
     let desk = f.desk.clone();
     let d = id.clone();
-    let caller = tokio::spawn(async move { desk.decide(&d, Decision::Deny, ME).await });
+    let caller = tokio::spawn(async move { decide(&desk, &d, Decision::Deny, ME).await });
     until("prompt taken", || f.desk.list().is_empty()).await;
     caller.abort();
     assert!(caller.await.unwrap_err().is_cancelled());
@@ -363,8 +514,7 @@ async fn deny_all_session_denies_every_pending_prompt_and_every_later_one() {
     let f = fx(5);
     let (a, ha) = asking(&f, shell(1, &["a"])).await;
     let (b, hb) = asking(&f, shell(2, &["b"])).await;
-    f.desk
-        .decide(&a, Decision::DenyAllSession, ME)
+    decide(&f.desk, &a, Decision::DenyAllSession, ME)
         .await
         .unwrap();
     assert_eq!(ha.await.unwrap(), Err(Refusal::Denied("denied")));
@@ -401,7 +551,7 @@ async fn deny_all_session_latches_first_and_stays_latched_when_its_entry_fails()
     let (a, ha) = asking(&f, shell(1, &["a"])).await;
     let (b, hb) = asking(&f, shell(2, &["b"])).await;
     f.sink.fail_next.store(1, SeqCst);
-    let r = f.desk.decide(&a, Decision::DenyAllSession, ME).await;
+    let r = decide(&f.desk, &a, Decision::DenyAllSession, ME).await;
     assert_eq!(r, Err(DecideError::Unrecorded));
     assert_eq!(ha.await.unwrap(), Err(Refusal::Unrecorded));
     // Latched all the same: the other prompt is denied with its own entry, and nothing new is
@@ -423,7 +573,7 @@ async fn deny_all_session_reports_an_entry_it_could_not_write_for_another_prompt
     let (_, hb) = asking(&f, shell(2, &["b"])).await;
     // The decision entry for `a` is written; the one for `b` is not.
     f.sink.fail_from.store(f.sink.rows().len() + 1, SeqCst);
-    let r = f.desk.decide(&a, Decision::DenyAllSession, ME).await;
+    let r = decide(&f.desk, &a, Decision::DenyAllSession, ME).await;
     assert_eq!(r, Err(DecideError::Unrecorded));
     assert_eq!(ha.await.unwrap(), Err(Refusal::Denied("denied")));
     assert_eq!(hb.await.unwrap(), Err(Refusal::Unrecorded));
@@ -436,10 +586,10 @@ async fn deny_all_session_reports_an_entry_it_could_not_write_for_another_prompt
 #[tokio::test]
 async fn deny_all_session_on_a_stale_id_sets_nothing() {
     let f = fx(5);
-    let r = f.desk.decide("ap-0", Decision::DenyAllSession, ME).await;
+    let r = decide(&f.desk, "ap-0", Decision::DenyAllSession, ME).await;
     assert_eq!(r, Err(DecideError::UnknownId));
     let (id, h) = asking(&f, shell(1, &["ls"])).await;
-    f.desk.decide(&id, Decision::Approve, ME).await.unwrap();
+    decide(&f.desk, &id, Decision::Approve, ME).await.unwrap();
     assert!(h.await.unwrap().is_ok());
 }
 
@@ -455,7 +605,7 @@ async fn a_withdrawn_call_leaves_the_queue_audited_and_cannot_be_approved() {
     assert_eq!(w["reason"], "cancel");
     assert!(f.sink.rows().last().unwrap().debug.contains("Harness"));
     assert_eq!(
-        f.desk.decide(&id, Decision::Approve, ME).await,
+        decide(&f.desk, &id, Decision::Approve, ME).await,
         Err(DecideError::UnknownId)
     );
     let (_, h) = asking(&f, shell(8, &["ls"])).await;
@@ -515,7 +665,7 @@ async fn a_withdraw_for_a_call_that_ended_or_never_began_is_not_kept() {
     // An ended call's number asks normally if it ever came again (it does not: numbers are
     // never reused), so nothing stale can deny a later call.
     let (id, h) = asking(&f, shell(call, &["ls"])).await;
-    f.desk.decide(&id, Decision::Deny, ME).await.unwrap();
+    decide(&f.desk, &id, Decision::Deny, ME).await.unwrap();
     let _ = h.await;
 }
 
@@ -542,12 +692,12 @@ async fn no_decision_slips_in_while_a_deny_all_session_is_written() {
     let (b, hb) = asking(&f, shell(2, &["b"])).await;
     f.sink.hold(true);
     let desk = f.desk.clone();
-    let all = tokio::spawn(async move { desk.decide(&a, Decision::DenyAllSession, ME).await });
+    let all = tokio::spawn(async move { decide(&desk, &a, Decision::DenyAllSession, ME).await });
     // The latch comes first: `a` is taken and `b` drained before `a`'s entry is written.
     until("a taken, b drained", || f.desk.list().is_empty()).await;
     let desk = f.desk.clone();
     let bb = b.clone();
-    let approve = tokio::spawn(async move { desk.decide(&bb, Decision::Approve, ME).await });
+    let approve = tokio::spawn(async move { decide(&desk, &bb, Decision::Approve, ME).await });
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(
         !approve.is_finished(),
@@ -579,7 +729,7 @@ async fn the_session_stop_withdraws_every_prompt_and_queues_no_more() {
     assert!(f.sink.rows().last().unwrap().debug.contains("Sallyd"));
     for id in [&a, &b] {
         assert_eq!(
-            f.desk.decide(id, Decision::Approve, ME).await,
+            decide(&f.desk, id, Decision::Approve, ME).await,
             Err(DecideError::UnknownId)
         );
     }
@@ -601,7 +751,7 @@ async fn an_approve_being_written_at_the_seal_lands_before_session_stop() {
     let (a, ha) = asking(&f, shell(7, &["ls"])).await;
     f.sink.hold(true);
     let desk = f.desk.clone();
-    let approve = tokio::spawn(async move { desk.decide(&a, Decision::Approve, ME).await });
+    let approve = tokio::spawn(async move { decide(&desk, &a, Decision::Approve, ME).await });
     until("the prompt is taken", || f.desk.list().is_empty()).await;
     let sealing = {
         let rec = f.rec.clone();
@@ -630,7 +780,7 @@ async fn after_the_seal_a_decide_or_withdraw_writes_nothing_and_runs_nothing() {
     let (b, hb) = asking(&f, shell(8, &["ls"])).await;
     assert!(seal(&f, Duration::from_secs(1)).await.written);
     assert_eq!(
-        f.desk.decide(&a, Decision::Approve, ME).await,
+        decide(&f.desk, &a, Decision::Approve, ME).await,
         Err(DecideError::Unrecorded)
     );
     assert_eq!(ha.await.unwrap(), Err(Refusal::Unrecorded));
@@ -701,6 +851,66 @@ async fn a_latch_set_while_the_entry_is_written_denies_the_prompt() {
     assert!(f.gate.inner.state().pending.is_empty());
 }
 
+fn listed(f: &Fx) -> Vec<String> {
+    f.desk.list().iter().map(|p| p.id.clone()).collect()
+}
+
+/// Q84, Q97: the list stays oldest first when the oldest prompt leaves, whichever way it
+/// leaves (a list cut at its budget keeps a prefix, so order decides what is shown).
+#[tokio::test(start_paused = true)]
+async fn the_oldest_prompt_leaving_keeps_the_rest_in_order() {
+    for how in ["decide", "withdraw", "expire", "drop"] {
+        let f = fx(5);
+        let (a, ha) = asking(&f, shell(1, &["ls"])).await;
+        if how == "expire" {
+            tokio::time::advance(Duration::from_secs(100)).await;
+        }
+        let (b, _hb) = asking(&f, shell(2, &["ls"])).await;
+        let (c, _hc) = asking(&f, shell(3, &["ls"])).await;
+        assert_eq!(listed(&f), [a.clone(), b.clone(), c.clone()], "{how}");
+        match how {
+            "decide" => decide(&f.desk, &a, Decision::Deny, ME).await.unwrap(),
+            "withdraw" => f.gate.withdraw(1, Withdraw::Cancel).await,
+            "expire" => {
+                tokio::time::advance(Duration::from_secs(200)).await;
+                assert_eq!(ha.await.unwrap(), Err(Refusal::Denied("timeout")));
+            }
+            _ => {
+                ha.abort();
+                let _ = ha.await;
+            }
+        }
+        until(how, || listed(&f).len() == 2).await;
+        assert_eq!(listed(&f), [b, c], "{how}");
+    }
+}
+
+/// A decision takes the prompt it names, not the first shown one.
+#[tokio::test(start_paused = true)]
+async fn a_decision_takes_the_prompt_it_names() {
+    let f = fx(5);
+    let (a, _ha) = asking(&f, shell(1, &["ls"])).await;
+    let (b, hb) = asking(&f, shell(2, &["ls"])).await;
+    decide(&f.desk, &b, Decision::Deny, ME).await.unwrap();
+    assert_eq!(hb.await.unwrap(), Err(Refusal::Denied("denied")));
+    assert_eq!(listed(&f), [a]);
+}
+
+/// Q97, the fifth removal site (security re-review LOW3): a prompt withdrawn before it is shown
+/// leaves at its announce, and the shown ones behind it keep their order.
+#[tokio::test(start_paused = true)]
+async fn a_prompt_leaving_unshown_keeps_the_rest_in_order() {
+    let f = fx(5);
+    let Ok((x, _, _rx)) = f.gate.inner.queue(&shell(9, &["ls"]), None, vec![]) else {
+        panic!("not queued");
+    };
+    let (a, _ha) = asking(&f, shell(1, &["ls"])).await;
+    let (b, _hb) = asking(&f, shell(2, &["ls"])).await;
+    f.gate.withdraw(9, Withdraw::Cancel).await;
+    assert!(f.gate.inner.announce(&x).is_err());
+    assert_eq!(listed(&f), [a, b]);
+}
+
 #[tokio::test]
 async fn a_dropped_wait_invalidates_the_id_at_once() {
     let f = fx(5);
@@ -710,7 +920,7 @@ async fn a_dropped_wait_invalidates_the_id_at_once() {
     assert!(f.desk.list().is_empty());
     assert!(f.fake.closed.lock().unwrap().contains(&id));
     assert_eq!(
-        f.desk.decide(&id, Decision::Approve, ME).await,
+        decide(&f.desk, &id, Decision::Approve, ME).await,
         Err(DecideError::UnknownId)
     );
 }
@@ -742,8 +952,8 @@ async fn a_flood_episode_is_announced_once_and_again_after_it_ends() {
     assert_eq!(f.fake.floods.lock().unwrap().as_slice(), ["s-1"]);
     assert_eq!(f.sink.last("approval.deny")["reason"], "approval-flood");
     // The episode ends once the queue is empty and the rate is full again.
-    f.desk.decide(&a, Decision::Deny, ME).await.unwrap();
-    f.desk.decide(&b, Decision::Deny, ME).await.unwrap();
+    decide(&f.desk, &a, Decision::Deny, ME).await.unwrap();
+    decide(&f.desk, &b, Decision::Deny, ME).await.unwrap();
     let _ = (ha.await, hb.await);
     tokio::time::advance(REFILL * 2).await;
     let (c, hc) = asking(&f, shell(6, &["c"])).await;
@@ -752,7 +962,7 @@ async fn a_flood_episode_is_announced_once_and_again_after_it_ends() {
     assert_eq!(r, Err(Refusal::Denied("approval-flood")));
     assert_eq!(f.fake.floods.lock().unwrap().len(), 2);
     for id in [c, d] {
-        f.desk.decide(&id, Decision::Deny, ME).await.unwrap();
+        decide(&f.desk, &id, Decision::Deny, ME).await.unwrap();
     }
     let _ = (hc.await, hd.await);
 }
@@ -768,14 +978,14 @@ async fn the_pending_bound_alone_refuses_and_refused_calls_take_no_rate_slot() {
         let r = f.gate.admit(shell(call, &["x"]), None, None).await;
         assert_eq!(r, Err(Refusal::Denied("approval-flood")));
     }
-    f.desk.decide(&a, Decision::Deny, ME).await.unwrap();
-    f.desk.decide(&b, Decision::Deny, ME).await.unwrap();
+    decide(&f.desk, &a, Decision::Deny, ME).await.unwrap();
+    decide(&f.desk, &b, Decision::Deny, ME).await.unwrap();
     let _ = (ha.await, hb.await);
     // Both slots are still there.
     let (c, hc) = asking(&f, shell(10, &["c"])).await;
     let (d, hd) = asking(&f, shell(11, &["d"])).await;
     for id in [c, d] {
-        f.desk.decide(&id, Decision::Deny, ME).await.unwrap();
+        decide(&f.desk, &id, Decision::Deny, ME).await.unwrap();
     }
     let _ = (hc.await, hd.await);
 }
@@ -785,7 +995,7 @@ async fn new_prompts_come_at_most_one_per_refill_after_the_burst() {
     let f = fx(3);
     for call in 0..3 {
         let (id, h) = asking(&f, shell(call, &["x"])).await;
-        f.desk.decide(&id, Decision::Deny, ME).await.unwrap();
+        decide(&f.desk, &id, Decision::Deny, ME).await.unwrap();
         let _ = h.await;
     }
     // Queue empty, burst spent: the rate alone refuses.
@@ -797,7 +1007,7 @@ async fn new_prompts_come_at_most_one_per_refill_after_the_burst() {
     assert_eq!(r, Err(Refusal::Denied("approval-flood")));
     tokio::time::advance(REFILL / 2).await;
     let (id, h) = asking(&f, shell(11, &["y"])).await;
-    f.desk.decide(&id, Decision::Approve, ME).await.unwrap();
+    decide(&f.desk, &id, Decision::Approve, ME).await.unwrap();
     assert!(h.await.unwrap().is_ok());
 }
 
@@ -813,7 +1023,7 @@ async fn a_flood_announcement_that_cannot_be_written_is_announced_again() {
     assert_eq!(r, Err(Refusal::Denied("approval-flood")));
     assert_eq!(count(&f.sink, "approval.flood"), 1);
     assert_eq!(f.fake.floods.lock().unwrap().len(), 1);
-    f.desk.decide(&id, Decision::Deny, ME).await.unwrap();
+    decide(&f.desk, &id, Decision::Deny, ME).await.unwrap();
     let _ = h.await;
 }
 
@@ -844,7 +1054,7 @@ async fn rt_ag_03_a_thousand_asks_leave_at_most_max_pending_and_run_nothing() {
     assert_eq!(f.desk.list().len(), 5);
     // Wave 2: the queue is empty but the rate is spent, so the rate alone refuses.
     for p in f.desk.list() {
-        f.desk.decide(&p.id, Decision::Deny, ME).await.unwrap();
+        decide(&f.desk, &p.id, Decision::Deny, ME).await.unwrap();
     }
     spawn_asks(&f, &mut tasks, 400, 200);
     until("595 denied", || count(&f.sink, "approval.deny") == 595).await;
@@ -895,7 +1105,7 @@ async fn the_pending_entry_carries_note_hash_and_tags_never_the_note() {
     let want = super::super::action::hex(&<sha2::Sha256 as sha2::Digest>::digest(note.as_bytes()));
     assert_eq!(e["note_sha256"], want);
     assert!(!e.to_string().contains("ignore the user"));
-    f.desk.decide(&p.id, Decision::Deny, ME).await.unwrap();
+    decide(&f.desk, &p.id, Decision::Deny, ME).await.unwrap();
     let _ = h.await;
 }
 
@@ -913,9 +1123,9 @@ async fn the_pending_entry_stays_under_the_writer_bound_in_the_worst_case() {
     let e = f.sink.last("tool.pending");
     let len = e.to_string().len();
     assert!(len < 4096, "{len}");
-    assert!(e["action"].as_str().unwrap().contains("… (+"));
+    assert!(e["action"].as_str().unwrap().contains("... (+"));
     let id = f.desk.list().remove(0).id.clone();
-    f.desk.decide(&id, Decision::Deny, ME).await.unwrap();
+    decide(&f.desk, &id, Decision::Deny, ME).await.unwrap();
     let _ = h.await;
     // So does the decision entry, which carries the same fields and the client.
     let d = f.sink.last("approval.decide").to_string().len();

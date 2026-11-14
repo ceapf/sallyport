@@ -39,6 +39,8 @@ exclude_re = [
   '''crates/sallyd/src/sandbox/scan\.rs:\d+:\d+: replace \| with \^ in Walk<'a>::pin_parents$''',
   'crates/sallyd/src/sandbox/stage\.rs:\d+:\d+: replace \| with \^ in open_dir$',
   'crates/sallyd/src/sandbox/types\.rs:\d+:\d+: replace \| with \^ in VerifiedModel::pin$',
+  'crates/sallyd/src/sandbox/changes\.rs:\d+:\d+: replace \| with \^ in beneath$',
+  'crates/sallyd/src/sandbox/dirs\.rs:\d+:\d+: replace \| with \^ in open_sessions$',
   'crates/sallyd/src/tools/fs\.rs:\d+:\d+: replace \| with \^ in beneath$',
   'crates/sallyd/src/tools/fs\.rs:\d+:\d+: replace \| with \^ in beneath_same_fs$',
   'crates/sallyd/src/tools/fs\.rs:\d+:\d+: replace \| with \^ in no_links$',
@@ -72,6 +74,12 @@ exclude_re = [
   # the scan is caught by the pin re-check (host and in-container) before the launch proceeds.
   '''crates/sallyd/src/sandbox/scan\.rs:\d+:\d+: replace \| with & in Walk<'a>::list$''',
   '''crates/sallyd/src/sandbox/scan\.rs:\d+:\d+: replace \| with & in Walk<'a>::pin_parents$''',
+  # Race only (rule ii): the `|` of open_sessions' flags (O_RDONLY|O_DIRECTORY|O_NOFOLLOW; either
+  # `&` leaves no O_DIRECTORY, the second no O_NOFOLLOW either). `private` has just created or
+  # lstat-ed `sessions` as a real 0700 directory of this user, inside sallyd's own 0700 data
+  # directory; a difference needs it replaced by a symlink or a file between that check and the
+  # open, which only this user's own process could do and no test can force.
+  'crates/sallyd/src/sandbox/dirs\.rs:\d+:\d+: replace \| with & in open_sessions$',
   # Clock instant only (rule ii): `now > until` -> `now >= until` differs only when the clock
   # reads the deadline to the nanosecond. `past` holds that one comparison (both walks use it).
   'crates/sallyd/src/sandbox/stage\.rs:\d+:\d+: replace > with >= in past$',

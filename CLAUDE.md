@@ -86,7 +86,7 @@ container-free tests run: unit tests, all of sally-core's `tests/`, `sallyd` `ar
 `sally-shim` `relay`. A new file that fits the rule joins its list in the same PR. Nightly, two jobs:
 - `make mutants` (deny paths): sally-core `manifest/validate/*.rs`, `manifest/paths.rs`,
   `manifest/host.rs`, `config.rs`.
-- `make mutants-wide-{core,sallyd,shim}` (sharded): sally-core `manifest/{image,hostenv,parse,
+- `make mutants-wide-{core,sallyd,shim,cli}` (sharded): sally-core `manifest/{image,hostenv,parse,
   summary,units}.rs`, `secrets/{store,secret}.rs`, `audit/{entry,redact,verify,writer,layout}.rs`,
   `fsutil.rs`, `fd.rs`, `text.rs`; sallyd `sandbox/{argv,check,types,profiles,overlap,scan,images,
   changes,dirs,podman,disk,stage,budget,orphans}.rs`, `sandbox/launch/error.rs`,
@@ -94,10 +94,11 @@ container-free tests run: unit tests, all of sally-core's `tests/`, `sallyd` `ar
   `oplog.rs`, `session/{lookup,types,exit}.rs`, `egress/{addr,authority,head,policy,server,
   hostaddrs,tunnel,net,ca,roots,rewrite,intercept,intercept_tls,intercept_report,meter,inject,
   redact,local}.rs` (net.rs tests stay hermetic: nothing leaves the machine),
-  `rpc/{agent,control,frame,json,listen,mcp,message,rate,record}.rs`,
-  `llm/{body,head,io,reply,server}.rs`, `approvals/{action,glob,handler,policy,queue,render}.rs`,
+  `rpc/{agent,control,control_methods,frame,json,listen,mcp,message,rate,record}.rs`,
+  `llm/{body,head,io,reply,server}.rs`, `approvals/{action,glob,handler,hub,policy,queue,render}.rs`,
   `tools/{args,path,tag,fs,shell,procs,mod,dac,ops,fetch,fetch_url,fetch_client}.rs`; sally-shim
-  `args.rs`, `relay.rs`.
+  `args.rs`, `relay.rs`; sally-cli `clean.rs`, `client.rs`, `commands.rs`, `approve.rs` (clap
+  definitions and `main.rs` are out).
 
 ## Agent / model routing (ECC)
 
@@ -223,7 +224,8 @@ issues, comments and CI output.
 - Never dispatch a nightly while one is running or queued. Check first with
   `gh run list --workflow nightly.yml --limit 3 --json status,databaseId`; any status other than
   `completed` means wait. A running nightly always finishes (`cancel-in-progress: false`), but
-  GitHub keeps only one pending run per group, so a second dispatch replaces a queued one.
+  GitHub keeps only one pending run per group, so a second dispatch, or the scheduled run,
+  replaces a queued one.
 - Standing merge rule: you may merge PRs **you authored from branches in this repository** when CI
   is green, the required reviews have run with findings fixed or deferred by TODO, and the task is
   in the approved plan. Never merge a PR carrying a checkpoint deliverable until the maintainer

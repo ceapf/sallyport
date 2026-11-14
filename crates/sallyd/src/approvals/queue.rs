@@ -92,6 +92,10 @@ pub struct Client {
 /// Where prompts go: the UI or CLI notifier. Answers come back through the [`Desk`]. Called
 /// from async code outside the queue's lock: implementations must not block.
 pub trait Approver: Send + Sync + 'static {
+    /// Whether a client is attached to answer (architect Q73: one that called
+    /// `approvals.watch`). Called under the queue's lock: a lock-free read. With none, every
+    /// prompt is denied `no-approver`.
+    fn attached(&self) -> bool;
     /// A prompt is waiting.
     fn requested(&self, prompt: &Prompt);
     /// The session started a flood episode (one call per episode).
@@ -165,6 +169,35 @@ pub enum DecideError {
     /// The decision could not be audited, so it was not taken (an approval becomes a refusal).
     #[error("audit-failed")]
     Unrecorded,
+    /// An approve named another digest than the prompt's: it was not for this action. The
+    /// prompt stays pending.
+    #[error("digest-mismatch")]
+    DigestMismatch,
+    /// An approve of a cut prompt whose full text the client did not show, or could not be
+    /// sent ([`render::FULL_WIRE_BYTES`](super::render::FULL_WIRE_BYTES)). The prompt stays
+    /// pending.
+    #[error("full-text-not-shown")]
+    FullTextNotShown,
+}
+
+/// Which prompt an `approval.decide` entry is for.
+#[derive(Clone, Copy)]
+enum How<'a> {
+    /// The one the client answered; `full_shown` for an approval of a cut prompt.
+    Asked { full_shown: bool },
+    /// Another one, denied with the answered prompt `via` by its `deny_all_session`.
+    Via(&'a str),
+}
+
+/// What the deciding client says it showed (architect Q74), checked for an approval only: a
+/// deny needs nothing but the id. `full_shown` is a trusted client's claim, a guard against
+/// client bugs rather than a boundary.
+#[derive(Debug, Clone, Copy)]
+pub struct Seen<'a> {
+    /// The digest of the prompt the client showed.
+    pub digest: &'a str,
+    /// The client showed the full action text of a cut prompt.
+    pub full_shown: bool,
 }
 
 enum Answer {
@@ -226,8 +259,8 @@ pub struct Gate {
     inner: Arc<Inner>,
 }
 
-/// The answering half (held by control-side code only).
-// TODO(#65): Task 12 serves `approvals.list`/`approvals.decide` on control.sock from this.
+/// The answering half (held by control-side code only): `approvals.list`, `approvals.watch`
+/// and `approvals.decide` on `control.sock` read and answer it (architect Q85).
 #[derive(Clone)]
 pub struct Desk {
     inner: Arc<Inner>,
@@ -398,7 +431,7 @@ impl Gate {
                     }
                     return;
                 }
-                Some(i) => st.pending.swap_remove(i),
+                Some(i) => st.pending.remove(i),
             }
         };
         let inner = Arc::clone(&self.inner);
@@ -501,28 +534,43 @@ impl Desk {
     /// that cannot be written is not given. Once it has taken the prompt it finishes in its own
     /// task, so dropping this future loses no entry.
     ///
+    /// An approve must name the digest the client showed and, for a cut prompt, say the full
+    /// text was shown (`seen`, architect Q74); refused, it leaves the prompt pending.
+    ///
     /// # Errors
-    /// `UnknownId` (audited) for an id that is not waiting; `Unrecorded` if an entry failed.
-    pub async fn decide(&self, id: &str, d: Decision, client: Client) -> Result<(), DecideError> {
+    /// `UnknownId`, `DigestMismatch` or `FullTextNotShown` (each audited); `Unrecorded` if an
+    /// entry failed.
+    pub async fn decide(
+        &self,
+        id: &str,
+        d: Decision,
+        client: Client,
+        seen: Seen<'_>,
+    ) -> Result<(), DecideError> {
         let inner = Arc::clone(&self.inner);
         let turn = Arc::clone(&inner.deciding).lock_owned().await;
-        let Some(first) = inner.take(id) else {
-            drop(turn);
-            let args = json!({
-                "id": escape(id.as_bytes()), "reason": "unknown-id", "client": who(client),
-            });
-            let entry = inner
-                .record
-                .entry(Actor::User, "approval.decide", Some("refuse"))
-                .args(args);
-            return if inner.record.append(entry).await {
-                Err(DecideError::UnknownId)
-            } else {
-                Err(DecideError::Unrecorded)
-            };
+        let first = match inner.take_checked(id, d, seen) {
+            Ok(e) => e,
+            Err(refused) => {
+                drop(turn);
+                let args = json!({
+                    "id": escape(id.as_bytes()), "reason": refused.to_string(),
+                    "client": who(client),
+                });
+                let entry = inner
+                    .record
+                    .entry(Actor::User, "approval.decide", Some("refuse"))
+                    .args(args);
+                return if inner.record.append(entry).await {
+                    Err(refused)
+                } else {
+                    Err(DecideError::Unrecorded)
+                };
+            }
         };
+        let full_shown = d == Decision::Approve && first.prompt.truncated;
         let task = tokio::spawn(async move {
-            let result = inner.finish(first, d, client).await;
+            let result = inner.finish(first, d, client, full_shown).await;
             drop(turn);
             result
         });
@@ -540,17 +588,39 @@ impl Inner {
         })
     }
 
-    /// Takes the shown prompt `id` out of the queue, so it is decided once.
-    fn take(&self, id: &str) -> Option<Entry> {
+    /// Takes the shown prompt `id` out of the queue, so it is decided once; an approve whose
+    /// `seen` does not fit the prompt leaves it there (architect Q74).
+    fn take_checked(&self, id: &str, d: Decision, seen: Seen<'_>) -> Result<Entry, DecideError> {
         let mut st = self.state();
-        let i = st.pending.iter().position(|e| e.announced && e.id == id)?;
-        Some(st.pending.swap_remove(i))
+        let i = st
+            .pending
+            .iter()
+            .position(|e| e.announced && e.id == id)
+            .ok_or(DecideError::UnknownId)?;
+        if d == Decision::Approve {
+            let p = &st.pending.get(i).ok_or(DecideError::UnknownId)?.prompt;
+            if p.digest != seen.digest {
+                return Err(DecideError::DigestMismatch);
+            }
+            if p.truncated && (!seen.full_shown || p.full_on_wire().is_none()) {
+                return Err(DecideError::FullTextNotShown);
+            }
+        }
+        Ok(st.pending.remove(i))
     }
 
     /// Writes and delivers a decision on a taken prompt. A `DenyAllSession` latches the session
     /// first (maintainer's Task 11 audit: a failed entry never leaves it open), then writes its
     /// entry and denies every other shown prompt, each with its own entry.
-    async fn finish(&self, first: Entry, d: Decision, client: Client) -> Result<(), DecideError> {
+    /// `full_shown`: an approval of a cut prompt, whose full text the client showed; its entry
+    /// records that claim.
+    async fn finish(
+        &self,
+        first: Entry,
+        d: Decision,
+        client: Client,
+        full_shown: bool,
+    ) -> Result<(), DecideError> {
         let rest: Vec<Entry> = if d == Decision::DenyAllSession {
             let mut st = self.state();
             st.latched = true;
@@ -562,7 +632,10 @@ impl Inner {
         };
         let via = first.id.clone();
         let mut result = Ok(());
-        if self.decided(&first, d, client, None).await {
+        if self
+            .decided(&first, d, client, How::Asked { full_shown })
+            .await
+        {
             let answer = match d {
                 Decision::Approve => Answer::Approve,
                 Decision::Deny | Decision::DenyAllSession => Answer::Deny("denied"),
@@ -573,7 +646,7 @@ impl Inner {
             result = Err(DecideError::Unrecorded);
         }
         for e in rest {
-            let answer = if self.decided(&e, d, client, Some(&via)).await {
+            let answer = if self.decided(&e, d, client, How::Via(&via)).await {
                 Answer::Deny("session-denied")
             } else {
                 result = Err(DecideError::Unrecorded);
@@ -585,13 +658,15 @@ impl Inner {
     }
 
     /// Writes one `approval.decide` entry; whether it was written.
-    async fn decided(&self, e: &Entry, d: Decision, client: Client, via: Option<&str>) -> bool {
+    async fn decided(&self, e: &Entry, d: Decision, client: Client, how: How<'_>) -> bool {
         let mut args = fields_of(&e.prompt);
         add(&mut args, "id", Value::from(e.id.as_str()));
         add(&mut args, "client", who(client));
-        if let Some(v) = via {
+        match how {
+            How::Asked { full_shown: true } => add(&mut args, "full_shown", Value::Bool(true)),
+            How::Asked { full_shown: false } => {}
             // Denied together with `v` by its deny_all_session.
-            add(&mut args, "via", Value::from(v));
+            How::Via(v) => add(&mut args, "via", Value::from(v)),
         }
         let entry = self
             .record
@@ -622,7 +697,7 @@ impl Inner {
         if st.latched {
             return Err(NotQueued::Deny("session-denied", false));
         }
-        if self.approver.is_none() {
+        if !self.approver.as_ref().is_some_and(|a| a.attached()) {
             return Err(NotQueued::Deny("no-approver", false));
         }
         if st.pending.len() >= self.limits.max_pending || st.rate.take().is_err() {
@@ -696,7 +771,7 @@ impl Inner {
                 None => None,
             };
             if let Some(stop) = stop {
-                st.pending.swap_remove(i);
+                st.pending.remove(i);
                 return Err(stop);
             }
             let Some(e) = st.pending.get_mut(i) else {
@@ -729,7 +804,7 @@ impl Inner {
             st.pending
                 .iter()
                 .position(|e| e.id == id)
-                .map(|i| st.pending.swap_remove(i))
+                .map(|i| st.pending.remove(i))
         };
         let Some(e) = expired else {
             // A decision or withdraw took it first and is being written: its answer is coming.
@@ -784,7 +859,7 @@ impl Drop for Waiting {
             st.pending
                 .iter()
                 .position(|e| e.id == self.id)
-                .map(|i| st.pending.swap_remove(i))
+                .map(|i| st.pending.remove(i))
         };
         // Only a prompt the approver was shown is closed to it.
         if let (Some(e), Some(a)) = (gone, &self.inner.approver)
@@ -836,7 +911,8 @@ fn with(mut v: Value, key: &str, value: &str) -> Value {
     v
 }
 
-fn who(c: Client) -> Value {
+/// A deciding client as audited: `{uid, pid}`.
+pub(crate) fn who(c: Client) -> Value {
     json!({"uid": c.uid, "pid": c.pid})
 }
 
@@ -867,4 +943,4 @@ fn id_from(
 
 #[cfg(test)]
 #[path = "queue_tests.rs"]
-mod tests;
+pub(crate) mod tests;

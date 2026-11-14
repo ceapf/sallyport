@@ -427,7 +427,14 @@ Transport: JSON-RPC 2.0, newline-delimited JSON over Unix stream sockets. Max fr
 stream events. Errors use JSON-RPC codes plus `data.reason`. Every socket checks the peer's UID
 (`SO_PEERCRED`) before it reads a byte: the expected UID is `sallyd`'s own, which under
 `--userns=keep-id` is also the sandbox user's (§7); a mismatch is closed and recorded `rpc.deny` /
-`llm.deny` with reason `peer-uid`. Every refusal that sends a reply has its own entry first.
+`llm.deny` with reason `peer-uid`. Every refusal that sends a reply has its own entry first; a
+refusal whose entry could not be written closes the connection unanswered. The one exception
+(architect Q93): `approvals.decide` answers `audit-failed` when the desk's entry could not be
+written; nothing was approved and a `deny_all_session` latch stays (the maintainer's Task 11
+audit rule). The
+CLI checks the other way too: before it sends a byte to `control.sock` it requires the socket's
+peer to be its own uid (architect Q78), and it reads replies under the same 1 MiB cap
+(`sally_proto::MAX_FRAME`; a longer frame is fatal).
 
 ### 4.1 `control.sock` — trusted clients (CLI, Tauri)
 
@@ -440,18 +447,59 @@ stream events. Errors use JSON-RPC codes plus `data.reason`. Every socket checks
 | `jobs.list` / `jobs.cancel`; notification `job.progress` | long-running work |
 | `infer.load` (model) / `infer.unload` / `infer.status` | inference lifecycle |
 | `chat.complete` (session-less chat using the loaded model; same body as `infer.complete`) | Chat screen |
-| `sessions.create` (manifest, task, model?) / `sessions.list` / `sessions.stop` / `sessions.attach` | agent sessions |
+| `sessions.create` (manifest text; task, model?: PR C) / `sessions.list` / `sessions.stop` (id) / `sessions.changes` (id) / `sessions.attach` | agent sessions |
 | `ui.send` (session, text) — user → harness; notification `ui.message` — harness → user | chat with an agent |
-| `approvals.list` / `approvals.decide` (id, approve\|deny\|deny_all_session); notification `approval.requested` / `approval.flood` | gate |
+| `approvals.list` / `approvals.watch` / `approvals.decide` (id, approve\|deny\|deny_all_session, digest, full_shown?); notification `approval.requested` / `approval.flood` / `approval.closed` | gate |
 | `secrets.set` (name, value) / `secrets.list` (names only) / `secrets.remove` | store; values are write-only |
 | `audit.tail` (filter, follow) / `audit.verify` | log |
 
-Until Task 12 fills the table, every method is `-32601` and recorded `rpc.deny {socket:
-control}`; no control method resolves on the session socket's table (a unit test holds that).
+Task 12 serves seven of them (`sally_proto::method::ALL`: `sessions.create`, `.list`, `.stop`,
+`.changes`, `approvals.list`, `.decide`, `.watch`); every other method is `-32601` and recorded
+`rpc.deny {socket: control}`, and no control method resolves on the session socket's table (a
+unit test holds that). Params are strict (unknown fields, `model`/`task` before PR C, a `client`
+in decide, a malformed session id: `-32602`). A request that is never admitted is recorded
+`rpc.deny`; an admitted one `rpc.request {socket, method, client: {uid, pid}}` before its effect
+(the uid and pid from `SO_PEERCRED`, audit detail only; a create adds `manifest_bytes` and
+`manifest_sha256`, never the text; a stop and a listing add the parsed `id`). A refused admitted
+request is `-32000` with `data`
+`{reason, detail?, errors?}` (`sally_proto::ErrorData`):
+
+- `sessions.create`: the manifest is validated against the host facts `sallyd` read at start; a
+  rejection is `manifest-invalid` with every error (`manifest.refuse`). Until #99 the validator
+  knows no secret names, so a manifest granting one is refused here, not by the launcher's
+  `secret-missing`. A launch refusal is told the launcher's reason and the very detail its
+  `sandbox.refuse` holds (e.g. `no-default-image`, `digest-mismatch`); a launch refusal whose
+  `sandbox.refuse` could not be written gets no reply. A launch whose task ended without a
+  result is `start-failed` with its own `session.refuse` naming the session (architect Q98;
+  TODO(#113): what such a task leaves behind). Any other start failure is `shutting-down` or
+  `start-failed` with its own `session.refuse`.
+- `sessions.stop`: an unknown id is `unknown-session` (`session.refuse`); a container not
+  confirmed gone is `stop-failed` (`session.refuse` in the control log: the session's own log
+  is sealed by then).
+- `sessions.changes`: needs no manifest, so it serves a live and a stopped session alike, across
+  restarts; it trusts only the directory names `sallyd` writes and fails closed on any other
+  (`listing-failed`, `session.refuse`). Paths are escaped by `sallyd`.
+- Listings (`sessions.changes`, `approvals.list`, `approvals.watch`) are held to 768 KiB of items
+  (`REPLY_BYTES`); a cut one says `complete: false` and the `total`. Prompts cut from a watch
+  result are not notified later: the CLI lists again once it has answered the ones it holds
+  (TODO(#107): paging).
+- `sessions.list`, `sessions.changes` and `approvals.list`, and a repeated `approvals.watch` on
+  one connection (it only lists again; architect Q94), share one daemon-wide rate, 20/s with
+  bursts of 40; an over-rate request waits before it is recorded. A connection's first watch
+  never waits.
 
 **Approvals** (Task 10; `sallyd::approvals`). Only a host client on this socket answers; the
-session's tool handler holds the asking half (`Gate`) and never the answering half (`Desk`), and
-Task 12 serves `approvals.*` from the `Desk` with the client taken from `SO_PEERCRED` (#65).
+session's tool handler holds the asking half (`Gate`) and never the answering half (`Desk`).
+Every session's prompts go to the daemon's one hub; a client is *attached* while a control
+connection that called `approvals.watch` is open (the watch attaches first, then lists what is
+pending). A watcher that falls 64 notifications behind, or whose write blocks for 10 s, is
+dropped with its connection, so a watching connection should not also create or stop sessions
+(TODO(#110)). The CLI holds at most 8 frames unread (architect Q91): an approver that does not
+read is dropped that way, and its prompts end `no-approver` or by timeout (TODO(#112)). `approvals.decide`
+finds the session holding the id; none is `unknown-id` (`approval.decide refuse`). An approve
+must carry the digest of the prompt the client showed (`digest-mismatch`) and, for a cut prompt,
+`full_shown` (`full-text-not-shown`); refused, the prompt stays pending. A cut prompt whose full
+text is over 256 KiB is sent `full_unavailable` and can only be denied (TODO(#108)).
 `approve` runs that one action once. `deny_all_session` needs a pending id (a stale one is
 `unknown-id` and sets nothing); it denies that request and every pending one, each with its own
 entry, and latches the session: every later prompt is denied `session-denied` unasked, while
@@ -1020,7 +1068,9 @@ sallyport/
   - Credentials and redaction (Tasks 9a-3 and 9b, `egress::inject`, `egress::redact`;
     maintainer decisions 1–7, architect D1–D13, A1–A3). At launch, a session with grants reads
     the grants' values through the starter's `SecretSource` (production: the 0600 store file;
-    until #99 the daemon wires a source with no values, so every grant is refused `secret-missing`;
+    until #99 the daemon wires a source with no values, so every grant is refused `secret-missing`,
+    and a manifest sent over `control.sock` naming a secret is refused even earlier, at
+    validation (`manifest.refuse`, architect Q87); `secret-missing` stays the launcher's check;
     every other value is dropped, wiped, before `prepare` returns): a missing one refuses the
     launch (`secret-missing`), an unreadable store too (`secret-store`), a grant that cannot be
     injected or redacted as well (`secret-grant`), and a session whose forms hold every filler
@@ -1117,7 +1167,16 @@ sallyport/
     `too-deep`, `batch`, `not-object`, `bad-version`, `bad-id`, `bad-method`, `bad-params`,
     `bad-shape`, `frame-too-large`, `unexpected-response`, `method-not-found`,
     `wrong-lifecycle`, `missing-protocol-version`, `bad-meta`, `unsupported-protocol-version`,
-    `second-initialize`, `duplicate-id`, `too-many-in-flight`, `peer-uid`.
+    `second-initialize`, `duplicate-id`, `too-many-in-flight`, `peer-uid`; on `control.sock`
+    also `invalid-params`.
+  - `rpc.request` on `control.sock` (actor `user`, no decision): `{socket: "control", method,
+    client: {uid, pid}}`, before the request's effect; `sessions.create` adds `manifest_bytes`
+    and `manifest_sha256` (never the text); `sessions.stop` and `sessions.changes` add `id`.
+  - `manifest.refuse` (actor `sallyd`, decision `refuse`): `{error}`, the validator's errors,
+    escaped, at most 1024 characters; nothing is launched.
+  - `session.refuse` (actor `sallyd`, decision `refuse`): `{method, id?, reason, detail?,
+    error?, client}`; reasons `unknown-session`, `listing-failed`, `shutting-down`,
+    `start-failed`, `stop-failed`.
   - `rpc.cancel` (actor `harness`): `{id}`, only for a cancel that matches an in-flight call,
     before its reply is suppressed.
   - `llm.request` (actor `harness`, decision `allow`): `{path}` for `/v1/models`; for a chat
@@ -1154,7 +1213,9 @@ sallyport/
     the note).
   - `approval.decide` (user, `approve|deny|deny_all_session`): action fields, `id`, `client
     {uid, pid}`, `via` (the id whose `deny_all_session` took it); `refuse` with `reason:
-    unknown-id` for an id that is not waiting.
+    unknown-id` for an id that is not waiting (written by `control.sock` itself, with no session,
+    when no live session holds it), `digest-mismatch` or `full-text-not-shown` for an approve
+    that does not match the prompt shown (the prompt stays pending).
   - `approval.expire` (sallyd, `deny`): `{id, call, reason: timeout}`.
   - `approval.withdraw` (harness for a cancel, sallyd for a closed connection or the session's
     stop; `deny`): `{id, call, reason}` with `reason` `cancel`, `closed` or `session-stop`; `id`

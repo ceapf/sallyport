@@ -31,6 +31,8 @@ time = { version = "0.3.55", default-features = false }
 # `rand`: getrandom(2) for single-use approval ids (Task 10; no new crate).
 rustix = { version = "1.1.6", default-features = false, features = ["fs", "net", "process", "rand", "std"] }
 sally-core = { path = "../sally-core", version = "0.1.0" }
+# The control socket's wire types, shared with the CLI (architect Q78; a workspace crate).
+sally-proto = { path = "../sally-proto", version = "0.1.0" }
 # Already in the tree through serde_json; used directly for the duplicate-key-refusing parse.
 serde = "1.0.229"
 serde_json = "1.0.154"
@@ -49,6 +51,8 @@ zeroize = { version = "1.9.1", default-features = false, features = ["alloc"] }
 [dev-dependencies]
 insta = "1.49.0"
 proptest = "1.12.0"
+# RT-FS-15 through the CLI's own code against the real control socket (architect Q79).
+sally-cli = { path = "../sally-cli", version = "0.1.0" }
 sha2 = "0.11.1"
 tokio = { version = "1.54.1", default-features = false, features = ["test-util"] }
 toml = { version = "1.2.1", default-features = false, features = ["parse", "serde", "std"] }

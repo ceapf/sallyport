@@ -19,6 +19,7 @@
 //! once. TODO(#92): a container `sallyd` cannot stop because it was killed outright is bounded by
 //! nothing yet; a `podman --timeout` backstop follows this PR (architect Q60).
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -26,21 +27,23 @@ use std::sync::{Arc, Mutex};
 
 use sally_core::audit::{AuditError, AuditWriter, SystemClock};
 use sally_core::config::{Config, MAX_CONFIG_BYTES, default_runtime_path, parse_config};
-use sally_core::manifest::AuditLevel;
+use sally_core::manifest::{AuditLevel, HostEnv, HostEnvError};
 use tokio::net::UnixListener;
 use tokio::signal::unix::{SignalKind, signal};
 
 use super::crash::{CrashReporter, payload};
 use super::startup::{self, STATE_DIR, StartError};
 use super::{process, stale, sweep};
+use crate::approvals::Approver;
+use crate::approvals::hub::Hub;
 use crate::oplog::Oplog;
-use crate::rpc::control::Control;
+use crate::rpc::control::{Control, ControlParts};
 use crate::rpc::record::Recorder;
 use crate::sandbox::budget::session_budget;
 use crate::sandbox::{
     AuditSink, CheckedRuntime, DirError, DiskFloor, Installation, LaunchError, Launcher,
     LauncherParts, Podman, PodmanError, PodmanHost, ScanLimits, Sessions, SharedAudit, Sweep,
-    UserIds, check_runtime_dir, resolve_podman,
+    UserIds, check_runtime_dir, open_sessions, resolve_podman,
 };
 use crate::session::lookup::{NoSecrets, SharedEgress};
 use crate::session::{Registry, RegistryParts};
@@ -77,6 +80,12 @@ pub enum DaemonError {
     /// This installation's id could not be read or made (architect Q64).
     #[error(transparent)]
     Installation(#[from] super::install::InstallError),
+    /// The host facts manifests are validated against could not be read (architect Q87).
+    #[error("host facts: {0}")]
+    HostEnv(#[from] HostEnvError),
+    /// The sessions' data directory could not be opened (architect Q81).
+    #[error("sessions directory: {0}")]
+    SessionsDir(#[source] DirError),
     /// Podman or the runtime failed a check.
     #[error(transparent)]
     Podman(#[from] PodmanError),
@@ -207,6 +216,11 @@ pub fn run(log: &Oplog) -> Result<(), DaemonError> {
     let audit: Arc<dyn AuditSink> = Arc::new(SharedAudit(Mutex::new(audit)));
     // Under the single-instance lock, in the state directory the audit log just made.
     let installation = super::install::load_or_create(&dirs.state())?;
+    let prepared = Prepared {
+        installation,
+        sessions: open_sessions(&dirs.state()).map_err(DaemonError::SessionsDir)?,
+        env: HostEnv::from_process()?,
+    };
     let nofile = process::raise_nofile()?;
     log.info(
         LOG,
@@ -220,15 +234,7 @@ pub fn run(log: &Oplog) -> Result<(), DaemonError> {
     // A panic in `serve` is caught here, so the runtime is still shut down within EXIT_WAIT
     // rather than dropped while unwinding, which waits for the blocking pool without bound (R9).
     let end = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        rt.block_on(serve(
-            log,
-            &dirs,
-            &config,
-            audit,
-            &lock,
-            nofile,
-            installation,
-        ))
+        rt.block_on(serve(log, &dirs, &config, audit, &lock, nofile, prepared))
     }));
     // After a second signal, work still on the blocking pool must not hold the exit.
     rt.shutdown_timeout(EXIT_WAIT);
@@ -282,6 +288,15 @@ fn read_config(path: &Path) -> Result<Config, DaemonError> {
     parse_config(&text).map_err(|e| fail(e.to_string()))
 }
 
+/// What `run` reads before the runtime starts (blocking), for `serve`.
+struct Prepared {
+    installation: Installation,
+    /// The open `sessions/` data directory.
+    sessions: OwnedFd,
+    /// The host facts manifests are validated against, read once.
+    env: HostEnv,
+}
+
 async fn serve(
     log: &Oplog,
     dirs: &Dirs,
@@ -289,8 +304,13 @@ async fn serve(
     audit: Arc<dyn AuditSink>,
     lock: &OwnedFd,
     nofile: u64,
-    installation: Installation,
+    prepared: Prepared,
 ) -> Result<(), DaemonError> {
+    let Prepared {
+        installation,
+        sessions: sessions_dir,
+        env,
+    } = prepared;
     // First, so a signal during startup is not the default action (death, no cleanup): it
     // waits here and is handled once `control.sock` is bound (security review M3).
     let mut signals = Signals::install()?;
@@ -337,6 +357,8 @@ async fn serve(
         })?
         .map_err(io("removing stale sockets"))?;
     let (crash, mut crashes) = CrashReporter::channel();
+    // The one approver: every session's desk tells it, control watchers hear it (Q73).
+    let hub = Arc::new(Hub::default());
     let registry = Registry::new(RegistryParts {
         launcher: Arc::clone(&launcher),
         audit: Arc::clone(&audit),
@@ -348,14 +370,20 @@ async fn serve(
         // `runtime.image` is refused `no-default-image`. TODO(#88): the bundled image.
         default_image: None,
         oplog: log.clone(),
+        approver: Arc::clone(&hub) as Arc<dyn Approver>,
         crash: crash.clone(),
         scope: String::new(),
     });
-    let control = Arc::new(Control::new(Recorder::new(
-        audit,
-        String::new(),
-        AuditLevel::default(),
-    )))
+    let control = Arc::new(Control::new(ControlParts {
+        record: Recorder::new(audit, String::new(), AuditLevel::default()),
+        sessions: registry.clone(),
+        hub,
+        sessions_dir: Arc::new(sessions_dir),
+        env: Arc::new(env),
+        // Architect Q87: no secret store yet, so a manifest granting one is refused at
+        // validation (`manifest.refuse`). TODO(#99): the store's names.
+        catalog: Arc::new(BTreeSet::<String>::new()),
+    }))
     .listen(bind_control(lock)?, ids.uid, crash.clone());
     log.info(LOG, "serving", &[("socket", CONTROL_SOCK)]);
     let sweeping = crash.spawn(

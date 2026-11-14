@@ -22,20 +22,34 @@ pub const STOP_GRACE: Duration = Duration::from_secs(2);
 
 /// A server the loop hands its connections to.
 pub trait Server: Send + Sync + 'static {
-    /// Serves one stream whose peer passed the UID check.
-    fn serve(self: Arc<Self>, stream: UnixStream) -> impl Future<Output = ()> + Send;
+    /// Serves one stream whose peer passed the UID check; `peer` as read at accept.
+    fn serve(self: Arc<Self>, stream: UnixStream, peer: Peer) -> impl Future<Output = ()> + Send;
     /// Records a refused peer (`None`: its credentials could not be read).
     fn refuse_peer(self: Arc<Self>, uid: Option<u32>) -> impl Future<Output = ()> + Send;
     /// Ends every connection (called once when the loop stops).
     fn stop(&self);
 }
 
-/// The peer's UID, if the kernel reports it.
+/// A connected peer, from `SO_PEERCRED`, read once at accept (architect Q76). The uid is what
+/// the loop checks; the pid is audit detail only (the pid at connect time, which can be reused),
+/// never used to authorize anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Peer {
+    /// The peer's uid.
+    pub uid: u32,
+    /// The peer's pid, in `sallyd`'s pid namespace.
+    pub pid: i32,
+}
+
+/// The peer's credentials, if the kernel reports them.
 #[must_use]
-pub(crate) fn peer_uid(stream: &UnixStream) -> Option<u32> {
+pub(crate) fn peer(stream: &UnixStream) -> Option<Peer> {
     rustix::net::sockopt::socket_peercred(stream)
         .ok()
-        .map(|c| c.uid.as_raw())
+        .map(|c| Peer {
+            uid: c.uid.as_raw(),
+            pid: c.pid.as_raw_nonzero().get(),
+        })
 }
 
 /// A running accept loop. [`Handle::shutdown`] stops it in order; dropping it aborts the loop
@@ -98,9 +112,9 @@ pub fn spawn<S: Server>(
                         let s = Arc::clone(&server);
                         conns.spawn(async move {
                             let _slot = slot;
-                            match peer_uid(&stream) {
-                                Some(u) if u == uid => s.serve(stream).await,
-                                other => s.refuse_peer(other).await,
+                            match peer(&stream) {
+                                Some(p) if p.uid == uid => s.serve(stream, p).await,
+                                other => s.refuse_peer(other.map(|p| p.uid)).await,
                             }
                         });
                     }
@@ -151,6 +165,7 @@ mod tests {
     #[derive(Default)]
     struct Probe {
         served: AtomicUsize,
+        peers: Mutex<Vec<Peer>>,
         refused: Mutex<Vec<Option<u32>>>,
         live: AtomicUsize,
         peak: AtomicUsize,
@@ -158,7 +173,8 @@ mod tests {
     }
 
     impl Server for Probe {
-        async fn serve(self: Arc<Self>, mut stream: UnixStream) {
+        async fn serve(self: Arc<Self>, mut stream: UnixStream, peer: Peer) {
+            self.peers.lock().unwrap().push(peer);
             self.served.fetch_add(1, Ordering::SeqCst);
             let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(now, Ordering::SeqCst);
@@ -242,6 +258,12 @@ mod tests {
         let (_c, ok) = echo(&d.path().join("s.sock")).await;
         assert!(ok);
         assert_eq!(p.served.load(Ordering::SeqCst), 1);
+        // The peer's credentials, read at accept: this process's own (architect Q76).
+        let own = Peer {
+            uid: me(),
+            pid: i32::try_from(std::process::id()).unwrap(),
+        };
+        assert_eq!(*p.peers.lock().unwrap(), vec![own]);
         assert!(p.refused.lock().unwrap().is_empty());
         h.shutdown().await;
         assert_eq!(p.stopped.load(Ordering::SeqCst), 1);
@@ -293,7 +315,7 @@ mod tests {
     struct Bomb;
 
     impl Server for Bomb {
-        async fn serve(self: Arc<Self>, _: UnixStream) {
+        async fn serve(self: Arc<Self>, _: UnixStream, _: Peer) {
             panic!("handler bug");
         }
         async fn refuse_peer(self: Arc<Self>, _: Option<u32>) {}

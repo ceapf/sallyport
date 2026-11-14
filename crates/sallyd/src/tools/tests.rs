@@ -17,6 +17,7 @@ use super::shell::Captured;
 use super::*;
 use crate::approvals::Gated;
 use crate::approvals::policy::{MountRule, Policy};
+use crate::approvals::queue::tests::decide;
 use crate::approvals::queue::{self, Approver, Client, Decision, Desk, Limits};
 use crate::approvals::render::Prompt;
 use crate::rpc::agent::ToolHandler;
@@ -28,6 +29,9 @@ pub(crate) const ME: Client = Client { uid: 1000, pid: 7 };
 struct Shown(StdMutex<Vec<Prompt>>);
 
 impl Approver for Shown {
+    fn attached(&self) -> bool {
+        true
+    }
     fn requested(&self, p: &Prompt) {
         self.0.lock().unwrap().push(p.clone());
     }
@@ -523,7 +527,7 @@ async fn rt_ag_05_brokered_writes_wait_for_approval() {
     );
     assert!(p.full.contains("\"/workspace/notes/a.md\""), "{}", p.full);
     assert!(!notes.join("a.md").exists(), "written before approval");
-    f.desk.decide(&p.id, Decision::Approve, ME).await.unwrap();
+    decide(&f.desk, &p.id, Decision::Approve, ME).await.unwrap();
     let out = h.await.unwrap().unwrap();
     assert!(!out.is_error, "{}", out.text);
     assert_eq!(std::fs::read(notes.join("a.md")).unwrap(), b"hi");
@@ -564,7 +568,7 @@ async fn a_denied_brokered_write_never_runs() {
         .await
     });
     let p = f.until_shown(1).await;
-    f.desk.decide(&p.id, Decision::Deny, ME).await.unwrap();
+    decide(&f.desk, &p.id, Decision::Deny, ME).await.unwrap();
     assert_eq!(h.await.unwrap().unwrap().text, "denied: denied");
     assert!(!notes.join("a.md").exists());
     assert!(!f.sink.events().iter().any(|e| e == "tool.run"));
@@ -924,7 +928,7 @@ async fn rt_ag_07_destructive_commands_ask_and_ls_runs() {
         let h = tokio::spawn(async move { f2.call("shell", json!({"cmd": cmd})).await });
         let p = f.until_shown(i + 1).await;
         assert_eq!(p.risk_tags, ["destructive"], "{}", p.full);
-        f.desk.decide(&p.id, Decision::Deny, ME).await.unwrap();
+        decide(&f.desk, &p.id, Decision::Deny, ME).await.unwrap();
         assert_eq!(h.await.unwrap().unwrap().text, "denied: denied");
     }
     assert_eq!(f.ran.lock().unwrap().len(), 1);

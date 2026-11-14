@@ -559,12 +559,25 @@ impl Lx {
         )
     }
 
-    /// [`registry`](Self::registry) with its operational log written to `oplog`.
+    /// [`registry`](Self::registry) with its operational log written to `oplog`; the production
+    /// hub with no watcher, so every prompt is denied `no-approver`.
     pub fn registry_logged(
         &self,
         audit: Arc<dyn AuditSink>,
         default_image: Option<ImageRef>,
         oplog: sallyd::oplog::Oplog,
+    ) -> Arc<Registry> {
+        let hub = Arc::new(sallyd::approvals::hub::Hub::default());
+        self.registry_hub(audit, default_image, oplog, hub)
+    }
+
+    /// [`registry_logged`](Self::registry_logged) with its prompts going to `hub`.
+    pub fn registry_hub(
+        &self,
+        audit: Arc<dyn AuditSink>,
+        default_image: Option<ImageRef>,
+        oplog: sallyd::oplog::Oplog,
+        hub: Arc<sallyd::approvals::hub::Hub>,
     ) -> Arc<Registry> {
         Registry::new(RegistryParts {
             launcher: self.launcher.clone(),
@@ -575,6 +588,7 @@ impl Lx {
             data: self.f.root.join("home/.local/share/sallyport"),
             default_image,
             oplog,
+            approver: hub,
             // A supervisor panic shows as a missing stop in the test; nobody reads these.
             crash: sallyd::daemon::crash::CrashReporter::channel().0,
             scope: self.scope.clone(),

@@ -16,6 +16,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, ReadHal
 use super::action::{Action, Bound, Payload};
 use super::handler::{Executor, Gated, Prepared};
 use super::policy::{MountRule, Policy};
+use super::queue::tests::decide;
 use super::queue::{self, Approver, Client, DecideError, Decision, Desk, Limits, Ticket};
 use super::render::Prompt;
 use crate::rpc::agent::{Agent, MAX_FRAME};
@@ -102,6 +103,9 @@ struct Shown {
 }
 
 impl Approver for Shown {
+    fn attached(&self) -> bool {
+        true
+    }
     fn requested(&self, p: &Prompt) {
         self.prompts.lock().unwrap().push(p.clone());
     }
@@ -271,7 +275,7 @@ async fn rt_ag_02_c_a_cancel_during_preparation_keeps_the_call_from_ever_being_s
     // The connection still works, and a later call with the same id is asked normally.
     c.send(&touch(1)).await;
     let p = shown(&f, 1).await;
-    f.desk.decide(&p.id, Decision::Deny, ME).await.unwrap();
+    decide(&f.desk, &p.id, Decision::Deny, ME).await.unwrap();
     assert_eq!(text(&c.recv().await), "denied: denied");
     assert_eq!(f.gate.kept(), (0, 0));
 }
@@ -337,7 +341,7 @@ async fn rt_ag_02_a_a_call_nobody_answers_times_out_and_never_runs() {
     assert!(ran(&f).is_empty());
     assert_eq!(f.sink.last("approval.expire")["id"], p.id.as_str());
     assert_eq!(
-        f.desk.decide(&p.id, Decision::Approve, ME).await,
+        decide(&f.desk, &p.id, Decision::Approve, ME).await,
         Err(DecideError::UnknownId)
     );
     assert!(ran(&f).is_empty());
@@ -349,7 +353,7 @@ async fn rt_ag_02_b_a_denied_call_never_runs() {
     let mut c = open(&f);
     c.send(&touch(1)).await;
     let p = shown(&f, 1).await;
-    f.desk.decide(&p.id, Decision::Deny, ME).await.unwrap();
+    decide(&f.desk, &p.id, Decision::Deny, ME).await.unwrap();
     assert_eq!(text(&c.recv().await), "denied: denied");
     assert!(ran(&f).is_empty());
 }
@@ -360,15 +364,14 @@ async fn rt_ag_02_c_an_approval_runs_once_and_is_never_reused() {
     let mut c = open(&f);
     c.send(&touch(1)).await;
     let first = shown(&f, 1).await;
-    f.desk
-        .decide(&first.id, Decision::Approve, ME)
+    decide(&f.desk, &first.id, Decision::Approve, ME)
         .await
         .unwrap();
     assert_eq!(text(&c.recv().await), "ran");
     assert_eq!(ran(&f).len(), 1);
     // Replaying the decision is refused and audited; nothing runs again.
     assert_eq!(
-        f.desk.decide(&first.id, Decision::Approve, ME).await,
+        decide(&f.desk, &first.id, Decision::Approve, ME).await,
         Err(DecideError::UnknownId)
     );
     assert_eq!(f.sink.last("approval.decide")["reason"], "unknown-id");
@@ -377,7 +380,9 @@ async fn rt_ag_02_c_an_approval_runs_once_and_is_never_reused() {
     let second = shown(&f, 2).await;
     assert_ne!(second.id, first.id);
     assert_eq!(second.full, first.full);
-    f.desk.decide(&second.id, Decision::Deny, ME).await.unwrap();
+    decide(&f.desk, &second.id, Decision::Deny, ME)
+        .await
+        .unwrap();
     assert_eq!(text(&c.recv().await), "denied: denied");
     // A cancelled call's prompt is withdrawn; an identical call after it inherits nothing.
     c.send(&touch(3)).await;
@@ -395,13 +400,15 @@ async fn rt_ag_02_c_an_approval_runs_once_and_is_never_reused() {
     assert!(f.desk.list().is_empty());
     assert_eq!(f.sink.last("approval.withdraw")["id"], third.id.as_str());
     assert_eq!(
-        f.desk.decide(&third.id, Decision::Approve, ME).await,
+        decide(&f.desk, &third.id, Decision::Approve, ME).await,
         Err(DecideError::UnknownId)
     );
     c.send(&touch(4)).await;
     let fourth = shown(&f, 4).await;
     assert_ne!(fourth.id, third.id);
-    f.desk.decide(&fourth.id, Decision::Deny, ME).await.unwrap();
+    decide(&f.desk, &fourth.id, Decision::Deny, ME)
+        .await
+        .unwrap();
     assert_eq!(text(&c.recv().await), "denied: denied");
     assert_eq!(ran(&f).len(), 1);
 }
@@ -444,14 +451,15 @@ async fn rt_ag_02_d_other_arguments_under_the_same_id_never_run_as_the_approved_
     assert_eq!(twin.full, approved.full);
     assert_ne!(twin.call, approved.call);
     assert_ne!(twin.digest, approved.digest);
-    f.desk
-        .decide(&approved.id, Decision::Approve, ME)
+    decide(&f.desk, &approved.id, Decision::Approve, ME)
         .await
         .unwrap();
     assert_eq!(text(&a.recv().await), "ran");
-    f.desk.decide(&other.id, Decision::Deny, ME).await.unwrap();
+    decide(&f.desk, &other.id, Decision::Deny, ME)
+        .await
+        .unwrap();
     assert_eq!(text(&b.recv().await), "denied: denied");
-    f.desk.decide(&twin.id, Decision::Deny, ME).await.unwrap();
+    decide(&f.desk, &twin.id, Decision::Deny, ME).await.unwrap();
     assert_eq!(text(&c.recv().await), "denied: denied");
     // What ran is exactly what was approved: the executed digest is the approved one.
     let ran = ran(&f);
@@ -543,7 +551,7 @@ async fn rt_ag_14_a_fetch_write_waits_for_approval_and_is_denied_on_timeout() {
             .starts_with("fetch \"POST\" \"https://api.mock.test/gists\"")
     );
     assert!(ran(&f).is_empty());
-    f.desk.decide(&p.id, Decision::Approve, ME).await.unwrap();
+    decide(&f.desk, &p.id, Decision::Approve, ME).await.unwrap();
     assert_eq!(text(&c.recv().await), "ran");
     c.send(&post(2)).await;
     shown(&f, 2).await;

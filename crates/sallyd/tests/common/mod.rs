@@ -20,6 +20,21 @@ use sallyd::sandbox::{
     SessionPaths, UserIds, scan_mounts,
 };
 
+/// The staged changes of the session at `paths`, as `sessions.changes` lists them: from the
+/// `sessions/` data directory and the session id alone, live or stopped (architect Q81).
+pub fn changes(
+    paths: &SessionPaths,
+) -> Result<Vec<sallyd::sandbox::Change>, sallyd::sandbox::ChangesError> {
+    use rustix::fs::{Mode, OFlags};
+    let sessions = sally_core::fd::open(
+        paths.data_root().parent().unwrap(),
+        OFlags::RDONLY | OFlags::DIRECTORY,
+        Mode::empty(),
+    )
+    .unwrap();
+    sallyd::sandbox::session_changes(rustix::fd::AsFd::as_fd(&sessions), paths.id())
+}
+
 pub const D0: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 pub const D1: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 pub const D2: &str = "2222222222222222222222222222222222222222222222222222222222222222";

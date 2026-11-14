@@ -324,6 +324,7 @@ fn call(f: &Arc<crate::tools::tests::Fx>, args: Value) -> tokio::task::JoinHandl
 #[tokio::test]
 async fn rt_ag_14_fetch_a_write_reaches_the_upstream_only_once_approved() {
     use crate::approvals::queue::Decision;
+    use crate::approvals::queue::tests::decide;
     use crate::tools::tests::ME;
     let r = rig(Opts {
         handler: Arc::new(echo),
@@ -362,14 +363,14 @@ async fn rt_ag_14_fetch_a_write_reaches_the_upstream_only_once_approved() {
     assert!(note.contains("secret:T0"), "{note}");
     assert!(!note.contains(&value(0)) && !p.full.contains(&value(0)));
     nothing_sent("pending again");
-    f.desk.decide(&p.id, Decision::Deny, ME).await.unwrap();
+    decide(&f.desk, &p.id, Decision::Deny, ME).await.unwrap();
     assert_eq!(bounded("deny", h).await.unwrap(), "denied: denied");
     nothing_sent("after the deny");
     // Approve: exactly one request.
     let h = call(&f, post.clone());
     let p = f.until_shown(2).await;
     nothing_sent("pending a third time");
-    f.desk.decide(&p.id, Decision::Approve, ME).await.unwrap();
+    decide(&f.desk, &p.id, Decision::Approve, ME).await.unwrap();
     let out: Value = serde_json::from_str(&bounded("approve", h).await.unwrap()).unwrap();
     assert_eq!(out["status"], 200);
     assert!(
@@ -382,7 +383,7 @@ async fn rt_ag_14_fetch_a_write_reaches_the_upstream_only_once_approved() {
     assert!(r.seen()[0].ends_with("secret notes"));
     assert!(r.seen()[0].contains("x-trace: t-1\r\n"), "{}", r.seen()[0]);
     // The approval is single-use.
-    assert!(f.desk.decide(&p.id, Decision::Approve, ME).await.is_err());
+    assert!(decide(&f.desk, &p.id, Decision::Approve, ME).await.is_err());
     assert_eq!(r.seen().len(), 1, "a reused approval sends nothing");
     // A read runs without a prompt.
     let got = bounded(

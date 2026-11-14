@@ -32,7 +32,7 @@ use super::supervise::{Request, Supervised};
 use super::types::{StopReason, fresh_id};
 use crate::approvals::Gated;
 use crate::approvals::policy::Policy;
-use crate::approvals::queue::{self, Desk, Limits};
+use crate::approvals::queue::{self, Approver, Desk, Limits};
 use crate::daemon::crash::CrashReporter;
 use crate::egress::net::bind;
 use crate::oplog::Oplog;
@@ -72,6 +72,9 @@ pub struct RegistryParts {
     pub default_image: Option<ImageRef>,
     /// The operational log.
     pub oplog: Oplog,
+    /// Where every session's prompts go: the daemon's one [`Hub`](crate::approvals::hub::Hub)
+    /// (architect Q73). With no client attached to it, prompts are denied `no-approver`.
+    pub approver: Arc<dyn Approver>,
     /// The daemon's crash reporter: a panic in a supervisor is not a session's, so `sallyd`
     /// stops every session and exits (architect Q47).
     pub crash: CrashReporter,
@@ -371,13 +374,12 @@ impl Registry {
     ) -> (Arc<Agent<Gated<Tools<PodmanExec>>>>, Desk) {
         let v = manifest.manifest();
         let sid = running.paths().id().as_str();
-        // TODO(#65): PR B gives the desk an approver that notifies control-side clients.
         let (gate, desk) = queue::new(
             sid.to_owned(),
             Policy::from_manifest(manifest),
             Limits::from_manifest(&v.approvals),
             rec.clone(),
-            None,
+            Some(Arc::clone(&self.p.approver)),
         );
         let tools = Tools::new(Parts {
             builtin: v.tools.builtin.clone(),
@@ -518,6 +520,29 @@ impl Registry {
         }
         unconfirmed.sort();
         unconfirmed
+    }
+}
+
+/// The control socket's sessions (architect Q86): pure delegation, proved by the container
+/// tests in `tests/control.rs`.
+impl crate::rpc::control_methods::SessionSet for Arc<Registry> {
+    fn list(&self) -> Vec<SessionInfo> {
+        Registry::list(self)
+    }
+
+    fn desk(&self, id: &str) -> Option<Desk> {
+        Registry::desk(self, id)
+    }
+
+    fn start(
+        &self,
+        manifest: Arc<ValidatedManifest>,
+    ) -> impl std::future::Future<Output = Result<SessionInfo, StartError>> + Send {
+        Registry::start(self, manifest)
+    }
+
+    fn stop(&self, id: &str) -> impl std::future::Future<Output = Option<StopOutcome>> + Send {
+        Registry::stop(self, id, StopReason::Request)
     }
 }
 

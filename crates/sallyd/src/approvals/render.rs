@@ -7,8 +7,9 @@
 //! character `\u{…}`. Nothing is normalized: what is shown is what runs. Each argv element and
 //! each path is quoted (`"` escaped), so element boundaries and empty arguments are visible.
 //!
-//! The action text is cut at [`ACTION_CHARS`] with an explicit `… (+N bytes, sha256 …)` tail,
-//! never inside an escape; the full text travels with the prompt so a client can reveal it.
+//! The action text is cut at [`ACTION_CHARS`] with an explicit `... (+N bytes, sha256 <hex>)`
+//! tail, all ASCII so a client's printable-ASCII check passes it (architect Q74), never inside an
+//! escape; the full text travels with the prompt so a client can reveal it.
 //! Text the model supplied (a reason, a description) is never part of the action: it is one
 //! line in its own field, cut at [`NOTE_CHARS`], and the terminal labels it as untrusted.
 
@@ -22,6 +23,10 @@ use super::action::{Action, Bound, Target, hex};
 pub const ACTION_CHARS: usize = 2000;
 /// Characters of the agent's note shown before the cut.
 pub const NOTE_CHARS: usize = 500;
+/// Most bytes of full action text a prompt carries to a client (architect Q74 (b)): the text is
+/// escaped ASCII and JSON at most doubles it, so a notification stays well inside the 1 MiB
+/// control frame. A longer action is never offered in full, and so can only be denied.
+pub const FULL_WIRE_BYTES: usize = 256 * 1024;
 
 /// One approval request, as shown to a human.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +71,14 @@ impl Prompt {
             note: note.map(note_text),
             risk_tags,
         }
+    }
+}
+
+impl Prompt {
+    /// The full action text a client may be sent, `None` past [`FULL_WIRE_BYTES`].
+    #[must_use]
+    pub fn full_on_wire(&self) -> Option<&str> {
+        (self.full.len() <= FULL_WIRE_BYTES).then_some(self.full.as_str())
     }
 }
 
@@ -115,7 +128,7 @@ fn note_text(n: &str) -> String {
         let sha = hex(&Sha256::digest(n.as_bytes()));
         let _ = write!(
             out,
-            "… (+{} bytes, sha256 {sha})",
+            "... (+{} bytes, sha256 {sha})",
             n.len().saturating_sub(used)
         );
     }
@@ -192,27 +205,19 @@ fn quoted(s: &str) -> String {
     out
 }
 
-/// `s` with everything outside printable ASCII escaped (see the module docs).
+/// `s` with everything outside printable ASCII escaped (see the module docs): the shared
+/// escaper, [`sally_core::text::escape`] (architect ruling Q50).
 #[must_use]
 pub fn escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        push_escaped(&mut out, c);
-    }
-    out
+    sally_core::text::escape(s.as_bytes())
 }
 
+/// One character through the shared escaper, for the quoted and capped forms built here.
 fn push_escaped(out: &mut String, c: char) {
-    match c {
-        '\\' => out.push_str("\\\\"),
-        ' '..='~' => out.push(c),
-        '\0'..='\x7f' => {
-            let _ = write!(out, "\\x{:02x}", u32::from(c));
-        }
-        _ => {
-            let _ = write!(out, "\\u{{{:x}}}", u32::from(c));
-        }
-    }
+    let mut buf = [0u8; 4];
+    out.push_str(&sally_core::text::escape(
+        c.encode_utf8(&mut buf).as_bytes(),
+    ));
 }
 
 /// `text` (escaped ASCII) cut at `max` characters, never inside an escape, with an explicit tail
@@ -225,7 +230,7 @@ pub(crate) fn cut(text: &str, max: usize) -> (String, bool) {
     let shown = text.get(..at).unwrap_or_default();
     let rest = text.len().saturating_sub(at);
     let sha = hex(&Sha256::digest(text.as_bytes()));
-    (format!("{shown}… (+{rest} bytes, sha256 {sha})"), true)
+    (format!("{shown}... (+{rest} bytes, sha256 {sha})"), true)
 }
 
 /// The largest offset at most `max` that does not fall inside a `\…` escape of `text`.
@@ -398,6 +403,18 @@ mod tests {
         assert_ne!(lossy(b"\xff"), lossy(b"\xfe"));
     }
 
+    /// The wire cap is inclusive: a full text of exactly the cap is offered, one byte more is
+    /// not (architect Q74 (b)); 256 KiB, so JSON's doubling stays inside a 1 MiB frame.
+    #[test]
+    fn the_full_text_goes_on_the_wire_up_to_its_cap() {
+        assert_eq!(FULL_WIRE_BYTES, 262_144);
+        let mut p = prompt(shell(&["ls"]), None);
+        p.full = "a".repeat(FULL_WIRE_BYTES);
+        assert_eq!(p.full_on_wire().map(str::len), Some(FULL_WIRE_BYTES));
+        p.full.push('a');
+        assert_eq!(p.full_on_wire(), None);
+    }
+
     #[test]
     fn a_long_action_is_cut_with_a_tail_and_kept_whole_in_full() {
         let long = "a".repeat(50 * 1024);
@@ -409,7 +426,7 @@ mod tests {
         let rest = full.len() - ACTION_CHARS;
         assert_eq!(
             p.action,
-            format!("{}… (+{rest} bytes, sha256 {sha})", &full[..ACTION_CHARS])
+            format!("{}... (+{rest} bytes, sha256 {sha})", &full[..ACTION_CHARS])
         );
         let short = prompt(shell(&["ls"]), None);
         assert!(!short.truncated);
@@ -419,7 +436,7 @@ mod tests {
     #[test]
     fn the_cut_falls_exactly_at_the_bound_or_before_an_escape() {
         assert_eq!(cut("abc", 3), ("abc".to_owned(), false));
-        assert!(cut("abcd", 3).0.starts_with("abc… (+1 bytes"));
+        assert!(cut("abcd", 3).0.starts_with("abc... (+1 bytes"));
         // Never inside `\x1b`, `\u{202e}` or `\\`.
         for (text, max, kept) in [
             ("ab\\x1bcd", 4, "ab"),
@@ -432,7 +449,7 @@ mod tests {
             let (shown, cut_) = cut(text, max);
             assert!(cut_, "{text}");
             assert!(
-                shown.starts_with(&format!("{kept}…")),
+                shown.starts_with(&format!("{kept}... (+")),
                 "{text} {max}: {shown}"
             );
         }
@@ -453,7 +470,7 @@ mod tests {
         let shown = "n".repeat(NOTE_CHARS - 2);
         assert_eq!(
             long.note.unwrap(),
-            format!("\"{shown}\"… (+2 bytes, sha256 {sha})")
+            format!("\"{shown}\"... (+2 bytes, sha256 {sha})")
         );
         // Exactly NOTE_CHARS with both quotes: shown whole.
         let fits = "n".repeat(NOTE_CHARS - 2);
@@ -465,7 +482,7 @@ mod tests {
         let p = prompt(shell(&["ls"]), Some(&"\x1b".repeat(100_000)));
         let note = p.note.unwrap();
         assert!(note.len() < NOTE_CHARS + 100, "{}", note.len());
-        assert!(note.contains("… (+"));
+        assert!(note.contains("... (+"));
     }
 
     #[test]
@@ -523,11 +540,12 @@ mod tests {
             let text = terminal(&p);
             // One logical line per field: no raw control character survives.
             assert!(!text.chars().any(|c| c.is_control() && c != '\n'), "{name}");
-            assert!(text.replace('…', "").is_ascii(), "{name}");
+            // All ASCII, the cut's tail included (architect Q74: a client's clean-check passes it).
+            assert!(text.is_ascii(), "{name}");
             // A quote in an argument stays inside its argument.
             assert!(!p.action.contains("x\"]"), "{name}");
             // A cut never splits an escape.
-            if let Some((shown, _)) = p.action.split_once('…') {
+            if let Some((shown, _)) = p.action.rsplit_once("... (+") {
                 for partial in ["\\", "\\x", "\\x1"] {
                     assert!(!shown.ends_with(partial), "{name}: {shown}");
                 }
