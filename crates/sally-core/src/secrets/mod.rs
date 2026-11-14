@@ -14,8 +14,10 @@
 //!
 //! Concurrency: a `SecretStore` is a snapshot and `save` writes all of it, so two editors could
 //! silently undo each other (a removed credential could come back). Every writer therefore holds
-//! [`SecretStore::lock`] (an exclusive `flock` on `secrets.lock` beside the store) across `open`,
-//! its changes and `save`; the `sally secrets` commands are the writers (architect Q52, Q108).
+//! [`SecretStore::lock`] (an exclusive `flock` on `secrets.lock`, a separate owner-only file
+//! beside the store, never the store itself) across `open`, its changes and `save`; the
+//! `sally secrets` commands are the writers (architect Q52, Q108). A writer waits at most
+//! [`LOCK_WAIT`] for another, then gives up with nothing changed.
 //! Readers (`sally secrets list`, and `sallyd` once #99 wires it) take no lock: `save` replaces
 //! the file by rename, so a reader sees the old store or the new one, never a mix.
 //!
@@ -34,6 +36,6 @@ mod store;
 
 pub use secret::Secret;
 pub use store::{
-    EditLock, MAX_SECRETS, MAX_STORE_BYTES, MAX_VALUE_BYTES, SHORT_SECRET_BYTES, SecretStore,
-    SecretsError, SetOutcome, is_secret_name,
+    EditLock, LOCK_WAIT, MAX_SECRETS, MAX_STORE_BYTES, MAX_VALUE_BYTES, SHORT_SECRET_BYTES,
+    SecretStore, SecretsError, SetOutcome, is_secret_name,
 };

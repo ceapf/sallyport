@@ -9,6 +9,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use rustix::fs::{Mode, OFlags};
 use zeroize::{Zeroize, Zeroizing};
@@ -24,6 +25,11 @@ pub const MAX_VALUE_BYTES: usize = 8 * 1024;
 /// Values shorter than this are stored but flagged: redaction skips collision-prone short
 /// patterns (ARCHITECTURE §7, Redaction; the CLI's warning is TODO(#98)).
 pub const SHORT_SECRET_BYTES: usize = 16;
+
+/// How long [`SecretStore::lock`] waits for another writer before giving up.
+pub const LOCK_WAIT: Duration = Duration::from_secs(10);
+/// How often a waiting writer retries the lock.
+const LOCK_RETRY: Duration = Duration::from_millis(50);
 
 const MAX_NAME_BYTES: usize = 64;
 /// Distinguishes temporary files of concurrent saves within one process.
@@ -60,6 +66,18 @@ pub enum SecretsError {
         path: String,
         /// What is wrong and how to fix it.
         msg: String,
+    },
+    /// Another writer kept the lock for the whole wait ([`SecretStore::lock_within`]).
+    #[error(
+        "{path}: another `sally secrets` command is changing the store; gave up after {:.1} s \
+         and nothing changed (try again when it ends)",
+        waited.as_secs_f64()
+    )]
+    LockHeld {
+        /// Host path of the lock file.
+        path: String,
+        /// How long this writer waited.
+        waited: Duration,
     },
     /// An I/O error.
     #[error("{path}: {source}")]
@@ -275,15 +293,25 @@ impl SecretStore {
     }
 
     /// Takes the writers' lock for the store at `path`: an exclusive `flock` on `secrets.lock`
-    /// (the store's name with `.lock`) beside it, 0600, never through a symlink. Blocks until no
-    /// other writer holds it. An editor holds it across [`open`](Self::open), its changes and
-    /// [`save`](Self::save), so two editors cannot undo each other (architect Q108); readers
-    /// take no lock. Creates the directory with mode 0700 if missing.
+    /// (the store's name with `.lock`) beside it, 0600, never through a symlink, waiting at most
+    /// [`LOCK_WAIT`] for another writer. An editor holds it across [`open`](Self::open), its
+    /// changes and [`save`](Self::save), so two editors cannot undo each other (architect Q108);
+    /// readers take no lock. Creates the directory with mode 0700 if missing.
     ///
     /// # Errors
-    /// [`SecretsError::Permissions`] if the directory is writable by group or others or the lock
-    /// is a symlink, [`SecretsError::Io`] otherwise.
+    /// As [`lock_within`](Self::lock_within).
     pub fn lock(path: &Path) -> Result<EditLock, SecretsError> {
+        Self::lock_within(path, LOCK_WAIT)
+    }
+
+    /// [`lock`](Self::lock), waiting at most `wait`: the lock is tried at once, then every
+    /// 50 ms until `wait` has passed (a free lock is taken even when `wait` is zero).
+    ///
+    /// # Errors
+    /// [`SecretsError::LockHeld`] when another writer kept it for the whole wait;
+    /// [`SecretsError::Permissions`] if the directory is writable by group or others or the lock
+    /// is a symlink; [`SecretsError::Io`] otherwise.
+    pub fn lock_within(path: &Path, wait: Duration) -> Result<EditLock, SecretsError> {
         let lock = path.with_extension("lock");
         let io_err = |e: std::io::Error| SecretsError::Io {
             path: lock.display().to_string(),
@@ -308,9 +336,22 @@ impl SecretStore {
             Err(e) => return Err(io_err(e.into())),
         };
         let file = File::from(fd);
-        rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)
-            .map_err(|e| io_err(e.into()))?;
-        Ok(EditLock { _file: file })
+        let start = Instant::now();
+        loop {
+            match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => return Ok(EditLock { _file: file }),
+                Err(rustix::io::Errno::WOULDBLOCK) => {}
+                Err(e) => return Err(io_err(e.into())),
+            }
+            let waited = start.elapsed();
+            let Some(left) = wait.checked_sub(waited).filter(|l| !l.is_zero()) else {
+                return Err(SecretsError::LockHeld {
+                    path: lock.display().to_string(),
+                    waited,
+                });
+            };
+            std::thread::sleep(left.min(LOCK_RETRY));
+        }
     }
 
     /// Writes the store atomically: a 0600 temporary file in the same directory, fsync, rename,

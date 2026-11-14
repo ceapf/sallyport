@@ -184,6 +184,19 @@ fn a_store_that_cannot_be_used_fails() {
     assert_eq!(run(|o| rm(&s.store(), "A", o)).0, EXIT_FAILED);
 }
 
+/// Another writer's lock outlasting the wait fails the command (2) with the store's message.
+#[test]
+fn a_held_lock_fails_with_its_message_and_no_name() {
+    let e = SecretsError::LockHeld {
+        path: "/s/secrets.lock".into(),
+        waited: std::time::Duration::from_secs(10),
+    };
+    let (code, out, err) = run(|o| store_error(o, &e));
+    assert_eq!((code, out.as_str()), (EXIT_FAILED, ""));
+    assert_eq!(err, format!("sally: {e}\n"));
+    assert!(err.contains("nothing changed"), "{err}");
+}
+
 #[test]
 fn list_prints_names_and_rm_removes_one() {
     let s = Scratch::new("list");

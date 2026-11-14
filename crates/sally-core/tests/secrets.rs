@@ -821,6 +821,57 @@ fn two_interleaved_edits_both_survive() {
     assert!(st.contains("FIRST") && st.contains("SECOND"));
 }
 
+/// A lock another writer keeps is not waited on forever (maintainer, 2026-11-14): after the
+/// wait, a clear error naming the lock file and saying nothing changed.
+#[test]
+fn a_held_lock_times_out_with_a_clear_message() {
+    let s = Scratch::new("lock-held");
+    let path = s.store_path();
+    let held = SecretStore::lock(&path).unwrap();
+    let wait = std::time::Duration::from_millis(200);
+    let start = std::time::Instant::now();
+    let e = SecretStore::lock_within(&path, wait).unwrap_err();
+    let took = start.elapsed();
+    assert!(matches!(e, SecretsError::LockHeld { .. }), "{e:?}");
+    assert!(took >= wait, "gave up after {took:?}");
+    assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+    let msg = e.to_string();
+    for needle in ["secrets.lock", "another", "nothing changed", "0.2 s"] {
+        assert!(msg.contains(needle), "{needle:?} not in {msg}");
+    }
+    drop(held);
+    assert!(
+        SecretStore::lock_within(&path, wait).is_ok(),
+        "free once released"
+    );
+}
+
+/// A lock released during the wait is taken; a free lock is taken even with no wait at all.
+#[test]
+fn a_lock_released_within_the_wait_is_taken() {
+    let s = Scratch::new("lock-wait");
+    let path = s.store_path();
+    assert!(SecretStore::lock_within(&path, std::time::Duration::ZERO).is_ok());
+    let held = SecretStore::lock(&path).unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        drop(held);
+    });
+    let start = std::time::Instant::now();
+    let got = SecretStore::lock_within(&path, std::time::Duration::from_secs(5));
+    assert!(got.is_ok(), "{got:?}");
+    assert!(start.elapsed() >= std::time::Duration::from_millis(150));
+    release.join().unwrap();
+}
+
+#[test]
+fn the_default_lock_wait_is_ten_seconds() {
+    assert_eq!(
+        sally_core::secrets::LOCK_WAIT,
+        std::time::Duration::from_secs(10)
+    );
+}
+
 #[test]
 fn the_lock_is_a_private_file_beside_the_store_and_creates_its_directory() {
     let s = Scratch::new("lock-file");
