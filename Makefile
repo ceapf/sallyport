@@ -176,7 +176,7 @@ zizmor:
 # Fuzz smoke: 60 s per target (needs nightly + cargo-fuzz; CI pins both).
 FUZZ_TARGETS := manifest secrets audit_line egress_head egress_rewrite egress_redact \
                 jsonrpc_message llm_request tool_path tool_args proc_stat fetch_url cli_frame \
-                oci_config
+                oci_config oci_facts
 FUZZ_SECS ?= 60
 CARGO_FUZZ_TOOLCHAIN ?= +nightly
 fuzz:
