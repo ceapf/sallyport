@@ -16,7 +16,7 @@ pub const INSPECT_FORMAT: &str = "{\"static\":{{json .StaticDir}},\"config\":{{j
 pub const IMAGE_FORMAT: &str = "{{json .Config}}";
 
 /// The largest `podman inspect` or `podman image inspect` output accepted.
-pub const MAX_INSPECT: usize = 64 * 1024;
+pub const MAX_INSPECT: usize = 65_536;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -328,6 +328,9 @@ mod tests {
         ] {
             assert!(ImageConfig::parse(bad).is_err(), "{bad:?}");
         }
-        assert!(ImageConfig::parse(format!("{{}}{}", " ".repeat(MAX_INSPECT)).as_bytes()).is_err());
+        let full = format!("{{}}{}", " ".repeat(MAX_INSPECT - 2));
+        assert_eq!(full.len(), MAX_INSPECT);
+        assert!(ImageConfig::parse(full.as_bytes()).is_ok());
+        assert!(ImageConfig::parse(format!("{full} ").as_bytes()).is_err());
     }
 }

@@ -14,7 +14,8 @@ use proptest::prelude::*;
 use sally_core::manifest::{ByteSize, Cpus};
 use sallyd::sandbox::{
     Allowed, ArgvError, Grant, ImageRef, InferenceSpec, Installation, Role, SessionId, Source,
-    VerifiedModel, check_argv, harness_argv, inference_argv, workspace_argv,
+    VerifiedModel, check_argv, harness_argv, harness_build, inference_argv, inference_build,
+    workspace_argv, workspace_build,
 };
 
 mod common;
@@ -97,6 +98,73 @@ fn snapshot_workspace_all_modes_secrets_and_custom_image() {
     ));
     let a = workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), Some(&ws_image())).unwrap();
     insta::assert_snapshot!("workspace-all-modes-secrets", f.redact(&a));
+}
+
+/// Task 14 (architect Q100): the intent the OCI config verifier compares against is what the
+/// argv asks for, flag by flag, in every role.
+#[test]
+fn the_intent_records_exactly_what_the_argv_asks_for() {
+    use sallyd::sandbox::oci::intent::Wanted;
+    let f = Fx::new();
+    f.tree("code/myproject", &[".git"], &[]);
+    let v = f.load(&format!(
+        "runtime:\n  cpus: 2.5\n  memory: 3GiB\n  pids: 256\n  tmp_size: 512MiB\n  tmp_exec: true\n{}",
+        mounts(&[
+            mount("~/code/myproject", "/workspace/p", "rw"),
+            mount("~/code/other", "/workspace/o", "ro"),
+            mount("~/Documents/research", "/workspace/r", "staged"),
+        ])
+    ));
+    let b = workspace_build(&f.common, &f.paths, &v, &f.scan(&v), Some(&ws_image())).unwrap();
+    let i = &b.intent;
+    assert_eq!(i.role, Role::Workspace);
+    assert_eq!(
+        (i.tmp, i.pids, i.cpu_millis),
+        (Some((512 << 20, true)), Some(256), Some(2500))
+    );
+    assert_eq!(
+        (i.memory, i.hostname.as_deref()),
+        (Some(3 << 30), Some("sandbox"))
+    );
+    assert_eq!(i.command, ["/opt/sallyport/entry", "--idle"]);
+    assert_eq!(i.image, ws_image().as_str());
+    assert!(!i.gpu);
+    let access: Vec<(&str, Option<bool>)> = i
+        .mounts
+        .iter()
+        .map(|m| match m {
+            Wanted::Bind { guest, rw, .. } => (guest.as_str(), Some(*rw)),
+            Wanted::Overlay { guest, .. } => (guest.as_str(), None),
+        })
+        .collect();
+    assert_eq!(
+        access,
+        [
+            ("/workspace/p", Some(true)),
+            ("/workspace/p/.git", None),
+            ("/workspace/o", Some(false)),
+            ("/workspace/r", None),
+            ("/run/sallyport", Some(false)),
+        ]
+    );
+    let h = harness_build(&f.common, &f.paths, &v, &image("harness", D0))
+        .unwrap()
+        .intent;
+    assert_eq!(
+        (h.role, h.cpu_millis, h.memory),
+        (Role::Harness, Some(1000), Some(1 << 30))
+    );
+    assert_eq!(h.env.len(), 2);
+    let c = inference_build(&f.common, &inference(&f, false, None))
+        .unwrap()
+        .intent;
+    assert_eq!((c.hostname, c.memory, c.gpu), (None, None, false));
+    assert!(
+        inference_build(&f.common, &inference(&f, true, None))
+            .unwrap()
+            .intent
+            .gpu
+    );
 }
 
 /// The CA variables are set exactly when the launcher writes the two CA files (`ca::wanted`,
