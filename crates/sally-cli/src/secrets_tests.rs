@@ -87,6 +87,42 @@ fn a_terminal_line_ends_at_its_newline_or_eof() {
     assert_eq!(read_line(&mut r, None), Err(ValueError::Empty));
 }
 
+/// A reader that plays a script of results, then reports EOF.
+struct Script(std::collections::VecDeque<std::io::Result<u8>>);
+
+impl Read for Script {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self.0.pop_front() {
+            None => Ok(0),
+            Some(Ok(b)) => {
+                buf[0] = b;
+                Ok(1)
+            }
+            Some(Err(e)) => Err(e),
+        }
+    }
+}
+
+#[test]
+fn an_interrupted_read_is_retried_and_a_failed_one_is_an_error() {
+    use std::io::{Error, ErrorKind};
+    let mut r = Script(
+        [
+            Ok(b'o'),
+            Err(Error::from(ErrorKind::Interrupted)),
+            Ok(b'k'),
+            Ok(b'\n'),
+        ]
+        .into(),
+    );
+    assert_eq!(read_line(&mut r, None).unwrap().as_str(), "ok");
+    let mut r = Script([Ok(b'o'), Err(Error::other("gone"))].into());
+    assert_eq!(
+        read_line(&mut r, None),
+        Err(ValueError::Read("gone".into()))
+    );
+}
+
 #[test]
 fn a_terminal_line_stops_at_the_cancel_byte() {
     let mut r = &b"part\x03ial\n"[..];
@@ -226,12 +262,23 @@ struct Typed {
 /// `read_terminal` on a fresh pty with `typed` typed at the prompt; bounded at 10 s so a
 /// terminal that never ends the line fails the test instead of hanging it.
 fn type_at_prompt(typed: &[u8]) -> Typed {
-    let typed = typed.to_vec();
+    type_ahead_then_at_prompt(b"", typed)
+}
+
+/// As [`type_at_prompt`], with `ahead` (whole lines) typed and queued before the prompt.
+fn type_ahead_then_at_prompt(ahead: &[u8], typed: &[u8]) -> Typed {
+    let (ahead, typed) = (ahead.to_vec(), typed.to_vec());
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         use rustix::termios::tcgetattr;
         let (mut controller, terminal) = pty();
         let before = tcgetattr(&terminal).unwrap();
+        controller.write_all(&ahead).unwrap();
+        let queued = std::time::Instant::now();
+        while rustix::io::ioctl_fionread(&terminal).unwrap() < ahead.len() as u64 {
+            assert!(queued.elapsed().as_secs() < 2, "type-ahead never queued");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         let mut err = TypeAfterPrompt {
             controller: controller.try_clone().unwrap(),
             terminal: terminal.try_clone().unwrap(),
@@ -305,6 +352,15 @@ fn ctrl_c_at_the_prompt_cancels_and_restores_echo() {
     restored(&t);
 }
 
+/// Re-review LOW-3: what was typed before the prompt (shown, echo on) is discarded, never taken
+/// as the value.
+#[test]
+fn input_typed_before_the_prompt_is_not_the_value() {
+    let t = type_ahead_then_at_prompt(b"typed-ahead\n", b"the-real-value\n");
+    assert_eq!(t.got.as_deref(), Ok("the-real-value"));
+    restored(&t);
+}
+
 #[test]
 fn an_empty_line_is_refused_and_echo_comes_back() {
     let t = type_at_prompt(b"\n");
@@ -330,6 +386,11 @@ fn the_prompt_takes_4094_bytes_and_refuses_more() {
     for len in [4095, 5000, 8192] {
         let t = type_at_prompt(format!("{}\n", "k".repeat(len)).as_bytes());
         assert_eq!(t.got, Err(ValueError::TooLongForTerminal), "{len}");
+        assert!(
+            t.left.is_empty(),
+            "{len}: left for the shell: {} bytes",
+            t.left.len()
+        );
         restored(&t);
     }
 }

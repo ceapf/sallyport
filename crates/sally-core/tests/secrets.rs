@@ -914,8 +914,28 @@ fn an_open_lock_file_is_made_private_and_a_directory_is_refused() {
     std::fs::create_dir(&lock).unwrap();
     assert!(matches!(
         SecretStore::lock(&s.store_path()),
-        Err(SecretsError::Permissions { .. } | SecretsError::Io { .. })
+        Err(SecretsError::Io { .. })
     ));
+}
+
+/// A FIFO lock that has a reader opens (no ENXIO), and the regular-file check refuses it.
+#[test]
+fn a_fifo_lock_with_a_reader_is_refused_as_not_a_regular_file() {
+    use std::os::unix::fs::OpenOptionsExt;
+    let s = Scratch::new("lock-fifo-rd");
+    let lock = s.0.join("secrets.lock");
+    mkfifo(&lock);
+    let _reader = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NONBLOCK.bits().cast_signed())
+        .open(&lock)
+        .unwrap();
+    let p = s.store_path();
+    let e = within_5s(move || SecretStore::lock(&p).map(|_| ())).unwrap_err();
+    assert!(
+        matches!(&e, SecretsError::Permissions { msg, .. } if msg == "is not a regular file"),
+        "{e:?}"
+    );
 }
 
 #[test]

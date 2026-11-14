@@ -278,6 +278,17 @@ fn core_dumps_off(pid: u32) -> bool {
 /// plaintext. `set` is caught waiting for its value, `rm` waiting for a held lock.
 #[test]
 fn secrets_commands_run_with_core_dumps_off() {
+    // Not vacuous: a child starts with this process's limits, so they must allow core dumps.
+    let own = std::fs::read_to_string("/proc/self/limits").unwrap();
+    let hard = own
+        .lines()
+        .find(|l| l.starts_with("Max core file size"))
+        .and_then(|l| l.split_whitespace().nth(5))
+        .unwrap();
+    assert_ne!(
+        hard, "0",
+        "the test runs with core dumps already off: {own}"
+    );
     let h = Home::new("harden");
     let spawn = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_sally"))

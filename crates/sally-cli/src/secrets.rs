@@ -191,7 +191,9 @@ pub fn read_terminal(
         quiet.local_modes.remove(LocalModes::ISIG);
         quiet.special_codes[SpecialCodeIndex::VEOL] = c;
     }
-    tcsetattr(tty, OptionalActions::Now, &quiet).map_err(term)?;
+    // Flush: input typed before the prompt (already shown with echo on) is discarded, never
+    // taken as the value (as glibc's getpass).
+    tcsetattr(tty, OptionalActions::Flush, &quiet).map_err(term)?;
     let _restore = Restore(tty, saved);
     let _ = write!(err, "{prompt}");
     let _ = err.flush();
