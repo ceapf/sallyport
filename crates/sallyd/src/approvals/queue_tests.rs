@@ -851,6 +851,40 @@ async fn a_latch_set_while_the_entry_is_written_denies_the_prompt() {
     assert!(f.gate.inner.state().pending.is_empty());
 }
 
+fn listed(f: &Fx) -> Vec<String> {
+    f.desk.list().iter().map(|p| p.id.clone()).collect()
+}
+
+/// Q84, Q97: the list stays oldest first when the oldest prompt leaves, whichever way it
+/// leaves (a list cut at its budget keeps a prefix, so order decides what is shown).
+#[tokio::test(start_paused = true)]
+async fn the_oldest_prompt_leaving_keeps_the_rest_in_order() {
+    for how in ["decide", "withdraw", "expire", "drop"] {
+        let f = fx(5);
+        let (a, ha) = asking(&f, shell(1, &["ls"])).await;
+        if how == "expire" {
+            tokio::time::advance(Duration::from_secs(100)).await;
+        }
+        let (b, _hb) = asking(&f, shell(2, &["ls"])).await;
+        let (c, _hc) = asking(&f, shell(3, &["ls"])).await;
+        assert_eq!(listed(&f), [a.clone(), b.clone(), c.clone()], "{how}");
+        match how {
+            "decide" => decide(&f.desk, &a, Decision::Deny, ME).await.unwrap(),
+            "withdraw" => f.gate.withdraw(1, Withdraw::Cancel).await,
+            "expire" => {
+                tokio::time::advance(Duration::from_secs(200)).await;
+                assert_eq!(ha.await.unwrap(), Err(Refusal::Denied("timeout")));
+            }
+            _ => {
+                ha.abort();
+                let _ = ha.await;
+            }
+        }
+        until(how, || listed(&f).len() == 2).await;
+        assert_eq!(listed(&f), [b, c], "{how}");
+    }
+}
+
 #[tokio::test]
 async fn a_dropped_wait_invalidates_the_id_at_once() {
     let f = fx(5);

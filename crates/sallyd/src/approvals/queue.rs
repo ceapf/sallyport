@@ -431,7 +431,7 @@ impl Gate {
                     }
                     return;
                 }
-                Some(i) => st.pending.swap_remove(i),
+                Some(i) => st.pending.remove(i),
             }
         };
         let inner = Arc::clone(&self.inner);
@@ -606,7 +606,7 @@ impl Inner {
                 return Err(DecideError::FullTextNotShown);
             }
         }
-        Ok(st.pending.swap_remove(i))
+        Ok(st.pending.remove(i))
     }
 
     /// Writes and delivers a decision on a taken prompt. A `DenyAllSession` latches the session
@@ -771,7 +771,7 @@ impl Inner {
                 None => None,
             };
             if let Some(stop) = stop {
-                st.pending.swap_remove(i);
+                st.pending.remove(i);
                 return Err(stop);
             }
             let Some(e) = st.pending.get_mut(i) else {
@@ -804,7 +804,7 @@ impl Inner {
             st.pending
                 .iter()
                 .position(|e| e.id == id)
-                .map(|i| st.pending.swap_remove(i))
+                .map(|i| st.pending.remove(i))
         };
         let Some(e) = expired else {
             // A decision or withdraw took it first and is being written: its answer is coming.
@@ -859,7 +859,7 @@ impl Drop for Waiting {
             st.pending
                 .iter()
                 .position(|e| e.id == self.id)
-                .map(|i| st.pending.swap_remove(i))
+                .map(|i| st.pending.remove(i))
         };
         // Only a prompt the approver was shown is closed to it.
         if let (Some(e), Some(a)) = (gone, &self.inner.approver)

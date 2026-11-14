@@ -1097,6 +1097,42 @@ async fn a_prompt_list_over_the_budget_is_cut_and_says_so() {
     assert!(res["prompts"][0]["full"].is_string());
 }
 
+/// Architect Q97: after the oldest prompt is answered, a cut list still shows the oldest of
+/// the rest, never the newest in its place.
+#[tokio::test]
+async fn a_cut_list_keeps_the_oldest_after_a_take() {
+    let f = fx("oldest");
+    f.session("s-1");
+    let mut w = f.connect();
+    w.call("approvals.watch", json!({})).await;
+    let big = "a".repeat(200 * 1024);
+    let mut ids = Vec::new();
+    let mut asks = Vec::new();
+    // Five prompts of about 200 KiB: after one is answered, three of the four fit the budget.
+    for call in 1..=5 {
+        asks.push(f.ask("s-1", call, &["echo", &big]));
+        ids.push(note(&mut w).await["params"]["id"].clone());
+    }
+    let mut other = f.connect();
+    let r = other
+        .call(
+            "approvals.decide",
+            json!({"id": ids[0], "decision": "deny", "digest": ""}),
+        )
+        .await;
+    assert_eq!(r["result"], json!({}));
+    let r = other.call("approvals.list", json!({})).await;
+    let res = &r["result"];
+    assert_eq!((&res["complete"], &res["total"]), (&json!(false), &json!(4)));
+    let listed: Vec<_> = res["prompts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].clone())
+        .collect();
+    assert_eq!(listed, ids[1..4]);
+}
+
 /// Architect Q77: 40 reads at once, then one per 50 ms; the wait ends with `sallyd`.
 #[tokio::test(start_paused = true)]
 async fn reads_are_rated_daemon_wide() {
