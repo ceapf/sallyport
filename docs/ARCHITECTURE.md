@@ -119,7 +119,7 @@ flowchart LR
   podman/config/              #   empty; XDG_CONFIG_HOME of every podman call
   podman/home/                #   empty; HOME of every podman call (Task 14, Q118)
   podman/hooks/               #   empty; --hooks-dir of every podman call
-  podman/mounts.conf          #   empty; --default-mounts-file of every podman call
+  podman/mounts.conf          #   empty; --default-mounts-file of create, init and start
   logs/
   bin/crun -> crun-<version>  # pinned upstream OCI runtime (static, signature-verified); the
                               # default sandbox.runtime_path. Never the distro crun (AMENDMENTS-02 B5)
@@ -427,16 +427,23 @@ overlap claims.
 **Hermetic podman** (#11). Every podman process gets a cleared environment plus
 `HOME=<data>/podman/home` (empty, never the user's home), the host's `XDG_RUNTIME_DIR`,
 `XDG_DATA_HOME` (the host's, else `<home>/.local/share`, so the user's image store is found) and
-`PATH=/usr/bin:/bin:/usr/sbin:/sbin`. Podman reads `$HOME/.config/containers/mounts.conf`
-whatever the two settings below say, and copied what it names into `/run/secrets` of every
-container until Task 14's OCI config verifier found it (architect Q118). It also gets:
+`PATH=/usr/bin:/bin:/usr/sbin:/sbin`. Podman builds a container's OCI spec, and with it the
+`mounts.conf` subscriptions, at `init`, not at `create`. Without `--default-mounts-file` on that
+call it reads the first existing file of `$HOME/.config/containers/mounts.conf`,
+`/etc/containers/mounts.conf` and `/usr/share/containers/mounts.conf`. Until Task 14 only
+`create` had the flag, so the user's file was copied into `/run/secrets` of every container;
+the OCI config verifier found it (architect Q118, Q119). It also gets:
 - `CONTAINERS_CONF=<data>/podman/containers.conf`, generated at startup. On Podman 4.9.3 it
   replaces the system file, the user file and their drop-ins; probed in Task 6b.
   `CONTAINERS_CONF_OVERRIDE` would still be read, and it is never passed.
 - `XDG_CONFIG_HOME=<data>/podman/config` (empty), so the user's `storage.conf` and
   `registries.conf` are not read either.
 - `--hooks-dir` naming the empty hooks directory and `--default-mounts-file` naming the empty
-  mounts file, which keep the system `mounts.conf` and hook directories out.
+  mounts file in the checked `create` argv, and the same mounts file as a global flag before
+  the verb on `init` and `start` (`Podman::spec_args`), which keep every `mounts.conf` and the
+  hook directories out. The `default_mounts_file` key of `containers.conf` is ignored on 4.9.3
+  (probed). FIPS mode (`/etc/system-fips`) is not switched off by the flag; such hosts are
+  refused by the verifier (#121).
 
 `home/`, `config/` and `hooks/` are checked private and empty before every launch. Whatever
 podman read, the OCI config verifier (§3.5 step 7) refuses a container whose config holds
@@ -446,7 +453,9 @@ The generated file has no default volumes, devices, capabilities, environment, s
 ulimits, annotations or mounts. Namespaces are private, there is no keyring, events and logs are
 off, and remote is off. The runtime, `conmon` and `catatonit` (`--init`) are explicit paths that
 passed the runtime's ownership checks. The podman binary is resolved once
-(`sandbox.podman_path`, else the first `podman` on `sallyd`'s `PATH`) and gets the same checks.
+(`sandbox.podman_path`, else the first `podman` on `sallyd`'s `PATH`) and gets the same checks
+(root- or user-owned; a first match that fails the checks is an error, later entries are not
+tried).
 Every podman command has its output capped at 64 KiB per stream and is killed after 120 s.
 
 **Consequences.**

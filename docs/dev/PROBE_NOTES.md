@@ -35,6 +35,23 @@ line per fact, with where it was found. Check a note again before relying on it 
   bound read-only. A bare-shell podman without CONTAINERS_CONF did not show it. With `HOME` a
   private empty directory (and `XDG_DATA_HOME` set) it is gone; podman wrote nothing into that
   `HOME` across the sallyd suite (checked empty before every launch). (Task 14, Q118)
+- Why (Task 14, Q119; strace `-f -b execve -e trace=%file` on `podman init`): the spec, and
+  with it the `mounts.conf` subscriptions, is built at `init`, a separate process from `create`;
+  only `create` had `--default-mounts-file`. The bare-shell probe used `podman run`, one
+  process with the flag, which is why it did not show the leak. Cases, create always with the
+  flag: (A) init without the flag, user file present: `/run/secrets/x` mounted
+  (`{"type":"bind","options":["bind","rprivate"]}`, source `<runroot>/…/userdata/run/secrets/x`
+  in a plain container), and only the user file opened: podman reads the first that exists of
+  `$HOME/.config/containers/mounts.conf`, `/etc/containers/mounts.conf`,
+  `/usr/share/containers/mounts.conf`. (B) `default_mounts_file = "<empty>"` in the
+  `CONTAINERS_CONF` file: ignored on 4.9.3, same leak. (C) no user file, no flag: init stats
+  `/etc/…` then `/usr/share/…`; the private `HOME` alone leaves the system files live. (D)
+  `podman --default-mounts-file <empty> init <id>`: no `mounts.conf` touched, no mount. Init
+  also stats `/etc/system-fips` (FIPS subscription), which the flag does not switch off (#121).
+- strace `-f` on `podman init` never returns: it follows conmon after it daemonizes. `-b execve`
+  detaches exec'd children. `sallyd` is not dumpable, so strace cannot read the envp of the
+  `execve` calls it makes; podman is dumpable after exec, so `-e inject=execve:delay_exit=<µs>`
+  holds each new process long enough to read `/proc/<pid>/environ`. (Task 14, Q120)
 - The OCI config, Podman 4.9.3 rootless crun: `capabilities: {}`; rlimits CORE, NOFILE, NPROC
   (the last two podman's own hard limits); hostname = 12-hex short id without `--hostname`;
   `/etc/passwd`, `/etc/group`, `/dev/shm` bind from `<graphroot>/…/userdata`, `/etc/hostname`
