@@ -175,6 +175,25 @@ fn note_of(len: usize) -> Frame {
     Ok((json!({"jsonrpc": "2.0", "method": "approval.closed"}), len))
 }
 
+/// A reply to another request is not this call's; a held note is given back as it came.
+#[test]
+fn a_reply_must_carry_the_calls_id_and_notes_come_back_whole() {
+    let (w, _peer) = UnixStream::pair().unwrap();
+    let (tx, rx) = mpsc::sync_channel(8);
+    let mut c = Client::from_parts(w, rx);
+    let n = json!({"jsonrpc": "2.0", "method": "approval.closed", "params": {"id": "p1"}});
+    tx.send(Ok((n.clone(), 10))).unwrap();
+    tx.send(Ok((json!({"jsonrpc": "2.0", "id": 99, "result": {}}), 10)))
+        .unwrap();
+    assert!(matches!(
+        c.call("sessions.list", json!({})),
+        Err(Error::Unexpected)
+    ));
+    assert_eq!(c.next_note().unwrap(), n);
+    tx.send(Ok((n.clone(), 10))).unwrap();
+    assert_eq!(c.next_note().unwrap(), n, "one taken from the queue too");
+}
+
 /// Architect Q91: a call holds the notifications before its reply up to `NOTES_BYTES`; one
 /// byte more is fatal.
 #[test]

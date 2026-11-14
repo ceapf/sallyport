@@ -219,6 +219,39 @@ fn a_manifest_over_the_cap_is_never_sent() {
     assert!(f.methods().is_empty());
 }
 
+/// A manifest of exactly the cap is read and sent.
+#[test]
+fn a_manifest_at_the_cap_is_sent() {
+    let f = Fake::new("at-cap", |req| result(req, json!({})));
+    let manifest = f.runtime.join("m.yaml");
+    std::fs::write(
+        &manifest,
+        "a".repeat(sally_core::manifest::MAX_MANIFEST_BYTES),
+    )
+    .unwrap();
+    let _ = f.sally(&["session", "start", manifest.to_str().unwrap()]);
+    assert_eq!(f.methods(), ["sessions.create"]);
+}
+
+/// A complete, clean prompt list exits 0; one with a dirty prompt text is printed escaped and
+/// exits 1.
+#[test]
+fn a_dirty_prompt_text_fails_the_listing() {
+    for (tag, text, code) in [
+        ("clean", "approval p1\n", 0),
+        ("dirty", "approval p1\x1b[2J\n", 1),
+    ] {
+        let f = Fake::new(tag, move |req| {
+            let p = json!({"id": "p1", "session": "s-1", "digest": "d", "truncated": false,
+                           "text": text});
+            result(req, json!({"prompts": [p], "complete": true, "total": 1}))
+        });
+        let o = f.sally(&["approvals"]);
+        assert_eq!(o.status.code(), Some(code), "{tag}");
+        assert!(!stdout(&o).contains('\x1b'), "{tag}");
+    }
+}
+
 #[test]
 fn approvals_lists_prompt_text_and_says_when_cut() {
     let f = Fake::new("prompts", |req| {

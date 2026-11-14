@@ -433,6 +433,41 @@ fn a_prompt_without_its_full_text_can_only_be_denied() {
     );
 }
 
+/// A cut prompt can be approved only when its full text came and is clean: one marked
+/// unavailable stays deny-only even if a full text came with it, and a dirty full text makes
+/// it deny-only.
+#[test]
+fn a_cut_prompt_with_an_unusable_full_text_is_deny_only() {
+    for (tag, unavailable, full) in [
+        ("cut-unav", true, "FULL"),
+        ("cut-dirty", false, "FULL\x1b[2J"),
+    ] {
+        let mut p = prompt("p1");
+        p["truncated"] = json!(true);
+        p["full"] = json!(full);
+        p["full_unavailable"] = json!(unavailable);
+        let f = daemon(tag, vec![p], 1);
+        let r = run_with(&f, &["approve", "deny"], None);
+        assert!(!r.shown.contains("approve, deny"), "{tag}: {}", r.shown);
+        assert_eq!(f.decides()[0]["decision"], "deny", "{tag}");
+    }
+}
+
+/// A flood notification is told, its session id clean.
+#[test]
+fn a_flood_is_told() {
+    let mut q = Queue::default();
+    let mut out = Vec::new();
+    q.note(
+        &note("approval.flood", json!({"session": "s-1\x1b"})),
+        &mut out,
+    );
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "session s-1\\x1b is asking too often: its prompts are denied for now\n"
+    );
+}
+
 /// Q80 clean-check: prompt text that is not printable ASCII is shown escaped and can only be
 /// denied.
 #[test]
