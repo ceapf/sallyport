@@ -108,9 +108,10 @@ fn changes_print_escaped_paths_exactly() {
 
 /// RT-FS-15 (architect Q79): a hostile reply with a raw newline and escape sequence in a path is
 /// escaped before it reaches the terminal, and the command fails. Control: the CLI's
-/// clean-check (`clean::line` in `commands::Printer`).
+/// clean-check (`clean::line` in `commands::Printer`). Named `rt_` so `make redteam` runs it
+/// (architect Q92).
 #[test]
-fn a_raw_control_byte_from_the_daemon_is_escaped_and_fails() {
+fn rt_fs_15_a_raw_control_byte_from_the_daemon_is_escaped_and_fails() {
     let f = Fake::new("hostile", |req| {
         result(
             req,
