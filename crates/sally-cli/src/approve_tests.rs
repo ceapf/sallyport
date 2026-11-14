@@ -4,19 +4,25 @@ use std::collections::VecDeque;
 use std::io::{BufReader, Read};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
 
 use super::*;
-use crate::EXIT_FAILED;
+use crate::client::{FRAME_QUEUE, Frame, spawn_reader};
 
-/// What the fake daemon answers one request with: frames to write, then whether to close.
+/// Runs before a terminal read: frames it sends reach the client's queue at once, behind
+/// whatever the reader already queued.
+type Hook = Box<dyn FnMut(&SyncSender<Frame>)>;
+
+/// What the fake daemon answers one request with: frames to write, then whether to close (its
+/// sending side: it still reads, so whatever the client sends after is kept).
 type Handler = Box<dyn FnMut(&Value) -> (Vec<Value>, bool) + Send>;
 
 /// A fake `sallyd` on a Unix socket: one connection, scripted replies, every request kept.
 struct Fake {
     path: PathBuf,
     requests: Arc<Mutex<Vec<Value>>>,
-    stream: Arc<Mutex<Option<UnixStream>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Fake {
@@ -25,38 +31,35 @@ impl Fake {
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let stream: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
-        let (reqs, out) = (Arc::clone(&requests), Arc::clone(&stream));
-        std::thread::spawn(move || {
+        let reqs = Arc::clone(&requests);
+        let thread = std::thread::spawn(move || {
             let (s, _) = listener.accept().unwrap();
-            *out.lock().unwrap() = Some(s.try_clone().unwrap());
+            let mut w = s.try_clone().unwrap();
             for l in BufReader::new(s).lines() {
                 let Ok(l) = l else { return };
                 let req: Value = serde_json::from_str(&l).unwrap();
                 reqs.lock().unwrap().push(req.clone());
                 let (frames, close) = handler(&req);
-                let mut g = out.lock().unwrap();
-                let w = g.as_mut().unwrap();
                 for f in frames {
                     let _ = writeln!(w, "{f}");
                 }
                 if close {
-                    let _ = w.shutdown(std::net::Shutdown::Both);
-                    return;
+                    let _ = w.shutdown(std::net::Shutdown::Write);
                 }
             }
         });
         Self {
             path,
             requests,
-            stream,
+            thread: Some(thread),
         }
     }
 
-    /// Writes `frame` now (a notification out of turn).
-    fn push(&self, frame: &Value) {
-        let mut g = self.stream.lock().unwrap();
-        writeln!(g.as_mut().unwrap(), "{frame}").unwrap();
+    /// Waits until the client has gone and every request it sent is kept.
+    fn join(&mut self) {
+        if let Some(t) = self.thread.take() {
+            t.join().unwrap();
+        }
     }
 
     fn decides(&self) -> Vec<Value> {
@@ -124,7 +127,8 @@ fn daemon(tag: &str, first: Vec<Value>, decides: usize) -> Fake {
 struct Script {
     lines: VecDeque<String>,
     reads: usize,
-    hook: Option<(usize, Box<dyn FnMut()>)>,
+    hook: Option<(usize, Hook)>,
+    queue: SyncSender<Frame>,
 }
 
 impl Read for Script {
@@ -132,7 +136,7 @@ impl Read for Script {
         if let Some((at, h)) = &mut self.hook
             && *at == self.reads
         {
-            h();
+            h(&self.queue);
         }
         self.reads += 1;
         let Some(l) = self.lines.pop_front() else {
@@ -150,12 +154,21 @@ struct Run {
     flushes: usize,
 }
 
-fn run_with(f: &Fake, lines: &[&str], hook: Option<(usize, Box<dyn FnMut()>)>) -> Run {
-    let mut c = Client::connect(&f.path).unwrap();
+/// A client on `f` whose frame queue the hook can also feed.
+fn client(f: &Fake) -> (Client, SyncSender<Frame>) {
+    let s = UnixStream::connect(&f.path).unwrap();
+    let (tx, rx) = mpsc::sync_channel(FRAME_QUEUE);
+    spawn_reader(&s, tx.clone()).unwrap();
+    (Client::from_parts(s, rx), tx)
+}
+
+fn run_with(f: &Fake, lines: &[&str], hook: Option<(usize, Hook)>) -> Run {
+    let (mut c, queue) = client(f);
     let script = Script {
         lines: lines.iter().map(|l| format!("{l}\n")).collect(),
         reads: 0,
         hook,
+        queue,
     };
     let mut input = BufReader::with_capacity(4096, script);
     let mut shown = Vec::new();
@@ -228,42 +241,143 @@ fn end_of_input_denies_the_prompt_on_screen() {
     assert!(r.shown.contains("denied p1"), "{}", r.shown);
 }
 
-/// Q80.6: a line typed while the prompt on screen closed is never applied to the next prompt.
+fn queued(frame: &Value) -> Frame {
+    Ok((frame.clone(), frame.to_string().len()))
+}
+
+/// Q80.6: a line typed while the prompt on screen closed is discarded: never sent for it, never
+/// applied to the next prompt.
 #[test]
 fn a_line_for_a_closed_prompt_is_not_applied_to_the_next() {
-    let f = Arc::new(Fake::new(
-        "closed",
-        Box::new(|req| match req["method"].as_str().unwrap() {
-            "approvals.watch" => (vec![ok(req, list(&[prompt("p1")], true))], false),
-            "approvals.decide" if req["params"]["id"] == "p1" => {
-                let refused = json!({"code": -32000, "message": "Server error",
-                                     "data": {"reason": "unknown-id"}});
-                (
-                    vec![json!({"jsonrpc": "2.0", "id": req["id"], "error": refused})],
-                    false,
-                )
-            }
-            _ => (vec![ok(req, json!({}))], true),
-        }),
-    ));
-    let fake = Arc::clone(&f);
-    let hook: Box<dyn FnMut()> = Box::new(move || {
-        fake.push(&note("approval.closed", json!({"id": "p1"})));
-        fake.push(&note("approval.requested", prompt("p2")));
+    let f = daemon("closed", vec![prompt("p1")], 1);
+    let hook: Hook = Box::new(|q| {
+        q.send(queued(&note("approval.closed", json!({"id": "p1"}))))
+            .unwrap();
+        q.send(queued(&note("approval.requested", prompt("p2"))))
+            .unwrap();
     });
     let r = run_with(&f, &["approve", "deny"], Some((0, hook)));
-    assert_eq!(r.code, EXIT_FAILED);
-    let decides = f.decides();
-    let for_p2: Vec<_> = decides.iter().filter(|d| d["id"] == "p2").collect();
-    assert_eq!(for_p2.len(), 1, "{decides:?}");
-    assert_eq!(
-        for_p2[0]["decision"], "deny",
-        "the first line went to p1 only"
-    );
+    assert_eq!(r.code, EXIT_FAILED, "the daemon closed after the decision");
     assert!(
-        decides
-            .iter()
-            .all(|d| d["id"] != "p2" || d["decision"] != "approve")
+        r.shown.contains("that prompt closed meanwhile"),
+        "{}",
+        r.shown
+    );
+    assert_eq!(
+        f.decides(),
+        [json!({"id": "p2", "decision": "deny", "digest": "d-p2", "full_shown": false})],
+        "nothing for p1; the first line was not p2's"
+    );
+}
+
+/// Q91: the connection ending while a question is shown sends nothing for the line typed,
+/// says so in one line, and exits non-zero.
+#[test]
+fn a_lost_connection_sends_nothing_for_the_line_typed() {
+    let f = daemon("lost", vec![prompt("p1")], 9);
+    let hook: Hook = Box::new(|q| q.send(Err(Error::Closed)).unwrap());
+    let (mut c, queue) = client(&f);
+    let mut input = BufReader::new(Script {
+        lines: VecDeque::from(["approve\n".to_owned()]),
+        reads: 0,
+        hook: Some((0, hook)),
+        queue,
+    });
+    let (mut shown, mut err) = (Vec::new(), Vec::new());
+    let mut flush = || {};
+    let code = approve(
+        &mut c,
+        &mut Tty {
+            input: &mut input,
+            output: &mut shown,
+            flush: &mut flush,
+        },
+        &mut err,
+    );
+    assert_eq!(code, EXIT_FAILED);
+    assert!(f.decides().is_empty(), "{:?}", f.decides());
+    let err = String::from_utf8(err).unwrap();
+    assert_eq!(err.lines().count(), 1, "{err}");
+    assert!(err.contains("prompts still pending are denied"), "{err}");
+}
+
+/// Q91: requested and closed prompts leave nothing behind but the one on screen.
+#[test]
+fn closed_prompts_leave_the_queue_empty() {
+    let mut q = Queue::default();
+    let mut out = Vec::new();
+    q.on_screen = Some("p0".to_owned());
+    for i in 0..1000 {
+        let id = format!("p{i}");
+        q.note(&note("approval.requested", prompt(&id)), &mut out);
+        q.note(&note("approval.closed", json!({"id": id})), &mut out);
+    }
+    assert!(q.seen.is_empty() && q.waiting.is_empty());
+    assert!(q.on_screen_closed, "the one on screen is known closed");
+}
+
+/// Rust review L3: a cut list is listed again only after something was answered or closed, not
+/// in a loop when a new list brings nothing new.
+#[test]
+fn a_cut_list_is_listed_again_only_after_progress() {
+    // The watch lists p1 of a cut list; the deny is not taken (p1 stays pending); the one
+    // re-list brings only p1 again. The approver then waits for a note, which ends it once
+    // that re-list is kept. A loop would have sent more lists by then.
+    let mut f = Fake::new(
+        "relist-progress",
+        Box::new(move |req| match req["method"].as_str().unwrap() {
+            "approvals.watch" => (vec![ok(req, list(&[prompt("p1")], false))], false),
+            "approvals.decide" => {
+                let refused = json!({"code": -32000, "message": "Server error",
+                                     "data": {"reason": "digest-mismatch"}});
+                let e = json!({"jsonrpc": "2.0", "id": req["id"], "error": refused});
+                (vec![e], false)
+            }
+            _ => (vec![ok(req, list(&[prompt("p1")], false))], false),
+        }),
+    );
+    let (mut c, queue) = client(&f);
+    let (requests, end) = (Arc::clone(&f.requests), queue.clone());
+    let ender = std::thread::spawn(move || {
+        for _ in 0..500 {
+            let listed = requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r["method"] == "approvals.list");
+            if listed {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let _ = end.send(Err(Error::Closed));
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("never listed again");
+    });
+    let mut input = BufReader::new(Script {
+        lines: VecDeque::from(["deny\n".to_owned()]),
+        reads: 0,
+        hook: None,
+        queue,
+    });
+    let (mut shown, mut err) = (Vec::new(), Vec::new());
+    let mut flush = || {};
+    let mut tty = Tty {
+        input: &mut input,
+        output: &mut shown,
+        flush: &mut flush,
+    };
+    let code = approve(&mut c, &mut tty, &mut err);
+    ender.join().unwrap();
+    drop(c);
+    f.join();
+    assert_eq!(code, EXIT_FAILED);
+    let shown = String::from_utf8(shown).unwrap();
+    assert!(shown.contains("not taken: digest-mismatch"), "{shown}");
+    assert_eq!(
+        f.methods(),
+        ["approvals.watch", "approvals.decide", "approvals.list"],
+        "listed again once, not in a loop"
     );
 }
 

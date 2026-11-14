@@ -107,7 +107,9 @@ fn run(cmd: Cmd) -> u8 {
             let (Ok(r), Ok(mut w)) = (tty.try_clone(), tty.try_clone()) else {
                 return EXIT_FAILED;
             };
-            let mut input = BufReader::new(r);
+            // One byte at a time: a read never takes input past the answer's newline, so
+            // nothing typed ahead waits in a buffer that tcflush cannot reach.
+            let mut input = BufReader::with_capacity(1, r);
             let mut flush = || {
                 let _ = rustix::termios::tcflush(&tty, rustix::termios::QueueSelector::IFlush);
             };

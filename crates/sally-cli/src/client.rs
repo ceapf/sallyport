@@ -2,18 +2,39 @@
 //! that the socket's owner is this user (a socket someone else bound gets nothing). A reader
 //! thread reads every frame under [`MAX_FRAME`](sally_proto::MAX_FRAME); a longer one is fatal.
 //! Replies come back to the call that sent the request; notifications wait in a queue.
+//!
+//! What the client holds unread is bounded (architect Q91). The reader hands frames over
+//! through a queue of [`FRAME_QUEUE`] frames and stops reading when it is full, so at most
+//! `FRAME_QUEUE + 1` frames (`(FRAME_QUEUE + 1) × MAX_FRAME` bytes) wait in the client. Then
+//! the socket fills and sallyd drops a watcher that does not read (its watch channel is full,
+//! or a write blocks past its timeout): its prompts end `no-approver` or by timeout, both
+//! denials. The notifications a `call` passes on the way to its reply are held under
+//! [`NOTES_BYTES`]; more is fatal ([`Error::Behind`]).
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write as _};
+use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 
 use sally_proto::{ErrorData, MAX_FRAME};
 use serde_json::{Value, json};
 
 /// The socket under `$XDG_RUNTIME_DIR`.
 pub const SOCKET: &str = "sallyport/control.sock";
+
+/// Frames read but not yet taken: the reader waits when this many are queued (architect Q91).
+/// TODO(#112): fold requested/closed pairs instead, so a busy session cannot get a reading
+/// approver dropped.
+pub const FRAME_QUEUE: usize = 8;
+
+/// Bytes of notifications a `call` may hold while it waits for its reply. Thousands of small
+/// `approval.closed` frames fit, as do a few full prompts.
+pub const NOTES_BYTES: usize = 16 << 20;
+
+/// One frame from the reader: the frame and its length on the wire, or why reading ended.
+pub(crate) type Frame = Result<(Value, usize), Error>;
 
 /// Why a call did not get a result.
 #[derive(Debug, thiserror::Error)]
@@ -42,6 +63,9 @@ pub enum Error {
     /// The connection ended.
     #[error("sallyd closed the connection")]
     Closed,
+    /// More notifications arrived before a reply than the client holds.
+    #[error("over {NOTES_BYTES} bytes of notifications arrived before a reply")]
+    Behind,
     /// A frame longer than the cap arrived.
     #[error("sallyd sent a frame over {MAX_FRAME} bytes")]
     TooLarge,
@@ -65,11 +89,42 @@ pub fn socket_path() -> Result<PathBuf, Error> {
         .ok_or(Error::NoRuntimeDir)
 }
 
-/// One connection to `sallyd`.
+/// What one frame from `sallyd` is.
+#[derive(Debug)]
+pub enum Decoded {
+    /// The reply to request `id`: its result or its refusal.
+    Reply {
+        /// The request's id.
+        id: Value,
+        /// The result, or why there is none.
+        result: Result<Value, Error>,
+    },
+    /// A notification.
+    Note(Value),
+}
+
+/// Splits a frame into a reply or a notification; anything else is [`Error::Unexpected`].
+///
+/// # Errors
+/// [`Error::Unexpected`].
+pub fn decode(frame: Value) -> Result<Decoded, Error> {
+    match frame.get("id") {
+        Some(id) => Ok(Decoded::Reply {
+            id: id.clone(),
+            result: reply(&frame),
+        }),
+        None if frame.get("method").is_some() => Ok(Decoded::Note(frame)),
+        None => Err(Error::Unexpected),
+    }
+}
+
+/// One connection to `sallyd`. Dropping it shuts the socket down, which also ends the reader
+/// thread, so a dropped watcher stops counting as attached at once.
 pub struct Client {
     w: UnixStream,
-    frames: Receiver<Result<Value, Error>>,
-    notes: VecDeque<Value>,
+    frames: Receiver<Frame>,
+    notes: VecDeque<(Value, usize)>,
+    notes_bytes: usize,
     next: i64,
 }
 
@@ -87,21 +142,27 @@ impl Client {
             .ok()
             .map(|c| c.uid.as_raw());
         check_owner(owner, rustix::process::getuid().as_raw())?;
-        let r = s.try_clone()?;
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || read_frames(BufReader::new(r), &tx));
-        Ok(Self {
-            w: s,
-            frames: rx,
+        let (tx, rx) = mpsc::sync_channel(FRAME_QUEUE);
+        spawn_reader(&s, tx)?;
+        Ok(Self::from_parts(s, rx))
+    }
+
+    /// A client writing to `w` and taking frames from `frames` (tests feed it their own).
+    pub(crate) fn from_parts(w: UnixStream, frames: Receiver<Frame>) -> Self {
+        Self {
+            w,
+            frames,
             notes: VecDeque::new(),
+            notes_bytes: 0,
             next: 1,
-        })
+        }
     }
 
     /// Calls `method` and waits for its reply; notifications that arrive first are queued.
     ///
     /// # Errors
-    /// [`Error::Refused`] for an error reply; the others when the connection fails.
+    /// [`Error::Refused`] for an error reply; [`Error::Behind`] when over [`NOTES_BYTES`] of
+    /// notifications came first; the others when the connection fails.
     pub fn call(&mut self, method: &str, params: Value) -> Result<Value, Error> {
         let id = self.next;
         self.next = self.next.wrapping_add(1);
@@ -110,13 +171,29 @@ impl Client {
         line.push(b'\n');
         self.w.write_all(&line)?;
         loop {
-            let frame = self.frames.recv().map_err(|_| Error::Closed)??;
-            match frame.get("id") {
-                None => self.notes.push_back(frame),
-                Some(v) if *v == json!(id) => return reply(frame),
-                Some(_) => return Err(Error::Unexpected),
+            let (frame, len) = self.frames.recv().map_err(|_| Error::Closed)??;
+            match decode(frame)? {
+                Decoded::Note(n) => self.hold(n, len)?,
+                Decoded::Reply { id: got, result } if got == json!(id) => return result,
+                Decoded::Reply { .. } => return Err(Error::Unexpected),
             }
         }
+    }
+
+    fn hold(&mut self, note: Value, len: usize) -> Result<(), Error> {
+        let held = self.notes_bytes.saturating_add(len);
+        if held > NOTES_BYTES {
+            return Err(Error::Behind);
+        }
+        self.notes_bytes = held;
+        self.notes.push_back((note, len));
+        Ok(())
+    }
+
+    fn held(&mut self) -> Option<Value> {
+        let (n, len) = self.notes.pop_front()?;
+        self.notes_bytes = self.notes_bytes.saturating_sub(len);
+        Some(n)
     }
 
     /// The next notification, waiting for one.
@@ -124,11 +201,11 @@ impl Client {
     /// # Errors
     /// The connection failed, or a reply arrived that no call asked for.
     pub fn next_note(&mut self) -> Result<Value, Error> {
-        if let Some(n) = self.notes.pop_front() {
+        if let Some(n) = self.held() {
             return Ok(n);
         }
-        let frame = self.frames.recv().map_err(|_| Error::Closed)??;
-        note(frame)
+        let (frame, _) = self.frames.recv().map_err(|_| Error::Closed)??;
+        only_note(frame)
     }
 
     /// The next notification if one has arrived.
@@ -136,15 +213,30 @@ impl Client {
     /// # Errors
     /// As [`Client::next_note`].
     pub fn try_note(&mut self) -> Result<Option<Value>, Error> {
-        if let Some(n) = self.notes.pop_front() {
+        if let Some(n) = self.held() {
             return Ok(Some(n));
         }
         match self.frames.try_recv() {
-            Ok(frame) => note(frame?).map(Some),
+            Ok(frame) => only_note(frame?.0).map(Some),
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => Err(Error::Closed),
         }
     }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        // The reader thread holds a clone of the socket: closing only this fd would leave the
+        // connection open (and a watch attached) until sallyd ends it.
+        let _ = self.w.shutdown(Shutdown::Both);
+    }
+}
+
+/// Starts the thread that reads `s` into `tx`.
+pub(crate) fn spawn_reader(s: &UnixStream, tx: SyncSender<Frame>) -> Result<(), Error> {
+    let r = s.try_clone()?;
+    std::thread::spawn(move || read_frames(BufReader::new(r), &tx));
+    Ok(())
 }
 
 /// The socket's owner must be this user.
@@ -156,15 +248,14 @@ fn check_owner(owner: Option<u32>, me: u32) -> Result<(), Error> {
     }
 }
 
-fn note(frame: Value) -> Result<Value, Error> {
-    if frame.get("id").is_none() && frame.get("method").is_some() {
-        Ok(frame)
-    } else {
-        Err(Error::Unexpected)
+fn only_note(frame: Value) -> Result<Value, Error> {
+    match decode(frame)? {
+        Decoded::Note(n) => Ok(n),
+        Decoded::Reply { .. } => Err(Error::Unexpected),
     }
 }
 
-fn reply(frame: Value) -> Result<Value, Error> {
+fn reply(frame: &Value) -> Result<Value, Error> {
     if let Some(result) = frame.get("result") {
         return Ok(result.clone());
     }
@@ -177,16 +268,20 @@ fn reply(frame: Value) -> Result<Value, Error> {
     Err(Error::Refused(data))
 }
 
-/// Reads frames until the stream ends or one fails; the last item sent is the failure.
-fn read_frames<R: BufRead>(mut r: R, tx: &Sender<Result<Value, Error>>) {
+/// Reads frames until the stream ends or one fails, waiting while `tx` is full; the last item
+/// sent says why reading ended (the end of the stream is [`Error::Closed`]). Returns once the
+/// client is gone.
+fn read_frames<R: BufRead>(mut r: R, tx: &SyncSender<Frame>) {
     loop {
         let item = match read_frame(&mut r, MAX_FRAME) {
-            Ok(Some(bytes)) => serde_json::from_slice(&bytes).map_err(|_| Error::Unexpected),
-            Ok(None) => return,
+            Ok(Some(bytes)) => serde_json::from_slice(&bytes)
+                .map(|v| (v, bytes.len()))
+                .map_err(|_| Error::Unexpected),
+            Ok(None) => Err(Error::Closed),
             Err(e) => Err(e),
         };
-        let failed = item.is_err();
-        if tx.send(item).is_err() || failed {
+        let last = item.is_err();
+        if tx.send(item).is_err() || last {
             return;
         }
     }
@@ -223,58 +318,5 @@ pub fn read_frame<R: BufRead>(r: &mut R, max: usize) -> Result<Option<Vec<u8>>, 
 }
 
 #[cfg(test)]
-mod tests {
-    #![allow(clippy::unwrap_used)]
-
-    use super::*;
-
-    #[test]
-    fn only_this_users_socket_is_spoken_to() {
-        assert!(check_owner(Some(1000), 1000).is_ok());
-        assert!(matches!(
-            check_owner(Some(0), 1000),
-            Err(Error::Owner { owner: Some(0) })
-        ));
-        assert!(matches!(
-            check_owner(None, 1000),
-            Err(Error::Owner { owner: None })
-        ));
-    }
-
-    #[test]
-    fn frames_are_read_up_to_the_cap_and_never_past_it() {
-        let mut r = BufReader::with_capacity(4, &b"abc\nabcd\nabcde\n"[..]);
-        assert_eq!(read_frame(&mut r, 4).unwrap(), Some(b"abc".to_vec()));
-        assert_eq!(read_frame(&mut r, 4).unwrap(), Some(b"abcd".to_vec()));
-        assert!(matches!(read_frame(&mut r, 4), Err(Error::TooLarge)));
-        let mut end = &b""[..];
-        assert_eq!(read_frame(&mut end, 4).unwrap(), None);
-        let mut cut = &b"ab"[..];
-        assert!(matches!(read_frame(&mut cut, 4), Err(Error::Closed)));
-    }
-
-    #[test]
-    fn a_reply_is_its_result_or_its_error_data() {
-        assert_eq!(
-            reply(json!({"id": 1, "result": {"a": 1}})).unwrap(),
-            json!({"a": 1})
-        );
-        let refused = reply(json!({"id": 1, "error": {"code": -32000, "data": {"reason": "r"}}}));
-        assert!(matches!(refused, Err(Error::Refused(d)) if d.reason == "r"));
-        assert!(matches!(reply(json!({"id": 1})), Err(Error::Unexpected)));
-        assert!(matches!(
-            note(json!({"id": 1, "method": "m"})),
-            Err(Error::Unexpected)
-        ));
-        assert!(matches!(
-            note(json!({"params": {}})),
-            Err(Error::Unexpected)
-        ));
-        assert!(note(json!({"method": "m"})).is_ok());
-    }
-
-    #[test]
-    fn the_socket_is_under_the_runtime_dir() {
-        assert_eq!(SOCKET, "sallyport/control.sock");
-    }
-}
+#[path = "client_tests.rs"]
+mod tests;

@@ -9,16 +9,18 @@
 //!   sent, or whose text failed the clean-check, can only be denied.
 //! - The terminal closing (end of input) or failing denies the prompt on screen, and `sally`
 //!   exits non-zero.
+//! - The connection ending (sallyd stopped, or dropped this approver for falling behind; architect
+//!   Q91) is told in one line, and `sally` exits non-zero: the prompts still pending are denied.
 
 use std::collections::{HashSet, VecDeque};
 use std::io::{BufRead, Write};
 
-use sally_proto::{Prompt, Prompts, method, notification};
+use sally_proto::{Closed, Flood, Prompt, Prompts, method, notification};
 use serde_json::{Value, json};
 
 use crate::client::{Client, Error};
 use crate::commands::failed;
-use crate::{EXIT_REFUSED, clean};
+use crate::{EXIT_FAILED, EXIT_REFUSED, clean};
 
 /// The terminal: where prompts are shown and answers read.
 pub struct Tty<'a> {
@@ -62,28 +64,42 @@ pub fn parse_answer(line: &str, deny_only: bool) -> Option<Answer> {
     }
 }
 
-/// The prompts still to ask about, de-duplicated by id (architect Q73.4).
+/// The prompts still to ask about, de-duplicated by id (architect Q73.4). It holds only live
+/// prompts: a closed one leaves `seen` too (sallyd removes a prompt before it tells the close
+/// and never reuses an id, so no later list or notification carries it again).
 #[derive(Default)]
 struct Queue {
     waiting: VecDeque<Prompt>,
     seen: HashSet<String>,
-    closed: HashSet<String>,
-    /// The last list was cut: list again once the queue is empty (architect Q84).
+    /// The prompt on screen, and whether it closed while it was asked about.
+    on_screen: Option<String>,
+    on_screen_closed: bool,
+    /// The last list was cut: list again once the queue is empty (architect Q84) ...
     cut: bool,
+    /// ... and something was answered or closed since, so a new list can differ.
+    progress: bool,
 }
 
 impl Queue {
     fn add(&mut self, p: Prompt) {
-        if !self.closed.contains(&p.id) && self.seen.insert(p.id.clone()) {
+        if self.seen.insert(p.id.clone()) {
             self.waiting.push_back(p);
         }
     }
 
     fn listed(&mut self, all: Prompts) {
         self.cut = !all.complete;
+        self.progress = false;
         for p in all.prompts {
             self.add(p);
         }
+    }
+
+    fn closed(&mut self, id: &str) {
+        self.seen.remove(id);
+        self.waiting.retain(|p| p.id != id);
+        self.on_screen_closed |= self.on_screen.as_deref() == Some(id);
+        self.progress = true;
     }
 
     /// Takes in one notification; a flood is told on `out`.
@@ -96,14 +112,14 @@ impl Queue {
                 }
             }
             Some(notification::APPROVAL_CLOSED) => {
-                if let Some(id) = params.get("id").and_then(Value::as_str) {
-                    self.closed.insert(id.to_owned());
-                    self.waiting.retain(|p| p.id != id);
+                if let Ok(c) = serde_json::from_value::<Closed>(params) {
+                    self.closed(&c.id);
                 }
             }
             Some(notification::APPROVAL_FLOOD) => {
-                let s = params.get("session").and_then(Value::as_str).unwrap_or("");
-                let s = clean::line(s).text;
+                let s = serde_json::from_value::<Flood>(params)
+                    .map_or_else(|_| String::new(), |f| f.session);
+                let s = clean::line(&s).text;
                 let _ = writeln!(
                     out,
                     "session {s} is asking too often: its prompts are denied for now"
@@ -118,6 +134,14 @@ impl Queue {
 pub fn approve(c: &mut Client, tty: &mut Tty<'_>, err: &mut dyn Write) -> u8 {
     match run(c, tty) {
         Ok(code) => code,
+        Err(Error::Closed | Error::Behind) => {
+            let _ = writeln!(
+                err,
+                "sally: lost sallyd (it stopped, or this approver fell behind); \
+                 prompts still pending are denied"
+            );
+            EXIT_FAILED
+        }
         Err(e) => failed(&e, err),
     }
 }
@@ -130,7 +154,7 @@ fn run(c: &mut Client, tty: &mut Tty<'_>) -> Result<u8, Error> {
             q.note(&n, tty.output);
         }
         let Some(p) = q.waiting.pop_front() else {
-            if q.cut {
+            if q.cut && q.progress {
                 q.listed(prompts(c.call(method::APPROVALS_LIST, json!({}))?)?);
             } else {
                 let n = c.next_note()?;
@@ -138,7 +162,12 @@ fn run(c: &mut Client, tty: &mut Tty<'_>) -> Result<u8, Error> {
             }
             continue;
         };
-        if let Some(code) = ask(c, tty, &mut q, &p)? {
+        q.on_screen = Some(p.id.clone());
+        q.on_screen_closed = false;
+        let asked = ask(c, tty, &mut q, &p);
+        q.on_screen = None;
+        q.progress = true;
+        if let Some(code) = asked? {
             return Ok(code);
         }
     }
@@ -192,7 +221,7 @@ fn ask(c: &mut Client, tty: &mut Tty<'_>, q: &mut Queue, p: &Prompt) -> Result<O
         while let Some(n) = c.try_note()? {
             q.note(&n, tty.output);
         }
-        if q.closed.contains(&p.id) {
+        if q.on_screen_closed {
             let _ = writeln!(
                 tty.output,
                 "that prompt closed meanwhile; the answer was not used"
