@@ -490,16 +490,16 @@ impl Launcher {
         let container = container_id(&out)?;
         let (init_pid, init_dir, observed) =
             match self.checked_start(req, scan, &container, &intent).await {
-            Ok(init) => init,
-            Err(e) => {
-                // The container may have run long enough to open a tunnel: stop the listener
-                // in order, so every `egress.allow` gets its `egress.close`.
-                if let Some(h) = egress {
-                    h.shutdown().await;
+                Ok(init) => init,
+                Err(e) => {
+                    // The container may have run long enough to open a tunnel: stop the listener
+                    // in order, so every `egress.allow` gets its `egress.close`.
+                    if let Some(h) = egress {
+                        h.shutdown().await;
+                    }
+                    return Err(e);
                 }
-                return Err(e);
-            }
-        };
+            };
         let running = Running {
             container,
             name,
