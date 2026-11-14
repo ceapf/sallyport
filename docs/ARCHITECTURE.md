@@ -117,6 +117,7 @@ flowchart LR
   podman/                     # 0700: hermetic podman (#11, §3.5)
   podman/containers.conf      #   generated at startup; CONTAINERS_CONF of every podman call
   podman/config/              #   empty; XDG_CONFIG_HOME of every podman call
+  podman/home/                #   empty; HOME of every podman call (Task 14, Q118)
   podman/hooks/               #   empty; --hooks-dir of every podman call
   podman/mounts.conf          #   empty; --default-mounts-file of every podman call
   logs/
@@ -411,17 +412,23 @@ keeps its claims and the caller gets the handle back to retry. Otherwise teardow
 container's user namespace), removes the socket directory, keeps `stage/`, and releases the
 overlap claims.
 
-**Hermetic podman** (#11). Every podman process gets a cleared environment plus `HOME`,
-`XDG_RUNTIME_DIR`, `XDG_DATA_HOME` (when set) and `PATH=/usr/bin:/bin:/usr/sbin:/sbin`. It also
-gets:
+**Hermetic podman** (#11). Every podman process gets a cleared environment plus
+`HOME=<data>/podman/home` (empty, never the user's home), the host's `XDG_RUNTIME_DIR`,
+`XDG_DATA_HOME` (the host's, else `<home>/.local/share`, so the user's image store is found) and
+`PATH=/usr/bin:/bin:/usr/sbin:/sbin`. Podman reads `$HOME/.config/containers/mounts.conf`
+whatever the two settings below say, and copied what it names into `/run/secrets` of every
+container until Task 14's OCI config verifier found it (architect Q118). It also gets:
 - `CONTAINERS_CONF=<data>/podman/containers.conf`, generated at startup. On Podman 4.9.3 it
   replaces the system file, the user file and their drop-ins; probed in Task 6b.
   `CONTAINERS_CONF_OVERRIDE` would still be read, and it is never passed.
-- `XDG_CONFIG_HOME=<data>/podman/config` (empty), so the user's `storage.conf`, `mounts.conf` and
+- `XDG_CONFIG_HOME=<data>/podman/config` (empty), so the user's `storage.conf` and
   `registries.conf` are not read either.
 - `--hooks-dir` naming the empty hooks directory and `--default-mounts-file` naming the empty
-  mounts file. Rootless podman reads `mounts.conf` through that flag; the `containers.conf` key
-  had no effect when probed in Task 6b.
+  mounts file, which keep the system `mounts.conf` and hook directories out.
+
+`home/`, `config/` and `hooks/` are checked private and empty before every launch. Whatever
+podman read, the OCI config verifier (§3.5 step 7) refuses a container whose config holds
+anything the argv did not ask for.
 
 The generated file has no default volumes, devices, capabilities, environment, sysctls,
 ulimits, annotations or mounts. Namespaces are private, there is no keyring, events and logs are

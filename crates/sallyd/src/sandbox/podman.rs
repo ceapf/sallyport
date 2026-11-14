@@ -9,10 +9,17 @@
 //!   replaces (does not merge with) every system and user file on Podman 4.9.3 (probed in
 //!   Task 6b); `CONTAINERS_CONF_OVERRIDE` is never passed;
 //! - `XDG_CONFIG_HOME` pointing at an empty directory of that state directory, so the user's
-//!   `~/.config/containers/{storage,mounts,registries}.conf` are not read either;
+//!   `~/.config/containers/{storage,registries}.conf` are not read either;
+//! - `HOME` pointing at another empty directory of it (`home/`), with `XDG_DATA_HOME` always set
+//!   so the image store stays the user's: podman reads `$HOME/.config/containers/mounts.conf`
+//!   whatever `XDG_CONFIG_HOME` and `--default-mounts-file` say, and copied what it names into
+//!   `/run/secrets` of every container (found by the OCI config verifier in Task 14, architect
+//!   Q118; the Task 6b probe that said otherwise was wrong);
 //! - `--hooks-dir` naming an empty Sallyport-owned directory and `--default-mounts-file` naming
-//!   an empty Sallyport-owned file (both in the checked argv; the rootless `mounts.conf` is read
-//!   through the flag, not through `containers.conf`, probed in Task 6b);
+//!   an empty Sallyport-owned file (both in the checked argv), which keep the system
+//!   `mounts.conf` and hook directories out;
+//! - the OCI config verifier (`sandbox::oci`), which refuses a container whose generated config
+//!   holds anything the argv did not ask for, whatever podman read;
 //! - a podman binary resolved once to an absolute path with the runtime's ownership checks.
 
 use std::ffi::{OsStr, OsString};
