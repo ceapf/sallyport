@@ -620,7 +620,7 @@ impl Launcher {
             })
             .collect();
         blocking(move || Ok(scan.recheck_host(&v)?)).await?;
-        self.run("init", [OsString::from("init"), container.into()])
+        self.run("init", self.podman.spec_args("init", container))
             .await?;
         let pid = self.init_pid(container).await?;
         let (dir, observed) = blocking(move || {
@@ -642,7 +642,7 @@ impl Launcher {
         .await?;
         // Task 14 (architect Q99): last before start, so the config read is the one started.
         self.verify_config(container, intent).await?;
-        self.run("start", [OsString::from("start"), container.into()])
+        self.run("start", self.podman.spec_args("start", container))
             .await?;
         tokio::time::sleep(START_GRACE).await;
         self.confirm_running(container, pid).await?;

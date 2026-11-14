@@ -865,6 +865,33 @@ fn mounts_are_exactly_the_intended_set() {
     });
 }
 
+/// The `oci_config` fuzz target's seed is a config the verifier accepts for this fixture (the
+/// target's fixture is the same), so the fuzzer starts from the accepting path.
+#[test]
+fn the_fuzz_seed_is_an_accepted_config() {
+    let seed = include_bytes!("../../../../../fuzz/corpus/oci_config/good.json");
+    verify(seed, &intent(), &facts()).unwrap();
+}
+
+/// A mount podman adds of its own accord is refused whatever reached it: a `mounts.conf`
+/// subscription (user, `/etc/containers` or `/usr/share/containers`), in exactly the shape
+/// Podman 4.9.3 writes (probed in Task 14: a copy in the run directory, bound `bind,rprivate`),
+/// and a FIPS-mode host's `system-fips` file (such hosts: #121).
+#[test]
+fn a_subscription_mount_podman_adds_is_refused() {
+    let run = facts().paths.run_dir;
+    for name in ["x", "system-fips"] {
+        let dest = format!("/run/secrets/{name}");
+        let source = format!("{run}/run/secrets/{name}");
+        let m = refused(&format!("mounts[{dest}]"), |v| {
+            v["mounts"].as_array_mut().unwrap().push(json!({
+                "destination": dest, "type": "bind", "source": source,
+                "options": ["bind", "rprivate"]}));
+        });
+        assert_eq!(m.why, "not intended");
+    }
+}
+
 #[test]
 fn each_mount_has_exactly_its_type_source_and_options() {
     let set = |dest: &'static str, key: &'static str, val: Value| {

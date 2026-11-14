@@ -406,17 +406,6 @@ impl Lx {
         Self::build(None, None, None, DiskFloor::default(), Some(io_lock(false)))
     }
 
-    /// `podman_home`: the `$HOME` hermetic podman is given (default: the real one).
-    pub fn with_home(podman_home: Option<PathBuf>) -> Self {
-        Self::build(
-            podman_home,
-            None,
-            None,
-            DiskFloor::default(),
-            Some(io_lock(false)),
-        )
-    }
-
     /// `runtime`: the OCI runtime podman is given (default: [`test_runtime`]).
     pub fn with_runtime(runtime: &Path) -> Self {
         Self::build(
@@ -431,9 +420,18 @@ impl Lx {
     /// `wrap` turns the real podman binary into the one the launcher runs (a test wrapper that
     /// ends by running the real one). It bypasses `resolve_podman`'s trust check, so test-only.
     pub fn with_podman(wrap: impl FnOnce(&Path) -> PathBuf) -> Self {
+        Self::with_home_and_podman(None, wrap)
+    }
+
+    /// [`with_podman`](Self::with_podman), and `podman_home` as the host `$HOME` hermetic podman
+    /// is set up from (default: the real one).
+    pub fn with_home_and_podman(
+        podman_home: Option<PathBuf>,
+        wrap: impl FnOnce(&Path) -> PathBuf,
+    ) -> Self {
         let real = resolve_podman(None, std::env::var_os("PATH").as_deref()).unwrap();
         Self::build(
-            None,
+            podman_home,
             None,
             Some(wrap(&real)),
             DiskFloor::default(),
