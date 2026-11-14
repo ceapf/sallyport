@@ -5,7 +5,9 @@
 //! Every request is recorded before its effect: one that is never admitted (a frame error, an
 //! unknown method, invalid params) as `rpc.deny`; an admitted one as `rpc.request` with the
 //! client's uid and pid from `SO_PEERCRED` (architect Q76). An entry that cannot be written
-//! closes the connection with no effect and no reply.
+//! closes the connection with no effect and no reply. The one exception (architect Q93 ii):
+//! `approvals.decide` answers `audit-failed` when the desk's own entry could not be written;
+//! nothing was approved and a `deny_all_session` latch stays (the maintainer's Task 11 rule).
 //!
 //! A connection that called `approvals.watch` also receives `approval.*` notifications between
 //! its replies; the read in progress is kept across them, so none splits a frame. A watching
@@ -19,7 +21,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use rustix::fd::OwnedFd;
 use sally_core::audit::Actor;
 use sally_core::manifest::{HostEnv, SecretCatalog};
-use sally_proto::notification;
+use sally_proto::{Closed, Flood, notification};
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -27,7 +29,7 @@ use tokio::sync::watch;
 
 use super::agent::{WRITE_TIMEOUT, error_object, failure, line, success};
 use super::control_methods::{
-    Call, Done, NotAdmitted, READ_BURST, READ_RATE, REFUSED, SessionSet, prompt,
+    Call, Done, NotAdmitted, READ_BURST, READ_RATE, REFUSED, SessionSet, prompt, value,
 };
 use super::frame::{self, Frame};
 use super::listen::{self, Peer, Server, until_true};
@@ -189,7 +191,7 @@ impl<S: SessionSet> Control<S> {
                 return self.deny(Some(&method), reason).await.then_some(reply);
             }
         };
-        if call.rated() && !self.wait_rate().await {
+        if call.rated(conn.watch.is_some()) && !self.wait_rate().await {
             return None;
         }
         if !self.request(&call, conn.client).await {
@@ -283,19 +285,24 @@ async fn next_note(watch: &mut Option<Watch>) -> Option<Note> {
 /// A notification as one frame.
 pub(crate) fn notify(note: &Note) -> Vec<u8> {
     let (method, params) = match note {
-        Note::Requested(p) => (
-            notification::APPROVAL_REQUESTED,
-            serde_json::to_value(prompt(p)).unwrap_or(Value::Null),
+        Note::Requested(p) => (notification::APPROVAL_REQUESTED, value(&prompt(p))),
+        Note::Flood(session) => (
+            notification::APPROVAL_FLOOD,
+            value(&Flood {
+                session: session.clone(),
+            }),
         ),
-        Note::Flood(session) => (notification::APPROVAL_FLOOD, json!({"session": session})),
-        Note::Closed(id) => (notification::APPROVAL_CLOSED, json!({"id": id})),
+        Note::Closed(id) => (
+            notification::APPROVAL_CLOSED,
+            value(&Closed { id: id.clone() }),
+        ),
     };
     line(&json!({"jsonrpc": "2.0", "method": method, "params": params}))
 }
 
 /// A refusal reply, its `data` the shared [`ErrorData`](sally_proto::ErrorData).
 fn refused(id: &Id, data: &sally_proto::ErrorData) -> Vec<u8> {
-    let data = serde_json::to_value(data).unwrap_or(Value::Null);
+    let data = value(data);
     failure(
         Some(id),
         json!({"code": REFUSED, "message": "Server error", "data": data}),

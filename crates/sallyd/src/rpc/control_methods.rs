@@ -26,7 +26,7 @@ use super::control::{Conn, Control};
 use crate::approvals::queue::who;
 use crate::approvals::render::{self, Prompt};
 use crate::approvals::{Client, Decision, Desk, Seen};
-use crate::sandbox::{Change, ChangeKind, ChangesError, SessionId, session_changes};
+use crate::sandbox::{Change, ChangeKind, ChangesError, LaunchError, SessionId, session_changes};
 use crate::session::{SessionInfo, SessionState, StartError, StopOutcome};
 
 /// `sessions.list`, `sessions.changes` and `approvals.list` per second, daemon-wide (architect
@@ -112,20 +112,34 @@ impl Call {
         }
     }
 
-    /// Whether it draws on the daemon-wide read rate (architect Q77).
-    pub(crate) fn rated(&self) -> bool {
-        matches!(self, Self::List | Self::Changes(_) | Self::Approvals)
+    /// Whether it draws on the daemon-wide read rate (architect Q77): the reads, and a watch on
+    /// a connection that already `watching`, which only lists again (Q94). A first watch never
+    /// waits, so attaching an approver is never delayed.
+    pub(crate) fn rated(&self, watching: bool) -> bool {
+        match self {
+            Self::List | Self::Changes(_) | Self::Approvals => true,
+            Self::Watch => watching,
+            Self::Create(_) | Self::Stop(_) | Self::Decide(_) => false,
+        }
     }
 
     /// What `rpc.request` records besides the socket, method and client: for a create, the
-    /// manifest's size and hash, never its text (architect Q71).
+    /// manifest's size and hash, never its text (architect Q71); for a stop or a listing, the
+    /// session id, canonical once parsed (Q95).
     pub(crate) fn request_args(&self) -> Map<String, Value> {
         let mut m = Map::new();
-        if let Self::Create(p) = self {
-            use sha2::Digest as _;
-            let sha = crate::approvals::action::hex(&sha2::Sha256::digest(p.manifest.as_bytes()));
-            m.insert("manifest_bytes".into(), Value::from(p.manifest.len()));
-            m.insert("manifest_sha256".into(), Value::from(sha));
+        match self {
+            Self::Create(p) => {
+                use sha2::Digest as _;
+                let sha =
+                    crate::approvals::action::hex(&sha2::Sha256::digest(p.manifest.as_bytes()));
+                m.insert("manifest_bytes".into(), Value::from(p.manifest.len()));
+                m.insert("manifest_sha256".into(), Value::from(sha));
+            }
+            Self::Stop(id) | Self::Changes(id) => {
+                m.insert("id".into(), Value::from(id.as_str()));
+            }
+            Self::List | Self::Approvals | Self::Decide(_) | Self::Watch => {}
         }
         m
     }
@@ -204,6 +218,8 @@ impl<S: SessionSet> Control<S> {
         };
         match self.p.sessions.start(Arc::new(validated.manifest)).await {
             Ok(info) => Done::Ok(value(&session(&info))),
+            // Its `sandbox.refuse` could not be written: no reply without an entry (Q93).
+            Err(StartError::Launch(LaunchError::Unaudited { .. })) => Done::Close,
             // The launcher audited its `sandbox.refuse` with this reason and detail.
             Err(StartError::Launch(e)) => Done::Refused(refusal(
                 e.reason(),
@@ -211,10 +227,7 @@ impl<S: SessionSet> Control<S> {
                 Vec::new(),
             )),
             Err(e) => {
-                let reason = match e {
-                    StartError::ShuttingDown => "shutting-down",
-                    _ => "start-failed",
-                };
+                let reason = start_reason(&e);
                 let detail = escape_capped(e.to_string().as_bytes(), DETAIL_CHARS);
                 let args = json!({
                     "method": method::SESSIONS_CREATE, "reason": reason, "detail": detail,
@@ -232,11 +245,17 @@ impl<S: SessionSet> Control<S> {
             Some(StopOutcome::Stopped) => Done::Ok(value(&Stopped {
                 id: id.as_str().to_owned(),
             })),
-            Some(StopOutcome::Failed(why)) => Done::Refused(refusal(
-                "stop-failed",
-                Some(escape_capped(why.as_bytes(), DETAIL_CHARS)),
-                Vec::new(),
-            )),
+            // The session's own log is sealed by now: the control log has the entry (Q95).
+            Some(StopOutcome::Failed(why)) => {
+                let detail = escape_capped(why.as_bytes(), DETAIL_CHARS);
+                let args = json!({
+                    "method": method::SESSIONS_STOP, "id": id.as_str(), "reason": "stop-failed",
+                    "detail": detail, "client": who(client),
+                });
+                let data = refusal("stop-failed", Some(detail), Vec::new());
+                self.refuse(Actor::Sallyd, "session.refuse", args, data)
+                    .await
+            }
             None => {
                 self.unknown_session(method::SESSIONS_STOP, id, client)
                     .await
@@ -288,12 +307,8 @@ impl<S: SessionSet> Control<S> {
     /// Every waiting prompt of every live session, by session id, then queue order, within
     /// [`REPLY_BYTES`].
     pub(crate) fn prompts(&self) -> Prompts {
-        let all: Vec<WirePrompt> = self
-            .desks()
-            .iter()
-            .flat_map(Desk::list)
-            .map(|p| prompt(&p))
-            .collect();
+        let desks = self.desks();
+        let all = desks.iter().flat_map(Desk::list).map(|p| prompt(&p));
         let (prompts, complete, total) = fit(all, REPLY_BYTES);
         Prompts {
             prompts,
@@ -332,9 +347,27 @@ impl<S: SessionSet> Control<S> {
         };
         match desk.decide(&p.id, decision(p.decision), client, seen).await {
             Ok(()) => Done::Ok(json!({})),
-            // The desk audited it.
+            // The desk audited it, except `audit-failed` (its entry could not be written): the
+            // one reply without an entry, by the maintainer's Task 11 rule. Nothing was
+            // approved and a `deny_all_session` latch stays (architect Q93 ii).
             Err(e) => Done::Refused(refusal(&e.to_string(), None, Vec::new())),
         }
+    }
+}
+
+/// The refusal reason of a start failure other than a launch refusal (architect Q88 iii);
+/// listed in full so a new kind of failure is named here, not swept into one.
+fn start_reason(e: &StartError) -> &'static str {
+    match e {
+        StartError::ShuttingDown => "shutting-down",
+        StartError::Launch(l) => l.reason(),
+        StartError::Id(_)
+        | StartError::Paths(_)
+        | StartError::Exited(_)
+        | StartError::Audit(_)
+        | StartError::Socket(_)
+        | StartError::Join(_)
+        | StartError::Task(_) => "start-failed",
     }
 }
 
@@ -404,6 +437,8 @@ pub(crate) fn fit<T: Serialize>(
 }
 
 pub(crate) fn value<T: Serialize>(t: &T) -> Value {
+    // The wire types are plain structs of strings, numbers and lists: serializing them cannot
+    // fail, so the `Null` is never sent.
     serde_json::to_value(t).unwrap_or(Value::Null)
 }
 

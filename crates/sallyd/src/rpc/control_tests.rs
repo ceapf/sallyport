@@ -279,6 +279,17 @@ impl Wire {
         self.frame().await.expect("the connection closed")
     }
 
+    /// The reply to `method`, past any notifications.
+    async fn reply(&mut self, method: &str, params: Value) -> Value {
+        self.send(method, params).await;
+        loop {
+            let f = self.frame().await.expect("the connection closed");
+            if f.get("id").is_some() {
+                return f;
+            }
+        }
+    }
+
     async fn ended(mut self) {
         assert_eq!(self.frame().await, None, "the connection is still open");
         self.task.await.unwrap();
@@ -354,17 +365,31 @@ fn every_method_parses_names_itself_and_only_reads_are_rated() {
         json!({}),
     ];
     let mut rated = Vec::new();
+    let mut rated_watching = Vec::new();
     for (m, p) in CONTROL_METHODS.iter().zip(params) {
         let Value::Object(p) = p else { unreachable!() };
         let call = Call::parse(m, p).unwrap();
         assert_eq!(call.method(), *m);
-        if call.rated() {
+        if call.rated(false) {
             rated.push(*m);
+        }
+        if call.rated(true) {
+            rated_watching.push(*m);
         }
     }
     assert_eq!(
         rated,
         ["sessions.list", "sessions.changes", "approvals.list"]
+    );
+    // Architect Q94: on a connection that already watches, a watch is a re-list.
+    assert_eq!(
+        rated_watching,
+        [
+            "sessions.list",
+            "sessions.changes",
+            "approvals.list",
+            "approvals.watch"
+        ]
     );
     assert_eq!(
         Call::parse("secrets.set", Map::new()).unwrap_err(),
@@ -372,8 +397,8 @@ fn every_method_parses_names_itself_and_only_reads_are_rated() {
     );
 }
 
-/// Architect Q71: the create's request entry has the manifest's size and hash, never its text;
-/// no other call adds anything.
+/// Architect Q71, Q95: the create's request entry has the manifest's size and hash, never its
+/// text; a stop or a listing adds the session id; no other call adds anything.
 #[test]
 fn only_a_create_records_the_manifest_size_and_hash() {
     let Value::Object(p) = json!({"manifest": "abc"}) else {
@@ -387,8 +412,23 @@ fn only_a_create_records_the_manifest_size_and_hash() {
             "manifest_sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
         })
     );
-    let list = Call::parse("sessions.list", Map::new()).unwrap();
-    assert!(list.request_args().is_empty());
+    for m in ["sessions.list", "approvals.list", "approvals.watch"] {
+        let c = Call::parse(m, Map::new()).unwrap();
+        assert!(c.request_args().is_empty(), "{m}");
+    }
+    let Value::Object(d) = json!({"id": "ap-1", "decision": "deny", "digest": "d"}) else {
+        unreachable!()
+    };
+    let decide = Call::parse("approvals.decide", d).unwrap();
+    assert!(decide.request_args().is_empty());
+    // Architect Q95: a stop and a listing name their (parsed, canonical) session.
+    for m in ["sessions.stop", "sessions.changes"] {
+        let Value::Object(p) = json!({"id": "s-1"}) else {
+            unreachable!()
+        };
+        let args = Call::parse(m, p).unwrap().request_args();
+        assert_eq!(Value::Object(args), json!({"id": "s-1"}), "{m}");
+    }
 }
 
 #[tokio::test]
@@ -747,10 +787,58 @@ async fn sessions_stop_stops_a_known_session_and_refuses_an_unknown_one() {
     *f.fake.stop_fails.lock().unwrap() = Some("container\x1b[2J stuck".to_owned());
     let r = w.call("sessions.stop", json!({"id": "s-1"})).await;
     assert_eq!(reason(&r), "stop-failed");
+    let detail = "container\\x1b[2J stuck";
+    assert_eq!(r["error"]["data"]["detail"], json!(detail));
+    // Architect Q95: the failure has its own entry before the reply; the request names the id.
+    let rows = f.rows();
+    let tail: Vec<_> = rows.iter().rev().take(2).rev().collect();
+    assert_eq!(tail[0].event, "rpc.request");
+    assert_eq!(tail[0].args["id"], json!("s-1"));
+    assert_eq!(tail[1].event, "session.refuse");
     assert_eq!(
-        r["error"]["data"]["detail"],
-        json!("container\\x1b[2J stuck")
+        tail[1].args,
+        json!({"method": "sessions.stop", "id": "s-1", "reason": "stop-failed",
+               "detail": detail, "client": client()})
     );
+}
+
+/// Architect Q95: a stop failure whose entry cannot be written gets no reply.
+#[tokio::test]
+async fn an_unwritten_stop_failure_closes_with_no_reply() {
+    let f = fx("stop-unwritten");
+    f.session("s-1");
+    *f.fake.stop_fails.lock().unwrap() = Some("stuck".to_owned());
+    f.sink
+        .fail_from
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let mut w = f.connect();
+    w.send("sessions.stop", json!({"id": "s-1"})).await;
+    w.ended().await;
+    assert_eq!(f.events(), ["rpc.request"]);
+}
+
+/// Architect Q93 (i): a launch refusal whose own entry failed gets no reply; one whose
+/// `sandbox.refuse` was written but whose launch failed on the log is told `audit`.
+#[tokio::test]
+async fn a_launch_refusal_that_was_not_audited_closes_with_no_reply() {
+    let failed = || LaunchError::Audit(sally_core::audit::AuditError::InvalidEntry("x"));
+    let f = fx("unaudited");
+    *f.fake.start_err.lock().unwrap() = Some(StartError::Launch(LaunchError::Unaudited {
+        original: Box::new(LaunchError::NoDefaultImage),
+        audit: Box::new(failed()),
+    }));
+    let mut w = f.connect();
+    w.send("sessions.create", json!({"manifest": MANIFEST}))
+        .await;
+    w.ended().await;
+    assert_eq!(f.events(), ["rpc.request"]);
+    let f = fx("audit");
+    *f.fake.start_err.lock().unwrap() = Some(StartError::Launch(failed()));
+    let r = f
+        .connect()
+        .call("sessions.create", json!({"manifest": MANIFEST}))
+        .await;
+    assert_eq!(reason(&r), "audit");
 }
 
 fn mkdirs(p: &Path) {
@@ -1026,6 +1114,53 @@ async fn decide_refuses_an_unknown_id_and_leaves_desk_refusals_to_the_desk() {
     );
 }
 
+/// Architect Q93 (ii): a decision the desk could not write is told `audit-failed` (the
+/// maintainer's Task 11 rule): nothing was approved, the asker is told so, the connection stays.
+#[tokio::test]
+async fn an_unwritten_decision_is_told_audit_failed_and_nothing_runs() {
+    let f = fx("unrecorded");
+    let desk_sink = f.session("s-1");
+    let mut w = f.connect();
+    w.call("approvals.watch", json!({})).await;
+    let asked = f.ask("s-1", 1, &["ls"]);
+    let p = note(&mut w).await["params"].clone();
+    desk_sink.set_failing(true);
+    let params = json!({"id": p["id"], "decision": "approve", "digest": p["digest"]});
+    let r = w.reply("approvals.decide", params).await;
+    assert_eq!(reason(&r), "audit-failed");
+    assert_eq!(
+        asked.await.unwrap(),
+        Err(crate::approvals::Refusal::Unrecorded)
+    );
+    let r = w.reply("sessions.list", json!({})).await;
+    assert!(
+        r["result"]["sessions"].is_array(),
+        "the connection stays: {r}"
+    );
+}
+
+/// Architect Q94: a watch on a connection that already watches draws on the read rate; a
+/// first watch never waits for it.
+#[tokio::test(start_paused = true)]
+async fn a_repeated_watch_is_rated_and_a_first_one_is_not() {
+    let f = fx("watch-rate");
+    let mut w = f.connect();
+    let t0 = tokio::time::Instant::now();
+    for _ in 0..READ_BURST {
+        w.call("sessions.list", json!({})).await;
+    }
+    assert_eq!(t0.elapsed(), Duration::ZERO);
+    w.call("approvals.watch", json!({})).await;
+    assert_eq!(t0.elapsed(), Duration::ZERO, "a first watch does not wait");
+    w.call("approvals.watch", json!({})).await;
+    assert_eq!(t0.elapsed(), Duration::from_millis(50), "a second one does");
+    assert_eq!(f.hub.count(), 1);
+    // The second watch took a token: the next read waits a full interval more.
+    let t1 = tokio::time::Instant::now();
+    w.call("sessions.list", json!({})).await;
+    assert_eq!(t1.elapsed(), Duration::from_millis(50));
+}
+
 /// Architect Q89 (c): a second watch on a connection lists again and keeps its one watcher; the
 /// watcher leaves with the connection (Q73.5).
 #[tokio::test]
@@ -1123,7 +1258,10 @@ async fn a_cut_list_keeps_the_oldest_after_a_take() {
     assert_eq!(r["result"], json!({}));
     let r = other.call("approvals.list", json!({})).await;
     let res = &r["result"];
-    assert_eq!((&res["complete"], &res["total"]), (&json!(false), &json!(4)));
+    assert_eq!(
+        (&res["complete"], &res["total"]),
+        (&json!(false), &json!(4))
+    );
     let listed: Vec<_> = res["prompts"]
         .as_array()
         .unwrap()
