@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # scripts/mutants-gate.sh <cargo-mutants exit code> <mutants.out dir> — the mutation gate
 # (maintainer ruling, issue #36): it fails on missed mutants only. A mutant that hangs a test
-# counts as detected; the timed-out ones are listed in the job summary ($GITHUB_STEP_SUMMARY,
-# else stdout). Any other cargo-mutants failure (usage, baseline, internal error) still fails.
+# counts as detected; the timed-out ones, and those caught by nextest's per-test limit, are listed
+# in the job summary ($GITHUB_STEP_SUMMARY, else stdout). Any other cargo-mutants failure (usage, baseline, internal error) still fails.
 # Tested by tests/scripts/mutants_gate_test.sh.
 set -euo pipefail
 
@@ -33,16 +33,42 @@ done
 missed="$(cat "$out/missed.txt")"
 timeouts="$(cat "$out/timeout.txt")"
 
-report() {
-  echo "### Timed-out mutants (detected: each hangs a test)"
-  echo
-  echo '```'
-  echo "$timeouts"
-  echo '```'
+# Mutants whose tests nextest terminated at the per-test limit (.config/nextest.toml, #82): they
+# are caught, so they are not in timeout.txt, but each still hangs a test. A log's first "*** "
+# line names its mutant (the log opens with a blank line); nextest marks a terminated test
+# "TIMEOUT [", maybe in colour.
+hung_tests() {
+  [ -d "$out/log" ] || return 0
+  local f
+  for f in "$out"/log/*.log; do
+    [ -f "$f" ] || continue
+    # grep without -q reads to the end, so sed never takes a SIGPIPE that pipefail would report.
+    if sed 's/\x1b\[[0-9;]*m//g' "$f" | grep -E '^ *TIMEOUT \[' >/dev/null; then
+      grep -m 1 '^\*\*\* ' "$f" | sed 's/^\*\*\* //'
+    fi
+  done
 }
-# The list is information: failing to write it (no summary file, a closed stdout) never changes
-# the verdict.
-if [ -n "$timeouts" ]; then
+hung="$(hung_tests || true)"
+
+report() {
+  if [ -n "$timeouts" ]; then
+    echo "### Timed-out mutants (detected: each hangs a test)"
+    echo
+    echo '```'
+    echo "$timeouts"
+    echo '```'
+  fi
+  if [ -n "$hung" ]; then
+    echo "### Mutants caught by the per-test limit (each hangs a test)"
+    echo
+    echo '```'
+    echo "$hung"
+    echo '```'
+  fi
+}
+# The lists are information: failing to write them (no summary file, a closed stdout) never
+# changes the verdict.
+if [ -n "$timeouts" ] || [ -n "$hung" ]; then
   if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     report >>"$GITHUB_STEP_SUMMARY" || true
   else

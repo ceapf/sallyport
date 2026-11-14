@@ -97,7 +97,12 @@ DISK_LOCK := bash scripts/disk-lock.sh
 # many-core machine's tokio runtimes and malloc arenas reserve far more than they use.
 MUTANTS_DATA_CAP := 4294967296
 MUTANTS_HOST := $(shell rustc -vV | sed -n 's/^host: //p' | tr 'a-z-' 'A-Z_')
-MUTANTS_ENV := TMPDIR=$(MUTANTS_TMP) CARGO_TARGET_$(MUTANTS_HOST)_RUNNER='prlimit --data=$(MUTANTS_DATA_CAP) --'
+# Tests run under nextest (.cargo/mutants.toml `test_tool`); NEXTEST_PROFILE=mutants selects the
+# profile in .config/nextest.toml whose per-test limit terminates a hung test, so its mutant is
+# caught in seconds instead of holding cargo-mutants' whole-mutant timeout (#82). The target
+# runner applies under nextest too.
+MUTANTS_ENV := TMPDIR=$(MUTANTS_TMP) NEXTEST_PROFILE=mutants \
+               CARGO_TARGET_$(MUTANTS_HOST)_RUNNER='prlimit --data=$(MUTANTS_DATA_CAP) --'
 # The gate fails on missed mutants only; a timed-out mutant hangs a test, so it counts as
 # detected and goes to the job summary (maintainer ruling, #36; scripts/mutants-gate.sh).
 mutants:

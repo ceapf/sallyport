@@ -15,6 +15,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_MUTANTS_VERSION: "27.1.0"
+  # Mutants run their tests under nextest (#82); the same pin as ci.yml.
+  CARGO_NEXTEST_VERSION: "0.9.151"
 jobs:
   mutants:
     runs-on: ubuntu-24.04
@@ -34,6 +36,9 @@ jobs:
       - run: cargo install cargo-mutants --locked --version "$CARGO_MUTANTS_VERSION"
       - name: verify cargo-mutants version
         run: cargo mutants --version | grep -Fw "$CARGO_MUTANTS_VERSION"
+      - run: cargo install cargo-nextest --locked --version "$CARGO_NEXTEST_VERSION"
+      - name: verify cargo-nextest version
+        run: cargo nextest --version | grep -Fw "$CARGO_NEXTEST_VERSION"
       - run: make mutants
       - name: runner disk and memory (end)
         if: always()
@@ -48,7 +53,9 @@ jobs:
   # run per mutant, so no podman is needed. Each mutant rebuilds the crate and reruns its whole
   # test set, about 27 s per mutant on these runners (#79), so the sallyd count sets the shards:
   # 24 keeps each one near 45 minutes; mutant TIMEOUTs (#82) need the 150-minute sallyd limit. Some
-  # shards queue behind the concurrent-job limit; that is fine for a nightly.
+  # shards queue behind the concurrent-job limit; that is fine for a nightly. Tests run under
+  # nextest's `mutants` profile, whose 30 s per-test limit ends a hung test long before the
+  # whole-mutant timeout (#82); the 150-minute limit stays until a nightly shows the new timings.
   mutants-wide:
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ matrix.set == 'sallyd' && 150 || 90 }}
@@ -97,6 +104,9 @@ jobs:
       - run: cargo install cargo-mutants --locked --version "$CARGO_MUTANTS_VERSION"
       - name: verify cargo-mutants version
         run: cargo mutants --version | grep -Fw "$CARGO_MUTANTS_VERSION"
+      - run: cargo install cargo-nextest --locked --version "$CARGO_NEXTEST_VERSION"
+      - name: verify cargo-nextest version
+        run: cargo nextest --version | grep -Fw "$CARGO_NEXTEST_VERSION"
       - name: mutants (${{ matrix.set }} ${{ matrix.shard }})
         env:
           SET: ${{ matrix.set }}

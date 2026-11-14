@@ -11,6 +11,9 @@
 # TODO(#87): Task 13 empties that test's allowlist.
 # Build with Cargo.toml's `mutants` profile: the test profile without debug info (#82).
 profile = "mutants"
+# Run each mutant's tests under nextest's `mutants` profile (.config/nextest.toml), whose per-test
+# limit ends a hung test in seconds (#82). nextest runs no doctests.
+test_tool = "nextest"
 exclude_re = [
   # Equivalent: `|` -> `^` over flag constants that are pairwise disjoint gives the same value.
   # Proof: mutants_config.rs `xor_exclusions_combine_disjoint_flags` reads each function below

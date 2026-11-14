@@ -817,8 +817,10 @@ async fn a_stream_ends_when_its_peer_is_gone() {
     drop(events_tx);
 }
 
+// The stream cap at its edges, one case per test: each pumps a whole cap of bytes, so together
+// they ran too long for the per-test limit of mutation runs (#82, architect ruling Q2).
 #[tokio::test]
-async fn a_stream_of_exactly_the_cap_is_whole_and_one_byte_more_is_cut() {
+async fn a_stream_of_exactly_the_cap_is_whole() {
     let (resp, out) = pumped(&[MAX_RESPONSE]).await;
     assert_eq!(
         (resp["cut"].clone(), resp["events"].clone()),
@@ -826,18 +828,30 @@ async fn a_stream_of_exactly_the_cap_is_whole_and_one_byte_more_is_cut() {
     );
     assert_eq!(out.len(), 2);
     assert_eq!(&out[1][..], reply::DONE);
+}
+
+#[tokio::test]
+async fn a_stream_of_exactly_the_cap_in_two_chunks_is_whole() {
     let (resp, out) = pumped(&[MAX_RESPONSE - 20, 20]).await;
     assert_eq!(
         (resp["cut"].clone(), resp["bytes"].clone()),
         (json!(false), json!(MAX_RESPONSE))
     );
     assert_eq!(out.len(), 3);
+}
+
+#[tokio::test]
+async fn a_stream_one_byte_over_the_cap_is_cut() {
     let (resp, out) = pumped(&[MAX_RESPONSE + 1]).await;
     assert_eq!(
         (resp["cut"].clone(), resp["events"].clone()),
         (json!(true), json!(0))
     );
     assert!(out.is_empty(), "a cut stream ends without [DONE]");
+}
+
+#[tokio::test]
+async fn a_stream_one_byte_over_the_cap_in_two_chunks_is_cut_after_the_first() {
     let (resp, out) = pumped(&[MAX_RESPONSE - 20, 21]).await;
     assert_eq!(
         (resp["cut"].clone(), resp["bytes"].clone()),

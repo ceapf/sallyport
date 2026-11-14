@@ -58,6 +58,44 @@ if ! grep -Fq "$t1" "$tmp/summary"; then
   echo "FAIL: the summary does not list the timed-out mutant" >&2
   fail=1
 fi
+# A mutant whose log shows a test terminated by nextest's per-test limit (#82), plain or in
+# colour, is listed in the summary; the verdict stays "caught". A log without one is not listed.
+h1='src/c.rs:5:6: replace step -> u64 with 0'
+h2='src/d.rs:7:8: replace h -> bool with true'
+c1='src/e.rs:9:10: replace k -> bool with false'
+rm -rf "$tmp/out" "$tmp/summary" && mkdir -p "$tmp/out/log"
+: >"$tmp/out/missed.txt"
+: >"$tmp/out/timeout.txt"
+# cargo-mutants opens each log with a blank line.
+printf '\n*** %s\n*** mutation diff:\n     TIMEOUT [   4.004s] (2/2) runaway tests::t\n' "$h1" \
+  >"$tmp/out/log/h1.log"
+printf '*** %s\n\033[1;31m     TIMEOUT\033[0m [  30.002s] (1/2) x tests::u\n' "$h2" >"$tmp/out/log/h2.log"
+printf '*** %s\n        PASS [   0.004s] (1/1) x tests::v\n' "$c1" >"$tmp/out/log/c1.log"
+rc=0
+GITHUB_STEP_SUMMARY="$tmp/summary" bash "$gate" 0 "$tmp/out" >/dev/null 2>&1 || rc=$?
+if [ "$rc" -ne 0 ]; then
+  echo "FAIL: mutants caught by the per-test limit: exit $rc, want 0" >&2
+  fail=1
+fi
+for m in "$h1" "$h2"; do
+  if ! grep -Fq "$m" "$tmp/summary" 2>/dev/null; then
+    echo "FAIL: the summary does not list the per-test-limit mutant $m" >&2
+    fail=1
+  fi
+done
+if grep -Fq "$c1" "$tmp/summary" 2>/dev/null; then
+  echo "FAIL: the summary lists a mutant no test hung for" >&2
+  fail=1
+fi
+# Missed mutants still fail when some were caught by the per-test limit.
+printf '%s\n' "$m1" >"$tmp/out/missed.txt"
+rc=0
+GITHUB_STEP_SUMMARY="$tmp/summary" bash "$gate" 2 "$tmp/out" >/dev/null 2>&1 || rc=$?
+if [ "$rc" -ne 1 ]; then
+  echo "FAIL: missed mutants beside per-test-limit ones: exit $rc, want 1" >&2
+  fail=1
+fi
+
 # Exit 3 can hide missed mutants (timeouts outrank them): without missed.txt, or without
 # timeout.txt, the gate fails rather than trusting the exit code.
 for gone in missed.txt timeout.txt; do

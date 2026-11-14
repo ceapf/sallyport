@@ -151,14 +151,26 @@ fn budget() -> Duration {
     }
 }
 
-#[test]
-fn rt_man_01_mutated_manifests_never_panic_and_round_trip() {
+/// RT-MAN-01's 10 000 cases, split into four tests so no one of them runs long under the per-test
+/// limit of mutation runs (#82, architect ruling Q2). Every part generates all 10 000 cases in
+/// order from the same stream and checks only its own: a block of one case per seed goes to part
+/// `(case / seeds) % PARTS`, so each part sees every seed equally. The four parts together are the
+/// row's 10 000 cases.
+const CASES: usize = 10_000;
+const PARTS: usize = 4;
+
+fn mutated_manifests_part(part: usize) {
     let f = Fixture::new();
     let seeds = seeds();
     let mut rng = Rng(0x5A11_7090_2026_1109);
-    for case in 0..10_000 {
+    let mut checked = 0;
+    for case in 0..CASES {
         let seed = seeds[case % seeds.len()].as_bytes();
         let input = mutate(&mut rng, seed);
+        if (case / seeds.len()) % PARTS != part {
+            continue;
+        }
+        checked += 1;
         if let Err(why) = check_case(&input, &f, budget()) {
             panic!(
                 "case {case}: {why}\ninput: {:?}",
@@ -166,6 +178,27 @@ fn rt_man_01_mutated_manifests_never_panic_and_round_trip() {
             );
         }
     }
+    assert_eq!(checked, CASES / PARTS, "part {part} checked its share");
+}
+
+#[test]
+fn rt_man_01_mutated_manifests_never_panic_and_round_trip_part_0() {
+    mutated_manifests_part(0);
+}
+
+#[test]
+fn rt_man_01_mutated_manifests_never_panic_and_round_trip_part_1() {
+    mutated_manifests_part(1);
+}
+
+#[test]
+fn rt_man_01_mutated_manifests_never_panic_and_round_trip_part_2() {
+    mutated_manifests_part(2);
+}
+
+#[test]
+fn rt_man_01_mutated_manifests_never_panic_and_round_trip_part_3() {
+    mutated_manifests_part(3);
 }
 
 #[test]

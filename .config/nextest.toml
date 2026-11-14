@@ -1,0 +1,12 @@
+# cargo-nextest configuration. Only mutation runs use a profile of their own; `make nextest`,
+# `make redteam` and CI run the default profile, which this file leaves unchanged (#82, architect
+# ruling Q4).
+
+# Mutation runs (.cargo/mutants.toml `test_tool`, Makefile MUTANTS_ENV `NEXTEST_PROFILE`): a test
+# that runs past the limit is terminated and fails, so its mutant is caught in seconds instead of
+# holding the whole-mutant timeout (#82, architect ruling Q1).
+# limit = 30 s; every per-mutant-set test must stay under 3.75 s CI-loaded (floor 7.5 s,
+# maintainer, #82); split a slower test, never raise the limit; worst-case kill is 30 s + 10 s
+# grace.
+[profile.mutants]
+slow-timeout = { period = "10s", terminate-after = 3 }
