@@ -188,12 +188,19 @@ fn check_namespaces(l: &Linux) -> Result<(), Mismatch> {
 /// The keep-id shape (architect Q105): exactly one mapping covers host id 0 (the user), and it
 /// is `{id → 0, size 1}`; no mapping is empty or overflows; no two overlap inside or outside.
 fn check_map(maps: &[IdMap], id: u32, field: &str) -> Result<(), Mismatch> {
+    // The kernel's limit on `uid_map`/`gid_map` lines: bounds the pairwise scan below.
+    ensure(
+        maps.len() <= 340,
+        field,
+        "more mappings than the kernel accepts",
+    )?;
     let mut ranges = Vec::new();
     for m in maps {
         ensure(m.size >= 1, field, "an empty mapping")?;
         let end = |start: u32| {
-            start
-                .checked_add(m.size - 1)
+            m.size
+                .checked_sub(1)
+                .and_then(|last| start.checked_add(last))
                 .ok_or_else(|| Mismatch::new(field, "a mapping overflows"))
         };
         let inside = (m.container_id, end(m.container_id)?);

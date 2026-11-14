@@ -733,6 +733,24 @@ fn id_maps_have_the_keep_id_shape() {
     check(&v, &intent(), &facts()).unwrap();
 }
 
+/// At most the 340 lines the kernel accepts in an id map, checked before the pairwise overlap
+/// scan (which a 1 MiB config could otherwise make quadratic over ~25k entries).
+#[test]
+fn an_id_map_longer_than_the_kernel_accepts_is_refused() {
+    let maps = |n: u32| {
+        let mut m = vec![json!({"containerID": 1000, "hostID": 0, "size": 1})];
+        m.extend((1..n).map(|k| json!({"containerID": 2000 + k, "hostID": 10 + k, "size": 1})));
+        Value::Array(m)
+    };
+    let mut v = good(&intent(), &facts());
+    v["linux"]["uidMappings"] = maps(340);
+    check(&v, &intent(), &facts()).unwrap();
+    let e = refused("linux.gidMappings", |v| {
+        v["linux"]["gidMappings"] = maps(341)
+    });
+    assert_eq!(e.why, "more mappings than the kernel accepts");
+}
+
 #[test]
 fn resources_are_exactly_the_argv_s_with_no_swap() {
     let r = "linux.resources";
@@ -924,6 +942,23 @@ fn each_mount_has_exactly_its_type_source_and_options() {
         ),
     );
     assert_eq!(e.why, "option nosuid missing");
+    // An option's value (a host path in `lowerdir=`) never reaches the audit detail.
+    let e = refused(
+        &field("/workspace/p"),
+        set(
+            "/workspace/p",
+            "options",
+            json!([
+                "rw",
+                "nosuid",
+                "nodev",
+                "bind",
+                "rprivate",
+                "lowerdir=/h/secret"
+            ]),
+        ),
+    );
+    assert_eq!(e.why, "option lowerdir not intended");
     refused(
         &field("/workspace/p"),
         set(

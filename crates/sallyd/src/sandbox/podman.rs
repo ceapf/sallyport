@@ -581,14 +581,16 @@ mod tests {
                 .mode(0o700)
                 .create(&root)
                 .unwrap();
+            // Built first, so a failed step below still removes what was made.
+            let made = Self(root);
             for &(name, dir_mode, file_mode) in dirs {
-                let d = root.join(name);
+                let d = made.0.join(name);
                 std::fs::create_dir(&d).unwrap();
                 std::fs::write(d.join("podman"), "#!/bin/sh\n").unwrap();
                 chmod(&d.join("podman"), file_mode);
                 chmod(&d, dir_mode);
             }
-            Self(root)
+            made
         }
 
         fn path_var(&self, names: &[&str]) -> OsString {

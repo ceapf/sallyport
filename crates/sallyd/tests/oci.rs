@@ -27,9 +27,19 @@ impl Drop for RemoveOnDrop {
     }
 }
 
+/// The test paths go into shell scripts, TOML and JSON unescaped, and the argv log is split on
+/// spaces: none may hold a quote, a backslash or a space.
+fn assert_plain(p: &str) {
+    assert!(
+        !p.contains(['\'', '"', '\\', ' ']),
+        "the test writes {p:?} into scripts and configs unescaped"
+    );
+}
+
 fn scratch(tag: &str) -> (PathBuf, RemoveOnDrop) {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("oci-{tag}-{}", std::process::id()));
+    assert_plain(&dir.display().to_string());
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     (dir.clone(), RemoveOnDrop(dir))
@@ -100,8 +110,8 @@ fn rt_sup_04_the_harness_config_passes_and_a_tampered_one_is_refused() {
     });
 }
 
-/// CPU inference: the real config passes (no hostname, no memory limit); a socket directory
-/// turned read-only-less and `no_new_privs` dropped are each refused.
+/// CPU inference: the real config passes (no hostname, no memory limit); `no_new_privs`
+/// dropped is refused, and so is a GPU intent.
 #[test]
 fn rt_sup_04_the_cpu_inference_config_passes_and_a_tampered_one_is_refused() {
     rt().block_on(async {
@@ -135,8 +145,9 @@ fn rt_sup_04_the_cpu_inference_config_passes_and_a_tampered_one_is_refused() {
             mismatch_field(x.launcher.verify_config(&id, &built.intent).await),
             "process.noNewPrivileges"
         );
-        let _ = podman(&["rm", "--force", &id]);
-        // A GPU intent is refused before anything is read (M3, #116).
+        // The same name is created again next.
+        assert!(podman(&["rm", "--force", &id]).status.success());
+        // A GPU intent is refused before the config is compared (M3, #116).
         let mut gpu = built.intent;
         gpu.gpu = true;
         let id = create_and_init(&x, built.argv).await;
@@ -154,10 +165,10 @@ fn rt_sup_04_the_cpu_inference_config_passes_and_a_tampered_one_is_refused() {
 fn wrapper(at: &Path, real: &Path, after: &str) -> PathBuf {
     let (dir, real) = (at.display(), real.display());
     for p in [dir.to_string(), real.to_string()] {
-        assert!(!p.contains('\''), "the wrapper single-quotes {p}");
+        assert_plain(&p);
     }
     let script = format!(
-        "#!/bin/sh\necho \"$*\" >>'{dir}/argv'\n'{real}' \"$@\"\nrc=$?\n\
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{dir}/argv'\n'{real}' \"$@\"\nrc=$?\n\
          v=; id=; skip=\nfor a; do\n\
          if [ -n \"$skip\" ]; then skip=; continue; fi\n\
          case \"$a\" in --*) [ -z \"$v\" ] && skip=1 ;; \
@@ -236,9 +247,16 @@ struct Hostile {
     _cleanup: RemoveOnDrop,
 }
 
+/// One `HOME` per call: the tests of this binary run in parallel in one process.
+static HOMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 fn hostile_home() -> Hostile {
-    let home = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("hostile-home-{}", std::process::id()));
+    let home = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "hostile-home-{}-{}",
+        std::process::id(),
+        HOMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    assert_plain(&home.display().to_string());
     let _ = std::fs::remove_dir_all(&home);
     let conf = home.join(".config/containers");
     std::fs::create_dir_all(conf.join("oci/hooks.d")).unwrap();
@@ -311,11 +329,14 @@ fn hostile_home() -> Hostile {
 /// `podman.rs::the_environment_is_an_allowlist`), so the same variables in `sallyd`'s own
 /// environment cannot point podman at these files either (architect Q113: no `set_var`).
 ///
-/// The `mounts.conf` part has two defences, each with its own failing test when removed
-/// (architect Q121): the empty mounts file on `init`/`start` (the exact argv lines asserted
-/// here; `podman.rs::spec_generating_verbs_carry_the_empty_mounts_file_before_the_verb`) and the
-/// private `HOME` (`the_environment_is_an_allowlist`); the verifier is the third. The probe's
-/// control is `rt_sup_04_the_probe_finds_the_canary_when_init_reads_a_hostile_home`.
+/// This test is defence in depth, not the control of each defence: with any one of the private
+/// `HOME`, `CONTAINERS_CONF`, `XDG_CONFIG_HOME`, `env_clear` or the verifier removed it still
+/// passes, the others keeping the files out; only the exact `init`/`start` argv lines fail it.
+/// Each defence's own failing test (architect Q121): the flag,
+/// `rt_sup_04_the_empty_mounts_file_on_init_keeps_every_mounts_conf_out`; the private `HOME`,
+/// `rt_sup_04_the_private_home_keeps_the_user_mounts_conf_out`; the environment, the daemon
+/// test's exact envp; the verifier, (i) and the altered-config test. The probe's control is
+/// `rt_sup_04_the_probe_finds_the_canary_when_init_reads_a_hostile_home`.
 #[test]
 fn rt_sup_04_hostile_podman_configuration_never_reaches_a_container() {
     let h = hostile_home();
@@ -349,6 +370,13 @@ fn rt_sup_04_hostile_podman_configuration_never_reaches_a_container() {
                 "{argv}"
             );
         }
+        // The verifier read the config between them (security review: its removal fails this).
+        let at = |verb: &str| argv.lines().position(|l| verb_of(l) == verb).unwrap();
+        let read = argv
+            .lines()
+            .position(|l| l.starts_with("unshare cat -- ") && l.ends_with("/config.json"))
+            .unwrap_or_else(|| panic!("no config read: {argv}"));
+        assert!(at("init") < read && read < at("start"), "{argv}");
         x.stop(r).await;
     });
     assert!(!h.hook_canary.exists(), "a hostile hook ran");
@@ -483,21 +511,27 @@ fn rt_sup_04_the_empty_mounts_file_on_init_keeps_every_mounts_conf_out() {
         assert_probe_clean(&r.out);
         let own = x.podman.mounts_file();
         let seen = mounts_conf_paths(&r.trace);
+        assert!(seen.iter().any(|p| Path::new(p) == own), "{seen:?}");
         assert!(seen.iter().all(|p| Path::new(p) == own), "{seen:?}");
     });
 }
 
-/// (iii) The private `HOME` alone: no flag on `init`. The user's file is not read (only the
+/// (iii) The private `HOME` alone: no flag on `init`, and hermetic podman set up from a host
+/// `HOME` that holds the hostile `mounts.conf`, so podman given that `HOME` (the redirect
+/// removed) would mount the canary and stop there. The user's file is not read (only the
 /// canary is asserted: a host with a system `mounts.conf` adds its own, #121). The control of
 /// (ii)'s scan: without the flag, strace shows `init` looking for the system files.
 #[test]
 fn rt_sup_04_the_private_home_keeps_the_user_mounts_conf_out() {
+    let h = hostile_home();
     let (dir, _cleanup) = scratch("raw-iii");
     rt().block_on(async {
-        let x = Lx::new();
+        let x = Lx::with_home_and_podman(Some(h.home.clone()), Path::to_path_buf);
         let r = raw_case(&x, &dir, "raw-iii", None, false).await;
         assert_probe_clean(&r.out);
         let seen = mounts_conf_paths(&r.trace);
+        let home = h.home.display().to_string();
+        assert!(!seen.iter().any(|p| p.starts_with(&home)), "{seen:?}");
         let etc = "/etc/containers/mounts.conf";
         assert!(seen.contains(&etc), "{seen:?}");
         // Podman stops at the first file that exists.

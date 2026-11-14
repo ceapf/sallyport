@@ -19,7 +19,11 @@ use sallyd::sandbox::oci::config::{Config, MAX_CONFIG, parse};
 fn main() -> ExitCode {
     let mut bytes = Vec::new();
     let read = std::io::stdin()
-        .take(u64::try_from(MAX_CONFIG).unwrap_or(u64::MAX) + 1)
+        .take(
+            u64::try_from(MAX_CONFIG)
+                .unwrap_or(u64::MAX)
+                .saturating_add(1),
+        )
         .read_to_end(&mut bytes);
     if let Err(e) = read {
         eprintln!("oci-dump: stdin: {e}");

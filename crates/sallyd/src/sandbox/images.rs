@@ -26,7 +26,7 @@ impl WorkspaceRequest {
 
 impl Launcher {
     // TODO(#28): the harness and inference launchers (Task 13) call this too.
-    // TODO(#116): and `verify_config` before their `start`, as the workspace launcher does.
+    // TODO(#123): and `verify_config` before their `start`, as the workspace launcher does.
     /// Refuses unless hermetic podman finds `image` (a digest-pinned reference) in local storage
     /// and the image it resolves to carries the pinned digest.
     ///

@@ -46,9 +46,14 @@ impl Mismatch {
     /// A mismatch of `field`; both parts are escaped and capped.
     #[must_use]
     pub fn new(field: impl AsRef<str>, why: impl AsRef<str>) -> Self {
+        Self::escaped(field.as_ref(), why.as_ref())
+    }
+
+    /// [`new`](Self::new), out of a `fn new` so the escaping is mutation-tested (CLAUDE.md).
+    fn escaped(field: &str, why: &str) -> Self {
         Self {
-            field: escape_capped(field.as_ref().as_bytes(), PART_CAP),
-            why: escape_capped(why.as_ref().as_bytes(), PART_CAP),
+            field: escape_capped(field.as_bytes(), PART_CAP),
+            why: escape_capped(why.as_bytes(), PART_CAP),
         }
     }
 }

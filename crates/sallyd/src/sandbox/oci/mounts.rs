@@ -196,12 +196,22 @@ fn check_one(m: &Mount, w: &Want, f: &Facts) -> Result<(), Mismatch> {
     ensure(source_ok, &field, "not the source intended")?;
     let have: BTreeSet<&str> = m.options.iter().map(String::as_str).collect();
     if let Some(o) = have.iter().find(|o| !w.options.contains(**o)) {
+        let o = option_key(o);
         return Err(Mismatch::new(field, format!("option {o} not intended")));
     }
     match w.options.iter().find(|o| !have.contains(o.as_str())) {
-        Some(o) => Err(Mismatch::new(field, format!("option {o} missing"))),
+        Some(o) => Err(Mismatch::new(
+            field,
+            format!("option {} missing", option_key(o)),
+        )),
         None => Ok(()),
     }
+}
+
+/// An option's name without its value (`lowerdir=<paths>` → `lowerdir`): the audit detail
+/// names the field, never a host path.
+fn option_key(o: &str) -> &str {
+    o.split_once('=').map_or(o, |(k, _)| k)
 }
 
 /// `parent` is a proper ancestor of `child` (both clean absolute paths).

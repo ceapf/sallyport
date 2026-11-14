@@ -683,6 +683,10 @@ fn user_podman(env: &Env) -> (PathBuf, PathBuf) {
     let bin = env.root.join("hostile-bin");
     std::fs::create_dir_all(&bin).unwrap();
     let canary = env.root.join("podman-ran");
+    assert!(
+        !canary.display().to_string().contains('\''),
+        "single-quoted in the script"
+    );
     let script = format!(
         "#!/bin/sh\ntouch '{}'\nexec /usr/bin/podman \"$@\"\n",
         canary.display()
@@ -798,8 +802,22 @@ fn rt_sup_04_hostile_variables_in_sallyd_s_environment_never_reach_podman() {
         );
     }
     assert!(!canary.exists(), "a later PATH entry was run");
-    // The control: sallyd's own execve (made by strace, before sallyd hardens) shows them all.
     let text = std::fs::read_to_string(&trace).unwrap();
+    // Every process sallyd started was read: a child of the non-dumpable sallyd execs with its
+    // arguments unreadable (`execve(0x…`), and each such successful exec is one seen above.
+    let blind: Vec<i32> = text
+        .lines()
+        .filter(|l| l.contains(" execve(0x") && l.contains(") = 0"))
+        .filter_map(|l| l.split_whitespace().next()?.parse().ok())
+        .collect();
+    assert!(
+        !blind.is_empty(),
+        "no exec by sallyd's children in the trace"
+    );
+    for pid in &blind {
+        assert!(seen.contains_key(pid), "pid {pid} exec'd unread: {blind:?}");
+    }
+    // The control: sallyd's own execve (made by strace, before sallyd hardens) shows them all.
     let own = text
         .lines()
         .find(|l| l.contains("execve(") && l.contains(env!("CARGO_BIN_EXE_sallyd")))

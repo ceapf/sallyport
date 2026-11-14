@@ -110,7 +110,23 @@ impl LaunchError {
         match self {
             Self::MountMismatch(_) => "sandbox.mount_mismatch",
             Self::ConfigMismatch(_) => "sandbox.config_mismatch",
-            _ => "sandbox.refuse",
+            Self::Scan(_)
+            | Self::Claims(_)
+            | Self::Overlap(_)
+            | Self::Dirs(_)
+            | Self::Argv(_)
+            | Self::Podman(_)
+            | Self::NotRunning(_)
+            | Self::DiskSpace(_)
+            | Self::CgroupEvents(_)
+            | Self::ImageMissing(_)
+            | Self::NoDefaultImage
+            | Self::Command { .. }
+            | Self::Audit(_)
+            | Self::Unaudited { .. }
+            | Self::Internal(_)
+            | Self::Lost(_)
+            | Self::Egress(_) => "sandbox.refuse",
         }
     }
 
