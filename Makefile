@@ -127,7 +127,8 @@ MUTANTS_WIDE_CORE := $(addprefix crates/sally-core/src/,manifest/image.rs manife
                      audit/writer.rs audit/layout.rs audit/tail.rs fsutil.rs fd.rs text.rs paths.rs)
 MUTANTS_WIDE_SALLYD := $(addprefix crates/sallyd/src/sandbox/,argv.rs check.rs types.rs profiles.rs \
                        overlap.rs scan.rs images.rs changes.rs cgroup.rs dirs.rs podman.rs disk.rs stage.rs \
-                       launch/error.rs budget.rs orphans.rs) \
+                       launch/error.rs budget.rs orphans.rs oci/mod.rs oci/config.rs oci/facts.rs \
+                       oci/intent.rs oci/linux.rs oci/mounts.rs oci/process.rs oci/seccomp.rs) \
                        $(addprefix crates/sallyd/src/daemon/,mod.rs crash.rs startup.rs stale.rs install.rs) \
                        crates/sallyd/src/oplog.rs \
                        $(addprefix crates/sallyd/src/session/,lookup.rs types.rs exit.rs) \
@@ -174,7 +175,8 @@ zizmor:
 
 # Fuzz smoke: 60 s per target (needs nightly + cargo-fuzz; CI pins both).
 FUZZ_TARGETS := manifest secrets audit_line egress_head egress_rewrite egress_redact \
-                jsonrpc_message llm_request tool_path tool_args proc_stat fetch_url cli_frame
+                jsonrpc_message llm_request tool_path tool_args proc_stat fetch_url cli_frame \
+                oci_config oci_facts
 FUZZ_SECS ?= 60
 CARGO_FUZZ_TOOLCHAIN ?= +nightly
 fuzz:

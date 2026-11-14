@@ -9,10 +9,19 @@
 //!   replaces (does not merge with) every system and user file on Podman 4.9.3 (probed in
 //!   Task 6b); `CONTAINERS_CONF_OVERRIDE` is never passed;
 //! - `XDG_CONFIG_HOME` pointing at an empty directory of that state directory, so the user's
-//!   `~/.config/containers/{storage,mounts,registries}.conf` are not read either;
+//!   `~/.config/containers/{storage,registries}.conf` are not read either;
+//! - `HOME` pointing at another empty directory of it (`home/`), with `XDG_DATA_HOME` always set
+//!   so the image store stays the user's: podman reads `$HOME/.config/containers/mounts.conf`
+//!   whatever `XDG_CONFIG_HOME` says (architect Q118);
 //! - `--hooks-dir` naming an empty Sallyport-owned directory and `--default-mounts-file` naming
-//!   an empty Sallyport-owned file (both in the checked argv; the rootless `mounts.conf` is read
-//!   through the flag, not through `containers.conf`, probed in Task 6b);
+//!   an empty Sallyport-owned file (both in the checked `create` argv), and the same mounts file
+//!   on `init` and `start` ([`Podman::spec_args`]), which keep the user's and the system
+//!   `mounts.conf` and hook directories out. Podman builds the OCI spec, and with it the
+//!   `mounts.conf` subscriptions, at `init`: until Task 14 that call had no flag, so the user's
+//!   file was copied into `/run/secrets` of every container (found by the OCI config verifier,
+//!   architect Q118/Q119; the Task 6b probe that said otherwise was wrong);
+//! - the OCI config verifier (`sandbox::oci`), which refuses a container whose generated config
+//!   holds anything the argv did not ask for, whatever podman read;
 //! - a podman binary resolved once to an absolute path with the runtime's ownership checks.
 
 use std::ffi::{OsStr, OsString};
@@ -41,6 +50,11 @@ const CONMON_CANDIDATES: [&str; 5] = [
     "/usr/bin/conmon",
     "/usr/sbin/conmon",
 ];
+
+/// The private, empty directories of the state directory: the hooks directory (`--hooks-dir`),
+/// podman's `XDG_CONFIG_HOME` and podman's `HOME`. Each is checked empty before every launch, so
+/// nothing podman would read from them can appear.
+const EMPTY_DIRS: [&str; 3] = ["hooks", "config", "home"];
 
 /// Why hermetic podman could not be set up.
 #[derive(Debug, thiserror::Error)]
@@ -219,6 +233,8 @@ pub struct Podman {
     state: PathBuf,
     conf_text: String,
     env: Vec<(OsString, OsString)>,
+    /// The checked `catatonit` that `containers.conf` names as `init_path`.
+    init: PathBuf,
 }
 
 impl Podman {
@@ -240,46 +256,56 @@ impl Podman {
             conmon: first_trusted(CONMON_FIELD, &CONMON_CANDIDATES)?,
         };
         private_dir(state)?;
-        let hooks = state.join("hooks");
-        let config_home = state.join("config");
-        for d in [&hooks, &config_home] {
-            private_dir(d)?;
-            ensure_empty(d)?;
+        for d in EMPTY_DIRS {
+            let d = state.join(d);
+            private_dir(&d)?;
+            ensure_empty(&d)?;
         }
-        let conf = state.join("containers.conf");
-        let text = containers_conf(&hooks, &bins)?;
+        let text = containers_conf(&state.join("hooks"), &bins)?;
         replace_0600(state, "containers.conf", text.as_bytes())?;
         replace_0600(state, "mounts.conf", b"")?;
         let p = Self {
             bin: podman,
-            env: Self::env(host, &conf, &config_home),
+            env: Self::env(host, state),
             state: state.to_owned(),
             conf_text: text,
+            init: bins.init,
         };
         p.recheck()?;
         Ok(p)
     }
 
-    /// The complete environment of every podman process: `HOME`, `XDG_RUNTIME_DIR`, optionally
-    /// `XDG_DATA_HOME`, a root-owned `PATH`, `CONTAINERS_CONF` and `XDG_CONFIG_HOME`. Nothing
-    /// else, in particular no `CONTAINERS_CONF_OVERRIDE`, `CONTAINER_HOST`, `DOCKER_HOST`,
-    /// `CONTAINERS_STORAGE_CONF`, `TMPDIR` or proxy variable.
+    /// The complete environment of every podman process: `HOME` (the empty `home/` of `state`,
+    /// never the host home: podman reads `~/.config/containers/mounts.conf` from `HOME` on any
+    /// spec-building call without `--default-mounts-file`, found by the OCI config verifier in
+    /// Task 14; [`Podman::spec_args`] now gives every such call the flag), the host's
+    /// `XDG_RUNTIME_DIR`, `XDG_DATA_HOME` (the host's, else `<host home>/.local/share`, so the
+    /// user's image store is found), a root-owned `PATH`, `CONTAINERS_CONF` and
+    /// `XDG_CONFIG_HOME`. Nothing else, in particular no `CONTAINERS_CONF_OVERRIDE`,
+    /// `CONTAINER_HOST`, `DOCKER_HOST`, `CONTAINERS_STORAGE_CONF`, `TMPDIR` or proxy variable.
     #[must_use]
-    pub fn env(host: &PodmanHost, conf: &Path, config_home: &Path) -> Vec<(OsString, OsString)> {
-        let mut env = vec![
-            ("HOME".into(), host.home.clone().into_os_string()),
+    pub fn env(host: &PodmanHost, state: &Path) -> Vec<(OsString, OsString)> {
+        let data = host
+            .xdg_data_home
+            .clone()
+            .unwrap_or_else(|| host.home.join(".local/share"));
+        vec![
+            ("HOME".into(), state.join("home").into_os_string()),
             (
                 "XDG_RUNTIME_DIR".into(),
                 host.xdg_runtime_dir.clone().into_os_string(),
             ),
             ("PATH".into(), PODMAN_PATH_VAR.into()),
-            ("CONTAINERS_CONF".into(), conf.as_os_str().to_owned()),
-            ("XDG_CONFIG_HOME".into(), config_home.as_os_str().to_owned()),
-        ];
-        if let Some(d) = &host.xdg_data_home {
-            env.push(("XDG_DATA_HOME".into(), d.clone().into_os_string()));
-        }
-        env
+            (
+                "CONTAINERS_CONF".into(),
+                state.join("containers.conf").into_os_string(),
+            ),
+            (
+                "XDG_CONFIG_HOME".into(),
+                state.join("config").into_os_string(),
+            ),
+            ("XDG_DATA_HOME".into(), data.into_os_string()),
+        ]
     }
 
     /// The checked podman binary.
@@ -300,6 +326,28 @@ impl Podman {
         self.state.join("mounts.conf")
     }
 
+    /// The argv of a verb that builds the container's OCI spec (`init`, `start`):
+    /// `--default-mounts-file <empty file> <verb> <id>`. Podman 4.9.3 reads `mounts.conf` (the
+    /// user's, `/etc/containers`, `/usr/share/containers`) when the spec is built, at `init`,
+    /// not at `create`, and ignores `default_mounts_file` in `containers.conf`; only this global
+    /// flag, before the verb, switches every one of them off (Task 14, architect Q119).
+    #[must_use]
+    pub fn spec_args(&self, verb: &str, id: &str) -> [OsString; 4] {
+        [
+            "--default-mounts-file".into(),
+            self.mounts_file().into_os_string(),
+            verb.into(),
+            id.into(),
+        ]
+    }
+
+    /// The checked `catatonit` (`init_path` in `containers.conf`): the source of every
+    /// container's `/run/podman-init` (architect Q100).
+    #[must_use]
+    pub fn init_path(&self) -> &Path {
+        &self.init
+    }
+
     /// The environment passed to podman.
     #[must_use]
     pub fn environment(&self) -> &[(OsString, OsString)] {
@@ -315,7 +363,7 @@ impl Podman {
     /// [`PodmanError`] naming what changed.
     pub fn recheck(&self) -> Result<(), PodmanError> {
         private_dir(&self.state)?;
-        for d in ["hooks", "config"] {
+        for d in EMPTY_DIRS {
             let d = self.state.join(d);
             private_dir(&d)?;
             ensure_empty(&d)?;
@@ -474,20 +522,23 @@ mod tests {
             xdg_runtime_dir: "/run/user/1000".into(),
             xdg_data_home: None,
         };
-        let env = Podman::env(
-            &host,
-            Path::new("/s/containers.conf"),
-            Path::new("/s/config"),
-        );
-        let names: Vec<&OsStr> = env.iter().map(|(k, _)| k.as_os_str()).collect();
+        let env = Podman::env(&host, Path::new("/s"));
+        let pairs: Vec<(&str, &str)> = env
+            .iter()
+            .map(|(k, v)| (k.to_str().unwrap(), v.to_str().unwrap()))
+            .collect();
+        // HOME is Sallyport's own empty directory, never the host home: podman reads the user's
+        // `~/.config/containers/mounts.conf` from it (Task 14, architect Q118). The image store
+        // stays where it is through XDG_DATA_HOME, which is always passed.
         assert_eq!(
-            names,
+            pairs,
             [
-                "HOME",
-                "XDG_RUNTIME_DIR",
-                "PATH",
-                "CONTAINERS_CONF",
-                "XDG_CONFIG_HOME"
+                ("HOME", "/s/home"),
+                ("XDG_RUNTIME_DIR", "/run/user/1000"),
+                ("PATH", PODMAN_PATH_VAR),
+                ("CONTAINERS_CONF", "/s/containers.conf"),
+                ("XDG_CONFIG_HOME", "/s/config"),
+                ("XDG_DATA_HOME", "/home/u/.local/share"),
             ]
         );
         let with_data = Podman::env(
@@ -495,10 +546,13 @@ mod tests {
                 xdg_data_home: Some("/d".into()),
                 ..host
             },
-            Path::new("/c"),
-            Path::new("/x"),
+            Path::new("/s"),
         );
-        assert_eq!(with_data.len(), 6);
+        assert_eq!(
+            with_data.last().map(|(k, v)| (k.to_str(), v.to_str())),
+            Some((Some("XDG_DATA_HOME"), Some("/d")))
+        );
+        assert!(!with_data.iter().any(|(_, v)| v == "/home/u"));
     }
 
     #[test]
@@ -509,6 +563,73 @@ mod tests {
         assert!(matches!(e, PodmanError::Missing("podman", _)), "{e}");
         let e = resolve_podman(Some(Path::new("/nonexistent/podman")), None).unwrap_err();
         assert!(e.to_string().starts_with("sandbox.podman_path: "), "{e}");
+    }
+
+    /// A directory beside the test binary (the build directory: every ancestor passes the
+    /// trust checks, unlike `/tmp`) with an executable `podman` in each named subdirectory.
+    struct PathDirs(PathBuf);
+
+    impl PathDirs {
+        fn new(tag: &str, dirs: &[(&str, u32, u32)]) -> Self {
+            let exe = std::env::current_exe().unwrap();
+            let root = exe
+                .parent()
+                .unwrap()
+                .join(format!("sp-path-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&root)
+                .unwrap();
+            // Built first, so a failed step below still removes what was made.
+            let made = Self(root);
+            for &(name, dir_mode, file_mode) in dirs {
+                let d = made.0.join(name);
+                std::fs::create_dir(&d).unwrap();
+                std::fs::write(d.join("podman"), "#!/bin/sh\n").unwrap();
+                chmod(&d.join("podman"), file_mode);
+                chmod(&d, dir_mode);
+            }
+            made
+        }
+
+        fn path_var(&self, names: &[&str]) -> OsString {
+            std::env::join_paths(names.iter().map(|n| self.0.join(n))).unwrap()
+        }
+    }
+
+    impl Drop for PathDirs {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The first `podman` on `PATH` is checked, and a failed check is an error naming the
+    /// setting: later entries are never tried (architect Q122).
+    #[test]
+    fn a_first_podman_on_path_that_fails_the_checks_is_refused_without_fall_through() {
+        let d = PathDirs::new(
+            "fail",
+            &[
+                ("open", 0o777, 0o755),
+                ("gw", 0o700, 0o775),
+                ("good", 0o700, 0o755),
+            ],
+        );
+        for first in ["open", "gw"] {
+            let e = resolve_podman(None, Some(&d.path_var(&[first, "good"]))).unwrap_err();
+            assert!(matches!(e, PodmanError::Binary(_)), "{first}: {e}");
+            assert!(e.to_string().starts_with("sandbox.podman_path: "), "{e}");
+        }
+    }
+
+    /// With no `sandbox.podman_path`, the first `podman` on `PATH` is used, a user-owned one
+    /// included (same-UID attacker out of scope; architect Q122).
+    #[test]
+    fn the_first_trusted_podman_on_path_is_used_even_when_user_owned() {
+        let d = PathDirs::new("ok", &[("mine", 0o700, 0o755), ("other", 0o700, 0o755)]);
+        let p = resolve_podman(None, Some(&d.path_var(&["mine", "other"]))).unwrap();
+        assert_eq!(p, std::fs::canonicalize(d.0.join("mine/podman")).unwrap());
     }
 
     #[test]
@@ -541,7 +662,7 @@ mod tests {
     /// The state `Podman::setup` leaves, without the host's catatonit and conmon.
     fn podman_at(state: &Path) -> Podman {
         private_dir(state).unwrap();
-        for d in ["hooks", "config"] {
+        for d in EMPTY_DIRS {
             private_dir(&state.join(d)).unwrap();
         }
         let text = containers_conf(&state.join("hooks"), &bins()).unwrap();
@@ -554,9 +675,10 @@ mod tests {
         };
         Podman {
             bin: "/bin/sh".into(),
-            env: Podman::env(&host, &state.join("containers.conf"), &state.join("config")),
+            env: Podman::env(&host, state),
             state: state.to_owned(),
             conf_text: text,
+            init: bins().init,
         }
     }
 
@@ -574,15 +696,37 @@ mod tests {
         assert_eq!(p.hooks_dir(), s.0.join("hooks"));
         assert_eq!(p.mounts_file(), s.0.join("mounts.conf"));
         assert_eq!(p.environment(), p.env.as_slice());
-        assert_eq!(p.environment().len(), 5);
+        assert_eq!(p.environment().len(), 6);
         assert_eq!(p.bin(), Path::new("/bin/sh"));
+        assert_eq!(p.init_path(), bins().init);
+    }
+
+    /// `init` and `start` build the OCI spec (and its `mounts.conf` subscriptions); each gets
+    /// the empty mounts file before the verb, exactly (Task 14, architect Q119; probe case D).
+    #[test]
+    fn spec_generating_verbs_carry_the_empty_mounts_file_before_the_verb() {
+        let s = Scratch::new("spec");
+        let p = podman_at(&s.0);
+        let file = s.0.join("mounts.conf").into_os_string();
+        for verb in ["init", "start"] {
+            assert_eq!(
+                p.spec_args(verb, "abc"),
+                [
+                    OsString::from("--default-mounts-file"),
+                    file.clone(),
+                    verb.into(),
+                    "abc".into()
+                ],
+                "{verb}"
+            );
+        }
     }
 
     /// The re-check passes on the state setup wrote and refuses each kind of tampering.
     #[test]
     fn recheck_refuses_every_change_to_the_state() {
         type Tamper = fn(&Path);
-        let cases: [(&str, Tamper, &str); 9] = [
+        let cases: [(&str, Tamper, &str); 11] = [
             ("state mode", |s| chmod(s, 0o750), "must be mode 0700"),
             (
                 "hooks entry",
@@ -594,6 +738,13 @@ mod tests {
                 |s| touch(&s.join("config/x")),
                 "must be empty",
             ),
+            // podman's HOME: a `.config/containers/mounts.conf` there would add mounts (Q118).
+            (
+                "home entry",
+                |s| touch(&s.join("home/.config")),
+                "must be empty",
+            ),
+            ("home mode", |s| chmod(&s.join("home"), 0o755), "mode 0700"),
             (
                 "mounts body",
                 |s| put(&s.join("mounts.conf"), b"x"),

@@ -1,0 +1,1 @@
+0{"Env":["PATH=/bin"],"Cmd":["/bin/sh"],"WorkingDir":"/","Labels":{"a":"b"},"Entrypoint":null,"StopSignal":"SIGTERM"}

@@ -7,7 +7,7 @@
 //! namespace (`podman unshare unshare -m`). Its mounts die with that namespace, so none reaches
 //! the pause namespace that later podman calls share (CLAUDE.md); the outer run checks that.
 //! Aliases of directories *inside* a protected folder are not detected: the same ancestry gap as
-//! the overlap rule's re-review M-2 (#17, Task 14).
+//! the overlap rule's re-review M-2 (open, optional: #17, #28).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::BTreeSet;

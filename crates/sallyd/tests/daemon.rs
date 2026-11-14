@@ -448,15 +448,10 @@ fn only_unix_and_loopback_lines_pass_the_trace_filter() {
     }
 }
 
-/// RT-NET-11 (SI-12): `sallyd` with no sessions and no downloads, traced for 60 s with every
-/// process it starts (`strace -f`), makes no connect() to a non-loopback address. The trace must
-/// show the `control.sock` bind, or it did not follow `sallyd`.
-#[test]
-fn rt_net_11_an_idle_sallyd_connects_nowhere() {
-    let env = Env::new();
-    // Traced processes run setuid helpers without their privilege, so podman could not create
-    // its user namespace (`newuidmap`); an untraced podman creates the pause process first, and
-    // the traced ones join it.
+/// Traced processes run setuid helpers without their privilege, so podman could not create its
+/// user namespace (`newuidmap`); an untraced podman creates the pause process first, and the
+/// traced ones join it.
+fn make_pause(env: &Env) {
     let mut pause = Command::new("podman");
     pause.args(["unshare", "true"]);
     let made = env.command(pause).output().unwrap();
@@ -465,6 +460,15 @@ fn rt_net_11_an_idle_sallyd_connects_nowhere() {
         "{}",
         String::from_utf8_lossy(&made.stderr)
     );
+}
+
+/// RT-NET-11 (SI-12): `sallyd` with no sessions and no downloads, traced for 60 s with every
+/// process it starts (`strace -f`), makes no connect() to a non-loopback address. The trace must
+/// show the `control.sock` bind, or it did not follow `sallyd`.
+#[test]
+fn rt_net_11_an_idle_sallyd_connects_nowhere() {
+    let env = Env::new();
+    make_pause(&env);
     let trace = env.root.join("trace");
     let mut strace = Command::new("strace");
     strace
@@ -513,4 +517,314 @@ fn rt_net_11_an_idle_sallyd_connects_nowhere() {
     );
     let bad: Vec<&str> = text.lines().filter(|l| outbound(l)).collect();
     assert!(bad.is_empty(), "outbound connects: {bad:#?}");
+}
+
+/// RT-SUP-04 (architect Q120): the variables Podman (or its libraries) may honour for
+/// configuration, storage, registries, auth and remote use, and the XDG variables. Coverage, not
+/// the defence: the defence is that podman's environment is an allowlist (`Podman::env` after
+/// `env_clear`), asserted as "envp equals the allowlist". Some may not be honoured by Podman
+/// 4.9.3; they are listed anyway. `HOME`, `XDG_CONFIG_HOME` and `CONTAINERS_CONF` are hostile too
+/// and asserted replaced; `XDG_RUNTIME_DIR` and `XDG_DATA_HOME` are passed by value by design.
+const HOSTILE_VARS: [&str; 29] = [
+    "CONTAINERS_CONF",
+    "CONTAINERS_CONF_OVERRIDE",
+    "CONTAINERS_STORAGE_CONF",
+    "CONTAINERS_REGISTRIES_CONF",
+    "REGISTRIES_CONFIG_PATH",
+    "CONTAINERS_SHORT_NAME_ALIAS_CONF",
+    "REGISTRY_AUTH_FILE",
+    "DOCKER_CONFIG",
+    "CONTAINER_HOST",
+    "CONTAINER_CONNECTION",
+    "CONTAINER_SSHKEY",
+    "CONTAINER_PASSPHRASE",
+    "PODMAN_CONNECTIONS_CONF",
+    "DOCKER_HOST",
+    "STORAGE_DRIVER",
+    "STORAGE_OPTS",
+    "PODMAN_USERNS",
+    "TMPDIR",
+    "NOTIFY_SOCKET",
+    "http_proxy",
+    "https_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "XDG_CONFIG_DIRS",
+    "XDG_DATA_DIRS",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+];
+
+/// A containers.conf that, if any podman read it, would make every podman call remote (and
+/// fail, refusing `sallyd`'s start at `remove_orphans`) and add a host mount.
+const HOSTILE_CONF: &str = "[engine]\nremote = true\n[containers]\nvolumes = [\"/:/hostile\"]\n";
+
+/// The hostile environment: each variable of [`HOSTILE_VARS`] with a value containing
+/// "hostile" (files written where a value names one), plus `HOME` and `XDG_CONFIG_HOME` (which
+/// `sallyd` needs for itself) with hostile podman files planted where podman would look.
+fn hostile_env(env: &Env) -> Vec<(String, String)> {
+    let dir = env.root.join("hostile");
+    std::fs::create_dir_all(dir.join("TMPDIR")).unwrap();
+    for conf in [
+        env.root.join("home/.config/containers"),
+        env.root.join("config/containers"),
+    ] {
+        std::fs::create_dir_all(&conf).unwrap();
+        for f in ["containers.conf", "storage.conf", "registries.conf"] {
+            std::fs::write(conf.join(f), HOSTILE_CONF).unwrap();
+        }
+        std::fs::write(conf.join("mounts.conf"), "/:/run/secrets/hostile\n").unwrap();
+    }
+    let mut vars: Vec<(String, String)> = HOSTILE_VARS
+        .iter()
+        .map(|&v| {
+            let value = match v {
+                "CONTAINER_HOST" | "DOCKER_HOST" => {
+                    format!("unix://{}/{v}.sock", dir.display())
+                }
+                "NO_PROXY" => "hostile.invalid".to_owned(),
+                _ if v.ends_with("_proxy") || v.ends_with("_PROXY") => {
+                    "http://hostile.invalid:1".to_owned()
+                }
+                "STORAGE_DRIVER" | "STORAGE_OPTS" | "PODMAN_USERNS" => "hostile".to_owned(),
+                _ => {
+                    let p = dir.join(v);
+                    if !p.exists() {
+                        std::fs::write(&p, HOSTILE_CONF).unwrap();
+                    }
+                    p.display().to_string()
+                }
+            };
+            (v.to_owned(), value)
+        })
+        .collect();
+    vars.push(("HOME".into(), env.root.join("home").display().to_string()));
+    vars.push((
+        "XDG_CONFIG_HOME".into(),
+        env.root.join("config").display().to_string(),
+    ));
+    vars
+}
+
+/// The names of the `hostile` variables whose value occurs in `text`: the one scan used on
+/// podman's environment and argv and, as its control, on `sallyd`'s own.
+fn hostile_values_in<'a>(text: &str, hostile: &'a [(String, String)]) -> Vec<&'a str> {
+    hostile
+        .iter()
+        .filter(|(_, v)| text.contains(v.as_str()))
+        .map(|(k, _)| k.as_str())
+        .collect()
+}
+
+/// One podman process: its environment and its argv (NUL-separated, joined by spaces).
+struct Seen {
+    env: Vec<String>,
+    argv: String,
+}
+
+/// The children of `parent` whose executable is `podman`, read from `/proc` (podman, unlike
+/// `sallyd`, is dumpable).
+fn podman_children(parent: i32, podman: &Path) -> Vec<(i32, Seen)> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir("/proc").unwrap().flatten() {
+        let Ok(pid) = e.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        let ppid = std::fs::read_to_string(format!("/proc/{pid}/status"))
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find_map(|l| l.strip_prefix("PPid:"))
+                    .and_then(|p| p.trim().parse::<i32>().ok())
+            });
+        if ppid != Some(parent)
+            || std::fs::read_link(format!("/proc/{pid}/exe"))
+                .ok()
+                .as_deref()
+                != Some(podman)
+        {
+            continue;
+        }
+        let (Ok(env), Ok(argv)) = (
+            std::fs::read(format!("/proc/{pid}/environ")),
+            std::fs::read(format!("/proc/{pid}/cmdline")),
+        ) else {
+            continue;
+        };
+        let split = |b: &[u8]| -> Vec<String> {
+            b.split(|&c| c == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .collect()
+        };
+        out.push((
+            pid,
+            Seen {
+                env: split(&env),
+                argv: split(&argv).join(" "),
+            },
+        ));
+    }
+    out
+}
+
+/// The trusted podman `sallyd` resolves on the real `PATH`, as `/proc/<pid>/exe` shows it.
+fn trusted_podman() -> PathBuf {
+    let real = std::env::var_os("PATH").unwrap_or_default();
+    let p = sallyd::sandbox::resolve_podman(None, Some(&real)).unwrap();
+    std::fs::canonicalize(p).unwrap()
+}
+
+/// A user-owned `podman` in `<root>/hostile-bin`, put after the real directories on `PATH`,
+/// that marks `<root>/podman-ran` when run.
+fn user_podman(env: &Env) -> (PathBuf, PathBuf) {
+    let bin = env.root.join("hostile-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let canary = env.root.join("podman-ran");
+    assert!(
+        !canary.display().to_string().contains('\''),
+        "single-quoted in the script"
+    );
+    let script = format!(
+        "#!/bin/sh\ntouch '{}'\nexec /usr/bin/podman \"$@\"\n",
+        canary.display()
+    );
+    std::fs::write(bin.join("podman"), script).unwrap();
+    std::fs::set_permissions(bin.join("podman"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    (bin, canary)
+}
+
+/// RT-SUP-04 (maintainer ruling 3, architect Q120): with every variable of [`HOSTILE_VARS`],
+/// `HOME` and `XDG_CONFIG_HOME` hostile in `sallyd`'s own environment, `sallyd` starts (a
+/// podman that read the hostile `containers.conf` would go remote and fail `remove_orphans`),
+/// and every podman it runs is the resolved trusted binary with exactly the allowlisted
+/// environment and no hostile value in its environment or argv. `PATH` is a trusted input
+/// (architect Q122): a second `podman` later on it shows first-match order only, not a defence.
+/// strace holds each new process for a moment after `execve` so `/proc/<pid>/environ` can be
+/// read. The control: the same scan finds every hostile value in `sallyd`'s own `execve`.
+#[test]
+fn rt_sup_04_hostile_variables_in_sallyd_s_environment_never_reach_podman() {
+    let env = Env::new();
+    make_pause(&env);
+    let hostile = hostile_env(&env);
+    let (bin, canary) = user_podman(&env);
+    let podman = trusted_podman();
+    let trace = env.root.join("trace");
+    let mut strace = Command::new("strace");
+    strace
+        .args([
+            "-f",
+            "-qq",
+            "-v",
+            "-s",
+            "65536",
+            "-e",
+            "trace=execve",
+            "-e",
+            "inject=execve:delay_exit=1000000",
+            "-e",
+            "signal=none",
+            "-o",
+        ])
+        .arg(&trace)
+        .arg(env!("CARGO_BIN_EXE_sallyd"));
+    let mut c = env.command(strace);
+    let path = format!(
+        "{}:{}",
+        std::env::var("PATH").unwrap_or_default(),
+        bin.display()
+    );
+    c.envs(hostile.iter().map(|(k, v)| (k, v)))
+        .env("PATH", path);
+    let mut tracer = Guard::spawn(c);
+    let sock = env.state().join("control.sock");
+    let end = Instant::now() + Duration::from_secs(120);
+    let mut seen = std::collections::BTreeMap::new();
+    let mut done: Option<Instant> = None;
+    // Until two seconds after control.sock appeared (startup's podman calls are over).
+    while done.is_none_or(|d| d.elapsed() < Duration::from_secs(2)) {
+        if let Some(status) = tracer.try_wait() {
+            panic!("strace exited {status}: {}", tracer.stderr());
+        }
+        assert!(Instant::now() < end, "control.sock never appeared");
+        if let Some(&sallyd) = tracer.children().first() {
+            for (pid, s) in podman_children(sallyd, &podman) {
+                seen.entry(pid).or_insert(s);
+            }
+        }
+        if done.is_none() && sock.exists() {
+            done = Some(Instant::now());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let sallyd = *tracer.children().first().expect("strace runs sallyd");
+    signal(sallyd, rustix::process::Signal::TERM);
+    let _ = tracer.finish();
+    assert!(!seen.is_empty(), "no podman process was seen");
+    let state = env.root.join("data/sallyport/podman");
+    let want: std::collections::BTreeMap<String, String> = [
+        ("HOME", state.join("home").display().to_string()),
+        (
+            "CONTAINERS_CONF",
+            state.join("containers.conf").display().to_string(),
+        ),
+        (
+            "XDG_CONFIG_HOME",
+            state.join("config").display().to_string(),
+        ),
+        ("PATH", sallyd::sandbox::PODMAN_PATH_VAR.to_owned()),
+        (
+            "XDG_RUNTIME_DIR",
+            env.root.join("run").display().to_string(),
+        ),
+        ("XDG_DATA_HOME", env.root.join("data").display().to_string()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v))
+    .collect();
+    for s in seen.values() {
+        let got: std::collections::BTreeMap<String, String> = s
+            .env
+            .iter()
+            .map(|kv| {
+                let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+                (k.to_owned(), v.to_owned())
+            })
+            .collect();
+        assert_eq!(got, want, "podman {}", s.argv);
+        let text = format!("{}\n{}", s.env.join("\n"), s.argv);
+        assert_eq!(
+            hostile_values_in(&text, &hostile),
+            Vec::<&str>::new(),
+            "{text}"
+        );
+    }
+    assert!(!canary.exists(), "a later PATH entry was run");
+    let text = std::fs::read_to_string(&trace).unwrap();
+    // Every process sallyd started was read: a child of the non-dumpable sallyd execs with its
+    // arguments unreadable (`execve(0x…`), and each such successful exec is one seen above.
+    let blind: Vec<i32> = text
+        .lines()
+        .filter(|l| l.contains(" execve(0x") && l.contains(") = 0"))
+        .filter_map(|l| l.split_whitespace().next()?.parse().ok())
+        .collect();
+    assert!(
+        !blind.is_empty(),
+        "no exec by sallyd's children in the trace"
+    );
+    for pid in &blind {
+        assert!(seen.contains_key(pid), "pid {pid} exec'd unread: {blind:?}");
+    }
+    // The control: sallyd's own execve (made by strace, before sallyd hardens) shows them all.
+    let own = text
+        .lines()
+        .find(|l| l.contains("execve(") && l.contains(env!("CARGO_BIN_EXE_sallyd")))
+        .expect("sallyd's execve");
+    assert_eq!(
+        hostile_values_in(own, &hostile).len(),
+        hostile.len(),
+        "{own}"
+    );
 }
