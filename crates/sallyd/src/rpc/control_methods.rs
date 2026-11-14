@@ -235,6 +235,8 @@ impl<S: SessionSet> Control<S> {
             Ok(info) => Done::Ok(value(&session(&info))),
             // Its `sandbox.refuse` could not be written: no reply without an entry (Q93).
             Err(StartError::Launch(LaunchError::Unaudited { .. })) => Done::Close,
+            // The launch task ended without a result: no launcher entry, so this one (Q98).
+            Err(StartError::Launch(LaunchError::Lost(sid))) => self.lost(sid, client).await,
             // The launcher audited its `sandbox.refuse` with this reason and detail.
             Err(StartError::Launch(e)) => Done::Refused(refusal(
                 e.reason(),
@@ -253,6 +255,21 @@ impl<S: SessionSet> Control<S> {
                     .await
             }
         }
+    }
+
+    /// A launch of session `sid` whose task ended without a result: the launcher wrote no
+    /// entry, so this `session.refuse` is the refusal's own (architect Q98).
+    async fn lost(&self, sid: SessionId, client: Client) -> Done {
+        let id = sid.as_str().to_owned();
+        let e = LaunchError::Lost(sid);
+        let detail = escape_capped(e.detail().as_bytes(), DETAIL_CHARS);
+        let args = json!({
+            "method": method::SESSIONS_CREATE, "id": id, "reason": e.reason(),
+            "detail": detail, "client": who(client),
+        });
+        let data = refusal(e.reason(), Some(detail), Vec::new());
+        self.refuse(Actor::Sallyd, "session.refuse", args, data)
+            .await
     }
 
     async fn stop(&self, id: &SessionId, client: Client) -> Done {

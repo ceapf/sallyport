@@ -319,11 +319,14 @@ impl Launcher {
     ///
     /// # Errors
     /// [`LaunchError`]; what was created is removed and `sandbox.refuse` (or
-    /// `sandbox.mount_mismatch`) is audited.
+    /// `sandbox.mount_mismatch`) is audited. The one exception is [`LaunchError::Lost`] (the
+    /// launch task ended without a result): it has no launcher entry, so its caller writes one
+    /// (architect Q98).
     pub async fn launch_workspace(
         self: &Arc<Self>,
         req: WorkspaceRequest,
     ) -> Result<Running, LaunchError> {
+        let sid = req.paths.id().clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         let this = Arc::clone(self);
         let crash = req.crash.clone();
@@ -344,10 +347,11 @@ impl Launcher {
                 this.stop_unreceived(orphan).await;
             }
         });
-        rx.await
-            .map_err(|_| LaunchError::Internal("the launch task ended without a result".into()))?
+        // TODO(#113): what a panicked launch task leaves behind.
+        error::received(rx, sid).await
     }
 
+    /// Every `Err` it returns went through `refused()`: audited, or `Unaudited` (architect Q98).
     async fn launch(
         &self,
         req: WorkspaceRequest,

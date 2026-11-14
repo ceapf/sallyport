@@ -469,8 +469,10 @@ request is `-32000` with `data`
   knows no secret names, so a manifest granting one is refused here, not by the launcher's
   `secret-missing`. A launch refusal is told the launcher's reason and the very detail its
   `sandbox.refuse` holds (e.g. `no-default-image`, `digest-mismatch`); a launch refusal whose
-  `sandbox.refuse` could not be written gets no reply. Any other start failure is
-  `shutting-down` or `start-failed` with its own `session.refuse`.
+  `sandbox.refuse` could not be written gets no reply. A launch whose task ended without a
+  result is `start-failed` with its own `session.refuse` naming the session (architect Q98;
+  TODO(#113): what such a task leaves behind). Any other start failure is `shutting-down` or
+  `start-failed` with its own `session.refuse`.
 - `sessions.stop`: an unknown id is `unknown-session` (`session.refuse`); a container not
   confirmed gone is `stop-failed` (`session.refuse` in the control log: the session's own log
   is sealed by then).

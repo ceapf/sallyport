@@ -10,7 +10,7 @@ use crate::sandbox::inside::Mismatch;
 use crate::sandbox::overlap::ReserveError;
 use crate::sandbox::podman::PodmanError;
 use crate::sandbox::scan::ScanError;
-use crate::sandbox::types::ArgvError;
+use crate::sandbox::types::{ArgvError, SessionId};
 
 /// Why a launch failed.
 #[derive(Debug, thiserror::Error)]
@@ -76,6 +76,11 @@ pub enum LaunchError {
     /// A background task failed.
     #[error("internal: {0}")]
     Internal(String),
+    /// The launch task of this session ended without a result (it panicked, or was cancelled at
+    /// shutdown). The one launch error with no `sandbox.refuse` of its own: whoever reports it
+    /// writes the entry (architect Q98).
+    #[error("the launch task ended without a result")]
+    Lost(SessionId),
     /// The session's egress could not be set up: trust roots, session CA, CA files, or the
     /// `net.sock` listener.
     #[error("network: {0}")]
@@ -110,6 +115,7 @@ impl LaunchError {
             Self::Command { .. } => "podman",
             Self::Audit(_) | Self::Unaudited { .. } => "audit",
             Self::Internal(_) => "internal",
+            Self::Lost(_) => "start-failed",
             Self::Egress(EgressError::Listener(_)) => "egress-listener",
             Self::Egress(EgressError::Roots(_)) => "trust-roots",
             Self::Egress(EgressError::Ca(_) | EgressError::Files(_)) => "session-ca",
@@ -141,4 +147,51 @@ pub struct StopError {
 
 pub(super) fn join_err(e: tokio::task::JoinError) -> LaunchError {
     LaunchError::Internal(e.to_string())
+}
+
+/// The result the launch task of session `sid` sent; [`LaunchError::Lost`] if it sent none.
+pub(super) async fn received<T>(
+    rx: tokio::sync::oneshot::Receiver<Result<T, LaunchError>>,
+    sid: SessionId,
+) -> Result<T, LaunchError> {
+    rx.await.unwrap_or(Err(LaunchError::Lost(sid)))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    fn sid() -> SessionId {
+        SessionId::parse("s-1").unwrap()
+    }
+
+    /// Architect Q98: a launch task that ends without sending is `Lost`, naming its session; a
+    /// sent result passes through unchanged.
+    #[tokio::test]
+    async fn a_launch_that_sent_nothing_is_lost_and_names_its_session() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<u8, LaunchError>>();
+        drop(tx);
+        match received(rx, sid()).await {
+            Err(LaunchError::Lost(s)) => assert_eq!(s.as_str(), "s-1"),
+            other => panic!("{other:?}"),
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(Ok(7u8)).unwrap();
+        assert_eq!(received(rx, sid()).await.unwrap(), 7);
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<u8, LaunchError>>();
+        tx.send(Err(LaunchError::NoDefaultImage)).unwrap();
+        assert!(matches!(
+            received(rx, sid()).await,
+            Err(LaunchError::NoDefaultImage)
+        ));
+    }
+
+    #[test]
+    fn a_lost_launch_is_start_failed_with_a_fixed_detail() {
+        let e = LaunchError::Lost(sid());
+        assert_eq!(e.reason(), "start-failed");
+        assert_eq!(e.detail(), "the launch task ended without a result");
+    }
 }

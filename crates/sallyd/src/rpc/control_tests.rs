@@ -817,6 +817,66 @@ async fn an_unwritten_stop_failure_closes_with_no_reply() {
     assert_eq!(f.events(), ["rpc.request"]);
 }
 
+fn lost() -> StartError {
+    StartError::Launch(LaunchError::Lost(
+        crate::sandbox::SessionId::parse("s-7").unwrap(),
+    ))
+}
+
+/// Architect Q98: a launch whose task ended without a result has no launcher entry, so the
+/// control socket writes its own `session.refuse`, naming the session, before the reply.
+#[tokio::test]
+async fn a_lost_launch_is_refused_with_its_own_entry() {
+    let f = fx("lost");
+    *f.fake.start_err.lock().unwrap() = Some(lost());
+    let mut w = f.connect();
+    let r = w
+        .call("sessions.create", json!({"manifest": MANIFEST}))
+        .await;
+    let detail = "the launch task ended without a result";
+    assert_eq!(reason(&r), "start-failed");
+    assert_eq!(r["error"]["code"], json!(REFUSED));
+    assert_eq!(r["error"]["data"]["detail"], json!(detail));
+    assert_eq!(f.events(), ["rpc.request", "session.refuse"]);
+    assert_eq!(
+        f.sink.last("session.refuse"),
+        json!({"method": "sessions.create", "id": "s-7", "reason": "start-failed",
+               "detail": detail, "client": client()})
+    );
+    let r = w.call("sessions.list", json!({})).await;
+    assert!(r["result"]["sessions"].is_array(), "the connection stays");
+    // Its entry unwritten: no reply.
+    let f = fx("lost-unwritten");
+    *f.fake.start_err.lock().unwrap() = Some(lost());
+    f.sink
+        .fail_from
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let mut w = f.connect();
+    w.send("sessions.create", json!({"manifest": MANIFEST}))
+        .await;
+    w.ended().await;
+    assert_eq!(f.events(), ["rpc.request"]);
+}
+
+/// Architect Q98: any other launch error keeps the launcher's entry and gets no second one.
+#[tokio::test]
+async fn an_internal_launch_error_has_only_the_launchers_entry() {
+    let f = fx("internal");
+    *f.fake.start_err.lock().unwrap() = Some(StartError::Launch(LaunchError::Internal(
+        "task\npanicked".into(),
+    )));
+    let r = f
+        .connect()
+        .call("sessions.create", json!({"manifest": MANIFEST}))
+        .await;
+    assert_eq!(reason(&r), "internal");
+    assert_eq!(
+        r["error"]["data"]["detail"],
+        json!("internal: task\\x0apanicked")
+    );
+    assert_eq!(f.events(), ["rpc.request"]);
+}
+
 /// Architect Q93 (i): a launch refusal whose own entry failed gets no reply; one whose
 /// `sandbox.refuse` was written but whose launch failed on the log is told `audit`.
 #[tokio::test]
