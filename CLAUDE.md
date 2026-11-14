@@ -97,8 +97,8 @@ container-free tests run: unit tests, all of sally-core's `tests/`, `sallyd` `ar
   `rpc/{agent,control,control_methods,frame,json,listen,mcp,message,rate,record}.rs`,
   `llm/{body,head,io,reply,server}.rs`, `approvals/{action,glob,handler,hub,policy,queue,render}.rs`,
   `tools/{args,path,tag,fs,shell,procs,mod,dac,ops,fetch,fetch_url,fetch_client}.rs`; sally-shim
-  `args.rs`, `relay.rs`; sally-cli `clean.rs`, `client.rs`, `commands.rs`, `approve.rs` (clap
-  definitions and `main.rs` are out).
+  `args.rs`, `relay.rs`; sally-cli `clean.rs`, `client.rs`, `commands.rs`, `approve.rs`,
+  `secrets.rs`, `local.rs`, `doctor.rs` (clap definitions and `main.rs` are out).
 
 ## Agent / model routing (ECC)
 
