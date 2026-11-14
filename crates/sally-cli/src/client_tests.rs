@@ -117,7 +117,9 @@ fn a_client_that_takes_nothing_stops_reading() {
         f
     };
     // Unbounded, the reader would take all 64 MiB; bounded, the writes stop for good well
-    // before (the queue, one frame in hand, the reader's buffer and the kernel's).
+    // before (the queue, one frame in hand, the reader's buffer and the kernel's). The 4 MiB
+    // slack assumes a Unix socket buffer near Linux's default (`net.core.wmem_default`, about
+    // 208 KiB); a host tuned above 4 MiB would fail this falsely.
     let limit = 64 << 20;
     let mut written = 0usize;
     let mut stalled = 0;

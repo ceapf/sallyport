@@ -885,6 +885,21 @@ async fn the_oldest_prompt_leaving_keeps_the_rest_in_order() {
     }
 }
 
+/// Q97, the fifth removal site (security re-review LOW3): a prompt withdrawn before it is shown
+/// leaves at its announce, and the shown ones behind it keep their order.
+#[tokio::test(start_paused = true)]
+async fn a_prompt_leaving_unshown_keeps_the_rest_in_order() {
+    let f = fx(5);
+    let Ok((x, _, _rx)) = f.gate.inner.queue(&shell(9, &["ls"]), None, vec![]) else {
+        panic!("not queued");
+    };
+    let (a, _ha) = asking(&f, shell(1, &["ls"])).await;
+    let (b, _hb) = asking(&f, shell(2, &["ls"])).await;
+    f.gate.withdraw(9, Withdraw::Cancel).await;
+    assert!(f.gate.inner.announce(&x).is_err());
+    assert_eq!(listed(&f), [a, b]);
+}
+
 #[tokio::test]
 async fn a_dropped_wait_invalidates_the_id_at_once() {
     let f = fx(5);

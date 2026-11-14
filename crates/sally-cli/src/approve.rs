@@ -239,7 +239,16 @@ fn ask(c: &mut Client, tty: &mut Tty<'_>, q: &mut Queue, p: &Prompt) -> Result<O
                 let reason = clean::line(&d.reason).text;
                 let _ = writeln!(tty.output, "not taken: {reason}");
             }
-            Err(e) => return Err(e),
+            // Sent, perhaps, but no reply: sallyd may have applied it.
+            Err(e) => {
+                let id = clean::line(&p.id).text;
+                let _ = writeln!(
+                    tty.output,
+                    "the {} for {id} may have been taken (see the audit log)",
+                    answer.wire()
+                );
+                return Err(e);
+            }
         }
         return Ok(None);
     }

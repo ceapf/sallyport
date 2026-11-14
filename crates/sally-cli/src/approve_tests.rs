@@ -301,6 +301,28 @@ fn a_lost_connection_sends_nothing_for_the_line_typed() {
     assert!(err.contains("prompts still pending are denied"), "{err}");
 }
 
+/// Security re-review LOW1: an answer sent but never replied to may have been taken; the
+/// approver says so instead of implying it was not.
+#[test]
+fn an_answer_lost_before_its_reply_may_have_been_taken() {
+    let f = Fake::new(
+        "unanswered",
+        Box::new(|req| match req["method"].as_str().unwrap() {
+            "approvals.watch" => (vec![ok(req, list(&[prompt("p1")], true))], false),
+            _ => (vec![], true),
+        }),
+    );
+    let r = run_with(&f, &["approve"], None);
+    assert_eq!(r.code, EXIT_FAILED);
+    assert_eq!(f.decides().len(), 1);
+    assert!(
+        r.shown
+            .contains("the approve for p1 may have been taken (see the audit log)"),
+        "{}",
+        r.shown
+    );
+}
+
 /// Q91: requested and closed prompts leave nothing behind but the one on screen.
 #[test]
 fn closed_prompts_leave_the_queue_empty() {
