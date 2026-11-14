@@ -76,7 +76,7 @@ pub enum SecretsError {
     LockHeld {
         /// Host path of the lock file.
         path: String,
-        /// How long this writer waited.
+        /// How long this writer was willing to wait.
         waited: Duration,
     },
     /// An I/O error.
@@ -305,12 +305,13 @@ impl SecretStore {
     }
 
     /// [`lock`](Self::lock), waiting at most `wait`: the lock is tried at once, then every
-    /// 50 ms until `wait` has passed (a free lock is taken even when `wait` is zero).
+    /// 50 ms until `wait` has passed (a free lock is taken even when `wait` is zero). Blocking:
+    /// it sleeps the calling thread, so async callers use `spawn_blocking`.
     ///
     /// # Errors
     /// [`SecretsError::LockHeld`] when another writer kept it for the whole wait;
-    /// [`SecretsError::Permissions`] if the directory is writable by group or others or the lock
-    /// is a symlink; [`SecretsError::Io`] otherwise.
+    /// [`SecretsError::Permissions`] if the directory is writable by group or others, or the lock
+    /// is a symlink, not a regular file, or not the user's; [`SecretsError::Io`] otherwise.
     pub fn lock_within(path: &Path, wait: Duration) -> Result<EditLock, SecretsError> {
         let lock = path.with_extension("lock");
         let io_err = |e: std::io::Error| SecretsError::Io {
@@ -326,16 +327,7 @@ impl SecretStore {
                 .map_err(io_err)?;
         }
         check_parent(path)?;
-        let fd = match crate::fd::open(
-            &lock,
-            OFlags::WRONLY | OFlags::CREATE | OFlags::NOFOLLOW,
-            Mode::from_raw_mode(0o600),
-        ) {
-            Ok(fd) => fd,
-            Err(rustix::io::Errno::LOOP) => return Err(perm(&lock, "is a symbolic link")),
-            Err(e) => return Err(io_err(e.into())),
-        };
-        let file = File::from(fd);
+        let file = open_lock_file(&lock)?;
         let start = Instant::now();
         loop {
             match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
@@ -343,11 +335,10 @@ impl SecretStore {
                 Err(rustix::io::Errno::WOULDBLOCK) => {}
                 Err(e) => return Err(io_err(e.into())),
             }
-            let waited = start.elapsed();
-            let Some(left) = wait.checked_sub(waited).filter(|l| !l.is_zero()) else {
+            let Some(left) = wait.checked_sub(start.elapsed()).filter(|l| !l.is_zero()) else {
                 return Err(SecretsError::LockHeld {
                     path: lock.display().to_string(),
-                    waited,
+                    waited: wait,
                 });
             };
             std::thread::sleep(left.min(LOCK_RETRY));
@@ -436,6 +427,37 @@ impl crate::manifest::SecretCatalog for SecretStore {
     fn contains(&self, name: &str) -> bool {
         Self::contains(self, name)
     }
+}
+
+/// The writers' lock file: write-only, created 0600, never through a symlink, and without
+/// blocking on a FIFO (`ENXIO` when it has no reader); then it must be a regular file of the
+/// user's, and is set to 0600 so no one else can take it.
+fn open_lock_file(lock: &Path) -> Result<File, SecretsError> {
+    let io_err = |e: std::io::Error| SecretsError::Io {
+        path: lock.display().to_string(),
+        source: e,
+    };
+    let fd = match crate::fd::open(
+        lock,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::from_raw_mode(0o600),
+    ) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::LOOP) => return Err(perm(lock, "is a symbolic link")),
+        Err(rustix::io::Errno::NXIO) => return Err(perm(lock, "is not a regular file")),
+        Err(e) => return Err(io_err(e.into())),
+    };
+    let file = File::from(fd);
+    let meta = file.metadata().map_err(io_err)?;
+    if !meta.is_file() {
+        return Err(perm(lock, "is not a regular file"));
+    }
+    if meta.uid() != rustix::process::geteuid().as_raw() {
+        return Err(perm(lock, "is not owned by the current user"));
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(io_err)?;
+    Ok(file)
 }
 
 fn perm(path: &Path, msg: &str) -> SecretsError {

@@ -619,18 +619,33 @@ fn the_error_vocabulary_oracle_exempts_message_text_but_not_values() {
 
 // ---- review follow-ups --------------------------------------------------------------------
 
-#[test]
-fn open_refuses_a_fifo_without_blocking() {
-    let s = Scratch::new("fifo");
+fn mkfifo(p: &Path) {
     rustix::fs::mknodat(
         rustix::fs::CWD,
-        s.store_path(),
+        p,
         rustix::fs::FileType::Fifo,
         rustix::fs::Mode::from_raw_mode(0o600),
         0,
     )
     .unwrap();
-    let err = SecretStore::open(&s.store_path()).unwrap_err();
+}
+
+/// `f`'s result, or a failure (not a hang) if it takes more than 5 s.
+fn within_5s<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(5))
+        .expect("blocked for more than 5 s")
+}
+
+#[test]
+fn open_refuses_a_fifo_without_blocking() {
+    let s = Scratch::new("fifo");
+    mkfifo(&s.store_path());
+    let p = s.store_path();
+    let err = within_5s(move || SecretStore::open(&p).map(|_| ())).unwrap_err();
     assert!(matches!(err, SecretsError::Permissions { .. }), "{err:?}");
 }
 
@@ -862,6 +877,45 @@ fn a_lock_released_within_the_wait_is_taken() {
     assert!(got.is_ok(), "{got:?}");
     assert!(start.elapsed() >= std::time::Duration::from_millis(150));
     release.join().unwrap();
+}
+
+/// With no wait, a held lock is refused after one try.
+#[test]
+fn a_held_lock_with_no_wait_is_refused_at_once() {
+    let s = Scratch::new("lock-zero");
+    let path = s.store_path();
+    let _held = SecretStore::lock(&path).unwrap();
+    let start = std::time::Instant::now();
+    let e = SecretStore::lock_within(&path, std::time::Duration::ZERO).unwrap_err();
+    assert!(matches!(e, SecretsError::LockHeld { .. }), "{e:?}");
+    assert!(start.elapsed() < std::time::Duration::from_secs(1));
+}
+
+/// A FIFO planted as the lock is refused, not opened (which would block past any timeout).
+#[test]
+fn a_fifo_lock_is_refused_without_blocking() {
+    let s = Scratch::new("lock-fifo");
+    mkfifo(&s.0.join("secrets.lock"));
+    let p = s.store_path();
+    let e = within_5s(move || SecretStore::lock(&p).map(|_| ())).unwrap_err();
+    assert!(matches!(e, SecretsError::Permissions { .. }), "{e:?}");
+}
+
+/// A lock someone made readable to others is set back to 0600; a directory is refused.
+#[test]
+fn an_open_lock_file_is_made_private_and_a_directory_is_refused() {
+    let s = Scratch::new("lock-mode");
+    let lock = s.0.join("secrets.lock");
+    std::fs::write(&lock, "").unwrap();
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
+    drop(SecretStore::lock(&s.store_path()).unwrap());
+    assert_eq!(mode_of(&lock), 0o600);
+    std::fs::remove_file(&lock).unwrap();
+    std::fs::create_dir(&lock).unwrap();
+    assert!(matches!(
+        SecretStore::lock(&s.store_path()),
+        Err(SecretsError::Permissions { .. } | SecretsError::Io { .. })
+    ));
 }
 
 #[test]
