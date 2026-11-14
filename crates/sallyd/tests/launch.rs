@@ -206,7 +206,7 @@ fn rt_ag_09_writing_past_stage_size_kills_the_session() {
         assert_eq!(limit["resource"], "stage_size", "{limit}");
         assert_eq!(limit["limit"], 4 << 20, "{limit}");
         assert_eq!(limit["area"], "filesystem.mounts[1]", "{limit}");
-        assert_eq!(limit["reason"], "stage_size", "{limit}");
+        assert_eq!(limit["reason"], "stage-size", "{limit}");
         assert!(limit["measured"].as_u64().unwrap() > 4 << 20, "{limit}");
         assert!(exists(bystander.container()), "the other session is alive");
         let paths = small.paths().clone();
@@ -252,7 +252,7 @@ fn rt_ag_09_writing_past_stage_size_into_a_git_overlay_kills_the_session() {
         );
         let limit = x.events.args("session.resource_limit").expect("audited");
         assert_eq!(limit["area"], "filesystem.mounts[0].git[0]", "{limit}");
-        assert_eq!(limit["reason"], "stage_size", "{limit}");
+        assert_eq!(limit["reason"], "stage-size", "{limit}");
         assert!(
             !x.f.root.join("home/code/myproject/.git/pack").exists(),
             "the host .git is untouched"

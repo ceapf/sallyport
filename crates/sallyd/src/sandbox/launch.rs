@@ -48,7 +48,7 @@ use super::overlap::{Sessions, claims};
 use super::podman::{Podman, PodmanError};
 use super::scan::{LaunchScan, PinKind, ScanLimits, scan_mounts};
 use super::types::{CheckedRuntime, CommonArgs, ImageRef, Installation, SessionPaths, UserIds};
-use super::watchdog::{Target, WatchPlan, Watchdog, watch_plan};
+use super::watchdog::{Observed, Target, Watch, WatchPlan, Watchdog, watch_plan};
 use crate::daemon::crash::CrashReporter;
 use crate::oplog::Oplog;
 
@@ -128,7 +128,8 @@ pub struct Running {
     name: String,
     paths: SessionPaths,
     level: AuditLevel,
-    /// The disk watchdog, if the sandbox can write to the host disk; stopped on drop.
+    /// The watchdog (the cgroup observer, and the disk tasks if the sandbox can write to the
+    /// host disk), set once the launch returns; stopped on drop.
     watchdog: Option<Watchdog>,
     /// The egress listener (`network.mode: proxy`); aborted on drop.
     egress: Option<EgressHandle>,
@@ -291,6 +292,16 @@ impl Launcher {
         })
     }
 
+    /// The oplog line for a session's cgroup event files that stopped being readable, which
+    /// they do once the container has ended (the observer stops; architect Q48).
+    pub(super) fn events_unreadable(&self, sid: &str, detail: &str) {
+        self.oplog.info(
+            "sandbox",
+            "cgroup events no longer readable",
+            &[("session", sid), ("detail", detail)],
+        );
+    }
+
     /// The oplog line for an audit entry that could not be written while the launcher went on
     /// (the action is still taken: a kill, a stop retry).
     pub(super) fn unaudited(&self, event: &str, sid: &str) {
@@ -331,16 +342,20 @@ impl Launcher {
         let this = Arc::clone(self);
         let crash = req.crash.clone();
         tokio::spawn(async move {
-            let result = this.launch(req).await.map(|(mut r, plan)| {
-                r.watchdog = plan.map(|plan| {
-                    let target = Target {
-                        sid: r.paths.id().as_str().to_owned(),
-                        container: r.container.clone(),
-                        level: r.level,
-                        exec_gate: Arc::clone(&r.exec_gate),
-                    };
-                    Watchdog::spawn(&this, target, plan, &crash)
-                });
+            let result = this.launch(req).await.map(|(mut r, watch)| {
+                let target = Target {
+                    sid: r.paths.id().as_str().to_owned(),
+                    container: r.container.clone(),
+                    level: r.level,
+                    exec_gate: Arc::clone(&r.exec_gate),
+                };
+                r.watchdog = Some(Watchdog::spawn(
+                    &this,
+                    target,
+                    watch.plan,
+                    watch.observed,
+                    &crash,
+                ));
                 r
             });
             if let Err(Ok(orphan)) = tx.send(result) {
@@ -352,10 +367,7 @@ impl Launcher {
     }
 
     /// Every `Err` it returns went through `refused()`: audited, or `Unaudited` (architect Q98).
-    async fn launch(
-        &self,
-        req: WorkspaceRequest,
-    ) -> Result<(Running, Option<WatchPlan>), LaunchError> {
+    async fn launch(&self, req: WorkspaceRequest) -> Result<(Running, Watch), LaunchError> {
         let level = req.manifest.manifest().audit.level;
         let sid = req.paths.id().as_str().to_owned();
         // Step 0 (architect Q58): the image, before anything is reserved or created.
@@ -439,7 +451,7 @@ impl Launcher {
         image: &ImageRef,
         level: AuditLevel,
         progress: &mut Progress,
-    ) -> Result<(Running, Option<WatchPlan>), LaunchError> {
+    ) -> Result<(Running, Watch), LaunchError> {
         let (runtime, scan, plan) = self.check_and_scan(req).await?;
         let image = image.as_str();
         self.image_present(image).await?;
@@ -475,7 +487,7 @@ impl Launcher {
             .run("create", argv.into_iter().map(OsString::from))
             .await?;
         let container = container_id(&out)?;
-        let (init_pid, init_dir) = match self.checked_start(req, scan, &container).await {
+        let (init_pid, init_dir, observed) = match self.checked_start(req, scan, &container).await {
             Ok(init) => init,
             Err(e) => {
                 // The container may have run long enough to open a tunnel: stop the listener
@@ -497,7 +509,7 @@ impl Launcher {
             init_pid,
             init_dir: Arc::new(init_dir),
         };
-        Ok((running, plan))
+        Ok((running, Watch { plan, observed }))
     }
 
     /// Step 3a: the session's egress listener on `net.sock`, for `network.mode: proxy` only. A
@@ -592,7 +604,7 @@ impl Launcher {
         req: &WorkspaceRequest,
         scan: LaunchScan,
         container: &str,
-    ) -> Result<(u32, rustix::fd::OwnedFd), LaunchError> {
+    ) -> Result<(u32, rustix::fd::OwnedFd, Observed), LaunchError> {
         let v = Arc::clone(&req.manifest);
         let expect: Vec<Expect> = scan
             .pins()
@@ -608,7 +620,7 @@ impl Launcher {
         self.run("init", [OsString::from("init"), container.into()])
             .await?;
         let pid = self.init_pid(container).await?;
-        let dir = blocking(move || {
+        let (dir, observed) = blocking(move || {
             // Opened first: the fd then names the process whose mounts are checked next.
             let p = format!("/proc/{pid}");
             let dir = sally_core::fd::open(
@@ -621,14 +633,15 @@ impl Launcher {
                 msg: format!("cannot open {p}: {e}"),
             })?;
             check_in_container(&dir, &expect).map_err(LaunchError::MountMismatch)?;
-            Ok(dir)
+            let observed = Observed::at_launch(&dir).map_err(LaunchError::CgroupEvents)?;
+            Ok((dir, observed))
         })
         .await?;
         self.run("start", [OsString::from("start"), container.into()])
             .await?;
         tokio::time::sleep(START_GRACE).await;
         self.confirm_running(container, pid).await?;
-        Ok((pid, dir))
+        Ok((pid, dir, observed))
     }
 
     /// Step 7: the container still runs, as the process whose mounts were checked. A container

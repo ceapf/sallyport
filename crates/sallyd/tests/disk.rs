@@ -113,7 +113,7 @@ fn rt_ag_09_a_full_speed_writer_in_an_rw_mount_is_stopped_by_the_floor() {
         write_until_killed(&r, "/workspace/p/fill", 512 * MIB).await;
         assert!(gone_within(r.container(), Duration::from_secs(20)).await);
         let a = x.events.args("session.resource_limit").expect("audited");
-        assert_eq!(a["reason"], "disk_floor", "{a}");
+        assert_eq!(a["reason"], "disk-floor", "{a}");
         assert_eq!(a["filesystem"], "filesystem.mounts[0]", "{a}");
         assert!(
             a["free"].as_u64().unwrap() < a["floor"].as_u64().unwrap(),
@@ -150,7 +150,7 @@ fn rt_ag_09_a_full_speed_writer_in_a_staged_mount_is_stopped_by_the_floor() {
         write_until_killed(&r, "/workspace/o/fill", 512 * MIB).await;
         assert!(gone_within(r.container(), Duration::from_secs(20)).await);
         let a = x.events.args("session.resource_limit").expect("audited");
-        assert_eq!(a["reason"], "disk_floor", "{a}");
+        assert_eq!(a["reason"], "disk-floor", "{a}");
         assert_eq!(a["filesystem"], "state", "{a}");
         x.stop(r).await;
     });
@@ -242,7 +242,7 @@ fn rt_ag_09_rename_churn_does_not_evade_stage_size() {
         let a = x.events.args("session.resource_limit").expect("audited");
         assert_eq!(a["resource"], "stage_size", "{a}");
         assert!(
-            a["reason"] == "stage_size" || a["reason"] == "unmeasurable",
+            a["reason"] == "stage-size" || a["reason"] == "unmeasurable",
             "{a}"
         );
         x.stop(r).await;
@@ -280,7 +280,7 @@ fn rt_ag_09_a_busy_walk_does_not_delay_another_sessions_floor() {
             "the floor reacted within its poll"
         );
         let a = x.events.args("session.resource_limit").expect("audited");
-        assert_eq!(a["reason"], "disk_floor", "{a}");
+        assert_eq!(a["reason"], "disk-floor", "{a}");
         x.stop(writer).await;
         x.stop(busy).await;
     });

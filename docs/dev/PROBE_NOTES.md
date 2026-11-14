@@ -12,6 +12,12 @@ line per fact, with where it was found. Check a note again before relying on it 
 - A container's limits (`pids.max`, `memory.max`, `memory.swap.max`) sit in
   `/sys/fs/cgroup/<CgroupPath>/container`, not in the `libpod-<id>.scope` itself (that shows the
   host default). `<CgroupPath>` is `podman inspect --format '{{.State.CgroupPath}}'`. (6c-2, AG-09)
+- The container init's `/proc/<pid>/cgroup` reads `0::<CgroupPath>/container` from the host, so it
+  names that directory directly. There, `pids.events` and `memory.events` are owned by the user,
+  mode 0444, and readable from the host. `max` went 0→1 after forks refused at `--pids-limit`,
+  and `oom_kill` went 0→1 after an in-container OOM; the container kept running. `pread` at
+  offset 0 of a held fd reads the current counts. (Task 12 PR C1, #27; the CI result is noted
+  below once C1's run has read it.)
 - With only `--memory`, swap is unlimited beyond it on cgroup v2 hosts with swap (the OCI config
   showed swap = 2 × memory). Sallyport sets `--memory-swap` equal to `--memory`. (Checkpoint 3)
 - On an OOM kill, the container's conmon writes an empty `oom` file into the working directory of

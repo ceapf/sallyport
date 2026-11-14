@@ -30,6 +30,8 @@ exclude_re = [
   'crates/sallyd/src/egress/ca\.rs:\d+:\d+: replace \| with \^ in write_new$',
   'crates/sallyd/src/egress/net\.rs:\d+:\d+: replace \| with \^ in bind$',
   'crates/sallyd/src/egress/roots\.rs:\d+:\d+: replace \| with \^ in read$',
+  'crates/sallyd/src/sandbox/cgroup\.rs:\d+:\d+: replace \| with \^ in open_root$',
+  'crates/sallyd/src/sandbox/cgroup\.rs:\d+:\d+: replace \| with \^ in open_event_file$',
   'crates/sallyd/src/sandbox/disk\.rs:\d+:\d+: replace \| with \^ in open_dir$',
   'crates/sallyd/src/sandbox/overlap\.rs:\d+:\d+: replace \| with \^ in identity_chain$',
   'crates/sallyd/src/sandbox/profiles\.rs:\d+:\d+: replace \| with \^ in write_profiles$',
