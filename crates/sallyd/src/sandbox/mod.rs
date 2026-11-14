@@ -17,6 +17,7 @@ mod disk;
 mod images;
 mod inside;
 mod launch;
+pub mod oci;
 pub(crate) mod orphans;
 mod overlap;
 mod podman;
@@ -26,7 +27,9 @@ mod stage;
 mod types;
 mod watchdog;
 
-pub use argv::{harness_argv, inference_argv, workspace_argv};
+pub use argv::{
+    harness_argv, harness_build, inference_argv, inference_build, workspace_argv, workspace_build,
+};
 pub use changes::{Change, ChangeKind, ChangesError, session_changes};
 pub use check::{Allowed, Grant, Source, check_argv};
 pub use dirs::{DirError, SessionDirs, check_runtime_dir, open_sessions, staged_indices};

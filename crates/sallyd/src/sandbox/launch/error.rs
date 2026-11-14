@@ -37,6 +37,10 @@ pub enum LaunchError {
     /// A mount inside the container is not the pinned object.
     #[error("sandbox.mount_mismatch: {0}")]
     MountMismatch(Mismatch),
+    /// The OCI config podman generated is not what the argv intended (Task 14, RT-SUP-04): the
+    /// first differing field, never the config.
+    #[error("sandbox.config_mismatch: {0}")]
+    ConfigMismatch(crate::sandbox::oci::Mismatch),
     /// The container was not running, with the checked pid, after `podman start`.
     #[error("the container is not running after start: {0}")]
     NotRunning(String),
@@ -99,6 +103,17 @@ impl LaunchError {
         super::capped(&self.to_string())
     }
 
+    /// The event of the refusal's audit entry: a mismatch found in the created container has
+    /// its own, every other refusal is `sandbox.refuse`.
+    #[must_use]
+    pub(crate) fn event(&self) -> &'static str {
+        match self {
+            Self::MountMismatch(_) => "sandbox.mount_mismatch",
+            Self::ConfigMismatch(_) => "sandbox.config_mismatch",
+            _ => "sandbox.refuse",
+        }
+    }
+
     /// A short reason for the `sandbox.refuse` audit entry, and the control reply's reason.
     #[must_use]
     pub(crate) fn reason(&self) -> &'static str {
@@ -112,6 +127,7 @@ impl LaunchError {
             Self::Argv(_) => "argv",
             Self::Podman(_) => "podman-config",
             Self::MountMismatch(_) => "mount-mismatch",
+            Self::ConfigMismatch(_) => "config-mismatch",
             Self::NotRunning(_) => "not-running",
             Self::DiskSpace(_) => "disk-floor",
             Self::CgroupEvents(_) => "cgroup-events",
@@ -191,6 +207,26 @@ mod tests {
             received(rx, sid()).await,
             Err(LaunchError::NoDefaultImage)
         ));
+    }
+
+    #[test]
+    fn a_config_mismatch_has_its_own_event_and_reason() {
+        let e = LaunchError::ConfigMismatch(crate::sandbox::oci::Mismatch::new(
+            "process.capabilities.bounding",
+            "not empty",
+        ));
+        assert_eq!(e.event(), "sandbox.config_mismatch");
+        assert_eq!(e.reason(), "config-mismatch");
+        assert_eq!(
+            e.detail(),
+            "sandbox.config_mismatch: process.capabilities.bounding: not empty"
+        );
+        let m = LaunchError::MountMismatch(crate::sandbox::inside::Mismatch {
+            guest: "/w".into(),
+            why: "moved".into(),
+        });
+        assert_eq!(m.event(), "sandbox.mount_mismatch");
+        assert_eq!(LaunchError::NoDefaultImage.event(), "sandbox.refuse");
     }
 
     #[test]

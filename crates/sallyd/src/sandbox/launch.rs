@@ -38,12 +38,13 @@ use serde_json::json;
 use crate::egress::local::Connector;
 use crate::egress::net::{EgressError, EgressHandle, EgressStarter, NET_SOCK, SessionEgress};
 
-use super::argv::workspace_argv;
+use super::argv::workspace_build;
 use super::budget::session_cost;
 use super::commands::container_id;
 use super::dirs::{SessionDirs, staged_indices};
 use super::disk::DiskFloor;
 use super::inside::{Expect, check_in_container};
+use super::oci::intent::{Built, Intent};
 use super::overlap::{Sessions, claims};
 use super::podman::{Podman, PodmanError};
 use super::scan::{LaunchScan, PinKind, ScanLimits, scan_mounts};
@@ -54,6 +55,7 @@ use crate::oplog::Oplog;
 
 mod error;
 mod teardown;
+mod verify;
 
 use error::join_err;
 pub use error::{LaunchError, StopError};
@@ -422,12 +424,7 @@ impl Launcher {
         level: AuditLevel,
         cleanup: String,
     ) -> LaunchError {
-        let event = if matches!(e, LaunchError::MountMismatch(_)) {
-            "sandbox.mount_mismatch"
-        } else {
-            "sandbox.refuse"
-        };
-        let entry = NewEntry::new(Actor::Sallyd, event)
+        let entry = NewEntry::new(Actor::Sallyd, e.event())
             .session(sid)
             .decision("deny")
             .args(json!({
@@ -455,7 +452,7 @@ impl Launcher {
         let (runtime, scan, plan) = self.check_and_scan(req).await?;
         let image = image.as_str();
         self.image_present(image).await?;
-        let argv = self.dirs_and_argv(req, runtime, &scan, progress).await?;
+        let Built { argv, intent } = self.dirs_and_argv(req, runtime, &scan, progress).await?;
         let egress = self.start_egress(req).await?;
         let mounts: Vec<_> = req
             .manifest
@@ -487,7 +484,8 @@ impl Launcher {
             .run("create", argv.into_iter().map(OsString::from))
             .await?;
         let container = container_id(&out)?;
-        let (init_pid, init_dir, observed) = match self.checked_start(req, scan, &container).await {
+        let (init_pid, init_dir, observed) =
+            match self.checked_start(req, scan, &container, &intent).await {
             Ok(init) => init,
             Err(e) => {
                 // The container may have run long enough to open a tunnel: stop the listener
@@ -566,7 +564,7 @@ impl Launcher {
         runtime: CheckedRuntime,
         scan: &LaunchScan,
         progress: &mut Progress,
-    ) -> Result<Vec<String>, LaunchError> {
+    ) -> Result<Built, LaunchError> {
         let staged = staged_indices(&req.manifest);
         let overlays = scan.git().iter().map(|g| g.dirs().len()).sum();
         let (paths, xdg) = (req.paths.clone(), self.xdg_runtime_dir.clone());
@@ -588,7 +586,7 @@ impl Launcher {
             mounts_file: self.podman.mounts_file(),
             installation: self.installation.clone(),
         };
-        Ok(workspace_argv(
+        Ok(workspace_build(
             &common,
             &req.paths,
             &req.manifest,
@@ -604,6 +602,7 @@ impl Launcher {
         req: &WorkspaceRequest,
         scan: LaunchScan,
         container: &str,
+        intent: &Intent,
     ) -> Result<(u32, rustix::fd::OwnedFd, Observed), LaunchError> {
         let v = Arc::clone(&req.manifest);
         let expect: Vec<Expect> = scan
@@ -637,6 +636,8 @@ impl Launcher {
             Ok((dir, observed))
         })
         .await?;
+        // Task 14 (architect Q99): last before start, so the config read is the one started.
+        self.verify_config(container, intent).await?;
         self.run("start", [OsString::from("start"), container.into()])
             .await?;
         tokio::time::sleep(START_GRACE).await;

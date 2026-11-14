@@ -10,9 +10,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use sally_core::manifest::{ByteSize, MountMode, NetworkMode, ValidatedManifest};
+use sally_core::manifest::{ByteSize, Cpus, MountMode, NetworkMode, ValidatedManifest};
 
 use super::check::{Allowed, Grant, Source, check_argv};
+use super::oci::intent::{Built, Intent, Wanted};
 use super::scan::{GitScan, LaunchScan};
 use super::types::{
     ArgvError, CommonArgs, INSTALLATION_LABEL, ImageRef, InferenceSpec, OverlayDirs, Role,
@@ -56,7 +57,7 @@ pub(super) const MODEL_GUEST: &str = "/models/model.gguf";
 /// `llama-server` listens here, inside the inference socket directory.
 pub(super) const INFER_SOCKET: &str = "/run/sallyport/infer.sock";
 /// Harness resources are fixed in v1 (AMENDMENTS-01 §2).
-const HARNESS_CPUS: &str = "1";
+const HARNESS_CPU_MILLIS: u32 = 1000;
 const HARNESS_MEMORY: u64 = 1024 * 1024 * 1024;
 const HARNESS_PIDS: u32 = 128;
 /// `/tmp` of the harness and inference containers.
@@ -110,11 +111,19 @@ fn git_rel(p: &Path, what: &str) -> Result<String, ArgvError> {
     Ok(s.to_owned())
 }
 
-struct Argv(Vec<String>);
+/// The argv being built, and what it asks for (architect Q100: every method that pushes a flag
+/// the verifier compares also records it).
+struct Argv {
+    args: Vec<String>,
+    intent: Intent,
+}
 
 impl Argv {
     fn new(c: &CommonArgs, name: String, role: Role) -> Result<Self, ArgvError> {
-        let mut a = Self(Vec::new());
+        let mut a = Self {
+            args: Vec::new(),
+            intent: Intent::begin(role, c.ids, c.profiles.clone()),
+        };
         a.push([
             "--runtime",
             &path_arg(c.runtime.path(), "runtime")?,
@@ -159,10 +168,11 @@ impl Argv {
     }
 
     fn push<const N: usize>(&mut self, items: [&str; N]) {
-        self.0.extend(items.iter().map(|s| (*s).to_owned()));
+        self.args.extend(items.iter().map(|s| (*s).to_owned()));
     }
 
     fn tmpfs(&mut self, bytes: u64, exec: bool) {
+        self.intent.tmp = Some((bytes, exec));
         let exec = if exec { "exec" } else { "noexec" };
         self.push([
             "--tmpfs",
@@ -170,8 +180,16 @@ impl Argv {
         ]);
     }
 
-    fn limits(&mut self, pids: u32, cpus: &str, memory: Option<u64>) {
-        self.push(["--pids-limit", &pids.to_string(), "--cpus", cpus]);
+    fn limits(&mut self, pids: u32, cpus: Cpus, memory: Option<u64>) {
+        self.intent.pids = Some(pids);
+        self.intent.cpu_millis = Some(cpus.millis());
+        self.intent.memory = memory;
+        self.push([
+            "--pids-limit",
+            &pids.to_string(),
+            "--cpus",
+            &cpus.to_string(),
+        ]);
         if let Some(m) = memory {
             // Swap equal to memory: no swap at all, in any role.
             let m = format!("{m}b");
@@ -179,11 +197,35 @@ impl Argv {
         }
     }
 
+    fn hostname(&mut self, name: &str) {
+        self.intent.hostname = Some(name.to_owned());
+        self.push(["--hostname", name]);
+    }
+
+    fn gpu(&mut self) {
+        self.intent.gpu = true;
+        self.push(["--device", "nvidia.com/gpu=all"]);
+    }
+
+    /// The image and the command after it: the last arguments.
+    fn run(&mut self, image: &ImageRef, command: &[&str]) {
+        self.intent.image = image.as_str().to_owned();
+        self.intent.command = command.iter().map(|s| (*s).to_owned()).collect();
+        self.args.push(image.as_str().to_owned());
+        self.args.extend(self.intent.command.iter().cloned());
+    }
+
     fn env(&mut self, name: &str, value: &str) {
+        self.intent.env.push((name.to_owned(), value.to_owned()));
         self.push(["--env", &format!("{name}={value}")]);
     }
 
     fn bind(&mut self, host: &str, guest: &str, access: &str) {
+        self.intent.mounts.push(Wanted::Bind {
+            host: host.to_owned(),
+            guest: guest.to_owned(),
+            rw: access == "rw",
+        });
         self.push(["-v", &format!("{host}:{guest}:{access},nosuid,nodev,bind")]);
     }
 
@@ -197,12 +239,21 @@ impl Argv {
             "-v",
             &format!("{host}:{guest}:O,upperdir={upper},workdir={work}"),
         ]);
+        self.intent.mounts.push(Wanted::Overlay {
+            host: host.to_owned(),
+            guest: guest.to_owned(),
+            upper,
+            work,
+        });
         Ok(())
     }
 
-    fn finish(self, allowed: &Allowed) -> Result<Vec<String>, ArgvError> {
-        check_argv(&self.0, allowed)?;
-        Ok(self.0)
+    fn finish(self, allowed: &Allowed) -> Result<Built, ArgvError> {
+        check_argv(&self.args, allowed)?;
+        Ok(Built {
+            argv: self.args,
+            intent: self.intent,
+        })
     }
 }
 
@@ -251,6 +302,20 @@ pub fn workspace_argv(
     scan: &LaunchScan,
     default_image: Option<&ImageRef>,
 ) -> Result<Vec<String>, ArgvError> {
+    workspace_build(c, paths, v, scan, default_image).map(|b| b.argv)
+}
+
+/// [`workspace_argv`] and its [`Intent`], for the OCI config verifier (Task 14).
+///
+/// # Errors
+/// As [`workspace_argv`].
+pub fn workspace_build(
+    c: &CommonArgs,
+    paths: &SessionPaths,
+    v: &ValidatedManifest,
+    scan: &LaunchScan,
+    default_image: Option<&ImageRef>,
+) -> Result<Built, ArgvError> {
     let m = v.manifest();
     if !scan.is_for(v) {
         return input("the launch scan belongs to another manifest");
@@ -260,10 +325,11 @@ pub fn workspace_argv(
     a.tmpfs(m.runtime.tmp_size.bytes(), m.runtime.tmp_exec);
     a.limits(
         m.runtime.pids,
-        &m.runtime.cpus.to_string(),
+        m.runtime.cpus,
         Some(m.runtime.memory.bytes()),
     );
-    a.push(["--init", "--env-host=false", "--hostname", "sandbox"]);
+    a.push(["--init", "--env-host=false"]);
+    a.hostname("sandbox");
     workspace_env(&mut a, v);
     let mut sources = workspace_mounts(&mut a, paths, v, &scans)?;
     let sockets = paths.workspace_sockets();
@@ -283,7 +349,7 @@ pub fn workspace_argv(
             );
         }
     };
-    a.push([image.as_str(), ENTRY, "--idle"]);
+    a.run(&image, &[ENTRY, "--idle"]);
     a.finish(&allowed(
         c,
         Role::Workspace,
@@ -458,10 +524,28 @@ pub fn harness_argv(
     v: &ValidatedManifest,
     default_image: &ImageRef,
 ) -> Result<Vec<String>, ArgvError> {
+    harness_build(c, paths, v, default_image).map(|b| b.argv)
+}
+
+/// [`harness_argv`] and its [`Intent`], for the OCI config verifier (Task 14).
+///
+/// # Errors
+/// As [`workspace_argv`].
+pub fn harness_build(
+    c: &CommonArgs,
+    paths: &SessionPaths,
+    v: &ValidatedManifest,
+    default_image: &ImageRef,
+) -> Result<Built, ArgvError> {
     let mut a = Argv::new(c, format!("sp-h-{}", paths.id().as_str()), Role::Harness)?;
     a.tmpfs(SMALL_TMP, false);
-    a.limits(HARNESS_PIDS, HARNESS_CPUS, Some(HARNESS_MEMORY));
-    a.push(["--init", "--env-host=false", "--hostname", "sandbox"]);
+    a.limits(
+        HARNESS_PIDS,
+        Cpus::from_millis(HARNESS_CPU_MILLIS),
+        Some(HARNESS_MEMORY),
+    );
+    a.push(["--init", "--env-host=false"]);
+    a.hostname("sandbox");
     a.env("OPENAI_BASE_URL", OPENAI_BASE_URL);
     a.env("OPENAI_API_KEY", HARNESS_API_KEY);
     let sockets = paths.harness_sockets();
@@ -474,7 +558,7 @@ pub fn harness_argv(
         Some(h) => ImageRef::parse(&h.image).map_err(|e| field_err("harness.image", e))?,
         None => default_image.clone(),
     };
-    a.push([image.as_str(), ENTRY]);
+    a.run(&image, &[ENTRY]);
     a.finish(&allowed(
         c,
         Role::Harness,
@@ -491,35 +575,48 @@ pub fn harness_argv(
 /// # Errors
 /// As [`workspace_argv`].
 pub fn inference_argv(c: &CommonArgs, s: &InferenceSpec) -> Result<Vec<String>, ArgvError> {
+    inference_build(c, s).map(|b| b.argv)
+}
+
+/// [`inference_argv`] and its [`Intent`], for the OCI config verifier (Task 14).
+///
+/// # Errors
+/// As [`workspace_argv`].
+pub fn inference_build(c: &CommonArgs, s: &InferenceSpec) -> Result<Built, ArgvError> {
     let mut a = Argv::new(
         c,
         format!("sp-infer-{}", s.instance.as_str()),
         Role::Inference,
     )?;
     a.tmpfs(SMALL_TMP, false);
-    a.limits(
-        INFERENCE_PIDS,
-        &s.cpus.to_string(),
-        s.memory.map(ByteSize::bytes),
-    );
+    a.limits(INFERENCE_PIDS, s.cpus, s.memory.map(ByteSize::bytes));
     a.push(["--init", "--env-host=false"]);
     if s.gpu {
-        a.push(["--device", "nvidia.com/gpu=all"]);
+        a.gpu();
     }
     a.bind(&path_arg(s.model.path(), "model file")?, MODEL_GUEST, "ro");
     let sockets = path_arg(&s.socket_dir, "inference socket directory")?;
     a.bind(&sockets, SOCKETS_GUEST, "rw");
-    a.push([s.image.as_str(), "llama-server", "--host", INFER_SOCKET]);
-    a.push(["-m", MODEL_GUEST, "-ngl", &s.gpu_layers.to_string()]);
-    a.push([
-        "-c",
-        &s.context.to_string(),
-        "--jinja",
-        "--no-webui",
-        "-np",
-        "1",
-        "--log-disable",
-    ]);
+    let (layers, context) = (s.gpu_layers.to_string(), s.context.to_string());
+    a.run(
+        &s.image,
+        &[
+            "llama-server",
+            "--host",
+            INFER_SOCKET,
+            "-m",
+            MODEL_GUEST,
+            "-ngl",
+            &layers,
+            "-c",
+            &context,
+            "--jinja",
+            "--no-webui",
+            "-np",
+            "1",
+            "--log-disable",
+        ],
+    );
     a.finish(&allowed(
         c,
         Role::Inference,
@@ -629,7 +726,14 @@ mod tests {
             assert!(e.to_string().contains("filesystem.mounts["), "{e}");
         }
         // A missing scan is refused when the argv is built.
-        let mut a = Argv(Vec::new());
+        let mut a = Argv {
+            args: Vec::new(),
+            intent: Intent::begin(
+                Role::Workspace,
+                crate::sandbox::UserIds { uid: 1, gid: 1 },
+                dir.clone(),
+            ),
+        };
         let paths = SessionPaths::new(
             super::super::types::SessionId::parse("s").unwrap(),
             &dir.join("run"),

@@ -98,6 +98,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "oci_config"
+path = "fuzz_targets/oci_config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "proc_stat"
 path = "fuzz_targets/proc_stat.rs"
 test = false

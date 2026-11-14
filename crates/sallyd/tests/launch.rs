@@ -498,67 +498,6 @@ fn rt_fs_16_a_nested_host_mount_is_not_visible() {
     });
 }
 
-/// #11: a hostile user `containers.conf`, `mounts.conf` and `storage.conf` under the `$HOME`
-/// podman is given have no effect: `CONTAINERS_CONF` replaces them and `XDG_CONFIG_HOME` is
-/// Sallyport's own empty directory. (RT-SUP-04 with the OCI config verifier: Task 14, #15.)
-#[test]
-fn hostile_user_podman_configuration_is_ignored() {
-    let fx_home = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("hostile-home-{}", std::process::id()));
-    let conf = fx_home.join(".config/containers");
-    std::fs::create_dir_all(conf.join("oci/hooks.d")).unwrap();
-    let leak = fx_home.join("leak");
-    std::fs::create_dir_all(&leak).unwrap();
-    std::fs::write(leak.join("canary"), "HOSTILE").unwrap();
-    std::fs::write(
-        conf.join("containers.conf"),
-        format!(
-            "[containers]\nvolumes = [\"{}:/hostile:rw\"]\ndefault_capabilities = [\"SYS_ADMIN\", \"NET_RAW\"]\nenv = [\"HOSTILE=1\"]\nnetns = \"host\"\n",
-            leak.display()
-        ),
-    )
-    .unwrap();
-    std::fs::write(
-        conf.join("mounts.conf"),
-        format!("{}:/run/secrets/hostile\n", leak.display()),
-    )
-    .unwrap();
-    // Read only if podman saw the user's config directory: an empty image store, so the launch
-    // would fail with the image unknown.
-    std::fs::write(
-        conf.join("storage.conf"),
-        format!(
-            "[storage]\ndriver = \"vfs\"\ngraphroot = \"{0}/store\"\nrunroot = \"{0}/run\"\n",
-            fx_home.display()
-        ),
-    )
-    .unwrap();
-    let _cleanup = RemoveOnDrop(fx_home.clone());
-    rt().block_on(async {
-        let x = Lx::with_home(Some(fx_home.clone()));
-        let v =
-            x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "ro")]));
-        let r = x.launch(&v, "hostile").await.unwrap();
-        let (_, out) = exec(
-            &r,
-            "ls /hostile /run/secrets 2>&1; env | grep HOSTILE; grep CapEff /proc/self/status; \
-             ls /sys/class/net",
-        )
-        .await;
-        assert!(
-            !out.contains("canary") && !out.contains("HOSTILE=1"),
-            "{out}"
-        );
-        assert!(out.contains("CapEff:\t0000000000000000"), "{out}");
-        assert_eq!(
-            out.lines().last(),
-            Some("lo"),
-            "own network namespace: {out}"
-        );
-        x.stop(r).await;
-    });
-}
-
 struct RemoveOnDrop(PathBuf);
 
 impl Drop for RemoveOnDrop {

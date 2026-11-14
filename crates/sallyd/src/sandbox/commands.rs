@@ -103,6 +103,20 @@ impl Launcher {
         verb: &'static str,
         args: impl IntoIterator<Item = OsString>,
     ) -> Result<String, LaunchError> {
+        self.run_raw(verb, args, OUTPUT_CAP)
+            .await
+            .map(|out| String::from_utf8_lossy(&out).into_owned())
+    }
+
+    /// [`run`](Self::run), keeping up to `keep` bytes of stdout as they are. A caller that
+    /// bounds its input passes its bound + 1, so an over-long output is refused by its parser
+    /// rather than cut (architect Q99).
+    pub(super) async fn run_raw(
+        &self,
+        verb: &'static str,
+        args: impl IntoIterator<Item = OsString>,
+        keep: usize,
+    ) -> Result<Vec<u8>, LaunchError> {
         let fail = |msg: String| LaunchError::Command { verb, msg };
         let mut child = self
             .podman
@@ -116,7 +130,7 @@ impl Launcher {
             return Err(fail("no pipes".into()));
         };
         let work = async {
-            let (out, err) = tokio::join!(read_capped(out), read_capped(err));
+            let (out, err) = tokio::join!(read_capped(out, keep), read_capped(err, OUTPUT_CAP));
             let status = child.wait().await;
             (out, err, status)
         };
@@ -125,7 +139,7 @@ impl Launcher {
             .map_err(|_| fail(format!("timed out after {}s", PODMAN_TIMEOUT.as_secs())))?;
         let status = status.map_err(|e| fail(e.to_string()))?;
         if status.success() {
-            Ok(String::from_utf8_lossy(&out).into_owned())
+            Ok(out)
         } else {
             Err(fail(format!(
                 "{status}: {}",
@@ -162,17 +176,17 @@ pub(super) fn container_id(out: &str) -> Result<String, LaunchError> {
     }
 }
 
-/// Reads until end of file, keeping the first [`OUTPUT_CAP`] bytes, so a chatty process never
-/// blocks on a full pipe and never grows memory without bound. A read error ends the read; the
-/// command's timeout then bounds the wait for the process.
-async fn read_capped(mut r: impl AsyncRead + Unpin) -> Vec<u8> {
+/// Reads until end of file, keeping the first `cap` bytes, so a chatty process never blocks on a
+/// full pipe and never grows memory without bound. A read error ends the read; the command's
+/// timeout then bounds the wait for the process.
+async fn read_capped(mut r: impl AsyncRead + Unpin, cap: usize) -> Vec<u8> {
     let mut kept = Vec::new();
     let mut buf = [0u8; 8192];
     loop {
         match r.read(&mut buf).await {
             Ok(0) | Err(_) => return kept,
             Ok(n) => {
-                let room = OUTPUT_CAP.saturating_sub(kept.len());
+                let room = cap.saturating_sub(kept.len());
                 kept.extend_from_slice(buf.get(..n.min(room)).unwrap_or_default());
             }
         }
@@ -204,7 +218,9 @@ mod tests {
     #[tokio::test]
     async fn output_is_capped_but_fully_drained() {
         let data = vec![b'x'; OUTPUT_CAP * 3 + 17];
-        let kept = read_capped(data.as_slice()).await;
+        let kept = read_capped(data.as_slice(), OUTPUT_CAP).await;
         assert_eq!(kept.len(), OUTPUT_CAP);
+        let kept = read_capped(data.as_slice(), OUTPUT_CAP * 2 + 1).await;
+        assert_eq!(kept.len(), OUTPUT_CAP * 2 + 1);
     }
 }
