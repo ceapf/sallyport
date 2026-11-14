@@ -9,6 +9,8 @@
 # cargo-mutants never mutates a function named `new` (no exclusion needed, and none covers it):
 # mutants_config.rs `no_fn_new_in_mutation_scope_holds_logic` keeps logic out of them.
 # TODO(#87): Task 13 empties that test's allowlist.
+# Build with Cargo.toml's `mutants` profile: the test profile without debug info (#82).
+profile = "mutants"
 exclude_re = [
   # Equivalent: `|` -> `^` over flag constants that are pairwise disjoint gives the same value.
   # Proof: mutants_config.rs `xor_exclusions_combine_disjoint_flags` reads each function below

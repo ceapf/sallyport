@@ -89,11 +89,20 @@ MUTANTS_FILES := crates/sally-core/src/manifest/validate/*.rs crates/sally-core/
 # TMPDIR move.
 MUTANTS_TMP := $(CURDIR)/target/mutants-tmp
 DISK_LOCK := bash scripts/disk-lock.sh
+# Every test binary a mutation run starts goes through cargo's target runner, which caps its data
+# segment (RLIMIT_DATA: heap and thread stacks, not untouched reservations). A mutant that
+# allocates without end then fails its own test (caught) instead of exhausting the nightly
+# runner (#82). The largest per-mutant test set passes under 1 GiB on a 32-core machine; the cap
+# is 4 GiB, a quarter of the runner's memory. An address-space cap (RLIMIT_AS) does not fit: a
+# many-core machine's tokio runtimes and malloc arenas reserve far more than they use.
+MUTANTS_DATA_CAP := 4294967296
+MUTANTS_HOST := $(shell rustc -vV | sed -n 's/^host: //p' | tr 'a-z-' 'A-Z_')
+MUTANTS_ENV := TMPDIR=$(MUTANTS_TMP) CARGO_TARGET_$(MUTANTS_HOST)_RUNNER='prlimit --data=$(MUTANTS_DATA_CAP) --'
 # The gate fails on missed mutants only; a timed-out mutant hangs a test, so it counts as
 # detected and goes to the job summary (maintainer ruling, #36; scripts/mutants-gate.sh).
 mutants:
 	mkdir -p $(MUTANTS_TMP)
-	TMPDIR=$(MUTANTS_TMP) $(DISK_LOCK) cargo mutants --package sally-core --no-shuffle $(foreach f,$(MUTANTS_FILES),--file '$(f)'); \
+	$(MUTANTS_ENV) $(DISK_LOCK) cargo mutants --package sally-core --no-shuffle $(foreach f,$(MUTANTS_FILES),--file '$(f)'); \
 	  bash scripts/mutants-gate.sh $$? mutants.out
 
 # The wider scope (CLAUDE.md "Mutation scope"): every other file whose security decisions can be
@@ -130,7 +139,7 @@ MUTANTS_WIDE_TESTS_SHIM := --lib --test=relay
 MUTANTS_SHARD ?=
 MUTANTS_OUT ?=
 # $(1) package, $(2) files, $(3) cargo test args
-mutants_wide = mkdir -p $(MUTANTS_TMP) && TMPDIR=$(MUTANTS_TMP) $(DISK_LOCK) cargo mutants --package $(1) \
+mutants_wide = mkdir -p $(MUTANTS_TMP) && $(MUTANTS_ENV) $(DISK_LOCK) cargo mutants --package $(1) \
   --no-shuffle $(if $(MUTANTS_SHARD),--shard $(MUTANTS_SHARD) --sharding round-robin) \
   $(if $(MUTANTS_OUT),--output $(MUTANTS_OUT)) $(foreach f,$(2),--file '$(f)') \
   $(foreach a,$(3),--cargo-test-arg=$(a)); \
