@@ -249,7 +249,7 @@ fn a_script_is_sent_as_a_scripted_model_declared_driven() {
 
 #[test]
 fn a_script_over_the_cap_is_never_sent() {
-    let f = Fake::new("bigscr",|req| result(req, json!({})));
+    let f = Fake::new("bigscr", |req| result(req, json!({})));
     let manifest = f.runtime.join("m.yaml");
     std::fs::write(&manifest, "name: t\n").unwrap();
     let script = f.runtime.join("s.jsonl");
