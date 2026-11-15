@@ -190,16 +190,53 @@ async fn texts_are_escaped_and_cut_at_their_named_caps() {
         panic!()
     };
     assert!(!s.calls[0].name.contains('\u{1b}'), "{}", s.calls[0].name);
-    assert!(s.calls[0].result.len() < RESULT_CHARS + 50);
+    let marker = "...(+50 bytes)";
+    assert!(s.calls[0].result.ends_with(marker));
+    assert_eq!(s.calls[0].result.len(), RESULT_CHARS + marker.len());
     let Stepped::Step(c) = seat.step().await else {
         panic!()
     };
     assert!(!c.content.unwrap().contains('\u{1b}'));
 }
 
+/// The step reply at its worst, serialized: every text cut at its cap from input that escapes
+/// to the most JSON (backslashes, each doubled again by JSON), and the most calls a turn has.
 #[test]
 fn the_largest_step_fits_the_reply_budget() {
-    let calls = crate::llm::scripted::MAX_CALLS;
-    let step = CONTENT_CHARS + calls * (RESULT_CHARS + NAME_CHARS + 64);
-    assert!(step < crate::rpc::control_methods::REPLY_BYTES);
+    let worst = |cap: usize| escape_capped(&vec![b'\\'; cap * 4], cap);
+    let call = StepCall {
+        name: worst(NAME_CHARS),
+        result: worst(RESULT_CHARS),
+    };
+    let step = Step {
+        turn: u32::MAX,
+        kind: TurnKind::ToolCalls,
+        content: Some(worst(CONTENT_CHARS)),
+        calls: vec![call; crate::llm::scripted::MAX_CALLS],
+        done: true,
+    };
+    let bytes = serde_json::to_vec(&step).unwrap().len();
+    assert!(
+        bytes > 2 * (CONTENT_CHARS + RESULT_CHARS),
+        "{bytes}: not the worst case"
+    );
+    assert!(bytes < crate::rpc::control_methods::REPLY_BYTES, "{bytes}");
+}
+
+/// A call left unrecorded because the session stopped while the step ran is a refusal, not a
+/// broken connection; the step's `drive.turn` was written before the stop.
+#[tokio::test]
+async fn a_call_cut_off_by_the_stop_refuses_the_step() {
+    let (sink, rec) = recorder("sess-a");
+    let ops = Ops::new();
+    let closing = ops.clone();
+    let answer: CallFn = Box::new(move |_, _| {
+        closing.close();
+        Box::pin(async { Driven::Unrecorded })
+    });
+    let turns = vec![Turn::ToolCalls(vec![call("a")])];
+    let d = Driver::build(turns, answer, rec.driven(), ops);
+    let r = d.claim().unwrap().step().await;
+    assert_eq!(r, Stepped::Refused("session-stopping"));
+    assert_eq!(sink.events(), ["drive.turn"]);
 }

@@ -220,6 +220,42 @@ async fn a_request_pipelined_behind_a_step_does_not_drop_it() {
     assert!(r["result"].is_object() || r["result"].is_array(), "{r}");
 }
 
+/// The seat of a session that stopped is let go at the connection's next request: the
+/// connection is no driver any more, so it may watch (and decide) again.
+#[tokio::test]
+async fn a_seat_of_a_stopped_session_is_let_go() {
+    let f = fx("drive-ended");
+    f.fake.live.lock().unwrap().push((info("s-1"), None));
+    let (own, rec) = recorder("s-1");
+    let ops = crate::tools::ops::Ops::new();
+    let call: CallFn = Box::new(|_, _| {
+        Box::pin(async {
+            Driven::Done(ToolOutcome {
+                is_error: false,
+                text: "ran".into(),
+            })
+        })
+    });
+    let d = Driver::build(
+        Script::parse(TWO).unwrap().turns,
+        call,
+        rec.driven(),
+        ops.clone(),
+    );
+    f.fake.drivers.lock().unwrap().insert("s-1".into(), d);
+    let mut w = f.connect();
+    w.call("sessions.drive", json!({"id": "s-1"})).await;
+    let r = w.call("approvals.watch", json!({})).await;
+    assert_eq!(reason(&r), "driver-seat");
+    ops.close();
+    let r = w.call("sessions.drive", json!({"id": "s-1"})).await;
+    assert_eq!(reason(&r), "session-stopping");
+    let r = w.call("approvals.watch", json!({})).await;
+    assert!(r.get("error").is_none(), "{r}");
+    assert_eq!(f.hub.count(), 1);
+    assert_eq!(own.events(), ["drive.turn"], "nothing after the stop");
+}
+
 #[tokio::test]
 async fn a_connection_that_watches_cannot_take_the_seat() {
     let f = fx("drive-watching");

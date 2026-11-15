@@ -27,6 +27,7 @@ use sha2::{Digest, Sha256};
 use super::agent::Driven;
 use super::record::Recorder;
 use crate::llm::scripted::{Call, Turn};
+use crate::tools::STOPPING;
 use crate::tools::ops::Ops;
 
 /// Characters of an assistant message in a step reply, after escaping.
@@ -73,7 +74,8 @@ enum SeatState {
 pub enum Stepped {
     /// The turn ran; this is its reply.
     Step(Step),
-    /// Refused with this reason, and nothing was written (`session-stopping`).
+    /// Refused with this reason (`session-stopping`): the session stopped before the step, and
+    /// nothing was written, or under one of its calls, after its `drive.turn`.
     Refused(&'static str),
     /// An entry could not be written: close the connection, send no reply.
     Close,
@@ -129,6 +131,12 @@ impl Driver {
             SeatState::Gone => Err(SeatRefusal::Gone),
         }
     }
+
+    /// Whether the session is stopping or stopped (its operations are closed).
+    #[must_use]
+    pub fn ended(&self) -> bool {
+        self.ops.is_closed()
+    }
 }
 
 impl Seat {
@@ -138,12 +146,18 @@ impl Seat {
         Arc::ptr_eq(&self.0, driver)
     }
 
+    /// Whether its session is stopping or stopped: the seat can drive nothing more.
+    #[must_use]
+    pub fn ended(&self) -> bool {
+        self.0.ended()
+    }
+
     /// Runs the next scripted turn.
     pub async fn step(&self) -> Stepped {
         let d = &*self.0;
         let mut next = d.next.lock().await;
-        if d.ops.is_closed() {
-            return Stepped::Refused("session-stopping");
+        if d.ended() {
+            return Stepped::Refused(STOPPING);
         }
         let Some(turn) = d.turns.get(*next) else {
             return Stepped::Step(Step {
@@ -217,6 +231,8 @@ impl Driver {
                     done = true;
                     break;
                 }
+                // The stop sealed the log under the call: say so, rather than close.
+                Driven::Unrecorded if self.ended() => return Stepped::Refused(STOPPING),
                 Driven::Unrecorded => return Stepped::Close,
             }
         }

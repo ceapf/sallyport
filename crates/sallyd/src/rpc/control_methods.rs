@@ -202,6 +202,9 @@ pub(crate) enum Done {
 impl<S: SessionSet> Control<S> {
     /// Runs one admitted call (its `rpc.request` is written).
     pub(crate) async fn run(&self, call: Call, conn: &mut Conn) -> Done {
+        // Seats of sessions that stopped are let go: they drive nothing, and a connection that
+        // only holds those is no driver (Q121's refusals are for a live seat).
+        conn.seats.retain(|s| !s.ended());
         match call {
             Call::Create(p) => self.create(p, conn.client).await,
             Call::List => {
@@ -256,6 +259,10 @@ impl<S: SessionSet> Control<S> {
                 self.unknown_session(method, &id, client).await
             };
         };
+        if driver.ended() {
+            let why = crate::tools::STOPPING;
+            return self.driver_refused(method, Some(&id), why, client).await;
+        }
         if !conn.holds(&driver) {
             if conn.watch.is_some() {
                 let why = "driver-watching";
