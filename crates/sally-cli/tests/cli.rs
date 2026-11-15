@@ -245,6 +245,11 @@ fn a_script_is_sent_as_a_scripted_model_declared_driven() {
         json!({"manifest": "name: t\n",
                "model": {"kind": "scripted", "script": "{\"fail\":true}\n", "driven": true}})
     );
+    // The hash sallyd computed is printed, so the user can match it to their file (Q103).
+    assert_eq!(
+        stdout(&o),
+        "s-1  running  t  sp-w-s-1  scripted, driven, 1 turns, sha256 ab\n"
+    );
 }
 
 #[test]

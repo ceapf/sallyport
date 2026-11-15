@@ -6,7 +6,8 @@ use std::path::Path;
 
 use sally_core::manifest::MAX_MANIFEST_BYTES;
 use sally_proto::{
-    Changes, ErrorData, MAX_SCRIPT_BYTES, Prompts, Session, SessionState, Sessions, Stopped, method,
+    Changes, ErrorData, MAX_SCRIPT_BYTES, ModelKind, Prompts, Session, SessionState, Sessions,
+    Stopped, method,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -108,7 +109,17 @@ fn session_line(p: &mut Printer<'_, '_>, s: &Session) {
         SessionState::Running => "running",
         SessionState::StopFailed => "stop-failed",
     };
-    p.line(&[&s.id, "  ", state, "  ", &s.manifest, "  ", &s.container]);
+    let base: [&str; 7] = [&s.id, "  ", state, "  ", &s.manifest, "  ", &s.container];
+    match (&s.model.kind, &s.model.sha256) {
+        // The hash `sallyd` computed of the script it parsed (architect Q103), with its turns.
+        // A scripted session is always driven in M1 (architect Q119).
+        (ModelKind::Scripted, Some(sha)) => {
+            let turns = s.model.turns.unwrap_or_default().to_string();
+            let tail = ["  scripted, driven, ", &turns, " turns, sha256 ", sha];
+            p.line(&[base.as_slice(), tail.as_slice()].concat());
+        }
+        _ => p.line(&base),
+    }
 }
 
 /// `sally session start <manifest> [--script <file>]`: sends the manifest's text, and with a
