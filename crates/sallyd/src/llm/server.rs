@@ -13,9 +13,10 @@
 //! (detail) follows the reply, like `egress.close`. A failed append closes the connection
 //! without a reply or a backend call (recorded `audit-failed` when the log takes it).
 //!
-//! The backend is a constructor argument (Task 7 decision 2). Until M3 none is wired in
-//! production; the scripted mock model lives in the test tree (architect ruling Q3).
-// TODO(#53): Task 12 wires no backend (llm.sock not served) until M3; never the test mock.
+//! The backend is a constructor argument (Task 7 decision 2). Until M3 none is served in
+//! production: `llm.sock` stays unserved, and the scripted model ([`super::scripted`]) answers
+//! a driven session's driver, never a harness (architect rulings Q46, Q119).
+// TODO(#53): Task 12 serves no llm.sock backend until M3.
 
 use std::fmt::Write as _;
 use std::future::Future;
@@ -61,7 +62,8 @@ const STREAM_BUFFER: usize = 16;
 /// Bytes read at a time while the head is incomplete.
 const READ_CHUNK: usize = 4096;
 
-/// What answers a checked chat request: the model (M3), or the scripted mock model in tests.
+/// What answers a checked chat request: the model (M3), or the scripted model
+/// ([`super::scripted::Scripted`]) in tests.
 pub trait Backend: Send + Sync + 'static {
     /// Completes `chat`; it must hold `chat.max_tokens`.
     fn complete(&self, chat: Chat) -> impl Future<Output = Result<Reply, BackendError>> + Send;

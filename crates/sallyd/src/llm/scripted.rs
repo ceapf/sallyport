@@ -9,12 +9,18 @@
 //! The whole script is parsed before anything launches. Duplicate keys, any other shape, an
 //! extra key in a call and every cap below are refused with an error naming the line.
 
+use std::collections::VecDeque;
 use std::fmt;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use serde::Deserialize;
 use serde::de::{Deserializer, Error as _, MapAccess, SeqAccess, Visitor};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
+use tokio::sync::mpsc;
+
+use super::body::Chat;
+use super::server::{Backend, BackendError, Reply};
 
 /// Bytes of a script at most (Q103).
 pub const MAX_SCRIPT_BYTES: usize = 256 * 1024;
@@ -201,12 +207,199 @@ impl Script {
     }
 }
 
+/// The scripted model as a [`Backend`]: the script's turns in order, one per request, and every
+/// request it was given. A request past the last turn, and a `fail` turn, fail like the
+/// backend: the broker answers 502. A streamed request gets the role, then the content or the
+/// calls, then the finish reason, as three chunks. Tool-call ids are `call_<request>_<index>`.
+#[derive(Debug, Default)]
+pub struct Scripted {
+    turns: Mutex<VecDeque<Turn>>,
+    served: Mutex<usize>,
+    /// The checked requests, in order.
+    pub seen: Mutex<Vec<Chat>>,
+}
+
+fn locked<V>(m: &Mutex<V>) -> std::sync::MutexGuard<'_, V> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Scripted {
+    /// A backend answering with `script`'s turns.
+    #[must_use]
+    pub fn from_script(script: &Script) -> Self {
+        Self {
+            turns: Mutex::new(script.turns.iter().cloned().collect()),
+            ..Self::default()
+        }
+    }
+
+    /// Turns not yet served.
+    #[must_use]
+    pub fn left(&self) -> usize {
+        locked(&self.turns).len()
+    }
+
+    fn next(&self, chat: Chat) -> (usize, Option<Turn>, bool) {
+        let stream = chat.stream;
+        locked(&self.seen).push(chat);
+        let mut served = locked(&self.served);
+        *served += 1;
+        (*served, locked(&self.turns).pop_front(), stream)
+    }
+
+    /// The scripted answer to `chat`.
+    ///
+    /// # Errors
+    /// [`BackendError`] for a `fail` turn, or when the script has no turn left.
+    pub fn complete(&self, chat: Chat) -> Result<Reply, BackendError> {
+        let (request, turn, stream) = self.next(chat);
+        let Some(turn @ (Turn::Content(_) | Turn::ToolCalls(_))) = turn else {
+            return Err(BackendError);
+        };
+        let (mut msg, finish) = message(request, &turn);
+        let id = format!("chatcmpl-scripted-{request}");
+        if !stream {
+            msg["role"] = json!("assistant");
+            return Ok(Reply::Whole(json!({
+                "id": id,
+                "object": "chat.completion",
+                "model": "scripted",
+                "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
+            })));
+        }
+        let chunk = |delta: Value, finish: Value| {
+            json!({
+                "id": id,
+                "object": "chat.completion.chunk",
+                "model": "scripted",
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+            })
+        };
+        let events = [
+            chunk(json!({"role": "assistant"}), Value::Null),
+            chunk(msg, Value::Null),
+            chunk(json!({}), json!(finish)),
+        ];
+        let (tx, rx) = mpsc::channel(events.len());
+        for e in events {
+            // The channel holds every event: a full or closed channel cannot happen here.
+            let _ = tx.try_send(e);
+        }
+        Ok(Reply::Stream(rx))
+    }
+}
+
+/// The assistant message (or delta) of a turn, and its finish reason.
+fn message(request: usize, turn: &Turn) -> (Value, &'static str) {
+    match turn {
+        Turn::Content(content) => (json!({"content": content}), "stop"),
+        Turn::ToolCalls(calls) => {
+            let calls: Vec<Value> = calls
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    json!({
+                        "index": i,
+                        "id": format!("call_{request}_{i}"),
+                        "type": "function",
+                        "function": {
+                            "name": c.name,
+                            "arguments": Value::Object(c.arguments.clone()).to_string(),
+                        },
+                    })
+                })
+                .collect();
+            (json!({"content": null, "tool_calls": calls}), "tool_calls")
+        }
+        Turn::Fail => (Value::Null, "stop"),
+    }
+}
+
+impl Backend for Arc<Scripted> {
+    async fn complete(&self, chat: Chat) -> Result<Reply, BackendError> {
+        Scripted::complete(self, chat)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn err(text: &str) -> String {
         Script::parse(text).unwrap_err().to_string()
+    }
+
+    fn chat(stream: bool) -> Chat {
+        Chat {
+            body: Map::new(),
+            stream,
+            max_tokens: 16,
+            messages: 1,
+        }
+    }
+
+    fn backend(text: &str) -> Scripted {
+        Scripted::from_script(&Script::parse(text).unwrap())
+    }
+
+    #[test]
+    fn a_whole_reply_is_a_chat_completion_with_the_scripted_message() {
+        let b = backend("{\"content\":\"hi\"}\n{\"fail\":true}");
+        assert_eq!(b.left(), 2);
+        let Ok(Reply::Whole(v)) = b.complete(chat(false)) else {
+            panic!("not whole")
+        };
+        assert_eq!(v["id"], "chatcmpl-scripted-1");
+        assert_eq!(v["choices"][0]["message"]["role"], "assistant");
+        assert_eq!(v["choices"][0]["message"]["content"], "hi");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+        assert_eq!(b.left(), 1);
+        assert_eq!(b.seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn tool_calls_get_ids_from_the_request_and_their_index() {
+        let b = backend(
+            "{\"tool_calls\":[{\"name\":\"a\",\"arguments\":{\"k\":1}},{\"name\":\"b\",\"arguments\":{}}]}",
+        );
+        let Ok(Reply::Whole(v)) = b.complete(chat(false)) else {
+            panic!()
+        };
+        let m = &v["choices"][0]["message"];
+        assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(m["content"], Value::Null);
+        assert_eq!(m["tool_calls"][0]["id"], "call_1_0");
+        assert_eq!(m["tool_calls"][1]["id"], "call_1_1");
+        assert_eq!(m["tool_calls"][0]["function"]["name"], "a");
+        assert_eq!(m["tool_calls"][0]["function"]["arguments"], "{\"k\":1}");
+        assert_eq!(m["tool_calls"][1]["index"], 1);
+    }
+
+    #[test]
+    fn a_stream_is_the_role_then_the_message_then_the_finish_reason() {
+        let b = backend("{\"content\":\"hi\"}");
+        let Ok(Reply::Stream(mut rx)) = b.complete(chat(true)) else {
+            panic!("not a stream")
+        };
+        let mut chunks = Vec::new();
+        while let Ok(c) = rx.try_recv() {
+            chunks.push(c);
+        }
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "hi");
+        assert_eq!(chunks[1]["choices"][0]["finish_reason"], Value::Null);
+        assert_eq!(chunks[2]["choices"][0]["finish_reason"], "stop");
+        assert_eq!(chunks[2]["object"], "chat.completion.chunk");
+    }
+
+    #[test]
+    fn a_fail_turn_and_a_request_past_the_end_fail_the_backend() {
+        let b = backend("{\"fail\":true}");
+        assert!(b.complete(chat(false)).is_err());
+        assert!(b.complete(chat(false)).is_err());
+        assert_eq!(b.left(), 0);
+        assert_eq!(b.seen.lock().unwrap().len(), 2, "both requests were seen");
     }
 
     #[test]
