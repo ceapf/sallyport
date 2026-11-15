@@ -33,7 +33,7 @@ use sally_core::audit::Actor;
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tokio::sync::{Semaphore, mpsc, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 
 use super::frame::{self, Frame};
@@ -68,6 +68,15 @@ pub enum Driven {
     Unrecorded,
 }
 
+/// Why [`Agent::admit`] did not admit a call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unadmitted {
+    /// Every in-flight slot is taken (`too-many-in-flight`).
+    Full,
+    /// The `rpc.request` entry could not be written: nothing runs, nothing is answered.
+    Unrecorded,
+}
+
 /// Withdraws the prompt of a driven call whose caller went away before it ended.
 struct WithdrawOnDrop<T: ToolHandler> {
     handler: Arc<T>,
@@ -77,9 +86,11 @@ struct WithdrawOnDrop<T: ToolHandler> {
 
 impl<T: ToolHandler> Drop for WithdrawOnDrop<T> {
     fn drop(&mut self) {
-        if self.armed {
+        // Without a runtime (it is shutting down) there is no prompt left to withdraw: the
+        // session's stop withdraws every prompt (architect Q59).
+        if let (true, Ok(rt)) = (self.armed, tokio::runtime::Handle::try_current()) {
             let (handler, call) = (Arc::clone(&self.handler), self.call);
-            tokio::spawn(async move { handler.withdraw(call, Withdraw::Closed).await });
+            rt.spawn(async move { handler.withdraw(call, Withdraw::Closed).await });
         }
     }
 }
@@ -248,6 +259,8 @@ impl<T: ToolHandler> Agent<T> {
     /// of [`dispatch`](Self::dispatch), so a driven call meets the same classifier, in-flight
     /// slot, `rpc.request` entry and handler as the harness's. Nothing here comes from a peer:
     /// the caller is the session's drive step, which got `name` and `arguments` from the script.
+    /// It skips the frame throttle, which paces a peer's reads: no frame is read here, and each
+    /// `sessions.drive` request passes the control socket's own admission first.
     ///
     /// The call runs in a task of its own; dropping this future (the driver went away) does not
     /// drop the call: it runs to its end with its entries, and a prompt it waits on is withdrawn
@@ -258,34 +271,16 @@ impl<T: ToolHandler> Agent<T> {
         params.insert("arguments".into(), Value::Object(arguments));
         let (era, name, arguments) = match mcp::classify("tools/call", &params, true) {
             Ok((era, Call::ToolsCall { name, arguments })) => (era, name, arguments),
-            Ok(_) => return Driven::Denied("method-not-found"),
-            Err(r) => {
-                return if self.deny(None, Some("tools/call"), r.reason()).await {
-                    Driven::Denied(r.reason())
-                } else {
-                    Driven::Unrecorded
-                };
-            }
-        };
-        let Ok(slot) = Arc::clone(&self.in_flight).try_acquire_owned() else {
-            return if self
-                .deny(None, Some("tools/call"), "too-many-in-flight")
-                .await
-            {
-                Driven::Denied("too-many-in-flight")
-            } else {
-                Driven::Unrecorded
-            };
+            // `tools/call` classifies as nothing else; refused and recorded all the same.
+            Ok(_) => return self.drive_denied("method-not-found").await,
+            Err(r) => return self.drive_denied(r.reason()).await,
         };
         let id = Id::Str("drive".into());
-        let entry = self
-            .record
-            .entry(Actor::Harness, "rpc.request", Some("allow"))
-            .args(call_args(&id, era, &name, &arguments));
-        if !self.record.append(entry).await {
-            return Driven::Unrecorded;
-        }
-        let call = self.handler.begin();
+        let (slot, call) = match self.admit(&id, era, &name, &arguments).await {
+            Ok(admitted) => admitted,
+            Err(Unadmitted::Full) => return self.drive_denied("too-many-in-flight").await,
+            Err(Unadmitted::Unrecorded) => return Driven::Unrecorded,
+        };
         let handler = Arc::clone(&self.handler);
         let task = tokio::spawn({
             let handler = Arc::clone(&handler);
@@ -305,6 +300,15 @@ impl<T: ToolHandler> Agent<T> {
         match outcome {
             Ok(Some(o)) => Driven::Done(o),
             Ok(None) | Err(_) => Driven::Unrecorded,
+        }
+    }
+
+    /// A driven call refused for `reason`: its `rpc.deny`, then [`Driven::Denied`].
+    async fn drive_denied(&self, reason: &'static str) -> Driven {
+        if self.deny(None, Some("tools/call"), reason).await {
+            Driven::Denied(reason)
+        } else {
+            Driven::Unrecorded
         }
     }
 
@@ -389,6 +393,28 @@ impl<T: ToolHandler> Agent<T> {
         send(conn, success(&id, result)).await
     }
 
+    /// The front half every `tools/call` meets, the harness's and the driver's (architect Q117):
+    /// an in-flight slot, the `rpc.request` entry, then the handler's number for the call.
+    async fn admit(
+        &self,
+        id: &Id,
+        era: Era,
+        name: &str,
+        arguments: &Map<String, Value>,
+    ) -> Result<(OwnedSemaphorePermit, u64), Unadmitted> {
+        let Ok(slot) = Arc::clone(&self.in_flight).try_acquire_owned() else {
+            return Err(Unadmitted::Full);
+        };
+        let entry = self
+            .record
+            .entry(Actor::Harness, "rpc.request", Some("allow"))
+            .args(call_args(id, era, name, arguments));
+        if !self.record.append(entry).await {
+            return Err(Unadmitted::Unrecorded);
+        }
+        Ok((slot, self.handler.begin()))
+    }
+
     /// `tools/call`: a session slot, the entry, then the handler in its own task.
     async fn dispatch(
         &self,
@@ -398,20 +424,16 @@ impl<T: ToolHandler> Agent<T> {
         name: String,
         arguments: Map<String, Value>,
     ) -> bool {
-        let Ok(slot) = Arc::clone(&self.in_flight).try_acquire_owned() else {
-            let m = Some("tools/call");
-            return self
-                .refuse(conn, Some(&id), m, "too-many-in-flight", SERVER_LIMIT)
-                .await;
+        let (slot, call) = match self.admit(&id, era, &name, &arguments).await {
+            Ok(admitted) => admitted,
+            Err(Unadmitted::Full) => {
+                let m = Some("tools/call");
+                return self
+                    .refuse(conn, Some(&id), m, "too-many-in-flight", SERVER_LIMIT)
+                    .await;
+            }
+            Err(Unadmitted::Unrecorded) => return false,
         };
-        let entry = self
-            .record
-            .entry(Actor::Harness, "rpc.request", Some("allow"))
-            .args(call_args(&id, era, &name, &arguments));
-        if !self.record.append(entry).await {
-            return false;
-        }
-        let call = self.handler.begin();
         let flight = InFlight {
             call,
             cancelled: false,
