@@ -24,9 +24,11 @@ fn absent_image() -> ImageRef {
 }
 
 /// A podman wrapper that appends each call's argv to `<at>/argv`, then runs the real podman.
-/// Armed (`<at>/when` holds `create` or `init`, `<at>/sock` a directory), it swaps that directory
-/// for a new one once: after a successful `create`, or before `init` runs (after the host
-/// re-check). The verb is the first word after the global `--flag value` pairs.
+/// Armed (`<at>/when` holds `create` or `init`, `<at>/sock` a path), it swaps that path once:
+/// a directory for a new empty one, a file for a copy of itself (same bytes, another inode).
+/// The swap happens after a successful `create`, or before `init` runs (after the host
+/// re-check). Armed with `rm`, it fails every `rm` until disarmed instead. The verb is the
+/// first word after the global `--flag value` pairs.
 fn logging_podman(at: &Path, real: &Path) -> PathBuf {
     let (at, real) = (at.display(), real.display());
     let script = format!(
@@ -36,8 +38,11 @@ fn logging_podman(at: &Path, real: &Path) -> PathBuf {
          case \"$a\" in --*) [ -z \"$v\" ] && skip=1 ;; *) [ -z \"$v\" ] && v=$a ;; esac\n\
          done\n\
          when=$(cat '{at}/when' 2>/dev/null); sock=$(cat '{at}/sock' 2>/dev/null)\n\
-         swap() {{ rm -f '{at}/when'; mv \"$sock\" \"$sock.old\" && mkdir -m 700 \"$sock\"; }}\n\
+         swap() {{ rm -f '{at}/when'; mv \"$sock\" \"$sock.old\" && \
+         if [ -d \"$sock.old\" ]; then mkdir -m 700 \"$sock\"; \
+         else cp -p \"$sock.old\" \"$sock\"; fi; }}\n\
          if [ \"$v\" = init ] && [ \"$when\" = init ]; then swap; fi\n\
+         if [ \"$v\" = rm ] && [ \"$when\" = rm ]; then exit 125; fi\n\
          '{real}' \"$@\"\nrc=$?\n\
          if [ $rc -eq 0 ] && [ \"$v\" = create ] && [ \"$when\" = create ]; then swap; fi\n\
          exit $rc\n"
@@ -203,6 +208,74 @@ fn a_swapped_socket_directory_is_refused_for_the_harness_and_inference() {
                 "{e:?}"
             );
             assert_eq!(args["role"], "inference");
+            assert!(!x.instance_paths(&tag).data_dir().exists());
+        }
+    });
+}
+
+/// Re-review L3: a stop whose entry was written but whose removal failed hands the handle back
+/// with the container and the claim kept; the retry removes it without a second
+/// `sandbox.stop`.
+#[test]
+fn a_retried_stop_after_a_failed_removal_writes_one_entry() {
+    let (dir, _cleanup) = scratch("rmfail");
+    rt().block_on(async {
+        let x = Lx::with_podman(|real| logging_podman(&dir, real));
+        let v = x.f.load("");
+        let ws = x.launch(&v, "rmfail").await.unwrap();
+        let h = x
+            .launcher
+            .launch_harness(x.harness(&v, "rmfail"))
+            .await
+            .unwrap();
+        let stops = || {
+            x.events
+                .all()
+                .iter()
+                .filter(|(e, a)| e == "sandbox.stop" && a["role"] == "harness")
+                .count()
+        };
+        std::fs::write(dir.join("when"), "rm").unwrap();
+        let e = x.launcher.stop_role(h).await.unwrap_err();
+        std::fs::remove_file(dir.join("when")).unwrap();
+        assert!(exists(e.running.name()), "the container is kept");
+        assert_eq!(stops(), 1);
+        let again = x.launcher.launch_harness(x.harness(&v, "rmfail")).await;
+        assert!(matches!(again, Err(LaunchError::Harness(_))), "{again:?}");
+        x.launcher.stop_role(e.running).await.unwrap();
+        assert_eq!(stops(), 1);
+        assert!(!exists(&format!("sp-h-{}", ws.paths().id().as_str())));
+        x.stop(ws).await;
+    });
+}
+
+/// Re-review M1 (SI-6, B4 for the model): the model blob replaced by a copy of itself (same
+/// bytes, another inode) after `create` is caught by the host re-check (`mount-changed`), and
+/// after that re-check but before `init` by the in-container check (`sandbox.mount_mismatch`).
+/// Either way the instance's directories are gone.
+#[test]
+fn a_swapped_model_blob_is_refused_for_inference() {
+    let (dir, _cleanup) = scratch("blob");
+    rt().block_on(async {
+        let x = Lx::with_podman(|real| logging_podman(&dir, real));
+        let cases = [
+            ("create", "sandbox.refuse", "mount-changed"),
+            ("init", "sandbox.mount_mismatch", "mount-mismatch"),
+        ];
+        for (n, (when, event, reason)) in cases.into_iter().enumerate() {
+            let tag = format!("blob-i{n}");
+            // Pinned anew each time: the previous case left the copy in place.
+            let model = x.model();
+            arm(&dir, when, model.path());
+            let e = x.launcher.launch_inference(x.inference(model, &tag)).await;
+            let (got, args, _) = last(&x);
+            assert_eq!(
+                (got.as_str(), &args["reason"]),
+                (event, &reason.into()),
+                "{e:?}"
+            );
+            assert_eq!(args["role"], "inference");
+            assert!(!std::fs::exists(dir.join("when")).unwrap(), "not swapped");
             assert!(!x.instance_paths(&tag).data_dir().exists());
         }
     });

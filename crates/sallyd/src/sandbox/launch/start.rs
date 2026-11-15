@@ -239,10 +239,26 @@ impl Launcher {
 
     /// A launch handed back another role's handle (a bug that `prepare_and_start` already
     /// refuses before `create`): its caller has stopped that handle with the stop that retries
-    /// until the container is gone; the launch is refused `internal`.
+    /// until the container is gone. What the request itself made is then cleaned up as after
+    /// any failed launch (its directories, then its claim), and the launch is refused
+    /// `internal`.
     pub(super) async fn wrong_handle(&self, req: &Request) -> LaunchError {
+        let owned = req.owned();
+        let progress = Progress {
+            dirs: owned.clone(),
+            owned,
+            ..Progress::default()
+        };
+        let cleanup = self.clean_failed(&progress).await;
+        let outcome = match &cleanup {
+            Ok(()) => "stopped, removed".to_owned(),
+            Err(c) => format!("stopped, incomplete, kept: {c}"),
+        };
+        if cleanup.is_ok() {
+            self.unclaim(req);
+        }
         let e = LaunchError::Internal("the launch made another role's handle".into());
-        self.refused(&req.subject(), req.role(), e, req.level(), "stopped".into())
+        self.refused(&req.subject(), req.role(), e, req.level(), outcome)
             .await
     }
 

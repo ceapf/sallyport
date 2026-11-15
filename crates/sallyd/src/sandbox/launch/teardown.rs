@@ -14,6 +14,10 @@ use crate::sandbox::commands::rm_args;
 use crate::sandbox::orphans::{Orphan, orphans, ps_args};
 use crate::sandbox::types::{Role, SessionPaths};
 
+/// How many more times a stop nobody received retries once its container is gone (for an
+/// instance's directories), [`STOP_RETRY`] apart.
+const STOP_RETRIES_AFTER_REMOVAL: u32 = 3;
+
 /// Which orphan sweep runs (architect Q61), named in each `sandbox.orphan_removed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sweep {
@@ -189,6 +193,7 @@ impl Launcher {
     /// [`Self::stop_unreceived`].
     pub(super) async fn stop_role_unreceived(&self, mut running: RoleRunning) {
         let mut reported = false;
+        let mut after_removal = 0_u32;
         loop {
             let e = match self.stop_role(running).await {
                 Ok(()) => return,
@@ -220,10 +225,15 @@ impl Launcher {
                 }
             }
             // `stop_role` also fails after the container is gone (the entry, the directories):
-            // nothing runs any more. Checked by id, as it was removed.
-            if e.running.removed
-                || matches!(self.container_exists(&e.running.container).await, Ok(false))
-            {
+            // nothing runs any more, so only a bounded number of retries remain, for what the
+            // retry still does (an instance's directories, which no sweep removes). Checked by
+            // id, as it was removed.
+            if e.running.removed {
+                if after_removal >= STOP_RETRIES_AFTER_REMOVAL {
+                    return;
+                }
+                after_removal += 1;
+            } else if matches!(self.container_exists(&e.running.container).await, Ok(false)) {
                 return;
             }
             running = e.running;
