@@ -173,11 +173,12 @@ fn start_sends_the_manifest_text_and_prints_the_session() {
     let f = Fake::new("start", |req| {
         let r = match req["method"].as_str().unwrap() {
             "sessions.create" | "sessions.list" => {
+                let none = json!({"kind": "none", "driven": false});
                 let s = json!({"id": "s-1", "manifest": "t", "container": "sp-w-s-1",
-                               "state": "running"});
+                               "state": "running", "model": none});
                 if req["method"] == "sessions.list" {
                     json!({"sessions": [s, {"id": "s-2", "manifest": "u",
-                           "container": "sp-w-s-2", "state": "stop-failed"}]})
+                           "container": "sp-w-s-2", "state": "stop-failed", "model": none}]})
                 } else {
                     s
                 }
@@ -217,6 +218,76 @@ fn a_manifest_over_the_cap_is_never_sent() {
     assert_eq!(o.status.code(), Some(2));
     assert!(stderr(&o).contains("larger than"), "{}", stderr(&o));
     assert!(f.methods().is_empty());
+}
+
+#[test]
+fn a_script_is_sent_as_a_scripted_model_declared_driven() {
+    let f = Fake::new("script", |req| {
+        let model = json!({"kind": "scripted", "driven": true, "sha256": "ab", "turns": 1});
+        let s = json!({"id": "s-1", "manifest": "t", "container": "sp-w-s-1",
+                       "state": "running", "model": model});
+        result(req, s)
+    });
+    let manifest = f.runtime.join("m.yaml");
+    std::fs::write(&manifest, "name: t\n").unwrap();
+    let script = f.runtime.join("s.jsonl");
+    std::fs::write(&script, "{\"fail\":true}\n").unwrap();
+    let o = f.sally(&[
+        "session",
+        "start",
+        manifest.to_str().unwrap(),
+        "--script",
+        script.to_str().unwrap(),
+    ]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(
+        f.requests.lock().unwrap()[0]["params"],
+        json!({"manifest": "name: t\n",
+               "model": {"kind": "scripted", "script": "{\"fail\":true}\n", "driven": true}})
+    );
+}
+
+#[test]
+fn a_script_over_the_cap_is_never_sent() {
+    let f = Fake::new("bigscr",|req| result(req, json!({})));
+    let manifest = f.runtime.join("m.yaml");
+    std::fs::write(&manifest, "name: t\n").unwrap();
+    let script = f.runtime.join("s.jsonl");
+    std::fs::write(&script, "a".repeat(sally_proto::MAX_SCRIPT_BYTES + 1)).unwrap();
+    let o = f.sally(&[
+        "session",
+        "start",
+        manifest.to_str().unwrap(),
+        "--script",
+        script.to_str().unwrap(),
+    ]);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(stderr(&o).contains("larger than"), "{}", stderr(&o));
+    assert!(f.methods().is_empty());
+}
+
+#[test]
+fn drive_runs_to_the_end_over_one_connection_and_sends_only_drive() {
+    let f = Fake::new("drive", |req| {
+        let done = req["id"] == 2;
+        let step = if done {
+            json!({"turn": 2, "kind": "content", "content": "bye", "done": true})
+        } else {
+            json!({"turn": 1, "kind": "tool_calls", "done": false,
+                   "calls": [{"name": "echo", "result": "ran"}]})
+        };
+        result(req, step)
+    });
+    let o = f.sally(&["session", "drive", "s-1"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(
+        stdout(&o),
+        "turn 1: call echo -> ran\nturn 2: model says: bye\n"
+    );
+    assert_eq!(f.methods(), ["sessions.drive", "sessions.drive"]);
+    for r in f.requests.lock().unwrap().iter() {
+        assert_eq!(r["params"], json!({"id": "s-1"}));
+    }
 }
 
 /// A manifest of exactly the cap is read and sent.

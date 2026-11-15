@@ -23,7 +23,7 @@ use super::body::Chat;
 use super::server::{Backend, BackendError, Reply};
 
 /// Bytes of a script at most (Q103).
-pub const MAX_SCRIPT_BYTES: usize = 256 * 1024;
+pub const MAX_SCRIPT_BYTES: usize = sally_proto::MAX_SCRIPT_BYTES;
 /// Bytes of one script line at most.
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
 /// Turns of a script at most.

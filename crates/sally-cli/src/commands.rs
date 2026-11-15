@@ -5,7 +5,9 @@ use std::io::{Read as _, Write};
 use std::path::Path;
 
 use sally_core::manifest::MAX_MANIFEST_BYTES;
-use sally_proto::{Changes, ErrorData, Prompts, Session, SessionState, Sessions, Stopped, method};
+use sally_proto::{
+    Changes, ErrorData, MAX_SCRIPT_BYTES, Prompts, Session, SessionState, Sessions, Stopped, method,
+};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
@@ -92,7 +94,11 @@ fn print_refusal(d: &ErrorData, err: &mut dyn Write) {
 }
 
 /// Calls `method` and decodes its result as `T`.
-fn call<T: DeserializeOwned>(c: &mut Client, method: &str, params: Value) -> Result<T, Error> {
+pub(crate) fn call<T: DeserializeOwned>(
+    c: &mut Client,
+    method: &str,
+    params: Value,
+) -> Result<T, Error> {
     let v = c.call(method, params)?;
     serde_json::from_value(v).map_err(|_| Error::Unexpected)
 }
@@ -105,21 +111,33 @@ fn session_line(p: &mut Printer<'_, '_>, s: &Session) {
     p.line(&[&s.id, "  ", state, "  ", &s.manifest, "  ", &s.container]);
 }
 
-/// `sally session start <manifest>`: sends the manifest's text; prints the session.
-pub fn session_start(c: &mut Client, manifest: &Path, o: &mut Out<'_>) -> u8 {
+/// `sally session start <manifest> [--script <file>]`: sends the manifest's text, and with a
+/// script a scripted model declared driven (architect Q119); prints the session.
+pub fn session_start(
+    c: &mut Client,
+    manifest: &Path,
+    script: Option<&Path>,
+    o: &mut Out<'_>,
+) -> u8 {
+    let unreadable = |path: &Path, msg: &str, o: &mut Out<'_>| {
+        let shown = clean::line(&path.display().to_string()).text;
+        let _ = writeln!(o.err, "sally: {shown}: {msg}");
+        EXIT_FAILED
+    };
     let text = match read_manifest(manifest) {
         Ok(t) => t,
-        Err(msg) => {
-            let _ = writeln!(
-                o.err,
-                "sally: {}: {}",
-                clean::line(&manifest.display().to_string()).text,
-                msg
-            );
-            return EXIT_FAILED;
-        }
+        Err(msg) => return unreadable(manifest, &msg, o),
     };
-    match call::<Session>(c, method::SESSIONS_CREATE, json!({"manifest": text})) {
+    let mut params = json!({"manifest": text});
+    if let Some(path) = script {
+        match read_script(path) {
+            Ok(s) => {
+                params["model"] = json!({"kind": "scripted", "script": s, "driven": true});
+            }
+            Err(msg) => return unreadable(path, &msg, o),
+        }
+    }
+    match call::<Session>(c, method::SESSIONS_CREATE, params) {
         Ok(s) => {
             let mut p = Printer::new(o);
             session_line(&mut p, &s);
@@ -131,16 +149,24 @@ pub fn session_start(c: &mut Client, manifest: &Path, o: &mut Out<'_>) -> u8 {
 
 /// The manifest's text, at most [`MAX_MANIFEST_BYTES`].
 pub(crate) fn read_manifest(path: &Path) -> Result<String, String> {
+    read_text(path, MAX_MANIFEST_BYTES)
+}
+
+/// The script's text, at most [`MAX_SCRIPT_BYTES`] (`sallyd` checks it again).
+pub(crate) fn read_script(path: &Path) -> Result<String, String> {
+    read_text(path, MAX_SCRIPT_BYTES)
+}
+
+/// The UTF-8 text of `path`, at most `max` bytes: one byte past it is read to tell.
+fn read_text(path: &Path, max: usize) -> Result<String, String> {
     let f = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    let cap = u64::try_from(MAX_MANIFEST_BYTES)
-        .unwrap_or(u64::MAX)
-        .saturating_add(1);
+    let cap = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
     let mut bytes = Vec::new();
     f.take(cap)
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
-    if bytes.len() > MAX_MANIFEST_BYTES {
-        return Err(format!("larger than {MAX_MANIFEST_BYTES} bytes"));
+    if bytes.len() > max {
+        return Err(format!("larger than {max} bytes"));
     }
     String::from_utf8(bytes).map_err(|_| "not UTF-8".to_owned())
 }

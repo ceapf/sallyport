@@ -16,6 +16,10 @@ use serde::{Deserialize, Serialize};
 /// a longer request; a client treats a longer reply or notification as fatal (architect Q78).
 pub const MAX_FRAME: usize = 1024 * 1024;
 
+/// Bytes of a model script at most (architect Q103). `sallyd` refuses a longer one; the CLI
+/// does not send it.
+pub const MAX_SCRIPT_BYTES: usize = 256 * 1024;
+
 /// The control methods, exactly what `control.sock` serves (architect Q72).
 pub mod method {
     /// Start a session from a manifest's text.
