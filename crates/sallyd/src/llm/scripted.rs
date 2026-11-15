@@ -28,7 +28,7 @@ pub const MAX_SCRIPT_BYTES: usize = sally_proto::MAX_SCRIPT_BYTES;
 /// Bytes of one script line at most.
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
 /// Turns of a script at most.
-pub const MAX_TURNS: usize = 1024;
+pub const MAX_TURNS: usize = sally_proto::MAX_TURNS;
 /// Calls of one turn at most.
 pub const MAX_CALLS: usize = 8;
 
@@ -78,6 +78,9 @@ pub enum ScriptError {
         /// What is wrong.
         what: String,
     },
+    /// A driven script has this turn (1-based) after a content or fail turn, which ends it.
+    #[error("model.script turn {0}: follows a content or fail turn, which ends a driven script")]
+    AfterEnd(usize),
 }
 
 /// One line as JSON: nested at most as deep as a frame on the agent socket, then parsed by the
@@ -158,6 +161,22 @@ impl Script {
             .map(|b| format!("{b:02x}"))
             .collect();
         Ok(Self { turns, sha256 })
+    }
+
+    /// Whether the script may drive a session: a content or fail turn is its last, as a model's
+    /// message ends its turn, so a step that reports `done` leaves nothing behind it.
+    ///
+    /// # Errors
+    /// [`ScriptError::AfterEnd`] with the first turn that follows one.
+    pub fn driven(&self) -> Result<(), ScriptError> {
+        let end = self
+            .turns
+            .iter()
+            .position(|t| matches!(t, Turn::Content(_) | Turn::Fail));
+        match end {
+            Some(i) if i + 1 < self.turns.len() => Err(ScriptError::AfterEnd(i + 2)),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -471,7 +490,42 @@ mod tests {
             err(&big(MAX_SCRIPT_BYTES + 1)),
             ScriptError::TooLarge(MAX_SCRIPT_BYTES + 1).to_string()
         );
-        let exactly = "{\"fail\":true}\n".repeat(MAX_SCRIPT_BYTES / 14);
-        assert!(exactly.len() <= MAX_SCRIPT_BYTES);
+        let line = |n: usize| format!("{}\n", pad(n - 1));
+        let mut exactly = line(MAX_LINE_BYTES).repeat(MAX_SCRIPT_BYTES / MAX_LINE_BYTES);
+        let rest = MAX_SCRIPT_BYTES % MAX_LINE_BYTES;
+        if rest > 0 {
+            exactly.push_str(&line(rest));
+        }
+        assert_eq!(exactly.len(), MAX_SCRIPT_BYTES);
+        assert!(Script::parse(&exactly).is_ok());
+    }
+
+    #[test]
+    fn a_driven_script_ends_at_its_first_message_or_failure() {
+        let call = "{\"tool_calls\":[{\"name\":\"a\",\"arguments\":{}}]}\n";
+        for good in [
+            String::new(),
+            call.repeat(3),
+            format!("{call}{call}{{\"content\":\"bye\"}}\n"),
+            format!("{call}{{\"fail\":true}}\n"),
+        ] {
+            let s = Script::parse(&good).unwrap();
+            assert_eq!(s.driven(), Ok(()), "{good}");
+        }
+        for (bad, turn) in [
+            (format!("{{\"content\":\"hi\"}}\n{call}"), 2),
+            (
+                format!("{call}{{\"fail\":true}}\n\n{{\"content\":\"x\"}}\n"),
+                3,
+            ),
+            ("{\"content\":\"a\"}\n{\"content\":\"b\"}\n".to_owned(), 2),
+        ] {
+            let s = Script::parse(&bad).unwrap();
+            assert_eq!(s.driven(), Err(ScriptError::AfterEnd(turn)), "{bad}");
+        }
+        assert_eq!(
+            ScriptError::AfterEnd(2).to_string(),
+            "model.script turn 2: follows a content or fail turn, which ends a driven script"
+        );
     }
 }

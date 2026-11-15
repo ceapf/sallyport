@@ -305,6 +305,10 @@ async fn rt_drv_08_a_model_is_refused_unless_scripted_declared_driven_with_a_goo
             model(true, "scripted", "{\"fail\":true,\"fail\":true}"),
             "script-invalid",
         ),
+        (
+            model(true, "scripted", "{\"content\":\"hi\"}\n{\"fail\":true}\n"),
+            "script-invalid",
+        ),
     ] {
         let r = w.call("sessions.create", p).await;
         assert_eq!(r["error"]["code"], json!(REFUSED));
@@ -322,7 +326,14 @@ async fn rt_drv_08_a_model_is_refused_unless_scripted_declared_driven_with_a_goo
             "session.refuse",
             "rpc.request",
             "session.refuse",
+            "rpc.request",
+            "session.refuse",
         ]
+    );
+    let last = f.sink.last("session.refuse");
+    assert!(
+        last["detail"].as_str().unwrap().contains("turn 2: follows"),
+        "{last}"
     );
 }
 

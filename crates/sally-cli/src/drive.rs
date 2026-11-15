@@ -10,9 +10,9 @@ use crate::EXIT_FAILED;
 use crate::client::Client;
 use crate::commands::{Out, Printer, call, failed};
 
-/// Steps asked for at most: a script holds up to 1024 turns, and the end is one more answer.
-/// A daemon that keeps going past it is not speaking the protocol.
-pub const MAX_STEPS: usize = 1100;
+/// Steps asked for at most: a script holds up to [`sally_proto::MAX_TURNS`] turns, and the end
+/// is one more answer. A daemon that keeps going past it is not speaking the protocol.
+pub const MAX_STEPS: usize = sally_proto::MAX_TURNS + 1;
 
 /// Drives session `id` until a step says it is done.
 pub fn session_drive(c: &mut Client, id: &str, o: &mut Out<'_>) -> u8 {

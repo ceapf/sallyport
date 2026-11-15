@@ -310,7 +310,9 @@ impl<S: SessionSet> Control<S> {
     }
 
     /// The script of a create's `model`, parsed whole before anything launches (architect Q119):
-    /// `Ok(None)` without a model. Only a scripted model declared driven starts, in this task.
+    /// `Ok(None)` without a model. Only a scripted model declared driven starts, in this task,
+    /// and its script ends at its first content or fail turn ([`Script::driven`]). The parse
+    /// runs off the runtime: a script is up to [`sally_proto::MAX_SCRIPT_BYTES`].
     /// TODO(#53): `driven: false` waits for the `llm.sock` backend (Task 13).
     async fn script_of(&self, p: &CreateParams, client: Client) -> Result<Option<Script>, Done> {
         let Some(m) = &p.model else {
@@ -327,9 +329,13 @@ impl<S: SessionSet> Control<S> {
                 "model.driven: a scripted model is served to a driver only".to_owned(),
             )
         } else {
-            match Script::parse(&m.script) {
-                Ok(s) => return Ok(Some(s)),
-                Err(e) => ("script-invalid", e.to_string()),
+            let text = m.script.clone();
+            let parsed =
+                blocking(move || Script::parse(&text).and_then(|s| s.driven().map(|()| s)));
+            match parsed.await {
+                Some(Ok(s)) => return Ok(Some(s)),
+                Some(Err(e)) => ("script-invalid", e.to_string()),
+                None => return Err(Done::Close),
             }
         };
         let detail = escape_capped(detail.as_bytes(), DETAIL_CHARS);

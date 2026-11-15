@@ -158,6 +158,19 @@ fn text_that_fails_the_clean_check_is_escaped_and_the_exit_says_so() {
 }
 
 #[test]
+fn the_longest_script_and_its_end_fit_in_the_steps() {
+    let mut steps: Vec<_> = (1..=sally_proto::MAX_TURNS as u32)
+        .map(|i| step(i, "tool_calls", json!({})))
+        .collect();
+    steps.push(step(0, "end", json!({"done": true})));
+    let mut f = daemon("longest", steps);
+    let (code, out, err) = run(&f);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.ends_with("end of script\n"), "{out}");
+    assert_eq!(f.requests().len(), sally_proto::MAX_TURNS + 1);
+}
+
+#[test]
 fn a_daemon_that_never_says_done_is_cut_off() {
     let steps: Vec<_> = (0..=MAX_STEPS as u32)
         .map(|i| step(i + 1, "tool_calls", json!({})))

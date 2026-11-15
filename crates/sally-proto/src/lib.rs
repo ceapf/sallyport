@@ -20,6 +20,10 @@ pub const MAX_FRAME: usize = 1024 * 1024;
 /// does not send it.
 pub const MAX_SCRIPT_BYTES: usize = 256 * 1024;
 
+/// Turns of a model script at most: a driven session answers at most this many steps with a
+/// turn, then one `end` step.
+pub const MAX_TURNS: usize = 1024;
+
 /// The control methods, exactly what `control.sock` serves (architect Q72).
 pub mod method {
     /// Start a session from a manifest's text.
@@ -158,7 +162,10 @@ pub struct Step {
     /// The calls of a tool-call turn, with their results.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub calls: Vec<StepCall>,
-    /// No turn is left after this one.
+    /// The driver stops here: this was a content or fail turn (a driven script ends at its
+    /// first), the script's last turn, the `end` step, or a turn whose call was refused before
+    /// its tool ran (that call's result is `denied: <reason>`; later calls of the turn did not
+    /// run).
     pub done: bool,
 }
 
