@@ -193,6 +193,16 @@ pub enum Role {
 }
 
 impl Role {
+    /// The role's name in audit entries (`sandbox.launch`, `sandbox.refuse`, `sandbox.stop`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Workspace => "workspace",
+            Self::Harness => "harness",
+            Self::Inference => "inference",
+        }
+    }
+
     /// The role's seccomp profile file name under [`CommonArgs::profiles`].
     #[must_use]
     pub const fn profile(self) -> &'static str {
@@ -271,6 +281,13 @@ impl SessionPaths {
         self.sockets.join("harness")
     }
 
+    /// What a workspace launch creates, and only its failure may remove: `sessions/<id>` under
+    /// both roots (a stop keeps the `staged` changes).
+    #[must_use]
+    pub fn created_dirs(&self) -> Vec<PathBuf> {
+        vec![self.sockets.clone(), self.data.clone()]
+    }
+
     /// The session's scratch root (stage and `.git` overlay directories).
     #[must_use]
     pub fn data_root(&self) -> &Path {
@@ -288,6 +305,64 @@ impl SessionPaths {
     #[must_use]
     pub fn git_overlay(&self, k: usize) -> OverlayDirs {
         OverlayDirs::under(&self.data.join("git").join(k.to_string()))
+    }
+}
+
+/// Host directories of one inference instance (architect Q131): `infer/<id>` under the socket
+/// root (the socket directory, bound read-write) and under the data root (its seccomp
+/// profiles). An instance is not a session: these are never a session's directories.
+#[derive(Debug, Clone)]
+pub struct InstancePaths {
+    id: SessionId,
+    sockets: PathBuf,
+    data: PathBuf,
+}
+
+impl InstancePaths {
+    /// `sockets` is `$XDG_RUNTIME_DIR/sallyport`, `data` is `~/.local/share/sallyport`.
+    ///
+    /// # Errors
+    /// [`ArgvError::Input`] if a root is not absolute.
+    pub fn under(id: SessionId, sockets: &Path, data: &Path) -> Result<Self, ArgvError> {
+        if !sockets.is_absolute() || !data.is_absolute() {
+            return input("instance roots must be absolute");
+        }
+        let at = |root: &Path| root.join("infer").join(id.as_str());
+        Ok(Self {
+            sockets: at(sockets),
+            data: at(data),
+            id,
+        })
+    }
+
+    /// The instance id.
+    #[must_use]
+    pub fn id(&self) -> &SessionId {
+        &self.id
+    }
+
+    /// The socket directory, `$XDG_RUNTIME_DIR/sallyport/infer/<id>`.
+    #[must_use]
+    pub fn socket_dir(&self) -> &Path {
+        &self.sockets
+    }
+
+    /// The instance's data directory, `<data>/infer/<id>`.
+    #[must_use]
+    pub fn data_dir(&self) -> &Path {
+        &self.data
+    }
+
+    /// The directory holding the instance's seccomp profiles.
+    #[must_use]
+    pub fn profiles(&self) -> PathBuf {
+        self.data.join("profiles")
+    }
+
+    /// What an instance's launch creates, and its failure or its stop may remove.
+    #[must_use]
+    pub fn created_dirs(&self) -> Vec<PathBuf> {
+        vec![self.sockets.clone(), self.data.clone()]
     }
 }
 
@@ -399,6 +474,48 @@ impl VerifiedModel {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_instance_lives_under_infer_in_both_roots_and_needs_absolute_roots() {
+        let id = SessionId::parse("i-1").unwrap();
+        let p = InstancePaths::under(id.clone(), Path::new("/r/sallyport"), Path::new("/d/sp"))
+            .unwrap();
+        assert_eq!(p.id().as_str(), "i-1");
+        assert_eq!(p.socket_dir(), Path::new("/r/sallyport/infer/i-1"));
+        assert_eq!(p.data_dir(), Path::new("/d/sp/infer/i-1"));
+        assert_eq!(p.profiles(), Path::new("/d/sp/infer/i-1/profiles"));
+        assert_eq!(
+            p.created_dirs(),
+            [
+                Path::new("/r/sallyport/infer/i-1"),
+                Path::new("/d/sp/infer/i-1")
+            ]
+        );
+        let s =
+            SessionPaths::new(id.clone(), Path::new("/r/sallyport"), Path::new("/d/sp")).unwrap();
+        assert_eq!(
+            s.created_dirs(),
+            [
+                Path::new("/r/sallyport/sessions/i-1"),
+                Path::new("/d/sp/sessions/i-1")
+            ]
+        );
+        for (s, d) in [("r", "/d"), ("/r", "d"), ("r", "d")] {
+            let e = InstancePaths::under(id.clone(), Path::new(s), Path::new(d)).unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                "sandbox argv input: instance roots must be absolute",
+                "{s} {d}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_role_has_its_own_audit_name() {
+        assert_eq!(Role::Workspace.as_str(), "workspace");
+        assert_eq!(Role::Harness.as_str(), "harness");
+        assert_eq!(Role::Inference.as_str(), "inference");
+    }
 
     #[test]
     fn uuid_v4_sets_the_version_and_variant_bits() {

@@ -1,4 +1,8 @@
-//! Launch and teardown of the workspace container (Task 6b; ARCHITECTURE §3.5). Order matters:
+//! Launch and teardown of the sandboxes (Task 6b, #123; ARCHITECTURE §3.5). Every role
+//! (workspace, harness, CPU inference) goes through one launch path (`launch/start.rs`,
+//! architect Q129): its refusals that need nothing made and its claim, the hermetic podman and
+//! runtime re-check, the role's preparation (this file for the workspace, `launch/harness.rs`,
+//! `launch/inference.rs`), then the one start path. For the workspace, order matters:
 //!
 //! 1. reserve the session's mounts against every live session (B4 overlap rule, by path and by
 //!    identity);
@@ -9,13 +13,10 @@
 //!    (0600) in the workspace socket directory and start its egress listener (Task 8, architect
 //!    Q7; `none` binds nothing). The listener lives in [`Running`]: `stop` shuts it down after
 //!    the container is gone, and a failed launch drops it;
-//! 4. audit `sandbox.launch` (SI-4: before anything is visible);
-//! 5. `podman create`; re-check every pin on the host; `podman init` (the runtime builds the
-//!    mounts but runs nothing);
-//! 6. compare every bind pin inside the container's mount namespace (B4); on a mismatch remove the
-//!    container and audit `sandbox.mount_mismatch`;
-//! 7. `podman start`, then confirm after a short grace that the container is running with the
-//!    pid that was checked (`start` succeeds even when the entry point exits at once).
+//! 4. to 7. the one start path (`launch/start.rs`): audit `sandbox.launch`, `podman create`, the
+//!    host re-check, `podman init`, the in-container pin check (`sandbox.mount_mismatch` on a
+//!    difference), the OCI config verifier (Task 14, `sandbox.config_mismatch`), `podman start`
+//!    and the running check.
 //!
 //! A session whose sandbox can write to the host disk (`staged` mounts, `.git` overlays) gets a
 //! watchdog that kills it when those writes exceed `runtime.stage_size` (#14; `watchdog.rs`).
@@ -25,17 +26,12 @@
 //! A failure removes the container by its name (even when `create` printed no id), removes only
 //! the directories this launch created, and keeps the session's overlap claims while a container
 //! might still exist.
-//!
-//! Between steps 6 and 7 the OCI config verifier (Task 14, `launch/verify.rs`, `sandbox::oci`)
-//! compares the config podman generated with the argv's intent; on a difference the container
-//! is removed and `sandbox.config_mismatch` is audited with the first differing field.
 
-use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use sally_core::audit::{Actor, AuditError, AuditWriter, NewEntry};
+use sally_core::audit::{AuditError, AuditWriter, NewEntry};
 use sally_core::manifest::{AuditLevel, MountMode, NetworkMode, ValidatedManifest};
 use serde_json::json;
 
@@ -44,25 +40,33 @@ use crate::egress::net::{EgressError, EgressHandle, EgressStarter, NET_SOCK, Ses
 
 use super::argv::workspace_build;
 use super::budget::session_cost;
-use super::commands::container_id;
 use super::dirs::{SessionDirs, staged_indices};
 use super::disk::DiskFloor;
-use super::inside::{Expect, check_in_container};
-use super::oci::intent::{Built, Intent};
+use super::oci::intent::Built;
 use super::overlap::{Sessions, claims};
-use super::podman::{Podman, PodmanError};
-use super::scan::{LaunchScan, PinKind, ScanLimits, scan_mounts};
-use super::types::{CheckedRuntime, CommonArgs, ImageRef, Installation, SessionPaths, UserIds};
-use super::watchdog::{Observed, Target, Watch, WatchPlan, Watchdog, watch_plan};
+use super::podman::Podman;
+use super::scan::{LaunchScan, ScanLimits, scan_mounts};
+use super::types::{CheckedRuntime, ImageRef, Installation, Role, SessionPaths, UserIds};
+use super::watchdog::{Target, WatchPlan, Watchdog, watch_plan};
 use crate::daemon::crash::CrashReporter;
 use crate::oplog::Oplog;
 
 mod error;
+mod harness;
+mod inference;
+mod parts;
+mod start;
 mod teardown;
 mod verify;
 
 use error::join_err;
-pub use error::{LaunchError, StopError};
+pub use error::{LaunchError, RoleStopError, StopError};
+pub use harness::HarnessRequest;
+pub use inference::InferenceRequest;
+pub use parts::PinError;
+use parts::Subject;
+pub use start::RoleRunning;
+use start::{Extra, Launched, Prepared, Recheck, Request};
 pub use teardown::Sweep;
 
 /// Longest free-text value in an audit entry (CLAUDE.md: nothing above 4 KiB is logged).
@@ -224,6 +228,9 @@ pub struct LauncherParts {
     pub ids: UserIds,
     /// `$XDG_RUNTIME_DIR`.
     pub xdg_runtime_dir: PathBuf,
+    /// Sallyport's data root, `~/.local/share/sallyport`: an inference instance's profiles go
+    /// under `infer/<id>` in it (architect Q140).
+    pub data_dir: PathBuf,
     /// Live sessions.
     pub sessions: Arc<Sessions>,
     /// The audit log.
@@ -249,6 +256,7 @@ pub struct Launcher {
     runtime: CheckedRuntime,
     ids: UserIds,
     xdg_runtime_dir: PathBuf,
+    data_dir: PathBuf,
     sessions: Arc<Sessions>,
     audit: Arc<dyn AuditSink>,
     limits: ScanLimits,
@@ -273,7 +281,9 @@ impl std::fmt::Debug for Launcher {
 /// How far a failed launch got, so cleanup removes exactly what it made.
 #[derive(Debug, Default)]
 struct Progress {
-    /// Session directories this launch created (and only those).
+    /// The directories this launch may create: cleanup refuses to remove any other.
+    owned: Vec<PathBuf>,
+    /// Directories this launch created (and only those).
     dirs: Vec<PathBuf>,
     container: Option<String>,
 }
@@ -287,6 +297,7 @@ impl Launcher {
             runtime: p.runtime,
             ids: p.ids,
             xdg_runtime_dir: p.xdg_runtime_dir,
+            data_dir: p.data_dir,
             sessions: p.sessions,
             audit: p.audit,
             limits: p.limits,
@@ -348,22 +359,31 @@ impl Launcher {
         let this = Arc::clone(self);
         let crash = req.crash.clone();
         tokio::spawn(async move {
-            let result = this.launch(req).await.map(|(mut r, watch)| {
-                let target = Target {
-                    sid: r.paths.id().as_str().to_owned(),
-                    container: r.container.clone(),
-                    level: r.level,
-                    exec_gate: Arc::clone(&r.exec_gate),
-                };
-                r.watchdog = Some(Watchdog::spawn(
-                    &this,
-                    target,
-                    watch.plan,
-                    watch.observed,
-                    &crash,
-                ));
-                r
-            });
+            let req = Request::Workspace(req);
+            let result = match this.launch_role(&req).await {
+                Ok(Launched::Workspace(w)) => {
+                    let (mut r, watch) = *w;
+                    let target = Target {
+                        sid: r.paths.id().as_str().to_owned(),
+                        container: r.container.clone(),
+                        level: r.level,
+                        exec_gate: Arc::clone(&r.exec_gate),
+                    };
+                    r.watchdog = Some(Watchdog::spawn(
+                        &this,
+                        target,
+                        watch.plan,
+                        watch.observed,
+                        &crash,
+                    ));
+                    Ok(r)
+                }
+                Ok(Launched::Role(r)) => {
+                    this.stop_role_unreceived(r).await;
+                    Err(this.wrong_handle(&req).await)
+                }
+                Err(e) => Err(e),
+            };
             if let Err(Ok(orphan)) = tx.send(result) {
                 this.stop_unreceived(orphan).await;
             }
@@ -372,71 +392,38 @@ impl Launcher {
         error::received(rx, sid).await
     }
 
-    /// Every `Err` it returns went through `refused()`: audited, or `Unaudited` (architect Q98).
-    async fn launch(&self, req: WorkspaceRequest) -> Result<(Running, Watch), LaunchError> {
-        let level = req.manifest.manifest().audit.level;
-        let sid = req.paths.id().as_str().to_owned();
-        // Step 0 (architect Q58): the image, before anything is reserved or created.
-        let image = match req.image() {
-            Ok(i) => i,
-            Err(e) => {
-                return Err(self
-                    .refused(&sid, e, level, "nothing to clean up".into())
-                    .await);
-            }
-        };
+    /// The workspace's step 0 and step 1: the image (architect Q58), before anything is
+    /// reserved or created; then the session's mounts and descriptors, reserved.
+    async fn admit_workspace(&self, req: &WorkspaceRequest) -> Result<ImageRef, LaunchError> {
+        let image = req.image()?;
         let v = Arc::clone(&req.manifest);
         let fds = session_cost(req.manifest.manifest().network.max_connections);
-        let reserved = match blocking(move || claims(&v).map_err(LaunchError::Claims)).await {
-            Ok(c) => self
-                .sessions
-                .reserve(&sid, c, fds)
-                .map_err(LaunchError::from),
-            Err(e) => Err(e),
-        };
-        if let Err(e) = reserved {
-            return Err(self
-                .refused(&sid, e, level, "nothing to clean up".into())
-                .await);
-        }
-        let mut progress = Progress::default();
-        match self
-            .launch_reserved(&req, &image, level, &mut progress)
-            .await
-        {
-            Ok(r) => Ok(r),
-            Err(e) => {
-                let cleanup = self.clean_failed(&req.paths, &progress).await;
-                let outcome = match &cleanup {
-                    Ok(()) => "removed".to_owned(),
-                    Err(c) => format!("incomplete, the session stays reserved: {c}"),
-                };
-                if cleanup.is_ok() {
-                    self.sessions.release(&sid);
-                }
-                Err(self.refused(&sid, e, level, outcome).await)
-            }
-        }
+        let c = blocking(move || claims(&v).map_err(LaunchError::Claims)).await?;
+        self.sessions.reserve(req.paths.id().as_str(), c, fds)?;
+        Ok(image)
     }
 
     /// Audits a refusal; returns the error to report (the original, or both when the audit
     /// entry fails too).
     async fn refused(
         &self,
-        sid: &str,
+        subject: &Subject,
+        role: Role,
         e: LaunchError,
         level: AuditLevel,
         cleanup: String,
     ) -> LaunchError {
-        let entry = NewEntry::new(Actor::Sallyd, e.event())
-            .session(sid)
-            .decision("deny")
-            .args(json!({
-                "role": "workspace",
-                "reason": e.reason(),
-                "detail": e.detail(),
-                "cleanup": capped(&cleanup),
-            }));
+        let entry = subject
+            .entry(
+                e.event(),
+                role,
+                [
+                    ("reason", e.reason().into()),
+                    ("detail", e.detail().into()),
+                    ("cleanup", capped(&cleanup).into()),
+                ],
+            )
+            .decision("deny");
         match self.audit(entry, level).await {
             Ok(()) => e,
             Err(a) => LaunchError::Unaudited {
@@ -446,17 +433,18 @@ impl Launcher {
         }
     }
 
-    async fn launch_reserved(
+    /// Steps 2 and 3 of the workspace (module docs), after the shared re-check of podman and
+    /// the runtime.
+    async fn prepare_workspace(
         &self,
         req: &WorkspaceRequest,
         image: &ImageRef,
-        level: AuditLevel,
+        runtime: CheckedRuntime,
         progress: &mut Progress,
-    ) -> Result<(Running, Watch), LaunchError> {
-        let (runtime, scan, plan) = self.check_and_scan(req).await?;
-        let image = image.as_str();
-        self.image_present(image).await?;
-        let Built { argv, intent } = self.dirs_and_argv(req, runtime, &scan, progress).await?;
+    ) -> Result<(Prepared, Extra), LaunchError> {
+        let (scan, plan) = self.scan(req).await?;
+        let image = self.image_present(image).await?;
+        let built = self.dirs_and_argv(req, runtime, &scan, progress).await?;
         let egress = self.start_egress(req).await?;
         let mounts: Vec<_> = req
             .manifest
@@ -469,49 +457,26 @@ impl Launcher {
             .iter()
             .map(|g| g.dirs().len() + g.files().len())
             .sum();
-        self.audit(
-            NewEntry::new(Actor::Sallyd, "sandbox.launch")
-                .session(req.paths.id().as_str())
-                .decision("allow")
-                .args(json!({
-                    "role": "workspace",
-                    "image": image,
-                    "mounts": mounts,
-                    "git_shields": shields,
-                })),
-            level,
-        )
-        .await?;
-        let name = format!("sp-ws-{}", req.paths.id().as_str());
-        progress.container = Some(name.clone());
-        let out = self
-            .run("create", argv.into_iter().map(OsString::from))
-            .await?;
-        let container = container_id(&out)?;
-        let (init_pid, init_dir, observed) =
-            match self.checked_start(req, scan, &container, &intent).await {
-                Ok(init) => init,
-                Err(e) => {
-                    // The container may have run long enough to open a tunnel: stop the listener
-                    // in order, so every `egress.allow` gets its `egress.close`.
-                    if let Some(h) = egress {
-                        h.shutdown().await;
-                    }
-                    return Err(e);
-                }
-            };
-        let running = Running {
-            container,
-            name,
-            paths: req.paths.clone(),
-            level,
-            watchdog: None,
-            egress,
-            exec_gate: Arc::new(tokio::sync::Mutex::new(())),
-            init_pid,
-            init_dir: Arc::new(init_dir),
+        let sid = req.paths.id();
+        let prepared = Prepared {
+            subject: Subject::Session(sid.clone()),
+            level: req.manifest.manifest().audit.level,
+            name: format!("sp-ws-{}", sid.as_str()),
+            launch_args: vec![
+                ("image", image.as_str().into()),
+                ("mounts", mounts.into()),
+                ("git_shields", shields.into()),
+            ],
+            image,
+            built,
+            recheck: Recheck::Scan(scan, Arc::clone(&req.manifest)),
         };
-        Ok((running, Watch { plan, observed }))
+        let extra = Extra::Workspace {
+            egress,
+            plan,
+            paths: req.paths.clone(),
+        };
+        Ok((prepared, extra))
     }
 
     /// Step 3a: the session's egress listener on `net.sock`, for `network.mode: proxy` only. A
@@ -539,23 +504,18 @@ impl Launcher {
             .map_err(|e| LaunchError::Egress(EgressError::Listener(e)))
     }
 
-    /// Step 2: hermetic podman and the runtime re-checked, then the launch scan, then the
+    /// Step 2, after the shared re-check of podman and the runtime: the launch scan, then the
     /// free-space check of every filesystem the sandbox could write to (`disk.rs`).
-    async fn check_and_scan(
+    async fn scan(
         &self,
         req: &WorkspaceRequest,
-    ) -> Result<(CheckedRuntime, LaunchScan, Option<WatchPlan>), LaunchError> {
-        let podman = self.podman.clone();
-        let runtime = self.runtime.path().to_owned();
+    ) -> Result<(LaunchScan, Option<WatchPlan>), LaunchError> {
         let (limits, floor) = (self.limits, self.disk_floor);
         let (v, paths) = (Arc::clone(&req.manifest), req.paths.clone());
         blocking(move || {
-            podman.recheck()?;
-            let runtime = CheckedRuntime::check(&runtime)
-                .map_err(|e| LaunchError::Podman(PodmanError::Binary(e)))?;
             let scan = scan_mounts(&v, &limits)?;
             let plan = watch_plan(&v, &paths, &scan, &floor)?;
-            Ok((runtime, scan, plan))
+            Ok((scan, plan))
         })
         .await
     }
@@ -582,14 +542,7 @@ impl Launcher {
             Err(e) => e.created.clone(),
         };
         let dirs = created?;
-        let common = CommonArgs {
-            runtime,
-            ids: self.ids,
-            profiles: dirs.profiles().to_owned(),
-            hooks_dir: self.podman.hooks_dir(),
-            mounts_file: self.podman.mounts_file(),
-            installation: self.installation.clone(),
-        };
+        let common = self.common_args(runtime, dirs.profiles().to_owned());
         Ok(workspace_build(
             &common,
             &req.paths,
@@ -597,107 +550,6 @@ impl Launcher {
             scan,
             req.default_image.as_ref(),
         )?)
-    }
-
-    /// Steps 5 (after create) to 7; the init's pid and `/proc/<pid>` directory, opened right
-    /// after the mount check on that pid (step 7 confirms the container still runs as it).
-    async fn checked_start(
-        &self,
-        req: &WorkspaceRequest,
-        scan: LaunchScan,
-        container: &str,
-        intent: &Intent,
-    ) -> Result<(u32, rustix::fd::OwnedFd, Observed), LaunchError> {
-        let v = Arc::clone(&req.manifest);
-        let expect: Vec<Expect> = scan
-            .pins()
-            .iter()
-            .filter(|p| p.kind == PinKind::Bind)
-            .map(|p| Expect {
-                guest: p.guest.clone(),
-                dev: p.dev,
-                ino: p.ino,
-            })
-            .collect();
-        blocking(move || Ok(scan.recheck_host(&v)?)).await?;
-        self.run("init", self.podman.spec_args("init", container))
-            .await?;
-        let pid = self.init_pid(container).await?;
-        let (dir, observed) = blocking(move || {
-            // Opened first: the fd then names the process whose mounts are checked next.
-            let p = format!("/proc/{pid}");
-            let dir = sally_core::fd::open(
-                p.as_str(),
-                rustix::fs::OFlags::PATH | rustix::fs::OFlags::DIRECTORY,
-                rustix::fs::Mode::empty(),
-            )
-            .map_err(|e| LaunchError::Command {
-                verb: "init",
-                msg: format!("cannot open {p}: {e}"),
-            })?;
-            check_in_container(&dir, &expect).map_err(LaunchError::MountMismatch)?;
-            let observed = Observed::at_launch(&dir).map_err(LaunchError::CgroupEvents)?;
-            Ok((dir, observed))
-        })
-        .await?;
-        // Task 14 (architect Q99): last before start, so the config read is the one started.
-        self.verify_config(container, intent).await?;
-        self.run("start", self.podman.spec_args("start", container))
-            .await?;
-        tokio::time::sleep(START_GRACE).await;
-        self.confirm_running(container, pid).await?;
-        Ok((pid, dir, observed))
-    }
-
-    /// Step 7: the container still runs, as the process whose mounts were checked. A container
-    /// that exited is already gone (`--rm`), so a failed inspect means "not running" too.
-    async fn confirm_running(&self, container: &str, pid: u32) -> Result<(), LaunchError> {
-        let state = self
-            .run(
-                "inspect",
-                [
-                    "inspect".into(),
-                    "--format".into(),
-                    "{{.State.Running}} {{.State.Pid}}".into(),
-                    container.into(),
-                ],
-            )
-            .await
-            .map_err(|e| LaunchError::NotRunning(e.to_string()))?;
-        running_as(&state, pid)
-    }
-
-    async fn init_pid(&self, container: &str) -> Result<u32, LaunchError> {
-        let out = self
-            .run(
-                "inspect",
-                [
-                    "inspect".into(),
-                    "--format".into(),
-                    "{{.State.Pid}}".into(),
-                    container.into(),
-                ],
-            )
-            .await?;
-        match out.trim().parse::<u32>() {
-            Ok(pid) if pid > 1 => Ok(pid),
-            _ => Err(LaunchError::Command {
-                verb: "inspect",
-                msg: format!("unexpected pid {:?}", out.trim()),
-            }),
-        }
-    }
-}
-
-/// `podman inspect` printed `true <pid>` with the pid checked after `init`.
-fn running_as(state: &str, pid: u32) -> Result<(), LaunchError> {
-    if state.trim() == format!("true {pid}") {
-        Ok(())
-    } else {
-        Err(LaunchError::NotRunning(format!(
-            "state {:?}, expected running as pid {pid}",
-            capped(state.trim())
-        )))
     }
 }
 
@@ -714,16 +566,6 @@ mod tests {
         let c = capped(&long);
         assert!(c.len() <= AUDIT_TEXT_CAP + "…".len());
         assert!(c.ends_with('…'));
-    }
-
-    #[test]
-    fn only_running_as_the_checked_pid_counts() {
-        assert!(running_as("true 42\n", 42).is_ok());
-        for bad in ["false 0", "true 43", "true 42 x", "", "TRUE 42"] {
-            let e = running_as(bad, 42).unwrap_err();
-            assert!(matches!(e, LaunchError::NotRunning(_)), "{bad:?}");
-            assert_eq!(e.reason(), "not-running");
-        }
     }
 
     /// #48 (architect Q45): a session over the descriptor budget is refused `fd-budget`, the

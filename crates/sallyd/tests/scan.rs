@@ -212,9 +212,26 @@ fn pins_carry_identity_guest_path_and_kind() {
         assert_eq!((pin.guest.as_str(), pin.kind), (guest, kind), "{rel}");
     }
     assert_eq!(scan.pins().len(), 6);
+    // The post-init check compares the five binds, never the overlay lower layer.
+    let expects = scan.bind_expects();
+    let guests: Vec<&str> = expects.iter().map(|e| e.guest.as_str()).collect();
+    assert_eq!(
+        guests,
+        scan.pins()
+            .iter()
+            .filter(|p| p.kind == PinKind::Bind)
+            .map(|p| p.guest.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(expects.len(), 5);
+    for e in &expects {
+        let pin = scan.pins().iter().find(|p| p.guest == e.guest).unwrap();
+        assert_eq!((e.dev, e.ino), (pin.dev, pin.ino), "{}", e.guest);
+    }
     let staged = f.scan(&one(&f, "staged"));
     assert_eq!(staged.pins().len(), 1);
     assert_eq!(staged.pins()[0].kind, PinKind::OverlayLower);
+    assert!(staged.bind_expects().is_empty());
 }
 
 /// The 6a re-review's H1 setup on the host side: a pinned parent renamed and recreated between

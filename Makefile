@@ -128,7 +128,7 @@ MUTANTS_WIDE_CORE := $(addprefix crates/sally-core/src/,manifest/image.rs manife
 MUTANTS_WIDE_SALLYD := $(addprefix crates/sallyd/src/sandbox/,argv.rs check.rs types.rs profiles.rs \
                        overlap.rs scan.rs images.rs changes.rs cgroup.rs dirs.rs podman.rs binaries.rs \
                        disk.rs stage.rs \
-                       launch/error.rs budget.rs orphans.rs oci/mod.rs oci/config.rs oci/facts.rs \
+                       launch/error.rs launch/parts.rs budget.rs orphans.rs oci/mod.rs oci/config.rs oci/facts.rs \
                        oci/intent.rs oci/linux.rs oci/mounts.rs oci/process.rs oci/seccomp.rs) \
                        $(addprefix crates/sallyd/src/daemon/,mod.rs crash.rs startup.rs stale.rs install.rs) \
                        crates/sallyd/src/oplog.rs \

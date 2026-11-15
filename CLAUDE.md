@@ -81,7 +81,8 @@ cargo-mutants never mutates a function named `new`, so in scope decision logic n
 one: `new` is a delegating call or a plain struct literal (guard test in
 `sally-core/tests/mutants_config.rs`; today's offenders are allowlisted until Task 13, #87).
 Orchestration that only container tests can prove (`sandbox/launch.rs`, `launch/teardown.rs`,
-`watchdog.rs`, `commands.rs`, `inside.rs`, `tools/exec.rs`) stays with the `rt_` tests. Per mutant only
+`launch/start.rs`, `launch/harness.rs`, `launch/inference.rs`, `watchdog.rs`, `commands.rs`,
+`inside.rs`, `tools/exec.rs`) stays with the `rt_` tests. Per mutant only
 container-free tests run: unit tests, all of sally-core's `tests/`, `sallyd` `argv` + `scan`,
 `sally-shim` `relay`. A new file that fits the rule joins its list in the same PR. Nightly, two jobs:
 - `make mutants` (deny paths): sally-core `manifest/validate/*.rs`, `manifest/paths.rs`,
@@ -89,7 +90,7 @@ container-free tests run: unit tests, all of sally-core's `tests/`, `sallyd` `ar
 - `make mutants-wide-{core,sallyd,shim,cli}` (sharded): sally-core `manifest/{image,hostenv,parse,
   summary,units}.rs`, `secrets/{store,secret}.rs`, `audit/{entry,redact,verify,writer,layout,tail}.rs`,
   `fsutil.rs`, `fd.rs`, `text.rs`, `paths.rs`; sallyd `sandbox/{argv,check,types,profiles,overlap,scan,images,
-  changes,cgroup,dirs,podman,binaries,disk,stage,budget,orphans}.rs`, `sandbox/launch/error.rs`,
+  changes,cgroup,dirs,podman,binaries,disk,stage,budget,orphans}.rs`, `sandbox/launch/{error,parts}.rs`,
   `sandbox/oci/{mod,config,facts,intent,linux,mounts,process,seccomp}.rs`,
   `daemon/{mod,crash,startup,stale,install}.rs`,
   `oplog.rs`, `session/{lookup,types,exit}.rs`, `egress/{addr,authority,head,policy,server,

@@ -286,7 +286,8 @@ are released only once the container is confirmed gone.
    launch reserves its id before it creates anything, so no sweep takes a launch in progress; a
    container a stop removes during the sweep drops out of its second listing; a failed periodic
    sweep is an oplog line, retried at the next.
-2. **Checks.** The runtime binary and the podman binary are re-checked (B5). Everything podman
+2. **Checks.** The runtime binary and the podman binary are re-checked (B5), for every role, by
+   the one launch path before the role's preparation. Everything podman
    reads from Sallyport's state is re-checked too: the state directory is private, `hooks/` and
    `config/` are empty, `mounts.conf` is empty, and `containers.conf` is byte-identical to what
    was generated.
@@ -348,6 +349,32 @@ are released only once the container is confirmed gone.
    must report the container running as the pid checked in step 7. `start` succeeds even when
    the entry point exits at once, and a container that exited is already gone (`--rm`). Either
    way the launch is refused (`not-running`), and everything it created is removed.
+
+**One launch path for every role** (#123; architect Q129–Q131, Q139–Q143). The workspace,
+harness (`Launcher::launch_harness`) and CPU inference (`Launcher::launch_inference`) launches
+share one path (`sandbox/launch/start.rs`): each role's refusals that need nothing made and its
+claim, the re-check of step 2, the role's own preparation (its image found in local storage,
+then its directories and argv), and steps 5 (audit) to 8. `podman create`, `init` and `start`,
+the empty mounts file (`Podman::spec_args`) and the config verifier are called there only, and
+every podman command runs through hermetic podman, so no role starts without the private `HOME`,
+the empty mounts file or the verifier. A refusal audits the real role.
+- **Harness**: `no-default-image` first (`harness.image`, else the bundled default, #88); then it
+  claims its session's harness, refused `no-session` unless the session is live and `overlap` if
+  a harness is already claimed (live check and claim under one lock, so a second launch can never
+  create, or clean up, a container of the same name); then `sessions/<id>` under both roots, the
+  harness socket directory and `profiles/` must exist as private directories (`no-session`;
+  never created). It pins its socket directory, re-checks it on the host after `create` and
+  compares it at `/run/sallyport` after `init`. `sp-h-<id>`, audited with the session.
+  `stop_role` audits `sandbox.stop {role}`, removes the container only and frees the claim; the
+  session layer stops the harness before the workspace (#133).
+- **CPU inference**: `gpu-unsupported` first (#116). An instance is not a session: its entries
+  carry `instance` in their args and no session. The launcher derives and creates
+  `$XDG_RUNTIME_DIR/sallyport/infer/<id>` (the socket directory) and `<data>/infer/<id>/profiles`,
+  fresh and 0700: an id in use is refused before anything is created. The model blob (its
+  import identity) and the socket directory are pinned, re-checked and compared like the
+  harness's. `stop_role` audits `sandbox.stop {role, instance}` and removes the container and
+  both directories. The orphan sweeps do not cover `sp-infer-*` yet (#134).
+- The disk watchdog and the cgroup event observer stay workspace-only (#132).
 
 **Disk watchdog** (#14, Task 6c; maintainer design after the 6c-1 reviews). A sandbox writes to
 the host disk through its `rw` mounts and through the upper directories of its `staged` mounts

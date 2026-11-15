@@ -21,7 +21,9 @@ use serde_json::Value;
 
 use super::types::{INSTALLATION_LABEL, Installation};
 
-/// The name prefixes of session containers.
+/// The name prefixes of session containers. An inference instance (`sp-infer-<id>`) is not a
+/// session: its liveness is not in `Sessions`, so it is not swept here. TODO(#134): sweep
+/// instances against their own liveness set before any RPC reaches the inference launch.
 pub const SESSION_PREFIXES: [&str; 2] = ["sp-ws-", "sp-h-"];
 
 /// `podman ps` arguments listing this installation's containers, one per line.

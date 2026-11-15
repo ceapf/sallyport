@@ -52,6 +52,7 @@ exclude_re = [
   'crates/sallyd/src/tools/fs\.rs:\d+:\d+: replace \| with \^ in read_file$',
   'crates/sallyd/src/tools/fs\.rs:\d+:\d+: replace \| with \^ in write_existing$',
   'crates/sallyd/src/tools/fs\.rs:\d+:\d+: replace \| with \^ in write_new$',
+  'crates/sallyd/src/sandbox/launch/parts\.rs:\d+:\d+: replace \| with \^ in stat$',
   # Power loss only: the directory fsync makes a rename or a new file durable across a crash.
   # Nothing a test can observe without cutting power differs.
   'crates/sally-core/src/audit/writer\.rs:\d+:\d+: replace sync_dir -> Result<\(\), AuditError> with Ok\(\(\)\)$',
@@ -86,9 +87,9 @@ exclude_re = [
   # Clock instant only (rule ii): `now > until` -> `now >= until` differs only when the clock
   # reads the deadline to the nanosecond. `past` holds that one comparison (both walks use it).
   'crates/sallyd/src/sandbox/stage\.rs:\d+:\d+: replace > with >= in past$',
-  # Container-only: needs the Podman image store. Each, applied by hand, fails
+  # Container-only: needs the Podman image store. Applied by hand, it fails
   # rt_sup_02_a_missing_digest_is_refused_without_an_outbound_connection ("image not known").
-  'crates/sallyd/src/sandbox/images\.rs:\d+:\d+: replace Launcher::image_present -> Result<\(\), LaunchError> with Ok\(\(\)\)$',
+  # (Its `-> Ok(..)` mutant no longer compiles: `PresentImage` has no default, #123.)
   'crates/sallyd/src/sandbox/images\.rs:\d+:\d+: delete ! in Launcher::image_present$',
   # Same value (rule i): `Value::default()` is `Value::Null`, which is what visit_unit returns
   # (architect ruling Q13, Task 7). Proof: json.rs `null_parses_to_the_default_value`.

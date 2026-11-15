@@ -24,9 +24,9 @@ fn own_hard(r: Resource) -> u64 {
 
 impl Launcher {
     /// Verifies the OCI config of the created and initialised `container` (its 64-digit id)
-    /// against the argv's `intent`. The workspace launcher calls it after the in-container mount
-    /// check and right before `podman start`; the container tests call it on their own
-    /// containers. TODO(#123): the harness and inference launchers of Task 13 call it too.
+    /// against the argv's `intent`. The one start path (`launch/start.rs`) calls it for every
+    /// role, after the in-container mount check and right before `podman start` (#123); the
+    /// container tests call it on their own containers.
     ///
     /// # Errors
     /// [`LaunchError::ConfigMismatch`] naming the first field that differs, or
