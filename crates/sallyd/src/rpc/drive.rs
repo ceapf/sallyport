@@ -31,9 +31,9 @@ use crate::tools::STOPPING;
 use crate::tools::ops::Ops;
 
 /// Characters of an assistant message in a step reply, after escaping.
-pub const CONTENT_CHARS: usize = 16 * 1024;
+pub const CONTENT_CHARS: usize = 16_384;
 /// Characters of one call's result in a step reply, after escaping.
-pub const RESULT_CHARS: usize = 16 * 1024;
+pub const RESULT_CHARS: usize = 16_384;
 /// Characters of a tool name in a step reply, after escaping.
 pub const NAME_CHARS: usize = 64;
 

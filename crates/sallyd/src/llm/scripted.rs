@@ -26,7 +26,7 @@ use crate::rpc::message::{MAX_DEPTH, too_deep};
 /// Bytes of a script at most (Q103).
 pub const MAX_SCRIPT_BYTES: usize = sally_proto::MAX_SCRIPT_BYTES;
 /// Bytes of one script line at most.
-pub const MAX_LINE_BYTES: usize = 64 * 1024;
+pub const MAX_LINE_BYTES: usize = 65_536;
 /// Turns of a script at most.
 pub const MAX_TURNS: usize = sally_proto::MAX_TURNS;
 /// Calls of one turn at most.
@@ -469,6 +469,7 @@ mod tests {
 
     #[test]
     fn caps_hold_at_their_boundaries() {
+        assert_eq!((MAX_LINE_BYTES, MAX_CALLS), (64 * 1024, 8));
         let call = "{\"name\":\"a\",\"arguments\":{}}";
         let calls = |n: usize| format!("{{\"tool_calls\":[{}]}}", vec![call; n].join(","));
         assert!(Script::parse(&calls(MAX_CALLS)).is_ok());

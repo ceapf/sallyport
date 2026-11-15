@@ -90,9 +90,14 @@ async fn a_content_turn_ends_the_loop_and_its_entry_holds_a_hash_never_the_text(
     assert_eq!(s.kind, TurnKind::Content);
     assert_eq!(s.content.as_deref(), Some("secret text"));
     assert!(s.done);
-    let args = sink.rows()[0].args.to_string();
-    assert!(!args.contains("secret text"), "{args}");
-    assert!(args.contains("content_sha256") && args.contains("\"content_bytes\":11"));
+    let args = &sink.rows()[0].args;
+    assert!(!args.to_string().contains("secret text"), "{args}");
+    assert_eq!(args["content_bytes"], 11);
+    // `printf 'secret text' | sha256sum`
+    assert_eq!(
+        args["content_sha256"],
+        "486a2d2abec341f9a9513329e29ea386e98b2a280d38d12a0b4a53c92ad8b26b"
+    );
 }
 
 #[tokio::test]
@@ -211,6 +216,10 @@ async fn texts_are_escaped_and_cut_at_their_named_caps() {
 /// to the most JSON (backslashes, each doubled again by JSON), and the most calls a turn has.
 #[test]
 fn the_largest_step_fits_the_reply_budget() {
+    assert_eq!(
+        (CONTENT_CHARS, RESULT_CHARS, NAME_CHARS),
+        (16 * 1024, 16 * 1024, 64)
+    );
     let worst = |cap: usize| escape_capped(&vec![b'\\'; cap * 4], cap);
     let call = StepCall {
         name: worst(NAME_CHARS),

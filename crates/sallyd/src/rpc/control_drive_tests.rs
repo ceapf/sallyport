@@ -321,6 +321,25 @@ async fn a_stopping_session_refuses_a_drive_from_any_connection() {
     assert_eq!(own.events(), ["drive.turn"]);
 }
 
+/// One connection may drive two sessions: each drive steps that session's own seat and script.
+#[tokio::test]
+async fn one_connection_drives_two_sessions_each_on_its_own_seat() {
+    let f = fx("drive-two");
+    let (one, _) = driven(&f, "s-1", THREE);
+    let (two, calls) = driven(&f, "s-2", "{\"content\":\"only\"}\n");
+    let mut w = f.connect();
+    let r = w.call("sessions.drive", json!({"id": "s-1"})).await;
+    assert_eq!(r["result"]["kind"], json!("tool_calls"));
+    let r = w.call("sessions.drive", json!({"id": "s-2"})).await;
+    assert_eq!(
+        r["result"],
+        json!({"turn": 1, "kind": "content", "content": "only", "done": true})
+    );
+    assert_eq!(one.events(), ["drive.turn"]);
+    assert_eq!(two.events(), ["drive.turn"]);
+    assert!(calls.lock().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn a_connection_that_watches_cannot_take_the_seat() {
     let f = fx("drive-watching");
