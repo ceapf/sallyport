@@ -26,6 +26,8 @@ pub struct Recorder {
     seal: Arc<Seal>,
     /// Where a write the seal refused is noted (session and event name only).
     log: Option<Oplog>,
+    /// Who the entries of the socket's peer are written as (architect ruling Q118).
+    driven: bool,
 }
 
 /// What [`Recorder::seal`] did.
@@ -148,12 +150,28 @@ impl Recorder {
             level,
             seal: Arc::new(Seal::new()),
             log: None,
+            driven: false,
+        }
+    }
+
+    /// This recorder for a driven session: every entry that would be the harness's is the
+    /// driver's. Fixed here, where the registry picks the transport, so that no request field,
+    /// script line or flag can choose it (architect ruling Q118).
+    #[must_use]
+    pub fn driven(self) -> Self {
+        Self {
+            driven: true,
+            ..self
         }
     }
 
     /// A new entry of this session (none for an empty session id: the control socket's).
     #[must_use]
     pub fn entry(&self, actor: Actor, event: &str, decision: Option<&str>) -> NewEntry {
+        let actor = match actor {
+            Actor::Harness if self.driven => Actor::Driver,
+            other => other,
+        };
         let e = NewEntry::new(actor, event);
         let e = if self.session.is_empty() {
             e
@@ -276,6 +294,36 @@ mod tests {
             r#"Recorder { session: "sess-a", level: Full, .. }"#
         );
         assert_eq!(rec.session(), "sess-a");
+    }
+
+    fn actor_of(e: &NewEntry) -> &'static str {
+        let d = format!("{e:?}");
+        ["Harness", "Driver", "Sallyd", "User"]
+            .into_iter()
+            .find(|a| d.contains(&format!("actor: {a}")))
+            .unwrap_or("?")
+    }
+
+    #[test]
+    fn a_driven_recorder_writes_the_harness_as_the_driver_and_no_one_else_changes() {
+        let (_, agent) = crate::rpc::testkit::recorder("sess-a");
+        let driven = agent.clone().driven();
+        assert_eq!(
+            actor_of(&agent.entry(Actor::Harness, "tool.run", None)),
+            "Harness"
+        );
+        assert_eq!(
+            actor_of(&driven.entry(Actor::Harness, "tool.run", None)),
+            "Driver"
+        );
+        for (actor, name) in [(Actor::Sallyd, "Sallyd"), (Actor::User, "User")] {
+            assert_eq!(actor_of(&driven.entry(actor, "x.y", None)), name);
+            assert_eq!(actor_of(&agent.entry(actor, "x.y", None)), name);
+        }
+        assert_eq!(
+            actor_of(&driven.entry(Actor::Driver, "drive.turn", None)),
+            "Driver"
+        );
     }
 
     fn note(rec: &Recorder, event: &str) -> NewEntry {
