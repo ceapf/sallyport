@@ -575,7 +575,9 @@ request is `-32000` with `data`
   `rpc.request`, policy, approvals and audit entries. A step ends at the first call the
   classifier refuses; a tool's own denial is a result, as to a model. The reply (`Step`:
   `turn`, `kind`, `content`, `calls: [{name, result}]`, `done`) carries texts escaped and cut
-  by `sallyd` at named caps; `done` marks the end of the script, a message or a failure. Every
+  by `sallyd` at named caps; `done` marks the end of the script, a message or a failure (a
+  driven script ends at its first message or failure: `sessions.create` refuses a turn after
+  one, `script-invalid`), or a call the classifier refused. Every
   entry that would be the harness's is written as actor `driver` (the recorder's origin is
   fixed where the registry picks the transport; nothing in a request, a script or a flag can
   choose it), so a driven session's log holds no `harness` entry; entries whose actor is
@@ -584,15 +586,19 @@ request is `-32000` with `data`
   session's life: another connection is `driver-busy`, and once the driver's connection has
   closed the seat is `driver-gone` (the session is not stopped). A session that was not
   declared driven is `not-driven`, an unknown one `unknown-session`, a step after the stop
-  began `session-stopping`; a connection that watches cannot take the seat
+  began `session-stopping` (also when the stop seals the log under a call of the step); a
+  seat whose session stopped is let go at its connection's next request, which is then no
+  driver; a connection that watches cannot take the seat
   (`driver-watching`). Each refusal is a `session.refuse` in the control log, and nothing is
   written to the session's. A connection in the seat is refused `approvals.decide` (the
   prompt stays pending; `approval.decide` `refuse`, reason `driver-seat`, actor `user`) and
   `approvals.watch`: the driver is never an approver. This is not a boundary against the host
   user: any process of the same uid may open a second connection and decide (THREAT_MODEL).
-  When the driver's connection closes mid-step the step runs to its end with its entries and a
-  prompt it waits on is withdrawn (`Withdraw::Closed`), as on a closed `agent.sock`
-  connection. TODO(#126): re-rule the transport once the Task 13 harness launcher lands.
+  While a step runs, the connection's end of stream is watched (bytes sent meanwhile are the
+  next request and are kept). When the driver's connection closes mid-step the step is dropped
+  and the seat is gone: the call in flight runs to its end with its entries, a prompt it waits
+  on is withdrawn (`Withdraw::Closed`), as on a closed `agent.sock` connection, and the turn's
+  later calls do not run. No other method is raced so. TODO(#126): re-rule the transport once the Task 13 harness launcher lands.
 - `sessions.stop`: an unknown id is `unknown-session` (`session.refuse`); a container not
   confirmed gone is `stop-failed` (`session.refuse` in the control log: the session's own log
   is sealed by then).
