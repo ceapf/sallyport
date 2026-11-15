@@ -9,18 +9,19 @@
 //! The whole script is parsed before anything launches. Duplicate keys, any other shape, an
 //! extra key in a call and every cap below are refused with an error naming the line.
 
+#![deny(clippy::indexing_slicing)]
+
 use std::collections::VecDeque;
-use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use serde::Deserialize;
-use serde::de::{Deserializer, Error as _, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use super::body::Chat;
 use super::server::{Backend, BackendError, Reply};
+use crate::rpc::json;
+use crate::rpc::message::{MAX_DEPTH, too_deep};
 
 /// Bytes of a script at most (Q103).
 pub const MAX_SCRIPT_BYTES: usize = sally_proto::MAX_SCRIPT_BYTES;
@@ -64,13 +65,13 @@ pub struct Script {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ScriptError {
     /// The text is longer than [`MAX_SCRIPT_BYTES`].
-    #[error("script: {0} bytes exceed the {MAX_SCRIPT_BYTES}-byte limit")]
+    #[error("model.script: {0} bytes exceed the {MAX_SCRIPT_BYTES}-byte limit")]
     TooLarge(usize),
     /// The script has more than [`MAX_TURNS`] turns.
-    #[error("script: more than {MAX_TURNS} turns")]
+    #[error("model.script: more than {MAX_TURNS} turns")]
     TooManyTurns,
     /// A line is wrong; the message names what.
-    #[error("script line {line}: {what}")]
+    #[error("model.script line {line}: {what}")]
     Line {
         /// 1-based line number.
         line: usize,
@@ -79,60 +80,13 @@ pub enum ScriptError {
     },
 }
 
-/// A JSON value parsed with duplicate keys refused at every depth (serde_json keeps the last).
-struct Strict(Value);
-
-impl<'de> Deserialize<'de> for Strict {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct V;
-        impl<'de> Visitor<'de> for V {
-            type Value = Strict;
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a JSON value")
-            }
-            fn visit_bool<E>(self, b: bool) -> Result<Strict, E> {
-                Ok(Strict(Value::Bool(b)))
-            }
-            fn visit_i64<E>(self, n: i64) -> Result<Strict, E> {
-                Ok(Strict(Value::from(n)))
-            }
-            fn visit_u64<E>(self, n: u64) -> Result<Strict, E> {
-                Ok(Strict(Value::from(n)))
-            }
-            fn visit_f64<E>(self, n: f64) -> Result<Strict, E> {
-                Ok(Strict(Value::from(n)))
-            }
-            fn visit_str<E>(self, s: &str) -> Result<Strict, E> {
-                Ok(Strict(Value::String(s.to_owned())))
-            }
-            fn visit_unit<E>(self) -> Result<Strict, E> {
-                Ok(Strict(Value::Null))
-            }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<Strict, A::Error> {
-                let mut out = Vec::new();
-                while let Some(Strict(v)) = s.next_element()? {
-                    out.push(v);
-                }
-                Ok(Strict(Value::Array(out)))
-            }
-            fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Strict, A::Error> {
-                let mut out = Map::new();
-                while let Some((k, Strict(v))) = m.next_entry::<String, Strict>()? {
-                    if out.insert(k, v).is_some() {
-                        return Err(A::Error::custom("duplicate key"));
-                    }
-                }
-                Ok(Strict(Value::Object(out)))
-            }
-        }
-        d.deserialize_any(V)
-    }
-}
-
+/// One line as JSON: nested at most as deep as a frame on the agent socket, then parsed by the
+/// broker's one strict parse (duplicate keys refused at every depth; architect ruling Q11).
 fn strict(text: &str) -> Result<Value, String> {
-    serde_json::from_str::<Strict>(text)
-        .map(|Strict(v)| v)
-        .map_err(|e| e.to_string())
+    if too_deep(text.as_bytes(), MAX_DEPTH) {
+        return Err(format!("nested deeper than {MAX_DEPTH}"));
+    }
+    json::parse(text.as_bytes()).map_err(|e| e.to_string())
 }
 
 fn call(v: Value) -> Result<Call, String> {
@@ -215,9 +169,12 @@ impl Script {
 pub struct Scripted {
     turns: Mutex<VecDeque<Turn>>,
     served: Mutex<usize>,
-    /// The checked requests, in order.
+    /// The first [`MAX_SEEN`] checked requests, in order (a test's view of what was asked).
     pub seen: Mutex<Vec<Chat>>,
 }
+
+/// Requests [`Scripted::seen`] keeps at most; later ones are answered but not kept.
+pub const MAX_SEEN: usize = 64;
 
 fn locked<V>(m: &Mutex<V>) -> std::sync::MutexGuard<'_, V> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -241,7 +198,11 @@ impl Scripted {
 
     fn next(&self, chat: Chat) -> (usize, Option<Turn>, bool) {
         let stream = chat.stream;
-        locked(&self.seen).push(chat);
+        let mut seen = locked(&self.seen);
+        if seen.len() < MAX_SEEN {
+            seen.push(chat);
+        }
+        drop(seen);
         let mut served = locked(&self.served);
         *served += 1;
         (*served, locked(&self.turns).pop_front(), stream)
@@ -253,13 +214,13 @@ impl Scripted {
     /// [`BackendError`] for a `fail` turn, or when the script has no turn left.
     pub fn complete(&self, chat: Chat) -> Result<Reply, BackendError> {
         let (request, turn, stream) = self.next(chat);
-        let Some(turn @ (Turn::Content(_) | Turn::ToolCalls(_))) = turn else {
+        let Some((mut msg, finish)) = turn.and_then(|t| message(request, &t)) else {
             return Err(BackendError);
         };
-        let (mut msg, finish) = message(request, &turn);
         let id = format!("chatcmpl-scripted-{request}");
         if !stream {
-            msg["role"] = json!("assistant");
+            msg.insert("role".into(), json!("assistant"));
+            let msg = Value::Object(msg);
             return Ok(Reply::Whole(json!({
                 "id": id,
                 "object": "chat.completion",
@@ -277,7 +238,7 @@ impl Scripted {
         };
         let events = [
             chunk(json!({"role": "assistant"}), Value::Null),
-            chunk(msg, Value::Null),
+            chunk(Value::Object(msg), Value::Null),
             chunk(json!({}), json!(finish)),
         ];
         let (tx, rx) = mpsc::channel(events.len());
@@ -289,10 +250,14 @@ impl Scripted {
     }
 }
 
-/// The assistant message (or delta) of a turn, and its finish reason.
-fn message(request: usize, turn: &Turn) -> (Value, &'static str) {
+/// The assistant message (or delta) of a turn, and its finish reason; `None` for a `fail` turn.
+fn message(request: usize, turn: &Turn) -> Option<(Map<String, Value>, &'static str)> {
+    let mut m = Map::new();
     match turn {
-        Turn::Content(content) => (json!({"content": content}), "stop"),
+        Turn::Content(content) => {
+            m.insert("content".into(), Value::from(content.as_str()));
+            Some((m, "stop"))
+        }
         Turn::ToolCalls(calls) => {
             let calls: Vec<Value> = calls
                 .iter()
@@ -309,9 +274,11 @@ fn message(request: usize, turn: &Turn) -> (Value, &'static str) {
                     })
                 })
                 .collect();
-            (json!({"content": null, "tool_calls": calls}), "tool_calls")
+            m.insert("content".into(), Value::Null);
+            m.insert("tool_calls".into(), Value::Array(calls));
+            Some((m, "tool_calls"))
         }
-        Turn::Fail => (Value::Null, "stop"),
+        Turn::Fail => None,
     }
 }
 
@@ -425,7 +392,7 @@ mod tests {
 
     #[test]
     fn refuses_other_shapes_naming_the_line() {
-        assert!(err("{\"content\":\"a\"}\n{\"x\":1}").starts_with("script line 2:"));
+        assert!(err("{\"content\":\"a\"}\n{\"x\":1}").starts_with("model.script line 2:"));
         assert!(err("{\"content\":1}").contains("unknown"));
         assert!(err("{\"fail\":false}").contains("unknown"));
         assert!(err("{\"content\":\"a\",\"fail\":true}").contains("exactly one key"));
@@ -435,10 +402,36 @@ mod tests {
     }
 
     #[test]
+    fn nesting_is_bounded_as_on_the_agent_socket() {
+        let nest = |n: usize| {
+            format!(
+                "{{\"tool_calls\":[{{\"name\":\"a\",\"arguments\":{{\"k\":{}{}}}}}]}}",
+                "[".repeat(n),
+                "]".repeat(n)
+            )
+        };
+        // The line's own object, the list, the call and its arguments hold four levels.
+        assert!(Script::parse(&nest(MAX_DEPTH - 4)).is_ok());
+        assert!(err(&nest(MAX_DEPTH - 3)).contains("nested deeper"));
+    }
+
+    #[test]
+    fn the_backend_keeps_at_most_max_seen_requests() {
+        let b = backend(&"{\"fail\":true}\n".repeat(MAX_SEEN + 2));
+        for _ in 0..MAX_SEEN + 2 {
+            let _ = b.complete(chat(false));
+        }
+        assert_eq!(b.seen.lock().unwrap().len(), MAX_SEEN);
+        assert_eq!(b.left(), 0);
+    }
+
+    #[test]
     fn refuses_duplicate_keys() {
-        assert!(err("{\"content\":\"a\",\"content\":\"b\"}").contains("duplicate"));
+        assert!(err("{\"content\":\"a\",\"content\":\"b\"}").contains("repeated key"));
         let dup = "{\"tool_calls\":[{\"name\":\"a\",\"name\":\"b\",\"arguments\":{}}]}";
-        assert!(err(dup).contains("duplicate"));
+        assert!(err(dup).contains("repeated key"));
+        let deep = "{\"tool_calls\":[{\"name\":\"a\",\"arguments\":{\"k\":{\"x\":1,\"x\":2}}}]}";
+        assert!(err(deep).contains("repeated key"));
     }
 
     #[test]
