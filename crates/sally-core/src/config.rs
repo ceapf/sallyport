@@ -15,6 +15,8 @@ use serde::Deserialize;
 
 /// Largest accepted `config.toml`.
 pub const MAX_CONFIG_BYTES: usize = 64 * 1024;
+/// The field an error about the runtime binary names.
+pub const RUNTIME_PATH_FIELD: &str = "sandbox.runtime_path";
 
 /// Mode bits that let someone other than the owner change a file or directory.
 const GROUP_OTHER_WRITE: u32 = 0o022;
@@ -103,7 +105,7 @@ pub fn parse_config(text: &str) -> Result<Config, ConfigError> {
         });
     }
     for (field, path) in [
-        ("sandbox.runtime_path", &config.sandbox.runtime_path),
+        (RUNTIME_PATH_FIELD, &config.sandbox.runtime_path),
         ("sandbox.podman_path", &config.sandbox.podman_path),
     ] {
         if path.as_ref().is_some_and(|p| !p.is_absolute()) {
@@ -134,7 +136,7 @@ pub fn default_runtime_path(data_home: &Path) -> PathBuf {
 /// # Errors
 /// [`ConfigError::Binary`] naming `sandbox.runtime_path`, the path and the failed check.
 pub fn check_runtime_binary(path: &Path) -> Result<PathBuf, ConfigError> {
-    check_trusted_binary(path, "sandbox.runtime_path")
+    check_trusted_binary(path, RUNTIME_PATH_FIELD)
 }
 
 /// The checks of [`check_runtime_binary`] for any binary `sallyd` executes with the user's

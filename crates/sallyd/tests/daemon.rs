@@ -677,15 +677,17 @@ fn known_children(parent: i32, exes: &[&Path]) -> Vec<(i32, Seen)> {
 
 /// The podman `sallyd`'s system search finds, as `/proc/<pid>/exe` shows it.
 fn trusted_podman() -> PathBuf {
-    let p = sallyd::sandbox::resolve_podman(None).unwrap().path;
-    std::fs::canonicalize(p).unwrap()
+    let p = sallyd::sandbox::resolve_podman(None).unwrap();
+    std::fs::canonicalize(p.path()).unwrap()
 }
 
 /// A user-owned `podman` in `<root>/hostile-bin` that marks `<root>/podman-ran` when run, then
-/// runs the real one.
+/// runs the real one. It passes the root-or-user checks (asserted, whatever the umask), so a
+/// `PATH` lookup under that rule would run it rather than skip it.
 fn user_podman(env: &Env) -> (PathBuf, PathBuf) {
     let bin = env.root.join("hostile-bin");
     std::fs::create_dir_all(&bin).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
     let canary = env.root.join("podman-ran");
     assert!(
         !canary.display().to_string().contains('\''),
@@ -697,6 +699,7 @@ fn user_podman(env: &Env) -> (PathBuf, PathBuf) {
     );
     std::fs::write(bin.join("podman"), script).unwrap();
     std::fs::set_permissions(bin.join("podman"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    sally_core::config::check_trusted_binary(&bin.join("podman"), "decoy").unwrap();
     (bin, canary)
 }
 

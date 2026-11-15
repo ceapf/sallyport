@@ -473,7 +473,10 @@ At start, `sallyd` runs `podman --version` (hermetic environment) and `<runtime>
 <token>` strictly. Any failure stops startup. One oplog line, `podman resolved`, records the
 podman path, version and source (`system` or `sandbox.podman_path`), and the runtime path and
 version. A configured podman that the system search would not have accepted (not root-owned,
-or not one of its candidates) runs, and a warning line says why.
+or not one of its candidates) runs, and a warning line says why. The setting comes from
+`config.toml` under `$XDG_CONFIG_HOME/sallyport/`, which is `sallyd`'s own configuration and a
+trusted input. Whoever sets `sallyd`'s environment can still pick a podman that way; the
+warning line is how that shows.
 Every podman command has its output capped at 64 KiB per stream and is killed after 120 s.
 
 **Consequences.**

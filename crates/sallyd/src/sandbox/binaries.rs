@@ -25,9 +25,11 @@ use super::podman::{PODMAN_PATH_VAR, PodmanError};
 /// How long a `--version` probe may take before the binary is refused.
 pub const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 /// How much of a `--version` probe's stdout and stderr is kept.
-pub const VERSION_CAP: usize = 4096;
+const VERSION_CAP: usize = 4096;
 /// Longest version token accepted.
 const VERSION_TOKEN_MAX: usize = 64;
+/// Longest piece of a probe's output an error shows.
+const SHOWN_MAX: usize = 80;
 /// The field named when podman comes from the system search.
 const SYSTEM_FIELD: &str = "podman";
 /// The field named when podman comes from the setting.
@@ -71,19 +73,31 @@ impl PodmanSource {
     }
 }
 
-/// A podman binary and where it came from. [`Podman::setup`](super::Podman::setup) and every
-/// launch re-check it under its source's policy, so a wrong `source` fails closed.
+/// A checked podman binary and where it came from. Only [`resolve_podman`] makes one, so its
+/// source is the rule it passed; [`Podman::setup`](super::Podman::setup) and every launch
+/// re-check it under that rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedPodman {
+    path: PathBuf,
+    source: PodmanSource,
+}
+
+impl ResolvedPodman {
     /// The realpath of the binary.
-    pub path: PathBuf,
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Where it came from.
-    pub source: PodmanSource,
+    #[must_use]
+    pub fn source(&self) -> PodmanSource {
+        self.source
+    }
 }
 
 /// `<dir>/<name>` for each directory of [`PODMAN_PATH_VAR`], in its order.
-#[must_use]
-pub fn system_candidates(name: &str) -> Vec<PathBuf> {
+fn system_candidates(name: &str) -> Vec<PathBuf> {
     PODMAN_PATH_VAR
         .split(':')
         .map(|d| Path::new(d).join(name))
@@ -94,16 +108,30 @@ pub fn system_candidates(name: &str) -> Vec<PathBuf> {
 /// (root-owned only, no fall-through). Performs blocking I/O.
 ///
 /// # Errors
-/// [`PodmanError::Missing`], [`PodmanError::Binary`] (a configured binary, naming
-/// `sandbox.podman_path`) or [`PodmanError::System`] (a system one, saying that
-/// `sandbox.podman_path` can name another).
+/// - [`PodmanError::Binary`]: a configured binary failed its checks (naming
+///   `sandbox.podman_path`);
+/// - [`PodmanError::System`] or [`PodmanError::NoSystemPodman`]: the system search found a
+///   binary that failed the root-owned checks, or found none (each saying that
+///   `sandbox.podman_path` can name another);
+/// - [`PodmanError::Io`]: a candidate could not be looked at.
 pub fn resolve_podman(configured: Option<&Path>) -> Result<ResolvedPodman, PodmanError> {
+    resolve_in(configured, &system_candidates("podman"))
+}
+
+/// [`resolve_podman`] over the system candidates `system`.
+fn resolve_in(
+    configured: Option<&Path>,
+    system: &[PathBuf],
+) -> Result<ResolvedPodman, PodmanError> {
     let (path, source) = match configured {
         Some(p) => (p.to_owned(), PodmanSource::Configured),
-        None => (
-            first_existing(SYSTEM_FIELD, &system_candidates("podman"))?,
-            PodmanSource::System,
-        ),
+        None => {
+            let found = first_existing(SYSTEM_FIELD, system).map_err(|e| match e {
+                PodmanError::Missing(_, list) => PodmanError::NoSystemPodman(list),
+                other => other,
+            })?;
+            (found, PodmanSource::System)
+        }
     };
     Ok(ResolvedPodman {
         path: check_podman(&path, source)?,
@@ -114,7 +142,7 @@ pub fn resolve_podman(configured: Option<&Path>) -> Result<ResolvedPodman, Podma
 /// The checks of a podman binary from `source`; the realpath.
 ///
 /// # Errors
-/// As [`resolve_podman`].
+/// [`PodmanError::Binary`] (configured) or [`PodmanError::System`] (system).
 pub(super) fn check_podman(path: &Path, source: PodmanSource) -> Result<PathBuf, PodmanError> {
     check_binary(path, source.field(), source.owner()).map_err(|e| match source {
         PodmanSource::System => PodmanError::System(e),
@@ -156,11 +184,16 @@ fn first_existing(what: &'static str, candidates: &[PathBuf]) -> Result<PathBuf,
 /// is the root-owned binary of a system candidate. Performs blocking I/O.
 #[must_use]
 pub fn outside_system_rule(r: &ResolvedPodman) -> Option<&'static str> {
+    outside_in(r, &system_candidates("podman"))
+}
+
+/// [`outside_system_rule`] over the system candidates `system`.
+fn outside_in(r: &ResolvedPodman, system: &[PathBuf]) -> Option<&'static str> {
     if r.source == PodmanSource::System {
         return None;
     }
     let root_owned = check_binary(&r.path, CONFIGURED_FIELD, Owner::Root).is_ok();
-    let listed = system_candidates("podman")
+    let listed = system
         .iter()
         .filter_map(|c| std::fs::canonicalize(c).ok())
         .any(|c| c == r.path);
@@ -178,75 +211,126 @@ fn outside_reason(root_owned: bool, listed: bool) -> Option<&'static str> {
     }
 }
 
-/// Runs `cmd --version` and parses its first line as `<name> version <token>`. `cmd` must
-/// already carry its environment; its stdin is null. stdout and stderr are kept up to
-/// [`VERSION_CAP`] each, and the process is killed after `timeout`.
+/// Why a `--version` probe refused its binary.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ProbeError {
+    /// The binary could not be started or waited for.
+    #[error("--version could not run: {0}")]
+    Spawn(std::io::Error),
+    /// It did not finish in time; its process group was killed.
+    #[error("--version timed out after {} ms", .0.as_millis())]
+    Timeout(Duration),
+    /// It exited unsuccessfully.
+    #[error("--version failed: {status}: {stderr:?}")]
+    Failed {
+        /// Its exit status.
+        status: std::process::ExitStatus,
+        /// The start of its stderr.
+        stderr: String,
+    },
+    /// Its first line was not `<name> version <token>`.
+    #[error("--version printed {line:?}, not \"{name} version <version>\"")]
+    Format {
+        /// The binary's expected name.
+        name: String,
+        /// The start of the line it printed.
+        line: String,
+    },
+}
+
+/// At most [`SHOWN_MAX`] characters of `bytes`, lossily decoded (the error escapes them).
+fn shown(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .take(SHOWN_MAX)
+        .collect()
+}
+
+/// Runs `cmd --version` in a process group of its own and parses its first line as
+/// `<name> version <token>`. `cmd` must already carry its environment; its stdin is null.
+/// stdout and stderr are kept up to 4 KiB each and read to their end, so a process (or a
+/// process it started) holding a pipe open runs into the timeout, after which the whole group
+/// is killed.
 ///
 /// # Errors
-/// What went wrong, for the caller's error: spawn, timeout, a failed exit or a bad line.
+/// [`ProbeError`].
 pub async fn probe_version(
     mut cmd: tokio::process::Command,
     name: &str,
     timeout: Duration,
-) -> Result<String, String> {
+) -> Result<String, ProbeError> {
     let mut child = cmd
         .arg("--version")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .process_group(0)
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| e.to_string())?;
+        .map_err(ProbeError::Spawn)?;
+    let group = child.id();
     let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) else {
-        return Err("no pipes".into());
+        return Err(ProbeError::Spawn(std::io::Error::other("no pipes")));
     };
     let work = async {
-        let (out, _) = tokio::join!(read_capped(out, VERSION_CAP), read_capped(err, VERSION_CAP));
-        (out, child.wait().await)
+        let (out, err) = tokio::join!(read_capped(out, VERSION_CAP), read_capped(err, VERSION_CAP));
+        (out, err, child.wait().await)
     };
-    let (out, status) = tokio::time::timeout(timeout, work)
-        .await
-        .map_err(|_| format!("--version timed out after {} ms", timeout.as_millis()))?;
-    let status = status.map_err(|e| e.to_string())?;
+    let Ok((out, err, status)) = tokio::time::timeout(timeout, work).await else {
+        kill_group(group);
+        return Err(ProbeError::Timeout(timeout));
+    };
+    let status = status.map_err(ProbeError::Spawn)?;
     if !status.success() {
-        return Err(format!("--version failed: {status}"));
+        return Err(ProbeError::Failed {
+            status,
+            stderr: shown(&err),
+        });
     }
     parse_version(name, &out)
+}
+
+/// Kills the process group led by `leader` (the probe's), if it has one.
+fn kill_group(leader: Option<u32>) {
+    let pid = leader
+        .and_then(|p| i32::try_from(p).ok())
+        .and_then(rustix::process::Pid::from_raw);
+    if let Some(pid) = pid {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
 }
 
 /// The version token of `<name> version <token>`, the first line of `out`. The token is 1 to
 /// 64 bytes of `[0-9A-Za-z.+~-]`.
 ///
 /// # Errors
-/// The line, cut and escaped, when it is not of that form.
-pub fn parse_version(name: &str, out: &[u8]) -> Result<String, String> {
+/// [`ProbeError::Format`], showing the start of the line.
+pub fn parse_version(name: &str, out: &[u8]) -> Result<String, ProbeError> {
     let line = out.split(|&b| b == b'\n').next().unwrap_or_default();
-    let shown = || {
-        let s: String = String::from_utf8_lossy(line).chars().take(80).collect();
-        format!("--version printed {s:?}, not \"{name} version <version>\"")
+    let refused = || ProbeError::Format {
+        name: name.to_owned(),
+        line: shown(line),
     };
     let token = std::str::from_utf8(line)
         .ok()
         .and_then(|l| l.strip_prefix(name))
         .and_then(|l| l.strip_prefix(" version "))
-        .ok_or_else(shown)?;
+        .ok_or_else(refused)?;
     let ok = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'~' | b'-');
     if token.is_empty() || token.len() > VERSION_TOKEN_MAX || !token.bytes().all(ok) {
-        return Err(shown());
+        return Err(refused());
     }
     Ok(token.to_owned())
 }
 
-/// The field an error about the runtime's version names.
-pub const RUNTIME_FIELD: &str = "sandbox.runtime_path";
-
 /// A [`ConfigError`] for a version probe that failed, naming `field` and `path`.
 #[must_use]
-pub fn version_error(field: &'static str, path: &Path, msg: String) -> ConfigError {
+pub fn version_error(field: &'static str, path: &Path, e: &ProbeError) -> ConfigError {
     ConfigError::Binary {
         field,
         path: path.display().to_string(),
-        msg,
+        msg: e.to_string(),
     }
 }
 

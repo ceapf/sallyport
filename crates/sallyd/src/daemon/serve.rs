@@ -25,7 +25,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use sally_core::audit::{AuditError, AuditWriter, SystemClock};
-use sally_core::config::{Config, MAX_CONFIG_BYTES, default_runtime_path, parse_config};
+use sally_core::config::{
+    Config, MAX_CONFIG_BYTES, RUNTIME_PATH_FIELD, default_runtime_path, parse_config,
+};
 use sally_core::manifest::{AuditLevel, HostEnv, HostEnvError};
 use sally_core::paths::{Paths, PathsError};
 use tokio::net::UnixListener;
@@ -42,7 +44,7 @@ use crate::rpc::record::Recorder;
 use crate::sandbox::budget::session_budget;
 use crate::sandbox::{
     AuditSink, CheckedRuntime, DirError, DiskFloor, Installation, LaunchError, Launcher,
-    LauncherParts, PODMAN_PATH_VAR, Podman, PodmanError, PodmanHost, RUNTIME_FIELD, ScanLimits,
+    LauncherParts, PODMAN_PATH_VAR, Podman, PodmanError, PodmanHost, ProbeError, ScanLimits,
     Sessions, SharedAudit, Sweep, UserIds, VERSION_TIMEOUT, check_runtime_dir, open_sessions,
     outside_system_rule, probe_version, resolve_podman, version_error,
 };
@@ -442,16 +444,25 @@ async fn podman(
     let (podman, runtime, outside) = checked_podman(dirs, config).await?;
     let failed = |field, path: &Path| {
         let path = path.to_owned();
-        move |m| PodmanError::Binary(version_error(field, &path, m))
+        move |e: ProbeError| PodmanError::Binary(version_error(field, &path, &e))
     };
-    let version = probe_version(podman.command(), "podman", VERSION_TIMEOUT)
-        .await
-        .map_err(failed(podman.source().field(), podman.bin()))?;
     let mut crun = tokio::process::Command::new(runtime.path());
-    crun.env_clear().env("PATH", PODMAN_PATH_VAR);
-    let runtime_version = probe_version(crun, "crun", VERSION_TIMEOUT)
-        .await
-        .map_err(failed(RUNTIME_FIELD, runtime.path()))?;
+    crun.env_clear()
+        .env("PATH", PODMAN_PATH_VAR)
+        .current_dir("/");
+    // Concurrently, so startup waits at most one timeout.
+    let (version, runtime_version) = tokio::try_join!(
+        async {
+            probe_version(podman.command(), "podman", VERSION_TIMEOUT)
+                .await
+                .map_err(failed(podman.source().field(), podman.bin()))
+        },
+        async {
+            probe_version(crun, "crun", VERSION_TIMEOUT)
+                .await
+                .map_err(failed(RUNTIME_PATH_FIELD, runtime.path()))
+        },
+    )?;
     let path = podman.bin().display().to_string();
     log.info(
         LOG,

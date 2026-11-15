@@ -32,8 +32,8 @@ pub use argv::{
     harness_argv, harness_build, inference_argv, inference_build, workspace_argv, workspace_build,
 };
 pub use binaries::{
-    PodmanSource, RUNTIME_FIELD, ResolvedPodman, VERSION_TIMEOUT, outside_system_rule,
-    probe_version, resolve_podman, system_candidates, version_error,
+    PodmanSource, ProbeError, ResolvedPodman, VERSION_TIMEOUT, outside_system_rule, probe_version,
+    resolve_podman, version_error,
 };
 pub use changes::{Change, ChangeKind, ChangesError, session_changes};
 pub use check::{Allowed, Grant, Source, check_argv};

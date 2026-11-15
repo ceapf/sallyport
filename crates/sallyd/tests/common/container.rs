@@ -430,7 +430,7 @@ impl Lx {
         podman_home: Option<PathBuf>,
         wrap: impl FnOnce(&Path) -> PathBuf,
     ) -> Self {
-        let real = resolve_podman(None).unwrap().path;
+        let real = resolve_podman(None).unwrap().path().to_owned();
         Self::build(
             podman_home,
             None,

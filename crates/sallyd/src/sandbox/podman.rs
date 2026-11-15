@@ -66,12 +66,16 @@ const EMPTY_DIRS: [&str; 3] = ["hooks", "config", "home"];
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum PodmanError {
-    /// A configured binary or a helper failed the ownership checks or was not found.
+    /// A configured podman, the runtime or a helper failed its checks, or a `--version` probe
+    /// failed.
     #[error(transparent)]
     Binary(#[from] ConfigError),
     /// The podman the system search found failed the root-owned checks (R1, architect Q124).
     #[error("{0}; sandbox.podman_path can name another podman")]
     System(ConfigError),
+    /// The system search found no podman.
+    #[error("podman: not found in any of {0:?}; sandbox.podman_path can name a podman elsewhere")]
+    NoSystemPodman(Vec<PathBuf>),
     /// A binary podman needs was not found in any of its candidates.
     #[error("{0}: not found in any of {1:?}")]
     Missing(&'static str, Vec<PathBuf>),
@@ -235,6 +239,8 @@ impl Podman {
         state: &Path,
         host: &PodmanHost,
     ) -> Result<Self, PodmanError> {
+        // Root-only even beside a configured user-owned podman (architect Q127): `first_root_owned`
+        // is the one helper search, unit-tested in `binaries_tests.rs`.
         let bins = ConfBinaries {
             runtime: runtime.path().to_owned(),
             init: first_root_owned(INIT_FIELD, &candidates(&INIT_CANDIDATES))?,
@@ -250,8 +256,8 @@ impl Podman {
         replace_0600(state, "containers.conf", text.as_bytes())?;
         replace_0600(state, "mounts.conf", b"")?;
         let p = Self {
-            bin: podman.path,
-            source: podman.source,
+            bin: podman.path().to_owned(),
+            source: podman.source(),
             env: Self::env(host, state),
             state: state.to_owned(),
             conf_text: text,

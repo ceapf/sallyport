@@ -30,6 +30,13 @@ impl Scratch {
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         p
     }
+
+    /// A dangling symlink in this private directory.
+    fn dangling(&self, name: &str) -> PathBuf {
+        let link = self.0.join(name);
+        std::os::unix::fs::symlink(self.0.join("gone"), &link).unwrap();
+        link
+    }
 }
 
 impl Drop for Scratch {
@@ -41,6 +48,8 @@ impl Drop for Scratch {
 fn paths(p: &[&str]) -> Vec<PathBuf> {
     p.iter().map(PathBuf::from).collect()
 }
+
+const HINT: &str = "sandbox.podman_path can name another podman";
 
 /// Architect Q123: the system list is `PODMAN_PATH_VAR`'s directories in its order, and
 /// nothing else (no `/usr/local/bin`, never `sallyd`'s `PATH`).
@@ -57,80 +66,111 @@ fn the_system_candidates_are_the_podman_path_directories_in_order() {
     );
 }
 
-/// Architect Q124: the first candidate that exists is checked as root-owned; one the user owns
-/// is refused naming the check, and the root-owned one after it is never tried.
+/// Architect Q124: the system search checks its first existing candidate as root-owned; one
+/// the user owns is refused naming the check and the setting, and the root-owned one after it
+/// is never tried.
 #[test]
-fn a_user_owned_first_candidate_is_refused_without_fall_through() {
-    let s = Scratch::new("mine");
-    let mine = s.mine("podman");
-    let e = first_root_owned("t", &[mine, PathBuf::from("/bin/sh")]).unwrap_err();
-    assert!(matches!(e, PodmanError::Binary(_)), "{e}");
+fn the_system_search_refuses_a_user_owned_first_candidate_without_fall_through() {
+    let s = Scratch::new("sys-mine");
+    let e = resolve_in(None, &[s.mine("podman"), PathBuf::from("/bin/sh")]).unwrap_err();
+    assert!(matches!(e, PodmanError::System(_)), "{e}");
     let msg = e.to_string();
-    assert!(msg.starts_with("t: "), "{msg}");
-    assert!(msg.ends_with(": is not owned by root"), "{msg}");
+    assert!(msg.starts_with("podman: "), "{msg}");
+    assert!(msg.contains(": is not owned by root; "), "{msg}");
+    assert!(msg.ends_with(HINT), "{msg}");
 }
 
 /// Architect Q123: a dangling link exists for the search (lstat): it is checked and refused,
 /// not skipped.
 #[test]
-fn a_dangling_link_is_checked_not_skipped() {
-    let s = Scratch::new("dangling");
-    let link = s.0.join("podman");
-    std::os::unix::fs::symlink(s.0.join("gone"), &link).unwrap();
-    let e = first_root_owned("t", &[link, PathBuf::from("/bin/sh")]).unwrap_err();
-    assert!(e.to_string().ends_with(": does not exist"), "{e}");
+fn the_system_search_checks_a_dangling_link_and_does_not_skip_it() {
+    let s = Scratch::new("sys-dangling");
+    let e = resolve_in(None, &[s.dangling("podman"), PathBuf::from("/bin/sh")]).unwrap_err();
+    assert!(matches!(e, PodmanError::System(_)), "{e}");
+    let msg = e.to_string();
+    assert!(msg.contains(": does not exist; "), "{msg}");
+    assert!(msg.ends_with(HINT), "{msg}");
 }
 
-/// Only "does not exist" moves the search on; any other stat error is an error.
+/// Absent candidates are skipped; the first root-owned one that exists is used, as `system`.
 #[test]
-fn a_stat_error_other_than_absence_stops_the_search() {
-    let e = first_root_owned("t", &paths(&["/bin/sh/podman", "/bin/sh"])).unwrap_err();
-    assert!(matches!(e, PodmanError::Io { .. }), "{e}");
-    assert!(e.to_string().starts_with("/bin/sh/podman: "), "{e}");
+fn the_system_search_skips_absent_candidates() {
+    let r = resolve_in(None, &paths(&["/nonexistent/podman", "/bin/sh"])).unwrap();
+    assert_eq!(r.source(), PodmanSource::System);
+    assert_eq!(r.path(), std::fs::canonicalize("/bin/sh").unwrap());
 }
 
+/// No candidate at all: the error lists them and points at the setting.
 #[test]
-fn missing_candidates_are_skipped_and_the_first_existing_one_is_used() {
-    let p = first_root_owned("t", &paths(&["/nonexistent/a", "/bin/sh", "/usr/bin/env"])).unwrap();
-    assert_eq!(p, std::fs::canonicalize("/bin/sh").unwrap());
-    let e = first_root_owned("t", &paths(&["/nonexistent/a", "/nonexistent/b"])).unwrap_err();
+fn no_system_podman_points_at_the_setting() {
+    let e = resolve_in(None, &paths(&["/nonexistent/a", "/nonexistent/b"])).unwrap_err();
     assert!(
-        matches!(e, PodmanError::Missing("t", ref l) if l.len() == 2),
+        matches!(e, PodmanError::NoSystemPodman(ref l) if l.len() == 2),
         "{e}"
     );
     assert_eq!(
         e.to_string(),
-        "t: not found in any of [\"/nonexistent/a\", \"/nonexistent/b\"]"
+        "podman: not found in any of [\"/nonexistent/a\", \"/nonexistent/b\"]; \
+         sandbox.podman_path can name a podman elsewhere"
     );
 }
 
-/// A configured podman may be the user's own (the runtime's rule); its errors name the setting.
+/// Only "does not exist" moves a search on; any other stat error is an error.
+#[test]
+fn a_stat_error_other_than_absence_stops_the_search() {
+    for e in [
+        first_root_owned("t", &paths(&["/bin/sh/podman", "/bin/sh"])).unwrap_err(),
+        resolve_in(None, &paths(&["/bin/sh/podman", "/bin/sh"])).unwrap_err(),
+    ] {
+        assert!(matches!(e, PodmanError::Io { .. }), "{e}");
+        assert!(e.to_string().starts_with("/bin/sh/podman: "), "{e}");
+    }
+}
+
+/// A helper search (conmon, catatonit) is root-only and never falls through either.
+#[test]
+fn a_helper_search_is_root_only_without_fall_through() {
+    let s = Scratch::new("helper");
+    let e = first_root_owned("t", &[s.mine("conmon"), PathBuf::from("/bin/sh")]).unwrap_err();
+    assert!(matches!(e, PodmanError::Binary(_)), "{e}");
+    let msg = e.to_string();
+    assert!(msg.starts_with("t: "), "{msg}");
+    assert!(msg.ends_with(": is not owned by root"), "{msg}");
+    let e = first_root_owned("t", &[s.dangling("x"), PathBuf::from("/bin/sh")]).unwrap_err();
+    assert!(e.to_string().ends_with(": does not exist"), "{e}");
+    let p = first_root_owned("t", &paths(&["/nonexistent/a", "/bin/sh", "/usr/bin/env"])).unwrap();
+    assert_eq!(p, std::fs::canonicalize("/bin/sh").unwrap());
+    let e = first_root_owned("t", &paths(&["/nonexistent/a"])).unwrap_err();
+    assert!(
+        matches!(e, PodmanError::Missing("t", ref l) if l.len() == 1),
+        "{e}"
+    );
+    assert_eq!(e.to_string(), "t: not found in any of [\"/nonexistent/a\"]");
+}
+
+/// A configured podman may be the user's own (the runtime's rule), the system list is not
+/// looked at, and its errors name the setting.
 #[test]
 fn a_configured_podman_may_be_user_owned_and_its_errors_name_the_setting() {
     let s = Scratch::new("configured");
     let mine = s.mine("podman");
-    let r = resolve_podman(Some(&mine)).unwrap();
-    assert_eq!(r.source, PodmanSource::Configured);
-    assert_eq!(r.path, std::fs::canonicalize(&mine).unwrap());
+    let r = resolve_in(Some(&mine), &paths(&["/nonexistent/podman"])).unwrap();
+    assert_eq!(r.source(), PodmanSource::Configured);
+    assert_eq!(r.path(), std::fs::canonicalize(&mine).unwrap());
+    assert_eq!(resolve_podman(Some(&mine)).unwrap(), r);
     let e = resolve_podman(Some(Path::new("/nonexistent/podman"))).unwrap_err();
     assert!(matches!(e, PodmanError::Binary(_)), "{e}");
     assert!(e.to_string().starts_with("sandbox.podman_path: "), "{e}");
 }
 
-/// A system podman is checked as root-owned, and a refusal says the setting can name another.
+/// The check of each source: system is root-only and its refusal points at the setting.
 #[test]
-fn a_system_podman_must_be_root_owned_and_its_refusal_points_at_the_setting() {
+fn each_source_is_checked_under_its_own_rule() {
     let s = Scratch::new("system");
     let mine = s.mine("podman");
     let e = check_podman(&mine, PodmanSource::System).unwrap_err();
     assert!(matches!(e, PodmanError::System(_)), "{e}");
-    let msg = e.to_string();
-    assert!(msg.starts_with("podman: "), "{msg}");
-    assert!(msg.contains(": is not owned by root"), "{msg}");
-    assert!(
-        msg.ends_with("sandbox.podman_path can name another podman"),
-        "{msg}"
-    );
+    assert!(e.to_string().ends_with(HINT), "{e}");
     assert!(check_podman(&mine, PodmanSource::Configured).is_ok());
     assert!(check_podman(Path::new("/bin/sh"), PodmanSource::System).is_ok());
 }
@@ -157,17 +197,20 @@ fn a_configured_podman_outside_the_system_rule_is_named() {
     );
     assert_eq!(outside_reason(true, true), None);
     let s = Scratch::new("outside");
+    let sh = paths(&["/bin/sh"]);
     let mine = resolve_podman(Some(&s.mine("podman"))).unwrap();
-    assert_eq!(outside_system_rule(&mine), Some("not owned by root"));
-    let sh = ResolvedPodman {
-        path: std::fs::canonicalize("/bin/sh").unwrap(),
-        source: PodmanSource::Configured,
-    };
-    assert_eq!(outside_system_rule(&sh), Some("not in a system directory"));
-    let system = ResolvedPodman {
-        source: PodmanSource::System,
-        ..mine
-    };
+    assert_eq!(outside_in(&mine, &sh), Some("not owned by root"));
+    let configured_sh = resolve_podman(Some(Path::new("/bin/sh"))).unwrap();
+    assert_eq!(outside_in(&configured_sh, &sh), None);
+    assert_eq!(
+        outside_in(
+            &configured_sh,
+            &paths(&["/nonexistent/podman", "/usr/bin/env"])
+        ),
+        Some("not in a system directory")
+    );
+    let system = resolve_in(None, &sh).unwrap();
+    assert_eq!(outside_in(&system, &[]), None);
     assert_eq!(outside_system_rule(&system), None);
 }
 
@@ -205,27 +248,39 @@ fn a_version_line_is_parsed_strictly() {
         b"x podman version 4.9.3\n",
     ] {
         let e = parse_version("podman", bad).unwrap_err();
-        assert!(e.contains("not \"podman version <version>\""), "{e}");
+        assert!(matches!(e, ProbeError::Format { .. }), "{e}");
+        assert!(
+            e.to_string().contains("not \"podman version <version>\""),
+            "{e}"
+        );
     }
     let over = "9".repeat(65);
     assert!(parse_version("p", format!("p version {over}").as_bytes()).is_err());
 }
 
-/// A refusal shows at most 80 characters of what was printed.
+/// A refusal shows at most 80 characters of what was printed, escaped.
 #[test]
-fn a_bad_version_line_is_shown_cut() {
+fn a_bad_version_line_is_shown_cut_and_escaped() {
     let long = format!("x{}", "y".repeat(500));
-    let e = parse_version("podman", long.as_bytes()).unwrap_err();
+    let e = parse_version("podman", long.as_bytes())
+        .unwrap_err()
+        .to_string();
     assert!(
         e.contains(&"y".repeat(79)) && !e.contains(&"y".repeat(80)),
         "{e}"
     );
+    let e = parse_version("podman", b"a\x1b[2Jb\"c")
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains(r#""a\u{1b}[2Jb\"c""#), "{e}");
 }
 
+/// `/bin/sh -c script` with only the fixed `PATH`; `--version` becomes `$1`.
 fn sh(script: &str) -> tokio::process::Command {
     let mut c = tokio::process::Command::new("/bin/sh");
-    // `--version` is appended: it becomes `$1` of the script.
-    c.env_clear().args(["-c", script, "sh"]);
+    c.env_clear()
+        .env("PATH", PODMAN_PATH_VAR)
+        .args(["-c", script, "sh"]);
     c
 }
 
@@ -240,14 +295,21 @@ async fn a_probe_reads_the_version_and_refuses_failure_and_bad_output() {
     .await
     .unwrap();
     assert_eq!(ok, "4.9.3");
-    let e = probe_version(sh("echo podman version 1; exit 3"), "podman", t)
-        .await
-        .unwrap_err();
-    assert!(e.starts_with("--version failed: "), "{e}");
+    let e = probe_version(
+        sh("echo podman version 1; echo boom >&2; exit 3"),
+        "podman",
+        t,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(e, ProbeError::Failed { .. }), "{e}");
+    let msg = e.to_string();
+    assert!(msg.starts_with("--version failed: "), "{msg}");
+    assert!(msg.ends_with(": \"boom\\n\""), "{msg}");
     let e = probe_version(sh("echo hello"), "podman", t)
         .await
         .unwrap_err();
-    assert!(e.contains("\"hello\""), "{e}");
+    assert!(e.to_string().contains("\"hello\""), "{e}");
     let e = probe_version(
         tokio::process::Command::new("/nonexistent/podman"),
         "podman",
@@ -255,23 +317,47 @@ async fn a_probe_reads_the_version_and_refuses_failure_and_bad_output() {
     )
     .await
     .unwrap_err();
-    assert!(!e.is_empty());
+    assert!(matches!(e, ProbeError::Spawn(_)), "{e}");
 }
 
-/// A probe that never finishes is killed at the timeout and refused.
+/// Whether `pid` is gone or a zombie.
+fn ended(pid: &str) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => true,
+        Ok(stat) => stat
+            .rsplit_once(") ")
+            .is_some_and(|(_, rest)| rest.starts_with('Z')),
+    }
+}
+
+/// A probe that never finishes is refused at its timeout, and its whole process group is
+/// killed: the shell, and a child of it that holds the pipes.
 #[tokio::test]
-async fn a_probe_that_hangs_is_refused_at_its_timeout() {
-    let start = std::time::Instant::now();
-    let e = probe_version(sh("exec sleep 30"), "podman", Duration::from_millis(200))
+async fn a_probe_that_hangs_is_refused_and_its_process_group_killed() {
+    let s = Scratch::new("hang");
+    let pids = s.0.join("pids");
+    let p = pids.display().to_string();
+    assert!(!p.contains('\''), "single-quoted in the script");
+    let script = format!("sleep 30 & echo $$ $! >'{p}'; wait");
+    let e = probe_version(sh(&script), "podman", Duration::from_millis(1000))
         .await
         .unwrap_err();
-    assert_eq!(e, "--version timed out after 200 ms");
-    assert!(start.elapsed() < Duration::from_secs(10));
+    assert!(matches!(e, ProbeError::Timeout(_)), "{e}");
+    assert_eq!(e.to_string(), "--version timed out after 1000 ms");
+    let text = std::fs::read_to_string(&pids).unwrap();
+    let ids: Vec<&str> = text.split_whitespace().collect();
+    assert_eq!(ids.len(), 2, "{text}");
+    let end = std::time::Instant::now() + Duration::from_secs(5);
+    while !ids.iter().all(|id| ended(id)) {
+        assert!(std::time::Instant::now() < end, "still running: {ids:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
-/// Output beyond the cap is drained, not kept: a huge first line is refused, never buffered.
+/// Output beyond the cap is drained, so a chatty binary cannot block on a full pipe; its long
+/// first line is refused.
 #[tokio::test]
-async fn a_probe_keeps_at_most_the_cap() {
+async fn a_probe_drains_output_beyond_the_cap() {
     let e = probe_version(
         sh("head -c 100000 /dev/zero | tr '\\0' 'a'"),
         "podman",
@@ -279,18 +365,26 @@ async fn a_probe_keeps_at_most_the_cap() {
     )
     .await
     .unwrap_err();
-    assert!(e.contains("not \"podman version <version>\""), "{e}");
+    assert!(matches!(e, ProbeError::Format { .. }), "{e}");
 }
 
 #[test]
-fn the_probe_bounds_are_five_seconds_and_four_kib() {
+fn the_probe_bounds_are_five_seconds_four_kib_and_eighty_characters() {
     assert_eq!(VERSION_TIMEOUT, Duration::from_secs(5));
     assert_eq!(VERSION_CAP, 4096);
     assert_eq!(VERSION_TOKEN_MAX, 64);
+    assert_eq!(SHOWN_MAX, 80);
 }
 
 #[test]
 fn a_version_error_names_the_field_and_path() {
-    let e = version_error(RUNTIME_FIELD, Path::new("/x/crun"), "boom".into());
-    assert_eq!(e.to_string(), "sandbox.runtime_path: /x/crun: boom");
+    let e = version_error(
+        sally_core::config::RUNTIME_PATH_FIELD,
+        Path::new("/x/crun"),
+        &ProbeError::Timeout(Duration::from_millis(5)),
+    );
+    assert_eq!(
+        e.to_string(),
+        "sandbox.runtime_path: /x/crun: --version timed out after 5 ms"
+    );
 }
