@@ -77,8 +77,11 @@ fn pieces(raw: &[u8], quote: bool) -> impl Iterator<Item = Piece> + '_ {
 /// (at most 3 bytes) and escaped whole, so the output does not depend on where chunks end; what
 /// is still carried at [`finish`](Self::finish) is escaped byte by byte.
 ///
-/// One per stream: a second stream needs its own. TODO(#130): pass readable non-ASCII text
-/// through on a terminal known to take it.
+/// One per stream: a second stream needs its own. Call [`finish`](Self::finish) at the end of
+/// the stream: an escaper dropped without it shows nothing of what it carries. Output that
+/// keeps `\n` can start a line that looks like the client's own, so a client that streams it
+/// sets sandbox lines apart. TODO(#130): pass readable non-ASCII text through on a terminal
+/// known to take it.
 #[derive(Debug, Default)]
 pub struct StreamEscaper {
     /// The start of a valid UTF-8 sequence the last chunk ended in (at most 3 bytes).
@@ -89,34 +92,33 @@ impl StreamEscaper {
     /// The escaped text of `chunk`, after what the last chunk left carried.
     #[must_use]
     pub fn push(&mut self, chunk: &[u8]) -> String {
-        let mut input = std::mem::take(&mut self.carry);
-        input.extend_from_slice(chunk);
+        let joined;
+        let input = if self.carry.is_empty() {
+            chunk
+        } else {
+            let mut j = std::mem::take(&mut self.carry);
+            j.extend_from_slice(chunk);
+            joined = j;
+            joined.as_slice()
+        };
         let mut out = String::with_capacity(input.len());
-        let mut rest = input.as_slice();
-        loop {
-            match std::str::from_utf8(rest) {
-                Ok(s) => {
-                    line_text(s, &mut out);
-                    return out;
-                }
-                Err(e) => {
-                    let (good, bad) = rest.split_at(e.valid_up_to());
-                    // `good` is valid UTF-8 by `valid_up_to`; were it not, it is shown bytewise.
-                    match std::str::from_utf8(good) {
-                        Ok(s) => line_text(s, &mut out),
-                        Err(_) => bytes_text(good, &mut out),
-                    }
-                    let Some(n) = e.error_len() else {
-                        // An incomplete sequence at the end: at most 3 bytes, carried.
-                        self.carry = bad.to_vec();
-                        return out;
-                    };
-                    let (broken, after) = bad.split_at(n.min(bad.len()));
-                    bytes_text(broken, &mut out);
-                    rest = after;
-                }
+        let mut parts = input.utf8_chunks().peekable();
+        while let Some(part) = parts.next() {
+            for c in part.valid().chars() {
+                line_char(c, &mut out);
+            }
+            let bad = part.invalid();
+            // Only the last part's invalid bytes can be a character cut by the chunk's end; a
+            // middle one is followed by more input, so it is broken, not cut.
+            let cut = parts.peek().is_none()
+                && std::str::from_utf8(bad).is_err_and(|e| e.error_len().is_none());
+            if cut {
+                self.carry = bad.to_vec();
+            } else {
+                bytes_text(bad, &mut out);
             }
         }
+        out
     }
 
     /// The escape of what is still carried; the stream is over.
@@ -134,16 +136,15 @@ impl StreamEscaper {
     }
 }
 
-fn line_text(s: &str, out: &mut String) {
-    for c in s.chars() {
-        if c == '\n' {
-            out.push('\n');
-        } else {
-            out.push_str(&char_text(c, false));
-        }
+fn line_char(c: char, out: &mut String) {
+    if c == '\n' {
+        out.push('\n');
+    } else {
+        push_char(c, false, out);
     }
 }
 
+// Writing to a `String` cannot fail, so the `write!` results are dropped.
 fn bytes_text(bytes: &[u8], out: &mut String) {
     for b in bytes {
         let _ = write!(out, "\\x{b:02x}");
@@ -151,12 +152,22 @@ fn bytes_text(bytes: &[u8], out: &mut String) {
 }
 
 fn char_text(c: char, quote: bool) -> String {
+    let mut out = String::new();
+    push_char(c, quote, &mut out);
+    out
+}
+
+fn push_char(c: char, quote: bool, out: &mut String) {
     match c {
-        '\\' => "\\\\".to_owned(),
-        '"' if quote => "\\x22".to_owned(),
-        ' '..='~' => c.to_string(),
-        '\0'..='\x7f' => format!("\\x{:02x}", u32::from(c)),
-        _ => format!("\\u{{{:x}}}", u32::from(c)),
+        '\\' => out.push_str("\\\\"),
+        '"' if quote => out.push_str("\\x22"),
+        ' '..='~' => out.push(c),
+        '\0'..='\x7f' => {
+            let _ = write!(out, "\\x{:02x}", u32::from(c));
+        }
+        _ => {
+            let _ = write!(out, "\\u{{{:x}}}", u32::from(c));
+        }
     }
 }
 
@@ -284,6 +295,22 @@ mod tests {
             prop_assert_eq!(streamed(&raw, &cuts), whole.clone());
             if !raw.contains(&b'\n') {
                 prop_assert_eq!(whole, escape(&raw), "the Q50 alphabet plus newline only");
+            }
+        }
+
+        /// Real characters, most of them several bytes, so cuts land inside them.
+        #[test]
+        fn characters_cut_anywhere_come_out_whole(
+            chars in proptest::collection::vec(any::<char>(), 0..48),
+            cuts in proptest::collection::vec(0usize..200, 0..8),
+        ) {
+            let raw: String = chars.into_iter().collect();
+            let mut cuts = cuts;
+            cuts.sort_unstable();
+            let whole = streamed(raw.as_bytes(), &[]);
+            prop_assert_eq!(streamed(raw.as_bytes(), &cuts), whole.clone());
+            if !raw.contains('\n') {
+                prop_assert_eq!(whole, escape(raw.as_bytes()));
             }
         }
 

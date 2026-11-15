@@ -641,8 +641,8 @@ actions that need no approval still run. It cannot be undone. There is no "allow
 session". With no client attached, every prompt is denied `no-approver`.
 
 **Output neutralization** (AMENDMENTS-01 §6.4; architect Q50, Q100). Untrusted text a client
-prints (model output, tool output, file names, sandbox output) is printable ASCII: it stays as
-it is, `\` becomes `\\`, every other ASCII byte (`\t`, `\r`, other controls, DEL) and every byte
+prints (model output, tool output, file names, sandbox output) is shown as printable ASCII:
+printable ASCII stays as it is, `\` becomes `\\`, every other ASCII byte (`\t`, `\r`, other controls, DEL) and every byte
 that is not valid UTF-8 becomes `\xNN`, and every other character becomes `\u{…}`, so no ESC,
 CSI, OSC (OSC 52, OSC 8), C1 control (raw `0x9b` or U+009B) or bidirectional control (U+202E)
 reaches a terminal (`sally_core::text::escape`; the CLI's one-line form is `clean::line`). Line
