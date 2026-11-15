@@ -11,6 +11,9 @@ use crate::rpc::mcp::ToolOutcome;
 
 const TWO: &str =
     "{\"tool_calls\":[{\"name\":\"echo\",\"arguments\":{}}]}\n{\"content\":\"bye\"}\n";
+/// Three turns: after two steps, one is left for a seat that is not gone to run.
+const THREE: &str = "{\"tool_calls\":[{\"name\":\"echo\",\"arguments\":{}}]}\n\
+    {\"tool_calls\":[{\"name\":\"echo\",\"arguments\":{}}]}\n{\"content\":\"bye\"}\n";
 
 /// Adds session `id`, declared driven over `script`; every call it makes answers `ran <name>`
 /// and is noted in the returned list. Its sink is the session's own log.
@@ -87,7 +90,7 @@ async fn a_drive_step_runs_one_scripted_turn_and_answers_with_it() {
 #[tokio::test]
 async fn rt_drv_06_a_second_connection_is_refused_and_a_closed_driver_leaves_the_seat_gone() {
     let f = fx("drive-seat");
-    let (own, _) = driven(&f, "s-1", TWO);
+    let (own, _) = driven(&f, "s-1", THREE);
     let mut first = f.connect();
     first.call("sessions.drive", json!({"id": "s-1"})).await;
     let r = f

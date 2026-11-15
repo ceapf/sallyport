@@ -176,8 +176,37 @@ fn rt_drv_02_an_approved_driven_call_runs_once() {
     });
 }
 
-/// A stop while a step waits on a prompt: the prompt is withdrawn, `session.stop` is the last
-/// entry of the session, and a later drive finds no session.
+/// `sessions.drive {id}` over a control socket on `r`'s registry; the reply's refusal reason.
+async fn drive_over_control(r: &Rx, id: &str) -> Value {
+    use sallyd::rpc::control::{Control, ControlParts};
+    let state = r.x.f.root.join("home/.local/share/sallyport");
+    let control = Arc::new(Control::new(ControlParts {
+        record: sallyd::rpc::record::Recorder::new(
+            r.sink.clone() as Arc<dyn AuditSink>,
+            String::new(),
+            AuditLevel::default(),
+        ),
+        sessions: Arc::clone(&r.reg),
+        hub: Arc::new(Hub::default()),
+        sessions_dir: Arc::new(sallyd::sandbox::open_sessions(&state).unwrap()),
+        env: Arc::new(r.x.f.env.clone()),
+        catalog: Arc::new(std::collections::BTreeSet::<String>::new()),
+    }));
+    let (client, server) = tokio::io::duplex(1 << 20);
+    let peer = sallyd::rpc::listen::Peer { uid: 1000, pid: 7 };
+    tokio::spawn(control.serve_stream(server, peer));
+    let (rd, mut wr) = tokio::io::split(client);
+    let req = json!({"jsonrpc": "2.0", "id": 1, "method": "sessions.drive", "params": {"id": id}});
+    wr.write_all(format!("{req}\n").as_bytes()).await.unwrap();
+    let mut line = String::new();
+    BufReader::new(rd).read_line(&mut line).await.unwrap();
+    let reply: Value = serde_json::from_str(&line).unwrap();
+    reply["error"]["data"]["reason"].clone()
+}
+
+/// A stop while a step waits on a prompt: the prompt is withdrawn, the step ends refused,
+/// `session.stop` is the session's last entry, a step on the same seat afterwards is refused and
+/// writes nothing, and a drive over the control socket finds no session.
 #[test]
 fn rt_drv_03_nothing_of_a_drive_follows_the_stop() {
     rt().block_on(async {
@@ -185,14 +214,14 @@ fn rt_drv_03_nothing_of_a_drive_follows_the_stop() {
         let r = registry_hub(Some(test_image()), Arc::clone(&hub));
         let mut watch = hub.watch();
         let (v, at) = manifest(&r, "drv03", "approve");
-        let s = r
-            .reg
-            .start_with(v, Some(script(SHELL_TOUCH)))
-            .await
-            .unwrap();
+        let three = format!("{SHELL_TOUCH}{SHELL_TOUCH}{{\"content\":\"bye\"}}\n");
+        let s = r.reg.start_with(v, Some(script(&three))).await.unwrap();
         let driver = r.reg.driver(&s.id).unwrap();
-        let seat = driver.claim().unwrap();
-        let step = tokio::spawn(async move { seat.step().await });
+        let seat = Arc::new(driver.claim().unwrap());
+        let step = tokio::spawn({
+            let seat = Arc::clone(&seat);
+            async move { seat.step().await }
+        });
         let note = tokio::time::timeout(Duration::from_secs(30), watch.rx.recv())
             .await
             .expect("no prompt")
@@ -204,10 +233,20 @@ fn rt_drv_03_nothing_of_a_drive_follows_the_stop() {
             r.reg.stop(&s.id, StopReason::Request).await,
             Some(StopOutcome::Stopped)
         );
-        let _ = step.await;
+        // The withdrawn prompt is the tool's own denial: a result, as a model would see it.
+        let Stepped::Step(first) = step.await.unwrap() else {
+            panic!("the waiting step was not answered")
+        };
+        assert_eq!((first.turn, first.calls.len()), (1, 1), "{first:?}");
+        assert_eq!(first.calls[0].result, "denied: withdrawn");
         let own = entries_of(&r, &s.id);
         let last = own.last().unwrap();
         assert!(last.contains("event: \"session.stop\""), "{own:#?}");
+        // The seat is still held here, outside the task: its next step is refused.
+        assert_eq!(seat.step().await, Stepped::Refused("session-stopping"));
+        assert_eq!(entries_of(&r, &s.id), own, "an entry followed the stop");
+        assert_eq!(drive_over_control(&r, &s.id).await, "unknown-session");
+        assert_eq!(entries_of(&r, &s.id), own, "an entry followed the stop");
         let all = r.x.events.all();
         let withdraw = all
             .iter()
@@ -217,8 +256,6 @@ fn rt_drv_03_nothing_of_a_drive_follows_the_stop() {
         assert!(withdraw < stop);
         assert!(!at.join("ran").exists(), "the withdrawn command ran");
         assert!(r.reg.driver(&s.id).is_none(), "the session is gone");
-        // A step on the seat taken earlier is refused: the operations are closed.
-        let late = driver.claim();
-        assert!(late.is_err(), "the seat was taken once");
+        assert!(driver.claim().is_err(), "the seat was taken once");
     });
 }
