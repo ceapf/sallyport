@@ -185,7 +185,8 @@ impl Launcher {
     }
 
     /// [`Self::stop_role`] for a launch nobody received, retried until the container is gone;
-    /// the first failure is audited as `sandbox.stop_failed`.
+    /// the first failure is audited as `sandbox.stop_failed`. TODO(#135): one loop with
+    /// [`Self::stop_unreceived`].
     pub(super) async fn stop_role_unreceived(&self, mut running: RoleRunning) {
         let mut reported = false;
         loop {

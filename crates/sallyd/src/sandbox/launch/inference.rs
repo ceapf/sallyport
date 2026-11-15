@@ -62,6 +62,7 @@ impl Launcher {
             &self.xdg_runtime_dir.join(crate::daemon::startup::STATE_DIR),
             &self.data_dir,
         );
+        // TODO(#135): refuse inside the spawned task, so a dropped caller cannot cut the entry.
         match paths {
             Ok(p) => self.spawn_role(Request::Inference(req, p)).await,
             Err(e) => {

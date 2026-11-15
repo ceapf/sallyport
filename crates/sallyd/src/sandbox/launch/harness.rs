@@ -80,6 +80,7 @@ impl Launcher {
         let prepared = Prepared {
             subject: Subject::Session(sid.clone()),
             level: req.manifest.manifest().audit.level,
+            // TODO(#135): one container-name function for every role.
             name: format!("sp-h-{}", sid.as_str()),
             launch_args: vec![("image", present.as_str().into())],
             image: present,

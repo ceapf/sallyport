@@ -19,7 +19,7 @@ use crate::sandbox::types::{Role, SessionId, VerifiedModel};
 pub(crate) enum Subject {
     /// A session (workspace, harness).
     Session(SessionId),
-    /// An inference instance.
+    /// An inference instance. TODO(#135): an `InstanceId` newtype.
     Instance(SessionId),
 }
 

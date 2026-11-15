@@ -107,6 +107,8 @@ pub enum LaunchError {
     /// The launch task of this session ended without a result (it panicked, or was cancelled at
     /// shutdown). The one launch error with no `sandbox.refuse` of its own: whoever reports it
     /// writes the entry (architect Q98).
+    /// TODO(#135): an inference launch's id is an instance's, not a session's; carry the
+    /// subject.
     #[error("the launch task ended without a result")]
     Lost(SessionId),
     /// The session's egress could not be set up: trust roots, session CA, CA files, or the
