@@ -57,6 +57,33 @@ pub enum Withdraw {
     SessionStop,
 }
 
+/// How a driven tool call ended ([`Agent::drive_call`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Driven {
+    /// The handler answered (its own denials are answers, `isError: true`).
+    Done(ToolOutcome),
+    /// Refused before the handler, with the `rpc.deny` reason.
+    Denied(&'static str),
+    /// An entry could not be written: nothing ran, or no answer exists.
+    Unrecorded,
+}
+
+/// Withdraws the prompt of a driven call whose caller went away before it ended.
+struct WithdrawOnDrop<T: ToolHandler> {
+    handler: Arc<T>,
+    call: u64,
+    armed: bool,
+}
+
+impl<T: ToolHandler> Drop for WithdrawOnDrop<T> {
+    fn drop(&mut self) {
+        if self.armed {
+            let (handler, call) = (Arc::clone(&self.handler), self.call);
+            tokio::spawn(async move { handler.withdraw(call, Withdraw::Closed).await });
+        }
+    }
+}
+
 /// Largest frame accepted (ARCHITECTURE §4: 256 KiB on the session socket).
 pub const MAX_FRAME: usize = 256 * 1024;
 /// `tools/call` requests running at once per session (architect Q8).
@@ -215,6 +242,70 @@ impl<T: ToolHandler> Agent<T> {
         drop(out);
         while tasks.join_next().await.is_some() {}
         let _ = writer.await;
+    }
+
+    /// One tool call of a driven session (architect ruling Q117): the transport-free front half
+    /// of [`dispatch`](Self::dispatch), so a driven call meets the same classifier, in-flight
+    /// slot, `rpc.request` entry and handler as the harness's. Nothing here comes from a peer:
+    /// the caller is the session's drive step, which got `name` and `arguments` from the script.
+    ///
+    /// The call runs in a task of its own; dropping this future (the driver went away) does not
+    /// drop the call: it runs to its end with its entries, and a prompt it waits on is withdrawn
+    /// ([`Withdraw::Closed`]), as for a closed `agent.sock` connection.
+    pub async fn drive_call(&self, name: String, arguments: Map<String, Value>) -> Driven {
+        let mut params = Map::new();
+        params.insert("name".into(), Value::from(name));
+        params.insert("arguments".into(), Value::Object(arguments));
+        let (era, name, arguments) = match mcp::classify("tools/call", &params, true) {
+            Ok((era, Call::ToolsCall { name, arguments })) => (era, name, arguments),
+            Ok(_) => return Driven::Denied("method-not-found"),
+            Err(r) => {
+                return if self.deny(None, Some("tools/call"), r.reason()).await {
+                    Driven::Denied(r.reason())
+                } else {
+                    Driven::Unrecorded
+                };
+            }
+        };
+        let Ok(slot) = Arc::clone(&self.in_flight).try_acquire_owned() else {
+            return if self
+                .deny(None, Some("tools/call"), "too-many-in-flight")
+                .await
+            {
+                Driven::Denied("too-many-in-flight")
+            } else {
+                Driven::Unrecorded
+            };
+        };
+        let id = Id::Str("drive".into());
+        let entry = self
+            .record
+            .entry(Actor::Harness, "rpc.request", Some("allow"))
+            .args(call_args(&id, era, &name, &arguments));
+        if !self.record.append(entry).await {
+            return Driven::Unrecorded;
+        }
+        let call = self.handler.begin();
+        let handler = Arc::clone(&self.handler);
+        let task = tokio::spawn({
+            let handler = Arc::clone(&handler);
+            async move {
+                let outcome = handler.call(call, name, arguments).await;
+                drop(slot);
+                outcome
+            }
+        });
+        let mut away = WithdrawOnDrop {
+            handler,
+            call,
+            armed: true,
+        };
+        let outcome = task.await;
+        away.armed = false;
+        match outcome {
+            Ok(Some(o)) => Driven::Done(o),
+            Ok(None) | Err(_) => Driven::Unrecorded,
+        }
     }
 
     /// Waits until the session's rate allows another frame.

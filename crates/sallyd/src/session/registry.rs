@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use sally_core::audit::{Actor, AuditError, NewEntry};
 use sally_core::manifest::{AuditLevel, ValidatedManifest};
+use sally_proto::{ModelKind, SessionModel};
 use serde_json::json;
 use tokio::sync::RwLock;
 use tokio::sync::{mpsc, oneshot};
@@ -35,8 +36,10 @@ use crate::approvals::policy::Policy;
 use crate::approvals::queue::{self, Approver, Desk, Limits};
 use crate::daemon::crash::CrashReporter;
 use crate::egress::net::bind;
+use crate::llm::scripted::Script;
 use crate::oplog::Oplog;
 use crate::rpc::agent::Agent;
+use crate::rpc::drive::{CallFn, Driver};
 use crate::rpc::record::Recorder;
 use crate::sandbox::{
     ArgvError, AuditSink, ImageRef, LaunchError, Launcher, Podman, Running, SessionPaths, UserIds,
@@ -104,6 +107,8 @@ pub struct SessionInfo {
     pub container: String,
     /// Where it is.
     pub state: SessionState,
+    /// Its model.
+    pub model: SessionModel,
 }
 
 /// Why a session did not start.
@@ -156,6 +161,8 @@ pub(super) struct Live {
     /// `None` for a workspace whose session never started.
     desk: Option<Desk>,
     crash: Option<CrashReporter>,
+    /// The drive handle of a driven session (architect Q117).
+    driver: Option<Arc<Driver>>,
     requests: mpsc::Sender<Request>,
 }
 
@@ -211,6 +218,12 @@ impl Registry {
         self.live().get(id).and_then(|l| l.desk.clone())
     }
 
+    /// The drive handle of session `id`: only a session declared driven at start has one.
+    #[must_use]
+    pub fn driver(&self, id: &str) -> Option<Arc<Driver>> {
+        self.live().get(id).and_then(|l| l.driver.clone())
+    }
+
     /// The crash reporter of session `id`, for a session task started after the session (the
     /// `llm.sock` listener): a panic it reports ends the session `crash`.
     #[must_use]
@@ -236,17 +249,33 @@ impl Registry {
         self: &Arc<Self>,
         manifest: Arc<ValidatedManifest>,
     ) -> Result<SessionInfo, StartError> {
+        self.start_with(manifest, None).await
+    }
+
+    /// [`start`](Self::start), declared driven when there is a `script` (architect Q119).
+    ///
+    /// # Errors
+    /// [`StartError`], as for [`start`](Self::start).
+    pub async fn start_with(
+        self: &Arc<Self>,
+        manifest: Arc<ValidatedManifest>,
+        script: Option<Script>,
+    ) -> Result<SessionInfo, StartError> {
         let this = Arc::clone(self);
         let (tx, rx) = oneshot::channel();
         self.p.crash.spawn("session", async move {
-            let _ = tx.send(this.start_owned(manifest).await);
+            let _ = tx.send(this.start_owned(manifest, script).await);
         });
         rx.await.map_err(StartError::Task)?
     }
 
+    /// `script`: the session is declared driven (architect Q119): it serves no socket of the
+    /// harness's, its recorder writes the harness's entries as the driver's, and a
+    /// [`Driver`] answers `sessions.drive`.
     async fn start_owned(
         self: Arc<Self>,
         manifest: Arc<ValidatedManifest>,
+        script: Option<Script>,
     ) -> Result<SessionInfo, StartError> {
         let _start = self.starts.read().await;
         if self.closing.load(Ordering::SeqCst) {
@@ -281,14 +310,20 @@ impl Registry {
         // TODO(#28): the `llm.sock` server (PR C) takes a clone of it.
         let record = Recorder::new(Arc::clone(&self.p.audit), sid.clone(), level)
             .logging(self.p.oplog.clone());
+        let record = if script.is_some() {
+            record.driven()
+        } else {
+            record
+        };
         let (agent, desk) = self.agent(&manifest, &running, &record, &ops, &crash);
+        let model = model_of(script.as_ref());
         let start = NewEntry::new(Actor::Sallyd, "session.start")
             .session(&sid)
             .decision("allow")
             .args(json!({
                 "manifest": v.name,
                 "container": running.name(),
-                "model": {"kind": "none"},
+                "model": json!(model),
             }));
         if let Err(e) = self.audit(start, level).await {
             self.p
@@ -304,19 +339,26 @@ impl Registry {
             return Err(e);
         }
         let sock = running.paths().harness_sockets().join(AGENT_SOCK);
-        let (handle, first, failed) = match bind(&sock) {
-            Ok(l) => (
-                Some(agent.listen(l, self.p.ids.uid, crash.clone())),
-                None,
-                None,
-            ),
-            Err(e) => (None, Some(StopReason::StartFailed), Some(e)),
+        // A driven session binds nothing: the harness has no socket to reach it by (Q119).
+        let driver = script.map(|s| driver_of(s, &agent, &record, &ops));
+        let (handle, first, failed) = if driver.is_some() {
+            (None, None, None)
+        } else {
+            match bind(&sock) {
+                Ok(l) => (
+                    Some(agent.listen(l, self.p.ids.uid, crash.clone())),
+                    None,
+                    None,
+                ),
+                Err(e) => (None, Some(StopReason::StartFailed), Some(e)),
+            }
         };
         let info = SessionInfo {
             id: sid.clone(),
             manifest: v.name.clone(),
             container: running.name().to_owned(),
             state: SessionState::Running,
+            model,
         };
         let (tx, rx) = mpsc::channel(REQUESTS);
         self.live().insert(
@@ -325,6 +367,7 @@ impl Registry {
                 info: info.clone(),
                 desk: Some(desk.clone()),
                 crash: Some(crash.clone()),
+                driver,
                 requests: tx.clone(),
             },
         );
@@ -426,9 +469,11 @@ impl Registry {
                     manifest: manifest.to_owned(),
                     container: r.name().to_owned(),
                     state: SessionState::StopFailed,
+                    model: SessionModel::none(),
                 },
                 desk: None,
                 crash: None,
+                driver: None,
                 requests: tx,
             },
         );
@@ -534,16 +579,47 @@ impl crate::rpc::control_methods::SessionSet for Arc<Registry> {
         Registry::desk(self, id)
     }
 
+    fn driver(&self, id: &str) -> Option<Arc<Driver>> {
+        Registry::driver(self, id)
+    }
+
     fn start(
         &self,
         manifest: Arc<ValidatedManifest>,
+        script: Option<Script>,
     ) -> impl std::future::Future<Output = Result<SessionInfo, StartError>> + Send {
-        Registry::start(self, manifest)
+        Registry::start_with(self, manifest, script)
     }
 
     fn stop(&self, id: &str) -> impl std::future::Future<Output = Option<StopOutcome>> + Send {
         Registry::stop(self, id, StopReason::Request)
     }
+}
+
+/// The model a session is started with, as listed and as `session.start` records it.
+fn model_of(script: Option<&Script>) -> SessionModel {
+    script.map_or_else(SessionModel::none, |s| SessionModel {
+        kind: ModelKind::Scripted,
+        driven: true,
+        sha256: Some(s.sha256.clone()),
+        turns: u32::try_from(s.turns.len()).ok(),
+    })
+}
+
+/// The drive handle of a driven session: its tool calls go to the session's own agent server,
+/// the one gate the harness's calls meet (architect Q117).
+fn driver_of(
+    script: Script,
+    agent: &Arc<Agent<Gated<Tools<PodmanExec>>>>,
+    record: &Recorder,
+    ops: &Ops,
+) -> Arc<Driver> {
+    let agent = Arc::clone(agent);
+    let call: CallFn = Box::new(move |name, arguments| {
+        let agent = Arc::clone(&agent);
+        Box::pin(async move { agent.drive_call(name, arguments).await })
+    });
+    Driver::build(script.turns, call, record.clone(), ops.clone())
 }
 
 /// What a stop of `id` answers when no supervisor took or answered the request. A supervisor
@@ -573,9 +649,11 @@ mod tests {
                     manifest: "m".into(),
                     container: "c".into(),
                     state: SessionState::Running,
+                    model: SessionModel::none(),
                 },
                 desk: None,
                 crash: None,
+                driver: None,
                 requests,
             },
         )]);

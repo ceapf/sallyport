@@ -26,6 +26,8 @@ pub mod method {
     pub const SESSIONS_STOP: &str = "sessions.stop";
     /// A session's staged changes, live or stopped.
     pub const SESSIONS_CHANGES: &str = "sessions.changes";
+    /// Run the next scripted turn of a driven session.
+    pub const SESSIONS_DRIVE: &str = "sessions.drive";
     /// The prompts waiting for an answer.
     pub const APPROVALS_LIST: &str = "approvals.list";
     /// Answer one prompt.
@@ -33,11 +35,12 @@ pub mod method {
     /// Attach this connection as an approver.
     pub const APPROVALS_WATCH: &str = "approvals.watch";
     /// Every method, in the order above.
-    pub const ALL: [&str; 7] = [
+    pub const ALL: [&str; 8] = [
         SESSIONS_CREATE,
         SESSIONS_LIST,
         SESSIONS_STOP,
         SESSIONS_CHANGES,
+        SESSIONS_DRIVE,
         APPROVALS_LIST,
         APPROVALS_DECIDE,
         APPROVALS_WATCH,
@@ -60,6 +63,99 @@ pub mod notification {
 pub struct CreateParams {
     /// The manifest's YAML text (its host paths are absolute or `~`-prefixed).
     pub manifest: String,
+    /// The session's model; absent means none (architect Q119).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelParams>,
+}
+
+/// The kinds of model a session can have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelKind {
+    /// No model.
+    None,
+    /// A script of turns, answered by `sallyd` (data, never code).
+    Scripted,
+}
+
+/// A session's requested model (architect Q119): strict, `driven` required.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelParams {
+    /// Only [`ModelKind::Scripted`] is accepted.
+    pub kind: ModelKind,
+    /// The script's JSON Lines text (at most 256 KiB).
+    pub script: String,
+    /// Declared driven: the host drives the session and no harness socket is served.
+    pub driven: bool,
+}
+
+/// A session's model as `sessions.list` shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionModel {
+    /// The kind.
+    pub kind: ModelKind,
+    /// Whether the session is driven.
+    pub driven: bool,
+    /// The script's SHA-256 (hex), for a scripted model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// The script's turns, for a scripted model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turns: Option<u32>,
+}
+
+impl SessionModel {
+    /// The model of a session without one.
+    #[must_use]
+    pub fn none() -> Self {
+        Self {
+            kind: ModelKind::None,
+            driven: false,
+            sha256: None,
+            turns: None,
+        }
+    }
+}
+
+/// What a drive step's turn was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnKind {
+    /// An assistant message.
+    Content,
+    /// Tool calls, made in order.
+    ToolCalls,
+    /// The scripted backend failure.
+    Fail,
+    /// The script has no turn left.
+    End,
+}
+
+/// One tool call a drive step made.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepCall {
+    /// The tool name, escaped by `sallyd`.
+    pub name: String,
+    /// The result text, escaped and cut by `sallyd`.
+    pub result: String,
+}
+
+/// `sessions.drive` result: one scripted turn (architect Q117). Text arrives escaped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Step {
+    /// The turn's 1-based number; 0 once the script has ended.
+    pub turn: u32,
+    /// What it was.
+    pub kind: TurnKind,
+    /// The assistant message of a content turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// The calls of a tool-call turn, with their results.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<StepCall>,
+    /// No turn is left after this one.
+    pub done: bool,
 }
 
 /// `sessions.stop` and `sessions.changes` params.
@@ -123,6 +219,8 @@ pub struct Session {
     pub container: String,
     /// Where it is.
     pub state: SessionState,
+    /// Its model.
+    pub model: SessionModel,
 }
 
 /// `sessions.list` result.
@@ -272,6 +370,7 @@ mod tests {
             manifest: "m".into(),
             container: "sp-w-s1".into(),
             state: SessionState::StopFailed,
+            model: SessionModel::none(),
         };
         assert_eq!(to_value(&s).unwrap()["state"], "stop-failed");
         let c = Change {
@@ -352,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn the_method_list_is_the_seven_names() {
+    fn the_method_list_is_the_eight_names() {
         assert_eq!(
             method::ALL,
             [
@@ -360,10 +459,76 @@ mod tests {
                 "sessions.list",
                 "sessions.stop",
                 "sessions.changes",
+                "sessions.drive",
                 "approvals.list",
                 "approvals.decide",
                 "approvals.watch",
             ]
         );
+    }
+
+    #[test]
+    fn create_params_carry_a_strict_optional_model() {
+        let bare: CreateParams = from_value(json!({"manifest": "x"})).unwrap();
+        assert_eq!(bare.model, None);
+        assert!(to_value(&bare).unwrap().get("model").is_none());
+        let m: CreateParams = from_value(
+            json!({"manifest": "x", "model": {"kind": "scripted", "script": "s", "driven": true}}),
+        )
+        .unwrap();
+        assert_eq!(
+            m.model,
+            Some(ModelParams {
+                kind: ModelKind::Scripted,
+                script: "s".into(),
+                driven: true,
+            })
+        );
+        for bad in [
+            json!({"kind": "scripted", "script": "s"}),
+            json!({"kind": "scripted", "script": "s", "driven": true, "x": 1}),
+            json!({"kind": "llama", "script": "s", "driven": true}),
+        ] {
+            assert!(from_value::<CreateParams>(json!({"manifest": "x", "model": bad})).is_err());
+        }
+    }
+
+    #[test]
+    fn the_session_names_its_model() {
+        let none = SessionModel::none();
+        assert_eq!(
+            to_value(&none).unwrap(),
+            json!({"kind": "none", "driven": false})
+        );
+        let s = SessionModel {
+            kind: ModelKind::Scripted,
+            driven: true,
+            sha256: Some("ab".into()),
+            turns: Some(3),
+        };
+        assert_eq!(
+            to_value(&s).unwrap(),
+            json!({"kind": "scripted", "driven": true, "sha256": "ab", "turns": 3})
+        );
+    }
+
+    #[test]
+    fn a_drive_step_in_wire_form() {
+        let step = Step {
+            turn: 2,
+            kind: TurnKind::ToolCalls,
+            content: None,
+            calls: vec![StepCall {
+                name: "fs.read".into(),
+                result: "ok".into(),
+            }],
+            done: false,
+        };
+        assert_eq!(
+            to_value(&step).unwrap(),
+            json!({"turn": 2, "kind": "tool_calls", "calls": [{"name": "fs.read", "result": "ok"}],
+                   "done": false})
+        );
+        assert!(from_value::<SessionParams>(json!({"id": "a"})).is_ok());
     }
 }

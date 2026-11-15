@@ -31,6 +31,7 @@ use super::agent::{WRITE_TIMEOUT, error_object, failure, line, success};
 use super::control_methods::{
     Call, Done, NotAdmitted, READ_BURST, READ_RATE, REFUSED, SessionSet, prompt, value,
 };
+use super::drive::{Driver, Seat};
 use super::frame::{self, Frame};
 use super::listen::{self, Peer, Server, until_true};
 use super::message::{self, INVALID_PARAMS, INVALID_REQUEST, Id, METHOD_NOT_FOUND, Message};
@@ -77,6 +78,27 @@ pub(crate) struct Conn {
     pub(crate) client: Client,
     /// Attached by `approvals.watch`; dropped with the connection.
     pub(crate) watch: Option<Watch>,
+    /// The drive seats this connection holds, one per driven session; dropped with the
+    /// connection, which makes each seat gone (architect Q121). A connection with a seat is
+    /// never an approver.
+    pub(crate) seats: Vec<Seat>,
+}
+
+impl Conn {
+    /// Whether this connection holds a drive seat.
+    pub(crate) fn drives(&self) -> bool {
+        !self.seats.is_empty()
+    }
+
+    /// Whether it holds the seat of `driver`.
+    pub(crate) fn holds(&self, driver: &Arc<Driver>) -> bool {
+        self.seat_of(driver).is_some()
+    }
+
+    /// Its seat of `driver`.
+    pub(crate) fn seat_of(&self, driver: &Arc<Driver>) -> Option<&Seat> {
+        self.seats.iter().find(|s| s.is_of(driver))
+    }
 }
 
 impl<S: SessionSet> Control<S> {
@@ -117,6 +139,7 @@ impl<S: SessionSet> Control<S> {
                 pid: peer.pid,
             },
             watch: None,
+            seats: Vec::new(),
         };
         loop {
             // One read per frame, kept across notifications: it is not cancel-safe.
