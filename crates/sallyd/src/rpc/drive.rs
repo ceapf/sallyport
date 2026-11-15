@@ -74,8 +74,8 @@ enum SeatState {
 pub enum Stepped {
     /// The turn ran; this is its reply.
     Step(Step),
-    /// Refused with this reason (`session-stopping`): the session stopped before the step, and
-    /// nothing was written, or under one of its calls, after its `drive.turn`.
+    /// Refused with this reason (`session-stopping`): the session stopped either before the
+    /// step (nothing was written) or during one of its calls (after its `drive.turn`).
     Refused(&'static str),
     /// An entry could not be written: close the connection, send no reply.
     Close,

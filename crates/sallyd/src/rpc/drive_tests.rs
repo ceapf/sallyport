@@ -121,7 +121,7 @@ async fn the_last_tool_turn_is_done() {
 
 #[tokio::test]
 async fn a_refused_call_ends_the_step_and_a_tools_own_denial_does_not() {
-    let (d, ..) = driver_with(
+    let (d, _, seen, _) = driver_with(
         vec![
             Turn::ToolCalls(vec![call("a"), call("b"), call("c")]),
             Turn::Fail,
@@ -135,13 +135,21 @@ async fn a_refused_call_ends_the_step_and_a_tools_own_denial_does_not() {
             _ => ok("never"),
         },
     );
-    let Stepped::Step(s) = d.claim().unwrap().step().await else {
+    let seat = d.claim().unwrap();
+    let Stepped::Step(s) = seat.step().await else {
         panic!()
     };
     assert_eq!(s.calls.len(), 2);
     assert_eq!(s.calls[0].result, "denied: not_granted");
     assert_eq!(s.calls[1].result, "denied: bad-params");
     assert!(s.done);
+    // A refusal ends the step, not the script: the next drive runs the next turn, and the
+    // refused turn's later call never runs.
+    let Stepped::Step(next) = seat.step().await else {
+        panic!()
+    };
+    assert_eq!((next.turn, next.kind), (2, TurnKind::Fail));
+    assert!(!seen.lock().unwrap().iter().any(|c| c.starts_with("c ")));
 }
 
 #[tokio::test]

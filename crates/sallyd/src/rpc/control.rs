@@ -325,8 +325,10 @@ async fn next_note(watch: &mut Option<Watch>) -> Option<Note> {
     }
 }
 
-/// Returns when `reader`'s peer closed (end of stream, or a read error); never while bytes wait
-/// unread: those are a next request, kept in the buffer for it. Cancel-safe (`fill_buf`).
+/// Returns when `reader`'s peer closed (end of stream, a half-close included, or a read error);
+/// never while bytes wait unread: those are a next request, kept in the buffer for it, and a
+/// close behind them is seen at the next frame's read (a prompt the step waits on meanwhile
+/// ends at its timeout, a deny). Cancel-safe (`fill_buf`).
 async fn closed<R: AsyncBufRead + Unpin>(reader: &mut R) {
     match reader.fill_buf().await {
         Ok([]) | Err(_) => {}

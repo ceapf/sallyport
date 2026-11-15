@@ -172,9 +172,10 @@ fn held(
     (began, release, dropped)
 }
 
-/// A driver that closes while its step waits (on a prompt, say) drops the step at once, so the
-/// call's prompt is withdrawn ([`Withdraw::Closed`] in `Agent::drive_call`), and the seat is
-/// gone; it is not left held by a connection nobody reads.
+/// A driver that closes while its step waits (on a prompt, say) drops the step at once, and the
+/// seat is gone; it is not left held by a connection nobody reads. That a dropped driven call
+/// withdraws its prompt is `agent_tests.rs`'s
+/// `a_dropped_driven_call_runs_to_its_end_and_its_prompt_is_withdrawn`.
 #[tokio::test]
 async fn a_driver_that_closes_mid_step_drops_the_step_and_leaves_the_seat_gone() {
     let f = fx("drive-away");
@@ -192,6 +193,37 @@ async fn a_driver_that_closes_mid_step_drops_the_step_and_leaves_the_seat_gone()
     assert!(
         dropped.load(std::sync::atomic::Ordering::SeqCst),
         "the step was kept"
+    );
+    let r = f
+        .connect()
+        .call("sessions.drive", json!({"id": "s-1"}))
+        .await;
+    assert_eq!(reason(&r), "driver-gone");
+}
+
+/// A driver that shuts its write side after the drive is a closed driver: the step is dropped
+/// unanswered and the seat is gone (architect ruling on the H1 fix: half-close fails closed).
+#[tokio::test]
+async fn a_driver_that_half_closes_mid_step_is_a_closed_driver() {
+    let f = fx("drive-half");
+    let (began, _release, dropped) = held(&f, "s-1");
+    let mut seat = f.connect();
+    seat.send("sessions.drive", json!({"id": "s-1"})).await;
+    began.notified().await;
+    seat.w.shutdown().await.unwrap();
+    for _ in 0..200 {
+        if dropped.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        dropped.load(std::sync::atomic::Ordering::SeqCst),
+        "the step was kept"
+    );
+    assert!(
+        seat.frame().await.is_none(),
+        "a closed driver gets no reply"
     );
     let r = f
         .connect()
@@ -257,6 +289,36 @@ async fn a_seat_of_a_stopped_session_is_let_go() {
     assert!(r.get("error").is_none(), "{r}");
     assert_eq!(f.hub.count(), 1);
     assert_eq!(own.events(), ["drive.turn"], "nothing after the stop");
+}
+
+/// A stopping session refuses every drive `session-stopping`, also one from a connection
+/// without its seat while another still holds it (not `driver-busy`).
+#[tokio::test]
+async fn a_stopping_session_refuses_a_drive_from_any_connection() {
+    let f = fx("drive-stopping");
+    f.fake.live.lock().unwrap().push((info("s-1"), None));
+    let (own, rec) = recorder("s-1");
+    let ops = crate::tools::ops::Ops::new();
+    let call: CallFn = Box::new(|_, _| {
+        Box::pin(async {
+            Driven::Done(ToolOutcome {
+                is_error: false,
+                text: "ran".into(),
+            })
+        })
+    });
+    let turns = Script::parse(THREE).unwrap().turns;
+    let d = Driver::build(turns, call, rec.driven(), ops.clone());
+    f.fake.drivers.lock().unwrap().insert("s-1".into(), d);
+    let mut holder = f.connect();
+    holder.call("sessions.drive", json!({"id": "s-1"})).await;
+    ops.close();
+    let r = f
+        .connect()
+        .call("sessions.drive", json!({"id": "s-1"}))
+        .await;
+    assert_eq!(reason(&r), "session-stopping");
+    assert_eq!(own.events(), ["drive.turn"]);
 }
 
 #[tokio::test]

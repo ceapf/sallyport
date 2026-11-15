@@ -577,7 +577,9 @@ request is `-32000` with `data`
   `turn`, `kind`, `content`, `calls: [{name, result}]`, `done`) carries texts escaped and cut
   by `sallyd` at named caps; `done` marks the end of the script, a message or a failure (a
   driven script ends at its first message or failure: `sessions.create` refuses a turn after
-  one, `script-invalid`), or a call the classifier refused. Every
+  one, `script-invalid`), or a call the classifier refused (that ends the step, not the script:
+  the next `sessions.drive` runs the next turn, and the refused turn's later calls never run).
+  Every
   entry that would be the harness's is written as actor `driver` (the recorder's origin is
   fixed where the registry picks the transport; nothing in a request, a script or a flag can
   choose it), so a driven session's log holds no `harness` entry; entries whose actor is
@@ -594,11 +596,17 @@ request is `-32000` with `data`
   prompt stays pending; `approval.decide` `refuse`, reason `driver-seat`, actor `user`) and
   `approvals.watch`: the driver is never an approver. This is not a boundary against the host
   user: any process of the same uid may open a second connection and decide (THREAT_MODEL).
-  While a step runs, the connection's end of stream is watched (bytes sent meanwhile are the
-  next request and are kept). When the driver's connection closes mid-step the step is dropped
-  and the seat is gone: the call in flight runs to its end with its entries, a prompt it waits
-  on is withdrawn (`Withdraw::Closed`), as on a closed `agent.sock` connection, and the turn's
-  later calls do not run. No other method is raced so. TODO(#126): re-rule the transport once the Task 13 harness launcher lands.
+  While a step runs, the connection's end of stream is watched, a half-close included (bytes
+  sent meanwhile are the next request and are kept; a close after them is seen at the next
+  read, so such a driver's prompt waits until it is decided or times out, a deny). When the
+  driver's connection closes mid-step (or shuts its write side) the step is dropped,
+  unanswered, and the seat is gone: the call in flight runs to its end with its entries, a
+  prompt it waits on is withdrawn (`Withdraw::Closed`), as on a closed `agent.sock`
+  connection, and the turn's later calls do not run. An entry being written when the step is
+  dropped is still written whole, so the log may show an `rpc.request` or `drive.turn` with no
+  call after it: it can over-report an attempt, never under-report an effect. No other method
+  is raced so.
+  TODO(#126): re-rule the transport once the Task 13 harness launcher lands.
 - `sessions.stop`: an unknown id is `unknown-session` (`session.refuse`); a container not
   confirmed gone is `stop-failed` (`session.refuse` in the control log: the session's own log
   is sealed by then).
