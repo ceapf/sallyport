@@ -188,6 +188,42 @@ fn note_of(len: usize) -> Frame {
     Ok((json!({"jsonrpc": "2.0", "method": "approval.closed"}), len))
 }
 
+/// A request `sallyd` would refuse as too large is not sent: up to `MAX_FRAME` bytes (its
+/// newline not counted, as `sallyd` counts) it goes, one byte more and nothing is written.
+#[test]
+fn a_request_over_the_frame_cap_is_not_sent() {
+    use std::io::Read;
+    let size = |pad: &str| {
+        let req = json!({"jsonrpc": "2.0", "id": 1, "method": "m", "params": {"p": pad}});
+        serde_json::to_vec(&req).unwrap().len()
+    };
+    let fill = MAX_FRAME - size("");
+    for (extra, sent) in [(0, true), (1, false)] {
+        let pad = "a".repeat(fill + extra);
+        assert_eq!(size(&pad), MAX_FRAME + extra);
+        let (w, mut peer) = UnixStream::pair().unwrap();
+        let (tx, rx) = mpsc::sync_channel(8);
+        tx.send(Ok((json!({"jsonrpc": "2.0", "id": 1, "result": {}}), 40)))
+            .unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut got = Vec::new();
+            peer.read_to_end(&mut got).unwrap();
+            got.len()
+        });
+        let mut c = Client::from_parts(w, rx);
+        let r = c.call("m", json!({"p": pad}));
+        drop(c);
+        let got = reader.join().unwrap();
+        if sent {
+            assert_eq!(r.unwrap(), json!({}));
+            assert_eq!(got, MAX_FRAME + 1);
+        } else {
+            assert!(matches!(r, Err(Error::RequestTooLarge)), "{r:?}");
+            assert_eq!(got, 0, "nothing is sent");
+        }
+    }
+}
+
 /// A reply to another request is not this call's; a held note is given back as it came.
 #[test]
 fn a_reply_must_carry_the_calls_id_and_notes_come_back_whole() {

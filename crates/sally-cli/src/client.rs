@@ -70,6 +70,9 @@ pub enum Error {
     /// A frame that is not what the protocol allows.
     #[error("sallyd sent an unexpected frame")]
     Unexpected,
+    /// The request would pass the frame cap; it was not sent.
+    #[error("the request is over {MAX_FRAME} bytes; nothing was sent")]
+    RequestTooLarge,
     /// Reading or writing the socket failed.
     #[error("control.sock: {0}")]
     Io(#[from] std::io::Error),
@@ -162,6 +165,10 @@ impl Client {
         self.next = self.next.wrapping_add(1);
         let req = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         let mut line = serde_json::to_vec(&req).map_err(|_| Error::Unexpected)?;
+        // `sallyd` refuses a longer frame and closes; say so here instead, sending nothing.
+        if line.len() > MAX_FRAME {
+            return Err(Error::RequestTooLarge);
+        }
         line.push(b'\n');
         self.w.write_all(&line)?;
         loop {
