@@ -640,6 +640,19 @@ entry, and latches the session: every later prompt is denied `session-denied` un
 actions that need no approval still run. It cannot be undone. There is no "allow for this
 session". With no client attached, every prompt is denied `no-approver`.
 
+**Output neutralization** (AMENDMENTS-01 §6.4; architect Q50, Q100). Untrusted text a client
+prints (model output, tool output, file names, sandbox output) is printable ASCII: it stays as
+it is, `\` becomes `\\`, every other ASCII byte (`\t`, `\r`, other controls, DEL) and every byte
+that is not valid UTF-8 becomes `\xNN`, and every other character becomes `\u{…}`, so no ESC,
+CSI, OSC (OSC 52, OSC 8), C1 control (raw `0x9b` or U+009B) or bidirectional control (U+202E)
+reaches a terminal (`sally_core::text::escape`; the CLI's one-line form is `clean::line`). Line
+mode output keeps `\n` as well and nothing else (`sally_core::text::StreamEscaper`, one per
+stream): a character cut across two chunks is carried, at most 3 bytes, and escaped whole, so
+the output does not depend on where chunks end; bytes still carried when the stream ends are
+`\xNN`. `sally session drive` prints whole lines, never a stream, through `clean::line`, so a
+tool result cannot forge a `turn N: …` line. TODO(#130): readable non-ASCII text passed through
+on a terminal known to take it.
+
 ### 4.2 `agent.sock` — untrusted client (the harness). **Method table is a strict allowlist.**
 
 The broker is an MCP server for tools only (Task 7; MCP specification 2026-07-28 and its schema,
