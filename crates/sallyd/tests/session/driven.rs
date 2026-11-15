@@ -205,9 +205,11 @@ async fn drive_over_control(r: &Rx, id: &str) -> Value {
     reply["error"]["data"]["reason"].clone()
 }
 
-/// A stop while a step waits on a prompt: the prompt is withdrawn, the step ends refused,
-/// `session.stop` is the session's last entry, a step on the same seat afterwards is refused and
-/// writes nothing, and a drive over the control socket finds no session.
+/// A stop while a step waits on a prompt: the prompt is withdrawn, the step is answered
+/// `denied: withdrawn`, `session.stop` is the last entry of the session's audit handle (only
+/// teardown's `sandbox.*`, written by the launcher, may follow; ARCHITECTURE §5.4), a step on the
+/// same seat afterwards is refused and writes nothing, and a drive over the control socket finds
+/// no session.
 #[test]
 fn rt_drv_03_nothing_of_a_drive_follows_the_stop() {
     rt().block_on(async {
