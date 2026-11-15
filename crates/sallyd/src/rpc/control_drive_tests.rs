@@ -43,7 +43,7 @@ fn refused(f: &Fx, event: &str) -> Value {
 }
 
 #[tokio::test]
-async fn a_session_not_declared_driven_has_no_drive_methods() {
+async fn rt_drv_05_a_session_not_declared_driven_has_no_drive_methods() {
     let f = fx("drive-none");
     let own = f.session("s-1");
     let mut w = f.connect();
@@ -85,7 +85,7 @@ async fn a_drive_step_runs_one_scripted_turn_and_answers_with_it() {
 }
 
 #[tokio::test]
-async fn a_second_connection_is_refused_and_a_closed_driver_leaves_the_seat_gone() {
+async fn rt_drv_06_a_second_connection_is_refused_and_a_closed_driver_leaves_the_seat_gone() {
     let f = fx("drive-seat");
     let (own, _) = driven(&f, "s-1", TWO);
     let mut first = f.connect();
@@ -130,7 +130,7 @@ async fn a_connection_that_watches_cannot_take_the_seat() {
 /// The driver is never an approver: decide and watch on a seat connection are refused, the
 /// prompt stays pending and its tool does not run.
 #[tokio::test]
-async fn a_connection_in_the_driver_seat_cannot_answer_an_approval() {
+async fn rt_drv_04_a_connection_in_the_driver_seat_cannot_answer_an_approval() {
     let f = fx("drive-decide");
     f.session("s-2");
     driven(&f, "s-1", TWO);
@@ -168,7 +168,7 @@ async fn a_connection_in_the_driver_seat_cannot_answer_an_approval() {
 }
 
 #[tokio::test]
-async fn drive_takes_a_session_id_and_nothing_else() {
+async fn rt_drv_07_drive_takes_a_session_id_and_nothing_else() {
     let f = fx("drive-params");
     let (own, calls) = driven(&f, "s-1", TWO);
     let mut w = f.connect();
@@ -191,7 +191,7 @@ fn model(driven: bool, kind: &str, script: &str) -> Value {
 }
 
 #[tokio::test]
-async fn a_model_is_refused_unless_it_is_a_scripted_one_declared_driven_with_a_good_script() {
+async fn rt_drv_08_a_model_is_refused_unless_scripted_declared_driven_with_a_good_script() {
     let f = fx("drive-create");
     let mut w = f.connect();
     for (p, why) in [

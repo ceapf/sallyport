@@ -6,6 +6,9 @@
 //! slot, entry and gate as a harness's call. Nothing the driver sends picks a call: the request
 //! carries the session id only.
 //!
+//! TODO(#126): re-rule this transport (and whether a scripted model may serve `llm.sock`) once the
+//! Task 13 harness launcher lands.
+//!
 //! One connection holds the session's seat for the session's life (a [`Seat`]); when it closes
 //! the seat is gone, not free. A step runs one turn: its `drive.turn` entry first (sizes and a
 //! hash, never the text), then its calls in order. A step ends at the first call the classifier
