@@ -117,6 +117,109 @@ async fn rt_drv_06_a_second_connection_is_refused_and_a_closed_driver_leaves_the
     );
 }
 
+/// Sets its flag when dropped.
+struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for Dropped {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Adds driven session `id` over [`TWO`] whose one call signals `began`, then waits for
+/// `release` (forever, if it never comes); `dropped` is set when the call's future is dropped.
+fn held(
+    f: &Fx,
+    id: &str,
+) -> (
+    Arc<tokio::sync::Notify>,
+    Arc<tokio::sync::Notify>,
+    Arc<std::sync::atomic::AtomicBool>,
+) {
+    f.fake.live.lock().unwrap().push((info(id), None));
+    let (_, rec) = recorder(id);
+    let began = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (b, r, d) = (
+        Arc::clone(&began),
+        Arc::clone(&release),
+        Arc::clone(&dropped),
+    );
+    let call: CallFn = Box::new(move |name, _| {
+        let guard = Dropped(Arc::clone(&d));
+        let (b, r) = (Arc::clone(&b), Arc::clone(&r));
+        Box::pin(async move {
+            let _guard = guard;
+            b.notify_one();
+            r.notified().await;
+            Driven::Done(ToolOutcome {
+                is_error: false,
+                text: format!("ran {name}"),
+            })
+        })
+    });
+    let driver = Driver::build(
+        Script::parse(TWO).unwrap().turns,
+        call,
+        rec.driven(),
+        crate::tools::ops::Ops::new(),
+    );
+    f.fake.drivers.lock().unwrap().insert(id.to_owned(), driver);
+    (began, release, dropped)
+}
+
+/// A driver that closes while its step waits (on a prompt, say) drops the step at once, so the
+/// call's prompt is withdrawn ([`Withdraw::Closed`] in `Agent::drive_call`), and the seat is
+/// gone; it is not left held by a connection nobody reads.
+#[tokio::test]
+async fn a_driver_that_closes_mid_step_drops_the_step_and_leaves_the_seat_gone() {
+    let f = fx("drive-away");
+    let (began, _release, dropped) = held(&f, "s-1");
+    let mut seat = f.connect();
+    seat.send("sessions.drive", json!({"id": "s-1"})).await;
+    began.notified().await;
+    drop(seat);
+    for _ in 0..200 {
+        if dropped.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        dropped.load(std::sync::atomic::Ordering::SeqCst),
+        "the step was kept"
+    );
+    let r = f
+        .connect()
+        .call("sessions.drive", json!({"id": "s-1"}))
+        .await;
+    assert_eq!(reason(&r), "driver-gone");
+}
+
+/// Bytes sent while a step runs are a next request, not a close: the step ends and both answer.
+#[tokio::test]
+async fn a_request_pipelined_behind_a_step_does_not_drop_it() {
+    let f = fx("drive-pipelined");
+    let (began, release, dropped) = held(&f, "s-1");
+    let mut seat = f.connect();
+    seat.send("sessions.drive", json!({"id": "s-1"})).await;
+    began.notified().await;
+    seat.send("sessions.list", json!({})).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !dropped.load(std::sync::atomic::Ordering::SeqCst),
+        "the step was dropped"
+    );
+    release.notify_one();
+    let r = seat.frame().await.expect("the connection closed");
+    assert_eq!(r["result"]["calls"][0]["result"], json!("ran echo"), "{r}");
+    let r = seat.frame().await.expect("the connection closed");
+    assert!(r["result"].is_object() || r["result"].is_array(), "{r}");
+}
+
 #[tokio::test]
 async fn a_connection_that_watches_cannot_take_the_seat() {
     let f = fx("drive-watching");

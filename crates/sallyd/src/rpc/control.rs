@@ -23,7 +23,7 @@ use sally_core::audit::Actor;
 use sally_core::manifest::{HostEnv, SecretCatalog};
 use sally_proto::{Closed, Flood, notification};
 use serde_json::{Map, Value, json};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::watch;
 
@@ -143,24 +143,26 @@ impl<S: SessionSet> Control<S> {
         };
         loop {
             // One read per frame, kept across notifications: it is not cancel-safe.
-            let read = frame::read(&mut reader, MAX_FRAME);
-            tokio::pin!(read);
-            let frame = loop {
-                tokio::select! {
-                    biased;
-                    () = &mut stopped => return,
-                    f = &mut read => break f,
-                    note = next_note(&mut conn.watch) => {
-                        // `None`: the hub dropped this watcher as too slow (architect Q73.5).
-                        let Some(note) = note else { return };
-                        if !write(&mut w, &notify(&note)).await {
-                            return;
+            let frame = {
+                let read = frame::read(&mut reader, MAX_FRAME);
+                tokio::pin!(read);
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = &mut stopped => return,
+                        f = &mut read => break f,
+                        note = next_note(&mut conn.watch) => {
+                            // `None`: the hub dropped this watcher as too slow (architect Q73.5).
+                            let Some(note) = note else { return };
+                            if !write(&mut w, &notify(&note)).await {
+                                return;
+                            }
                         }
                     }
                 }
             };
             let reply = match frame {
-                Ok(Frame::Line(l)) => match self.handle(&l, &mut conn).await {
+                Ok(Frame::Line(l)) => match self.handle(&l, &mut conn, &mut reader).await {
                     Some(reply) => reply,
                     None => break,
                 },
@@ -182,8 +184,14 @@ impl<S: SessionSet> Control<S> {
         }
     }
 
-    /// The reply to one frame (empty for none); `None` closes the connection.
-    async fn handle(&self, frame: &[u8], conn: &mut Conn) -> Option<Vec<u8>> {
+    /// The reply to one frame (empty for none); `None` closes the connection. `reader` is the
+    /// connection's, only watched for its end while a drive step runs.
+    async fn handle<R: AsyncBufRead + Unpin>(
+        &self,
+        frame: &[u8],
+        conn: &mut Conn,
+        reader: &mut R,
+    ) -> Option<Vec<u8>> {
         let (id, method, params) = match message::parse(frame) {
             Err(r) => {
                 let reply = failure(
@@ -220,7 +228,19 @@ impl<S: SessionSet> Control<S> {
         if !self.request(&call, conn.client).await {
             return None;
         }
-        match self.run(call, conn).await {
+        // A drive step can wait long (on a prompt): if its driver goes away meanwhile, the step
+        // is dropped, which withdraws that prompt, and the connection closes, leaving the seat
+        // gone. Only a drive is raced; other methods are not drop-safe and run to their end.
+        let done = if matches!(call, Call::Drive(_)) {
+            tokio::select! {
+                biased;
+                d = self.run(call, conn) => d,
+                () = closed(reader) => Done::Close,
+            }
+        } else {
+            self.run(call, conn).await
+        };
+        match done {
             Done::Ok(result) => Some(success(&id, result)),
             Done::Refused(data) => Some(refused(&id, &data)),
             Done::Close => None,
@@ -302,6 +322,15 @@ async fn next_note(watch: &mut Option<Watch>) -> Option<Note> {
     match watch {
         Some(w) => w.rx.recv().await,
         None => std::future::pending().await,
+    }
+}
+
+/// Returns when `reader`'s peer closed (end of stream, or a read error); never while bytes wait
+/// unread: those are a next request, kept in the buffer for it. Cancel-safe (`fill_buf`).
+async fn closed<R: AsyncBufRead + Unpin>(reader: &mut R) {
+    match reader.fill_buf().await {
+        Ok([]) | Err(_) => {}
+        Ok(_) => std::future::pending().await,
     }
 }
 
