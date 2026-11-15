@@ -212,6 +212,8 @@ fn a_configured_podman_outside_the_system_rule_is_named() {
     let system = resolve_in(None, &sh).unwrap();
     assert_eq!(outside_in(&system, &[]), None);
     assert_eq!(outside_system_rule(&system), None);
+    // Through the real system list: a user-owned binary is never root-owned, on any host.
+    assert_eq!(outside_system_rule(&mine), Some("not owned by root"));
 }
 
 /// Architect Q126: the version is the bounded token of the first line, nothing else.
