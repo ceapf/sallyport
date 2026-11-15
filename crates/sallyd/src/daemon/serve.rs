@@ -20,13 +20,14 @@
 //! nothing yet; a `podman --timeout` backstop follows this PR (architect Q60).
 
 use std::collections::BTreeSet;
-use std::ffi::OsString;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use sally_core::audit::{AuditError, AuditWriter, SystemClock};
-use sally_core::config::{Config, MAX_CONFIG_BYTES, default_runtime_path, parse_config};
+use sally_core::config::{
+    Config, MAX_CONFIG_BYTES, RUNTIME_PATH_FIELD, default_runtime_path, parse_config,
+};
 use sally_core::manifest::{AuditLevel, HostEnv, HostEnvError};
 use sally_core::paths::{Paths, PathsError};
 use tokio::net::UnixListener;
@@ -43,8 +44,9 @@ use crate::rpc::record::Recorder;
 use crate::sandbox::budget::session_budget;
 use crate::sandbox::{
     AuditSink, CheckedRuntime, DirError, DiskFloor, Installation, LaunchError, Launcher,
-    LauncherParts, Podman, PodmanError, PodmanHost, ScanLimits, Sessions, SharedAudit, Sweep,
-    UserIds, check_runtime_dir, open_sessions, resolve_podman,
+    LauncherParts, PODMAN_PATH_VAR, Podman, PodmanError, PodmanHost, ProbeError, ScanLimits,
+    Sessions, SharedAudit, Sweep, UserIds, VERSION_TIMEOUT, check_runtime_dir, open_sessions,
+    outside_system_rule, probe_version, resolve_podman, version_error,
 };
 use crate::session::lookup::{NoSecrets, SharedEgress};
 use crate::session::{Registry, RegistryParts};
@@ -166,8 +168,6 @@ pub struct Dirs {
     pub data_home: PathBuf,
     /// `$XDG_CONFIG_HOME`, or `~/.config`.
     pub config_home: PathBuf,
-    /// `$PATH`, for finding `podman` when `config.toml` names none.
-    pub path: Option<OsString>,
     /// The derivation the CLI shares (`sally_core::paths`, architect Q107).
     pub paths: Paths,
 }
@@ -192,7 +192,6 @@ impl Dirs {
                 .filter(|p| p.is_absolute()),
             data_home: paths.data_home().to_owned(),
             config_home: paths.config_home().to_owned(),
-            path: std::env::var_os("PATH"),
             paths,
         })
     }
@@ -320,7 +319,7 @@ async fn serve(
         uid: rustix::process::geteuid().as_raw(),
         gid: rustix::process::getegid().as_raw(),
     };
-    let (podman, runtime) = podman(dirs, config).await?;
+    let (podman, runtime) = podman(log, dirs, config).await?;
     let launcher = Launcher::new(LauncherParts {
         podman: podman.clone(),
         runtime,
@@ -433,8 +432,65 @@ async fn serve(
     }
 }
 
-/// Hermetic podman over the checked runtime (blocking checks, off the runtime).
-async fn podman(dirs: &Dirs, config: &Config) -> Result<(Podman, CheckedRuntime), DaemonError> {
+/// Hermetic podman over the checked runtime (blocking checks, off the runtime), then the
+/// `--version` of podman and of the runtime, recorded in the oplog with where podman came from
+/// (R1, architect Q125–Q127). A configured podman that the system search would refuse gets a
+/// warning line. Any failed probe stops startup.
+async fn podman(
+    log: &Oplog,
+    dirs: &Dirs,
+    config: &Config,
+) -> Result<(Podman, CheckedRuntime), DaemonError> {
+    let (podman, runtime, outside) = checked_podman(dirs, config).await?;
+    let failed = |field, path: &Path| {
+        let path = path.to_owned();
+        move |e: ProbeError| PodmanError::Binary(version_error(field, &path, &e))
+    };
+    let mut crun = tokio::process::Command::new(runtime.path());
+    crun.env_clear()
+        .env("PATH", PODMAN_PATH_VAR)
+        .current_dir("/");
+    // Concurrently, so startup waits at most one timeout.
+    let (version, runtime_version) = tokio::try_join!(
+        async {
+            probe_version(podman.command(), "podman", VERSION_TIMEOUT)
+                .await
+                .map_err(failed(podman.source().field(), podman.bin()))
+        },
+        async {
+            probe_version(crun, "crun", VERSION_TIMEOUT)
+                .await
+                .map_err(failed(RUNTIME_PATH_FIELD, runtime.path()))
+        },
+    )?;
+    let path = podman.bin().display().to_string();
+    log.info(
+        LOG,
+        "podman resolved",
+        &[
+            ("path", &path),
+            ("version", &version),
+            ("source", podman.source().as_str()),
+            ("runtime", &runtime.path().display().to_string()),
+            ("runtime_version", &runtime_version),
+        ],
+    );
+    if let Some(why) = outside {
+        log.warn(
+            LOG,
+            "podman runs only because sandbox.podman_path names it",
+            &[("path", &path), ("why", why)],
+        );
+    }
+    Ok((podman, runtime))
+}
+
+/// The blocking half of [`podman`]: the runtime and podman checked, hermetic podman set up, and
+/// why a configured podman is outside the system rule, if it is.
+async fn checked_podman(
+    dirs: &Dirs,
+    config: &Config,
+) -> Result<(Podman, CheckedRuntime, Option<&'static str>), DaemonError> {
     let runtime_path = config
         .sandbox
         .runtime_path
@@ -446,12 +502,13 @@ async fn podman(dirs: &Dirs, config: &Config) -> Result<(Podman, CheckedRuntime)
         xdg_runtime_dir: dirs.runtime.clone(),
         xdg_data_home: dirs.data_home_var.clone(),
     };
-    let (path, state) = (dirs.path.clone(), dirs.state().join("podman"));
+    let state = dirs.state().join("podman");
     tokio::task::spawn_blocking(move || {
         let runtime = CheckedRuntime::check(&runtime_path).map_err(PodmanError::Binary)?;
-        let bin = resolve_podman(configured.as_deref(), path.as_deref())?;
-        let podman = Podman::setup(bin, &runtime, &state, &host)?;
-        Ok((podman, runtime))
+        let resolved = resolve_podman(configured.as_deref())?;
+        let outside = outside_system_rule(&resolved);
+        let podman = Podman::setup(resolved, &runtime, &state, &host)?;
+        Ok((podman, runtime, outside))
     })
     .await
     .map_err(|e| DaemonError::Io {

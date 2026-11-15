@@ -5,8 +5,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use sally_core::config::{
-    Config, ConfigError, RuntimeKind, check_runtime_binary, check_trusted_binary,
-    default_runtime_path, parse_config,
+    Config, ConfigError, Owner, RuntimeKind, check_binary, check_runtime_binary,
+    check_trusted_binary, default_runtime_path, parse_config,
 };
 
 /// A scratch dir under the target dir (not /tmp: its ancestors must pass the runtime checks),
@@ -211,4 +211,33 @@ fn trusted_binary_errors_name_their_field() {
     assert!(e.starts_with("sandbox.podman_path: "), "{e}");
     assert!(e.contains("writable by group or others"), "{e}");
     assert!(check_trusted_binary(Path::new("/bin/sh"), "sandbox.podman_path").is_ok());
+}
+
+/// R1 (architect Q124): a binary found by a system search must be owned by root. The user's own
+/// executable passes the root-or-user policy of a configured path and fails the root policy,
+/// the error naming the field and the check.
+#[test]
+fn the_root_policy_refuses_a_binary_the_user_owns() {
+    let s = Scratch::new("root");
+    let d = s.dir("mine", 0o700);
+    let p = d.join("podman");
+    exe(&p, 0o755);
+    assert!(check_binary(&p, "f", Owner::RootOrUser).is_ok());
+    assert!(check_trusted_binary(&p, "f").is_ok());
+    let e = check_binary(&p, "f", Owner::Root).unwrap_err().to_string();
+    assert!(e.starts_with("f: "), "{e}");
+    assert!(e.ends_with(": is not owned by root"), "{e}");
+}
+
+/// Under the root policy a symlink is judged by its target, like the runtime's: a link the user
+/// owns that names a root-owned binary in root-owned directories passes.
+#[test]
+fn the_root_policy_accepts_a_root_owned_binary_through_a_link() {
+    assert!(check_binary(Path::new("/bin/sh"), "f", Owner::Root).is_ok());
+    let s = Scratch::new("root-link");
+    let d = s.dir("links", 0o700);
+    let link = d.join("sh");
+    std::os::unix::fs::symlink("/bin/sh", &link).unwrap();
+    let real = check_binary(&link, "f", Owner::Root).unwrap();
+    assert_eq!(real, std::fs::canonicalize("/bin/sh").unwrap());
 }

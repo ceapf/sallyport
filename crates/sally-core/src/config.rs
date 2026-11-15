@@ -15,6 +15,8 @@ use serde::Deserialize;
 
 /// Largest accepted `config.toml`.
 pub const MAX_CONFIG_BYTES: usize = 64 * 1024;
+/// The field an error about the runtime binary names.
+pub const RUNTIME_PATH_FIELD: &str = "sandbox.runtime_path";
 
 /// Mode bits that let someone other than the owner change a file or directory.
 const GROUP_OTHER_WRITE: u32 = 0o022;
@@ -38,8 +40,10 @@ pub struct SandboxConfig {
     /// Absolute path of the runtime binary. `None` = [`default_runtime_path`], the pinned
     /// upstream build installed by `install.sh`.
     pub runtime_path: Option<PathBuf>,
-    /// Absolute path of the `podman` binary. `None` = the first `podman` on `sallyd`'s `PATH`
-    /// at startup. Either way it is resolved once and checked like the runtime (#11).
+    /// Absolute path of the `podman` binary, checked like the runtime (root or the user, #11).
+    /// `None` = `podman` in `/usr/bin`, `/bin`, `/usr/sbin` or `/sbin` (in that order; the first
+    /// that exists), which must be owned by root, with every directory above it (R1, architect
+    /// Q123/Q124). `sallyd`'s `PATH` is never consulted. Resolved once, at startup.
     pub podman_path: Option<PathBuf>,
 }
 
@@ -101,7 +105,7 @@ pub fn parse_config(text: &str) -> Result<Config, ConfigError> {
         });
     }
     for (field, path) in [
-        ("sandbox.runtime_path", &config.sandbox.runtime_path),
+        (RUNTIME_PATH_FIELD, &config.sandbox.runtime_path),
         ("sandbox.podman_path", &config.sandbox.podman_path),
     ] {
         if path.as_ref().is_some_and(|p| !p.is_absolute()) {
@@ -132,15 +136,50 @@ pub fn default_runtime_path(data_home: &Path) -> PathBuf {
 /// # Errors
 /// [`ConfigError::Binary`] naming `sandbox.runtime_path`, the path and the failed check.
 pub fn check_runtime_binary(path: &Path) -> Result<PathBuf, ConfigError> {
-    check_trusted_binary(path, "sandbox.runtime_path")
+    check_trusted_binary(path, RUNTIME_PATH_FIELD)
 }
 
 /// The checks of [`check_runtime_binary`] for any binary `sallyd` executes with the user's
-/// authority (the runtime, podman); errors name `field`.
+/// authority that a setting names (the runtime, a configured podman); errors name `field`.
 ///
 /// # Errors
 /// [`ConfigError::Binary`] naming `field`, the path and the failed check.
 pub fn check_trusted_binary(path: &Path, field: &'static str) -> Result<PathBuf, ConfigError> {
+    check_binary(path, field, Owner::RootOrUser)
+}
+
+/// Who may own a trusted binary and every directory above it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Owner {
+    /// Root only: a binary `sallyd` finds by searching fixed system directories (podman when
+    /// `sandbox.podman_path` is unset, `conmon`, `catatonit`; R1, architect Q124/Q127).
+    Root,
+    /// Root or the current user: a binary a setting names (`sandbox.runtime_path`,
+    /// `sandbox.podman_path`).
+    RootOrUser,
+}
+
+impl Owner {
+    /// The failed check, as the error message says it.
+    fn refusal(self) -> &'static str {
+        match self {
+            Self::Root => "is not owned by root",
+            Self::RootOrUser => "is owned by another user",
+        }
+    }
+}
+
+/// The checks of [`check_runtime_binary`] under the ownership policy `owner`: the realpath is a
+/// regular executable file, not writable by group or others, and it and every directory above
+/// it are owned as `owner` allows and not writable by group or others. Returns the realpath.
+///
+/// # Errors
+/// [`ConfigError::Binary`] naming `field`, the path and the failed check.
+pub fn check_binary(
+    path: &Path,
+    field: &'static str,
+    owner: Owner,
+) -> Result<PathBuf, ConfigError> {
     let fail = |msg: &str| ConfigError::Binary {
         field,
         path: path.display().to_string(),
@@ -162,8 +201,8 @@ pub fn check_trusted_binary(path: &Path, field: &'static str) -> Result<PathBuf,
     if mode & GROUP_OTHER_WRITE != 0 {
         return Err(fail("is writable by group or others"));
     }
-    if !owner_ok(meta.uid(), euid) {
-        return Err(fail("is owned by another user"));
+    if !owner_ok(meta.uid(), euid, owner) {
+        return Err(fail(owner.refusal()));
     }
     for dir in real.ancestors().skip(1) {
         let d = dir.display();
@@ -173,27 +212,46 @@ pub fn check_trusted_binary(path: &Path, field: &'static str) -> Result<PathBuf,
                 "{d}: directory is writable by group or others"
             )));
         }
-        if !owner_ok(dmeta.uid(), euid) {
-            return Err(fail(&format!("{d}: directory is owned by another user")));
+        if !owner_ok(dmeta.uid(), euid, owner) {
+            return Err(fail(&format!("{d}: directory {}", owner.refusal())));
         }
     }
     Ok(real)
 }
 
-/// Only root or the current user may own the runtime binary and the directories above it.
-fn owner_ok(file_uid: u32, euid: u32) -> bool {
-    file_uid == 0 || file_uid == euid
+/// Whether `file_uid` may own a trusted binary or a directory above it: root always; the
+/// current user only under [`Owner::RootOrUser`].
+fn owner_ok(file_uid: u32, euid: u32, owner: Owner) -> bool {
+    match owner {
+        Owner::Root => file_uid == 0,
+        Owner::RootOrUser => file_uid == 0 || file_uid == euid,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::owner_ok;
+    use super::{Owner, owner_ok};
 
     #[test]
     fn runtime_owner_must_be_root_or_us() {
-        assert!(owner_ok(0, 1000));
-        assert!(owner_ok(1000, 1000));
-        assert!(!owner_ok(1001, 1000));
-        assert!(!owner_ok(1000, 1001));
+        assert!(owner_ok(0, 1000, Owner::RootOrUser));
+        assert!(owner_ok(1000, 1000, Owner::RootOrUser));
+        assert!(!owner_ok(1001, 1000, Owner::RootOrUser));
+        assert!(!owner_ok(1000, 1001, Owner::RootOrUser));
+    }
+
+    /// R1 (architect Q124): a searched binary is root's alone, even when the user owns it.
+    #[test]
+    fn a_searched_binary_must_be_owned_by_root() {
+        assert!(owner_ok(0, 1000, Owner::Root));
+        assert!(owner_ok(0, 0, Owner::Root));
+        assert!(!owner_ok(1000, 1000, Owner::Root));
+        assert!(!owner_ok(1001, 1000, Owner::Root));
+    }
+
+    #[test]
+    fn each_policy_names_its_own_failed_check() {
+        assert_eq!(Owner::Root.refusal(), "is not owned by root");
+        assert_eq!(Owner::RootOrUser.refusal(), "is owned by another user");
     }
 }

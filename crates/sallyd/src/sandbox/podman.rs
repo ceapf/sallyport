@@ -22,18 +22,24 @@
 //!   architect Q118/Q119; the Task 6b probe that said otherwise was wrong);
 //! - the OCI config verifier (`sandbox::oci`), which refuses a container whose generated config
 //!   holds anything the argv did not ask for, whatever podman read;
-//! - a podman binary resolved once to an absolute path with the runtime's ownership checks.
+//! - a podman binary resolved once to an absolute path: `sandbox.podman_path` with the runtime's
+//!   ownership checks, else a root-owned `podman` in a fixed system directory, never through
+//!   `sallyd`'s `PATH` (R1; `binaries.rs`), re-checked under the same policy before every
+//!   launch.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use sally_core::config::{ConfigError, check_trusted_binary};
+use sally_core::config::ConfigError;
 
+use super::binaries::{PodmanSource, ResolvedPodman, check_podman, first_root_owned};
 use super::types::CheckedRuntime;
 
 /// Directories podman and its helpers (`conmon`, `newuidmap`) may be found in. Root-owned on
-/// every supported host; never the user's `PATH`.
+/// every supported host; never the user's `PATH`. Podman's own `PATH`, and the list (in this
+/// order) the system search looks for `podman` in when `sandbox.podman_path` is unset (R1,
+/// architect Q123).
 pub const PODMAN_PATH_VAR: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 /// Where `catatonit` (`--init`) lives on supported distributions, in podman's search order.
 const INIT_CANDIDATES: [&str; 4] = [
@@ -60,12 +66,19 @@ const EMPTY_DIRS: [&str; 3] = ["hooks", "config", "home"];
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum PodmanError {
-    /// A binary failed the ownership checks or was not found.
+    /// A configured podman, the runtime or a helper failed its checks, or a `--version` probe
+    /// failed.
     #[error(transparent)]
     Binary(#[from] ConfigError),
-    /// A binary podman needs was not found.
-    #[error("podman helper {0}: not found in any of {1:?}")]
-    Missing(&'static str, Vec<&'static str>),
+    /// The podman the system search found failed the root-owned checks (R1, architect Q124).
+    #[error("{0}; sandbox.podman_path can name another podman")]
+    System(ConfigError),
+    /// The system search found no podman.
+    #[error("podman: not found in any of {0:?}; sandbox.podman_path can name a podman elsewhere")]
+    NoSystemPodman(Vec<PathBuf>),
+    /// A binary podman needs was not found in any of its candidates.
+    #[error("{0}: not found in any of {1:?}")]
+    Missing(&'static str, Vec<PathBuf>),
     /// A host directory is not private, or not what it should be.
     #[error("{path}: {msg}")]
     Dir {
@@ -109,36 +122,9 @@ pub struct PodmanHost {
     pub xdg_data_home: Option<PathBuf>,
 }
 
-/// Picks the podman binary: the configured path, else the first `podman` on `sallyd`'s own
-/// `PATH`; then the ownership checks of the runtime (`sandbox.podman_path`).
-///
-/// # Errors
-/// [`PodmanError::Missing`] or [`PodmanError::Binary`].
-pub fn resolve_podman(
-    configured: Option<&Path>,
-    path_var: Option<&OsStr>,
-) -> Result<PathBuf, PodmanError> {
-    let found = match configured {
-        Some(p) => p.to_owned(),
-        None => path_var
-            .into_iter()
-            .flat_map(std::env::split_paths)
-            .filter(|d| d.is_absolute())
-            .map(|d| d.join("podman"))
-            .find(|p| p.is_file())
-            .ok_or(PodmanError::Missing("podman", vec!["$PATH"]))?,
-    };
-    Ok(check_trusted_binary(&found, "sandbox.podman_path")?)
-}
-
-/// The first candidate that exists, checked like the runtime.
-fn first_trusted(what: &'static str, candidates: &[&'static str]) -> Result<PathBuf, PodmanError> {
-    let p = candidates
-        .iter()
-        .map(Path::new)
-        .find(|p| p.exists())
-        .ok_or_else(|| PodmanError::Missing(what, candidates.to_vec()))?;
-    Ok(check_trusted_binary(p, what)?)
+/// A helper's candidates as paths, for [`first_root_owned`].
+fn candidates(list: &[&str]) -> Vec<PathBuf> {
+    list.iter().map(PathBuf::from).collect()
 }
 
 /// Field names for helper binaries in errors: they come from fixed system paths, not settings.
@@ -230,6 +216,8 @@ crun = [{runtime}]
 #[derive(Debug, Clone)]
 pub struct Podman {
     bin: PathBuf,
+    /// Where `bin` came from: its ownership policy at every re-check.
+    source: PodmanSource,
     state: PathBuf,
     conf_text: String,
     env: Vec<(OsString, OsString)>,
@@ -244,16 +232,19 @@ impl Podman {
     ///
     /// # Errors
     /// [`PodmanError`] if a binary fails its checks or a directory is not private and empty.
+    /// `conmon` and `catatonit` must be root-owned (architect Q127).
     pub fn setup(
-        podman: PathBuf,
+        podman: ResolvedPodman,
         runtime: &CheckedRuntime,
         state: &Path,
         host: &PodmanHost,
     ) -> Result<Self, PodmanError> {
+        // Root-only even beside a configured user-owned podman (architect Q127): `first_root_owned`
+        // is the one helper search, unit-tested in `binaries_tests.rs`.
         let bins = ConfBinaries {
             runtime: runtime.path().to_owned(),
-            init: first_trusted(INIT_FIELD, &INIT_CANDIDATES)?,
-            conmon: first_trusted(CONMON_FIELD, &CONMON_CANDIDATES)?,
+            init: first_root_owned(INIT_FIELD, &candidates(&INIT_CANDIDATES))?,
+            conmon: first_root_owned(CONMON_FIELD, &candidates(&CONMON_CANDIDATES))?,
         };
         private_dir(state)?;
         for d in EMPTY_DIRS {
@@ -265,7 +256,8 @@ impl Podman {
         replace_0600(state, "containers.conf", text.as_bytes())?;
         replace_0600(state, "mounts.conf", b"")?;
         let p = Self {
-            bin: podman,
+            bin: podman.path().to_owned(),
+            source: podman.source(),
             env: Self::env(host, state),
             state: state.to_owned(),
             conf_text: text,
@@ -314,6 +306,12 @@ impl Podman {
         &self.bin
     }
 
+    /// Where the podman binary came from.
+    #[must_use]
+    pub fn source(&self) -> PodmanSource {
+        self.source
+    }
+
     /// The empty hooks directory, for `--hooks-dir`.
     #[must_use]
     pub fn hooks_dir(&self) -> PathBuf {
@@ -356,8 +354,8 @@ impl Podman {
 
     /// Re-checks, before each launch, everything podman reads from Sallyport's state: the state
     /// directory is private, `hooks/` and `config/` are empty, `mounts.conf` is empty and
-    /// `containers.conf` is exactly what was generated; and the podman binary still passes its
-    /// ownership checks. Performs blocking I/O.
+    /// `containers.conf` is exactly what was generated; and the podman binary still passes the
+    /// ownership checks of its source (root-owned for the system search). Performs blocking I/O.
     ///
     /// # Errors
     /// [`PodmanError`] naming what changed.
@@ -373,7 +371,7 @@ impl Podman {
             &self.state.join("containers.conf"),
             self.conf_text.as_bytes(),
         )?;
-        check_trusted_binary(&self.bin, "sandbox.podman_path")?;
+        check_podman(&self.bin, self.source)?;
         Ok(())
     }
 
@@ -555,89 +553,32 @@ mod tests {
         assert!(!with_data.iter().any(|(_, v)| v == "/home/u"));
     }
 
+    /// The helpers' candidate lists, as paths, in their order.
     #[test]
-    fn podman_is_resolved_from_path_and_checked() {
-        let p = resolve_podman(Some(Path::new("/bin/sh")), None).unwrap();
-        assert!(p.is_absolute());
-        let e = resolve_podman(None, Some(OsStr::new("relative:/nonexistent"))).unwrap_err();
-        assert!(matches!(e, PodmanError::Missing("podman", _)), "{e}");
-        let e = resolve_podman(Some(Path::new("/nonexistent/podman")), None).unwrap_err();
-        assert!(e.to_string().starts_with("sandbox.podman_path: "), "{e}");
-    }
-
-    /// A directory beside the test binary (the build directory: every ancestor passes the
-    /// trust checks, unlike `/tmp`) with an executable `podman` in each named subdirectory.
-    struct PathDirs(PathBuf);
-
-    impl PathDirs {
-        fn new(tag: &str, dirs: &[(&str, u32, u32)]) -> Self {
-            let exe = std::env::current_exe().unwrap();
-            let root = exe
-                .parent()
-                .unwrap()
-                .join(format!("sp-path-{tag}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
-            std::fs::DirBuilder::new()
-                .mode(0o700)
-                .create(&root)
-                .unwrap();
-            // Built first, so a failed step below still removes what was made.
-            let made = Self(root);
-            for &(name, dir_mode, file_mode) in dirs {
-                let d = made.0.join(name);
-                std::fs::create_dir(&d).unwrap();
-                std::fs::write(d.join("podman"), "#!/bin/sh\n").unwrap();
-                chmod(&d.join("podman"), file_mode);
-                chmod(&d, dir_mode);
-            }
-            made
-        }
-
-        fn path_var(&self, names: &[&str]) -> OsString {
-            std::env::join_paths(names.iter().map(|n| self.0.join(n))).unwrap()
-        }
-    }
-
-    impl Drop for PathDirs {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    /// The first `podman` on `PATH` is checked, and a failed check is an error naming the
-    /// setting: later entries are never tried (architect Q122).
-    #[test]
-    fn a_first_podman_on_path_that_fails_the_checks_is_refused_without_fall_through() {
-        let d = PathDirs::new(
-            "fail",
-            &[
-                ("open", 0o777, 0o755),
-                ("gw", 0o700, 0o775),
-                ("good", 0o700, 0o755),
-            ],
+    fn helper_candidates_keep_their_order() {
+        assert_eq!(
+            candidates(&INIT_CANDIDATES),
+            INIT_CANDIDATES.map(PathBuf::from).to_vec()
         );
-        for first in ["open", "gw"] {
-            let e = resolve_podman(None, Some(&d.path_var(&[first, "good"]))).unwrap_err();
-            assert!(matches!(e, PodmanError::Binary(_)), "{first}: {e}");
-            assert!(e.to_string().starts_with("sandbox.podman_path: "), "{e}");
-        }
+        assert_eq!(
+            candidates(&["/b", "/a"]),
+            vec![PathBuf::from("/b"), PathBuf::from("/a")]
+        );
     }
 
-    /// With no `sandbox.podman_path`, the first `podman` on `PATH` is used, a user-owned one
-    /// included (same-UID attacker out of scope; architect Q122).
+    /// Architect Q124: the re-check before every launch applies the policy the binary was
+    /// resolved under. The test binary (user-owned) passes as configured and fails as a
+    /// system podman.
     #[test]
-    fn the_first_trusted_podman_on_path_is_used_even_when_user_owned() {
-        let d = PathDirs::new("ok", &[("mine", 0o700, 0o755), ("other", 0o700, 0o755)]);
-        let p = resolve_podman(None, Some(&d.path_var(&["mine", "other"]))).unwrap();
-        assert_eq!(p, std::fs::canonicalize(d.0.join("mine/podman")).unwrap());
-    }
-
-    #[test]
-    fn a_helper_is_the_first_candidate_that_exists_and_passes_the_checks() {
-        let p = first_trusted("t", &["/nonexistent/a", "/bin/sh", "/usr/bin/env"]).unwrap();
-        assert_eq!(p, std::fs::canonicalize("/bin/sh").unwrap());
-        let e = first_trusted("t", &["/nonexistent/a"]).unwrap_err();
-        assert!(matches!(e, PodmanError::Missing("t", _)), "{e}");
+    fn recheck_applies_the_policy_of_the_binary_s_source() {
+        let s = Scratch::new("recheck-source");
+        let mut p = podman_at(&s.0);
+        p.bin = std::env::current_exe().unwrap();
+        p.recheck().unwrap();
+        p.source = PodmanSource::System;
+        let e = p.recheck().unwrap_err();
+        assert!(matches!(e, PodmanError::System(_)), "{e}");
+        assert_eq!(p.source(), PodmanSource::System);
     }
 
     /// A private scratch directory, removed (after restoring write access) on drop.
@@ -675,6 +616,7 @@ mod tests {
         };
         Podman {
             bin: "/bin/sh".into(),
+            source: PodmanSource::Configured,
             env: Podman::env(&host, state),
             state: state.to_owned(),
             conf_text: text,

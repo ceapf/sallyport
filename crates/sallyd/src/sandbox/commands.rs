@@ -179,7 +179,7 @@ pub(super) fn container_id(out: &str) -> Result<String, LaunchError> {
 /// Reads until end of file, keeping the first `cap` bytes, so a chatty process never blocks on a
 /// full pipe and never grows memory without bound. A read error ends the read; the command's
 /// timeout then bounds the wait for the process.
-async fn read_capped(mut r: impl AsyncRead + Unpin, cap: usize) -> Vec<u8> {
+pub(super) async fn read_capped(mut r: impl AsyncRead + Unpin, cap: usize) -> Vec<u8> {
     let mut kept = Vec::new();
     let mut buf = [0u8; 8192];
     loop {

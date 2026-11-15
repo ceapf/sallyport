@@ -7,6 +7,7 @@
 //! check.
 
 mod argv;
+mod binaries;
 pub mod budget;
 mod cgroup;
 mod changes;
@@ -30,6 +31,10 @@ mod watchdog;
 pub use argv::{
     harness_argv, harness_build, inference_argv, inference_build, workspace_argv, workspace_build,
 };
+pub use binaries::{
+    PodmanSource, ProbeError, ResolvedPodman, VERSION_TIMEOUT, outside_system_rule, probe_version,
+    resolve_podman, version_error,
+};
 pub use changes::{Change, ChangeKind, ChangesError, session_changes};
 pub use check::{Allowed, Grant, Source, check_argv};
 pub use dirs::{DirError, SessionDirs, check_runtime_dir, open_sessions, staged_indices};
@@ -44,7 +49,7 @@ pub use launch::{
     WorkspaceRequest,
 };
 pub use overlap::{Claim, Conflict, ReserveError, Sessions, claims};
-pub use podman::{PODMAN_PATH_VAR, Podman, PodmanError, PodmanHost, resolve_podman};
+pub use podman::{PODMAN_PATH_VAR, Podman, PodmanError, PodmanHost};
 pub use profiles::profile;
 pub use scan::{GitScan, LaunchScan, Pin, PinKind, ScanError, ScanLimits, scan_mounts};
 pub use types::{

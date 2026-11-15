@@ -418,7 +418,8 @@ impl Lx {
     }
 
     /// `wrap` turns the real podman binary into the one the launcher runs (a test wrapper that
-    /// ends by running the real one). It bypasses `resolve_podman`'s trust check, so test-only.
+    /// ends by running the real one). The wrapper enters as `sandbox.podman_path` would name it:
+    /// the root-or-user checks, never the system search's root rule.
     pub fn with_podman(wrap: impl FnOnce(&Path) -> PathBuf) -> Self {
         Self::with_home_and_podman(None, wrap)
     }
@@ -429,7 +430,7 @@ impl Lx {
         podman_home: Option<PathBuf>,
         wrap: impl FnOnce(&Path) -> PathBuf,
     ) -> Self {
-        let real = resolve_podman(None, std::env::var_os("PATH").as_deref()).unwrap();
+        let real = resolve_podman(None).unwrap().path().to_owned();
         Self::build(
             podman_home,
             None,
@@ -494,8 +495,9 @@ impl Lx {
         let runtime = CheckedRuntime::check(runtime.unwrap_or(&test_runtime())).unwrap();
         let state = f.root.join("home/.local/share/sallyport/podman");
         std::fs::create_dir_all(state.parent().unwrap()).unwrap();
-        let bin = podman_bin
-            .unwrap_or_else(|| resolve_podman(None, std::env::var_os("PATH").as_deref()).unwrap());
+        // A test wrapper enters as a configured podman, through the product's own resolution
+        // (architect Q128): no root-rule bypass.
+        let bin = resolve_podman(podman_bin.as_deref()).unwrap();
         let podman = Podman::setup(bin, &runtime, &state, &host).unwrap();
         let events = Arc::new(Events::default());
         let egress = super::egress::fake_egress(&f.root);

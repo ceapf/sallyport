@@ -451,11 +451,32 @@ anything the argv did not ask for.
 
 The generated file has no default volumes, devices, capabilities, environment, sysctls,
 ulimits, annotations or mounts. Namespaces are private, there is no keyring, events and logs are
-off, and remote is off. The runtime, `conmon` and `catatonit` (`--init`) are explicit paths that
-passed the runtime's ownership checks. The podman binary is resolved once
-(`sandbox.podman_path`, else the first `podman` on `sallyd`'s `PATH`) and gets the same checks
-(root- or user-owned; a first match that fails the checks is an error, later entries are not
-tried).
+off, and remote is off. The runtime, `conmon` and `catatonit` (`--init`) are explicit paths.
+
+**Binaries** (R1, architect Q123–Q128; `sandbox/binaries.rs`). Each is resolved once, to its
+realpath, and every check covers the file and every directory above it (a regular executable
+file, no group or other write bit, owned as the rule allows):
+- the runtime: `sandbox.runtime_path`, else `<data_home>/sallyport/bin/crun`; root or the user;
+- podman: `sandbox.podman_path` when set, root or the user. Otherwise `podman` in
+  `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin` (the directories of podman's own `PATH`, in that
+  order), root only. `sallyd`'s own `PATH` is never consulted;
+- `conmon` and `catatonit`: their fixed candidate lists, root only, even beside a configured
+  user-owned podman.
+
+A search never falls through. The first candidate that exists by `lstat` (a dangling link or
+a directory included) is checked, and a failure is an error. For podman, that error says
+`sandbox.podman_path` can name another. Only an absent candidate moves the search on. Before
+every launch the podman binary is re-checked under the rule it was resolved under.
+
+At start, `sallyd` runs `podman --version` (hermetic environment) and `<runtime> --version`
+(`PATH` only), each within 5 s with output capped at 4 KiB, and parses `<name> version
+<token>` strictly. Any failure stops startup. One oplog line, `podman resolved`, records the
+podman path, version and source (`system` or `sandbox.podman_path`), and the runtime path and
+version. A configured podman that the system search would not have accepted (not root-owned,
+or not one of its candidates) runs, and a warning line says why. The setting comes from
+`config.toml` under `$XDG_CONFIG_HOME/sallyport/`, which is `sallyd`'s own configuration and a
+trusted input. Whoever sets `sallyd`'s environment can still pick a podman that way; the
+warning line is how that shows.
 Every podman command has its output capped at 64 KiB per stream and is killed after 120 s.
 
 **Consequences.**

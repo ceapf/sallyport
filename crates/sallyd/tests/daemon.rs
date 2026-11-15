@@ -618,15 +618,18 @@ fn hostile_values_in<'a>(text: &str, hostile: &'a [(String, String)]) -> Vec<&'a
         .collect()
 }
 
-/// One podman process: its environment and its argv (NUL-separated, joined by spaces).
+/// One child process: its executable, its environment and its argv (NUL-separated, joined by
+/// spaces).
 struct Seen {
+    exe: PathBuf,
     env: Vec<String>,
     argv: String,
 }
 
-/// The children of `parent` whose executable is `podman`, read from `/proc` (podman, unlike
-/// `sallyd`, is dumpable).
-fn podman_children(parent: i32, podman: &Path) -> Vec<(i32, Seen)> {
+/// The children of `parent` whose executable is one of `exes` (podman, and the runtime whose
+/// `--version` `sallyd` records at start), read from `/proc` (they, unlike `sallyd`, are
+/// dumpable).
+fn known_children(parent: i32, exes: &[&Path]) -> Vec<(i32, Seen)> {
     let mut out = Vec::new();
     for e in std::fs::read_dir("/proc").unwrap().flatten() {
         let Ok(pid) = e.file_name().to_string_lossy().parse::<i32>() else {
@@ -639,14 +642,15 @@ fn podman_children(parent: i32, podman: &Path) -> Vec<(i32, Seen)> {
                     .find_map(|l| l.strip_prefix("PPid:"))
                     .and_then(|p| p.trim().parse::<i32>().ok())
             });
-        if ppid != Some(parent)
-            || std::fs::read_link(format!("/proc/{pid}/exe"))
-                .ok()
-                .as_deref()
-                != Some(podman)
-        {
+        if ppid != Some(parent) {
             continue;
         }
+        let Some(exe) = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()
+            .filter(|x| exes.contains(&x.as_path()))
+        else {
+            continue;
+        };
         let (Ok(env), Ok(argv)) = (
             std::fs::read(format!("/proc/{pid}/environ")),
             std::fs::read(format!("/proc/{pid}/cmdline")),
@@ -662,6 +666,7 @@ fn podman_children(parent: i32, podman: &Path) -> Vec<(i32, Seen)> {
         out.push((
             pid,
             Seen {
+                exe,
                 env: split(&env),
                 argv: split(&argv).join(" "),
             },
@@ -670,18 +675,19 @@ fn podman_children(parent: i32, podman: &Path) -> Vec<(i32, Seen)> {
     out
 }
 
-/// The trusted podman `sallyd` resolves on the real `PATH`, as `/proc/<pid>/exe` shows it.
+/// The podman `sallyd`'s system search finds, as `/proc/<pid>/exe` shows it.
 fn trusted_podman() -> PathBuf {
-    let real = std::env::var_os("PATH").unwrap_or_default();
-    let p = sallyd::sandbox::resolve_podman(None, Some(&real)).unwrap();
-    std::fs::canonicalize(p).unwrap()
+    let p = sallyd::sandbox::resolve_podman(None).unwrap();
+    std::fs::canonicalize(p.path()).unwrap()
 }
 
-/// A user-owned `podman` in `<root>/hostile-bin`, put after the real directories on `PATH`,
-/// that marks `<root>/podman-ran` when run.
+/// A user-owned `podman` in `<root>/hostile-bin` that marks `<root>/podman-ran` when run, then
+/// runs the real one. It passes the root-or-user checks (asserted, whatever the umask), so a
+/// `PATH` lookup under that rule would run it rather than skip it.
 fn user_podman(env: &Env) -> (PathBuf, PathBuf) {
     let bin = env.root.join("hostile-bin");
     std::fs::create_dir_all(&bin).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
     let canary = env.root.join("podman-ran");
     assert!(
         !canary.display().to_string().contains('\''),
@@ -693,6 +699,7 @@ fn user_podman(env: &Env) -> (PathBuf, PathBuf) {
     );
     std::fs::write(bin.join("podman"), script).unwrap();
     std::fs::set_permissions(bin.join("podman"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    sally_core::config::check_trusted_binary(&bin.join("podman"), "decoy").unwrap();
     (bin, canary)
 }
 
@@ -700,8 +707,9 @@ fn user_podman(env: &Env) -> (PathBuf, PathBuf) {
 /// `HOME` and `XDG_CONFIG_HOME` hostile in `sallyd`'s own environment, `sallyd` starts (a
 /// podman that read the hostile `containers.conf` would go remote and fail `remove_orphans`),
 /// and every podman it runs is the resolved trusted binary with exactly the allowlisted
-/// environment and no hostile value in its environment or argv. `PATH` is a trusted input
-/// (architect Q122): a second `podman` later on it shows first-match order only, not a defence.
+/// environment and no hostile value in its environment or argv. `PATH` is never consulted
+/// (R1, architect Q128): a user-owned `podman` first on it never runs, and every podman seen is
+/// the system search's root-owned binary (this fails if `sallyd` looks at `PATH`).
 /// strace holds each new process for a moment after `execve` so `/proc/<pid>/environ` can be
 /// read. The control: the same scan finds every hostile value in `sallyd`'s own `execve`.
 #[test]
@@ -711,6 +719,7 @@ fn rt_sup_04_hostile_variables_in_sallyd_s_environment_never_reach_podman() {
     let hostile = hostile_env(&env);
     let (bin, canary) = user_podman(&env);
     let podman = trusted_podman();
+    let runtime = std::fs::canonicalize(test_runtime()).unwrap();
     let trace = env.root.join("trace");
     let mut strace = Command::new("strace");
     strace
@@ -733,8 +742,8 @@ fn rt_sup_04_hostile_variables_in_sallyd_s_environment_never_reach_podman() {
     let mut c = env.command(strace);
     let path = format!(
         "{}:{}",
-        std::env::var("PATH").unwrap_or_default(),
-        bin.display()
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
     );
     c.envs(hostile.iter().map(|(k, v)| (k, v)))
         .env("PATH", path);
@@ -750,7 +759,7 @@ fn rt_sup_04_hostile_variables_in_sallyd_s_environment_never_reach_podman() {
         }
         assert!(Instant::now() < end, "control.sock never appeared");
         if let Some(&sallyd) = tracer.children().first() {
-            for (pid, s) in podman_children(sallyd, &podman) {
+            for (pid, s) in known_children(sallyd, &[&podman, &runtime]) {
                 seen.entry(pid).or_insert(s);
             }
         }
@@ -762,7 +771,23 @@ fn rt_sup_04_hostile_variables_in_sallyd_s_environment_never_reach_podman() {
     let sallyd = *tracer.children().first().expect("strace runs sallyd");
     signal(sallyd, rustix::process::Signal::TERM);
     let _ = tracer.finish();
-    assert!(!seen.is_empty(), "no podman process was seen");
+    // R1 (architect Q128): checked first, so a `sallyd` that consults `PATH` fails here.
+    assert!(!canary.exists(), "the podman first on PATH was run");
+    assert!(
+        seen.values().any(|s| s.exe == podman),
+        "no podman process was seen"
+    );
+    // R1 (architect Q127): the runtime's `--version` at start, with `PATH` alone.
+    assert!(
+        seen.values().any(|s| s.exe == runtime),
+        "the runtime's version probe was not seen"
+    );
+    let runtime_want: std::collections::BTreeMap<String, String> = [(
+        "PATH".to_owned(),
+        sallyd::sandbox::PODMAN_PATH_VAR.to_owned(),
+    )]
+    .into_iter()
+    .collect();
     let state = env.root.join("data/sallyport/podman");
     let want: std::collections::BTreeMap<String, String> = [
         ("HOME", state.join("home").display().to_string()),
@@ -793,7 +818,12 @@ fn rt_sup_04_hostile_variables_in_sallyd_s_environment_never_reach_podman() {
                 (k.to_owned(), v.to_owned())
             })
             .collect();
-        assert_eq!(got, want, "podman {}", s.argv);
+        let want = if s.exe == runtime {
+            &runtime_want
+        } else {
+            &want
+        };
+        assert_eq!(&got, want, "{}", s.argv);
         let text = format!("{}\n{}", s.env.join("\n"), s.argv);
         assert_eq!(
             hostile_values_in(&text, &hostile),
@@ -801,7 +831,6 @@ fn rt_sup_04_hostile_variables_in_sallyd_s_environment_never_reach_podman() {
             "{text}"
         );
     }
-    assert!(!canary.exists(), "a later PATH entry was run");
     let text = std::fs::read_to_string(&trace).unwrap();
     // Every process sallyd started was read: a child of the non-dumpable sallyd execs with its
     // arguments unreadable (`execve(0x…`), and each such successful exec is one seen above.
@@ -827,4 +856,84 @@ fn rt_sup_04_hostile_variables_in_sallyd_s_environment_never_reach_podman() {
         hostile.len(),
         "{own}"
     );
+}
+
+/// The version token `<name> --version` prints on its first line.
+fn version_of(bin: &Path, name: &str) -> String {
+    let out = Command::new(bin).arg("--version").output().unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    let first = text.lines().next().unwrap();
+    first
+        .strip_prefix(&format!("{name} version "))
+        .unwrap_or_else(|| panic!("{first}"))
+        .to_owned()
+}
+
+/// A daemon's oplog line at `level` with message `msg`.
+fn oplog_line<'a>(log: &'a str, level: &str, msg: &str) -> Option<&'a str> {
+    log.lines()
+        .find(|l| l.contains(&format!(" {level} ")) && l.contains(&format!("\"{msg}\"")))
+}
+
+/// R1 (architect Q125, Q128): with no `sandbox.podman_path`, the start line names the root-owned
+/// podman the system search found, its version, the source `system`, and the runtime with its
+/// version; there is no warning.
+#[test]
+fn the_daemon_records_the_system_podman_and_the_runtime_at_start() {
+    let env = Env::new();
+    let mut d = env.start();
+    terminate(&mut d);
+    let out = d.finish();
+    let log = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{log}");
+    let line = oplog_line(&log, "info", "podman resolved").unwrap_or_else(|| panic!("{log}"));
+    let podman = trusted_podman();
+    let runtime = std::fs::canonicalize(test_runtime()).unwrap();
+    for want in [
+        format!("path=\"{}\"", podman.display()),
+        format!("version=\"{}\"", version_of(&podman, "podman")),
+        "source=\"system\"".to_owned(),
+        format!("runtime=\"{}\"", runtime.display()),
+        format!("runtime_version=\"{}\"", version_of(&runtime, "crun")),
+    ] {
+        assert!(line.contains(&want), "{want}: {line}");
+    }
+    assert!(!log.contains("podman runs only because"), "{log}");
+}
+
+/// R1 (architect Q125, Q128): a podman the user owns runs only when `sandbox.podman_path` names
+/// it, and the daemon says so: the start line names the setting as the source, and a warning
+/// says why the system search would not have accepted it.
+#[test]
+fn a_configured_user_owned_podman_runs_and_the_daemon_says_so() {
+    let env = Env::new();
+    let (bin, canary) = user_podman(&env);
+    let configured = std::fs::canonicalize(bin.join("podman")).unwrap();
+    std::fs::write(
+        env.root.join("config/sallyport/config.toml"),
+        format!(
+            "[sandbox]\nruntime_path = \"{}\"\npodman_path = \"{}\"\n",
+            test_runtime().display(),
+            configured.display()
+        ),
+    )
+    .unwrap();
+    let mut d = env.start();
+    terminate(&mut d);
+    let out = d.finish();
+    let log = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{log}");
+    assert!(canary.exists(), "the configured podman never ran");
+    let path = format!("path=\"{}\"", configured.display());
+    let line = oplog_line(&log, "info", "podman resolved").unwrap_or_else(|| panic!("{log}"));
+    assert!(line.contains(&path), "{line}");
+    assert!(line.contains("source=\"sandbox.podman_path\""), "{line}");
+    let warn = oplog_line(
+        &log,
+        "warn",
+        "podman runs only because sandbox.podman_path names it",
+    )
+    .unwrap_or_else(|| panic!("{log}"));
+    assert!(warn.contains(&path), "{warn}");
+    assert!(warn.contains("why=\"not owned by root\""), "{warn}");
 }
