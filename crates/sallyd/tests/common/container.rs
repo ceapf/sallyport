@@ -698,6 +698,67 @@ impl Lx {
         );
         String::from_utf8_lossy(&out.stdout).trim().to_owned()
     }
+
+    /// A red-team control (#122, architect Q155): the product-built workspace argv for `v` and
+    /// session `tag` with exactly one defence left out (`leave_out`), created and started by
+    /// hermetic podman outside the launcher; the container id. The container carries the
+    /// session's name, so the fixture removes it.
+    ///
+    /// A [`LeaveOut::Bind`] source must lie strictly below this fixture's root (it panics
+    /// otherwise), so a control never mounts anything of the real host.
+    #[allow(dead_code)] // Only the escape and launch tests run controls.
+    pub async fn control_workspace(
+        &self,
+        v: &ValidatedManifest,
+        tag: &str,
+        leave_out: LeaveOut<'_>,
+    ) -> String {
+        let paths = self.paths(tag);
+        let dirs = SessionDirs::create(&paths, &self.xdg, &[], 0).unwrap();
+        let scan = sallyd::sandbox::scan_mounts(v, &ScanLimits::default()).unwrap();
+        let mut argv = sallyd::sandbox::workspace_argv(
+            &self.common_args(&dirs),
+            &paths,
+            v,
+            &scan,
+            Some(&test_image()),
+        )
+        .unwrap();
+        match leave_out {
+            LeaveOut::Bind { host, guest } => {
+                let root = self.f.root.canonicalize().unwrap();
+                let host = host.canonicalize().unwrap();
+                assert!(
+                    host != root && host.starts_with(&root),
+                    "a control binds only below the fixture root: {}",
+                    host.display()
+                );
+                let image = test_image();
+                let at = argv.iter().position(|a| a == image.as_str()).unwrap();
+                let spec = format!("{}:{guest}:ro,nosuid,nodev,bind", host.display());
+                argv.splice(at..at, ["-v".to_owned(), spec]);
+            }
+            LeaveOut::NonRecursive { guest } => {
+                let suffix = format!(":{guest}:");
+                let spec = argv
+                    .iter_mut()
+                    .find(|a| a.contains(&suffix) && a.ends_with(",bind"))
+                    .unwrap();
+                let recursive = format!("{}rbind", spec.strip_suffix("bind").unwrap());
+                *spec = recursive;
+            }
+        }
+        self.create_and_start(argv).await
+    }
+}
+
+/// The one defence a [`Lx::control_workspace`] container leaves out of the product argv.
+#[allow(dead_code)] // Only the escape and launch tests run controls.
+pub enum LeaveOut<'a> {
+    /// The mount set: one more `ro` bind of `host` (below the fixture root) at `guest`.
+    Bind { host: &'a Path, guest: &'a str },
+    /// Non-recursive binds: the bind at `guest` becomes `rbind`.
+    NonRecursive { guest: &'a str },
 }
 
 pub fn ids() -> UserIds {

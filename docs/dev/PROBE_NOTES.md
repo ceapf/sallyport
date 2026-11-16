@@ -109,6 +109,9 @@ line per fact, with where it was found. Check a note again before relying on it 
 - `ps --format '{{json .ID}}'` prints the 12-digit short ID; with `--no-trunc` it prints all 64
   lowercase hex digits, which is what the sweep lists and passes to `rm` (a name can be re-used
   between the listing and the removal; an ID cannot). (Task 12 PR A, review PS-L5)
+- A `-v src:dst:…,rbind` on 4.9.3 rootless carries a mount made below `src` in podman's own
+  mount namespace (`podman unshare mount --bind`) into the container; the product's `…,bind`
+  does not. RT-FS-16's control is that one word. (#122)
 
 ## Kernel and namespaces
 
