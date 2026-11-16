@@ -1,5 +1,6 @@
 //! `sally-shim` relay behaviour after a failed write: the other direction still relays, the
 //! client is discarded and cut a linger after its failed send, and its slot comes back (#76).
+//! Also the write bound toward a client that stops reading, and a reader it must not cut (#155).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;
@@ -8,7 +9,8 @@ use std::io::ErrorKind;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -193,6 +195,9 @@ fn deaf_flood_for_halfclose(s: UnixStream) {
     flood_deaf(s, &HALFCLOSE_IS_DEAF);
 }
 
+/// Its control is the discard's wait for the other direction at the client's EOF. The write
+/// bound (#155) now frees this slot too, so [`a_client_that_half_closes_after_a_failed_send_is_cut_while_the_server_trickles`]
+/// pins that control.
 #[test]
 fn a_client_that_half_closes_after_a_failed_send_and_never_reads_is_cut_a_linger_later() {
     // The client's EOF does not end the discard's bound while the reply is still blocked on
@@ -219,6 +224,9 @@ fn deaf_flood_for_silent(s: UnixStream) {
     flood_deaf(s, &SILENT_IS_DEAF);
 }
 
+/// Its control is the discard's read timeout. The write bound (#155) now frees this slot too,
+/// within a linger of the ceiling, so [`a_silent_client_after_a_failed_send_is_cut_while_the_server_trickles`]
+/// pins that control.
 #[test]
 fn a_silent_client_after_a_failed_send_is_cut_a_linger_later() {
     // Neither sends again, nor closes, nor reads: the discard's read must time out to see its
@@ -238,6 +246,9 @@ fn a_silent_client_after_a_failed_send_is_cut_a_linger_later() {
     drop(c);
 }
 
+/// Its control is the discard's own deadline. The write bound (#155) now frees this slot too,
+/// within a linger of the ceiling, so [`a_client_that_sends_on_after_a_failed_send_is_cut_while_the_server_trickles`]
+/// pins that control.
 #[test]
 fn a_client_that_sends_but_never_reads_is_cut_a_linger_after_its_failed_send() {
     // The server-to-client direction stays blocked writing to this client, so the linger after
@@ -252,6 +263,108 @@ fn a_client_that_sends_but_never_reads_is_cut_a_linger_after_its_failed_send() {
         .duration_since(started);
     assert!(refused_after >= SHORT_LINGER / 2, "{refused_after:?}");
     slot_comes_back(addr, "a client that does not read");
+}
+
+/// How long [`trickle_deaf`] writes after it stops reading: at least four lingers, so only the
+/// discard's own bounds free a slot before it ends.
+const TRICKLE_FOR: Duration = Duration::from_millis(4500);
+const _: () = assert!(TRICKLE_FOR.as_millis() >= 4 * SHORT_LINGER.as_millis());
+/// The pause between [`trickle_deaf`]'s one-byte writes: what it writes in all stays far below
+/// the buffers, so the shim's write toward the client never blocks and the write bound (#155)
+/// never fires.
+const TRICKLE_PAUSE: Duration = Duration::from_millis(100);
+
+/// Stops reading and sets `deaf`, then writes one byte (`x`) per [`TRICKLE_PAUSE`] for
+/// [`TRICKLE_FOR`], and closes.
+fn trickle_deaf(mut s: UnixStream, deaf: &AtomicBool) {
+    let _ = s.shutdown(Shutdown::Read);
+    deaf.store(true, Ordering::SeqCst);
+    let started = Instant::now();
+    while started.elapsed() < TRICKLE_FOR {
+        if s.write_all(b"x").is_err() {
+            return;
+        }
+        thread::sleep(TRICKLE_PAUSE);
+    }
+}
+
+static TRICKLE_SENDS_ON: AtomicBool = AtomicBool::new(false);
+
+fn trickle_for_sends_on(s: UnixStream) {
+    trickle_deaf(s, &TRICKLE_SENDS_ON);
+}
+
+#[test]
+fn a_client_that_sends_on_after_a_failed_send_is_cut_while_the_server_trickles() {
+    // Only the discard's own deadline cuts this client a linger after its failed send: the
+    // server's end is four lingers away, and nothing toward the client blocks.
+    let s = Scratch::new("tricksend");
+    uds_server(&s.sock(), trickle_for_sends_on);
+    let addr = start_shim_with(&s.sock(), Limiter::with_linger(1, SHORT_LINGER));
+    let mut c = connect(addr);
+    wait_for(&TRICKLE_SENDS_ON);
+    let started = Instant::now();
+    let cut = send_until_cut(
+        &mut c,
+        b"y",
+        Duration::from_millis(20),
+        SHORT_LINGER + PROMPT,
+    );
+    let after = cut.duration_since(started);
+    assert!(after >= SHORT_LINGER / 2, "{after:?}");
+    slot_comes_back(addr, "a client still sending to a trickling server");
+}
+
+static TRICKLE_HALF: AtomicBool = AtomicBool::new(false);
+
+fn trickle_for_half(s: UnixStream) {
+    trickle_deaf(s, &TRICKLE_HALF);
+}
+
+#[test]
+fn a_client_that_half_closes_after_a_failed_send_is_cut_while_the_server_trickles() {
+    // Only the discard's wait for the other direction, at the client's EOF, cuts this client
+    // a linger after its failed send: the server's end is four lingers away.
+    let s = Scratch::new("trickhalf");
+    uds_server(&s.sock(), trickle_for_half);
+    let addr = start_shim_with(&s.sock(), Limiter::with_linger(1, SHORT_LINGER));
+    let mut c = connect(addr);
+    wait_for(&TRICKLE_HALF);
+    c.write_all(b"hello").unwrap();
+    let sent = Instant::now();
+    c.shutdown(Shutdown::Write).unwrap();
+    let back =
+        slot_comes_back(addr, "a half-closed client of a trickling server").duration_since(sent);
+    assert!(
+        back >= SHORT_LINGER / 2 && back < SHORT_LINGER + PROMPT,
+        "{back:?}"
+    );
+    drop(c);
+}
+
+static TRICKLE_SILENT: AtomicBool = AtomicBool::new(false);
+
+fn trickle_for_silent(s: UnixStream) {
+    trickle_deaf(s, &TRICKLE_SILENT);
+}
+
+#[test]
+fn a_silent_client_after_a_failed_send_is_cut_while_the_server_trickles() {
+    // Only the discard's read timeout lets it see its deadline and cut this client a linger
+    // after its failed send: the server's end is four lingers away.
+    let s = Scratch::new("tricksilent");
+    uds_server(&s.sock(), trickle_for_silent);
+    let addr = start_shim_with(&s.sock(), Limiter::with_linger(1, SHORT_LINGER));
+    let mut c = connect(addr);
+    wait_for(&TRICKLE_SILENT);
+    c.write_all(b"hello").unwrap();
+    let sent = Instant::now();
+    let back = slot_comes_back(addr, "a silent client of a trickling server").duration_since(sent);
+    assert!(
+        back >= SHORT_LINGER / 2 && back < SHORT_LINGER + PROMPT,
+        "{back:?}"
+    );
+    drop(c);
 }
 
 static HALFSTOP_IS_DEAF: AtomicBool = AtomicBool::new(false);
@@ -280,4 +393,209 @@ fn a_write_error_stops_only_its_own_direction() {
     let read = c.read_to_end(&mut got);
     assert_eq!(got, b"reply", "{read:?}");
     assert!(read.is_ok(), "{read:?}");
+}
+
+/// The linger of the tests of a client that stops reading (#155). Duration only: no assertion
+/// depends on the kernel's round count. The write bound fails a write toward such a client
+/// some lingers after it blocked, as many as the kernel takes (a call that got some bytes in
+/// returns them only when its linger runs out), so these tests time everything from the
+/// moment it fails: the server's own write fails then, as the failed direction stops reading
+/// it.
+const MUTE_LINGER: Duration = Duration::from_millis(500);
+
+/// When the first connection to a [`flood_noting`] server saw its write fail; later
+/// connections are the probes of [`slot_comes_back`].
+struct FirstFailure {
+    seen: AtomicBool,
+    at: Mutex<Option<Instant>>,
+}
+
+impl FirstFailure {
+    const fn new() -> Self {
+        Self {
+            seen: AtomicBool::new(false),
+            at: Mutex::new(None),
+        }
+    }
+
+    /// When the server's write failed, which must have happened.
+    fn instant(&self) -> Instant {
+        self.at
+            .lock()
+            .unwrap()
+            .expect("the server never learned the client is gone")
+    }
+}
+
+/// Writes until a write fails, without reading and without shutting its read side: more than
+/// the buffers between it and a client that never reads hold. On the first connection, notes
+/// when the write failed in `first`.
+fn flood_noting(mut s: UnixStream, first: &FirstFailure) {
+    let is_first = !first.seen.swap(true, Ordering::SeqCst);
+    let chunk = vec![b'x'; 64 * 1024];
+    while s.write_all(&chunk).is_ok() {}
+    if is_first {
+        *first.at.lock().unwrap() = Some(Instant::now());
+    }
+}
+
+static MUTE: FirstFailure = FirstFailure::new();
+
+fn flood_for_mute(s: UnixStream) {
+    flood_noting(s, &MUTE);
+}
+
+#[test]
+fn a_client_that_neither_sends_nor_reads_is_cut_a_linger_after_its_write_fails() {
+    // #155: the server-to-client direction is blocked writing to this client. The write bound
+    // fails that write, which also stops reading the server, so its write fails; the linger
+    // after that direction's end then cuts the connection.
+    let s = Scratch::new("mute");
+    uds_server(&s.sock(), flood_for_mute);
+    let addr = start_shim_with(&s.sock(), Limiter::with_linger(1, MUTE_LINGER));
+    let c = connect(addr);
+    let back = slot_comes_back(addr, "a client that neither sends nor reads");
+    let failed = MUTE.instant();
+    assert!(
+        failed < back,
+        "the server learned only after the slot came back"
+    );
+    let after = back.duration_since(failed);
+    assert!(
+        after >= MUTE_LINGER / 2 && after < MUTE_LINGER + PROMPT,
+        "{after:?}"
+    );
+    drop(c);
+}
+
+static HALFMUTE: FirstFailure = FirstFailure::new();
+
+fn flood_for_halfmute(s: UnixStream) {
+    flood_noting(s, &HALFMUTE);
+}
+
+#[test]
+fn a_client_that_half_closes_after_its_request_and_never_reads_is_cut_when_its_write_fails() {
+    // #155: no send failed, so there is no discard, and the client-to-server direction has
+    // ended; the server-to-client direction is blocked writing to this client until the write
+    // bound fails it, and the slot comes back then.
+    let s = Scratch::new("halfmute");
+    uds_server(&s.sock(), flood_for_halfmute);
+    let addr = start_shim_with(&s.sock(), Limiter::with_linger(1, MUTE_LINGER));
+    let mut c = connect(addr);
+    c.write_all(b"hello").unwrap();
+    let sent = Instant::now();
+    c.shutdown(Shutdown::Write).unwrap();
+    let back = slot_comes_back(addr, "a client that half-closed and never reads");
+    let failed = HALFMUTE.instant();
+    assert!(
+        failed < back,
+        "the server learned only after the slot came back"
+    );
+    let after = back.duration_since(failed);
+    assert!(after < PROMPT, "{after:?}");
+    let since_sent = back.duration_since(sent);
+    assert!(since_sent >= MUTE_LINGER / 2, "{since_sent:?}");
+    drop(c);
+}
+
+static BLOCKED: FirstFailure = FirstFailure::new();
+
+fn flood_for_blocked(s: UnixStream) {
+    flood_noting(s, &BLOCKED);
+}
+
+#[test]
+fn a_client_whose_sends_block_and_that_never_reads_is_cut_a_linger_after_its_write_fails() {
+    // #155: the server neither reads nor closes, so the client's sends block without failing
+    // and there is no discard yet. The write bound fails the blocked write toward the client,
+    // which stops reading the server; its write fails and it closes, the client's send that
+    // then fails starts the discard, and the connection is cut a linger later. The client's own
+    // timeout is only a backstop.
+    let s = Scratch::new("blocked");
+    uds_server(&s.sock(), flood_for_blocked);
+    let addr = start_shim_with(&s.sock(), Limiter::with_linger(1, MUTE_LINGER));
+    let mut c = connect(addr);
+    let chunk = vec![b'a'; 16 * 1024];
+    let cut = send_until_cut(&mut c, &chunk, Duration::ZERO, T);
+    let back = slot_comes_back(addr, "a client whose sends block");
+    let failed = BLOCKED.instant();
+    assert!(failed < cut, "the client was cut before the server learned");
+    for (what, at) in [("the cut", cut), ("the slot", back)] {
+        let after = at.duration_since(failed);
+        assert!(after < MUTE_LINGER + PROMPT, "{what}: {after:?}");
+    }
+}
+
+/// How long [`steady_flow`] writes: over two lingers, so a bound that ignored the client's
+/// progress would cut the reply.
+const FLOW: Duration = Duration::from_millis(2500);
+/// What [`a_client_reading_a_large_reply_with_pauses_gets_every_byte`] reads between pauses:
+/// enough to reopen the receive window at the largest buffers seen, so each pause lets the
+/// shim's blocked write make progress.
+const BURST: usize = 1024 * 1024;
+/// The pause between bursts: well under [`SHORT_LINGER`].
+const PAUSE: Duration = Duration::from_millis(100);
+static FLOW_SENT: AtomicUsize = AtomicUsize::new(0);
+static FLOW_FAILED: AtomicBool = AtomicBool::new(false);
+static FLOW_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Writes as fast as the client lets it for [`FLOW`], then closes; how much it wrote, and
+/// whether a write failed.
+fn steady_flow(mut s: UnixStream) {
+    let chunk = vec![b'r'; 64 * 1024];
+    let started = Instant::now();
+    let mut sent = 0;
+    while started.elapsed() < FLOW {
+        if s.write_all(&chunk).is_err() {
+            FLOW_FAILED.store(true, Ordering::SeqCst);
+            break;
+        }
+        sent += chunk.len();
+    }
+    FLOW_SENT.store(sent, Ordering::SeqCst);
+    FLOW_DONE.store(true, Ordering::SeqCst);
+}
+
+#[test]
+fn a_client_reading_a_large_reply_with_pauses_gets_every_byte() {
+    // #155's bound is on progress: a write toward the client fails only after a linger in which
+    // the client accepted nothing. A client that keeps reading, with pauses under the linger,
+    // gets the whole reply however long it takes; the server writes faster than it reads for
+    // over two lingers, so the shim's write is blocked through every pause.
+    let s = Scratch::new("slowread");
+    uds_server(&s.sock(), steady_flow);
+    let mut c = connect(start_shim_with(
+        &s.sock(),
+        Limiter::with_linger(1, SHORT_LINGER),
+    ));
+    let started = Instant::now();
+    let mut buf = vec![0u8; BURST];
+    let mut got = 0;
+    'flow: while !FLOW_DONE.load(Ordering::SeqCst) {
+        let mut burst = 0;
+        while burst < BURST {
+            let n = c.read(&mut buf[burst..]).unwrap();
+            if n == 0 {
+                got += burst;
+                break 'flow;
+            }
+            burst += n;
+        }
+        got += burst;
+        thread::sleep(PAUSE);
+    }
+    let mut rest = Vec::new();
+    c.read_to_end(&mut rest).unwrap();
+    got += rest.len();
+    assert!(
+        !FLOW_FAILED.load(Ordering::SeqCst),
+        "the shim stopped relaying a client that reads"
+    );
+    assert_eq!(got, FLOW_SENT.load(Ordering::SeqCst));
+    assert!(
+        started.elapsed() > 2 * SHORT_LINGER,
+        "{:?}",
+        started.elapsed()
+    );
 }
