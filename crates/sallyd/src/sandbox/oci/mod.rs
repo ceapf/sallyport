@@ -77,6 +77,12 @@ pub fn verify(bytes: &[u8], intent: &Intent, facts: &Facts) -> Result<(), Mismat
         "linux.devices",
         "GPU inference is not verified before M3",
     )?;
+    // RT-AG-16 (#92, architect Q193): podman's record of the conmon backstop is the argv's.
+    ensure(
+        facts.paths.timeout == intent.timeout.unwrap_or(0),
+        "timeout",
+        "podman's .Config.Timeout is not the argv's --timeout",
+    )?;
     let c = config::parse(bytes)?;
     ensure(c.oci_version == "1.1.0", "ociVersion", "not 1.1.0")?;
     linux::check_hostname(&c.hostname, intent, facts)?;

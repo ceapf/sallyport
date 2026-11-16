@@ -154,6 +154,57 @@ fn a_mount_swapped_during_init_is_a_mismatch() {
     });
 }
 
+/// The short stand-in for `runtime.timeout` + 300 s in RT-AG-16, in seconds: long enough for
+/// each container to be listed after its own start.
+const BACKSTOP_STAND_IN: u64 = 15;
+
+/// RT-AG-16 (#92, architect Q60, Q196): with no `sallyd` at all, conmon ends a session's
+/// workspace container at its `--timeout`, whether it runs or is frozen with `podman pause`
+/// (as the disk watchdog freezes one), and the `--rm` cleanup then removes it. The helper
+/// asserts the product argv carries exactly `runtime.timeout` + 300 s before a short stand-in
+/// replaces the value. Control: the same product argv with `--timeout` left out
+/// (`LeaveOut::Timeout`), started alongside, is still listed after the deadline.
+#[test]
+fn rt_ag_16_conmon_ends_a_session_container_with_no_sallyd() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let v =
+            x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "ro")]));
+        let name = |tag: &str| format!("sp-ws-{}-{tag}", x.scope);
+        x.backstop_workspace(&v, "run", BACKSTOP_STAND_IN).await;
+        assert!(
+            listed_name(&name("run")),
+            "the running one, after its start"
+        );
+        let frozen = x.backstop_workspace(&v, "frz", BACKSTOP_STAND_IN).await;
+        x.hermetic(&["pause".into(), frozen]).await;
+        assert!(listed_name(&name("frz")), "the frozen one, after its start");
+        let control = x.control_workspace(&v, "ctl", LeaveOut::Timeout).await;
+        assert!(listed_name(&name("ctl")), "control: listed after its start");
+
+        let cap = std::time::Instant::now() + Duration::from_secs(BACKSTOP_STAND_IN + 60);
+        while (listed_name(&name("run")) || listed_name(&name("frz")))
+            && std::time::Instant::now() < cap
+        {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        assert!(
+            !listed_name(&name("run")),
+            "the running one outlived its --timeout"
+        );
+        assert!(
+            !listed_name(&name("frz")),
+            "the frozen one outlived its --timeout"
+        );
+        assert!(
+            listed_name(&name("ctl")),
+            "control: the container without --timeout is still listed"
+        );
+        x.hermetic(&["rm".into(), "--force".into(), control]).await;
+        assert!(!listed_name(&name("ctl")), "the control is removed");
+    });
+}
+
 /// Waits up to 20 s for the container to be gone.
 async fn gone_within_deadline(container: &str) -> bool {
     let deadline = std::time::Instant::now() + Duration::from_secs(20);

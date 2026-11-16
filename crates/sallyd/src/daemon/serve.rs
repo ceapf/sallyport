@@ -16,8 +16,9 @@
 //! a signal that arrives during startup is handled once it is done): `control.sock` is closed
 //! first, then every session is stopped `shutdown`, all at once. A container not confirmed gone,
 //! or a panic, makes `sallyd` exit non-zero; so does a second signal during the shutdown, at
-//! once. TODO(#92): a container `sallyd` cannot stop because it was killed outright is bounded by
-//! nothing yet; a `podman --timeout` backstop follows this PR (architect Q60).
+//! once. A container `sallyd` cannot stop because it was killed outright is bounded by conmon's
+//! `--timeout` backstop (#92, architect Q60): a session's container ends `runtime.timeout` +
+//! 300 s after its `podman init`, and the next start's orphan sweep removes what is left.
 
 use std::collections::BTreeSet;
 use std::os::fd::{AsRawFd, OwnedFd};

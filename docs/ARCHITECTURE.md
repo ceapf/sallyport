@@ -183,7 +183,8 @@ inert there.
 ```
   --tmpfs /tmp:rw,{noexec|exec},nosuid,nodev,size=<tmp_size>
   --pids-limit <pids> --cpus <cpus> --memory <memory>b --memory-swap <memory>b   # no swap
-  --init --env-host=false --hostname sandbox
+  --init --env-host=false --timeout <runtime.timeout + 300>   # conmon backstop, seconds (#92)
+  --hostname sandbox
   [--env {HTTP,HTTPS,ALL}_PROXY=http://127.0.0.1:3128 (and lowercase) --env NO_PROXY= --env no_proxy=]   # proxy mode
   [--env {SSL_CERT_FILE,REQUESTS_CA_BUNDLE,CURL_CA_BUNDLE,GIT_SSL_CAINFO,PIP_CERT,CARGO_HTTP_CAINFO,AWS_CA_BUNDLE}=/run/sallyport/ca-bundle.pem
    --env NODE_EXTRA_CA_CERTS=/run/sallyport/session-ca.pem]                                            # proxy mode + secrets
@@ -201,7 +202,8 @@ inert there.
 **Harness** (no mounts, no egress, no GPU; fixed 1 CPU, 1 GiB, 128 pids):
 ```
   --tmpfs /tmp:rw,noexec,nosuid,nodev,size=256MiB --pids-limit 128 --cpus 1 --memory 1GiB --memory-swap 1GiB
-  --init --env-host=false --hostname sandbox
+  --init --env-host=false --timeout <runtime.timeout + 300>   # the session's manifest (#92)
+  --hostname sandbox
   --env OPENAI_BASE_URL=http://127.0.0.1:8080/v1 --env OPENAI_API_KEY=sallyport
   -v $XDG_RUNTIME_DIR/sallyport/sessions/<id>/harness:/run/sallyport:ro,…                 # llm.sock, agent.sock (connect only)
   <harness.image or bundled harness image>@sha256:<digest> /opt/sallyport/entry
@@ -220,7 +222,17 @@ inert there.
 accepts exactly this command with only the `-ngl`/`-c` numbers varying, so `--models-dir`,
 `--models-preset`, `--slot-save-path`, `--webui*`, `--path`, `--lora`, `-hf` and every other flag
 are refused (AMENDMENTS-01 §6.2). Each role has its own socket directory; no role can see
-another's sockets. Podman configuration outside the argv (`containers.conf`, `mounts.conf`, OCI
+another's sockets.
+
+`--timeout` (#92, architect Q60, Q191–Q197) is the bound on a session's container whose
+`sallyd` was killed outright: conmon kills the container `runtime.timeout` + 300 s after its own
+`podman init` (the clock starts at `init`, not `start`; PROBE_NOTES), frozen or not, and the
+`--rm` cleanup removes it, with no `sallyd`. The workspace and the harness each carry their
+session manifest's value; `check_argv` requires exactly that value, once, as two tokens, and
+refuses a policy without one or with one no longer than the grace (podman reads 0 as none). An
+inference container carries none: it has no `runtime.timeout`, and an instance is not a
+session's. The value is not in the OCI config; the verifier (§3.5) compares podman's
+`.Config.Timeout` with it instead (0 for inference). Podman configuration outside the argv (`containers.conf`, `mounts.conf`, OCI
 hooks, `CONTAINER_HOST`) is not covered by `check_argv`; hermetic podman (§3.5) controls it.
 
 ### 3.4 Seccomp
@@ -342,7 +354,9 @@ are released only once the container is confirmed gone.
    included, parents before children), the args and environment as built plus the image's
    `Env`/`WorkingDir`, rlimits, cgroup limits with swap equal to memory, `cgroupsPath` in the
    systemd form only (doctor requires systemd), masked and read-only paths, annotations and
-   hostname. On a difference the container is removed and `sandbox.config_mismatch` is audited
+   hostname. Beside the config, podman's `.Config.Timeout` (read by the same `podman inspect`)
+   must equal the argv's `--timeout`, and 0 when it has none (#92, Q193). On a difference the
+   container is removed and `sandbox.config_mismatch` is audited
    with the first differing field (never a value of the environment or the command). GPU
    inference is refused until M3 (#116); an image with an entrypoint until #117.
 8. `podman start`, then the **running check** (Task 6c): after a 250 ms grace, `podman inspect`
@@ -938,11 +952,15 @@ TODO(#28): the harness container and `llm.sock` (Task 13, Task 12 PR C).
 - `shutdown`: SIGTERM, SIGINT, SIGHUP or SIGQUIT (handlers installed before startup work, so a
   signal during it is handled once `control.sock` is bound); `control.sock` is closed first,
   then every session stops at once. A second signal meanwhile exits non-zero at once.
-  TODO(#92): a `podman --timeout` backstop for a `sallyd` killed outright (Q60).
+  A `sallyd` killed outright stops nothing; conmon's `--timeout` backstop (§3.3, #92) ends each
+  session container `runtime.timeout` + 300 s after its `podman init`, and the next start's
+  orphan sweep removes whatever is left.
 - `start-failed`.
 - `exited`: the container ended on its own. The registry checks the init's `/proc/<pid>` fd
   every 250 ms (Q62); a lookup through it fails once that process is gone, even if its pid is
-  reused.
+  reused. The backstop's grace outlasts every wait `sallyd` adds from `podman init` to the end
+  of a timeout stop plus one 120 s podman budget (a relation test, Q194); a session whose launch
+  tail or stop meets podman hanging past that budget may instead end `exited`, by the backstop.
 
 **Stop order** (Q57, amended by Q59: once a stop returns, nothing from the session has any
 further effect):

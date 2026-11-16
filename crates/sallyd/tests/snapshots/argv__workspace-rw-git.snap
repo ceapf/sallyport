@@ -45,6 +45,8 @@ label=disable
 8589934592b
 --init
 --env-host=false
+--timeout
+7500
 --hostname
 sandbox
 -v

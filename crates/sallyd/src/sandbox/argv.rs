@@ -9,8 +9,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::time::Duration;
 
-use sally_core::manifest::{ByteSize, Cpus, MountMode, NetworkMode, ValidatedManifest};
+use sally_core::manifest::{
+    ByteSize, Cpus, Duration as ManifestDuration, MountMode, NetworkMode, ValidatedManifest,
+};
 
 use super::check::{Allowed, Grant, Source, check_argv};
 use super::oci::intent::{Built, Intent, Wanted};
@@ -63,6 +66,24 @@ const HARNESS_PIDS: u32 = 128;
 /// `/tmp` of the harness and inference containers.
 const SMALL_TMP: u64 = 256 * 1024 * 1024;
 const INFERENCE_PIDS: u32 = 64;
+/// How long past `runtime.timeout` conmon kills a session's container by itself (`--timeout`,
+/// #92, architect Q60, Q192): the bound on a workspace or harness container whose `sallyd` was
+/// killed outright. Longer than the supervisor's whole timeout stop, so `session.timeout` comes
+/// first (the relation test in `session/supervise.rs`, Q194). Counted from `podman init`.
+pub(crate) const BACKSTOP_GRACE: Duration = Duration::from_secs(300);
+
+/// The `--timeout` of a session's container, in seconds: `runtime.timeout` +
+/// [`BACKSTOP_GRACE`]. The manifest's duration has whole-second resolution, so nothing is
+/// rounded and the backstop never fires before that.
+///
+/// # Errors
+/// [`ArgvError::Input`] naming `runtime.timeout` when the sum overflows.
+pub(crate) fn backstop_secs(timeout: ManifestDuration) -> Result<u64, ArgvError> {
+    match timeout.as_secs().checked_add(BACKSTOP_GRACE.as_secs()) {
+        Some(s) => Ok(s),
+        None => input("runtime.timeout: too long for the conmon backstop"),
+    }
+}
 
 /// A path as it may appear in a `-v`, `--security-opt` or `--runtime` argument: absolute, UTF-8,
 /// and free of `:`, `,` and control characters, which would change the meaning of the argument.
@@ -197,6 +218,12 @@ impl Argv {
         }
     }
 
+    /// RT-AG-16: the conmon backstop of a session's container (#92, architect Q192).
+    fn backstop(&mut self, secs: u64) {
+        self.intent.timeout = Some(secs);
+        self.push(["--timeout", &secs.to_string()]);
+    }
+
     fn hostname(&mut self, name: &str) {
         self.intent.hostname = Some(name.to_owned());
         self.push(["--hostname", name]);
@@ -258,8 +285,15 @@ impl Argv {
 }
 
 /// The parts of [`Allowed`] every role shares.
-fn allowed(c: &CommonArgs, role: Role, sources: Vec<Source>, scratch: Option<&Path>) -> Allowed {
+fn allowed(
+    c: &CommonArgs,
+    role: Role,
+    sources: Vec<Source>,
+    scratch: Option<&Path>,
+    timeout: Option<u64>,
+) -> Allowed {
     Allowed {
+        timeout,
         role,
         runtime: c.runtime.path().to_owned(),
         hooks_dir: c.hooks_dir.clone(),
@@ -329,6 +363,8 @@ pub fn workspace_build(
         Some(m.runtime.memory.bytes()),
     );
     a.push(["--init", "--env-host=false"]);
+    let backstop = backstop_secs(m.runtime.timeout)?;
+    a.backstop(backstop);
     a.hostname("sandbox");
     workspace_env(&mut a, v);
     let mut sources = workspace_mounts(&mut a, paths, v, &scans)?;
@@ -355,6 +391,7 @@ pub fn workspace_build(
         Role::Workspace,
         sources,
         Some(paths.data_root()),
+        Some(backstop),
     ))
 }
 
@@ -545,6 +582,8 @@ pub fn harness_build(
         Some(HARNESS_MEMORY),
     );
     a.push(["--init", "--env-host=false"]);
+    let backstop = backstop_secs(v.manifest().runtime.timeout)?;
+    a.backstop(backstop);
     a.hostname("sandbox");
     a.env("OPENAI_BASE_URL", OPENAI_BASE_URL);
     a.env("OPENAI_API_KEY", HARNESS_API_KEY);
@@ -564,6 +603,7 @@ pub fn harness_build(
         Role::Harness,
         vec![source(&sockets, SOCKETS_GUEST, Grant::Ro)],
         None,
+        Some(backstop),
     ))
 }
 
@@ -625,6 +665,7 @@ pub fn inference_build(c: &CommonArgs, s: &InferenceSpec) -> Result<Built, ArgvE
             source(&s.socket_dir, SOCKETS_GUEST, Grant::Rw),
         ],
         None,
+        None,
     ))
 }
 
@@ -635,6 +676,25 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    /// RT-AG-16 (#92, architect Q192): the grace is pinned as a literal, and the backstop is
+    /// `runtime.timeout` + grace, with overflow refused.
+    #[test]
+    fn the_backstop_is_the_timeout_plus_300_s() {
+        assert_eq!(BACKSTOP_GRACE, Duration::from_secs(300));
+        let at = |secs| backstop_secs(ManifestDuration::from_secs(secs));
+        assert_eq!(at(60).unwrap(), 360);
+        assert_eq!(at(7200).unwrap(), 7500);
+        assert_eq!(at(0).unwrap(), 300);
+        assert_eq!(at(u64::MAX - 300).unwrap(), u64::MAX);
+        for secs in [u64::MAX - 299, u64::MAX] {
+            let r = at(secs);
+            assert!(
+                matches!(&r, Err(ArgvError::Input(m)) if m.starts_with("runtime.timeout")),
+                "{secs}: {r:?}"
+            );
+        }
+    }
 
     /// Each character or segment that would change a `-v`/`--security-opt` argument's meaning
     /// is refused on its own; the clean path is the control.

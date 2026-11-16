@@ -14,6 +14,7 @@ use sally_core::manifest::{Code, MAX_MANIFEST_BYTES, parse, parse_bytes, to_yaml
 
 /// The control of a return-value refusal (#122): `body`, which differs from the refused case
 /// only in the attribute under test, is accepted by the same load.
+#[track_caller]
 fn twin_ok(f: &Fixture, body: &str) {
     let r = f.load(body);
     assert!(

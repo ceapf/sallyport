@@ -13,10 +13,10 @@ use super::launch::{LaunchError, Launcher};
 /// Bytes of podman's stdout and stderr kept per command; the rest is read and dropped.
 const OUTPUT_CAP: usize = 64 * 1024;
 /// A podman command that takes longer is killed.
-const PODMAN_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const PODMAN_TIMEOUT: Duration = Duration::from_secs(120);
 /// `podman rm` attempts before a removal is reported as failed, and the pause between them.
-const RM_ATTEMPTS: u32 = 4;
-const RM_RETRY: Duration = Duration::from_secs(2);
+pub(crate) const RM_ATTEMPTS: u32 = 4;
+pub(crate) const RM_RETRY: Duration = Duration::from_secs(2);
 
 /// What `podman <kind> exists` looks for.
 #[derive(Clone, Copy)]

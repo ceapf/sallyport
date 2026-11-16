@@ -3,22 +3,24 @@
 //! expected shape, at most once unless it is a mount or an environment variable; every hardening
 //! option must be present; every `-v` source must be a declared [`Source`] with a grant that
 //! covers the requested access; overlay scratch must lie in the session's scratch directory; the
-//! image must be digest-pinned; and the command after the image must be the role's fixed command.
-//! An unforeseen flag fails closed instead of slipping past a denylist. The red-team harness also
+//! image must be digest-pinned; the command after the image must be the role's fixed command; and
+//! a session's container (workspace, harness) carries exactly the conmon backstop `--timeout` its
+//! policy names, an inference container none (#92, RT-AG-16). An unforeseen flag fails closed instead of slipping past a denylist. The red-team harness also
 //! greps argv for the forbidden flags; this is the same rule enforced in-process before launch.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use super::argv::{
-    CA_BUNDLE, CA_BUNDLE_VARS, ENTRY, HARNESS_API_KEY, INFER_SOCKET, MODEL_GUEST, OPENAI_BASE_URL,
-    PLACEHOLDER, PROXY_URL, PROXY_VARS, SESSION_CA,
+    BACKSTOP_GRACE, CA_BUNDLE, CA_BUNDLE_VARS, ENTRY, HARNESS_API_KEY, INFER_SOCKET, MODEL_GUEST,
+    OPENAI_BASE_URL, PLACEHOLDER, PROXY_URL, PROXY_VARS, SESSION_CA,
 };
 use super::types::{ArgvError, INSTALLATION_LABEL, ImageRef, Installation, Role, UserIds};
 
 /// Options written `--flag value`, as two tokens; `--flag=value` is refused, so the argv has one
 /// spelling and does not depend on how podman parses either form.
-const SPACE_FLAGS: [&str; 14] = [
+const SPACE_FLAGS: [&str; 15] = [
+    "--timeout",
     "--name",
     "--label",
     "--ulimit",
@@ -121,6 +123,11 @@ pub struct Allowed {
     pub scratch: Option<PathBuf>,
     /// The one `--label` allowed: [`INSTALLATION_LABEL`]`=<this id>` (Q64).
     pub installation: Installation,
+    /// The one `--timeout` allowed, in seconds: the conmon backstop of a session's container
+    /// (#92, architect Q192). `Some` exactly for the workspace and the harness, and then longer
+    /// than [`BACKSTOP_GRACE`] (podman reads 0 as no timeout); `None` for inference, which may
+    /// carry none.
+    pub timeout: Option<u64>,
 }
 
 fn forbid<T>(msg: impl Into<String>) -> Result<T, ArgvError> {
@@ -172,6 +179,20 @@ fn check_globals(args: &[String], a: &Allowed) -> Result<(), ArgvError> {
 }
 
 fn check_allowed(a: &Allowed) -> Result<(), ArgvError> {
+    // RT-AG-16 (#92, architect Q192): a session's container always has a backstop past the
+    // grace; an inference instance never has one.
+    match (a.role, a.timeout) {
+        (Role::Inference, None) => {}
+        (Role::Inference, Some(_)) => return forbid("an inference policy names no --timeout"),
+        (_, None) => return forbid("a workspace or harness policy must name its --timeout"),
+        (_, Some(t)) if t <= BACKSTOP_GRACE.as_secs() => {
+            return forbid(format!(
+                "--timeout {t} is not longer than the {} s backstop grace",
+                BACKSTOP_GRACE.as_secs()
+            ));
+        }
+        (_, Some(_)) => {}
+    }
     let paths = a.sources.iter().map(|s| s.path.as_path());
     let guests = a.sources.iter().map(|s| Path::new(&s.guest));
     let all = paths.chain(guests).chain(a.scratch.as_deref()).chain([
@@ -298,6 +319,11 @@ fn check_option(
         ("--security-opt", Some(v)) => security_opt(v, a),
         ("--name", Some(v)) => ok(name_ok(v, a.role)),
         ("--label", _) => fixed(&format!("{INSTALLATION_LABEL}={}", a.installation.as_str())),
+        // RT-AG-16: exactly the policy's value, in canonical digits; none without one.
+        ("--timeout", _) => match a.timeout {
+            Some(t) => fixed(&t.to_string()),
+            None => forbid("podman option --timeout is not allowed here"),
+        },
         ("--pids-limit", Some(v)) => ok(positive(v)),
         ("--cpus", Some(v)) => ok(cpus_ok(v)),
         ("--memory", Some(v)) => {
@@ -525,7 +551,7 @@ fn require(seen: &Seen, role: Role) -> Result<(), ArgvError> {
         }
     }
     if role != Role::Inference {
-        for flag in ["--memory", "--hostname"] {
+        for flag in ["--memory", "--hostname", "--timeout"] {
             if seen.count(flag) != 1 {
                 return forbid(format!("{flag} must appear exactly once"));
             }
