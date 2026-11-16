@@ -232,9 +232,11 @@ fn the_audit_writer_and_the_oplog_redact_what_is_registered() {
 
 /// Architect Q249: an egress entry written through a session's [`SessionRedacted`] sink is
 /// redacted with that session's own forms even when the writer's redactor no longer holds them
-/// (the state after the session's release): the sandbox-chosen `target` of `egress.request`,
-/// `egress.deny`, `egress.limit` and a dropped `egress.response` holds no form. Control: the
-/// same entries appended to the writer directly are in the clear.
+/// (the state after the session's release): the sandbox-chosen `host` of `egress.allow` and
+/// `egress.close` (a wildcard-allowed CONNECT host, which `audit_text` does not mask; Q266,
+/// Q279) and `target` of `egress.request`, `egress.deny`, `egress.limit` and a dropped
+/// `egress.response` hold no form. Control: the same entries appended to the writer directly
+/// are in the clear.
 #[test]
 fn a_sessions_egress_entries_are_redacted_with_its_own_forms_after_the_release() {
     let dir = scratch("own-forms");
@@ -242,13 +244,20 @@ fn a_sessions_egress_entries_are_redacted_with_its_own_forms_after_the_release()
         AuditWriter::open(&dir.join("audit"), Box::new(SystemClock)).unwrap(),
     )));
     let v = value("own");
+    let redaction = Redaction::of(forms("GITHUB_TOKEN", &v)).unwrap();
     let sink = SessionRedacted::over(
         Arc::clone(&audit) as Arc<dyn AuditSink>,
-        forms("GITHUB_TOKEN", &v),
+        Arc::new(redaction),
     );
     let entries = |mark: &str| {
         let target = format!("/x?t={v}&m={mark}");
+        let host = format!("{v}.h.test");
         [
+            (
+                "egress.allow",
+                json!({"host": host, "intercept": false, "m": mark}),
+            ),
+            ("egress.close", json!({"host": host, "m": mark})),
             (
                 "egress.request",
                 json!({"host": "h.test", "target": target}),
@@ -273,13 +282,19 @@ fn a_sessions_egress_entries_are_redacted_with_its_own_forms_after_the_release()
     }
     let text = all_text(&dir.join("audit"));
     let own: Vec<&str> = text.lines().filter(|l| l.contains("mark-own")).collect();
-    assert_eq!(own.len(), 4, "{text}");
+    assert_eq!(own.len(), 6, "{text}");
     for l in &own {
         assert!(!l.contains(&v), "{l}");
         assert!(l.contains("[REDACTED:GITHUB_TOKEN]"), "{l}");
     }
+    for l in own.iter().take(2) {
+        assert!(
+            l.contains("[REDACTED:GITHUB_TOKEN].h.test"),
+            "the host: {l}"
+        );
+    }
     let raw: Vec<&str> = text.lines().filter(|l| l.contains("mark-raw")).collect();
-    assert_eq!(raw.len(), 4, "{text}");
+    assert_eq!(raw.len(), 6, "{text}");
     assert!(raw.iter().all(|l| l.contains(&v)), "control: {raw:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }

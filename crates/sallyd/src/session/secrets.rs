@@ -29,36 +29,37 @@ use std::sync::{Arc, Mutex};
 use sally_core::audit::{AuditError, NewEntry, Redactor, SessionForms};
 use sally_core::manifest::AuditLevel;
 
+use crate::egress::redact::Redaction;
 use crate::oplog::Oplog;
 use crate::sandbox::{AuditSink, SharedAudit};
 
-/// The egress audit sink of a proxy session with secret grants (interception; without grants
-/// there are no forms): each entry is redacted with that session's own forms
-/// before it goes on to the audit log, which redacts it again with the live sessions' union
-/// (architect Q249). An egress entry can land after the session's `session.closed` and the
-/// release of its forms (an append aborted mid-write, a dropped body's report; Q251, #156);
-/// its sandbox-chosen text (`target`, `host`) is still redacted with the session's forms. The
-/// launcher wraps the session's sink right after its egress loaded the forms. Append-only:
-/// it swaps no redactor.
+/// The egress audit sink of a proxy session with secret grants (interception): every egress
+/// entry of such a session passes here (architect Q277). A session without grants is not
+/// wrapped and has no forms. Each entry is redacted with that session's own forms before it
+/// goes on to the audit log, which redacts it again with the live sessions' union (Q249). It
+/// reads the session's [`Redaction`], the same patterns
+/// [`crate::egress::authority::audit_text`] masks with (Q278). An egress entry can land after
+/// the session's `session.closed` and the release of its forms (an append aborted mid-write, a
+/// dropped body's report; Q251, #156); its sandbox-chosen text (`target`, `host`) is still
+/// redacted with the session's forms. The launcher wraps the session's sink right after its
+/// egress loaded the forms. Append-only: it swaps no redactor.
 pub(crate) struct SessionRedacted {
     inner: Arc<dyn AuditSink>,
-    redactor: Redactor,
+    redaction: Arc<Redaction>,
 }
 
 impl SessionRedacted {
-    /// `inner` with every entry redacted by `forms` first.
+    /// `inner` with every entry redacted by `redaction`'s audit patterns first.
     #[must_use]
-    pub(crate) fn over(inner: Arc<dyn AuditSink>, forms: Arc<SessionForms>) -> Self {
-        Self {
-            inner,
-            redactor: Redactor::from_forms([forms]),
-        }
+    pub(crate) const fn over(inner: Arc<dyn AuditSink>, redaction: Arc<Redaction>) -> Self {
+        Self { inner, redaction }
     }
 }
 
 impl AuditSink for SessionRedacted {
     fn append(&self, entry: NewEntry, level: AuditLevel) -> Result<(), AuditError> {
-        self.inner.append(entry.redacted(&self.redactor), level)
+        self.inner
+            .append(entry.redacted(self.redaction.audit()), level)
     }
 }
 

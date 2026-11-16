@@ -562,13 +562,13 @@ impl Launcher {
         // The forms are registered in the same closure that loaded them: no await point between,
         // and before `net.sock` is bound or the container exists (architect Q219). The session's
         // egress entries are redacted with its own forms too, so one that lands after the
-        // release is still redacted (Q249).
+        // release is still redacted (Q249, Q278).
         let s = blocking(move || {
             let mut s = egress.prepare(&dir, s).map_err(LaunchError::Egress)?;
             if let Some(i) = &s.interception {
-                let forms = Arc::clone(i.credentials().redaction().forms());
-                redactors.register(&id, Arc::clone(&forms));
-                s.audit = Arc::new(SessionRedacted::over(s.audit, forms));
+                let redaction = Arc::clone(i.credentials().redaction());
+                redactors.register(&id, Arc::clone(redaction.forms()));
+                s.audit = Arc::new(SessionRedacted::over(s.audit, redaction));
             }
             Ok(s)
         })
