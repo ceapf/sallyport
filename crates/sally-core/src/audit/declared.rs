@@ -38,6 +38,10 @@ pub(super) enum Shape {
     },
     /// A composite text, cut by [`text::cut_escaped`] at `max` bytes once assembled.
     Pieces { pieces: Vec<Piece>, max: usize },
+    /// A list of raw texts, written as a JSON array in order, each masked whole and then styled
+    /// on its own (architect Q291). Elements are never joined, so no cut spans two of them; a
+    /// value split across two elements is a form in neither, as across two args.
+    List { raws: Vec<Arc<str>>, style: Style },
 }
 
 /// One declared text: the arg it fills and how.
@@ -52,7 +56,7 @@ impl Declared {
     fn keys(&self) -> impl Iterator<Item = &'static str> {
         let cut = match &self.shape {
             Shape::Styled { cut_key, .. } => *cut_key,
-            Shape::Pieces { .. } => None,
+            Shape::Pieces { .. } | Shape::List { .. } => None,
         };
         std::iter::once(self.key).chain(cut)
     }
@@ -80,6 +84,10 @@ impl Declared {
                     })
                     .collect(),
                 max: *max,
+            },
+            Shape::List { raws, style } => Shape::List {
+                raws: raws.iter().map(mask).collect(),
+                style: *style,
             },
         };
         Self {
@@ -114,6 +122,13 @@ impl Declared {
                 }
                 let (shown, _) = text::cut_escaped(&whole, *max);
                 args.insert(self.key.to_owned(), Value::from(shown));
+            }
+            Shape::List { raws, style } => {
+                let shown: Vec<Value> = raws
+                    .iter()
+                    .map(|r| Value::from(text::styled(&redactor.redact_str(r), *style).0))
+                    .collect();
+                args.insert(self.key.to_owned(), Value::Array(shown));
             }
         }
     }

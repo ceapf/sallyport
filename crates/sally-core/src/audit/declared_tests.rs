@@ -51,6 +51,62 @@ fn every_style_is_in_the_list() {
     assert_eq!(slots, (0..STYLES.len()).collect::<Vec<_>>());
 }
 
+/// Every shape of a declared text. A new shape fails to compile here until it has a slot, and
+/// [`every_shape_is_in_the_property_test`] fails until the property test covers it.
+const fn shape_slot(s: &Shape) -> usize {
+    match s {
+        Shape::Styled { .. } => 0,
+        Shape::Pieces { .. } => 1,
+        Shape::List { .. } => 2,
+    }
+}
+
+/// The shapes [`every_style_masks_every_form_at_every_offset_before_it_cuts_or_escapes`] and
+/// [`a_composite_text_masks_each_raw_piece_then_escapes_assembles_and_cuts`] cover.
+fn tested_shapes() -> Vec<Shape> {
+    let style = Style::Hex { max: MAX };
+    vec![
+        Shape::Styled {
+            raw: Arc::from(""),
+            style,
+            cut_key: None,
+        },
+        Shape::Pieces {
+            pieces: Vec::new(),
+            max: MAX,
+        },
+        Shape::List {
+            raws: Vec::new(),
+            style,
+        },
+    ]
+}
+
+#[test]
+fn every_shape_is_in_the_property_test() {
+    let mut slots: Vec<usize> = tested_shapes().iter().map(shape_slot).collect();
+    slots.sort_unstable();
+    assert_eq!(slots, vec![0, 1, 2]);
+}
+
+/// The elements of a declared list of `raws`, resolved by `r`.
+fn listed(raws: &[&str], style: Style, r: &Redactor) -> Vec<String> {
+    let d = Declared {
+        key: "l",
+        shape: Shape::List {
+            raws: raws.iter().map(|&s| Arc::from(s)).collect(),
+            style,
+        },
+    };
+    let v = resolve(&Value::Null, &[d], r);
+    v["l"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e.as_str().unwrap().to_owned())
+        .collect()
+}
+
 /// A value with a quote, a backslash and a non-printable byte: the escape rewrites each.
 const VALUE: &str = "q\"u\\o\x01te-secret-value-0123456789";
 
@@ -118,9 +174,35 @@ fn every_style_masks_every_form_at_every_offset_before_it_cuts_or_escapes() {
                 if !matches!(style, Style::Plain { .. }) {
                     assert!(body.bytes().all(|b| (b' '..=b'~').contains(&b)), "{out:?}");
                 }
+                // Architect Q291: the same text as the first, middle and last element of a
+                // list, beside form-free neighbours that are written as on their own.
+                let n = "neighbour";
+                for at in 0..3 {
+                    let mut raws = [n, n, n];
+                    raws[at] = raw.as_str();
+                    let got = listed(&raws, style, &r);
+                    assert_eq!(got.len(), 3);
+                    assert_eq!(got[at], out, "{style:?} at {at}");
+                    for (i, e) in got.iter().enumerate().filter(|&(i, _)| i != at) {
+                        assert_eq!(e, &text::styled(n, style).0, "{style:?} {i}");
+                    }
+                }
             }
         }
     }
+}
+
+#[test]
+fn an_empty_list_is_an_empty_array() {
+    let d = Declared {
+        key: "l",
+        shape: Shape::List {
+            raws: Vec::new(),
+            style: Style::Hex { max: 9 },
+        },
+    };
+    let v = resolve(&serde_json::json!({"a": 1}), &[d], &Redactor::default());
+    assert_eq!(v, serde_json::json!({"a": 1, "l": []}));
 }
 
 /// Architect Q276: a 24-byte canary at byte 220 or straddling byte 256 of a 300+ byte text;
@@ -264,7 +346,18 @@ fn a_key_used_twice_or_args_that_are_not_an_object_collide() {
             max: 9,
         },
     };
+    let list = |key| Declared {
+        key,
+        shape: Shape::List {
+            raws: Vec::new(),
+            style: Style::Hex { max: 9 },
+        },
+    };
     let obj = serde_json::json!({"a": 1});
+    assert!(!collides(&obj, &[list("l")]));
+    assert!(collides(&obj, &[list("a")]));
+    assert!(collides(&obj, &[list("l"), pieces("l")]));
+    assert!(collides(&Value::from(1), &[list("l")]));
     assert!(!collides(&obj, &[]));
     assert!(!collides(&Value::from(1), &[]));
     assert!(!collides(&Value::Null, &[styled("t", Some("t_cut"))]));
@@ -291,6 +384,11 @@ fn redacted_masks_declared_texts_uncut_and_unescaped() {
             vec![Piece::Literal("x ".into()), Piece::Raw(Arc::from(VALUE))],
             100,
         )
+        .texts(
+            "keys",
+            vec![Arc::from("k"), Arc::from(raw.as_str())],
+            Style::HexCounted { max: 64 },
+        )
         .redacted(&r);
     let v = e.resolved(&Redactor::default());
     assert_eq!(
@@ -302,6 +400,9 @@ fn redacted_masks_declared_texts_uncut_and_unescaped() {
         .0
     );
     assert_eq!(v["action"], "x [REDACTED:Y]");
+    let masked = format!("{}\"[REDACTED:Y]", "a".repeat(300));
+    let key = text::styled(&masked, Style::HexCounted { max: 64 }).0;
+    assert_eq!(v["keys"], serde_json::json!(["k", key]));
     // Control: without the session's pass, an empty writer redactor logs the value's spelling.
     let bare = NewEntry::new(crate::audit::Actor::Sallyd, "egress.request")
         .pieces("action", vec![Piece::Raw(Arc::from(VALUE))], 100)
@@ -314,7 +415,8 @@ fn redacted_masks_declared_texts_uncut_and_unescaped() {
 fn debug_omits_declared_texts() {
     let e = NewEntry::new(crate::audit::Actor::Sallyd, "egress.request")
         .text("t", VALUE, Style::Plain { max: 99 })
-        .pieces("p", vec![Piece::Raw(Arc::from(VALUE))], 99);
+        .pieces("p", vec![Piece::Raw(Arc::from(VALUE))], 99)
+        .texts("l", vec![Arc::from(VALUE)], Style::Plain { max: 99 });
     let d = format!("{e:?}");
     assert!(!d.contains("secret-value"), "{d}");
 }

@@ -44,7 +44,7 @@ use super::message::{
     PARSE_ERROR,
 };
 use super::rate::Rate;
-use super::record::{Recorder, SHORT_STYLE, escape};
+use super::record::{Recorder, SHORT_STYLE};
 
 /// Why a call's prompt is withdrawn ([`ToolHandler::withdraw`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -580,8 +580,9 @@ fn lock<V>(m: &Mutex<V>) -> std::sync::MutexGuard<'_, V> {
 /// The `rpc.request` arguments of a `tools/call` (architect ruling Q16): which tool, and the
 /// shape of its arguments, never their values. The handler's own entry carries each tool's
 /// fields (ARCHITECTURE §4.3) before its effect. Bounded so the writer never truncates it: at
-/// most [`LOGGED_KEYS`] keys, each escaped and cut like every peer string. The tool name and a
-/// string id are declared, so the writer masks them whole before their cut (architect Q276).
+/// most [`LOGGED_KEYS`] keys, each escaped and cut like every peer string. The tool name, a
+/// string id and the keys (a declared list, Q291) are declared raw, so the writer masks them
+/// whole before their cut (architect Q276).
 fn call_entry(
     e: NewEntry,
     id: &Id,
@@ -589,20 +590,23 @@ fn call_entry(
     name: &str,
     arguments: &Map<String, Value>,
 ) -> NewEntry {
-    let keys: Vec<String> = arguments
+    // The keys go raw to the writer, which masks each whole before it cuts and escapes it
+    // (architect Q291); how many are logged is the builder's choice.
+    let keys: Vec<Arc<str>> = arguments
         .keys()
         .take(LOGGED_KEYS)
-        .map(|k| escape(k.as_bytes()))
+        .map(|k| Arc::from(k.as_str()))
         .collect();
     let bytes = serde_json::to_vec(arguments).map_or(0, |b| b.len());
     let args = json!({
         "method": "tools/call",
         "lifecycle": era.as_str(),
         "argument_count": arguments.len(),
-        "argument_keys": keys,
         "arguments_bytes": bytes,
     });
-    with_id(e, args, id).text("tool", name, SHORT_STYLE)
+    with_id(e, args, id)
+        .text("tool", name, SHORT_STYLE)
+        .texts("argument_keys", keys, SHORT_STYLE)
 }
 
 /// `e` with `args` and `id` as an audit entry shows it: a number as the arg `id`, a string

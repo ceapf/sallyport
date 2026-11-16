@@ -165,6 +165,17 @@ impl NewEntry {
         self
     }
 
+    /// Declares a list of raw texts as the arg `key`, a JSON array in order, each element masked
+    /// whole and then written in `style` on its own (architect Q291). An empty list is `[]`.
+    #[must_use]
+    pub fn texts(mut self, key: &'static str, raws: Vec<Arc<str>>, style: Style) -> Self {
+        self.texts.push(Declared {
+            key,
+            shape: Shape::List { raws, style },
+        });
+        self
+    }
+
     /// Declares a composite text as the arg `key`: `pieces` assembled once each raw piece is
     /// masked and escaped, then cut at `max` bytes ([`crate::text::cut_escaped`]).
     #[must_use]

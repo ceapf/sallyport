@@ -950,6 +950,38 @@ fn error_messages_follow_their_codes() {
     }
 }
 
+/// Architect Q291: an argument key holding a form of a live session's secret (at byte 0,
+/// straddling the 64-byte cut, with a quote, a backslash and a non-printable byte) is masked
+/// whole before it is cut and escaped. Control: the keys escaped and cut in the builder.
+#[test]
+fn argument_keys_holding_a_form_are_masked_before_their_cut() {
+    let value = "q\"u\\o\x01te-secret-value-0123456789";
+    let r = sally_core::audit::Redactor::new([("Y", value)]);
+    let straddle = format!("{}{value}", "k".repeat(50));
+    let mut arguments = Map::new();
+    for k in [value.to_owned(), straddle, "plain".to_owned()] {
+        arguments.insert(k, json!(1));
+    }
+    let e = NewEntry::new(Actor::Harness, "rpc.request");
+    let v = call_entry(e, &Id::Num(1), Era::Modern, "t", &arguments).resolved(&r);
+    let keys = v["argument_keys"].as_array().unwrap();
+    assert_eq!(keys.len(), 3, "every key is logged");
+    let spelt = sally_core::text::hex_capped(value.as_bytes(), usize::MAX).0;
+    for k in keys {
+        let k = k.as_str().unwrap();
+        for w in value
+            .as_bytes()
+            .windows(8)
+            .chain(spelt.as_bytes().windows(8))
+        {
+            let w = std::str::from_utf8(w).unwrap();
+            assert!(!k.contains(w), "{w:?} in {k:?}");
+        }
+    }
+    assert!(keys.contains(&json!("[REDACTED:Y]")), "{keys:?}");
+    assert!(keys.contains(&json!("plain")), "{keys:?}");
+}
+
 #[test]
 fn logged_ids_are_escaped() {
     let logged = |id: &Id| {
