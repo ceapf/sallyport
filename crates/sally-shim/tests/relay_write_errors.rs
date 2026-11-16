@@ -196,8 +196,9 @@ fn deaf_flood_for_halfclose(s: UnixStream) {
 }
 
 /// Its control is the discard's wait for the other direction at the client's EOF. The write
-/// bound (#155) now frees this slot too, so [`a_client_that_half_closes_after_a_failed_send_is_cut_while_the_server_trickles`]
-/// pins that control.
+/// bound (#155) now frees this slot too, so
+/// [`a_client_that_half_closes_after_a_failed_send_is_cut_while_the_server_trickles`] pins that
+/// control.
 #[test]
 fn a_client_that_half_closes_after_a_failed_send_and_never_reads_is_cut_a_linger_later() {
     // The client's EOF does not end the discard's bound while the reply is still blocked on
@@ -225,8 +226,8 @@ fn deaf_flood_for_silent(s: UnixStream) {
 }
 
 /// Its control is the discard's read timeout. The write bound (#155) now frees this slot too,
-/// within a linger of the ceiling, so [`a_silent_client_after_a_failed_send_is_cut_while_the_server_trickles`]
-/// pins that control.
+/// within a linger of the ceiling, so
+/// [`a_silent_client_after_a_failed_send_is_cut_while_the_server_trickles`] pins that control.
 #[test]
 fn a_silent_client_after_a_failed_send_is_cut_a_linger_later() {
     // Neither sends again, nor closes, nor reads: the discard's read must time out to see its
@@ -247,8 +248,9 @@ fn a_silent_client_after_a_failed_send_is_cut_a_linger_later() {
 }
 
 /// Its control is the discard's own deadline. The write bound (#155) now frees this slot too,
-/// within a linger of the ceiling, so [`a_client_that_sends_on_after_a_failed_send_is_cut_while_the_server_trickles`]
-/// pins that control.
+/// within a linger of the ceiling, so
+/// [`a_client_that_sends_on_after_a_failed_send_is_cut_while_the_server_trickles`] pins that
+/// control.
 #[test]
 fn a_client_that_sends_but_never_reads_is_cut_a_linger_after_its_failed_send() {
     // The server-to-client direction stays blocked writing to this client, so the linger after
@@ -418,14 +420,25 @@ impl FirstFailure {
         }
     }
 
-    /// When the server's write failed, which must have happened.
-    fn instant(&self) -> Instant {
-        self.at
-            .lock()
-            .unwrap()
-            .expect("the server never learned the client is gone")
+    /// When the server's write failed, waiting up to `bound` for it.
+    fn wait(&self, bound: Duration) -> Instant {
+        let started = Instant::now();
+        loop {
+            if let Some(at) = *self.at.lock().unwrap() {
+                return at;
+            }
+            assert!(
+                started.elapsed() < bound,
+                "the server never learned the client is gone"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 }
+
+/// How long the tests of a client that stops reading wait for the server's write to fail: as
+/// many kernel rounds as fit, so only the slot's own return is held to a ceiling.
+const FAILS_WITHIN: Duration = Duration::from_secs(10);
 
 /// Writes until a write fails, without reading and without shutting its read side: more than
 /// the buffers between it and a client that never reads hold. On the first connection, notes
@@ -454,12 +467,9 @@ fn a_client_that_neither_sends_nor_reads_is_cut_a_linger_after_its_write_fails()
     uds_server(&s.sock(), flood_for_mute);
     let addr = start_shim_with(&s.sock(), Limiter::with_linger(1, MUTE_LINGER));
     let c = connect(addr);
+    let failed = MUTE.wait(FAILS_WITHIN);
+    // A slot back before the failure is found at once, under the floor.
     let back = slot_comes_back(addr, "a client that neither sends nor reads");
-    let failed = MUTE.instant();
-    assert!(
-        failed < back,
-        "the server learned only after the slot came back"
-    );
     let after = back.duration_since(failed);
     assert!(
         after >= MUTE_LINGER / 2 && after < MUTE_LINGER + PROMPT,
@@ -486,12 +496,9 @@ fn a_client_that_half_closes_after_its_request_and_never_reads_is_cut_when_its_w
     c.write_all(b"hello").unwrap();
     let sent = Instant::now();
     c.shutdown(Shutdown::Write).unwrap();
+    // The failure first: the slot comes back as it happens, so the two are not ordered.
+    let failed = HALFMUTE.wait(FAILS_WITHIN);
     let back = slot_comes_back(addr, "a client that half-closed and never reads");
-    let failed = HALFMUTE.instant();
-    assert!(
-        failed < back,
-        "the server learned only after the slot came back"
-    );
     let after = back.duration_since(failed);
     assert!(after < PROMPT, "{after:?}");
     let since_sent = back.duration_since(sent);
@@ -519,7 +526,8 @@ fn a_client_whose_sends_block_and_that_never_reads_is_cut_a_linger_after_its_wri
     let chunk = vec![b'a'; 16 * 1024];
     let cut = send_until_cut(&mut c, &chunk, Duration::ZERO, T);
     let back = slot_comes_back(addr, "a client whose sends block");
-    let failed = BLOCKED.instant();
+    // Noted before the server closes, which is what leads to the cut.
+    let failed = BLOCKED.wait(PROMPT);
     assert!(failed < cut, "the client was cut before the server learned");
     for (what, at) in [("the cut", cut), ("the slot", back)] {
         let after = at.duration_since(failed);

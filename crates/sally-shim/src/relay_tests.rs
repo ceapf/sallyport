@@ -195,14 +195,32 @@ fn a_timed_out_write_toward_the_client_is_a_failed_write() {
     }
 }
 
+/// A scratch directory, removed on drop (also when a test panics).
+struct ScratchDir(std::path::PathBuf);
+
+impl ScratchDir {
+    fn create(name: &str) -> Self {
+        // Short: a Unix socket path is limited to 107 bytes.
+        let dir = std::env::temp_dir().join(format!("shu{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[test]
 fn relay_connection_bounds_writes_to_the_client_by_the_limiter_s_linger() {
-    // A linger other than the default, so the value is the limiter's.
+    // A linger other than the default, so the value is the limiter's; a whole number of clock
+    // ticks at every kernel tick rate (100, 250, 300, 1000 Hz), so it reads back exactly.
     let linger = Duration::from_millis(1700);
-    let dir = std::env::temp_dir().join(format!("shu{}-wired", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let sock = dir.join("u.sock");
+    let dir = ScratchDir::create("wired");
+    let sock = dir.0.join("u.sock");
     // The server closes at once and the client is gone, so the relay ends promptly.
     let server = std::os::unix::net::UnixListener::bind(&sock).unwrap();
     let closing = thread::spawn(move || drop(server.accept()));
@@ -213,9 +231,12 @@ fn relay_connection_bounds_writes_to_the_client_by_the_limiter_s_linger() {
     drop(client);
     let limiter = Limiter::with_linger(1, linger);
     let slot = limiter.admit().unwrap();
-    relay_connection(tcp, &sock, &limiter, &slot).unwrap();
+    let relayed = relay_connection(tcp, &sock, &limiter, &slot);
+    // Wakes the server's accept if the relay never connected, so the join below cannot hang;
+    // harmless if it did (refused, or queued on a listener about to close).
+    let _ = std::os::unix::net::UnixStream::connect(&sock);
     closing.join().unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
+    relayed.unwrap();
     assert_eq!(seen.write_timeout().unwrap(), Some(linger));
 }
 
@@ -223,6 +244,7 @@ fn relay_connection_bounds_writes_to_the_client_by_the_limiter_s_linger() {
 fn write_wait_bounds_each_later_write_on_a_tcp_stream() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let tcp = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    // A whole number of clock ticks at every kernel tick rate, so it reads back exactly.
     let wait = Duration::from_millis(1500);
     tcp.write_wait(wait).unwrap();
     assert_eq!(tcp.write_timeout().unwrap(), Some(wait));

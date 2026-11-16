@@ -187,8 +187,8 @@ trait Half: Send + Sync + 'static {
     fn read_wait(&self, wait: Duration);
     /// Bounds each later write call to `wait`: a call that gets no byte accepted in that time
     /// fails with `WouldBlock` or `TimedOut`; one that got some returns them when its bound runs
-    /// out, and `write_all` goes on with the rest in a new call with a fresh bound. A zero `wait` gives the smallest
-    /// bound the platform keeps, never none.
+    /// out, and [`Half::write_all_to`] (std's `write_all`) goes on with the rest in a new call
+    /// with a fresh bound. A zero `wait` gives the smallest bound the platform keeps, never none.
     ///
     /// # Errors
     /// The error setting the bound; the stream is then not relayed.
@@ -241,10 +241,13 @@ half!(UnixStream);
 /// only when its linger runs out, and so does each later call that found room the client's
 /// kernel made meanwhile; that count is the kernel's, finite because the client's receive
 /// buffer is. A client that keeps reading, with pauses under the linger, is not cut by this
-/// bound. Writes to the server are not bounded here: `sallyd` keeps its own limits.
+/// bound, as long as its reads free room in the send queue (see [`LINGER`]). A client cut this
+/// way that reads again gets what was queued for it, then an EOF: the reply cut short ends like
+/// a complete one, and only the relayed protocol's framing tells them apart. Writes to the
+/// server are not bounded here: `sallyd` keeps its own limits.
 ///
 /// # Errors
-/// Failure to connect to `socket`, to bound writes to the client, or to start the copy thread;
+/// Failure to bound writes to the client, to connect to `socket`, or to start the copy thread;
 /// a panicked copy thread.
 fn relay_connection(
     tcp: TcpStream,
@@ -252,9 +255,10 @@ fn relay_connection(
     limiter: &Arc<Limiter>,
     _slot: &Slot,
 ) -> io::Result<()> {
+    // Before the connect, so a connection that cannot be bounded never reaches the server.
+    tcp.write_wait(limiter.linger)?;
     let uds = UnixStream::connect(socket)?;
     let _ = tcp.set_nodelay(true);
-    tcp.write_wait(limiter.linger)?;
     let (tcp, uds) = (Arc::new(tcp), Arc::new(uds));
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let (down_done_tx, down_done_rx) = mpsc::channel::<()>();
