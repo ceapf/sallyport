@@ -7,8 +7,12 @@ use sally_core::audit::{AuditError, NewEntry};
 use sally_core::manifest::AuditLevel;
 use serde_json::Value;
 
+use sally_proto::Stream;
+
 use super::record::Recorder;
 use crate::sandbox::AuditSink;
+use crate::tools::ops::DISCONNECT;
+use crate::tools::shell::{AttachIo, Chunk, Ran, Status, Streamer};
 
 /// One recorded entry.
 #[derive(Debug, Clone, PartialEq)]
@@ -103,6 +107,97 @@ pub struct Held(Arc<Sink>);
 impl Drop for Held {
     fn drop(&mut self) {
         self.0.hold(false);
+    }
+}
+
+/// What the fake attached command does.
+#[derive(Clone, Copy, Debug)]
+pub enum Mode {
+    /// Prints `hi\n` and exits with this code.
+    Exit(i32),
+    /// Echoes its input to stdout until the input ends, then exits 0.
+    Echo,
+    /// Never reads its input; runs until its connection is gone (`killed: disconnect`) or it
+    /// is released (exits 0).
+    Deaf,
+    /// Prints `n` lines of 1 KiB, then exits 0.
+    Lines(usize),
+    /// `podman exec` could not be run.
+    Fail,
+}
+
+/// A stand-in for the attached command's runner (`tools::exec::PodmanExec`).
+pub struct FakeExec {
+    pub mode: Mode,
+    /// Each command's argv and directory.
+    pub seen: Mutex<Vec<(Vec<String>, String)>>,
+    /// Ends a [`Mode::Deaf`] command.
+    pub release: tokio::sync::Notify,
+}
+
+impl FakeExec {
+    pub fn new(mode: Mode) -> Arc<Self> {
+        Arc::new(Self {
+            mode,
+            seen: Mutex::default(),
+            release: tokio::sync::Notify::new(),
+        })
+    }
+}
+
+impl Streamer for Arc<FakeExec> {
+    async fn attach(&self, argv: &[String], cwd: &str, mut io: AttachIo) -> Ran {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((argv.to_vec(), cwd.to_owned()));
+        let ran = |status, stdin, stdout| Ran {
+            status,
+            stdin,
+            stdout,
+            stderr: 0,
+        };
+        let say = |text: String| Chunk {
+            stream: Stream::Stdout,
+            text,
+        };
+        match self.mode {
+            Mode::Exit(code) => {
+                let _ = io.output.send(say("hi\n".into())).await;
+                ran(Status::Exited(code), 0, 3)
+            }
+            Mode::Echo => {
+                let mut n = 0u64;
+                while let Some(i) = io.input.recv().await {
+                    n += i.data.len() as u64;
+                    let _ = io
+                        .output
+                        .send(say(String::from_utf8(i.data).unwrap()))
+                        .await;
+                    let _ = i.done.send(true);
+                    if i.eof {
+                        break;
+                    }
+                }
+                ran(Status::Exited(0), n, n)
+            }
+            Mode::Deaf => {
+                tokio::select! {
+                    _ = io.disconnect.wait_for(|g| *g) => ran(Status::Killed(DISCONNECT), 0, 0),
+                    () = self.release.notified() => ran(Status::Exited(0), 0, 0),
+                }
+            }
+            Mode::Lines(n) => {
+                for i in 0..n {
+                    let line = format!("{i:04}{}\n", "x".repeat(1019));
+                    if io.output.send(say(line)).await.is_err() {
+                        break;
+                    }
+                }
+                ran(Status::Exited(0), 0, (n * 1024) as u64)
+            }
+            Mode::Fail => ran(Status::Failed("podman exec: gone".into()), 0, 0),
+        }
     }
 }
 

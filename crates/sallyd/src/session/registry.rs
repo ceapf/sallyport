@@ -40,6 +40,7 @@ use crate::llm::scripted::Script;
 use crate::oplog::Oplog;
 use crate::rpc::agent::Agent;
 use crate::rpc::drive::{CallFn, Driver};
+use crate::rpc::line::{Line, LineParts};
 use crate::rpc::record::Recorder;
 use crate::sandbox::{
     ArgvError, AuditSink, ImageRef, LaunchError, Launcher, Podman, Running, SessionPaths, UserIds,
@@ -163,6 +164,8 @@ pub(super) struct Live {
     crash: Option<CrashReporter>,
     /// The drive handle of a driven session (architect Q117).
     driver: Option<Arc<Driver>>,
+    /// Its line mode; `None` for a workspace whose session never started.
+    line: Option<Arc<Line<PodmanExec>>>,
     requests: mpsc::Sender<Request>,
 }
 
@@ -316,6 +319,15 @@ impl Registry {
             record
         };
         let (agent, desk) = self.agent(&manifest, &running, &record, &ops, &crash);
+        // Line mode: the shell tool's runner, its default directory, the session's one audit
+        // handle and operations (architect Q101, Q146).
+        let line = Line::build(LineParts {
+            exec: PodmanExec::new(self.p.podman.clone(), &running, ops.clone()),
+            record: record.clone(),
+            ops: ops.clone(),
+            crash: crash.clone(),
+            cwd: tools::default_cwd(&tools::mounts(&manifest, &running.init_dir())),
+        });
         let model = model_of(script.as_ref());
         let start = NewEntry::new(Actor::Sallyd, "session.start")
             .session(&sid)
@@ -368,6 +380,7 @@ impl Registry {
                 desk: Some(desk.clone()),
                 crash: Some(crash.clone()),
                 driver,
+                line: Some(line),
                 requests: tx.clone(),
             },
         );
@@ -474,6 +487,7 @@ impl Registry {
                 desk: None,
                 crash: None,
                 driver: None,
+                line: None,
                 requests: tx,
             },
         );
@@ -536,6 +550,25 @@ impl Registry {
         }
     }
 
+    /// Stops session `id`, `disconnect`: the connection it was bound to closed (architect
+    /// Q150). No client is told; a failed stop is an oplog line here, and the control socket
+    /// writes its `session.refuse`.
+    pub async fn stop_disconnected(&self, id: &str) -> Option<StopOutcome> {
+        let outcome = self.stop(id, StopReason::Disconnect).await;
+        if matches!(outcome, Some(StopOutcome::Failed(_))) {
+            self.p
+                .oplog
+                .error(LOG, "bound session not stopped", &[("session", id)]);
+        }
+        outcome
+    }
+
+    /// Session `id`'s line mode (architect Q101).
+    #[must_use]
+    pub fn line(&self, id: &str) -> Option<Arc<Line<PodmanExec>>> {
+        self.live().get(id).and_then(|l| l.line.clone())
+    }
+
     /// Refuses new sessions and stops every live one (`shutdown`), all at once: each session is
     /// asked in a task of its own, so one with a full request queue delays no other (R7). The
     /// ids of sessions whose container could not be confirmed gone; `sallyd` then exits
@@ -571,8 +604,21 @@ impl Registry {
 /// The control socket's sessions (architect Q86): pure delegation, proved by the container
 /// tests in `tests/control.rs`.
 impl crate::rpc::control_methods::SessionSet for Arc<Registry> {
+    type Exec = PodmanExec;
+
     fn list(&self) -> Vec<SessionInfo> {
         Registry::list(self)
+    }
+
+    fn line(&self, id: &str) -> Option<Arc<Line<PodmanExec>>> {
+        Registry::line(self, id)
+    }
+
+    fn stop_disconnected(
+        &self,
+        id: &str,
+    ) -> impl std::future::Future<Output = Option<StopOutcome>> + Send {
+        Registry::stop_disconnected(self, id)
     }
 
     fn desk(&self, id: &str) -> Option<Desk> {
@@ -654,6 +700,7 @@ mod tests {
                 desk: None,
                 crash: None,
                 driver: None,
+                line: None,
                 requests,
             },
         )]);

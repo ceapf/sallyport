@@ -387,6 +387,7 @@ async fn serve(
         // Architect Q87: no secret store yet, so a manifest granting one is refused at
         // validation (`manifest.refuse`). TODO(#99): the store's names.
         catalog: Arc::new(BTreeSet::<String>::new()),
+        crash: crash.clone(),
     }))
     .listen(bind_control(lock)?, ids.uid, crash.clone());
     log.info(LOG, "serving", &[("socket", CONTROL_SOCK)]);

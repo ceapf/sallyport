@@ -48,6 +48,7 @@ fn cx() -> Cx {
         sessions_dir: Arc::new(sessions_dir),
         env: Arc::new(x.f.env.clone()),
         catalog: Arc::new(BTreeSet::<String>::new()),
+        crash: sallyd::daemon::crash::CrashReporter::channel().0,
     }));
     Cx { x, control }
 }

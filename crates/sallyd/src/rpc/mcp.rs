@@ -58,7 +58,7 @@ pub const SESSION_METHODS: [&str; 7] = [
 ];
 /// The control socket's methods (architect Q72): the wire names `sally-proto` shares with the
 /// CLI. Every other method is `-32601`.
-pub const CONTROL_METHODS: [&str; 8] = sally_proto::method::ALL;
+pub const CONTROL_METHODS: [&str; 10] = sally_proto::method::ALL;
 
 /// The lifecycle a request is served under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

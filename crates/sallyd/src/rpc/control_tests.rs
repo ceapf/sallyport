@@ -18,7 +18,8 @@ use crate::rpc::control_methods::{
     DETAIL_CHARS, ID_CHARS, MAX_ERROR_LINES, REPLY_BYTES, error_lines, fit,
 };
 use crate::rpc::drive::Driver;
-use crate::rpc::testkit::{Row, Sink, recorder};
+use crate::rpc::line::Line;
+use crate::rpc::testkit::{FakeExec, Row, Sink, recorder};
 use crate::sandbox::LaunchError;
 use crate::session::{SessionInfo, SessionState, StartError, StopOutcome};
 
@@ -40,6 +41,10 @@ struct Fake {
     drivers: StdMutex<std::collections::HashMap<String, Arc<Driver>>>,
     /// The script each start was given (`None`: no model).
     scripts: StdMutex<Vec<Option<Script>>>,
+    /// The line modes of the sessions among `live` that have one.
+    lines: StdMutex<std::collections::HashMap<String, Arc<Line<Arc<FakeExec>>>>>,
+    /// The sessions stopped because their bound connection closed.
+    disconnected: StdMutex<Vec<String>>,
 }
 
 fn info(id: &str) -> SessionInfo {
@@ -53,8 +58,26 @@ fn info(id: &str) -> SessionInfo {
 }
 
 impl SessionSet for Arc<Fake> {
+    type Exec = Arc<FakeExec>;
+
     fn driver(&self, id: &str) -> Option<Arc<Driver>> {
         self.drivers.lock().unwrap().get(id).cloned()
+    }
+
+    fn line(&self, id: &str) -> Option<Arc<Line<Arc<FakeExec>>>> {
+        self.lines.lock().unwrap().get(id).cloned()
+    }
+
+    fn stop_disconnected(&self, id: &str) -> impl Future<Output = Option<StopOutcome>> + Send {
+        let known = self.live.lock().unwrap().iter().any(|(i, _)| i.id == id);
+        let r = known.then(|| {
+            self.disconnected.lock().unwrap().push(id.to_owned());
+            match self.stop_fails.lock().unwrap().clone() {
+                Some(why) => StopOutcome::Failed(why),
+                None => StopOutcome::Stopped,
+            }
+        });
+        async move { r }
     }
 
     fn list(&self) -> Vec<SessionInfo> {
@@ -163,6 +186,7 @@ fn fx_with(tag: &str, catalog: BTreeSet<String>) -> Fx {
         sessions_dir: Arc::new(sessions_dir),
         env: Arc::new(env()),
         catalog: Arc::new(catalog),
+        crash: crate::daemon::crash::CrashReporter::channel().0,
     }));
     Fx {
         control,
@@ -342,10 +366,10 @@ async fn exchange(lines: &[&[u8]]) -> (Vec<Value>, Vec<Row>) {
     (replies, f.rows())
 }
 
-/// Architect Q72, Q117: exactly these eight, in this order, and the CLI's names are the same
-/// ones.
+/// Architect Q72, Q117, Q153: exactly these ten, in this order, and the CLI's names are the
+/// same ones.
 #[test]
-fn the_control_table_is_exactly_the_eight_methods() {
+fn the_control_table_is_exactly_the_ten_methods() {
     assert_eq!(
         CONTROL_METHODS,
         [
@@ -354,6 +378,8 @@ fn the_control_table_is_exactly_the_eight_methods() {
             "sessions.stop",
             "sessions.changes",
             "sessions.drive",
+            "sessions.attach",
+            "sessions.input",
             "approvals.list",
             "approvals.decide",
             "approvals.watch",
@@ -378,10 +404,13 @@ fn every_method_parses_names_itself_and_only_reads_are_rated() {
         json!({"id": "s-1"}),
         json!({"id": "s-1"}),
         json!({"id": "s-1"}),
+        json!({"id": "s-1", "argv": ["sh"]}),
+        json!({"id": "s-1", "data": "x"}),
         json!({}),
         json!({"id": "a", "decision": "deny", "digest": "d"}),
         json!({}),
     ];
+    assert_eq!(params.len(), CONTROL_METHODS.len());
     let mut rated = Vec::new();
     let mut rated_watching = Vec::new();
     for (m, p) in CONTROL_METHODS.iter().zip(params) {
@@ -1387,3 +1416,6 @@ async fn reads_are_rated_daemon_wide() {
 
 #[path = "control_drive_tests.rs"]
 mod drive;
+
+#[path = "control_line_tests.rs"]
+mod line_mode;

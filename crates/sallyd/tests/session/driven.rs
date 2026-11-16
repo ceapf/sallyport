@@ -192,6 +192,7 @@ async fn drive_over_control(r: &Rx, id: &str) -> Value {
         sessions_dir: Arc::new(sallyd::sandbox::open_sessions(&state).unwrap()),
         env: Arc::new(r.x.f.env.clone()),
         catalog: Arc::new(std::collections::BTreeSet::<String>::new()),
+        crash: sallyd::daemon::crash::CrashReporter::channel().0,
     }));
     let (client, server) = tokio::io::duplex(1 << 20);
     let peer = sallyd::rpc::listen::Peer { uid: 1000, pid: 7 };
