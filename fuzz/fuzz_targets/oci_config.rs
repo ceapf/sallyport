@@ -51,6 +51,9 @@ fn fixture() -> (Intent, Facts) {
             static_dir: s,
             run_dir: r,
             id,
+            // The intent names no `--timeout`, so podman's record is 0 and every input reaches
+            // the config parser (#92).
+            timeout: 0,
         },
         image: ImageConfig {
             env: Some(vec!["PATH=/usr/bin:/bin".into()]),
