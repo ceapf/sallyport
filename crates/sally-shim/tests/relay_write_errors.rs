@@ -526,7 +526,7 @@ fn a_client_whose_sends_block_and_that_never_reads_is_cut_a_linger_after_its_wri
     let chunk = vec![b'a'; 16 * 1024];
     let cut = send_until_cut(&mut c, &chunk, Duration::ZERO, T);
     let back = slot_comes_back(addr, "a client whose sends block");
-    // Noted before the server closes, which is what leads to the cut.
+    // Noted when the shim's write toward the client failed, about a linger before the cut.
     let failed = BLOCKED.wait(PROMPT);
     assert!(failed < cut, "the client was cut before the server learned");
     for (what, at) in [("the cut", cut), ("the slot", back)] {

@@ -242,8 +242,9 @@ half!(UnixStream);
 /// kernel made meanwhile; that count is the kernel's, finite because the client's receive
 /// buffer is. A client that keeps reading, with pauses under the linger, is not cut by this
 /// bound, as long as its reads free room in the send queue (see [`LINGER`]). A client cut this
-/// way that reads again gets what was queued for it, then an EOF: the reply cut short ends like
-/// a complete one, and only the relayed protocol's framing tells them apart. Writes to the
+/// way that reads again gets what was queued for it, then an EOF (a reset instead, if it had
+/// sent bytes the relay never read): the reply cut short then ends like a complete one, and only
+/// the relayed protocol's framing tells them apart. Writes to the
 /// server are not bounded here: `sallyd` keeps its own limits.
 ///
 /// # Errors
