@@ -468,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn caps_hold_at_their_boundaries() {
+    fn rt_drv_08_caps_hold_at_their_boundaries() {
         assert_eq!((MAX_LINE_BYTES, MAX_CALLS), (64 * 1024, 8));
         let call = "{\"name\":\"a\",\"arguments\":{}}";
         let calls = |n: usize| format!("{{\"tool_calls\":[{}]}}", vec![call; n].join(","));

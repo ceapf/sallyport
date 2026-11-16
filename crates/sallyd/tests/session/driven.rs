@@ -210,6 +210,65 @@ async fn drive_over_control(r: &Rx, id: &str) -> Value {
 /// teardown's `sandbox.*`, written by the launcher, may follow; ARCHITECTURE §5.4), a step on the
 /// same seat afterwards is refused and writes nothing, and a drive over the control socket finds
 /// no session.
+/// One scripted `fs_write` of `/workspace/p/late.txt`.
+const LATE_WRITE: &str = "{\"tool_calls\":[{\"name\":\"fs_write\",\"arguments\":\
+    {\"path\":\"/workspace/p/late.txt\",\"content_b64\":\"bGF0ZQ==\"}}]}\n";
+
+/// RT-DRV-03, the seal (#122, architect Q176): a driven `fs_write` whose `tool.run` append is
+/// still running past the drain keeps one operation in flight. The step began before the stop,
+/// so `Seat::step`'s check cannot refuse it: only the seal holds it. The stop answers failed,
+/// `session.stop {in_flight: 1}` follows that `tool.run`, the file is untouched, and no entry of
+/// the session follows `session.stop`. The write's `tool.result` either lands before it, aborted,
+/// or is refused by the seal with an oplog line naming it (the order is a race once the append is
+/// released, as in RT-AG-15).
+#[test]
+fn rt_drv_03_a_driven_call_past_the_drain_writes_nothing_after_the_stop() {
+    rt().block_on(async {
+        let r = registry();
+        let at = r.x.f.root.join("home/code/drv03b");
+        std::fs::create_dir_all(&at).unwrap();
+        let v = Arc::new(r.x.f.load(&format!(
+            "{}tools:\n  builtin: [fs_write]\n",
+            mounts(&[mount("~/code/drv03b", "/workspace/p", "rw")])
+        )));
+        let s = r.reg.start_with(v, Some(script(LATE_WRITE))).await.unwrap();
+        r.x.events.hold(&["tool.run"]);
+        let seat = r.reg.driver(&s.id).unwrap().claim().unwrap();
+        let step = tokio::spawn(async move { seat.step().await });
+        r.x.events.until_parked("tool.run", 1).await;
+        let stopping = {
+            let reg = Arc::clone(&r.reg);
+            let id = s.id.clone();
+            tokio::spawn(async move { reg.stop(&id, StopReason::Request).await })
+        };
+        // Past the drain (5 s): the operation is still in flight, its entry still being written.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(!r.x.events.list().contains(&"session.stop".to_owned()));
+        r.x.events.hold(&[]);
+        let outcome = stopping.await.unwrap();
+        assert!(
+            matches!(outcome, Some(StopOutcome::Failed(ref w)) if w.contains("1 operations")),
+            "{outcome:?}"
+        );
+        let stepped = step.await.unwrap();
+        assert_eq!(stepped, Stepped::Refused("session-stopping"), "{stepped:?}");
+        let (stop_at, after) = after_stop(&r.x);
+        assert!(after.is_empty(), "after session.stop: {after:?}");
+        let all = r.x.events.all();
+        assert_eq!(all[stop_at].1["in_flight"], 1, "{all:#?}");
+        let run = all.iter().position(|(e, _)| e == "tool.run").unwrap();
+        assert!(run < stop_at, "{all:#?}");
+        assert!(!at.join("late.txt").exists(), "the write touched the file");
+        match all.iter().position(|(e, _)| e == "tool.result") {
+            Some(i) => {
+                assert!(i < stop_at, "{all:#?}");
+                assert_eq!(all[i].1["outcome"], "aborted", "{all:#?}");
+            }
+            None => r.until_logged("entry refused after session.stop").await,
+        }
+    });
+}
+
 #[test]
 fn rt_drv_03_nothing_of_a_drive_follows_the_stop() {
     rt().block_on(async {
