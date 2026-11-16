@@ -431,7 +431,7 @@ mod tests {
             p.sha256(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
-        assert!(Payload::new(b"abc".to_vec()) == p);
+        assert_eq!(Payload::new(b"abc".to_vec()), p);
     }
 
     #[test]

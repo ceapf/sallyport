@@ -140,6 +140,8 @@ fn common_args(dir: &Path, runtime_dir: &str) -> CommonArgs {
     use std::os::unix::fs::PermissionsExt;
     let bin = dir.join(runtime_dir);
     std::fs::create_dir_all(&bin).unwrap();
+    // Whatever the umask: the check refuses a group-writable directory above the binary.
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     let crun = bin.join("crun");
     std::fs::write(&crun, "#!/bin/sh\n").unwrap();
     std::fs::set_permissions(&crun, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -161,19 +163,28 @@ fn common_args(dir: &Path, runtime_dir: &str) -> CommonArgs {
 /// clean settings are the control.
 #[test]
 fn begin_refuses_each_unclean_path_by_its_label() {
-    let dir = std::env::current_dir()
-        .unwrap()
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/argv-unit")
         .join(format!("begin-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let dir = std::fs::canonicalize(&dir).unwrap();
+    let _gone = Gone(dir.clone());
     let ok = common_args(&dir, "bin");
     let a = Argv::begin(&ok, "sp-ws-s".to_owned(), Role::Workspace).unwrap();
-    let crun = ok.runtime.path().to_str().unwrap();
+    let path = |p: &Path| p.to_str().unwrap().to_owned();
+    let prefix = [
+        "--runtime".to_owned(),
+        path(ok.runtime.path()),
+        "--hooks-dir".to_owned(),
+        path(&ok.hooks_dir),
+        "--default-mounts-file".to_owned(),
+        path(&ok.mounts_file),
+        "create".to_owned(),
+    ];
+    assert_eq!(a.args.get(..prefix.len()), Some(&prefix[..]));
     let seccomp = format!("seccomp={}/seccomp-workspace.json", ok.profiles.display());
-    let wanted = ["--runtime", crun, "create", "sp-ws-s", "--network=none"];
-    for want in wanted.iter().chain([&seccomp.as_str()]) {
+    for want in ["sp-ws-s", "--network=none", seccomp.as_str()] {
         assert!(a.args.iter().any(|x| x == want), "{want}: {:?}", a.args);
     }
     let bad = dir.join("a,b");
@@ -209,5 +220,13 @@ fn begin_refuses_each_unclean_path_by_its_label() {
             "{label}: {e:?}"
         );
     }
-    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Removes its directory on drop, so a failing assertion leaves nothing behind.
+struct Gone(PathBuf);
+
+impl Drop for Gone {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
