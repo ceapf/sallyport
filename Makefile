@@ -132,7 +132,7 @@ MUTANTS_WIDE_SALLYD := $(addprefix crates/sallyd/src/sandbox/,argv.rs check.rs t
                        oci/intent.rs oci/linux.rs oci/mounts.rs oci/process.rs oci/seccomp.rs) \
                        $(addprefix crates/sallyd/src/daemon/,mod.rs crash.rs startup.rs stale.rs install.rs) \
                        crates/sallyd/src/oplog.rs \
-                       $(addprefix crates/sallyd/src/session/,lookup.rs types.rs exit.rs) \
+                       $(addprefix crates/sallyd/src/session/,lookup.rs types.rs exit.rs secrets.rs) \
                        $(addprefix crates/sallyd/src/egress/,addr.rs authority.rs head.rs policy.rs server.rs \
                        hostaddrs.rs tunnel.rs net.rs ca.rs roots.rs rewrite.rs intercept.rs \
                        intercept_tls.rs intercept_report.rs meter.rs inject.rs redact.rs local.rs) \

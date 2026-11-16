@@ -464,10 +464,12 @@ impl Registry {
     /// `session.stop`). One that cannot be confirmed gone stays listed as stop-failed, under a
     /// supervisor that retries it on request (and at shutdown).
     async fn discard(self: &Arc<Self>, running: Running, manifest: &str) {
+        let sid = running.paths().id().as_str().to_owned();
         let Err(r) = self.stop_bounded(running).await else {
+            // Its last entry is written and it is gone (architect Q219).
+            self.p.launcher.release_secrets(&sid);
             return;
         };
-        let sid = r.paths().id().as_str().to_owned();
         self.p.oplog.error(
             LOG,
             "workspace of a failed start not confirmed gone",

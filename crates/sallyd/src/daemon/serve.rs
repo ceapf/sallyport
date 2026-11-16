@@ -51,6 +51,7 @@ use crate::sandbox::{
     outside_system_rule, probe_version, resolve_podman, version_error,
 };
 use crate::session::lookup::{NoSecrets, SharedEgress};
+use crate::session::secrets::{RedactorTarget, Redactors};
 use crate::session::{Registry, RegistryParts};
 
 /// The trusted clients' socket in the locked runtime directory.
@@ -216,13 +217,21 @@ pub fn run(log: &Oplog) -> Result<(), DaemonError> {
     let lock = startup::open_and_lock(&dirs.runtime)?;
     let config = read_config(&dirs.paths.config_file())?;
     let audit = AuditWriter::open(&dirs.paths.audit(), Box::new(SystemClock))?;
-    let audit: Arc<dyn AuditSink> = Arc::new(SharedAudit(Mutex::new(audit)));
+    let shared = Arc::new(SharedAudit(Mutex::new(audit)));
+    // The same writer the launcher appends to, and the oplog: the two redactor targets
+    // (architect Q220).
+    let redactors = Arc::new(Redactors::new(vec![
+        Arc::clone(&shared) as Arc<dyn RedactorTarget>,
+        Arc::new(log.clone()) as Arc<dyn RedactorTarget>,
+    ]));
+    let audit: Arc<dyn AuditSink> = shared;
     // Under the single-instance lock, in the state directory the audit log just made.
     let installation = super::install::load_or_create(&dirs.state())?;
     let prepared = Prepared {
         installation,
         sessions: open_sessions(&dirs.state()).map_err(DaemonError::SessionsDir)?,
         env: HostEnv::from_process()?,
+        redactors,
     };
     let nofile = process::raise_nofile()?;
     log.info(
@@ -298,6 +307,8 @@ struct Prepared {
     sessions: OwnedFd,
     /// The host facts manifests are validated against, read once.
     env: HostEnv,
+    /// The live sessions' secrets, swapped into the audit writer's and the oplog's redactors.
+    redactors: Arc<Redactors>,
 }
 
 async fn serve(
@@ -313,6 +324,7 @@ async fn serve(
         installation,
         sessions: sessions_dir,
         env,
+        redactors,
     } = prepared;
     // First, so a signal during startup is not the default action (death, no cleanup): it
     // waits here and is handled once `control.sock` is bound (security review M3).
@@ -339,6 +351,7 @@ async fn serve(
             Arc::new(crate::egress::net::getaddrinfo),
             Arc::new(NoSecrets),
         )),
+        redactors,
         oplog: log.clone(),
         installation,
     });

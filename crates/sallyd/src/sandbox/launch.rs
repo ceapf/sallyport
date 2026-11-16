@@ -50,6 +50,7 @@ use super::types::{CheckedRuntime, ImageRef, Installation, Role, SessionPaths, U
 use super::watchdog::{Target, WatchPlan, Watchdog, watch_plan};
 use crate::daemon::crash::CrashReporter;
 use crate::oplog::Oplog;
+use crate::session::secrets::Redactors;
 
 mod error;
 mod harness;
@@ -242,6 +243,9 @@ pub struct LauncherParts {
     /// Starts each proxy-mode session's egress listener ([`crate::egress::net::SystemEgress`] in
     /// production; tests pass fakes through the same field).
     pub egress: Arc<dyn EgressStarter>,
+    /// The live sessions' secrets, for the audit and operational logs' redactors: a session's
+    /// forms are registered as soon as its egress has loaded them (architect Q219).
+    pub redactors: Arc<Redactors>,
     /// The operational log: an audit entry that cannot be written while the launcher acts
     /// anyway (a kill, a retried stop) gets an error line here (architect Q43).
     pub oplog: Oplog,
@@ -262,6 +266,7 @@ pub struct Launcher {
     limits: ScanLimits,
     pub(super) disk_floor: DiskFloor,
     egress: Arc<dyn EgressStarter>,
+    redactors: Arc<Redactors>,
     oplog: Oplog,
     pub(super) installation: Installation,
     /// One stage walk at a time across all sessions, so a sandbox with a huge or deep tree
@@ -303,10 +308,18 @@ impl Launcher {
             limits: p.limits,
             disk_floor: p.disk_floor,
             egress: p.egress,
+            redactors: p.redactors,
             oplog: p.oplog,
             installation: p.installation,
             walks: Arc::new(tokio::sync::Semaphore::new(1)),
         })
+    }
+
+    /// Drops session `id`'s secrets from the logs' redactors, once its last entry is written:
+    /// by the launcher after `sandbox.refuse`, by the registry after `session.stop` and teardown
+    /// (architect Q219). Safe to call more than once.
+    pub fn release_secrets(&self, id: &str) {
+        self.redactors.unregister(id);
     }
 
     /// The oplog line for a session's cgroup event files that stopped being readable, which
@@ -385,7 +398,9 @@ impl Launcher {
                 Err(e) => Err(e),
             };
             if let Err(Ok(orphan)) = tx.send(result) {
+                let id = orphan.paths.id().as_str().to_owned();
                 this.stop_unreceived(orphan).await;
+                this.release_secrets(&id);
             }
         });
         // TODO(#113): what a panicked launch task leaves behind.
@@ -497,7 +512,20 @@ impl Launcher {
             Arc::clone(&self.audit),
         );
         let egress = Arc::clone(&self.egress);
-        let s = blocking(move || egress.prepare(&dir, s).map_err(LaunchError::Egress)).await?;
+        let (redactors, id) = (
+            Arc::clone(&self.redactors),
+            req.paths.id().as_str().to_owned(),
+        );
+        // The forms are registered in the same closure that loaded them: no await point between,
+        // and before `net.sock` is bound or the container exists (architect Q219).
+        let s = blocking(move || {
+            let s = egress.prepare(&dir, s).map_err(LaunchError::Egress)?;
+            if let Some(i) = &s.interception {
+                redactors.register(&id, Arc::clone(i.credentials().redaction().forms()));
+            }
+            Ok(s)
+        })
+        .await?;
         self.egress
             .start(&sock, s)
             .map(Some)

@@ -300,6 +300,10 @@ impl Registry {
             match self.stop_bounded(running).await {
                 Ok(()) => {
                     self.live().remove(&sid);
+                    // After `session.stop` (or a failed start's last entry) and the teardown:
+                    // the session's secrets leave the logs' redactors before any stop is
+                    // answered (architect Q219).
+                    self.p.launcher.release_secrets(&sid);
                     requests.close();
                     while let Ok((_, reply)) = requests.try_recv() {
                         replies.extend(reply);

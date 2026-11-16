@@ -93,7 +93,7 @@ container-free tests run: unit tests, all of sally-core's `tests/`, `sallyd` `ar
   changes,cgroup,dirs,podman,binaries,disk,stage,budget,orphans}.rs`, `sandbox/launch/{error,parts}.rs`,
   `sandbox/oci/{mod,config,facts,intent,linux,mounts,process,seccomp}.rs`,
   `daemon/{mod,crash,startup,stale,install}.rs`,
-  `oplog.rs`, `session/{lookup,types,exit}.rs`, `egress/{addr,authority,head,policy,server,
+  `oplog.rs`, `session/{lookup,types,exit,secrets}.rs`, `egress/{addr,authority,head,policy,server,
   hostaddrs,tunnel,net,ca,roots,rewrite,intercept,intercept_tls,intercept_report,meter,inject,
   redact,local}.rs` (net.rs tests stay hermetic: nothing leaves the machine),
   `rpc/{agent,control,control_methods,control_line,drive,attach,line,frame,json,listen,mcp,message,

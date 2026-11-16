@@ -372,6 +372,27 @@ impl Events {
     }
 }
 
+/// A redactor target that keeps the last redactor it was given.
+#[derive(Default)]
+pub struct Swapped(Mutex<Option<sally_core::audit::Redactor>>);
+
+impl sallyd::session::secrets::RedactorTarget for Swapped {
+    fn set_redactor(&self, redactor: sally_core::audit::Redactor) {
+        *self.0.lock().unwrap() = Some(redactor);
+    }
+}
+
+impl Swapped {
+    /// `text` through the last redactor swapped in (unchanged before the first).
+    pub fn redact(&self, text: &str) -> String {
+        self.0
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(text.to_owned(), |r| r.redact_str(text).into_owned())
+    }
+}
+
 pub struct Lx {
     pub f: Fx,
     pub launcher: Arc<Launcher>,
@@ -381,6 +402,11 @@ pub struct Lx {
     pub xdg: PathBuf,
     /// The fake network side of every session's egress listener.
     pub egress: Arc<super::egress::FakeEgress>,
+    /// The launcher's live secrets, and the last redactor they swapped in. The test sink
+    /// ([`Events`]) never applies it, so no red-team row is passed by a redaction it does not
+    /// name.
+    pub redactors: Arc<sallyd::session::secrets::Redactors>,
+    pub redacted: Arc<Swapped>,
     /// Prefix of every session id this fixture makes: `t<run>-<pid>-<n>`, with [`run_id`]
     /// (architect Q24), so every container name carries the run and `Drop` and the wrapper's
     /// sweep remove only their own.
@@ -502,6 +528,10 @@ impl Lx {
         let podman = Podman::setup(bin, &runtime, &state, &host).unwrap();
         let events = Arc::new(Events::default());
         let egress = super::egress::fake_egress(&f.root);
+        let redacted = Arc::new(Swapped::default());
+        let redactors = Arc::new(sallyd::session::secrets::Redactors::new(vec![
+            Arc::clone(&redacted) as Arc<dyn sallyd::session::secrets::RedactorTarget>,
+        ]));
         let launcher = Launcher::new(LauncherParts {
             podman: podman.clone(),
             runtime: runtime.clone(),
@@ -514,6 +544,7 @@ impl Lx {
             limits: ScanLimits::default(),
             disk_floor: floor,
             egress: egress.clone(),
+            redactors: Arc::clone(&redactors),
             oplog: sallyd::oplog::Oplog::new(std::io::sink()),
             installation: installation.clone(),
         });
@@ -527,6 +558,8 @@ impl Lx {
             events,
             xdg,
             egress,
+            redactors,
+            redacted,
             scope: format!("t{}-{}-{n}", run_id(), std::process::id()),
             installation,
             _io: io,
