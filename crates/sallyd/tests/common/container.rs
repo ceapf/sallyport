@@ -710,10 +710,12 @@ impl Lx {
         }
     }
 
-    /// `podman create <argv>` then `podman start`, both hermetic; the container id.
+    /// `podman create <argv>`, `podman init`, then `podman start`, all hermetic, in the
+    /// launcher's order (conmon, and a `--timeout` clock, start at `init`); the container id.
     pub async fn create_and_start(&self, argv: Vec<String>) -> String {
         let out = self.hermetic(&argv).await;
         let id = out.lines().last().unwrap().to_owned();
+        self.hermetic(&["init".to_owned(), id.clone()]).await;
         self.hermetic(&["start".to_owned(), id.clone()]).await;
         id
     }
@@ -866,10 +868,16 @@ fn only_timeout(argv: &[String]) -> usize {
     at[0]
 }
 
-/// Whether `podman ps --all` lists a container named exactly `name`.
+/// Whether `podman ps --all` lists a container named exactly `name`; a failed `ps` panics, so
+/// it never reads as "gone".
 #[allow(dead_code)] // Only the launch tests probe one name.
 pub fn listed_name(name: &str) -> bool {
     let out = podman(&["ps", "--all", "--format", "{{.Names}}"]);
+    assert!(
+        out.status.success(),
+        "podman ps: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .any(|n| n == name)

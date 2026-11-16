@@ -5,7 +5,8 @@
 //! covers the requested access; overlay scratch must lie in the session's scratch directory; the
 //! image must be digest-pinned; the command after the image must be the role's fixed command; and
 //! a session's container (workspace, harness) carries exactly the conmon backstop `--timeout` its
-//! policy names, an inference container none (#92, RT-AG-16). An unforeseen flag fails closed instead of slipping past a denylist. The red-team harness also
+//! policy names, an inference container none (#92, RT-AG-16). An unforeseen flag fails closed
+//! instead of slipping past a denylist. The red-team harness also
 //! greps argv for the forbidden flags; this is the same rule enforced in-process before launch.
 
 use std::collections::HashSet;
@@ -183,15 +184,19 @@ fn check_allowed(a: &Allowed) -> Result<(), ArgvError> {
     // grace; an inference instance never has one.
     match (a.role, a.timeout) {
         (Role::Inference, None) => {}
-        (Role::Inference, Some(_)) => return forbid("an inference policy names no --timeout"),
-        (_, None) => return forbid("a workspace or harness policy must name its --timeout"),
-        (_, Some(t)) if t <= BACKSTOP_GRACE.as_secs() => {
+        (Role::Inference, Some(_)) => {
+            return forbid("an inference policy must not name a --timeout");
+        }
+        (Role::Workspace | Role::Harness, None) => {
+            return forbid("a workspace or harness policy must name its --timeout");
+        }
+        (Role::Workspace | Role::Harness, Some(t)) if t <= BACKSTOP_GRACE.as_secs() => {
             return forbid(format!(
                 "--timeout {t} is not longer than the {} s backstop grace",
                 BACKSTOP_GRACE.as_secs()
             ));
         }
-        (_, Some(_)) => {}
+        (Role::Workspace | Role::Harness, Some(_)) => {}
     }
     let paths = a.sources.iter().map(|s| s.path.as_path());
     let guests = a.sources.iter().map(|s| Path::new(&s.guest));

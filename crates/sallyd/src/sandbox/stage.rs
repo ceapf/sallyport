@@ -34,12 +34,16 @@ pub(crate) struct StageBounds {
     pub deadline: Duration,
 }
 
+/// The default [`StageBounds::deadline`]: how long a stage walk may hold the container frozen
+/// and its exec gate. A stop waits behind it (the backstop relation test, #92, architect Q198).
+pub(crate) const WALK_DEADLINE: Duration = Duration::from_secs(10);
+
 impl Default for StageBounds {
     fn default() -> Self {
         Self {
             max_entries: 1_000_000,
             max_depth: 64,
-            deadline: Duration::from_secs(10),
+            deadline: WALK_DEADLINE,
         }
     }
 }
@@ -231,6 +235,14 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    /// The walk deadline is pinned as a literal and is the default bound (#92, architect Q198:
+    /// the backstop relation test counts it).
+    #[test]
+    fn the_walk_deadline_is_10_s_and_the_default() {
+        assert_eq!(WALK_DEADLINE, Duration::from_secs(10));
+        assert_eq!(StageBounds::default().deadline, WALK_DEADLINE);
+    }
 
     struct Tmp(PathBuf);
 

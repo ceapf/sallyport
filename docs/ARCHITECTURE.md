@@ -232,8 +232,10 @@ session manifest's value; `check_argv` requires exactly that value, once, as two
 refuses a policy without one or with one no longer than the grace (podman reads 0 as none). An
 inference container carries none: it has no `runtime.timeout`, and an instance is not a
 session's. The value is not in the OCI config; the verifier (§3.5) compares podman's
-`.Config.Timeout` with it instead (0 for inference). Podman configuration outside the argv (`containers.conf`, `mounts.conf`, OCI
-hooks, `CONTAINER_HOST`) is not covered by `check_argv`; hermetic podman (§3.5) controls it.
+`.Config.Timeout` with it instead (0 for inference).
+
+Podman configuration outside the argv (`containers.conf`, `mounts.conf`, OCI hooks,
+`CONTAINER_HOST`) is not covered by `check_argv`; hermetic podman (§3.5) controls it.
 
 ### 3.4 Seccomp
 Start from `containers-common`'s default profile and **remove**: `mount, umount2, pivot_root,
@@ -958,9 +960,13 @@ TODO(#28): the harness container and `llm.sock` (Task 13, Task 12 PR C).
 - `start-failed`.
 - `exited`: the container ended on its own. The registry checks the init's `/proc/<pid>` fd
   every 250 ms (Q62); a lookup through it fails once that process is gone, even if its pid is
-  reused. The backstop's grace outlasts every wait `sallyd` adds from `podman init` to the end
-  of a timeout stop plus one 120 s podman budget (a relation test, Q194); a session whose launch
-  tail or stop meets podman hanging past that budget may instead end `exited`, by the backstop.
+  reused. The backstop's grace outlasts every timed wait `sallyd` adds from `podman init` to the
+  end of a timeout stop plus one 120 s podman budget (a relation test, Q194, Q198). Untimed waits
+  are outside it: audit appends with no deadline (`session.start`, `session.timeout` or
+  `session.crash`, `sandbox.stop`, `session.resource_limit`), `wait_out` while operations are in
+  flight, and a file-system call blocked in a stage walk. A session whose launch tail or stop
+  meets one of them, or podman hanging past the budget, may instead end `exited`, by the
+  backstop (fail closed).
 
 **Stop order** (Q57, amended by Q59: once a stop returns, nothing from the session has any
 further effect):
@@ -998,7 +1004,8 @@ by the seal (an oplog line names it), so `in_flight: n` counts the `tool.run` en
 no result. Residual risk: a hung file system under a mount keeps an idle container (listener
 closed, shells killed, nothing new can start) until that operation returns; if `sallyd` shuts
 down meanwhile, the container outlives it with no watchdog until the next start's sweep
-(TODO(#96), Q66). A container that cannot be confirmed gone, whether its session started or
+(TODO(#96), Q66). Either way conmon's backstop ends it `runtime.timeout` + 300 s after its
+`podman init` (#92): a bound from `init`, not from the stop. A container that cannot be confirmed gone, whether its session started or
 not, also leaves the session listed as stop-failed. It keeps its claims and its disk watchdog
 until a later stop succeeds. At shutdown, which stops every session at once, it makes `sallyd`
 exit non-zero. A failed `session.start` append is followed by a best-effort `session.stop`

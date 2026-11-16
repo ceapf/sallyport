@@ -237,7 +237,9 @@ impl Registry {
 
     /// Operations still run past the drain: the session stays stop-failed, every request is
     /// answered `Failed`, until the last one returns. TODO(#96): a Shutdown request is answered
-    /// `Failed` too, so the container outlives `sallyd` until the next startup sweep (Q66).
+    /// `Failed` too, so the container outlives `sallyd` until the next startup sweep (Q66), or
+    /// until conmon's backstop ends it `runtime.timeout` + 300 s after its `podman init` (#92;
+    /// a bound from `init`, not from the stop).
     async fn wait_out(
         &self,
         sid: &str,
@@ -406,31 +408,42 @@ mod tests {
 
     use super::{STOP_ATTEMPTS, STOP_RETRY};
     use crate::egress::net::STOP_GRACE as EGRESS_STOP_GRACE;
-    use crate::sandbox::{BACKSTOP_GRACE, PODMAN_TIMEOUT, RM_ATTEMPTS, RM_RETRY, START_GRACE};
+    use crate::sandbox::{
+        BACKSTOP_GRACE, EVENTS_TIMEOUT, PODMAN_TIMEOUT, RM_ATTEMPTS, RM_RETRY, START_GRACE,
+        WALK_DEADLINE,
+    };
     use crate::session::exit::EXIT_POLL;
     use crate::tools::ops::STOP_DRAIN;
 
-    /// RT-AG-16 (#92, architect Q194): conmon's backstop (`--timeout`, counted from
-    /// `podman init`) outlasts every wait `sallyd` itself adds between `init` and the end of a
-    /// timeout stop, plus one [`PODMAN_TIMEOUT`] as the budget for all real podman time on that
-    /// path, so `session.timeout` is written and the stop done before conmon fires. The waits:
+    /// RT-AG-16 (#92, architect Q194, amended by Q198): conmon's backstop (`--timeout`, counted
+    /// from `podman init`) outlasts every **timed** wait `sallyd` itself adds between `init` and
+    /// the end of a timeout stop, plus one [`PODMAN_TIMEOUT`] as the budget for all real podman
+    /// time on that path (the in-container check after `init` included), so `session.timeout`
+    /// is written and the stop done before conmon fires. The timed waits:
     /// - [`START_GRACE`]: after `podman start`, before the launch returns and the supervisor's
     ///   clock starts;
     /// - [`EXIT_POLL`]: the exit check that may run first;
-    /// - [`STOP_DRAIN`]: the drain and the seal share one deadline; the agent listener's
-    ///   shutdown runs alongside it;
-    /// - per [`STOP_ATTEMPTS`]: `remove_container`'s `RM_ATTEMPTS - 1` pauses of [`RM_RETRY`];
+    /// - [`STOP_DRAIN`]: the drain and the seal (`session.stop`) share one deadline; the agent
+    ///   listener's shutdown runs alongside it;
+    /// - per [`STOP_ATTEMPTS`]: the watchdog's last reading (up to two [`EVENTS_TIMEOUT`] reads,
+    ///   one behind the event observer's lock), the exec gate behind a stage walk
+    ///   ([`WALK_DEADLINE`]), and `remove_container`'s `RM_ATTEMPTS - 1` pauses of [`RM_RETRY`];
     /// - `STOP_ATTEMPTS - 1` pauses of [`STOP_RETRY`];
     /// - the egress server's stop grace, awaited after the container is gone.
     ///
-    /// Podman hanging past the budget may let conmon fire first: the session then ends
-    /// `exited`, or the stop finds the container gone (accepted by Q60, Q194).
+    /// Untimed waits are outside the relation and fail closed: the audit appends with no
+    /// deadline (`session.start`, `session.timeout` or `session.crash`, `sandbox.stop` per
+    /// attempt, `session.resource_limit` under the observer's lock), `wait_out` while operations
+    /// are in flight, and a file-system call blocked inside a stage walk or `statvfs`. Podman
+    /// hanging past the budget does too. Conmon then fires first: the session ends `exited`, or
+    /// the stop finds the container gone (accepted by Q60, Q194).
     #[test]
     fn the_backstop_grace_outlasts_the_timeout_stop_path() {
         let waits = [
             START_GRACE,
             EXIT_POLL,
             STOP_DRAIN,
+            (EVENTS_TIMEOUT * 2 + WALK_DEADLINE) * STOP_ATTEMPTS,
             RM_RETRY * (RM_ATTEMPTS - 1) * STOP_ATTEMPTS,
             STOP_RETRY * (STOP_ATTEMPTS - 1),
             EGRESS_STOP_GRACE,
