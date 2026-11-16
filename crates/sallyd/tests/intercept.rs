@@ -269,19 +269,59 @@ fn rt_sec_09_a_grant_host_gets_a_session_ca_leaf_and_any_other_host_its_own_chai
 ///   plaintext request would be parsed and forwarded (`egress.request`, the upstream sees it).
 ///
 /// No credential can be attached on either path: nothing is forwarded at all.
+///
+/// In-test control (asserted first): one TLS `GET` to the same grant host on the same session
+/// is looked up, dialled, seen by the upstream and audited as `egress.request`, once each. Every
+/// later count is an exact equality with the control's, so an unwired resolver, dialer, mock log
+/// or audit sink fails the test instead of passing it.
 #[test]
 fn rt_sec_13_plain_http_to_a_grant_host_is_never_forwarded() {
     rt().block_on(async {
         let lx = Lx::new();
         let r = session(&lx, "sec13").await;
+        let count = |name: &str| lx.events.list().iter().filter(|e| *e == name).count();
+        let closes = |lx: &Lx| {
+            lx.events
+                .all()
+                .into_iter()
+                .filter(|(e, _)| e == "egress.close")
+                .map(|(_, a)| a)
+                .collect::<Vec<_>>()
+        };
+        async fn close_number(lx: &Lx, n: usize, closes: impl Fn(&Lx) -> Vec<serde_json::Value>) {
+            for _ in 0..100 {
+                if closes(lx).len() >= n {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        let back = over(
+            &lx,
+            "sec13",
+            "mock.test",
+            &get_req("mock.test", "/echo-headers", ""),
+        )
+        .await;
+        assert!(back.starts_with("HTTP/1.1 200 "), "control: {back}");
+        let lookups = vec!["mock.test".to_owned()];
+        assert_eq!(lx.egress.resolver.lookups(), lookups, "control: lookups");
+        assert_eq!(lx.egress.dialer.dials().len(), 1, "control: dials");
+        assert_eq!(lx.egress.dialer.seen().len(), 1, "control: upstream log");
+        assert_eq!(count("egress.request"), 1, "control: egress.request");
+        close_number(&lx, 1, closes).await;
+        assert_eq!(closes(&lx).len(), 1, "control: egress.close");
+
         let req = "GET http://mock.test/echo-headers HTTP/1.1\\r\\nHost: mock.test\\r\\n\\r\\n";
         let (_, out) = exec(&r, &format!("printf '{req}' | nc -w 3 127.0.0.1 3128")).await;
         assert!(out.starts_with("HTTP/1.1 405 "), "{out}");
         assert!(out.contains("plain-http-unsupported"), "{out}");
-        assert!(lx.egress.resolver.lookups().is_empty(), "looked up");
-        assert!(lx.egress.dialer.dials().is_empty(), "dialled");
-        assert!(
-            lx.egress.dialer.seen().is_empty(),
+        assert_eq!(lx.egress.resolver.lookups(), lookups, "looked up");
+        assert_eq!(lx.egress.dialer.dials().len(), 1, "dialled");
+        assert_eq!(
+            lx.egress.dialer.seen().len(),
+            1,
             "the upstream saw a request"
         );
         let deny: Vec<_> = lx
@@ -307,22 +347,19 @@ fn rt_sec_13_plain_http_to_a_grant_host_is_never_forwarded() {
             !String::from_utf8_lossy(&back).contains("HTTP/"),
             "an HTTP answer to plaintext: {back:?}"
         );
-        assert!(
-            lx.egress.dialer.seen().is_empty(),
+        assert_eq!(
+            lx.egress.dialer.seen().len(),
+            1,
             "the upstream saw a request"
         );
-        // The failed handshake drops the client before the close entry is written.
-        let mut close = None;
-        for _ in 0..100 {
-            close = lx.events.args("egress.close");
-            if close.is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        let close = close.expect("egress.close");
-        let events = lx.events.list();
-        assert!(!events.iter().any(|e| e == "egress.request"), "{events:?}");
+        // The failed handshake drops the client before the close entry is written. The control's
+        // close is the first; the proxy-form deny writes none (no tunnel), so the tunnel's is the
+        // second.
+        close_number(&lx, 2, closes).await;
+        let all = closes(&lx);
+        assert_eq!(all.len(), 2, "egress.close: {all:?}");
+        let close = all.last().expect("egress.close").clone();
+        assert_eq!(count("egress.request"), 1, "{:?}", lx.events.list());
         assert_eq!(close["end"], json!("client-tls-failed"), "{close}");
         assert_eq!(close["requests"], json!(0), "{close}");
         lx.stop(r).await;

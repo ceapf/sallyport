@@ -382,18 +382,42 @@ async fn tools_list_shows_the_granted_tools_and_fetch_only_with_a_connector() {
 
 /// RT-AG-01 (unit): an ungranted tool is denied before its arguments or paths are looked at,
 /// so it is no existence oracle (architect ruling Q28).
+///
+/// In-test control (first): a second fixture from the same builder, differing only in every
+/// tool being granted, takes the same calls. None is denied `tool_not_granted`, and its runner
+/// records exactly the one `shell` call. So the empty runner below is the grant's doing, not an
+/// unwired recorder.
 #[tokio::test]
 async fn rt_ag_01_ungranted_tools_are_denied_and_audited() {
-    let mut o = opts(all_modes());
-    o.builtin = vec![BuiltinTool::FsRead];
-    let f = fx("rt-ag-01", o);
-    for (tool, args) in [
+    let calls = [
         ("shell", json!({"cmd": ["ls"]})),
         ("fs_delete", json!({"path": "/workspace/rw/x"})),
         ("fetch", json!({"url": "https://example.org/"})),
         ("fs_write", json!({"bogus": 1})),
         ("fs_list", json!({"path": "../../etc"})),
-    ] {
+    ];
+    let build = |builtin: Vec<BuiltinTool>| {
+        let mut o = opts(all_modes());
+        o.builtin = builtin;
+        o
+    };
+
+    let granted = fx("rt-ag-01-control", build(ALL.to_vec()));
+    for (tool, args) in calls.clone() {
+        let out = granted.call(tool, args).await.unwrap();
+        assert_ne!(out.text, "denied: tool_not_granted", "control: {tool}");
+    }
+    let ran: Vec<Vec<String>> = granted
+        .ran
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(argv, _)| argv.clone())
+        .collect();
+    assert_eq!(ran, [vec!["ls".to_owned()]], "control: the runner");
+
+    let f = fx("rt-ag-01", build(vec![BuiltinTool::FsRead]));
+    for (tool, args) in calls {
         let out = f.call(tool, args).await.unwrap();
         assert!(out.is_error);
         assert_eq!(out.text, "denied: tool_not_granted", "{tool}");
@@ -433,13 +457,73 @@ async fn bad_arguments_are_refused_before_any_path() {
     }
 }
 
+/// One entry of a [`snapshot`]: a file's bytes, a link's target, or a directory.
+#[derive(Debug, PartialEq, Eq)]
+enum Entry {
+    File(Vec<u8>),
+    Link(PathBuf),
+    Dir,
+}
+
+/// Every name under `root` (links not followed) with its content, in name order.
+fn snapshot(root: &Path) -> Vec<(PathBuf, Entry)> {
+    let mut out = Vec::new();
+    let mut todo = vec![root.to_owned()];
+    while let Some(d) = todo.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            let t = std::fs::symlink_metadata(&p).unwrap().file_type();
+            let entry = if t.is_symlink() {
+                Entry::Link(std::fs::read_link(&p).unwrap())
+            } else if t.is_dir() {
+                todo.push(p.clone());
+                Entry::Dir
+            } else {
+                Entry::File(std::fs::read(&p).unwrap())
+            };
+            out.push((p.strip_prefix(root).unwrap().to_owned(), entry));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 /// RT-FS-04: traversal through the brokered tools.
+///
+/// In-test control (first): a write the grants allow, into the rw mount of the same fixture,
+/// changes [`snapshot`] by exactly that file and is recorded as one `tool.run`, with no prompt.
+/// Then the fixture's whole tree (`outside` and every mount) has the same snapshot before and
+/// after the traversals, and the prompt and `tool.run` counts are still the control's.
 #[tokio::test]
 async fn rt_fs_04_traversal_via_brokered_tools_is_denied_and_touches_nothing() {
     let f = fx("rt-fs-04", opts(all_modes()));
     let notes = f.dir("/workspace/notes").to_owned();
     std::os::unix::fs::symlink(f.outside.join("secret"), notes.join("link")).unwrap();
     std::os::unix::fs::symlink(&f.outside, notes.join("dir")).unwrap();
+    let runs = || f.sink.events().iter().filter(|e| *e == "tool.run").count();
+
+    let before = snapshot(&f.base);
+    let out = f
+        .call(
+            "fs_write",
+            json!({"path": "/workspace/rw/control", "content_b64": "eA=="}),
+        )
+        .await
+        .unwrap();
+    assert!(!out.is_error, "control: {}", out.text);
+    let after = snapshot(&f.base);
+    let added: Vec<_> = after.iter().filter(|e| !before.contains(e)).collect();
+    let rw = f.dir("/workspace/rw").strip_prefix(&f.base).unwrap();
+    assert_eq!(
+        added,
+        [&(rw.join("control"), Entry::File(b"x".to_vec()))],
+        "control: the snapshot"
+    );
+    assert_eq!(after.len(), before.len() + 1, "control: the snapshot");
+    assert_eq!(f.prompts().len(), 0, "control: prompts");
+    assert_eq!(runs(), 1, "control: tool.run");
+
+    let outside = snapshot(&f.outside);
     for (tool, args) in [
         ("fs_read", json!({"path": "../../../etc/passwd"})),
         (
@@ -463,11 +547,13 @@ async fn rt_fs_04_traversal_via_brokered_tools_is_denied_and_touches_nothing() {
         assert_eq!(out.text, "denied: path_escapes_mount", "{tool} {args}");
         assert_eq!(f.sink.last("tool.deny")["code"], "path_escapes_mount");
     }
+    assert_eq!(snapshot(&f.outside), outside, "outside changed");
+    assert_eq!(snapshot(&f.base), after, "the fixture's tree changed");
     assert_eq!(std::fs::read(f.outside.join("secret")).unwrap(), b"outside");
     assert!(!f.outside.join("new").exists());
     assert!(notes.join("link").symlink_metadata().is_ok());
-    assert!(f.prompts().is_empty());
-    assert!(!f.sink.events().iter().any(|e| e == "tool.run"));
+    assert_eq!(f.prompts().len(), 0);
+    assert_eq!(runs(), 1);
 }
 
 /// #19 (RT-FS-12, the broker's part): a `.git` component is refused for writes and deletes in

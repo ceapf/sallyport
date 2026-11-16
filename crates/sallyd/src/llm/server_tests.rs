@@ -181,9 +181,21 @@ async fn a_streamed_reply_is_server_sent_events_then_done() {
 
 /// RT-INF-05 (llm.sock half): endpoints other than the two served are 404 and recorded; image
 /// parts and `n: 5` are 400; the backend sees none of them.
+///
+/// In-test control (first): one valid chat on the same server reaches the backend, so
+/// `fake.calls` is 1; it is still exactly 1 at the end. The audit rows are read from the offset
+/// after the control.
 #[tokio::test]
 async fn rt_inf_05_other_endpoints_and_parts_never_reach_the_backend() {
     let (llm, fake, sink) = setup();
+    let r = exchange(&llm, &post(&chat(json!({})))).await;
+    assert_eq!(status(&r), 200, "control: {r}");
+    assert_eq!(
+        fake.calls.load(Ordering::SeqCst),
+        1,
+        "control: backend calls"
+    );
+    let base = sink.rows().len();
     for target in [
         "POST /v1/completions",
         "POST /models/load",
@@ -224,7 +236,7 @@ async fn rt_inf_05_other_endpoints_and_parts_never_reach_the_backend() {
         (status(&r), body(&r)["error"]["code"].clone()),
         (400, json!("n-must-be-1"))
     );
-    assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
     let d = denies(&sink);
     assert_eq!(d.len(), 16);
     assert!(
@@ -232,18 +244,30 @@ async fn rt_inf_05_other_endpoints_and_parts_never_reach_the_backend() {
             .iter()
             .all(|(r, s)| r == "not-found" && *s == json!(404))
     );
-    let first = sink.rows()[0].args.clone();
+    let rows = sink.rows();
+    assert_eq!(rows.len(), base + 16, "one llm.deny per refusal");
+    let first = rows[base].args.clone();
     assert_eq!(first["path"], json!("/v1/completions"));
     assert_eq!(first["method"], json!("POST"));
-    assert_eq!(sink.rows()[15].args["field"], json!("n"));
+    assert_eq!(rows[base + 15].args["field"], json!("n"));
 }
 
 /// RT-INF-03 on llm.sock (ruling Q4): unknown fields, a huge token limit, a 10 MiB body, `n:
 /// 100`, `logit_bias`; and a path-like `model`, which is dropped (Task 7 decision 1) so the
 /// backend never sees it.
+///
+/// In-test control (first): one valid chat on the same server reaches the backend, so
+/// `fake.calls` is 1, and it is still exactly 1 after the refusals.
 #[tokio::test]
 async fn rt_inf_03_request_validation_on_llm_sock() {
     let (llm, fake, sink) = setup();
+    let r = exchange(&llm, &post(&chat(json!({})))).await;
+    assert_eq!(status(&r), 200, "control: {r}");
+    assert_eq!(
+        fake.calls.load(Ordering::SeqCst),
+        1,
+        "control: backend calls"
+    );
     for (extra, code) in [
         (json!({"logit_bias": {"1": 100}}), "unknown-field"),
         (json!({"logprobs": true}), "unknown-field"),
@@ -265,7 +289,7 @@ async fn rt_inf_03_request_validation_on_llm_sock() {
     );
     let r = exchange(&llm, big.as_bytes()).await;
     assert_eq!(status(&r), 413);
-    assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         denies(&sink).last().unwrap(),
         &("body-too-large".to_owned(), json!(413))
@@ -277,8 +301,8 @@ async fn rt_inf_03_request_validation_on_llm_sock() {
     .await;
     assert_eq!(status(&r), 200);
     let seen = fake.seen.lock().unwrap();
-    assert_eq!(seen.len(), 1);
-    assert!(!seen[0].body.contains_key("model"));
+    assert_eq!(seen.len(), 2);
+    assert!(!seen[1].body.contains_key("model"));
 }
 
 #[tokio::test]
