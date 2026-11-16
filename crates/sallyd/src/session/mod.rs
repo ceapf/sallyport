@@ -3,6 +3,7 @@
 
 pub mod exit;
 pub mod lookup;
+pub mod secrets;
 pub mod types;
 
 mod registry;

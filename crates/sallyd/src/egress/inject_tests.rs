@@ -393,6 +393,28 @@ fn the_store_file_gives_only_the_named_values() {
     assert!(!err.to_string().contains(&value("A")), "{err}");
 }
 
+/// #99 (architect Q222): each load reads the file again, so a `sally secrets set` between two
+/// sessions gives the next one the new value; nothing is cached.
+#[test]
+fn the_store_file_is_read_again_for_each_load() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = crate::egress::scratch::scratch("inject-unit", "reread");
+    std::fs::set_permissions(&*dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = dir.join("secrets.toml");
+    let src = StoreFile { path: path.clone() };
+    let save = |v: &str| {
+        let mut s = SecretStore::empty(path.clone());
+        s.set("A", v.to_owned()).unwrap();
+        s.save().unwrap();
+    };
+    save(&value("old"));
+    let first = src.load(&["A".into()]).unwrap();
+    assert_eq!(first[0].1.expose(), &value("old"));
+    save(&value("new"));
+    let second = src.load(&["A".into()]).unwrap();
+    assert_eq!(second[0].1.expose(), &value("new"));
+}
+
 #[test]
 fn debug_names_grants_but_never_a_value() {
     let c = Credentials::new(&[bearer("GH", "a.mock.test")], values(&["GH"])).unwrap();

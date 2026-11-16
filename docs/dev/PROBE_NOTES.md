@@ -123,6 +123,17 @@ line per fact, with where it was found. Check a note again before relying on it 
   watchdog freezes one) is killed at its deadline too, and the `--rm` cleanup then removes it
   with no podman process left running. Q60 assumed the clock starts at `start`; it starts at
   `init`. (#92, Q60, Q194)
+- A rootless podman whose `XDG_RUNTIME_DIR` has no `bus` socket (the daemon tests' private
+  runtime directory) warns "no systemd user session" and falls back to cgroupfs; its OCI config
+  then has no `linux.cgroupsPath`, which the launcher's config check refuses
+  (`config-mismatch`). Linking the user's own `$XDG_RUNTIME_DIR/bus` into the private directory
+  restores the systemd cgroup manager. (#99, `tests/daemon.rs`)
+- `podman save --format oci-archive` then `podman load` into another store keeps the image ID
+  but not the `.Digest`: a test that runs an image from a private store names the digest that
+  store reports after the load. (#99)
+- Podman 4.9.3 rootless (cgroup v2, crun 1.14.1) accepts `--cpus` above the host's CPU count:
+  `--cpus 34` on a 32-CPU host creates, starts and exits 0. Only the manifest validator bounds
+  `runtime.cpus` by the host (`HostEnv.nproc`). (#99, the line 1 test)
 
 ## Kernel and namespaces
 
@@ -155,6 +166,10 @@ line per fact, with where it was found. Check a note again before relying on it 
 - `awk 'BEGIN { s = "x"; while (1) s = s s }'` is a reliable memory bomb (no python in the image).
 - Alpine's busybox `nc` has no `-U`: reach a Unix socket with `sally-shim --stdio <sock>`. The
   image has `nslookup` and `getent` but no `/etc/resolv.conf`, `curl` or `python3`. (Task 8)
+- Busybox 1.36.1 `wget` through a proxy (`http_proxy`/`https_proxy`) sends an absolute-form
+  `GET https://host/path` for an `https://` URL too, never `CONNECT`, so the egress proxy
+  answers 405; the image's `ssl_client` is only reached without a proxy. `nc` can send a raw
+  `CONNECT` and print the status line. (#99, architect Q218)
 - BusyBox 1.36.1 `pgrep -x NAME` compares the full `argv[0]`: a process started as
   `/usr/local/bin/sally-shim` is not found by `pgrep -x sally-shim` (and `pkill -x` kills
   nothing, silently). `pgrep -f` matches the calling `sh -c` too. Match `/proc/<pid>/comm`

@@ -591,9 +591,11 @@ request is `-32000` with `data`
 `{reason, detail?, errors?}` (`sally_proto::ErrorData`):
 
 - `sessions.create`: the manifest is validated against the host facts `sallyd` read at start; a
-  rejection is `manifest-invalid` with every error (`manifest.refuse`). Until #99 the validator
-  knows no secret names, so a manifest granting one is refused here, not by the launcher's
-  `secret-missing`. A launch refusal is told the launcher's reason and the very detail its
+  rejection is `manifest-invalid` with every error (`manifest.refuse`). The secret names come
+  from the secrets store, read afresh for each create through `sally_core::secrets::StoreNames`
+  (the type `sally manifest validate|summary` uses too) and only when the manifest names a
+  secret; a store that cannot be read refuses the create as `session.refuse` `secret-store`
+  (the store's error, never its text), not as a missing name (architect Q221). A launch refusal is told the launcher's reason and the very detail its
   `sandbox.refuse` holds (e.g. `no-default-image`, `digest-mismatch`); a launch refusal whose
   `sandbox.refuse` could not be written gets no reply. A launch whose task ended without a
   result is `start-failed` with its own `session.refuse` naming the session (architect Q98;
@@ -1334,11 +1336,10 @@ sallyport/
     reason phrase, never the upstream's.
   - Credentials and redaction (Tasks 9a-3 and 9b, `egress::inject`, `egress::redact`;
     maintainer decisions 1–7, architect D1–D13, A1–A3). At launch, a session with grants reads
-    the grants' values through the starter's `SecretSource` (production: the 0600 store file;
-    until #99 the daemon wires a source with no values, so every grant is refused `secret-missing`,
-    and a manifest sent over `control.sock` naming a secret is refused even earlier, at
-    validation (`manifest.refuse`, architect Q87); `secret-missing` stays the launcher's check;
-    every other value is dropped, wiped, before `prepare` returns): a missing one refuses the
+    the grants' values through the starter's `SecretSource` (production: `StoreFile`, the 0600
+    store file `sally secrets` writes, read when each session starts, without the writers'
+    lock; `secret-missing` stays the launcher's check behind validation; every other value is
+    dropped, wiped, before `prepare` returns): a missing one refuses the
     launch (`secret-missing`), an unreadable store too (`secret-store`), a grant that cannot be
     injected or redacted as well (`secret-grant`), and a session whose forms hold every filler
     candidate (`secret-filler`). A format holds exactly one placeholder: `{value}` takes the

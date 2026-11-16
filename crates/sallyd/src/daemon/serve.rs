@@ -21,7 +21,6 @@
 //! `runtime.timeout` + 300 s after its `podman init`. An inference container has no backstop
 //! and stays until the next start's orphan sweep, which also removes whatever else is left.
 
-use std::collections::BTreeSet;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -40,6 +39,7 @@ use super::startup::{self, STATE_DIR, StartError};
 use super::{process, stale, sweep};
 use crate::approvals::Approver;
 use crate::approvals::hub::Hub;
+use crate::egress::inject::StoreFile;
 use crate::oplog::Oplog;
 use crate::rpc::control::{Control, ControlParts};
 use crate::rpc::record::Recorder;
@@ -50,7 +50,8 @@ use crate::sandbox::{
     Sessions, SharedAudit, Sweep, UserIds, VERSION_TIMEOUT, check_runtime_dir, open_sessions,
     outside_system_rule, probe_version, resolve_podman, version_error,
 };
-use crate::session::lookup::{NoSecrets, SharedEgress};
+use crate::session::lookup::SharedEgress;
+use crate::session::secrets::Redactors;
 use crate::session::{Registry, RegistryParts};
 
 /// The trusted clients' socket in the locked runtime directory.
@@ -216,13 +217,17 @@ pub fn run(log: &Oplog) -> Result<(), DaemonError> {
     let lock = startup::open_and_lock(&dirs.runtime)?;
     let config = read_config(&dirs.paths.config_file())?;
     let audit = AuditWriter::open(&dirs.paths.audit(), Box::new(SystemClock))?;
-    let audit: Arc<dyn AuditSink> = Arc::new(SharedAudit(Mutex::new(audit)));
+    let shared = Arc::new(SharedAudit(Mutex::new(audit)));
+    // The same writer the launcher appends to, and the oplog (architect Q220).
+    let redactors = Arc::new(Redactors::for_logs(&shared, log));
+    let audit: Arc<dyn AuditSink> = shared;
     // Under the single-instance lock, in the state directory the audit log just made.
     let installation = super::install::load_or_create(&dirs.state())?;
     let prepared = Prepared {
         installation,
         sessions: open_sessions(&dirs.state()).map_err(DaemonError::SessionsDir)?,
         env: HostEnv::from_process()?,
+        redactors,
     };
     let nofile = process::raise_nofile()?;
     log.info(
@@ -298,6 +303,8 @@ struct Prepared {
     sessions: OwnedFd,
     /// The host facts manifests are validated against, read once.
     env: HostEnv,
+    /// The live sessions' secrets, swapped into the audit writer's and the oplog's redactors.
+    redactors: Arc<Redactors>,
 }
 
 async fn serve(
@@ -313,6 +320,7 @@ async fn serve(
         installation,
         sessions: sessions_dir,
         env,
+        redactors,
     } = prepared;
     // First, so a signal during startup is not the default action (death, no cleanup): it
     // waits here and is handled once `control.sock` is bound (security review M3).
@@ -332,13 +340,16 @@ async fn serve(
         audit: Arc::clone(&audit),
         limits: ScanLimits::default(),
         disk_floor: DiskFloor::default(),
-        // PR A has no secret set (maintainer): a source with no values refuses every grant
-        // `secret-missing`. TODO(#99): `StoreFile { path: dirs.config_home.join(
-        // "sallyport/secrets.toml") }`, with the #85 redactor swap and PR C's `sally secrets`.
+        // Values come from the store `sally secrets` writes, read when each session starts
+        // (#99); the session's forms reach the logs' redactors before anything can use them
+        // (`redactors`, #85).
         egress: Arc::new(SharedEgress::new(
             Arc::new(crate::egress::net::getaddrinfo),
-            Arc::new(NoSecrets),
+            Arc::new(StoreFile {
+                path: dirs.paths.secrets_file(),
+            }),
         )),
+        redactors,
         oplog: log.clone(),
         installation,
     });
@@ -384,9 +395,9 @@ async fn serve(
         hub,
         sessions_dir: Arc::new(sessions_dir),
         env: Arc::new(env),
-        // Architect Q87: no secret store yet, so a manifest granting one is refused at
-        // validation (`manifest.refuse`). TODO(#99): the store's names.
-        catalog: Arc::new(BTreeSet::<String>::new()),
+        // The names a manifest may grant: read afresh for each validation (architect Q221),
+        // from the store `sally secrets` writes and the egress reads values from.
+        secrets: Arc::new(dirs.paths.secrets_file()),
         crash: crash.clone(),
     }))
     .listen(bind_control(lock)?, ids.uid, crash.clone());

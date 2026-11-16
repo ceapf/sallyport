@@ -16,11 +16,12 @@
 //! is lost (architect Q89 f). TODO(#110): the M5 UI bridge watches on a connection of its own.
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use rustix::fd::OwnedFd;
 use sally_core::audit::Actor;
-use sally_core::manifest::{HostEnv, SecretCatalog};
+use sally_core::manifest::HostEnv;
 use sally_proto::{Closed, Flood, notification};
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -62,8 +63,10 @@ pub struct ControlParts<S> {
     pub sessions_dir: Arc<OwnedFd>,
     /// The host facts a manifest is validated against, read once at start (architect Q87).
     pub env: Arc<HostEnv>,
-    /// The secret names a manifest may grant. TODO(#99): the store's names; until then none.
-    pub catalog: Arc<dyn SecretCatalog + Send + Sync>,
+    /// The secrets store file: the names a manifest may grant are read from it afresh for each
+    /// validation (`StoreNames`, architect Q221), so a `sally secrets set|rm` counts from the
+    /// next `sessions.create` on.
+    pub secrets: Arc<PathBuf>,
     /// The daemon's crash reporter: the stop of a session whose bound connection closed runs
     /// in a task of the daemon's (architect Q150).
     pub crash: CrashReporter,

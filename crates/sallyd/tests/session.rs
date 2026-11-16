@@ -205,9 +205,9 @@ fn an_unaudited_session_start_binds_nothing_and_stops_the_workspace() {
             ["sandbox.launch", "session.stop", "sandbox.stop"]
         );
         assert_eq!(stops(&r.x), ["start-failed"]);
-        let names = podman(&["ps", "-a", "--format", "{{.Names}}"]);
-        let names = String::from_utf8_lossy(&names.stdout);
-        assert!(!names.contains(&r.x.scope), "{names}");
+        // The fixture's own match: scope `…-1` never matches `…-18`, a test running beside
+        // this one.
+        assert!(!r.x.listed(), "a container of this test is left");
     });
 }
 
@@ -966,20 +966,6 @@ fn rt_ag_15_a_call_during_the_stop_is_denied_before_anything_runs() {
         assert!(!made("made"), "the command had an effect");
         drop(conn);
     });
-}
-
-/// An oplog writer the test reads back.
-#[derive(Clone, Default)]
-struct Lines(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for Lines {
-    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(b);
-        Ok(b.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
 }
 
 /// Ruling 1 with `in_flight > 0` (Q63), and Q67. A write whose `tool.run` append is still

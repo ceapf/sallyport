@@ -215,7 +215,7 @@ fn fetch_line(m: &Manifest) -> Option<String> {
             } else {
                 ""
             };
-            format!("fetch can send data (POST, PUT, DELETE, …) without your approval{ack}.")
+            format!("fetch can send data (POST, PUT, DELETE, ...) without your approval{ack}.")
         }
     })
 }
@@ -253,7 +253,7 @@ fn mcp_line(m: &Manifest, s: &McpServer) -> String {
         .join(" ");
     if let Some((cut, _)) = cmd.char_indices().nth(MAX_COMMAND_SHOWN) {
         cmd.truncate(cut);
-        cmd.push('…');
+        cmd.push_str("...");
     }
     let env = if s.env.is_empty() {
         String::new()

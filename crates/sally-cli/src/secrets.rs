@@ -17,11 +17,6 @@ use zeroize::Zeroizing;
 use crate::commands::Out;
 use crate::{EXIT_FAILED, EXIT_OK, EXIT_REFUSED, clean};
 
-/// What stored secrets are for until #99: printed by `set` and by a rejected manifest that
-/// grants one. TODO(#99): remove once sallyd reads the store.
-pub const NOT_YET_USED: &str = "note: sessions cannot use stored secrets yet (#99); a manifest that \
-                                grants one is refused until then";
-
 /// Printed after a secrets command line that was not understood, or that gave an illegal name
 /// (maintainer ruling, 2026-11-14). It repeats no argument: a value typed where it does not
 /// belong is already in argv and may be in shell history, and must not reach the terminal or a
@@ -251,7 +246,6 @@ pub fn set(
                      reliably"
                 );
             }
-            let _ = writeln!(o.err, "{NOT_YET_USED}");
             EXIT_OK
         }
         Err(e) => store_error(o, &e),

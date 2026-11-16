@@ -152,15 +152,26 @@ impl Registry {
             self.wait_out(&sid, &ops, &mut replies, &mut requests, in_flight)
                 .await;
         }
-        // 7.
-        self.retry_stop(sid, running, replies, requests, reason)
+        // 7. A crash reported after the reason was chosen is not lost: `retry_stop` logs it
+        // before the session's secrets leave the oplog's redactor.
+        self.retry_stop(sid, running, replies, requests, reason, Some(crashes))
             .await;
-        // A crash reported after the reason was chosen is not lost.
+    }
+
+    /// The oplog line of each crash reported after the session's reason was chosen. With the
+    /// panic's payload only while the session's secrets are still redacted (`payload`); after
+    /// their release, the task's name alone.
+    fn late_crashes(&self, crashes: &mut CrashReceiver, payload: bool) {
         while let Ok(c) = crashes.try_recv() {
+            let shown = if payload {
+                c.payload.as_str()
+            } else {
+                "withheld"
+            };
             self.p.oplog.error(
                 LOG,
                 "session task panicked during its stop",
-                &[("task", c.task), ("payload", &c.payload)],
+                &[("task", c.task), ("payload", shown)],
             );
         }
     }
@@ -286,7 +297,8 @@ impl Registry {
     }
 
     /// `Launcher::stop` until the container is confirmed gone: bounded attempts, then
-    /// stop-failed, retried on each later request. Answers every request it has.
+    /// stop-failed, retried on each later request. Answers every request it has. `crashes`: a
+    /// supervised session's crash reports, logged before its secrets are released.
     pub(super) async fn retry_stop(
         &self,
         sid: String,
@@ -294,12 +306,22 @@ impl Registry {
         mut replies: Vec<Reply>,
         mut requests: mpsc::Receiver<Request>,
         reason: StopReason,
+        mut crashes: Option<CrashReceiver>,
     ) {
         let mut running = running;
         loop {
             match self.stop_bounded(running).await {
                 Ok(()) => {
                     self.live().remove(&sid);
+                    if let Some(c) = crashes.as_mut() {
+                        // Before the release, so a payload is still redacted (architect Q228;
+                        // tests/redactors.rs `a_crash_reported_during_a_stop_is_logged_redacted`).
+                        self.late_crashes(c, true);
+                    }
+                    // After `session.stop` (or a failed start's last entry), the teardown and
+                    // the late crashes' lines: the session's secrets leave the logs' redactors
+                    // before any stop is answered (architect Q219).
+                    self.p.launcher.release_secrets(&sid).await;
                     requests.close();
                     while let Ok((_, reply)) = requests.try_recv() {
                         replies.extend(reply);
@@ -312,6 +334,9 @@ impl Registry {
                         "session stopped",
                         &[("session", &sid), ("reason", reason.as_str())],
                     );
+                    if let Some(c) = crashes.as_mut() {
+                        self.late_crashes(c, false);
+                    }
                     return;
                 }
                 Err(r) => {

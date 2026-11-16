@@ -4,6 +4,10 @@
 //! session created with `lifetime: "connection"` stops when its connection ends.
 
 use super::*;
+use common::egress::{canary, tls_upstream};
+use common::forms::{basic_blob, basic_forms, forms_of};
+use common::intercept::{self, body_and_length, filled, get_req, gh, header_values, rendered};
+use common::search::{Plants, Scope, fixed_patterns, found, search_script};
 
 /// Every terminal control the escaper must neutralize: CSI, OSC 52 (clipboard), OSC 8 (link)
 /// ended by ST, a raw C1 CSI byte (0x9b, not UTF-8), U+009B, U+202E and `\r`. A `printf` format.
@@ -322,6 +326,67 @@ fn input_reaches_the_attached_command_and_eof_ends_it() {
     });
 }
 
+/// Maintainer Q202: an attached command's bytes reach the audit log and the operational log only
+/// as counts. A canary goes in through `sessions.input` (never argv, which is audited) and comes
+/// back on both streams; the control is that the client sees it on each. No audit entry and no
+/// oplog line carries it, and `sandbox.exec_result` counts every byte of it. The session runs at
+/// the default `audit.level`, full (architect Q223), and the test sink keeps every entry's
+/// arguments whatever the level, so no level could record more than is checked here.
+#[test]
+fn attached_bytes_reach_the_logs_only_as_counts() {
+    rt().block_on(async {
+        let c = cx();
+        let mut w = c.connect();
+        let (id, _) = create(&c, &mut w, "counts", false).await;
+        let canary = format!("sp-output-canary-{}", "q".repeat(24));
+        let argv = ["sh", "-c", "read l; echo \"$l\"; echo \"$l\" >&2"];
+        let n = w
+            .send("sessions.attach", json!({"id": id, "argv": argv}))
+            .await;
+        let input = w
+            .send(
+                "sessions.input",
+                json!({"id": id, "data": format!("{canary}\n"), "eof": true}),
+            )
+            .await;
+        let (ack, before) = w.until_reply(input).await;
+        assert_eq!(ack["result"], json!({}), "{ack}");
+        let (reply, after) = w.until_reply(n).await;
+        assert_eq!(reply["result"], json!({"exit_code": 0}), "{reply}");
+        let notes = [before, after].concat();
+        let line = format!("{canary}\n");
+        assert_eq!(
+            (joined(&notes, "stdout"), joined(&notes, "stderr")),
+            (line.clone(), line.clone()),
+            "control: the canary came back on both streams"
+        );
+        let result = until_entry(&c, "sandbox.exec_result", |_| true).await;
+        let args = c.x.events.all()[result].1.clone();
+        let len = line.len() as u64;
+        assert_eq!(
+            (
+                args["stdin_bytes"].as_u64(),
+                args["stdout_bytes"].as_u64(),
+                args["stderr_bytes"].as_u64()
+            ),
+            (Some(len), Some(len), Some(len)),
+            "{args}"
+        );
+        w.call("sessions.stop", json!({"id": id})).await;
+        let audited: Vec<String> =
+            c.x.events
+                .all()
+                .iter()
+                .map(|(e, a)| format!("{e} {a}"))
+                .filter(|t| t.contains(&canary))
+                .collect();
+        assert_eq!(audited, Vec::<String>::new());
+        assert!(c.oplog.flush(Duration::from_secs(10)), "the oplog drained");
+        let logged = c.log.text();
+        assert!(!logged.contains(&canary), "{logged}");
+    });
+}
+
 /// Q102 (a): a bound session whose connection ends before any attach stops `disconnect`, and
 /// its container is gone.
 #[test]
@@ -440,4 +505,249 @@ async fn gone(container: &str) {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// `manifests/examples/coding-agent.yaml` as M1 Acceptance line 1 runs it (architect Q217):
+/// read at test time, with exactly one line replaced: `runtime.image` names the developer test
+/// image (with the shim) by digest, since no product image exists (#88, Q199). Every other line
+/// is the example's own, asserted (`runtime.cpus: 6` included: podman accepts more CPUs than
+/// the host has, PROBE_NOTES).
+fn line_1_manifest() -> String {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../manifests/examples/coding-agent.yaml");
+    let example = std::fs::read_to_string(path).unwrap();
+    let image = format!("  image: {}", net_image().as_str());
+    let mut text = String::new();
+    for line in example.lines() {
+        let line = if line.trim_start().starts_with("image: ") {
+            image.as_str()
+        } else {
+            line
+        };
+        text.push_str(line);
+        text.push('\n');
+    }
+    let differ: Vec<(&str, &str)> = example
+        .lines()
+        .zip(text.lines())
+        .filter(|(a, b)| a != b)
+        .collect();
+    assert_eq!(differ.len(), 1, "runtime.image only: {differ:?}");
+    assert_eq!(example.lines().count(), text.lines().count());
+    text
+}
+
+/// The hosts the example allows; each resolves to the TLS mock upstream.
+const LINE_1_HOSTS: [&str; 4] = [
+    "pypi.org",
+    "files.pythonhosted.org",
+    "api.github.com",
+    "github.com",
+];
+
+/// What the line 1 shell checks and prints, in order, once the shim listens; then it waits on
+/// stdin until the host-side half is done. No secret value is in it, and none goes in on stdin.
+/// The image's busybox has no client that sends `CONNECT` (its `wget` sends absolute-form
+/// requests), so the proxy checks write one raw with `nc` (architect Q218).
+const LINE_1_SCRIPT: &str = "\
+i=0
+until grep -q 'listening on 127.0.0.1:3128' /tmp/shim.log 2>/dev/null; do
+  i=$((i+1)); [ $i -lt 60 ] || break; sleep 1
+done
+echo \"dns:$(nslookup pypi.org >/dev/null 2>&1 && echo ok || echo fail)\"
+echo \"tcp:$(nc -w 2 192.0.2.10 443 </dev/null >/dev/null 2>&1 && echo ok || echo fail)\"
+for h in pypi.org api.github.com example.org; do
+  printf 'CONNECT %s:443 HTTP/1.1\\r\\nHost: %s:443\\r\\n\\r\\n' $h $h | nc -w 3 127.0.0.1 3128 \\
+    | head -n 1 | tr -d '\\r' | sed \"s/^/connect $h: /\"
+done
+echo \"workspace:$(ls -A /workspace | tr '\\n' ' ')\"
+echo \"ca:$(sha256sum /run/sallyport/session-ca.pem | cut -d ' ' -f 1)\"
+echo \"gh_token:$GH_TOKEN\"
+echo ready
+read go
+";
+
+/// The forms of `GITHUB_TOKEN`'s canary the example's two grants make (raw and encodings, the
+/// rendered `Bearer` value, the `x-access-token` `{basic}` forms), the marker, the search's own
+/// mark and the planted blob: what RT-SEC-01/02's search looks for.
+fn line_1_patterns(mark: &str, planted_blob: &str) -> Vec<String> {
+    let gh = canary("GITHUB_TOKEN");
+    let mut p = vec![
+        mark.to_owned(),
+        "SALLY_CANARY".to_owned(),
+        planted_blob.to_owned(),
+    ];
+    p.extend(forms_of(&gh));
+    p.push(format!("Bearer {gh}"));
+    p.extend(basic_forms("x-access-token", &gh));
+    p
+}
+
+/// RT-SEC-01/02's search of a live container, within 120 s: what it found.
+async fn line_1_search(container: &str) -> Vec<String> {
+    let mark = "sp-line-1-search";
+    let planted = format!("SALLY_CANARY_PLANTED_{}", std::process::id());
+    let blob = basic_blob("planted", &format!("{planted}/+?&= {}", "p".repeat(7)));
+    let files = format!(
+        "printf '%s' '{planted}' > /tmp/planted.txt\nprintf '%s' '{blob}' > /tmp/planted-blob.txt\n"
+    );
+    let plants = Plants {
+        files: &files,
+        shm: &planted,
+        process: &blob,
+    };
+    let script = search_script(
+        mark,
+        &plants,
+        &fixed_patterns(&line_1_patterns(mark, &blob)),
+        Scope::All,
+    );
+    let container = container.to_owned();
+    let search = tokio::task::spawn_blocking(move || exec_in(&container, &["sh", "-c", &script]));
+    let (code, out) = tokio::time::timeout(Duration::from_secs(120), search)
+        .await
+        .expect("the search ended within 120 s")
+        .unwrap();
+    assert_eq!(code, 0, "{out}");
+    found(&out)
+}
+
+/// M1 Acceptance line 1 through `sally sandbox run` in line mode (maintainer Q199, Q201;
+/// architect Q217, Q218): the example manifest ([`line_1_manifest`]), a session made by
+/// `sessions.create` with egress and the `GITHUB_TOKEN` grants, one `sh` attached. It is also
+/// the proof that `sessions.create` starts egress when the manifest grants it (Q201).
+///
+/// In the shell: DNS and direct TCP fail; a raw `CONNECT` through `127.0.0.1:3128` is 200 for
+/// `pypi.org` and `api.github.com` and 403 for `example.org`; `/workspace` holds only
+/// `myproject`; `GH_TOKEN` is the placeholder. While the session lives, RT-SEC-01/02's search
+/// finds no form of the canary in the container (only its planted controls), and the TLS leg
+/// (Q47: the image has no TLS client) runs host-side over the same session's `net.sock`,
+/// trusting the session CA whose hash the shell printed: the mock upstream gets
+/// `Authorization: Bearer <canary>`, its echoes come back as filler of the same length, and
+/// after the run the `egress.response` entry names `secret:GITHUB_TOKEN` and the bytes.
+/// Controls: the 200s (the proxy works, so the 403 and the failures are policy), the planted
+/// search hits, and the upstream receiving the credential (so the filler is redaction).
+/// TODO(#88): the in-container `curl -x … https://…` form once an image with curl exists.
+#[test]
+fn m1_acceptance_line_1_through_sally_sandbox_run() {
+    use sha2::{Digest, Sha256};
+    use std::io::Write as _;
+    rt().block_on(async {
+        let c = cx();
+        std::fs::create_dir_all(c.x.f.root.join("home/code/myproject")).unwrap();
+        let manifest = c.x.f.root.join("coding-agent.yaml");
+        std::fs::write(&manifest, line_1_manifest()).unwrap();
+        for host in LINE_1_HOSTS {
+            c.x.egress.resolver.set(host, vec![vec![tls_upstream()]]);
+        }
+        let served = Served::start(&c, "line1");
+        let (go, stdin) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (out, err) = (Lines::default(), Lines::default());
+        let run = {
+            let path = served.path.clone();
+            let manifest = manifest.clone();
+            let (mut o_out, mut o_err) = (out.clone(), err.clone());
+            std::thread::spawn(move || {
+                let mut client = sally_cli::client::Client::connect(&path).unwrap();
+                let argv = ["sh", "-c", LINE_1_SCRIPT].map(str::to_owned).to_vec();
+                let mut o = sally_cli::commands::Out {
+                    out: &mut o_out,
+                    err: &mut o_err,
+                };
+                sally_cli::run::sandbox_run(&mut client, &manifest, &argv, stdin, &mut o)
+            })
+        };
+        let end = std::time::Instant::now() + Duration::from_secs(120);
+        while !out.text().contains("ready\n") {
+            assert!(
+                std::time::Instant::now() < end && !run.is_finished(),
+                "no ready line: {} / {}",
+                out.text(),
+                err.text()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // The live session, found over a second control connection.
+        let listed = c.connect().call("sessions.list", json!({})).await;
+        let s = &listed["result"]["sessions"][0];
+        let id = s["id"].as_str().unwrap().to_owned();
+        let container = s["container"].as_str().unwrap().to_owned();
+        let tag = id
+            .strip_prefix(&format!("{}-", c.x.scope))
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            line_1_search(&container).await,
+            [
+                "/proc/<planted>/cmdline",
+                "/proc/<planted>/environ",
+                "/tmp/planted-blob.txt",
+                "/tmp/planted.txt",
+            ]
+        );
+        // The TLS leg over this session's net.sock, trusting the session CA.
+        let ca = std::fs::read(c.x.paths(&tag).workspace_sockets().join("session-ca.pem")).unwrap();
+        let ca_hash: String = Sha256::digest(&ca)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let req = get_req("api.github.com", "/echo-headers", "");
+        let resp = intercept::over(&c.x, &tag, "api.github.com", &req).await;
+        let seen = c.x.egress.dialer.seen();
+        let got = seen
+            .iter()
+            .find(|r| r.starts_with("GET /echo-headers"))
+            .expect("the upstream got the request");
+        assert_eq!(
+            header_values(got, "authorization"),
+            [rendered()],
+            "control: the credential reached the upstream"
+        );
+        assert!(!resp.contains(&gh()), "{resp}");
+        let (body, n) = body_and_length(&resp);
+        assert_eq!((body, n), (filled(got).as_str(), got.len()));
+        // Let the shell end; the run stops its session.
+        (&go).write_all(b"go\n").unwrap();
+        drop(go);
+        let end = std::time::Instant::now() + Duration::from_secs(120);
+        while !run.is_finished() {
+            assert!(std::time::Instant::now() < end, "the run never ended");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let code = run.join().unwrap();
+        assert_eq!((code, err.text().as_str()), (0, ""), "{}", out.text());
+        let lines: Vec<String> = out.text().lines().map(str::to_owned).collect();
+        assert_eq!(lines.len(), 9, "{lines:?}");
+        assert_eq!(lines[..2], ["dns:fail", "tcp:fail"], "{lines:?}");
+        assert!(
+            lines[2].starts_with("connect pypi.org: HTTP/1.1 200 "),
+            "{lines:?}"
+        );
+        assert!(
+            lines[3].starts_with("connect api.github.com: HTTP/1.1 200 "),
+            "{lines:?}"
+        );
+        assert!(
+            lines[4].starts_with("connect example.org: HTTP/1.1 403 "),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines[5..],
+            [
+                "workspace:myproject ".to_owned(),
+                format!("ca:{ca_hash}"),
+                "gh_token:sallyport-placeholder".to_owned(),
+                "ready".to_owned(),
+            ]
+        );
+        served.stop();
+        let entries = intercept::responses(&c.x, "api.github.com");
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        let bytes = 2 * rendered().len();
+        assert_eq!(
+            entries[0]["redacted"],
+            json!([{"secret": "secret:GITHUB_TOKEN", "bytes": bytes}])
+        );
+        assert_eq!(stops(&c), 1);
+    });
 }

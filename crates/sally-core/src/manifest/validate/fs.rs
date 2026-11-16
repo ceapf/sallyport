@@ -201,7 +201,7 @@ pub fn check_glob(g: &str) -> Result<(), GlobError> {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum GlobError {
     /// Empty or longer than the limit.
-    #[error("glob must be 1–{} bytes", MAX_GLOB_LEN)]
+    #[error("glob must be 1 to {} bytes", MAX_GLOB_LEN)]
     Length,
     /// Starts with `/`.
     #[error("{0:?} must be relative to the mount")]

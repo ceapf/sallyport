@@ -135,7 +135,7 @@ fn check_scheme(s: &SecretGrant, i: usize, d: &mut Diags) {
 /// RFC 7617 user-id: no `:`, no control characters, not a credential. Not echoed.
 fn check_basic_user(u: &str) -> Result<(), &'static str> {
     if u.is_empty() || u.len() > MAX_BASIC_USER {
-        return Err("must be 1–256 bytes");
+        return Err("must be 1 to 256 bytes");
     }
     if looks_like_credential(u) {
         return Err("looks like a credential; put it in the secrets store, never the manifest");
@@ -347,7 +347,7 @@ pub(super) fn check_mcp(servers: &[McpServer], d: &mut Diags) {
 
 fn check_command(s: &McpServer, i: usize, d: &mut Diags) {
     if s.command.is_empty() || s.command.len() > MAX_ARGS {
-        let msg = format!("command must have 1–{MAX_ARGS} elements");
+        let msg = format!("command must have 1 to {MAX_ARGS} elements");
         d.error(format!("tools.mcp[{i}].command"), Code::InvalidValue, msg);
     }
     for (j, arg) in s.command.iter().enumerate() {

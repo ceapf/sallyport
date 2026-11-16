@@ -22,7 +22,6 @@ use crate::egress::net::{
     SessionEgress, SystemResolver, TcpDialer,
 };
 use crate::egress::roots::BundleFiles;
-use sally_core::secrets::{Secret, SecretsError};
 
 /// Lookups one session may have in flight: a quarter of the daemon's.
 pub const SESSION_LOOKUPS: usize = MAX_LOOKUPS / 4;
@@ -51,19 +50,6 @@ pub(crate) fn session_resolver(lookup: &Lookup) -> SystemResolver {
         Arc::new(Semaphore::new(SESSION_LOOKUPS)),
         Arc::clone(lookup),
     )
-}
-
-/// A secrets source that holds no value, so every secret grant is refused `secret-missing`
-/// before anything is created. PR A wires it in production: the secret set is outside PR A
-/// (maintainer), and values must not be loaded before the redactor swap of #85.
-/// TODO(#99): replace it with the store file, `<config_home>/sallyport/secrets.toml`.
-#[derive(Debug, Clone, Copy)]
-pub struct NoSecrets;
-
-impl SecretSource for NoSecrets {
-    fn load(&self, _names: &[String]) -> Result<Vec<(String, Secret<String>)>, SecretsError> {
-        Ok(Vec::new())
-    }
 }
 
 /// The production starter: system resolver, plain TCP, `/proc` host addresses, the default
@@ -140,7 +126,10 @@ mod tests {
     fn a_session_egress_uses_the_starters_lookup() {
         crate::daemon::runtime().unwrap().block_on(async {
             let (inner, _release, _) = stuck();
-            let starter = SharedEgress::new(inner, Arc::new(NoSecrets));
+            let starter = SharedEgress::new(
+                inner,
+                Arc::new(crate::egress::inject::testing::Fixed::default()),
+            );
             assert!(format!("{starter:?}").starts_with("SharedEgress"));
             let got = starter
                 .session()
@@ -150,13 +139,6 @@ mod tests {
                 .unwrap();
             assert_eq!(got, [SocketAddr::from(([192, 0, 2, 1], 443))]);
         });
-    }
-
-    /// PR A's production source holds no value: every grant is refused `secret-missing`.
-    #[test]
-    fn no_secrets_holds_no_value() {
-        let got = NoSecrets.load(&["GH".into()]).unwrap();
-        assert!(got.is_empty());
     }
 
     /// Each session's egress reads secrets through the starter's own source.

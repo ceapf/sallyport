@@ -341,7 +341,7 @@ fn unapproved_fetch_writes_with_private_data_require_acknowledgement() {
     let s = summary(&v);
     assert!(
         s.contains(
-            "fetch can send data (POST, PUT, DELETE, …) without your approval (acknowledged)."
+            "fetch can send data (POST, PUT, DELETE, ...) without your approval (acknowledged)."
         ),
         "{s}"
     );
@@ -585,7 +585,10 @@ fn more_home_folders_are_denylisted_with_the_rule_in_words() {
     );
     let msg =
         common::rendered(&f.load(&mount("~/.config/sallyport", "/workspace/x", "ro"))).join("");
-    assert!(msg.contains("— "), "{msg}");
+    assert!(
+        msg.contains("/.config: configuration folders are never mountable"),
+        "{msg}"
+    );
 }
 
 #[test]
@@ -715,7 +718,7 @@ fn data_can_leave_when_private_data_meets_an_allow_rule() {
     let first = s.lines().next().unwrap();
     assert_eq!(
         first,
-        "[data-can-leave] Anything this agent reads — $ROOT/home/code/myproject and whatever your GITHUB_TOKEN unlocks on api.github.com — can be sent to pypi.org and api.github.com (acting as you)."
+        "[data-can-leave] Anything this agent reads ($ROOT/home/code/myproject and whatever your GITHUB_TOKEN unlocks on api.github.com) can be sent to pypi.org and api.github.com (acting as you)."
     );
 }
 

@@ -202,3 +202,24 @@ pub fn tree_state(root: &std::path::Path) -> Vec<String> {
 }
 
 pub const PROXY: &str = "network:\n  mode: proxy\n  allow:\n    - host: pypi.org\n";
+
+/// An oplog writer the test reads back.
+#[derive(Clone, Default)]
+pub struct Lines(pub std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl Lines {
+    /// Everything written so far, as text.
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for Lines {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}

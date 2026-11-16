@@ -951,3 +951,203 @@ fn a_configured_user_owned_podman_runs_and_the_daemon_says_so() {
     assert!(warn.contains(&path), "{warn}");
     assert!(warn.contains("why=\"not owned by root\""), "{warn}");
 }
+
+/// The test image, loaded into `env`'s private podman store (the one `sallyd` uses there), as
+/// `localhost/<name>@sha256:…` with the digest that store gives it.
+fn load_test_image(env: &Env) -> String {
+    let tag = common::container::test_image_tag();
+    let archive = env.root.join("test-image.tar");
+    let saved = podman(&[
+        "save",
+        "--format",
+        "oci-archive",
+        "-o",
+        archive.to_str().unwrap(),
+        tag,
+    ]);
+    assert!(
+        saved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&saved.stderr)
+    );
+    let private = |args: &[&str]| {
+        let mut c = Command::new("podman");
+        c.args(args);
+        let out = env.command(c).stdout(Stdio::piped()).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    private(&["load", "-q", "-i", archive.to_str().unwrap()]);
+    let digest = private(&["image", "inspect", "--format", "{{.Digest}}", tag]);
+    let name = tag.split_once(':').unwrap().0;
+    format!("{name}@{}", digest.trim())
+}
+
+/// #99 (architect Q222): `serve` reads the secrets store `sally secrets` writes, at the path the
+/// CLI computes (`Paths::secrets_file`, here through the CLI's own `secrets::set` and `rm`),
+/// afresh at each `sessions.create`. With no store a grant is refused at validation; once the
+/// name is stored, the session starts and its egress writes the session CA files (with the old
+/// value-less source the launch was refused `secret-missing`: the control for the wiring);
+/// after `rm` the next create is refused again, and after another `set` it starts. No outbound
+/// connection: the session is created and stopped, nothing is dialled. The store is written
+/// in-process (architect Q236); that the `sally` binary writes it at this same path is
+/// sally-cli's `set_stores_under_xdg_config_home_when_it_is_set` (tests/secrets_argv.rs).
+#[test]
+fn the_daemon_validates_and_injects_from_the_store_the_cli_writes() {
+    let env = Env::new();
+    // The private runtime directory has no user bus, so podman would fall back to cgroupfs and
+    // the launch's config check refuses the container (no `cgroupsPath`); the user's own bus
+    // lets podman use the systemd cgroup manager, as it does for the user.
+    let bus = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap()).join("bus");
+    std::os::unix::fs::symlink(bus, env.root.join("run/bus")).unwrap();
+    let image = load_test_image(&env);
+    let paths = sally_core::paths::Paths::from_lookup(|k| {
+        let sub = match k {
+            "HOME" => "home",
+            "XDG_RUNTIME_DIR" => "run",
+            "XDG_DATA_HOME" => "data",
+            "XDG_CONFIG_HOME" => "config",
+            _ => return None,
+        };
+        Some(env.root.join(sub).into_os_string())
+    })
+    .unwrap();
+    let store = paths.secrets_file();
+    std::fs::set_permissions(
+        store.parent().unwrap(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let value = format!("sp-daemon-{}", "t".repeat(24));
+    let mut err = Vec::new();
+    let set = |err: &mut Vec<u8>| {
+        let mut read = || Ok(zeroize::Zeroizing::new(value.clone()));
+        let mut o = sally_cli::commands::Out {
+            out: &mut Vec::new(),
+            err,
+        };
+        sally_cli::secrets::set(&store, "GH_TOKEN", &mut read, &mut o)
+    };
+    let manifest = format!(
+        "apiVersion: sallyport/v1\nkind: Manifest\nname: t\nmodel:\n  ref: any\n\
+         runtime:\n  image: {image}\nnetwork:\n  mode: proxy\n  allow:\n    - host: api.mock.test\n\
+         secrets:\n  - name: GH_TOKEN\n    inject: {{host: api.mock.test, header: Authorization, \
+         format: \"Bearer {{value}}\"}}\n"
+    );
+    let mut d = env.start();
+    let mut c = sally_cli::client::Client::connect(&env.state().join("control.sock")).unwrap();
+    let create = |c: &mut sally_cli::client::Client| {
+        c.call("sessions.create", serde_json::json!({"manifest": manifest}))
+    };
+    let missing = |r: &Result<serde_json::Value, sally_cli::client::Error>| {
+        matches!(r, Err(sally_cli::client::Error::Refused(d))
+            if d.reason == "manifest-invalid"
+                && d.errors.iter().any(|e| e.contains("secret-missing")))
+    };
+    let r = create(&mut c);
+    assert!(missing(&r), "no store yet: {r:?}");
+    assert_eq!(
+        set(&mut err),
+        sally_cli::EXIT_OK,
+        "{}",
+        String::from_utf8_lossy(&err)
+    );
+    let started = |c: &mut sally_cli::client::Client, r: Result<serde_json::Value, _>| {
+        let s = r.unwrap_or_else(|e| panic!("stored, so it starts: {e:?}"));
+        let id = s["id"].as_str().unwrap().to_owned();
+        let ca = env
+            .state()
+            .join(format!("sessions/{id}/workspace/session-ca.pem"));
+        assert!(
+            ca.exists(),
+            "the egress wrote the session CA: {}",
+            ca.display()
+        );
+        c.call("sessions.stop", serde_json::json!({"id": id}))
+            .unwrap();
+    };
+    let r = create(&mut c);
+    started(&mut c, r);
+    let mut o = sally_cli::commands::Out {
+        out: &mut Vec::new(),
+        err: &mut err,
+    };
+    assert_eq!(
+        sally_cli::secrets::rm(&store, "GH_TOKEN", &mut o),
+        sally_cli::EXIT_OK
+    );
+    let r = create(&mut c);
+    assert!(missing(&r), "removed, so refused: {r:?}");
+    assert_eq!(set(&mut err), sally_cli::EXIT_OK);
+    let r = create(&mut c);
+    started(&mut c, r);
+    // The redactors `serve` wires (Rust review M3, security review M2): a command that carries
+    // the value, run in a session that holds it, is audited redacted in the daemon's own log.
+    let file = env.root.join("m.yaml");
+    std::fs::write(&file, &manifest).unwrap();
+    let argv = ["sh".to_owned(), "-c".to_owned(), format!("true {value}")];
+    let (mut run_out, mut run_err) = (Vec::new(), Vec::new());
+    let code = sally_cli::run::sandbox_run(
+        &mut c,
+        &file,
+        &argv,
+        std::io::empty(),
+        &mut sally_cli::commands::Out {
+            out: &mut run_out,
+            err: &mut run_err,
+        },
+    );
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&run_err));
+    drop(c);
+    terminate(&mut d);
+    let out = d.finish();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !files_holding(&paths.audit(), b"[REDACTED:GH_TOKEN]").is_empty(),
+        "control: the command's argv reached the audit log"
+    );
+    // Everything Sallyport writes. Podman's own storage is left out: the value here is this
+    // test's own argv, which podman's records of the exec may hold, not an injected secret, and
+    // its layer files belong to the mapped ids.
+    let held: Vec<PathBuf> = [
+        "home",
+        "run/sallyport",
+        "data/sallyport",
+        "config/sallyport",
+    ]
+    .iter()
+    .flat_map(|d| files_holding(&env.root.join(d), value.as_bytes()))
+    .collect();
+    assert_eq!(held, std::slice::from_ref(&store));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains(&value));
+}
+
+/// Every regular file under `dir` (symlinks not followed) whose bytes hold `needle`. A
+/// directory or file it cannot read fails the test, naming it: unread is not clean.
+fn files_holding(dir: &Path, needle: &[u8]) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let entries =
+        std::fs::read_dir(dir).unwrap_or_else(|e| panic!("cannot list {}: {e}", dir.display()));
+    for e in entries {
+        let path = e.unwrap().path();
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        if meta.is_dir() {
+            found.extend(files_holding(&path, needle));
+        } else if meta.is_file() {
+            let bytes = std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            if bytes.windows(needle.len()).any(|w| w == needle) {
+                found.push(path);
+            }
+        }
+    }
+    found
+}

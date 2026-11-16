@@ -4,7 +4,6 @@
 //! live session is answered through `approvals.watch` / `approvals.decide`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,16 +27,21 @@ use common::*;
 struct Cx {
     x: Lx,
     control: Arc<Control<Arc<Registry>>>,
+    /// The registry's operational log, and what it wrote.
+    oplog: sallyd::oplog::Oplog,
+    log: Lines,
 }
 
 fn cx() -> Cx {
     let x = Lx::new();
     let audit = x.events.clone() as Arc<dyn AuditSink>;
     let hub = Arc::new(Hub::default());
+    let log = Lines::default();
+    let oplog = sallyd::oplog::Oplog::new(log.clone());
     let reg = x.registry_hub(
         Arc::clone(&audit),
         Some(test_image()),
-        sallyd::oplog::Oplog::new(std::io::sink()),
+        oplog.clone(),
         Arc::clone(&hub),
     );
     let sessions_dir = open_sessions(&x.f.root.join("home/.local/share/sallyport")).unwrap();
@@ -47,10 +51,16 @@ fn cx() -> Cx {
         hub,
         sessions_dir: Arc::new(sessions_dir),
         env: Arc::new(x.f.env.clone()),
-        catalog: Arc::new(BTreeSet::<String>::new()),
+        // The store the fixture's egress reads its values from (`common::egress::canary_store`).
+        secrets: Arc::new(x.f.root.join("egress-secrets/secrets.toml")),
         crash: sallyd::daemon::crash::CrashReporter::channel().0,
     }));
-    Cx { x, control }
+    Cx {
+        x,
+        control,
+        oplog,
+        log,
+    }
 }
 
 /// One control connection, as the peer `PEER`.

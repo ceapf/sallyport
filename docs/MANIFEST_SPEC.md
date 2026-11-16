@@ -123,7 +123,7 @@ channel** (`network.mode: proxy` with any allow rule), the validator emits a `da
 warning (path `network.allow`) and `summary()` opens with it, e.g.:
 
 ```
-[data-can-leave] Anything this agent reads — /home/u/code/p and whatever your GITHUB_TOKEN unlocks on api.github.com or github.com — can be sent to pypi.org, api.github.com (acting as you) and github.com (acting as you).
+[data-can-leave] Anything this agent reads (/home/u/code/p and whatever your GITHUB_TOKEN unlocks on api.github.com or github.com) can be sent to pypi.org, api.github.com (acting as you) and github.com (acting as you).
 ```
 
 Hosts with a secret grant are marked "acting as you". When `fetch` is granted the finding ends
@@ -383,7 +383,7 @@ validation — otherwise `mount-changed`/`is-symlink` (RT-FS-06).
 | `network.acknowledge_unrestricted_egress` | validator | validate | reject if `*` without ack |
 | `network.max_connections` | `sallyd::egress::server` admission, decided and audited at accept before any byte is read; after the 429 is written the proxy discards, unparsed, what the client still sends (at most 256 KiB, at most 1 s), then closes | each connection | 429 `too-many-connections`, audit `egress.limit` |
 | `network.max_request_bytes`/`max_response_bytes` | `sallyd::egress::server::intercept` body caps (Task 9a-2: intercepted requests only; a spliced tunnel is opaque; body bytes after chunk decoding, per message); `sallyd::tools::fetch` also applies both to a fetch on either route: the request body at prepare, the returned body (also ≤ 1 MiB) at run (#75 ruling Q13) | each intercepted request and response; each fetch | 413 request / 502 response, audit `egress.limit`; a fetch: `denied: request-too-large`, or the body cut with `truncated: true` |
-| `secrets[].name` | validator checks store; `sallyd::egress::inject` reads the grants' values from the store at launch (Task 9a-3) | validate + launch + each matching request | reject if missing; at launch `sandbox.refuse` `secret-missing` (`secret-store` when the store cannot be read) |
+| `secrets[].name` | validator checks the store's names (`sally_core::secrets::StoreNames`, read afresh for each validation by `sallyd` and the CLI alike, #99); `sallyd::egress::inject` reads the grants' values from the store at launch (Task 9a-3) | validate + launch + each matching request | reject if missing; a store that cannot be read is `session.refuse` `secret-store` over `control.sock` (exit 2 in the CLI), never a missing name; at launch `sandbox.refuse` `secret-missing` (`secret-store` when the store cannot be read) |
 | `secrets[].inject.host` | validator (exact host, must be allowed) + inject (a grant's credential is set on its own host only; every intercepted response is redacted with every secret of the session, and its `egress.response` entry names the secrets redacted and the bytes) | validate + launch + request | reject; at launch `sandbox.refuse` `secret-filler` when the session's forms hold every filler candidate |
 | `secrets[].inject.header/format/basic_user` | validator + inject (TLS-terminated grant hosts only; every client copy of the header is dropped, then the grant's value set once the request is audited; `{basic}` renders RFC 7617's padded base64 of `basic_user:secret`, Task 9b; the placeholder and `basic_user` pairing is checked again at launch) | validate + launch + request | reject; plain HTTP to any host → 405 `plain-http-unsupported`; a grant that cannot be injected → `sandbox.refuse` `secret-grant` |
 | `secrets[].expose_env` | validator (name rule) + workspace `--env NAME=sallyport-placeholder` | validate + launch | reject |
@@ -408,10 +408,11 @@ error: filesystem.mounts[0].host: "~/" is the home directory root (denylisted) [
 error: secrets[0].inject.host: "*.github.com": host must be exact (no wildcards) [not-exact-host]
 error: network.allow[2].host: "*" requires network.acknowledge_unrestricted_egress: true [unacknowledged-wildcard]
 error: tools.acknowledge_unapproved: shell: allow with destructive_requires_approval: false runs every command without approval; add "shell" to tools.acknowledge_unapproved to accept this [unacknowledged-risk]
-warning: tools.shell: "allow" — shell commands run without approval unless tagged destructive [risky]
+warning: tools.shell: "allow": shell commands run without approval unless tagged destructive [risky]
 ```
 
-All errors are reported at once. Diagnostics are single-line, at most 300 characters, and
+All errors are reported at once. Diagnostics are single-line; a diagnostic's path and its
+message are each at most 300 characters (a cut one ends in `...`), and
 token-looking values (20+ characters with a digit and no spaces/slashes) are masked in both the
 message and the path, so a credential pasted into the wrong field does not reach the UI or the
 audit log. The bracketed code is stable (tests and the UI match on it,

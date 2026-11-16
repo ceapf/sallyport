@@ -159,8 +159,10 @@ impl Diagnostic {
     }
 }
 
-/// Longest diagnostic text kept, in characters.
+/// Longest diagnostic text kept, in characters, the cut marker included.
 const MAX_TEXT: usize = 300;
+/// What ends a cut text.
+const CUT: &str = "...";
 /// Quoted spans at least this long that look like tokens are masked.
 const TOKEN_MIN: usize = 20;
 
@@ -171,8 +173,12 @@ pub(crate) fn scrub(s: &str) -> String {
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
     let masked = mask_quoted(&flat);
-    match masked.char_indices().nth(MAX_TEXT) {
-        Some((i, _)) => format!("{}…", masked.get(..i).unwrap_or_default()),
+    if masked.chars().count() <= MAX_TEXT {
+        return masked;
+    }
+    let keep = MAX_TEXT.saturating_sub(CUT.len());
+    match masked.char_indices().nth(keep) {
+        Some((i, _)) => format!("{}{CUT}", masked.get(..i).unwrap_or_default()),
         None => masked,
     }
 }
@@ -185,7 +191,7 @@ fn scrub_path(path: &str) -> String {
         .map(|seg| {
             if looks_like_token(without_index(seg)) {
                 let head: String = seg.chars().take(4).collect();
-                format!("{head}…")
+                format!("{head}...")
             } else {
                 seg.to_owned()
             }
@@ -213,7 +219,7 @@ fn mask_quoted(s: &str) -> String {
         out.push(q);
         if looks_like_token(body) {
             let head: String = body.chars().take(4).collect();
-            out.push_str(&format!("{head}…[{} chars hidden]", body.chars().count()));
+            out.push_str(&format!("{head}...[{} chars hidden]", body.chars().count()));
         } else {
             out.push_str(body);
         }
@@ -337,12 +343,12 @@ mod tests {
         ));
         assert_eq!(
             m,
-            format!("invalid value: string \"{gh}…[30 chars hidden]\", expected x")
+            format!("invalid value: string \"{gh}...[30 chars hidden]\", expected x")
         );
         let m = scrub(&format!(
             "unknown field `{sk}proj-abcdefghij0123456789`, expected one of a"
         ));
-        assert!(m.contains(&format!("`{sk}p…[28 chars hidden]`")), "{m}");
+        assert!(m.contains(&format!("`{sk}p...[28 chars hidden]`")), "{m}");
     }
 
     #[test]
@@ -360,7 +366,26 @@ mod tests {
     #[test]
     fn scrub_flattens_and_bounds() {
         assert_eq!(scrub("a\nb\tc"), "a b c");
-        assert_eq!(scrub(&"x".repeat(1000)).chars().count(), MAX_TEXT + 1);
+        // MANIFEST_SPEC: a message (or a path) is at most 300 characters, its cut marker included.
+        let cut = scrub(&"x".repeat(1000));
+        assert_eq!(cut.chars().count(), MAX_TEXT);
+        assert!(cut.ends_with("x..."), "{cut}");
+        let whole = "y".repeat(MAX_TEXT);
+        assert_eq!(scrub(&whole), whole, "exactly the bound is kept whole");
+        let over = scrub(&"z".repeat(MAX_TEXT + 1));
+        assert_eq!(over.chars().count(), MAX_TEXT);
+        assert!(over.ends_with("z..."), "{over}");
+    }
+
+    /// A quoted token that straddles the cut is masked whole before the cut: cutting first
+    /// would leave it unterminated, and an unterminated quote is never masked (security review
+    /// of the 300-character cut).
+    #[test]
+    fn a_token_straddling_the_cut_is_masked_before_it() {
+        let token = "k9".repeat(15);
+        let s = scrub(&format!("{}\"{token}\" tail", "a ".repeat(140)));
+        assert!(s.chars().count() <= MAX_TEXT, "{s}");
+        assert!(!s.contains("k9k9k9"), "{s}");
     }
 
     #[test]
@@ -375,15 +400,15 @@ mod tests {
         );
         let tok = ["gh", "p_", "abcdefghij0123456789xyz"].concat();
         // A token-like key stays masked, with or without an index-looking suffix.
-        assert_eq!(scrub_path(&format!("tools.{tok}")), "tools.ghp_…");
-        assert_eq!(scrub_path(&format!("tools.{tok}[0]")), "tools.ghp_…");
-        assert_eq!(scrub_path(&format!("tools.x[{tok}]")), "tools.x[gh…");
+        assert_eq!(scrub_path(&format!("tools.{tok}")), "tools.ghp_...");
+        assert_eq!(scrub_path(&format!("tools.{tok}[0]")), "tools.ghp_...");
+        assert_eq!(scrub_path(&format!("tools.x[{tok}]")), "tools.x[gh...");
         // A long digit run is not an index: it is masked with its segment.
         let digits = "1234567890123456789012";
-        assert_eq!(scrub_path(&format!("tools.x[{digits}]")), "tools.x[12…");
+        assert_eq!(scrub_path(&format!("tools.x[{digits}]")), "tools.x[12...");
         assert_eq!(
             scrub_path(&format!("tools.acknowledge_unapproved[{digits}]")),
-            "tools.ackn…"
+            "tools.ackn..."
         );
     }
 }

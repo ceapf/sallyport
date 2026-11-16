@@ -258,8 +258,11 @@ impl Launcher {
             self.unclaim(req);
         }
         let e = LaunchError::Internal("the launch made another role's handle".into());
-        self.refused(&req.subject(), req.role(), e, req.level(), outcome)
-            .await
+        let refused = self
+            .refused(&req.subject(), req.role(), e, req.level(), outcome)
+            .await;
+        self.forget(req).await;
+        refused
     }
 
     /// The one launch path (architect Q129). Every `Err` it returns went through `refused()`:
@@ -289,8 +292,19 @@ impl Launcher {
                 if cleanup.is_ok() {
                     self.unclaim(req);
                 }
-                Err(self.refused(&subject, role, e, level, outcome).await)
+                let refused = self.refused(&subject, role, e, level, outcome).await;
+                self.forget(req).await;
+                Err(refused)
             }
+        }
+    }
+
+    /// After a refused workspace's `sandbox.refuse`, its last entry: its secrets leave the logs'
+    /// redactors (architect Q219). A harness shares its session's id, so only a workspace
+    /// request releases them.
+    async fn forget(&self, req: &Request) {
+        if let Request::Workspace(r) = req {
+            self.release_secrets(r.paths.id().as_str()).await;
         }
     }
 
