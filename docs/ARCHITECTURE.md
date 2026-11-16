@@ -1026,8 +1026,9 @@ TODO(#28): the harness container and `llm.sock` (Task 13, Task 12 PR C).
   reused. The backstop's grace outlasts every timed wait `sallyd` adds from `podman init` to the
   end of a timeout stop plus one 120 s podman budget (a relation test, Q194, Q198). Untimed waits
   are outside it: audit appends with no deadline (`session.start`, `session.timeout` or
-  `session.crash`, `sandbox.stop`, `session.resource_limit`), `wait_out` while operations are in
-  flight, and a file-system call blocked in a stage walk. A session whose launch tail or stop
+  `session.crash`, the `approval.withdraw` entries `Desk::stop` awaits before the drain deadline
+  starts, `sandbox.stop`, `session.resource_limit`), `wait_out` while operations are in flight,
+  and a file-system call blocked in a stage walk or `statvfs`. A session whose launch tail or stop
   meets one of them, or podman hanging past the budget, may instead end `exited`, by the
   backstop (fail closed).
 - `disconnect`: the control connection that created a session with `lifetime: "connection"`

@@ -457,8 +457,9 @@ mod tests {
     /// - the egress server's stop grace, awaited after the container is gone.
     ///
     /// Untimed waits are outside the relation and fail closed: the audit appends with no
-    /// deadline (`session.start`, `session.timeout` or `session.crash`, `sandbox.stop` per
-    /// attempt, `session.resource_limit` under the observer's lock), `wait_out` while operations
+    /// deadline (`session.start`, `session.timeout` or `session.crash`, the `approval.withdraw`
+    /// entries `Desk::stop` awaits before the drain deadline starts, `sandbox.stop` per attempt,
+    /// `session.resource_limit` under the observer's lock), `wait_out` while operations
     /// are in flight, and a file-system call blocked inside a stage walk or `statvfs`. Podman
     /// hanging past the budget does too. Conmon then fires first: the session ends `exited`, or
     /// the stop finds the container gone (accepted by Q60, Q194).
