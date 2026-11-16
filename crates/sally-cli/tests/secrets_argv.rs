@@ -30,10 +30,16 @@ impl Home {
     }
 
     fn sally(&self, args: &[&str], stdin: &[u8]) -> Output {
+        self.sally_with(args, stdin, &[])
+    }
+
+    /// [`Home::sally`] with `env` set as well.
+    fn sally_with(&self, args: &[&str], stdin: &[u8], env: &[(&str, &PathBuf)]) -> Output {
         let mut child = Command::new(env!("CARGO_BIN_EXE_sally"))
             .args(args)
             .env_clear()
             .env("HOME", &self.0)
+            .envs(env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -333,6 +339,32 @@ fn a_piped_value_is_stored_and_only_its_name_listed() {
     assert_eq!(
         (o.status.code(), String::from_utf8_lossy(&o.stdout).as_ref()),
         (Some(0), format!("{NAME}\n").as_str())
+    );
+}
+
+/// Architect Q236: the binary stores under `$XDG_CONFIG_HOME` when it is set, at the literal
+/// path `sallyd` reads (`$XDG_CONFIG_HOME/sallyport/secrets.toml`), and nothing under `$HOME`'s
+/// own `.config`: the binary-side link of the daemon test that writes the store in-process.
+#[test]
+fn set_stores_under_xdg_config_home_when_it_is_set() {
+    let h = Home::new("xdg");
+    let xdg = h.0.join("xdg-config");
+    std::fs::create_dir_all(&xdg).unwrap();
+    let o = h.sally_with(
+        &["secrets", "set", NAME],
+        format!("{VALUE}-long-enough\n").as_bytes(),
+        &[("XDG_CONFIG_HOME", &xdg)],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    let store =
+        sally_core::secrets::SecretStore::open(&xdg.join("sallyport/secrets.toml")).unwrap();
+    assert_eq!(
+        store.get(NAME).unwrap().expose(),
+        &format!("{VALUE}-long-enough")
+    );
+    assert!(
+        !h.0.join(".config/sallyport").exists(),
+        "nothing under $HOME/.config"
     );
 }
 

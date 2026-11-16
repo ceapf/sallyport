@@ -993,7 +993,9 @@ fn load_test_image(env: &Env) -> String {
 /// name is stored, the session starts and its egress writes the session CA files (with the old
 /// value-less source the launch was refused `secret-missing`: the control for the wiring);
 /// after `rm` the next create is refused again, and after another `set` it starts. No outbound
-/// connection: the session is created and stopped, nothing is dialled.
+/// connection: the session is created and stopped, nothing is dialled. The store is written
+/// in-process (architect Q236); that the `sally` binary writes it at this same path is
+/// sally-cli's `set_stores_under_xdg_config_home_when_it_is_set` (tests/secrets_argv.rs).
 #[test]
 fn the_daemon_validates_and_injects_from_the_store_the_cli_writes() {
     let env = Env::new();
