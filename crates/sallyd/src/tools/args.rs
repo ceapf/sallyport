@@ -202,8 +202,9 @@ fn argv(v: &Value) -> Result<Vec<String>, &'static str> {
     Ok(cmd)
 }
 
-/// An absolute guest directory with no `..` and no control bytes, in canonical form.
-fn cwd(s: &str) -> Result<String, &'static str> {
+/// An absolute guest directory with no `..` and no control bytes, in canonical form: the shell
+/// tool's `cwd`, and an attach's (architect Q101).
+pub(crate) fn cwd(s: &str) -> Result<String, &'static str> {
     if !s.starts_with('/') || s.len() > MAX_PATH || s.bytes().any(|b| b < 0x20 || b == 0x7f) {
         return Err(BAD);
     }

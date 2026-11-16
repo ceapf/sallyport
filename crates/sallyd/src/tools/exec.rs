@@ -22,6 +22,15 @@
 //!    killed off the runtime; the output readers are aborted. The container's removal ends the
 //!    rest.
 //!
+//! The same runner serves an attached command (`sessions.attach`; architect Q101, Q145): `-i`
+//! with a stdin pipe that takes each `sessions.input` in order, no time limit of its own, and
+//! output escaped per stream (`StreamEscaper`) into a bounded queue, a full queue pausing the
+//! reads. The connection's end is watched with the session's stop at the gate, during the
+//! search and during the wait, and takes the same awaited kill (`killed: disconnect`; a stop
+//! goes first when both hold). A kill stops the reading at once, so a client that does not
+//! read never delays it; after an exit the pipes are read to their end or to [`DRAIN_LIMIT`] of
+//! idleness.
+//!
 //! Killing the `podman exec` client alone leaves the command running in the container (probed,
 //! `docs/dev/PROBE_NOTES.md`), hence the pidfds. A process is named by its pid and start time,
 //! both read through one `/proc/<pid>` directory fd, and a signal goes only through a pidfd
@@ -29,17 +38,24 @@
 
 use std::os::unix::process::ExitStatusExt as _;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rustix::fd::OwnedFd;
 use rustix::fs::{Mode, OFlags};
 use rustix::process::{Pid, PidfdFlags, Signal};
-use tokio::io::{AsyncRead, AsyncReadExt as _};
+use sally_core::text::StreamEscaper;
+use sally_proto::Stream;
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::sync::{mpsc, watch};
 
-use super::ops::{Ops, SESSION_STOP};
+use super::ops::{DISCONNECT, Ops, SESSION_STOP};
 use super::procs::{self, Call, Snapshot, Stat};
-use super::shell::{Captured, Output, Runner, START_LIMIT, Status, TIME_LIMIT, exec_argv};
+use super::shell::{
+    AttachIo, Captured, Chunk, Input, Output, Ran, Runner, START_LIMIT, Status, Stdin, Streamer,
+    TIME_LIMIT, exec_argv, read_len,
+};
 use crate::sandbox::{Podman, Running};
 
 /// Pause between snapshots while looking for the started process.
@@ -243,18 +259,74 @@ impl Drop for Reader {
 
 impl Runner for PodmanExec {
     async fn run(&self, argv: &[String], cwd: &str) -> Output {
-        let me = &self.inner;
         let stdout = Arc::new(Mutex::new(Captured::default()));
         let stderr = Arc::new(Mutex::new(Captured::default()));
-        let out = |status| Output {
+        let io = Io::Capture {
+            stdout: Arc::clone(&stdout),
+            stderr: Arc::clone(&stderr),
+        };
+        let (status, _) = self.run_io(argv, cwd, io).await;
+        Output {
             status,
             stdout: take(&stdout),
             stderr: take(&stderr),
+        }
+    }
+}
+
+impl Streamer for PodmanExec {
+    async fn attach(&self, argv: &[String], cwd: &str, io: AttachIo) -> Ran {
+        let (status, n) = self.run_io(argv, cwd, Io::Attach(io)).await;
+        Ran {
+            status,
+            stdin: n.stdin.load(Ordering::Relaxed),
+            stdout: n.stdout.load(Ordering::Relaxed),
+            stderr: n.stderr.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// What a run reads and writes: the shell tool's capture, or an attached command's ends.
+enum Io {
+    Capture {
+        stdout: Arc<Mutex<Captured>>,
+        stderr: Arc<Mutex<Captured>>,
+    },
+    Attach(AttachIo),
+}
+
+/// Bytes an attached command moved, counted as they go.
+#[derive(Default)]
+struct Counts {
+    stdin: AtomicU64,
+    stdout: AtomicU64,
+    stderr: AtomicU64,
+}
+
+/// The pipe tasks of one run.
+struct Pipes {
+    readers: [Option<Reader>; 2],
+    writer: Option<Reader>,
+    /// Attach only: set once the client exited (the drain's idle bound starts) and once reading
+    /// must stop (a stop or a disconnect).
+    exited: Option<watch::Sender<bool>>,
+    halt: Option<watch::Sender<bool>>,
+}
+
+impl PodmanExec {
+    /// The one runner of the shell tool and of an attached command (architect Q101, Q145).
+    async fn run_io(&self, argv: &[String], cwd: &str, io: Io) -> (Status, Arc<Counts>) {
+        let me = &self.inner;
+        let counts = Arc::new(Counts::default());
+        let (stdin, limit, disconnect) = match &io {
+            Io::Capture { .. } => (Stdin::Null, Some(me.time_limit), None),
+            Io::Attach(a) => (Stdin::Piped, None, Some(a.disconnect.clone())),
         };
+        let out = |status| (status, Arc::clone(&counts));
         let gate = tokio::select! {
             biased;
             // Nothing started yet: nothing to kill.
-            () = me.ops.stopped() => return out(Status::Killed(SESSION_STOP)),
+            why = ended(&me.ops, disconnect.clone()) => return out(Status::Killed(why)),
             g = Arc::clone(&me.gate).lock_owned() => g,
         };
         // Closed (the stop has begun): nothing new starts, as for a write.
@@ -269,8 +341,11 @@ impl Runner for PodmanExec {
         let spawned = me
             .podman
             .command()
-            .args(exec_argv(&me.container, cwd, argv))
-            .stdin(Stdio::null())
+            .args(exec_argv(&me.container, cwd, argv, stdin))
+            .stdin(match stdin {
+                Stdin::Null => Stdio::null(),
+                Stdin::Piped => Stdio::piped(),
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
@@ -279,31 +354,26 @@ impl Runner for PodmanExec {
             Ok(c) => c,
             Err(e) => return out(Status::Failed(format!("podman exec: {e}"))),
         };
-        let readers = [
-            child
-                .stdout
-                .take()
-                .map(|r| Reader(drain(r, Arc::clone(&stdout)))),
-            child
-                .stderr
-                .take()
-                .map(|r| Reader(drain(r, Arc::clone(&stderr)))),
-        ];
+        let pipes = pipes(&mut child, io, &counts);
         let mut guard = KillOnDrop {
             pidfd: None,
             session: None,
         };
         let found = tokio::select! {
-            f = self.find_started(&before, &mut child) => Some(f),
-            () = me.ops.stopped() => None,
+            biased;
+            why = ended(&me.ops, disconnect.clone()) => Err(Some(why)),
+            f = self.find_started(&before, &mut child) => match f {
+                Found::Lost => Err(None),
+                f => Ok(f),
+            },
         };
         let call = match found {
-            Some(Found::Started(call, fd)) => {
+            Ok(Found::Started(call, fd)) => {
                 guard.pidfd = Some(fd);
                 Some(call)
             }
-            Some(Found::Exited(call)) => call,
-            lost @ (Some(Found::Lost) | None) => {
+            Ok(Found::Exited(call)) => call,
+            lost @ (Ok(Found::Lost) | Err(_)) => {
                 let _ = child.kill().await;
                 // Whatever the dead client may still have started is new since `before`.
                 let call = blocking(me, move |i| i.quick_session(&before))
@@ -311,18 +381,19 @@ impl Runner for PodmanExec {
                     .flatten();
                 drop(gate);
                 kill(me, call).await;
-                let why = if lost.is_none() {
-                    SESSION_STOP
-                } else {
-                    "start-timeout"
-                };
+                let why = lost.err().flatten().unwrap_or("start-timeout");
+                pipes.halt();
                 return out(Status::Killed(why));
             }
         };
         drop(gate);
         guard.session = call.map(|c| (Arc::clone(me), c));
         let status = tokio::select! {
-            r = tokio::time::timeout(me.time_limit, child.wait()) => match r {
+            biased;
+            // The same awaited kill as a timeout, finished before `tool.result` (Q59 (c)); a
+            // stop goes before a disconnect, both before the limit (architect Q145).
+            why = ended(&me.ops, disconnect.clone()) => Status::Killed(why),
+            r = within(limit, child.wait()) => match r {
                 Ok(Ok(s)) => Status::Exited(
                     s.code()
                         .or_else(|| s.signal().map(|n| 128 + n))
@@ -331,9 +402,11 @@ impl Runner for PodmanExec {
                 Ok(Err(e)) => Status::Failed(format!("podman exec: {e}")),
                 Err(_) => Status::Killed("timeout"),
             },
-            // The same awaited kill as a timeout, finished before `tool.result` (Q59 (c)).
-            () = me.ops.stopped() => Status::Killed(SESSION_STOP),
         };
+        if matches!(status, Status::Killed(_)) {
+            // A blocked output queue never delays the kill; queued chunks may still go.
+            pipes.halt();
+        }
         // Also after a normal exit: what the command left running ends with the call. Its top
         // has exited then, so only its session is followed (its pid could be another's now).
         let left = match status {
@@ -352,12 +425,222 @@ impl Runner for PodmanExec {
         // The guard's pidfd fires here on every path (ESRCH once the process is gone is
         // harmless; a pidfd never reaches a reused pid).
         drop(guard);
-        for r in readers.into_iter().flatten() {
-            // A process outside the call's reach may still hold the pipe: keep what was read.
-            let mut r = r;
-            let _ = tokio::time::timeout(DRAIN_LIMIT, &mut r.0).await;
-        }
+        pipes.drain(&me.ops, disconnect).await;
         out(status)
+    }
+}
+
+/// Resolves with why the run must end: its session stopped, or (attach only) its connection
+/// is gone. A stop wins when both hold. A disconnect watch whose sender is gone is a
+/// disconnect: the attach's guard fires on drop.
+async fn ended(ops: &Ops, disconnect: Option<watch::Receiver<bool>>) -> &'static str {
+    let gone = async move {
+        match disconnect {
+            Some(mut d) => {
+                let _ = d.wait_for(|gone| *gone).await;
+            }
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        biased;
+        () = ops.stopped() => SESSION_STOP,
+        () = gone => DISCONNECT,
+    }
+}
+
+/// `f` within `limit`; no limit: `f` to its end.
+async fn within<F: Future>(
+    limit: Option<Duration>,
+    f: F,
+) -> Result<F::Output, tokio::time::error::Elapsed> {
+    match limit {
+        Some(l) => tokio::time::timeout(l, f).await,
+        None => Ok(f.await),
+    }
+}
+
+/// Starts the tasks on the child's pipes for `io`.
+fn pipes(child: &mut tokio::process::Child, io: Io, counts: &Arc<Counts>) -> Pipes {
+    let (out, err) = (child.stdout.take(), child.stderr.take());
+    match io {
+        Io::Capture { stdout, stderr } => Pipes {
+            readers: [
+                out.map(|r| Reader(drain(r, stdout))),
+                err.map(|r| Reader(drain(r, stderr))),
+            ],
+            writer: None,
+            exited: None,
+            halt: None,
+        },
+        Io::Attach(a) => {
+            let (exited, halt) = (watch::Sender::new(false), watch::Sender::new(false));
+            let marks = || (halt.subscribe(), exited.subscribe());
+            let readers = [
+                out.map(|r| {
+                    let tx = a.output.clone();
+                    let c = Arc::clone(counts);
+                    Reader(tokio::spawn(stream(r, Stream::Stdout, tx, marks(), c)))
+                }),
+                err.map(|r| {
+                    let tx = a.output.clone();
+                    let c = Arc::clone(counts);
+                    Reader(tokio::spawn(stream(r, Stream::Stderr, tx, marks(), c)))
+                }),
+            ];
+            let writer = child
+                .stdin
+                .take()
+                .map(|w| Reader(tokio::spawn(write_input(w, a.input, Arc::clone(counts)))));
+            Pipes {
+                readers,
+                writer,
+                exited: Some(exited),
+                halt: Some(halt),
+            }
+        }
+    }
+}
+
+impl Pipes {
+    /// Stops the reading of the pipes (attach).
+    fn halt(&self) {
+        if let Some(h) = &self.halt {
+            h.send_replace(true);
+        }
+    }
+
+    /// Ends the pipe tasks once the client exited. The shell tool's readers get [`DRAIN_LIMIT`]
+    /// in all; an attached command's end at the end of their pipes, at [`DRAIN_LIMIT`] of a
+    /// pipe's idleness, or at a stop or disconnect; time waiting for room in the output queue
+    /// does not count (architect Q145). The input writer ends with the run: an input it has
+    /// not written is dropped unanswered, which its connection tells as `input-closed`.
+    async fn drain(self, ops: &Ops, disconnect: Option<watch::Receiver<bool>>) {
+        let Self {
+            readers,
+            writer,
+            exited,
+            halt,
+        } = self;
+        drop(writer);
+        let Some(exited) = exited else {
+            for r in readers.into_iter().flatten() {
+                // A process outside the call's reach may still hold the pipe: keep what was read.
+                let mut r = r;
+                let _ = tokio::time::timeout(DRAIN_LIMIT, &mut r.0).await;
+            }
+            return;
+        };
+        exited.send_replace(true);
+        let all = async {
+            for r in readers.into_iter().flatten() {
+                let mut r = r;
+                let _ = (&mut r.0).await;
+            }
+        };
+        tokio::pin!(all);
+        tokio::select! {
+            biased;
+            () = &mut all => return,
+            _ = ended(ops, disconnect) => {}
+        }
+        if let Some(h) = &halt {
+            h.send_replace(true);
+        }
+        all.await;
+    }
+}
+
+/// Reads one pipe of an attached command to its end: each read at most what keeps the chunk
+/// with its carry within [`sally_proto::MAX_OUTPUT_CHUNK`], escaped by this stream's own
+/// escaper, and queued, waiting for room. Ends at the pipe's end, at [`DRAIN_LIMIT`] of
+/// idleness once the client exited, or when halted.
+async fn stream(
+    mut r: impl AsyncRead + Unpin + Send + 'static,
+    which: Stream,
+    tx: mpsc::Sender<Chunk>,
+    (mut halt, mut exited): (watch::Receiver<bool>, watch::Receiver<bool>),
+    counts: Arc<Counts>,
+) {
+    let mut esc = StreamEscaper::default();
+    let mut buf = vec![0u8; sally_proto::MAX_OUTPUT_CHUNK];
+    let counter = match which {
+        Stream::Stdout => &counts.stdout,
+        Stream::Stderr => &counts.stderr,
+    };
+    loop {
+        let want = read_len(esc.held());
+        let Some(space) = buf.get_mut(..want) else {
+            return;
+        };
+        let idle = async {
+            let _ = exited.wait_for(|e| *e).await;
+            tokio::time::sleep(DRAIN_LIMIT).await;
+        };
+        let n = tokio::select! {
+            biased;
+            () = until(&mut halt) => return,
+            r = r.read(space) => match r {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            },
+            () = idle => break,
+        };
+        counter.fetch_add(u64::try_from(n).unwrap_or(u64::MAX), Ordering::Relaxed);
+        let text = esc.push(buf.get(..n).unwrap_or_default());
+        if !send(&tx, which, text, &mut halt).await {
+            return;
+        }
+    }
+    let rest = esc.finish();
+    let _ = send(&tx, which, rest, &mut halt).await;
+}
+
+/// Queues `text` (nothing when empty), waiting for room; `false` once halted or the queue's
+/// reader is gone.
+async fn send(
+    tx: &mpsc::Sender<Chunk>,
+    stream: Stream,
+    text: String,
+    halt: &mut watch::Receiver<bool>,
+) -> bool {
+    if text.is_empty() {
+        return true;
+    }
+    tokio::select! {
+        biased;
+        () = until(halt) => false,
+        r = tx.send(Chunk { stream, text }) => r.is_ok(),
+    }
+}
+
+/// Resolves once `w` is `true` or its sender is gone.
+async fn until(w: &mut watch::Receiver<bool>) {
+    let _ = w.wait_for(|v| *v).await;
+}
+
+/// Writes each input to the command's standard input in order and tells whether it was
+/// written; closes the pipe after an input with `eof`. Once a write failed or the pipe was
+/// closed, every later input is answered `false`.
+async fn write_input(
+    w: tokio::process::ChildStdin,
+    mut rx: mpsc::Receiver<Input>,
+    counts: Arc<Counts>,
+) {
+    let mut w = Some(w);
+    while let Some(input) = rx.recv().await {
+        let ok = match w.as_mut() {
+            Some(pipe) => pipe.write_all(&input.data).await.is_ok() && pipe.flush().await.is_ok(),
+            None => false,
+        };
+        if ok {
+            let n = u64::try_from(input.data.len()).unwrap_or(u64::MAX);
+            counts.stdin.fetch_add(n, Ordering::Relaxed);
+        }
+        if !ok || input.eof {
+            w = None;
+        }
+        let _ = input.done.send(ok);
     }
 }
 
