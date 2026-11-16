@@ -6,10 +6,17 @@ use sally_core::audit::{Actor, NewEntry};
 use sally_core::manifest::AuditLevel;
 use serde_json::json;
 
-use super::{LaunchError, Launcher, Progress, Running, STOP_RETRY, StopError, blocking, capped};
+use super::{
+    LaunchError, Launcher, Progress, RoleRunning, RoleStopError, Running, STOP_RETRY, StopError,
+    blocking, capped,
+};
 use crate::sandbox::commands::rm_args;
 use crate::sandbox::orphans::{Orphan, orphans, ps_args};
-use crate::sandbox::types::SessionPaths;
+use crate::sandbox::types::{Role, SessionPaths};
+
+/// How many more times a stop nobody received retries once its container is gone (for an
+/// instance's directories), [`STOP_RETRY`] apart.
+const STOP_RETRIES_AFTER_REMOVAL: u32 = 3;
 
 /// Which orphan sweep runs (architect Q61), named in each `sandbox.orphan_removed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,17 +126,14 @@ impl Launcher {
 
     /// Cleanup after a failed launch: the container by name if `create` was attempted (it may
     /// exist without a printed id), then the directories this launch created.
-    pub(super) async fn clean_failed(
-        &self,
-        paths: &SessionPaths,
-        p: &Progress,
-    ) -> Result<(), LaunchError> {
+    pub(super) async fn clean_failed(&self, p: &Progress) -> Result<(), LaunchError> {
         if let Some(name) = &p.container {
             self.remove_container(name).await?;
         }
         for d in &p.dirs {
-            // Only `sessions/<id>` under either root: what this launch created.
-            if d != paths.socket_root() && d != paths.data_root() {
+            // Only what this role's launch can create (`sessions/<id>` or `infer/<id>` under
+            // either root).
+            if !p.owned.contains(d) {
                 return Err(LaunchError::Internal(format!(
                     "refusing to remove {}",
                     d.display()
@@ -138,6 +142,103 @@ impl Launcher {
             self.unshare_rm(d).await?;
         }
         Ok(())
+    }
+
+    /// Stops and removes a harness or inference container, then the directories its launch
+    /// created (an instance's; a harness has none, its session's directories stay). Audits
+    /// `sandbox.stop` {role} first ({role, instance} for an instance), and frees the harness
+    /// claim once the container is gone (architect Q130, Q139).
+    ///
+    /// A retry with the returned handle does only what is left: the entry if it failed, the
+    /// container (by its id, never its name: a harness name is reused within a live session
+    /// once the claim is free) and the claim only until they are confirmed gone and freed, once.
+    ///
+    /// # Errors
+    /// [`RoleStopError`] carrying the handle back, when the container cannot be confirmed gone
+    /// (the claim is kept), the entry cannot be written, or its directories cannot be removed.
+    pub async fn stop_role(&self, mut r: RoleRunning) -> Result<(), Box<RoleStopError>> {
+        let audited = if r.stop_audited {
+            Ok(())
+        } else {
+            let a = self
+                .audit(r.subject.entry("sandbox.stop", r.role, []), r.level)
+                .await;
+            r.stop_audited = a.is_ok();
+            a
+        };
+        if !r.removed {
+            if let Err(error) = self.remove_container(&r.container).await {
+                return Err(Box::new(RoleStopError { running: r, error }));
+            }
+            r.removed = true;
+            match r.role {
+                Role::Harness => self.sessions.free_harness(r.subject.id().as_str()),
+                Role::Workspace | Role::Inference => {}
+            }
+        }
+        let mut cleaned = Ok(());
+        for d in &r.dirs {
+            if let Err(e) = self.unshare_rm(d).await {
+                cleaned = Err(e);
+                break;
+            }
+        }
+        audited
+            .and(cleaned)
+            .map_err(|error| Box::new(RoleStopError { running: r, error }))
+    }
+
+    /// [`Self::stop_role`] for a launch nobody received, retried until the container is gone;
+    /// the first failure is audited as `sandbox.stop_failed`. TODO(#135): one loop with
+    /// [`Self::stop_unreceived`].
+    pub(super) async fn stop_role_unreceived(&self, mut running: RoleRunning) {
+        let mut reported = false;
+        let mut after_removal = 0_u32;
+        loop {
+            let e = match self.stop_role(running).await {
+                Ok(()) => return,
+                Err(e) => e,
+            };
+            if !reported {
+                reported = true;
+                let r = &e.running;
+                let entry = r
+                    .subject
+                    .entry(
+                        "sandbox.stop_failed",
+                        r.role,
+                        [
+                            ("container", r.name.clone().into()),
+                            ("detail", capped(&e.error.to_string()).into()),
+                        ],
+                    )
+                    .decision("deny");
+                if self.audit(entry, r.level).await.is_err() {
+                    self.oplog.error(
+                        "sandbox",
+                        "audit entry not written",
+                        &[
+                            ("event", "sandbox.stop_failed"),
+                            (r.subject.kind(), r.subject.id().as_str()),
+                        ],
+                    );
+                }
+            }
+            // `stop_role` also fails after the container is gone (the entry, the directories):
+            // nothing runs any more, so only a bounded number of retries remain, for what the
+            // retry still does (an instance's directories, which no sweep removes). Checked by
+            // id, as it was removed.
+            if e.running.removed {
+                if after_removal >= STOP_RETRIES_AFTER_REMOVAL {
+                    return;
+                }
+                after_removal += 1;
+            } else if matches!(self.container_exists(&e.running.container).await, Ok(false)) {
+                return;
+            }
+            running = e.running;
+            tokio::time::sleep(STOP_RETRY).await;
+        }
     }
 
     /// Stops and removes the container, discards the `.git` overlays, the profiles and the

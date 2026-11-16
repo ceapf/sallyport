@@ -16,7 +16,7 @@
 //! installation left behind ([`super::Launcher::remove_orphans`], matched on the installation
 //! label: architect Q64) before the first launch, so in-process state is the whole picture.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -154,10 +154,25 @@ pub struct Sessions {
     fd_budget: u64,
 }
 
+/// Why a harness launch could not claim its session's harness (architect Q139).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum HarnessClaimError {
+    /// The session is not live: a harness runs only beside a live workspace (Q130).
+    #[error("session {0} is not live")]
+    NotLive(String),
+    /// The session's harness is already launched or launching.
+    #[error("session {0} already has a harness (sp-h-{0})")]
+    Claimed(String),
+}
+
 #[derive(Debug, Default)]
 struct Live {
     held: BTreeMap<String, (Vec<Claim>, u64)>,
     fds: u64,
+    /// Live sessions with a harness launched or launching: its container name is taken, so a
+    /// second launch is refused before it could create, or clean up, a container of that name.
+    harnesses: BTreeSet<String>,
 }
 
 impl Sessions {
@@ -204,9 +219,39 @@ impl Sessions {
         self.lock().held.contains_key(id)
     }
 
-    /// Forgets `id` and frees its descriptors (teardown; only the launcher releases, #17).
+    /// Claims the harness of live session `id`, atomically with the liveness check, so a release
+    /// cannot come between them (architect Q139).
+    ///
+    /// # Errors
+    /// [`HarnessClaimError`] when `id` is not live or its harness is already claimed.
+    pub(crate) fn claim_harness(&self, id: &str) -> Result<(), HarnessClaimError> {
+        let mut live = self.lock();
+        if !live.held.contains_key(id) {
+            return Err(HarnessClaimError::NotLive(id.to_owned()));
+        }
+        if !live.harnesses.insert(id.to_owned()) {
+            return Err(HarnessClaimError::Claimed(id.to_owned()));
+        }
+        Ok(())
+    }
+
+    /// Whether `id`'s harness is claimed.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn has_harness(&self, id: &str) -> bool {
+        self.lock().harnesses.contains(id)
+    }
+
+    /// Frees `id`'s harness claim: its container is confirmed gone, or never existed.
+    pub(crate) fn free_harness(&self, id: &str) {
+        self.lock().harnesses.remove(id);
+    }
+
+    /// Forgets `id`, its harness claim with it, and frees its descriptors (teardown; only the
+    /// launcher releases, #17).
     pub(crate) fn release(&self, id: &str) {
         let mut live = self.lock();
+        live.harnesses.remove(id);
         if let Some((_, fds)) = live.held.remove(id) {
             live.fds = live.fds.saturating_sub(fds);
         }
@@ -305,6 +350,38 @@ mod tests {
         std::fs::remove_dir_all(&base).unwrap();
         assert!(chain.is_ok(), "search-only dir: {chain:?}");
         assert!(link.is_err(), "symlinked root: {link:?}");
+    }
+
+    /// Architect Q139: a harness claims only a live session, once; freeing it allows the next
+    /// claim, and the session's release drops it.
+    #[test]
+    fn a_harness_claims_a_live_session_once_until_freed_or_released() {
+        let s = Sessions::new(BIG);
+        assert_eq!(
+            s.claim_harness("a"),
+            Err(HarnessClaimError::NotLive("a".into()))
+        );
+        assert!(!s.has_harness("a"), "a refused claim holds nothing");
+        s.reserve("a", Vec::new(), 1).unwrap();
+        s.reserve("b", Vec::new(), 1).unwrap();
+        s.claim_harness("a").unwrap();
+        assert!(s.has_harness("a") && !s.has_harness("b"));
+        let second = s.claim_harness("a").unwrap_err();
+        assert_eq!(second, HarnessClaimError::Claimed("a".into()));
+        assert_eq!(
+            second.to_string(),
+            "session a already has a harness (sp-h-a)"
+        );
+        s.claim_harness("b").unwrap();
+        s.free_harness("a");
+        assert!(!s.has_harness("a") && s.has_harness("b"));
+        s.claim_harness("a").unwrap();
+        s.release("a");
+        assert!(!s.has_harness("a") && s.has_harness("b"));
+        assert!(matches!(
+            s.claim_harness("a"),
+            Err(HarnessClaimError::NotLive(_))
+        ));
     }
 
     /// Path containment alone is a conflict, even with no identity to compare.

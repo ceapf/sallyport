@@ -45,14 +45,15 @@ pub use inside::Mismatch;
 #[doc(hidden)]
 pub use inside::{Expect, check_in_container};
 pub use launch::{
-    AuditSink, LaunchError, Launcher, LauncherParts, Running, SharedAudit, StopError, Sweep,
-    WorkspaceRequest,
+    AuditSink, HarnessRequest, InferenceRequest, LaunchError, Launcher, LauncherParts, PinError,
+    RoleRunning, RoleStopError, Running, SharedAudit, StopError, Sweep, WorkspaceRequest,
 };
-pub use overlap::{Claim, Conflict, ReserveError, Sessions, claims};
+pub use overlap::{Claim, Conflict, HarnessClaimError, ReserveError, Sessions, claims};
 pub use podman::{PODMAN_PATH_VAR, Podman, PodmanError, PodmanHost};
 pub use profiles::profile;
 pub use scan::{GitScan, LaunchScan, Pin, PinKind, ScanError, ScanLimits, scan_mounts};
 pub use types::{
     ArgvError, CheckedRuntime, CommonArgs, INSTALLATION_LABEL, ImageRef, InferenceSpec,
-    Installation, OverlayDirs, Role, SessionId, SessionPaths, UserIds, VerifiedModel,
+    Installation, InstancePaths, OverlayDirs, Role, SessionId, SessionPaths, UserIds,
+    VerifiedModel,
 };

@@ -6,7 +6,7 @@
 //! re-checked, and fails closed on any podman error or ambiguous result.
 
 use super::commands::Stored;
-use super::launch::{LaunchError, Launcher, WorkspaceRequest};
+use super::launch::{HarnessRequest, LaunchError, Launcher, WorkspaceRequest};
 use super::types::ImageRef;
 
 impl WorkspaceRequest {
@@ -24,11 +24,54 @@ impl WorkspaceRequest {
     }
 }
 
+impl HarnessRequest {
+    /// The harness image: the manifest's `harness.image`, or the bundled default.
+    ///
+    /// # Errors
+    /// [`LaunchError::NoHarnessImage`] when there is neither (architect Q142);
+    /// [`LaunchError::Argv`] for a manifest image that is not a pinned reference.
+    pub(super) fn image(&self) -> Result<ImageRef, LaunchError> {
+        match (&self.manifest.manifest().harness, &self.default_image) {
+            (Some(h), _) => Ok(ImageRef::parse(&h.image)?),
+            (None, Some(d)) => Ok(d.clone()),
+            (None, None) => Err(LaunchError::NoHarnessImage),
+        }
+    }
+}
+
+/// An image [`Launcher::image_present`] found in local storage with its pinned digest. Only that
+/// check makes one, and every role's launch must hand one to the one start path, which compares
+/// it with the argv's image (architect Q143): a launch that skips the check does not compile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PresentImage(ImageRef);
+
+impl PresentImage {
+    /// The reference.
+    #[must_use]
+    pub(crate) fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    /// The argv runs exactly the image that was checked (architect Q143).
+    ///
+    /// # Errors
+    /// [`LaunchError::Internal`] naming both when it does not (a bug).
+    pub(crate) fn matches(&self, argv_image: &str) -> Result<(), LaunchError> {
+        if self.as_str() == argv_image {
+            Ok(())
+        } else {
+            Err(LaunchError::Internal(format!(
+                "the checked image {} is not the argv's {argv_image}",
+                self.as_str()
+            )))
+        }
+    }
+}
+
 impl Launcher {
-    // TODO(#28): the harness and inference launchers (Task 13) call this too.
-    // TODO(#123): and `verify_config` before their `start`, as the workspace launcher does.
     /// Refuses unless hermetic podman finds `image` (a digest-pinned reference) in local storage
-    /// and the image it resolves to carries the pinned digest.
+    /// and the image it resolves to carries the pinned digest. Every role's launch calls it
+    /// before its directories and argv are made.
     ///
     /// The name is checked by `podman image exists` alone (it resolves `name@digest` as a
     /// whole); the inspect step compares the digest only. A reference holds one `@` (the
@@ -39,7 +82,11 @@ impl Launcher {
     /// [`LaunchError::ImageMissing`] when the image is absent, or when `podman image inspect`
     /// does not print exactly one list of references with one carrying the pinned digest;
     /// [`LaunchError::Command`] when podman fails or times out.
-    pub(super) async fn image_present(&self, image: &str) -> Result<(), LaunchError> {
+    pub(super) async fn image_present(
+        &self,
+        pinned: &ImageRef,
+    ) -> Result<PresentImage, LaunchError> {
+        let image = pinned.as_str();
         let Some((_, digest)) = image.split_once('@') else {
             return Err(missing(image, "no digest"));
         };
@@ -60,7 +107,7 @@ impl Launcher {
             .run("image inspect", args.into_iter().map(Into::into))
             .await?;
         if carries_digest(&out, digest) {
-            Ok(())
+            Ok(PresentImage(pinned.clone()))
         } else {
             Err(missing(
                 image,
@@ -103,6 +150,22 @@ mod tests {
             &format!("[\"x@sha256:{}\"]", "c".repeat(64)),
             D
         ));
+    }
+
+    /// Architect Q143: the start path runs only the image that was found.
+    #[test]
+    fn a_checked_image_matches_only_itself() {
+        #![allow(clippy::unwrap_used)]
+        let r = format!("ghcr.io/x/tools@{D}");
+        let present = super::PresentImage(super::ImageRef::parse(&r).unwrap());
+        assert_eq!(present.as_str(), r);
+        present.matches(&r).unwrap();
+        let other = format!("ghcr.io/x/other@{D}");
+        let e = present.matches(&other).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            format!("internal: the checked image {r} is not the argv's {other}")
+        );
     }
 
     #[test]
@@ -174,5 +237,27 @@ mod tests {
         let e = request("", None).image().unwrap_err();
         assert!(matches!(e, LaunchError::NoDefaultImage), "{e}");
         assert!(e.to_string().starts_with("runtime.image: "), "{e}");
+        // The harness (architect Q142): `harness.image`, else its bundled default.
+        let harness = |body: &str, default: Option<&str>| {
+            let w = request(body, None);
+            super::super::launch::HarnessRequest {
+                paths: w.paths,
+                manifest: w.manifest,
+                default_image: default.map(|d| ImageRef::parse(d).unwrap()),
+            }
+        };
+        let named = format!("harness:\n  image: {custom}\n");
+        for d in [Some(default.as_str()), None] {
+            assert_eq!(harness(&named, d).image().unwrap().as_str(), custom);
+        }
+        let workspace_named = format!("runtime:\n  image: {custom}\n");
+        let bundled = harness(&workspace_named, Some(&default)).image().unwrap();
+        assert_eq!(
+            bundled.as_str(),
+            default,
+            "runtime.image is the workspace's"
+        );
+        let e = harness(&workspace_named, None).image().unwrap_err();
+        assert!(matches!(e, LaunchError::NoHarnessImage), "{e}");
     }
 }

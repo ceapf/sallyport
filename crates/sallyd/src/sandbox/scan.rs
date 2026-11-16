@@ -198,6 +198,21 @@ impl LaunchScan {
         &self.pins
     }
 
+    /// What the post-init check compares (B4): every bind pin at its guest path. Overlay lower
+    /// layers are left out (an overlay shows its own device); the host re-check covers them.
+    #[must_use]
+    pub fn bind_expects(&self) -> Vec<super::inside::Expect> {
+        self.pins
+            .iter()
+            .filter(|p| p.kind == PinKind::Bind)
+            .map(|p| super::inside::Expect {
+                guest: p.guest.clone(),
+                dev: p.dev,
+                ino: p.ino,
+            })
+            .collect()
+    }
+
     /// Re-opens every pin on the host, without following symlinks or leaving its mount, and
     /// compares identities: the last host-side check before `podman create`.
     ///

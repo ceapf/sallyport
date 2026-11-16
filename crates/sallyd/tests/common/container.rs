@@ -12,9 +12,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use sally_core::audit::{AuditError, NewEntry};
 use sally_core::manifest::{AuditLevel, ValidatedManifest};
 use sallyd::sandbox::{
-    AuditSink, CheckedRuntime, CommonArgs, DiskFloor, ImageRef, Installation, LaunchError,
-    Launcher, LauncherParts, Podman, PodmanHost, Running, ScanLimits, SessionDirs, SessionId,
-    SessionPaths, Sessions, UserIds, WorkspaceRequest, resolve_podman,
+    AuditSink, CheckedRuntime, CommonArgs, DiskFloor, HarnessRequest, ImageRef, InferenceRequest,
+    Installation, InstancePaths, LaunchError, Launcher, LauncherParts, Podman, PodmanHost, Running,
+    ScanLimits, SessionDirs, SessionId, SessionPaths, Sessions, UserIds, VerifiedModel,
+    WorkspaceRequest, resolve_podman,
 };
 
 use sallyd::session::{Registry, RegistryParts};
@@ -506,6 +507,7 @@ impl Lx {
             runtime: runtime.clone(),
             ids: ids(),
             xdg_runtime_dir: xdg.clone(),
+            data_dir: f.root.join("home/.local/share/sallyport"),
             // Well past what the test sessions need; the budget is unit-tested in `overlap.rs`.
             sessions: Arc::new(Sessions::new(1 << 20)),
             audit: events.clone(),
@@ -611,6 +613,58 @@ impl Lx {
 
     pub async fn stop(&self, r: Running) {
         self.launcher.stop(r).await.unwrap();
+    }
+
+    /// The harness request of the session `tag` (its workspace launched first).
+    #[allow(dead_code)] // Only the role launch tests launch a harness.
+    pub fn harness(&self, v: &ValidatedManifest, tag: &str) -> HarnessRequest {
+        HarnessRequest {
+            paths: self.paths(tag),
+            manifest: Arc::new(v.clone()),
+            default_image: Some(test_image()),
+        }
+    }
+
+    /// A CPU inference request for instance `tag` serving `model`.
+    #[allow(dead_code)] // Only the role launch tests launch inference.
+    pub fn inference(&self, model: VerifiedModel, tag: &str) -> InferenceRequest {
+        InferenceRequest {
+            instance: SessionId::parse(&format!("{}-{tag}", self.scope)).unwrap(),
+            model,
+            image: test_image(),
+            gpu: false,
+            gpu_layers: 0,
+            context: 512,
+            cpus: sally_core::manifest::Cpus::from_millis(1000),
+            memory: None,
+            level: AuditLevel::default(),
+        }
+    }
+
+    /// A model blob (the stand-in `llama-server` never reads it) pinned from this fixture's
+    /// library.
+    #[allow(dead_code)] // Only the role launch tests launch inference.
+    pub fn model(&self) -> VerifiedModel {
+        let blobs = self.f.root.join("blobs");
+        let digest = "a".repeat(64);
+        let blob = blobs.join("sha256").join(&digest);
+        if !blob.exists() {
+            std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+            std::fs::write(&blob, b"GGUF").unwrap();
+            std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        VerifiedModel::pin(&blobs, &digest).unwrap()
+    }
+
+    /// The instance paths of inference instance `tag`.
+    #[allow(dead_code)] // Only the role launch tests launch inference.
+    pub fn instance_paths(&self, tag: &str) -> InstancePaths {
+        InstancePaths::under(
+            SessionId::parse(&format!("{}-{tag}", self.scope)).unwrap(),
+            &self.xdg.join("sallyport"),
+            &self.f.root.join("home/.local/share/sallyport"),
+        )
+        .unwrap()
     }
 
     /// The common argv inputs for a session's directories.

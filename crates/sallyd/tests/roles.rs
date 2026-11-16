@@ -3,9 +3,10 @@
 //! RT-FS-17 (no new namespaces), and the ENOENT half of RT-FS-10 (broker state out of reach).
 //!
 //! The workspace comes from the launcher; the harness and inference containers from their argv
-//! builders, created and started with hermetic podman exactly as the argv says (their launchers
-//! arrive in Tasks 12 and M3). The probe is `tests/redteam/probe/probe.c`. Every refusal must be
-//! `ENOSYS` (38), the seccomp profiles' default action: the kernel never returns it for `socket`,
+//! builders, created and started with hermetic podman exactly as the argv says (their launchers,
+//! #123, are tested in `tests/oci.rs` and `tests/role_launch.rs`). The probe is
+//! `tests/redteam/probe/probe.c`. Every refusal must be `ENOSYS` (38), the seccomp profiles'
+//! default action: the kernel never returns it for `socket`,
 //! `unshare`, `clone` or `clone3` itself, so the profile is what refused. That holds for
 //! `clone3` only from kernel 5.3 on, where the syscall exists; [`kernel_has_clone3`] checks it.
 //! The fixture is `common::container`; these tests never skip.

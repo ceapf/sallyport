@@ -159,16 +159,18 @@ fn rt_sup_04_the_cpu_inference_config_passes_and_a_tampered_one_is_refused() {
     });
 }
 
-/// A podman wrapper that appends its whole argv (`$*`) to `<at>/argv`, runs the real podman,
-/// then runs `after` (shell, with `$rc`, `$v` the verb and `$id` the word after it) and exits
-/// with podman's status. The verb is the first word after the global `--flag value` pairs.
+/// A podman wrapper that appends its whole argv (`$*`) to `<at>/argv` and its `$HOME` to
+/// `<at>/home` (one line each per call), runs the real podman, then runs `after` (shell, with
+/// `$rc`, `$v` the verb and `$id` the word after it) and exits with podman's status. The verb is
+/// the first word after the global `--flag value` pairs.
 fn wrapper(at: &Path, real: &Path, after: &str) -> PathBuf {
     let (dir, real) = (at.display(), real.display());
     for p in [dir.to_string(), real.to_string()] {
         assert_plain(&p);
     }
     let script = format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{dir}/argv'\n'{real}' \"$@\"\nrc=$?\n\
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{dir}/argv'\nprintf '%s\\n' \"$HOME\" >>'{dir}/home'\n\
+         '{real}' \"$@\"\nrc=$?\n\
          v=; id=; skip=\nfor a; do\n\
          if [ -n \"$skip\" ]; then skip=; continue; fi\n\
          case \"$a\" in --*) [ -z \"$v\" ] && skip=1 ;; \
@@ -192,27 +194,194 @@ fn verb_of(line: &str) -> &str {
     ""
 }
 
-/// [`wrapper`] that, after a successful `init`, adds a capability to the config podman
-/// generated: the window between create and start (architect Q114).
-fn altering_podman(at: &Path, real: &Path) -> PathBuf {
+/// [`wrapper`] that, after a successful `init` of a container whose name starts with `prefix`,
+/// adds a capability to the config podman generated: the window between create and start
+/// (architect Q114; Q132: the harness case alters only the harness).
+fn altering_podman(at: &Path, real: &Path, prefix: &str) -> PathBuf {
     let r = real.display();
     wrapper(
         at,
         real,
         &format!(
             "if [ $rc -eq 0 ] && [ \"$v\" = init ]; then\n\
+             name=$('{r}' inspect --format '{{{{.Name}}}}' \"$id\")\n\
+             case \"$name\" in {prefix}*)\n\
              cfg=$('{r}' inspect --format '{{{{.OCIConfigPath}}}}' \"$id\")\n\
-             '{r}' unshare sed -i -e 's/\"capabilities\":{{}}/\"capabilities\":{{\"bounding\":[\"CAP_SYS_ADMIN\"]}}/' \"$cfg\"\n\
+             '{r}' unshare sed -i -e 's/\"capabilities\":{{}}/\"capabilities\":{{\"bounding\":[\"CAP_SYS_ADMIN\"]}}/' \"$cfg\" ;;\n\
+             esac\n\
              fi"
         ),
     )
+}
+
+/// Q132, one helper for every role: the podman calls logged from line `from` on (one launch of
+/// `container`) all ran with the private `HOME`; there was exactly one `create`, one `init` and
+/// one `start`; `init` and `start` carried exactly the empty mounts file; and the verifier read
+/// the config between them.
+fn assert_one_start_path(x: &Lx, dir: &Path, from: usize, container: &str) {
+    let argv = std::fs::read_to_string(dir.join("argv")).unwrap();
+    let homes = std::fs::read_to_string(dir.join("home")).unwrap();
+    let lines: Vec<&str> = argv.lines().skip(from).collect();
+    let homes: Vec<&str> = homes.lines().skip(from).collect();
+    assert_eq!(lines.len(), homes.len(), "{argv}");
+    // The fixture's state directory (`Lx::build`): the private HOME is `<state>/podman/home`.
+    let home = x.f.root.join("home/.local/share/sallyport/podman/home");
+    for (line, h) in lines.iter().zip(&homes) {
+        assert_eq!(Path::new(h), home, "{line}");
+    }
+    for verb in ["create", "init", "start"] {
+        let n = lines.iter().filter(|l| verb_of(l) == verb).count();
+        assert_eq!(n, 1, "{verb}: {argv}");
+    }
+    let file = x.podman.mounts_file();
+    for verb in ["init", "start"] {
+        let line = lines.iter().find(|l| verb_of(l) == verb).unwrap();
+        assert_eq!(
+            *line,
+            format!(
+                "--default-mounts-file {} {verb} {container}",
+                file.display()
+            ),
+            "{argv}"
+        );
+    }
+    let at = |verb: &str| lines.iter().position(|l| verb_of(l) == verb).unwrap();
+    let read = lines
+        .iter()
+        .position(|l| l.starts_with("unshare cat -- ") && l.ends_with("/config.json"))
+        .unwrap_or_else(|| panic!("no config read: {argv}"));
+    assert!(at("init") < read && read < at("start"), "{argv}");
+}
+
+/// How many podman calls the wrapper in `dir` logged so far.
+fn logged(dir: &Path) -> usize {
+    std::fs::read_to_string(dir.join("argv"))
+        .map(|a| a.lines().count())
+        .unwrap_or(0)
+}
+
+/// RT-SUP-04, #123: the workspace launch runs the one start path.
+#[test]
+fn rt_sup_04_the_workspace_launch_runs_the_one_start_path() {
+    let (dir, _cleanup) = scratch("ws-path");
+    rt().block_on(async {
+        let x = Lx::with_podman(|real| wrapper(&dir, real, ""));
+        let v = x.f.load("");
+        let r = x.launch(&v, "ws-path").await.unwrap();
+        assert_one_start_path(&x, &dir, 0, r.container());
+        x.stop(r).await;
+    });
+}
+
+/// RT-SUP-04, #123: the harness launch, into the live session, runs the one start path.
+#[test]
+fn rt_sup_04_the_harness_launch_runs_the_one_start_path() {
+    let (dir, _cleanup) = scratch("h-path");
+    rt().block_on(async {
+        let x = Lx::with_podman(|real| wrapper(&dir, real, ""));
+        let v = x.f.load("");
+        let ws = x.launch(&v, "h-path").await.unwrap();
+        let from = logged(&dir);
+        let h = x
+            .launcher
+            .launch_harness(x.harness(&v, "h-path"))
+            .await
+            .unwrap();
+        assert_eq!(h.name(), format!("sp-h-{}", ws.paths().id().as_str()));
+        assert_one_start_path(&x, &dir, from, h.container());
+        x.launcher.stop_role(h).await.unwrap();
+        x.stop(ws).await;
+    });
+}
+
+/// RT-SUP-04, #123: the CPU inference launch runs the one start path.
+#[test]
+fn rt_sup_04_the_cpu_inference_launch_runs_the_one_start_path() {
+    let (dir, _cleanup) = scratch("i-path");
+    rt().block_on(async {
+        let x = Lx::with_podman(|real| wrapper(&dir, real, ""));
+        let i = x
+            .launcher
+            .launch_inference(x.inference(x.model(), "i-path"))
+            .await
+            .unwrap();
+        assert!(i.name().starts_with("sp-infer-"), "{}", i.name());
+        assert_one_start_path(&x, &dir, 0, i.container());
+        x.launcher.stop_role(i).await.unwrap();
+    });
+}
+
+/// RT-SUP-04, #123, Q132 phase 2: a harness whose config is altered between `init` and
+/// `start` is refused `config-mismatch` and never started; the workspace beside it was not
+/// altered and still runs.
+#[test]
+fn rt_sup_04_a_harness_config_altered_between_create_and_start_is_refused() {
+    let (dir, _cleanup) = scratch("h-altered");
+    rt().block_on(async {
+        let x = Lx::with_podman(|real| altering_podman(&dir, real, "sp-h-"));
+        let v = x.f.load("");
+        let ws = x.launch(&v, "h-altered").await.unwrap();
+        let from = logged(&dir);
+        let e = x
+            .launcher
+            .launch_harness(x.harness(&v, "h-altered"))
+            .await
+            .unwrap_err();
+        assert!(matches!(&e, LaunchError::ConfigMismatch(_)), "{e:?}");
+        let args = x.events.args("sandbox.config_mismatch").unwrap();
+        assert_eq!(args["role"], "harness");
+        assert_eq!(args["reason"], "config-mismatch");
+        assert!(
+            args["detail"]
+                .as_str()
+                .unwrap()
+                .contains("process.capabilities"),
+            "{args}"
+        );
+        let sid = ws.paths().id().as_str().to_owned();
+        assert!(!exists(&format!("sp-h-{sid}")));
+        let argv = std::fs::read_to_string(dir.join("argv")).unwrap();
+        let after: Vec<&str> = argv.lines().skip(from).collect();
+        assert!(after.iter().any(|l| verb_of(l) == "init"), "{argv}");
+        assert!(!after.iter().any(|l| verb_of(l) == "start"), "{argv}");
+        let (_, caps) = exec(&ws, "grep CapEff /proc/self/status").await;
+        assert!(caps.contains("CapEff:\t0000000000000000"), "{caps}");
+        assert!(exists(ws.name()), "the workspace still runs");
+        x.stop(ws).await;
+    });
+}
+
+/// RT-SUP-04, #123, Q132 phase 2: an inference config altered between `init` and `start` is
+/// refused `config-mismatch`, never started, and the instance's directories are gone.
+#[test]
+fn rt_sup_04_an_inference_config_altered_between_create_and_start_is_refused() {
+    let (dir, _cleanup) = scratch("i-altered");
+    rt().block_on(async {
+        let x = Lx::with_podman(|real| altering_podman(&dir, real, "sp-infer-"));
+        let req = x.inference(x.model(), "i-altered");
+        let name = format!("sp-infer-{}", req.instance.as_str());
+        let e = x.launcher.launch_inference(req).await.unwrap_err();
+        assert!(matches!(&e, LaunchError::ConfigMismatch(_)), "{e:?}");
+        let args = x.events.args("sandbox.config_mismatch").unwrap();
+        assert_eq!(args["role"], "inference");
+        assert!(
+            args["instance"].as_str().unwrap().ends_with("-i-altered"),
+            "{args}"
+        );
+        assert!(!exists(&name));
+        let argv = std::fs::read_to_string(dir.join("argv")).unwrap();
+        assert!(argv.lines().any(|l| verb_of(l) == "init"), "{argv}");
+        assert!(!argv.lines().any(|l| verb_of(l) == "start"), "{argv}");
+        let p = x.instance_paths("i-altered");
+        assert!(!p.socket_dir().exists() && !p.data_dir().exists());
+    });
 }
 
 #[test]
 fn rt_sup_04_a_config_altered_between_create_and_start_is_refused() {
     let (dir, _cleanup) = scratch("altered");
     rt().block_on(async {
-        let x = Lx::with_podman(|real| altering_podman(&dir, real));
+        let x = Lx::with_podman(|real| altering_podman(&dir, real, "sp-"));
         let v =
             x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "ro")]));
         let paths = x.paths("altered");

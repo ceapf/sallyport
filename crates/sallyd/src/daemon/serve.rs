@@ -325,6 +325,7 @@ async fn serve(
         runtime,
         ids,
         xdg_runtime_dir: dirs.runtime.clone(),
+        data_dir: dirs.state(),
         sessions: Arc::new(Sessions::new(session_budget(nofile))),
         audit: Arc::clone(&audit),
         limits: ScanLimits::default(),

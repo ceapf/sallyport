@@ -2,12 +2,13 @@
 
 use sally_core::audit::AuditError;
 
-use super::Running;
+use super::parts::PinError;
+use super::{RoleRunning, Running};
 use crate::egress::inject::CredentialsError;
 use crate::egress::net::EgressError;
 use crate::sandbox::dirs::DirError;
 use crate::sandbox::inside::Mismatch;
-use crate::sandbox::overlap::ReserveError;
+use crate::sandbox::overlap::{HarnessClaimError, ReserveError};
 use crate::sandbox::podman::PodmanError;
 use crate::sandbox::scan::ScanError;
 use crate::sandbox::types::{ArgvError, SessionId};
@@ -62,6 +63,25 @@ pub enum LaunchError {
          digest-pinned image"
     )]
     NoDefaultImage,
+    /// The manifest names no `harness.image` and no bundled harness image is installed
+    /// (architect Q142). TODO(#88): the bundled image and its digest source.
+    #[error(
+        "harness.image: no bundled harness image is installed; the manifest must name a \
+         digest-pinned image"
+    )]
+    NoHarnessImage,
+    /// The harness's session is not live, or its harness is already claimed (architect Q139).
+    #[error(transparent)]
+    Harness(#[from] HarnessClaimError),
+    /// A directory the harness's session should have made is missing or not private (Q142).
+    #[error("session directory: {0}")]
+    NoSession(#[source] DirError),
+    /// GPU inference is refused until M3 (TODO(#116)): only CPU inference launches.
+    #[error("gpu: GPU inference is not supported yet; only CPU inference launches")]
+    GpuUnsupported,
+    /// A host object a harness or inference launch pinned changed before `podman init`.
+    #[error("pinned path: {0}")]
+    Pin(#[from] PinError),
     /// A podman command failed.
     #[error("podman {verb}: {msg}")]
     Command {
@@ -87,6 +107,8 @@ pub enum LaunchError {
     /// The launch task of this session ended without a result (it panicked, or was cancelled at
     /// shutdown). The one launch error with no `sandbox.refuse` of its own: whoever reports it
     /// writes the entry (architect Q98).
+    /// TODO(#135): an inference launch's id is an instance's, not a session's; carry the
+    /// subject.
     #[error("the launch task ended without a result")]
     Lost(SessionId),
     /// The session's egress could not be set up: trust roots, session CA, CA files, or the
@@ -121,6 +143,11 @@ impl LaunchError {
             | Self::CgroupEvents(_)
             | Self::ImageMissing(_)
             | Self::NoDefaultImage
+            | Self::NoHarnessImage
+            | Self::Harness(_)
+            | Self::NoSession(_)
+            | Self::GpuUnsupported
+            | Self::Pin(_)
             | Self::Command { .. }
             | Self::Audit(_)
             | Self::Unaudited { .. }
@@ -148,7 +175,11 @@ impl LaunchError {
             Self::DiskSpace(_) => "disk-floor",
             Self::CgroupEvents(_) => "cgroup-events",
             Self::ImageMissing(_) => "digest-mismatch",
-            Self::NoDefaultImage => "no-default-image",
+            Self::NoDefaultImage | Self::NoHarnessImage => "no-default-image",
+            Self::Harness(HarnessClaimError::NotLive(_)) | Self::NoSession(_) => "no-session",
+            Self::Harness(HarnessClaimError::Claimed(_)) => "overlap",
+            Self::GpuUnsupported => "gpu-unsupported",
+            Self::Pin(_) => "mount-changed",
             Self::Command { .. } => "podman",
             Self::Audit(_) | Self::Unaudited { .. } => "audit",
             Self::Internal(_) => "internal",
@@ -180,6 +211,39 @@ pub struct StopError {
     pub running: Running,
     /// What failed.
     pub error: LaunchError,
+}
+
+/// [`Launcher::stop_role`](super::Launcher::stop_role) could not confirm the container is gone,
+/// or could not remove the directories after; the error carries the handle back for a retry.
+#[derive(Debug, thiserror::Error)]
+#[error("stop {}: {error}", running.name)]
+pub struct RoleStopError {
+    /// The container's handle.
+    pub running: RoleRunning,
+    /// What failed.
+    pub error: LaunchError,
+}
+
+/// GPU inference stays refused until M3 (architect Q131, TODO(#116)): the first check of an
+/// inference launch.
+pub(super) fn cpu_only(gpu: bool) -> Result<(), LaunchError> {
+    if gpu {
+        Err(LaunchError::GpuUnsupported)
+    } else {
+        Ok(())
+    }
+}
+
+/// `podman inspect` printed `true <pid>` with the pid checked after `init`.
+pub(super) fn running_as(state: &str, pid: u32) -> Result<(), LaunchError> {
+    if state.trim() == format!("true {pid}") {
+        Ok(())
+    } else {
+        Err(LaunchError::NotRunning(format!(
+            "state {:?}, expected running as pid {pid}",
+            super::capped(state.trim())
+        )))
+    }
 }
 
 pub(super) fn join_err(e: tokio::task::JoinError) -> LaunchError {
@@ -243,6 +307,63 @@ mod tests {
         });
         assert_eq!(m.event(), "sandbox.mount_mismatch");
         assert_eq!(LaunchError::NoDefaultImage.event(), "sandbox.refuse");
+    }
+
+    #[test]
+    fn only_running_as_the_checked_pid_counts() {
+        assert!(running_as("true 42\n", 42).is_ok());
+        for bad in ["false 0", "true 43", "true 42 x", "", "TRUE 42"] {
+            let e = running_as(bad, 42).unwrap_err();
+            assert!(matches!(e, LaunchError::NotRunning(_)), "{bad:?}");
+            assert_eq!(e.reason(), "not-running");
+            assert!(e.to_string().contains("expected running as pid 42"), "{e}");
+        }
+    }
+
+    /// Architect Q142: a harness with no image to run names the harness field, with the
+    /// workspace's reason.
+    #[test]
+    fn a_missing_harness_image_names_its_field() {
+        let e = LaunchError::NoHarnessImage;
+        assert_eq!(e.reason(), "no-default-image");
+        assert_eq!(e.event(), "sandbox.refuse");
+        assert_eq!(
+            e.to_string(),
+            "harness.image: no bundled harness image is installed; the manifest must name a \
+             digest-pinned image"
+        );
+    }
+
+    /// Architect Q139, Q142, Q131: a harness outside a live session, or without its
+    /// directories, is `no-session`; a second harness is `overlap`; GPU inference and a changed
+    /// pin each have their own reason.
+    #[test]
+    fn role_refusals_have_their_own_reasons() {
+        let not_live = LaunchError::from(HarnessClaimError::NotLive("s".into()));
+        assert_eq!(not_live.reason(), "no-session");
+        assert_eq!(not_live.event(), "sandbox.refuse");
+        let claimed = LaunchError::from(HarnessClaimError::Claimed("s".into()));
+        assert_eq!(claimed.reason(), "overlap");
+        assert_eq!(claimed.detail(), "session s already has a harness (sp-h-s)");
+        let dirs = LaunchError::NoSession(DirError {
+            path: "/d".into(),
+            msg: "gone".into(),
+            reused: false,
+            created: Vec::new(),
+        });
+        assert_eq!(dirs.reason(), "no-session");
+        assert_eq!(dirs.detail(), "session directory: /d: gone");
+        assert!(cpu_only(false).is_ok());
+        assert!(matches!(cpu_only(true), Err(LaunchError::GpuUnsupported)));
+        assert_eq!(LaunchError::GpuUnsupported.reason(), "gpu-unsupported");
+        assert_eq!(LaunchError::GpuUnsupported.event(), "sandbox.refuse");
+        let pin = LaunchError::from(PinError {
+            path: "/p".into(),
+            msg: "moved".into(),
+        });
+        assert_eq!(pin.reason(), "mount-changed");
+        assert_eq!(pin.event(), "sandbox.refuse");
+        assert_eq!(pin.detail(), "pinned path: /p: moved");
     }
 
     #[test]
