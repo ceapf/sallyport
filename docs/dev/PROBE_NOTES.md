@@ -131,6 +131,9 @@ line per fact, with where it was found. Check a note again before relying on it 
 - `podman save --format oci-archive` then `podman load` into another store keeps the image ID
   but not the `.Digest`: a test that runs an image from a private store names the digest that
   store reports after the load. (#99)
+- Podman 4.9.3 rootless (cgroup v2, crun 1.14.1) accepts `--cpus` above the host's CPU count:
+  `--cpus 34` on a 32-CPU host creates, starts and exits 0. Only the manifest validator bounds
+  `runtime.cpus` by the host (`HostEnv.nproc`). (#99, the line 1 test)
 
 ## Kernel and namespaces
 

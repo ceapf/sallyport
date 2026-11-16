@@ -508,10 +508,10 @@ async fn gone(container: &str) {
 }
 
 /// `manifests/examples/coding-agent.yaml` as M1 Acceptance line 1 runs it (architect Q217):
-/// read at test time, with exactly two lines replaced. `runtime.image` names the developer test
-/// image (with the shim) by digest, since no product image exists (#88, Q199); `runtime.cpus`
-/// drops from 6 to 2, since the validator refuses more CPUs than the host has and CI runners
-/// have four. Every other line is the example's own, asserted.
+/// read at test time, with exactly one line replaced: `runtime.image` names the developer test
+/// image (with the shim) by digest, since no product image exists (#88, Q199). Every other line
+/// is the example's own, asserted (`runtime.cpus: 6` included: podman accepts more CPUs than
+/// the host has, PROBE_NOTES).
 fn line_1_manifest() -> String {
     let path =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../manifests/examples/coding-agent.yaml");
@@ -521,8 +521,6 @@ fn line_1_manifest() -> String {
     for line in example.lines() {
         let line = if line.trim_start().starts_with("image: ") {
             image.as_str()
-        } else if line.trim_start().starts_with("cpus: ") {
-            "  cpus: 2"
         } else {
             line
         };
@@ -534,11 +532,7 @@ fn line_1_manifest() -> String {
         .zip(text.lines())
         .filter(|(a, b)| a != b)
         .collect();
-    assert_eq!(
-        differ.len(),
-        2,
-        "runtime.image and runtime.cpus only: {differ:?}"
-    );
+    assert_eq!(differ.len(), 1, "runtime.image only: {differ:?}");
     assert_eq!(example.lines().count(), text.lines().count());
     text
 }
