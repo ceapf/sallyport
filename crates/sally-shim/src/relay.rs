@@ -216,7 +216,8 @@ half!(UnixStream);
 /// directions at once.
 ///
 /// TODO(#155): a client that does not read a reply larger than the buffers, and has had no send
-/// fail (it sends nothing, or half-closed after its sends went through), holds its slot: the
+/// fail (for example: it sends nothing, its sends block because the server stopped reading
+/// without closing, or it half-closed after they went through), holds its slot: the
 /// server-to-client direction stays blocked writing to it.
 fn relay_connection(
     tcp: TcpStream,
@@ -549,7 +550,8 @@ mod tests {
     static CUT: AtomicBool = AtomicBool::new(true);
 
     /// Toward the server, with the server-to-client direction already done (its sender gone), so
-    /// the client's EOF ends the discard at once. The receiver is leaked: a few bytes per test.
+    /// the client's EOF ends the discard at once. The receiver is leaked, one small allocation
+    /// per call: a `static` one cannot exist, as `Receiver` is not `Sync`.
     fn to_server(linger: Duration, cut: &AtomicBool) -> Direction<'_> {
         let down_done: &'static Receiver<()> = Box::leak(Box::new(mpsc::channel().1));
         Direction::ToServer {
