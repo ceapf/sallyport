@@ -20,7 +20,8 @@
 //! land after `session.closed` and after the release (TODO(#156): a sealable per-session
 //! teardown handle). It holds the sandbox's own request text (host, target), redacted with the
 //! session's own forms by [`SessionRedacted`] whenever it lands (Q249), plus counts and secret
-//! names; watchdog entries hold no sandbox text. A launch or start task that panics after
+//! names: the release changes nothing about what is redacted, which is forms only (Q253);
+//! watchdog entries hold no sandbox text. A launch or start task that panics after
 //! registering never releases its session's forms (TODO(#113)): its values stay redacted, and
 //! in `sallyd`'s memory, until the daemon exits.
 

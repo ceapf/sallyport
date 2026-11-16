@@ -1593,12 +1593,14 @@ sallyport/
   `sallyd::session::secrets`, Q219, Q220). A session's forms enter both redactors when its
   egress has loaded them, before `net.sock` is bound or a container exists. They leave after
   the session's last entry: `sandbox.refuse` for a refused launch, `session.closed` (§5.4) for
-  a session. A value two live sessions share stays redacted until both have left. A proxy
-  session's egress sink also redacts each of its entries with that session's own forms before
-  the writer sees it (`SessionRedacted`, Q249), so an egress entry that lands after the release
-  (§5.4: an aborted or detached append, #156, #72) has its sandbox-chosen text redacted all the
-  same. Residual: a launch or start task that panics after registering never releases its
-  forms, so they stay redacted, and in memory, until `sallyd` exits (TODO(#113)).
+  a session. A value two live sessions share stays redacted until both have left. The egress
+  sink of a proxy session with secret grants (interception) also redacts each of its entries
+  with that session's own forms, read from its `Redaction` (the patterns `audit_text` masks
+  with), before the writer sees it (`SessionRedacted`, Q249, Q278). So an egress entry that
+  lands after the release (§5.4: an aborted or detached append, #156, #72) is redacted exactly
+  as a live session's entry is: forms only (Q253). Residual: a launch or start task that
+  panics after registering never releases its forms, so they stay redacted, and in memory,
+  until `sallyd` exits (TODO(#113)).
 - **Tauri bridge**: Rust side exposes one command `rpc(method: String, params: Value)` that
   forwards to `control.sock` **only** for methods in a compile-time allowlist (no
   `secrets.list` of values exists anyway). Capabilities file grants `core:default` only.
