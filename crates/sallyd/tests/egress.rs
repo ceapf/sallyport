@@ -419,37 +419,62 @@ fn rt_net_09_oversized_heads_slow_clients_and_too_many_connections_are_limited()
         .await
         .1;
         assert_eq!(status(&line), "431", "{line:?}");
+        // Control for the timed drip below: the stdio relay carries the proxy's reply.
+        let line = exec(
+            &r,
+            "(printf 'CONNECT a.mock.test:443'; head -c 102400 /dev/zero | tr '\\0' a; \
+             printf ' HTTP/1.1\\r\\n\\r\\n') | \
+             /usr/local/bin/sally-shim --stdio /run/sallyport/net.sock",
+        )
+        .await
+        .1;
+        assert_eq!(status(&line), "431", "control: the stdio relay: {line:?}");
         // 20 MiB of headers: the proxy stops reading at 8 KiB, answers, drains at most
-        // DRAIN_BYTES and closes. The reply may be lost: a client still sending past the drain
-        // fails its send, and the shim then closes its TCP side (#76). The audit entry is not.
+        // DRAIN_BYTES and closes. The client is still sending: the shim discards the rest until
+        // its end, so the reply is read, not cut (#76).
         let t0 = Instant::now();
-        exec(
+        let headers = exec(
             &r,
             "(printf 'CONNECT a.mock.test:443 HTTP/1.1\\r\\n'; head -c 20971520 /dev/zero | \
              tr '\\0' a) | nc -w 3 127.0.0.1 3128",
         )
-        .await;
+        .await
+        .1;
+        assert_eq!(status(&headers), "431", "{headers:?}");
         assert!(t0.elapsed() < Duration::from_secs(30));
         let limits = refusals(&lx, "egress.limit");
-        assert_eq!(limits.len(), 2, "{limits:?}");
+        assert_eq!(limits.len(), 3, "{limits:?}");
         for l in &limits {
             assert_eq!(l["reason"], json!("head-too-large"));
             assert!(l["head_bytes"].as_u64().unwrap() <= 8192, "{l}");
         }
-        // Slowloris: one byte a second is closed at the 10 s head limit, without a reply.
+        // Slowloris: one byte a second is closed at the 10 s head limit, without a reply. Timed
+        // through the stdio relay, which ends when the proxy closes even with its input still
+        // open, so the time is the proxy's close (architect Q235).
+        let drip = "(for c in C O N N E C T ' ' a . m o c k . t e s t; do printf \"$c\"; \
+                    sleep 1; done)";
         let t0 = Instant::now();
-        let drip = exec(
+        let timed = exec(
             &r,
-            "(for c in C O N N E C T ' ' a . m o c k . t e s t; do printf \"$c\"; sleep 1; \
-             done) | nc 127.0.0.1 3128",
+            &format!("{drip} | /usr/local/bin/sally-shim --stdio /run/sallyport/net.sock"),
         )
         .await
         .1;
         let took = t0.elapsed();
-        assert!(drip.is_empty(), "{drip:?}");
-        // Closed at about 10 s, before the 17 s drip would have ended on its own.
+        assert!(timed.is_empty(), "{timed:?}");
+        // Closed at about 10 s, before the drip's 19 one-second steps would have ended.
         assert!(took >= Duration::from_secs(9) && took < Duration::from_secs(17), "{took:?}");
-        assert_eq!(refusals(&lx, "egress.limit")[2]["reason"], json!("head-timeout"));
+        assert_eq!(refusals(&lx, "egress.limit")[3]["reason"], json!("head-timeout"));
+        // The same drip through the TCP relay gets no reply either. The shim discards what the
+        // client still sends after the proxy closed (#76), so it ends at its own end, below the
+        // shim's linger, not at the proxy's close: a shim that reset it on its next byte after
+        // the close would end it at about 11 s.
+        let t0 = Instant::now();
+        let through_tcp = exec(&r, &format!("{drip} | nc 127.0.0.1 3128")).await.1;
+        let took = t0.elapsed();
+        assert!(through_tcp.is_empty(), "{through_tcp:?}");
+        assert!(took >= Duration::from_secs(15) && took < Duration::from_secs(30), "{took:?}");
+        assert_eq!(refusals(&lx, "egress.limit")[4]["reason"], json!("head-timeout"));
         // Two held tunnels fill max_connections: the third is refused at accept.
         let held = exec(
             &r,
@@ -464,7 +489,7 @@ fn rt_net_09_oversized_heads_slow_clients_and_too_many_connections_are_limited()
         assert!(held.starts_with("HTTP/1.1 429 "), "{held}");
         assert_eq!(held.matches("200 Connection Established").count(), 2, "{held}");
         let last = refusals(&lx, "egress.limit");
-        assert_eq!(last[3], json!({"reason": "too-many-connections"}));
+        assert_eq!(last[5], json!({"reason": "too-many-connections"}));
         lx.stop(r).await;
     });
 }
