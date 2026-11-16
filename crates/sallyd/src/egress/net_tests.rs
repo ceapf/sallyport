@@ -628,7 +628,7 @@ impl AuditSink for Ends {
         if let Some(g) = &self.gate {
             g.pass();
         }
-        let a = e.arguments();
+        let a = e.resolved(&sally_core::audit::Redactor::default());
         let why = a["end"]
             .as_str()
             .or(a["reason"].as_str())

@@ -110,7 +110,7 @@ impl AuditSink for Sink {
         let row = (
             e.event().to_owned(),
             e.decision_value().map(str::to_owned),
-            e.arguments().clone(),
+            e.resolved(&sally_core::audit::Redactor::default()),
         );
         self.entries.lock().unwrap().push(row);
         Ok(())

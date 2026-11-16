@@ -233,7 +233,7 @@ fn the_audit_writer_and_the_oplog_redact_what_is_registered() {
 /// Architect Q249: an egress entry written through a session's [`SessionRedacted`] sink is
 /// redacted with that session's own forms even when the writer's redactor no longer holds them
 /// (the state after the session's release): the sandbox-chosen `host` of `egress.allow` and
-/// `egress.close` (a wildcard-allowed CONNECT host, which `audit_text` does not mask; Q266,
+/// `egress.close` (a wildcard-allowed CONNECT host, which `own_masked` does not mask; Q266,
 /// Q279) and `target` of `egress.request`, `egress.deny`, `egress.limit` and a dropped
 /// `egress.response` hold no form. Control: the same entries appended to the writer directly
 /// are in the clear.

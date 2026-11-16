@@ -122,7 +122,7 @@ impl Redaction {
     }
 
     /// The session's forms as an audit redactor, reading the same allocation: what
-    /// [`super::authority::audit_text`] masks sandbox-chosen text with (architect Q253).
+    /// [`super::authority::own_masked`] masks sandbox-chosen text with (architect Q253).
     #[must_use]
     pub const fn audit(&self) -> &Redactor {
         &self.audit

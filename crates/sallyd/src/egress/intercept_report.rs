@@ -16,7 +16,7 @@ use sally_core::manifest::AuditLevel;
 use serde_json::{Value, json};
 
 use super::State;
-use crate::egress::authority::{Authority, audit_text};
+use crate::egress::authority::{Authority, with_target};
 use crate::egress::redact::{Ending, OnRedacted, Redaction, Report, Tally};
 use crate::egress::tunnel::End;
 
@@ -49,7 +49,8 @@ impl ResponseReport {
             Ending::Cut => self.state.end().map_or("error", End::as_str),
             Ending::Dropped => "dropped",
         };
-        let args = response_args(
+        let entry = response_entry(
+            entry,
             &self.state.auth,
             &self.target,
             self.status,
@@ -57,7 +58,6 @@ impl ResponseReport {
             &self.redaction,
             tally,
         );
-        let entry = entry.args(args);
         let (sink, level, st) = (Arc::clone(&self.sink), self.level, Arc::clone(&self.state));
         // TODO(#72): a dropped body's entry may land after `egress.close`.
         let h = runtime.spawn_blocking(move || {
@@ -86,32 +86,31 @@ impl OnRedacted for ResponseReport {
     }
 }
 
-/// `egress.response`'s arguments: the exchange (the target masked with the session's forms
-/// before it is cut, architect Q253), how its body ended, and per secret (in grant order,
+/// `egress.response`: the exchange (the target declared as [`with_target`] does, masked before
+/// it is cut, architect Q253, Q276), how its body ended, and per secret (in grant order,
 /// `secret:NAME` as in `injected`) the bytes its forms covered, with the total.
-pub(super) fn response_args(
+pub(super) fn response_entry(
+    e: NewEntry,
     a: &Authority,
     target: &str,
     status: StatusCode,
     end: &str,
     r: &Redaction,
     tally: &Tally,
-) -> Value {
-    let (text, bytes, cut) = audit_text(target, Some(r.audit()));
+) -> NewEntry {
     let redacted: Vec<Value> = r
         .named(tally)
         .into_iter()
         .map(|(name, n)| json!({"secret": format!("secret:{name}"), "bytes": n}))
         .collect();
-    json!({
+    let args = json!({
         "host": a.host,
         "port": a.port,
-        "target": text,
-        "target_bytes": bytes,
-        "target_cut": cut,
+        "target_bytes": target.len(),
         "status": status.as_u16(),
         "end": end,
         "redacted_bytes": tally.total(),
         "redacted": redacted,
-    })
+    });
+    with_target(e.args(args), target, Some(r.audit()))
 }

@@ -1,11 +1,12 @@
 //! The CONNECT request-target (`host:port`), the only thing the egress decision reads. Hostnames
 //! only: an IP address in any spelling is refused, even under a `*` rule (SI-9).
 
-use std::borrow::Cow;
 use std::net::Ipv6Addr;
+use std::sync::Arc;
 
-use sally_core::audit::Redactor;
+use sally_core::audit::{NewEntry, Redactor};
 use sally_core::manifest::{HostError, parse_hostname};
+use sally_core::text::Style;
 
 /// Most bytes of a request-target an audit entry carries; the rest is counted, not logged.
 pub const LOGGED_TARGET_BYTES: usize = 256;
@@ -37,7 +38,7 @@ pub enum AuthorityError {
 /// [`AuthorityError`].
 // TODO(#160): the lower-cased host goes into every entry that names it, where a mixed-case form
 // in a label no longer matches the session's forms (a documented residual, architect Q253; the
-// raw target of a refusal is masked by `audit_text`).
+// raw target of a refusal is declared by `with_target` and masked whole).
 pub fn parse(target: &str) -> Result<Authority, AuthorityError> {
     let (host, port) = target.rsplit_once(':').ok_or(AuthorityError::Malformed)?;
     let port = parse_port(port).ok_or(AuthorityError::Malformed)?;
@@ -125,37 +126,48 @@ fn parse_port(s: &str) -> Option<u16> {
     s.parse::<u16>().ok().filter(|&p| p != 0)
 }
 
-/// Text the sandbox chose (a request-target, a method) for an audit entry. In this order: every
-/// secret form `forms` knows is masked in the whole of `raw`; the masked text is cut to its
-/// first [`LOGGED_TARGET_BYTES`] bytes; every byte outside printable ASCII, and `\` and `"`, is
-/// written as `\xNN`. Masking first means no cut or escape can split or rewrite a form of the
-/// session's secrets (architect Q253). `forms` is the session's own forms, `None` for a session
-/// without secret grants. Returns the text, the length of `raw` in bytes, and whether the masked
-/// text was cut.
+/// How text the sandbox chose (a request-target, a method) is logged: its first
+/// [`LOGGED_TARGET_BYTES`] bytes, every byte outside printable ASCII, and `\` and `"`, as `\xNN`
+/// (architect Q288's hex format).
+pub const TARGET_STYLE: Style = Style::Hex {
+    max: LOGGED_TARGET_BYTES,
+};
+
+/// Text the sandbox chose, as an egress entry declares it: masked with the session's own forms
+/// (`None` for a session without secret grants), uncut and unescaped. The audit writer then
+/// masks it whole with every live session's forms, and only then cuts and escapes it in
+/// [`TARGET_STYLE`] (architect Q253, Q276), so no cut or escape can split or rewrite a form of
+/// any live session's secret. The session's own pass keeps a late entry masked after its forms
+/// left the writer.
 #[must_use]
-// TODO(#162): a form of another live session's secret (for a session without secret grants,
-// any form) is masked only by the writer's redactor, after this cut and escape: one that
-// straddles the cut leaves its prefix, and one holding a byte the escape rewrites is logged
-// whole in its `\xNN` spelling, wherever it stands (architect Q254, Q263).
-pub fn audit_text(raw: &str, forms: Option<&Redactor>) -> (String, usize, bool) {
-    let masked = forms.map_or(Cow::Borrowed(raw), |r| r.redact_str(raw));
-    let bytes = masked.as_bytes();
-    let shown = bytes.get(..LOGGED_TARGET_BYTES).unwrap_or(bytes);
-    let mut out = String::with_capacity(shown.len());
-    for &b in shown {
-        if (0x20..0x7f).contains(&b) && b != b'\\' && b != b'"' {
-            out.push(char::from(b));
-        } else {
-            out.push_str(&format!("\\x{b:02x}"));
-        }
+pub fn own_masked(raw: &str, forms: Option<&Redactor>) -> Arc<str> {
+    match forms {
+        Some(r) => Arc::from(r.redact_str(raw).as_ref()),
+        None => Arc::from(raw),
     }
-    (out, raw.len(), bytes.len() > shown.len())
+}
+
+/// `e` with the sandbox's request-target `raw` declared as its `target`, with `target_cut`
+/// saying whether the masked text was cut. The builder puts the raw length in `target_bytes`.
+#[must_use]
+pub fn with_target(e: NewEntry, raw: &str, forms: Option<&Redactor>) -> NewEntry {
+    e.text_and_cut("target", "target_cut", own_masked(raw, forms), TARGET_STYLE)
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use sally_core::audit::Actor;
+
+    /// The target as a writer with no secrets logs it: the text, the raw length, and whether
+    /// it was cut. `forms` is the session's own pass.
+    fn logged(raw: &str, forms: Option<&Redactor>) -> (String, usize, bool) {
+        let e = with_target(NewEntry::new(Actor::Sallyd, "egress.deny"), raw, forms);
+        let v = e.resolved(&Redactor::default());
+        let text = v["target"].as_str().unwrap().to_owned();
+        (text, raw.len(), v["target_cut"].as_bool().unwrap())
+    }
 
     fn ok(host: &str, port: u16) -> Result<Authority, AuthorityError> {
         Ok(Authority {
@@ -324,18 +336,18 @@ mod tests {
     #[test]
     fn audit_text_is_escaped_and_bounded() {
         assert_eq!(
-            audit_text("ok.test:443", None),
+            logged("ok.test:443", None),
             ("ok.test:443".to_owned(), 11, false)
         );
         assert_eq!(
-            audit_text("a\"b\\c\x00\x1f\x7f\u{ff}~ ", None),
+            logged("a\"b\\c\x00\x1f\x7f\u{ff}~ ", None),
             (r"a\x22b\x5cc\x00\x1f\x7f\xc3\xbf~ ".to_owned(), 12, false)
         );
         let long = "a".repeat(LOGGED_TARGET_BYTES + 1);
-        let (text, len, cut) = audit_text(&long, None);
+        let (text, len, cut) = logged(&long, None);
         assert_eq!((text.len(), len, cut), (LOGGED_TARGET_BYTES, 257, true));
         let exact = "a".repeat(LOGGED_TARGET_BYTES);
-        assert!(!audit_text(&exact, None).2);
+        assert!(!logged(&exact, None).2);
     }
 
     /// A 40-character canary, assembled at runtime, with no run of one character.
@@ -363,7 +375,7 @@ mod tests {
             let raw = format!("{pad}{canary}{}", "q".repeat(60));
             assert!(raw.len() > 300);
             let masked = format!("{pad}[REDACTED:C]{}", "q".repeat(60));
-            let (text, len, cut) = audit_text(&raw, Some(&forms));
+            let (text, len, cut) = logged(&raw, Some(&forms));
             assert_eq!(text, masked[..LOGGED_TARGET_BYTES], "at {at}");
             assert_eq!((len, cut), (raw.len(), true), "at {at}");
             assert!(!holds_a_run_of(&canary, &text), "at {at}: {text}");
@@ -381,13 +393,13 @@ mod tests {
         let pad = "p".repeat(LOGGED_TARGET_BYTES - placeholder);
         let raw = format!("{pad}{canary}");
         assert!(raw.len() > LOGGED_TARGET_BYTES);
-        let (text, len, cut) = audit_text(&raw, Some(&forms));
+        let (text, len, cut) = logged(&raw, Some(&forms));
         assert_eq!(text, format!("{pad}[REDACTED:C]"));
         assert_eq!(
             (text.len(), len, cut),
             (LOGGED_TARGET_BYTES, raw.len(), false)
         );
-        let (_, _, cut) = audit_text(&format!("{raw}q"), Some(&forms));
+        let (_, _, cut) = logged(&format!("{raw}q"), Some(&forms));
         assert!(cut);
     }
 
@@ -402,7 +414,7 @@ mod tests {
             &canary()[24..]
         );
         let forms = Redactor::new([("Q", value.as_str())]);
-        let (text, len, cut) = audit_text(&format!("/x{value}/y"), Some(&forms));
+        let (text, len, cut) = logged(&format!("/x{value}/y"), Some(&forms));
         assert_eq!(text, "/x[REDACTED:Q]/y");
         assert_eq!((len, cut), (value.len() + 4, false));
         assert!(!text.contains(r"\x22") && !text.contains(r"\x5c"), "{text}");

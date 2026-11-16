@@ -18,7 +18,10 @@ struct Rows(Mutex<Vec<Value>>);
 
 impl AuditSink for Rows {
     fn append(&self, e: NewEntry, _: AuditLevel) -> Result<(), AuditError> {
-        self.0.lock().unwrap().push(e.arguments().clone());
+        self.0
+            .lock()
+            .unwrap()
+            .push(e.resolved(&sally_core::audit::Redactor::default()));
         Ok(())
     }
 }

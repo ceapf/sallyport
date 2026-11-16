@@ -36,7 +36,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::time::Instant;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-use super::super::authority::{Authority, audit_text};
+use super::super::authority::{Authority, TARGET_STYLE, own_masked, with_target};
 use super::super::head::MAX_HEAD;
 use super::super::inject::Credentials;
 use super::super::meter::{BodyEnd, BoxError, Capped, Counts, Meter, OnEnd};
@@ -555,15 +555,14 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
             return reply;
         }
         let grants = st.credentials.prepare(&st.auth.host);
-        let audited = self
-            .entry("egress.request", Some("allow"))
-            .args(request_args(
-                &st.auth,
-                &parts.method,
-                target,
-                grants.names(),
-                st.credentials.redaction(),
-            ));
+        let audited = request_entry(
+            self.entry("egress.request", Some("allow")),
+            &st.auth,
+            &parts.method,
+            target,
+            grants.names(),
+            st.credentials.redaction(),
+        );
         // TODO(#72): on a session stop this append may land after `egress.close`.
         if !self.append(audited).await {
             st.set_end(End::Error);
@@ -594,13 +593,14 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
 
     /// The request body's end handler, holding its `egress.limit` entry (architect ruling R2).
     fn request_end(&self, st: &Arc<State>, target: &str) -> Arc<RequestEnd> {
-        let over = self.entry("egress.limit", Some("deny")).args(inside_args(
+        let over = inside_entry(
+            self.entry("egress.limit", Some("deny")),
             &st.auth,
             Reason::RequestTooLarge,
             target,
             None,
             st.credentials.redaction(),
-        ));
+        );
         Arc::new(RequestEnd {
             state: Arc::clone(st),
             limit: Mutex::new(Some((over, self.sink()))),
@@ -667,13 +667,14 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
                 .await;
         }
         st.count(rp.status);
-        let over = self.entry("egress.limit", Some("deny")).args(inside_args(
+        let over = inside_entry(
+            self.entry("egress.limit", Some("deny")),
             &st.auth,
             Reason::ResponseTooLarge,
             target,
             Some("body"),
             redaction,
-        ));
+        );
         let on_end = ResponseEnd {
             state: Arc::clone(st),
             limit: Mutex::new(Some((over, self.sink()))),
@@ -720,13 +721,14 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         } else {
             "egress.deny"
         };
-        let entry = self.entry(event, Some("deny")).args(inside_args(
+        let entry = inside_entry(
+            self.entry(event, Some("deny")),
             &st.auth,
             reason,
             target,
             part,
             st.credentials.redaction(),
-        ));
+        );
         if !self.append(entry).await {
             st.set_end(End::Error);
             return Err("audit append failed".into());
@@ -839,51 +841,49 @@ fn reply_response(reason: Reason) -> Response<Out> {
 }
 
 /// Arguments of `egress.request` (Q34): `injected` lists the grants set on the request as
-/// `secret:NAME`, never a value (Task 9a-3, architect D9, D13). The method and target are the
-/// sandbox's text, masked with the session's forms before they are cut (architect Q253). The
-/// method is cut to 256 bytes like the target, but the entry does not say it was (Q256).
-fn request_args(
+/// `egress.request` (Q34): `injected` lists the grants set on the request as `secret:NAME`,
+/// never a value (Task 9a-3, architect D9, D13). The method and target are the sandbox's text,
+/// declared masked with the session's own forms; the writer masks them with every live
+/// session's forms before it cuts and escapes them (architect Q253, Q276). The method is cut to
+/// 256 bytes like the target, but the entry does not say it was (Q256).
+fn request_entry(
+    e: NewEntry,
     a: &Authority,
     method: &Method,
     target: &str,
     injected: &[String],
     r: &Redaction,
-) -> Value {
-    let (method, _, _) = audit_text(method.as_str(), Some(r.audit()));
-    let (text, bytes, cut) = audit_text(target, Some(r.audit()));
-    json!({
+) -> NewEntry {
+    let args = json!({
         "host": a.host,
         "port": a.port,
-        "method": method,
-        "target": text,
-        "target_bytes": bytes,
-        "target_cut": cut,
+        "target_bytes": target.len(),
         "injected": injected,
-    })
+    });
+    let method = own_masked(method.as_str(), Some(r.audit()));
+    with_target(e.args(args), target, Some(r.audit())).text("method", method, TARGET_STYLE)
 }
 
-/// Arguments of a refusal inside the tunnel (Q34): reason, host, port, and the target masked,
-/// cut and escaped as [`audit_text`] does.
-fn inside_args(
+/// A refusal inside the tunnel (Q34): reason, host, port, and the target declared as
+/// [`with_target`] does.
+fn inside_entry(
+    e: NewEntry,
     a: &Authority,
     reason: Reason,
     target: &str,
     part: Option<&str>,
     r: &Redaction,
-) -> Value {
-    let (text, bytes, cut) = audit_text(target, Some(r.audit()));
+) -> NewEntry {
     let mut v = json!({
         "reason": reason.as_str(),
         "host": a.host,
         "port": a.port,
-        "target": text,
-        "target_bytes": bytes,
-        "target_cut": cut,
+        "target_bytes": target.len(),
     });
     if let (Some(obj), Some(p)) = (v.as_object_mut(), part) {
         obj.insert("part".into(), json!(p));
     }
-    v
+    with_target(e.args(v), target, Some(r.audit()))
 }
 
 #[path = "intercept_report.rs"]

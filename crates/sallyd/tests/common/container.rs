@@ -297,7 +297,8 @@ impl AuditSink for Events {
         if self.1.lock().unwrap().contains(&e.event()) {
             return Err(AuditError::InvalidEntry("fake failure"));
         }
-        let args = e.arguments().clone();
+        // The args as a writer with no secrets writes them, declared texts included (Q290).
+        let args = e.resolved(&sally_core::audit::Redactor::default());
         self.4.lock().unwrap().push(format!("{e:?}"));
         self.0.lock().unwrap().push((e.event().to_owned(), args));
         Ok(())

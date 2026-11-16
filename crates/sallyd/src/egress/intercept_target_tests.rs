@@ -95,7 +95,7 @@ async fn a_form_across_the_cut_is_masked_in_a_limit_inside_the_tunnel() {
 }
 
 /// A path check (architect Q257): the entry of a body the client dropped, written from a
-/// detached task, carries the same masked target. Its control is `audit_text`'s call in
+/// detached task, carries the same masked target. Its control is `with_target`'s call in
 /// `intercept_report.rs`, the one builder it shares with the complete case.
 #[tokio::test]
 async fn a_form_across_the_cut_is_masked_in_a_dropped_responses_entry() {
