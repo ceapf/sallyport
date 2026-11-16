@@ -365,6 +365,36 @@ fn texts_fill_args_and_the_whole_is_redacted() {
     assert_eq!(resolve(&over, &[plain], &r), serde_json::json!({"t": "v"}));
 }
 
+/// Architect Q290 (4), Q291 (7): a declared list or composite text wins over an arg of the same
+/// name too (the writer refuses such an entry first), and over args that are not an object.
+#[test]
+fn a_declared_list_or_composite_wins_over_an_arg_of_its_name() {
+    let r = Redactor::default();
+    let list = Declared {
+        key: "k",
+        shape: Shape::List {
+            raws: vec![Arc::from("a"), Arc::from("b\"")],
+            style: Style::HexCounted { max: 8 },
+        },
+    };
+    let pieces = Declared {
+        key: "p",
+        shape: Shape::Pieces {
+            pieces: vec![Piece::Literal("x ".into()), Piece::Raw(Arc::from("\""))],
+            max: 100,
+        },
+    };
+    let over = serde_json::json!({"k": "arg", "p": "arg", "z": 1});
+    assert_eq!(
+        resolve(&over, &[list.clone(), pieces.clone()], &r),
+        serde_json::json!({"k": ["a", "b\\x22"], "p": "x \\\"", "z": 1})
+    );
+    assert_eq!(
+        resolve(&Value::from("s"), &[list, pieces], &r),
+        serde_json::json!({"k": ["a", "b\\x22"], "p": "x \\\""})
+    );
+}
+
 #[test]
 fn a_key_used_twice_or_args_that_are_not_an_object_collide() {
     let styled = |key, cut_key| Declared {
