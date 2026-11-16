@@ -39,6 +39,7 @@ use super::startup::{self, STATE_DIR, StartError};
 use super::{process, stale, sweep};
 use crate::approvals::Approver;
 use crate::approvals::hub::Hub;
+use crate::egress::inject::StoreFile;
 use crate::oplog::Oplog;
 use crate::rpc::control::{Control, ControlParts};
 use crate::rpc::record::Recorder;
@@ -49,7 +50,7 @@ use crate::sandbox::{
     Sessions, SharedAudit, Sweep, UserIds, VERSION_TIMEOUT, check_runtime_dir, open_sessions,
     outside_system_rule, probe_version, resolve_podman, version_error,
 };
-use crate::session::lookup::{NoSecrets, SharedEgress};
+use crate::session::lookup::SharedEgress;
 use crate::session::secrets::{RedactorTarget, Redactors};
 use crate::session::{Registry, RegistryParts};
 
@@ -343,12 +344,14 @@ async fn serve(
         audit: Arc::clone(&audit),
         limits: ScanLimits::default(),
         disk_floor: DiskFloor::default(),
-        // PR A has no secret set (maintainer): a source with no values refuses every grant
-        // `secret-missing`. TODO(#99): `StoreFile { path: dirs.config_home.join(
-        // "sallyport/secrets.toml") }`, with the #85 redactor swap and PR C's `sally secrets`.
+        // Values come from the store `sally secrets` writes, read when each session starts
+        // (#99); the session's forms reach the logs' redactors before anything can use them
+        // (`redactors`, #85).
         egress: Arc::new(SharedEgress::new(
             Arc::new(crate::egress::net::getaddrinfo),
-            Arc::new(NoSecrets),
+            Arc::new(StoreFile {
+                path: dirs.paths.secrets_file(),
+            }),
         )),
         redactors,
         oplog: log.clone(),

@@ -951,3 +951,144 @@ fn a_configured_user_owned_podman_runs_and_the_daemon_says_so() {
     assert!(warn.contains(&path), "{warn}");
     assert!(warn.contains("why=\"not owned by root\""), "{warn}");
 }
+
+/// The test image, loaded into `env`'s private podman store (the one `sallyd` uses there), as
+/// `localhost/<name>@sha256:…` with the digest that store gives it.
+fn load_test_image(env: &Env) -> String {
+    let tag = common::container::test_image_tag();
+    let archive = env.root.join("test-image.tar");
+    let saved = podman(&[
+        "save",
+        "--format",
+        "oci-archive",
+        "-o",
+        archive.to_str().unwrap(),
+        tag,
+    ]);
+    assert!(
+        saved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&saved.stderr)
+    );
+    let private = |args: &[&str]| {
+        let mut c = Command::new("podman");
+        c.args(args);
+        let out = env.command(c).stdout(Stdio::piped()).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    private(&["load", "-q", "-i", archive.to_str().unwrap()]);
+    let digest = private(&["image", "inspect", "--format", "{{.Digest}}", tag]);
+    let name = tag.split_once(':').unwrap().0;
+    format!("{name}@{}", digest.trim())
+}
+
+/// #99 (architect Q222): `serve` reads the secrets store `sally secrets` writes, at the path the
+/// CLI computes (`Paths::secrets_file`, here through the CLI's own `secrets::set` and `rm`),
+/// afresh at each `sessions.create`. With no store a grant is refused at validation; once the
+/// name is stored, the session starts and its egress writes the session CA files (with the old
+/// value-less source the launch was refused `secret-missing`: the control for the wiring);
+/// after `rm` the next create is refused again, and after another `set` it starts. No outbound
+/// connection: the session is created and stopped, nothing is dialled.
+#[test]
+fn the_daemon_validates_and_injects_from_the_store_the_cli_writes() {
+    let env = Env::new();
+    // The private runtime directory has no user bus, so podman would fall back to cgroupfs and
+    // the launch's config check refuses the container (no `cgroupsPath`); the user's own bus
+    // lets podman use the systemd cgroup manager, as it does for the user.
+    let bus = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap()).join("bus");
+    std::os::unix::fs::symlink(bus, env.root.join("run/bus")).unwrap();
+    let image = load_test_image(&env);
+    let paths = sally_core::paths::Paths::from_lookup(|k| {
+        let sub = match k {
+            "HOME" => "home",
+            "XDG_RUNTIME_DIR" => "run",
+            "XDG_DATA_HOME" => "data",
+            "XDG_CONFIG_HOME" => "config",
+            _ => return None,
+        };
+        Some(env.root.join(sub).into_os_string())
+    })
+    .unwrap();
+    let store = paths.secrets_file();
+    std::fs::set_permissions(
+        store.parent().unwrap(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let value = format!("sp-daemon-{}", "t".repeat(24));
+    let mut err = Vec::new();
+    let set = |err: &mut Vec<u8>| {
+        let mut read = || Ok(zeroize::Zeroizing::new(value.clone()));
+        let mut o = sally_cli::commands::Out {
+            out: &mut Vec::new(),
+            err,
+        };
+        sally_cli::secrets::set(&store, "GH_TOKEN", &mut read, &mut o)
+    };
+    let manifest = format!(
+        "apiVersion: sallyport/v1\nkind: Manifest\nname: t\nmodel:\n  ref: any\n\
+         runtime:\n  image: {image}\nnetwork:\n  mode: proxy\n  allow:\n    - host: api.mock.test\n\
+         secrets:\n  - name: GH_TOKEN\n    inject: {{host: api.mock.test, header: Authorization, \
+         format: \"Bearer {{value}}\"}}\n"
+    );
+    let mut d = env.start();
+    let mut c = sally_cli::client::Client::connect(&env.state().join("control.sock")).unwrap();
+    let create = |c: &mut sally_cli::client::Client| {
+        c.call("sessions.create", serde_json::json!({"manifest": manifest}))
+    };
+    let missing = |r: &Result<serde_json::Value, sally_cli::client::Error>| {
+        matches!(r, Err(sally_cli::client::Error::Refused(d))
+            if d.reason == "manifest-invalid"
+                && d.errors.iter().any(|e| e.contains("secret-missing")))
+    };
+    let r = create(&mut c);
+    assert!(missing(&r), "no store yet: {r:?}");
+    assert_eq!(
+        set(&mut err),
+        sally_cli::EXIT_OK,
+        "{}",
+        String::from_utf8_lossy(&err)
+    );
+    let started = |c: &mut sally_cli::client::Client, r: Result<serde_json::Value, _>| {
+        let s = r.unwrap_or_else(|e| panic!("stored, so it starts: {e:?}"));
+        let id = s["id"].as_str().unwrap().to_owned();
+        let ca = env
+            .state()
+            .join(format!("sessions/{id}/workspace/session-ca.pem"));
+        assert!(
+            ca.exists(),
+            "the egress wrote the session CA: {}",
+            ca.display()
+        );
+        c.call("sessions.stop", serde_json::json!({"id": id}))
+            .unwrap();
+    };
+    let r = create(&mut c);
+    started(&mut c, r);
+    let mut o = sally_cli::commands::Out {
+        out: &mut Vec::new(),
+        err: &mut err,
+    };
+    assert_eq!(
+        sally_cli::secrets::rm(&store, "GH_TOKEN", &mut o),
+        sally_cli::EXIT_OK
+    );
+    let r = create(&mut c);
+    assert!(missing(&r), "removed, so refused: {r:?}");
+    assert_eq!(set(&mut err), sally_cli::EXIT_OK);
+    let r = create(&mut c);
+    started(&mut c, r);
+    drop(c);
+    terminate(&mut d);
+    let out = d.finish();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
