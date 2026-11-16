@@ -345,6 +345,31 @@ async fn the_connections_end_kills_the_command() {
     assert_eq!(sink.last("sandbox.exec_result")["killed"], "disconnect");
 }
 
+/// Architect Q152: a client that stops reading stalls the command's output, never `sallyd`; a
+/// write blocked for [`WRITE_TIMEOUT`](crate::rpc::agent::WRITE_TIMEOUT) drops the connection,
+/// which kills the command (`disconnect`). Before that, nothing is killed.
+#[tokio::test(start_paused = true)]
+async fn a_reader_paused_past_the_write_timeout_gets_the_command_killed() {
+    let f = fx("line-paused");
+    let (sink, _, _) = lined(&f, "s-1", Mode::Flood);
+    let mut w = f.connect();
+    w.send("sessions.attach", attach("s-1", &["yes"])).await;
+    let limit = crate::rpc::agent::WRITE_TIMEOUT;
+    tokio::time::sleep(limit - Duration::from_secs(1)).await;
+    assert_eq!(sink.events(), ["sandbox.exec"], "killed before the timeout");
+    eventually(|| sink.events().len() == 2).await;
+    assert_eq!(sink.last("sandbox.exec_result")["killed"], "disconnect");
+    // The server's half is gone: what was buffered (its last frame cut by the timed-out write)
+    // can still be read, then the end.
+    w.w.shutdown().await.unwrap();
+    let mut rest = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut w.r, &mut rest)
+        .await
+        .unwrap();
+    assert!(!rest.is_empty());
+    w.task.await.unwrap();
+}
+
 /// Architect Q144: all output comes before the reply, in order.
 #[tokio::test]
 async fn all_output_comes_before_the_reply() {

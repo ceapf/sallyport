@@ -59,7 +59,8 @@ pub(crate) enum Event {
 }
 
 impl Attachment {
-    /// The next thing to send; never, until there is one. Output goes first, so the reply comes
+    /// The next thing to send; never, until there is one. An input's answer goes first, so
+    /// steady output cannot starve the input; output goes before the end, so the reply comes
     /// after the last of it. Cancel-safe: nothing is taken until a branch is chosen.
     pub(crate) async fn next(&mut self) -> Event {
         loop {
@@ -71,11 +72,11 @@ impl Attachment {
             };
             let got = tokio::select! {
                 biased;
-                c = self.run.output.recv(), if self.output_open => c.map(Event::Output),
                 ok = pending => {
                     let id = self.pending.take().map(|(id, _)| id);
                     id.map(|id| Event::Ack(id, ok))
                 },
+                c = self.run.output.recv(), if self.output_open => c.map(Event::Output),
                 d = &mut self.run.done => Some(Event::Done(d.ok().flatten())),
             };
             match got {
@@ -167,8 +168,8 @@ impl<S: SessionSet> Control<S> {
             done,
         });
         if taken.is_err() {
-            // The command's input is gone: it ended, or its writer stopped.
-            a.closed = true;
+            // The command's input is gone: it ended, or its writer stopped (so every later
+            // input lands here too).
             return self
                 .driver_refused(m, Some(&i.id), "input-closed", client)
                 .await;
@@ -193,10 +194,10 @@ impl<S: SessionSet> Control<S> {
                 write(w, &output(&a.session, c)).await
             }
             Event::Ack(id, ok) => {
-                let Some(a) = conn.attach.as_mut() else {
+                // A failed write ends the stdin writer: the next input finds it gone.
+                let Some(a) = conn.attach.as_ref() else {
                     return true;
                 };
-                a.closed |= !ok;
                 let session = a.session.clone();
                 self.ack(&id, ok, &session, conn.client, w).await
             }

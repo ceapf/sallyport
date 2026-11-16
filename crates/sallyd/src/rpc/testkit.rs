@@ -122,6 +122,9 @@ pub enum Mode {
     Deaf,
     /// Prints `n` lines of 1 KiB, then exits 0.
     Lines(usize),
+    /// Prints 1 KiB lines until its connection is gone (`killed: disconnect`); a full queue
+    /// never delays that, as with the real runner.
+    Flood,
     /// `podman exec` could not be run.
     Fail,
 }
@@ -195,6 +198,24 @@ impl Streamer for Arc<FakeExec> {
                     }
                 }
                 ran(Status::Exited(0), 0, (n * 1024) as u64)
+            }
+            Mode::Flood => {
+                let mut sent = 0u64;
+                loop {
+                    let line = say(format!("{}\n", "y".repeat(1023)));
+                    tokio::select! {
+                        biased;
+                        _ = io.disconnect.wait_for(|g| *g) => {
+                            return ran(Status::Killed(DISCONNECT), 0, sent);
+                        }
+                        r = io.output.send(line) => {
+                            if r.is_err() {
+                                return ran(Status::Exited(0), 0, sent);
+                            }
+                            sent += 1024;
+                        }
+                    }
+                }
             }
             Mode::Fail => ran(Status::Failed("podman exec: gone".into()), 0, 0),
         }

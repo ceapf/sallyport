@@ -653,7 +653,8 @@ request is `-32000` with `data`
   TODO(#126): re-rule the transport once the Task 13 harness launcher lands.
 - **Line mode** (`sessions.attach {id, argv, cwd?}`, `sessions.input {id, data, eof?}`;
   architect Q100–Q102, Q144–Q153). An attach runs one command in the session's workspace
-  container, `podman exec -i` through the shell tool's own runner, and streams its output. Params
+  container, `podman exec -i --detach-keys=` (no detach sequence in the relayed stdin) through
+  the shell tool's own runner, and streams its output. Params
   are strict: `argv` is 1 to 256 strings with no NUL (`MAX_ARGV`), `data` at most 64 KiB
   (`MAX_INPUT_BYTES`), both `-32602` at parse; an absent `cwd` is the shell tool's default (the
   first mount's guest path, else `/`), a bad one the shell tool's `bad-arguments`. Input is
@@ -682,7 +683,9 @@ request is `-32000` with `data`
     session-stop | disconnect | start-timeout}`, by precedence stop, then disconnect, then the
     start limit. A kill is never delayed by a blocked client; once killed the pipes are no longer
     read (queued chunks may still be sent). After the command exits its pipes are drained to
-    their end, 500 ms of idleness, or a stop or disconnect. `sandbox.exec_result {exec,
+    their end, 500 ms of idleness, or a stop or disconnect. That bound is on idleness only: a
+    process the command left behind (`setsid`) that keeps writing to the pipes holds the attach,
+    and the session's `attach-busy`, until the client disconnects or the session stops. `sandbox.exec_result {exec,
     stdin_bytes, stdout_bytes, stderr_bytes, exit_code | killed | failed}` (actor `sallyd`,
     byte counts, never content) is written when the runner returns, never waiting on the
     client, so within the stop's drain. A run that failed is `failed: true` and the attach is

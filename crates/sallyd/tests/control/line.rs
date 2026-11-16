@@ -158,10 +158,11 @@ fn rt_cli_01_terminal_controls_reach_the_client_escaped() {
 }
 
 /// RT-CLI-01, the CLI half: `sally sandbox run` over a real `control.sock` prints exactly the
-/// escaped text and exits with the command's code. Control: the `StreamEscaper` (as above);
-/// without it the CLI's clean-check (`run::show`, through `clean::text`) still escapes, but
-/// differently (`\u{fffd}`, `\x0a`), and exits refused. The clean-check, the second layer, has
-/// its own tests in sally-cli (`run_tests.rs`).
+/// escaped text, nothing on stderr, and exits with the command's code. Control: the
+/// `StreamEscaper` (as above); without it the CLI's clean-check (`run::show`, through
+/// `clean::text`) still escapes, but differently (`\u{fffd}`, `\x0a`), and adds its not-clean
+/// line on stderr, so both the stdout and the stderr assertions fail. The clean-check, the
+/// second layer, has its own tests in sally-cli (`run_tests.rs`).
 #[test]
 fn rt_cli_01_sally_sandbox_run_prints_the_escaped_text() {
     let c = cx();
@@ -262,14 +263,20 @@ fn input_reaches_the_attached_command_and_eof_ends_it() {
         let n = w
             .send("sessions.attach", json!({"id": id, "argv": ["cat"]}))
             .await;
-        let input = w
-            .call(
+        // Ctrl-P Ctrl-Q (podman's default detach keys) are data, not a detach.
+        let first = w
+            .send(
                 "sessions.input",
-                json!({"id": id, "data": "one\ntwo\n", "eof": false}),
+                json!({"id": id, "data": "one\u{10}\u{11}\ntwo\n", "eof": false}),
             )
             .await;
+        let (input, early) = w.until_reply(first).await;
         assert_eq!(input["result"], json!({}), "{input}");
-        assert_eq!(w.until_output("stdout", "two\n").await, "one\ntwo\n");
+        let mut echoed = joined(&early, "stdout");
+        if !echoed.contains("two\n") {
+            echoed.push_str(&w.until_output("stdout", "two\n").await);
+        }
+        assert_eq!(echoed, "one\\x10\\x11\ntwo\n");
         let last = w
             .send(
                 "sessions.input",
@@ -286,7 +293,7 @@ fn input_reaches_the_attached_command_and_eof_ends_it() {
         let args = c.x.events.all()[result].1.clone();
         assert_eq!(
             (args["stdin_bytes"].as_u64(), args["stdout_bytes"].as_u64()),
-            (Some(14), Some(14)),
+            (Some(16), Some(16)),
             "{args}"
         );
         // The two streams are kept apart, each in its own order.

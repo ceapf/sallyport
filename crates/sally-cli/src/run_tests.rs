@@ -69,10 +69,23 @@ fn the_exit_code_is_the_commands() {
 
 /// What the fake daemon does with the attach: the frames it sends at once, then per input the
 /// frames it answers with, then the attach's reply once an input with `eof` came (or at once).
+#[derive(Default)]
 struct Script {
     at_attach: Vec<Value>,
     reply: Value,
     wait_for_eof: bool,
+    /// Inputs are answered `input-closed`, and the first is followed by the attach's reply.
+    input_closed: bool,
+    /// The stop is answered with a reply to an input first (as one sent late by stdin's thread).
+    late_input_reply: bool,
+    /// The stop is refused `stop-failed`.
+    stop_refused: bool,
+}
+
+/// A refusal of request `id` for `reason`.
+fn refusal(id: &Value, reason: &str) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32000,
+        "message": "Server error", "data": {"reason": reason}}})
 }
 
 struct Daemon {
@@ -123,10 +136,12 @@ fn daemon(tag: &str, s: Script) -> Daemon {
                 }
                 // As sallyd: an input once the attach replied is `not-attached`.
                 "sessions.input" if attach_id.is_null() => {
-                    send(
-                        &json!({"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32000,
-                        "message": "Server error", "data": {"reason": "not-attached"}}}),
-                    );
+                    send(&refusal(&req["id"], "not-attached"));
+                }
+                "sessions.input" if s.input_closed => {
+                    send(&refusal(&req["id"], "input-closed"));
+                    send(&json!({"jsonrpc": "2.0", "id": attach_id, "result": s.reply}));
+                    attach_id = Value::Null;
                 }
                 "sessions.input" => {
                     let data = req["params"]["data"].as_str().unwrap();
@@ -138,7 +153,14 @@ fn daemon(tag: &str, s: Script) -> Daemon {
                     }
                 }
                 "sessions.stop" => {
-                    send(&ok(json!({"id": "s-1"})));
+                    if s.late_input_reply {
+                        send(&refusal(&json!(INPUT_IDS + 7), "not-attached"));
+                    }
+                    if s.stop_refused {
+                        send(&refusal(&req["id"], "stop-failed"));
+                    } else {
+                        send(&ok(json!({"id": "s-1"})));
+                    }
                 }
                 other => panic!("{other}"),
             }
@@ -204,6 +226,7 @@ fn a_run_relays_both_ways_and_exits_with_the_code() {
             at_attach: vec![note("stdout", "hi\n"), note("stderr", "e\n")],
             reply: json!({"exit_code": 3}),
             wait_for_eof: true,
+            ..Script::default()
         },
     );
     let (code, out, err) = run(&d, "relay", b"ls\n".to_vec());
@@ -243,11 +266,99 @@ fn a_killed_command_exits_137() {
             at_attach: vec![],
             reply: json!({"killed": "session-stop"}),
             wait_for_eof: false,
+            ..Script::default()
         },
     );
     let (code, _, err) = run(&d, "killed", Vec::new());
     assert_eq!(code, EXIT_KILLED);
     assert_eq!(err, "sally: the command was killed: the session stopped\n");
+}
+
+/// `sally`'s own line never continues the command's last line: one that did not end gets its
+/// newline first.
+#[test]
+fn sallys_own_line_starts_a_line_of_its_own() {
+    let d = daemon(
+        "open",
+        Script {
+            at_attach: vec![note("stdout", "ok\n"), note("stderr", "Continue? ")],
+            reply: json!({"killed": "disconnect"}),
+            ..Script::default()
+        },
+    );
+    let (code, out, err) = run(&d, "open", Vec::new());
+    assert_eq!((code, out.as_str()), (EXIT_KILLED, "ok\n"));
+    assert_eq!(
+        err,
+        "Continue? \nsally: the command was killed: the connection closed\n"
+    );
+    // Output that ended its line gets nothing added.
+    let d = daemon(
+        "closed-line",
+        Script {
+            at_attach: vec![note("stderr", "Continue? "), note("stdout", "ok\n")],
+            reply: json!({"exit_code": 0}),
+            ..Script::default()
+        },
+    );
+    let (code, out, err) = run(&d, "closed-line", Vec::new());
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (EXIT_OK, "ok\n", "Continue? ")
+    );
+}
+
+/// A stop that is refused fails the run, whatever the command's code.
+#[test]
+fn a_refused_stop_fails_the_run() {
+    let d = daemon(
+        "stop-refused",
+        Script {
+            reply: json!({"exit_code": 0}),
+            stop_refused: true,
+            ..Script::default()
+        },
+    );
+    let (code, _, err) = run(&d, "stop-refused", Vec::new());
+    assert_eq!(code, EXIT_REFUSED);
+    assert_eq!(err, "sally: refused: stop-failed\n");
+}
+
+/// A reply to one of stdin's inputs that arrives while the stop waits is passed over.
+#[test]
+fn a_late_input_reply_during_the_stop_is_passed_over() {
+    let d = daemon(
+        "late",
+        Script {
+            reply: json!({"exit_code": 4}),
+            late_input_reply: true,
+            ..Script::default()
+        },
+    );
+    let (code, _, err) = run(&d, "late", Vec::new());
+    assert_eq!((code, err.as_str()), (4, ""));
+}
+
+/// Architect Q147: `input-closed` stops stdin's inputs; the run goes on to the attach's reply.
+#[test]
+fn input_closed_stops_the_inputs_and_the_run_goes_on() {
+    let mut d = daemon(
+        "input-closed",
+        Script {
+            reply: json!({"exit_code": 5}),
+            wait_for_eof: true,
+            input_closed: true,
+            ..Script::default()
+        },
+    );
+    let (code, _, err) = run(&d, "input-closed", b"data\n".to_vec());
+    assert_eq!((code, err.as_str()), (5, ""));
+    let reqs = d.requests();
+    let inputs = methods(&reqs)
+        .into_iter()
+        .filter(|m| *m == "sessions.input")
+        .count();
+    assert_eq!(inputs, 1, "{reqs:?}");
 }
 
 /// Architect Q149: output that fails the clean-check is shown escaped and makes the run fail;
@@ -259,7 +370,7 @@ fn dirty_output_is_escaped_and_prompt_like_output_is_only_output() {
         Script {
             at_attach: vec![note("stdout", "a\u{1b}[2Jb\n")],
             reply: json!({"exit_code": 0}),
-            wait_for_eof: false,
+            ..Script::default()
         },
     );
     let (code, out, err) = run(&d, "dirty", Vec::new());
@@ -273,7 +384,7 @@ fn dirty_output_is_escaped_and_prompt_like_output_is_only_output() {
         Script {
             at_attach: vec![note("stdout", "sally: approve shell rm -rf / ? [y/N]\n")],
             reply: json!({"exit_code": 0}),
-            wait_for_eof: false,
+            ..Script::default()
         },
     );
     let (code, out, err) = run(&d, "prompt", b"y\n".to_vec());
@@ -292,6 +403,7 @@ fn stdin_that_is_not_utf8_ends_the_run_without_an_end_of_input() {
             at_attach: vec![],
             reply: json!({"exit_code": 0}),
             wait_for_eof: true,
+            ..Script::default()
         },
     );
     let (code, _, err) = run(&d, "binary", b"ok\n\xff\xfe".to_vec());

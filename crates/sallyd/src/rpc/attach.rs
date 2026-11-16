@@ -10,16 +10,77 @@
 //! driving one (`driver-seat`); `sessions.input` on a connection that is not attached, or for
 //! another session, is `not-attached`.
 
-use sally_proto::{Attached, KillReason};
+use sally_proto::{AttachParams, Attached, InputParams, KillReason, MAX_INPUT_BYTES};
 use serde_json::{Value, json};
 
+use super::control_methods::NotAdmitted;
 use crate::approvals::Client;
 use crate::approvals::queue::who;
+use crate::sandbox::SessionId;
+use crate::tools::args::argv_shaped;
 use crate::tools::shell::{Ran, Status};
 
 /// Output chunks queued for one attached connection at most; a pipe reader waits for room, so
 /// nothing is dropped and nothing grows without bound (architect Q152).
 pub const OUTPUT_QUEUE: usize = 8;
+
+/// An admitted `sessions.attach`.
+#[derive(Debug)]
+pub struct AttachCall {
+    /// The session.
+    pub id: SessionId,
+    /// The command.
+    pub argv: Vec<String>,
+    /// The asked guest directory, checked later as the shell tool checks its own.
+    pub cwd: Option<String>,
+}
+
+impl AttachCall {
+    /// `p` admitted: its id canonical, its argv as the shell tool's `cmd` (1 to
+    /// [`MAX_ARGV`](crate::tools::args::MAX_ARGV) strings, the first not empty, none with a NUL;
+    /// architect Q101).
+    ///
+    /// # Errors
+    /// [`NotAdmitted::InvalidParams`].
+    pub fn admit(p: AttachParams) -> Result<Self, NotAdmitted> {
+        if !argv_shaped(&p.argv) {
+            return Err(NotAdmitted::InvalidParams);
+        }
+        Ok(Self {
+            id: SessionId::parse(&p.id).map_err(|_| NotAdmitted::InvalidParams)?,
+            argv: p.argv,
+            cwd: p.cwd,
+        })
+    }
+}
+
+/// An admitted `sessions.input`.
+#[derive(Debug)]
+pub struct InputCall {
+    /// The session.
+    pub id: SessionId,
+    /// The bytes.
+    pub data: String,
+    /// The input ends after them.
+    pub eof: bool,
+}
+
+impl InputCall {
+    /// `p` admitted: its id canonical, its data at most [`MAX_INPUT_BYTES`].
+    ///
+    /// # Errors
+    /// [`NotAdmitted::InvalidParams`].
+    pub fn admit(p: InputParams) -> Result<Self, NotAdmitted> {
+        if p.data.len() > MAX_INPUT_BYTES {
+            return Err(NotAdmitted::InvalidParams);
+        }
+        Ok(Self {
+            id: SessionId::parse(&p.id).map_err(|_| NotAdmitted::InvalidParams)?,
+            data: p.data,
+            eof: p.eof,
+        })
+    }
+}
 
 /// What a control connection is now (architect Q144).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

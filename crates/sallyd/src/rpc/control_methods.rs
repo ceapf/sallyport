@@ -15,16 +15,16 @@ use sally_core::text::escape_capped;
 use sally_proto::ModelKind;
 use sally_proto::method;
 use sally_proto::{
-    AttachParams, Change as WireChange, ChangeKind as WireKind, Changes, CreateParams,
-    DecideParams, Decision as WireDecision, ErrorData, InputParams, Lifetime, MAX_INPUT_BYTES,
-    NoParams, Prompt as WirePrompt, Prompts, Session, SessionParams, SessionState as WireState,
-    Sessions, Stopped,
+    Change as WireChange, ChangeKind as WireKind, Changes, CreateParams, DecideParams,
+    Decision as WireDecision, ErrorData, Lifetime, NoParams, Prompt as WirePrompt, Prompts,
+    Session, SessionParams, SessionState as WireState, Sessions, Stopped,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 
 use super::attach::{self, Asked, ConnState};
+pub use super::attach::{AttachCall, InputCall};
 use super::control::{Conn, Control};
 use super::drive::{Driver, Stepped};
 use super::line::Line;
@@ -35,7 +35,6 @@ use crate::approvals::{Client, Decision, Desk, Seen};
 use crate::llm::scripted::Script;
 use crate::sandbox::{Change, ChangeKind, ChangesError, LaunchError, SessionId, session_changes};
 use crate::session::{SessionInfo, SessionState, StartError, StopOutcome};
-use crate::tools::args::MAX_ARGV;
 use crate::tools::shell::Streamer;
 
 /// `sessions.list`, `sessions.changes` and `approvals.list` per second, daemon-wide (architect
@@ -99,10 +98,9 @@ pub enum Call {
     /// `sessions.drive`, its id already canonical. It carries nothing else: the script held by
     /// `sallyd` is the only source of a driven call (architect Q117).
     Drive(SessionId),
-    /// `sessions.attach`: its id canonical, its argv 1 to [`MAX_ARGV`] strings, the first not
-    /// empty, none with a NUL (architect Q101).
+    /// `sessions.attach` ([`AttachCall::admit`]).
     Attach(AttachCall),
-    /// `sessions.input`: its id canonical, its data at most [`MAX_INPUT_BYTES`].
+    /// `sessions.input` ([`InputCall::admit`]).
     Input(InputCall),
     /// `approvals.list`.
     Approvals,
@@ -110,28 +108,6 @@ pub enum Call {
     Decide(DecideParams),
     /// `approvals.watch`.
     Watch,
-}
-
-/// An admitted `sessions.attach`.
-#[derive(Debug)]
-pub struct AttachCall {
-    /// The session.
-    pub id: SessionId,
-    /// The command.
-    pub argv: Vec<String>,
-    /// The asked guest directory, checked later as the shell tool checks its own.
-    pub cwd: Option<String>,
-}
-
-/// An admitted `sessions.input`.
-#[derive(Debug)]
-pub struct InputCall {
-    /// The session.
-    pub id: SessionId,
-    /// The bytes.
-    pub data: String,
-    /// The input ends after them.
-    pub eof: bool,
 }
 
 /// Why a request was not admitted (`rpc.deny`).
@@ -156,31 +132,8 @@ impl Call {
             method::SESSIONS_STOP => Ok(Self::Stop(session_id(params)?)),
             method::SESSIONS_CHANGES => Ok(Self::Changes(session_id(params)?)),
             method::SESSIONS_DRIVE => Ok(Self::Drive(session_id(params)?)),
-            method::SESSIONS_ATTACH => {
-                let p: AttachParams = params_of(params)?;
-                let shaped = (1..=MAX_ARGV).contains(&p.argv.len())
-                    && p.argv.first().is_some_and(|a| !a.is_empty())
-                    && !p.argv.iter().any(|a| a.contains('\0'));
-                if !shaped {
-                    return Err(NotAdmitted::InvalidParams);
-                }
-                Ok(Self::Attach(AttachCall {
-                    id: SessionId::parse(&p.id).map_err(|_| NotAdmitted::InvalidParams)?,
-                    argv: p.argv,
-                    cwd: p.cwd,
-                }))
-            }
-            method::SESSIONS_INPUT => {
-                let p: InputParams = params_of(params)?;
-                if p.data.len() > MAX_INPUT_BYTES {
-                    return Err(NotAdmitted::InvalidParams);
-                }
-                Ok(Self::Input(InputCall {
-                    id: SessionId::parse(&p.id).map_err(|_| NotAdmitted::InvalidParams)?,
-                    data: p.data,
-                    eof: p.eof,
-                }))
-            }
+            method::SESSIONS_ATTACH => AttachCall::admit(params_of(params)?).map(Self::Attach),
+            method::SESSIONS_INPUT => InputCall::admit(params_of(params)?).map(Self::Input),
             method::APPROVALS_LIST => params_of::<NoParams>(params).map(|_| Self::Approvals),
             method::APPROVALS_DECIDE => Ok(Self::Decide(params_of(params)?)),
             method::APPROVALS_WATCH => params_of::<NoParams>(params).map(|_| Self::Watch),
@@ -207,7 +160,8 @@ impl Call {
 
     /// Whether it draws on the daemon-wide read rate (architect Q77): the reads, and a watch on
     /// a connection that already `watching`, which only lists again (Q94). A first watch never
-    /// waits, so attaching an approver is never delayed.
+    /// waits, so attaching an approver is never delayed. TODO(#142): refusals of the unrated
+    /// methods are entries too, with no rate.
     pub(crate) fn rated(&self, watching: bool) -> bool {
         match self {
             Self::List | Self::Changes(_) | Self::Approvals => true,

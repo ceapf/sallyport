@@ -17,6 +17,7 @@ use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use sally_core::paths::Paths;
 use sally_proto::{ErrorData, MAX_FRAME};
@@ -119,6 +120,9 @@ pub fn decode(frame: Value) -> Result<Decoded, Error> {
 /// thread, so a dropped watcher stops counting as attached at once.
 pub struct Client {
     w: UnixStream,
+    /// Held while a frame is written, by this client and its [`Writer`]s: a frame larger than
+    /// one `write` is never interleaved with another thread's.
+    writing: Arc<Mutex<()>>,
     frames: Receiver<Frame>,
     notes: VecDeque<(Value, usize)>,
     notes_bytes: usize,
@@ -148,6 +152,7 @@ impl Client {
     pub(crate) fn from_parts(w: UnixStream, frames: Receiver<Frame>) -> Self {
         Self {
             w,
+            writing: Arc::default(),
             frames,
             notes: VecDeque::new(),
             notes_bytes: 0,
@@ -179,7 +184,7 @@ impl Client {
     pub fn send(&mut self, method: &str, params: Value) -> Result<i64, Error> {
         let id = self.next;
         self.next = self.next.wrapping_add(1);
-        self.w.write_all(&request(id, method, params)?)?;
+        write_whole(&mut self.w, &self.writing, &request(id, method, params)?)?;
         Ok(id)
     }
 
@@ -203,6 +208,7 @@ impl Client {
     pub fn writer(&self, first: i64) -> Result<Writer, Error> {
         Ok(Writer {
             w: self.w.try_clone()?,
+            writing: Arc::clone(&self.writing),
             next: first,
         })
     }
@@ -263,11 +269,18 @@ fn request(id: i64, method: &str, params: Value) -> Result<Vec<u8>, Error> {
     Ok(line)
 }
 
+/// Writes `frame` whole on `w`, holding `writing` (a poisoned lock still serializes).
+fn write_whole(w: &mut UnixStream, writing: &Mutex<()>, frame: &[u8]) -> std::io::Result<()> {
+    let _held = writing.lock().unwrap_or_else(PoisonError::into_inner);
+    w.write_all(frame)
+}
+
 /// A writer of requests on a [`Client`]'s connection, for another thread; the client's reader
 /// takes the replies.
 #[derive(Debug)]
 pub struct Writer {
     w: UnixStream,
+    writing: Arc<Mutex<()>>,
     next: i64,
 }
 
@@ -279,7 +292,7 @@ impl Writer {
     pub fn send(&mut self, method: &str, params: Value) -> Result<i64, Error> {
         let id = self.next;
         self.next = self.next.wrapping_add(1);
-        self.w.write_all(&request(id, method, params)?)?;
+        write_whole(&mut self.w, &self.writing, &request(id, method, params)?)?;
         Ok(id)
     }
 

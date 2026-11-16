@@ -40,6 +40,9 @@ pub fn exec_argv(container: &str, cwd: &str, argv: &[String], stdin: Stdin) -> V
     let mut a = vec!["exec".to_owned()];
     if stdin == Stdin::Piped {
         a.push("-i".to_owned());
+        // No detach sequence in the relayed stdin (4.9.3 applies none without `-t`; this keeps
+        // it so if that changes: a detach would read as a clean exit).
+        a.push("--detach-keys=".to_owned());
     }
     a.push(format!("--workdir={cwd}"));
     a.push(container.to_owned());
@@ -189,14 +192,23 @@ mod tests {
         );
     }
 
-    /// Architect Q145: only an attached command gets `-i`, and it comes before the container id,
-    /// so podman reads it as its own flag; the shell tool's command never has it.
+    /// Architect Q145: only an attached command gets `-i` (and no detach keys), and they come
+    /// before the container id, so podman reads them as its own flags; the shell tool's command
+    /// never has them.
     #[test]
     fn only_an_attached_command_keeps_stdin_open() {
         let argv = vec!["sh".to_owned(), "-i".to_owned()];
         assert_eq!(
             exec_argv("c", "/w", &argv, Stdin::Piped),
-            ["exec", "-i", "--workdir=/w", "c", "sh", "-i"]
+            [
+                "exec",
+                "-i",
+                "--detach-keys=",
+                "--workdir=/w",
+                "c",
+                "sh",
+                "-i"
+            ]
         );
         let tool = exec_argv("c", "/w", &argv, Stdin::Null);
         assert_eq!(tool, ["exec", "--workdir=/w", "c", "sh", "-i"]);

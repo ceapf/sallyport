@@ -177,25 +177,68 @@ fn attach(
         invalid: Arc::clone(&invalid),
     };
     std::thread::spawn(move || pump.run(stdin));
-    let mut permits: Option<SyncSender<()>> = Some(permits);
-    let mut dirty = false;
+    let mut shown = Shown::default();
+    let end = relay(c, attach, &invalid, permits, &mut shown, o);
+    // `sally`'s own lines start a line of their own, never the end of the command's.
+    if shown.open {
+        let _ = writeln!(o.err);
+    }
+    match end {
+        Relayed::Reply(result) => ended(result, o).map(|code| (code, shown.dirty)),
+        Relayed::Failed(e) => Err(failed(&e, o.err)),
+        Relayed::NotUtf8 => {
+            let _ = writeln!(
+                o.err,
+                "sally: stdin is not UTF-8 text; the command was ended"
+            );
+            Err(EXIT_FAILED)
+        }
+    }
+}
+
+/// What the command's output did to the terminal so far.
+#[derive(Debug, Default)]
+struct Shown {
+    /// Some output failed the clean-check.
+    dirty: bool,
+    /// The last output did not end its line.
+    open: bool,
+}
+
+/// How a relay ended; nothing of `sally`'s own is printed until then.
+enum Relayed {
+    /// The attach's reply.
+    Reply(Result<Value, Error>),
+    /// The run failed.
+    Failed(Error),
+    /// Stdin was not UTF-8 text.
+    NotUtf8,
+}
+
+/// Prints the command's output and passes its stdin on, until the attach's reply.
+fn relay(
+    c: &mut Client,
+    attach: i64,
+    invalid: &AtomicBool,
+    permits: SyncSender<()>,
+    shown: &mut Shown,
+    o: &mut Out<'_>,
+) -> Relayed {
+    let mut permits = Some(permits);
     loop {
         let frame = match c.recv() {
             Ok(f) => f,
-            Err(_) if invalid.load(Ordering::SeqCst) => {
-                let _ = writeln!(
-                    o.err,
-                    "sally: stdin is not UTF-8 text; the command was ended"
-                );
-                return Err(EXIT_FAILED);
-            }
-            Err(e) => return Err(failed(&e, o.err)),
+            Err(_) if invalid.load(Ordering::SeqCst) => return Relayed::NotUtf8,
+            Err(e) => return Relayed::Failed(e),
         };
         match frame {
-            Decoded::Note(n) => dirty |= !show(&n, o).map_err(|e| failed(&e, o.err))?,
+            Decoded::Note(n) => {
+                if let Err(e) = show(&n, shown, o) {
+                    return Relayed::Failed(e);
+                }
+            }
             Decoded::Reply { id: got, result } if got == json!(attach) => {
-                drop(permits);
-                return ended(result, o).map(|code| (code, dirty));
+                return Relayed::Reply(result);
             }
             Decoded::Reply { id: got, result } if is_input(&got) => match result {
                 Ok(_) => {
@@ -205,9 +248,9 @@ fn attach(
                 }
                 // The command no longer takes input: stop sending it.
                 Err(Error::Refused(d)) if d.reason == "input-closed" => permits = None,
-                Err(e) => return Err(failed(&e, o.err)),
+                Err(e) => return Relayed::Failed(e),
             },
-            Decoded::Reply { .. } => return Err(failed(&Error::Unexpected, o.err)),
+            Decoded::Reply { .. } => return Relayed::Failed(Error::Unexpected),
         }
     }
 }
@@ -234,8 +277,8 @@ fn ended(result: Result<Value, Error>, o: &mut Out<'_>) -> Result<u8, u8> {
     }
 }
 
-/// Prints one `session.output`; whether it was clean.
-fn show(note: &Value, o: &mut Out<'_>) -> Result<bool, Error> {
+/// Prints one `session.output`, noting in `shown` whether it was clean and ended its line.
+fn show(note: &Value, shown: &mut Shown, o: &mut Out<'_>) -> Result<(), Error> {
     if note.get("method") != Some(&json!(sally_proto::notification::SESSION_OUTPUT)) {
         return Err(Error::Unexpected);
     }
@@ -249,9 +292,14 @@ fn show(note: &Value, o: &mut Out<'_>) -> Result<bool, Error> {
         Stream::Stdout => &mut *o.out,
         Stream::Stderr => &mut *o.err,
     };
+    // TODO(#143): a closed stdout (EPIPE) should end the run.
     let _ = write!(w, "{}", checked.text);
     let _ = w.flush();
-    Ok(checked.clean)
+    shown.dirty |= !checked.clean;
+    if let Some(last) = checked.text.chars().last() {
+        shown.open = last != '\n';
+    }
+    Ok(())
 }
 
 /// Stops session `id`; whether it stopped. Replies to the stdin thread's late inputs are passed
@@ -305,8 +353,12 @@ impl Pump {
             let Some(space) = buf.get_mut(..want) else {
                 return;
             };
-            // A read error is the end of stdin.
-            let n = stdin.read(space).unwrap_or(0);
+            let n = match stdin.read(space) {
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                // Any other read error is the end of stdin.
+                Err(_) => 0,
+            };
             if n == 0 {
                 if cut.finish().is_err() {
                     self.not_utf8();
