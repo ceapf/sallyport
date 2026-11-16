@@ -812,12 +812,11 @@ fn std_path_call(path: &str) -> bool {
 /// line). cargo-mutants never mutates a function named `new` (Task 9a-3, Q1), so their logic is
 /// untested by the nightly. Task 13 moves each into a named function and empties this list; an
 /// entry that is clean or gone fails the guard, so the list only shrinks.
-const NEW_WITH_LOGIC: [(&str, &str); 5] = [
-    ("crates/sallyd/src/sandbox/types.rs", "SessionPaths"), // TODO(#87)
-    ("crates/sallyd/src/rpc/rate.rs", "Rate"),              // TODO(#87)
-    ("crates/sallyd/src/approvals/action.rs", "Payload"),   // TODO(#87)
-    ("crates/sallyd/src/approvals/queue.rs", "Ticket"),     // TODO(#87)
-    ("crates/sallyd/src/approvals/render.rs", "Prompt"),    // TODO(#87)
+const NEW_WITH_LOGIC: [(&str, &str); 4] = [
+    ("crates/sallyd/src/rpc/rate.rs", "Rate"), // TODO(#87)
+    ("crates/sallyd/src/approvals/action.rs", "Payload"), // TODO(#87)
+    ("crates/sallyd/src/approvals/queue.rs", "Ticket"), // TODO(#87)
+    ("crates/sallyd/src/approvals/render.rs", "Prompt"), // TODO(#87)
 ];
 
 /// Architect Q12 (R3): decision logic never lives in a function named `new` in mutation scope.
