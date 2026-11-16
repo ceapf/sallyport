@@ -194,7 +194,8 @@ impl<S: SessionSet> Control<S> {
                 write(w, &output(&a.session, c)).await
             }
             Event::Ack(id, ok) => {
-                // A failed write ends the stdin writer: the next input finds it gone.
+                // A failed write closes the command's stdin: the writer answers every later
+                // input `false`, so `input-closed` (`tools::pipe::write_input`).
                 let Some(a) = conn.attach.as_ref() else {
                     return true;
                 };

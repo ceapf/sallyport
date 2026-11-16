@@ -38,23 +38,23 @@
 
 use std::os::unix::process::ExitStatusExt as _;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rustix::fd::OwnedFd;
 use rustix::fs::{Mode, OFlags};
 use rustix::process::{Pid, PidfdFlags, Signal};
-use sally_core::text::StreamEscaper;
 use sally_proto::Stream;
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::sync::{mpsc, watch};
+use tokio::io::{AsyncRead, AsyncReadExt as _};
+use tokio::sync::watch;
 
-use super::ops::{DISCONNECT, Ops, SESSION_STOP};
+use super::ops::{Ops, SESSION_STOP};
+use super::pipe::{Counts, DRAIN_LIMIT, ended, stream, within, write_input};
 use super::procs::{self, Call, Snapshot, Stat};
 use super::shell::{
-    AttachIo, Captured, Chunk, Input, Output, Ran, Runner, START_LIMIT, Status, Stdin, Streamer,
-    TIME_LIMIT, exec_argv, read_len,
+    AttachIo, Captured, Output, Ran, Runner, START_LIMIT, Status, Stdin, Streamer, TIME_LIMIT,
+    exec_argv,
 };
 use crate::sandbox::{Podman, Running};
 
@@ -66,9 +66,6 @@ const KILL_ROUNDS: usize = 20;
 const KILL_PAUSE: Duration = Duration::from_millis(2);
 /// How long the client gets to exit once its command was killed.
 const REAP_LIMIT: Duration = Duration::from_secs(10);
-/// How long output is still read after the client exited (a background process can hold the
-/// pipe open).
-const DRAIN_LIMIT: Duration = Duration::from_millis(500);
 
 /// `podman exec` into one session's workspace container.
 #[derive(Debug, Clone)]
@@ -295,14 +292,6 @@ enum Io {
     Attach(AttachIo),
 }
 
-/// Bytes an attached command moved, counted as they go.
-#[derive(Default)]
-struct Counts {
-    stdin: AtomicU64,
-    stdout: AtomicU64,
-    stderr: AtomicU64,
-}
-
 /// The pipe tasks of one run.
 struct Pipes {
     readers: [Option<Reader>; 2],
@@ -430,36 +419,6 @@ impl PodmanExec {
     }
 }
 
-/// Resolves with why the run must end: its session stopped, or (attach only) its connection
-/// is gone. A stop wins when both hold. A disconnect watch whose sender is gone is a
-/// disconnect: the attach's guard fires on drop.
-async fn ended(ops: &Ops, disconnect: Option<watch::Receiver<bool>>) -> &'static str {
-    let gone = async move {
-        match disconnect {
-            Some(mut d) => {
-                let _ = d.wait_for(|gone| *gone).await;
-            }
-            None => std::future::pending().await,
-        }
-    };
-    tokio::select! {
-        biased;
-        () = ops.stopped() => SESSION_STOP,
-        () = gone => DISCONNECT,
-    }
-}
-
-/// `f` within `limit`; no limit: `f` to its end.
-async fn within<F: Future>(
-    limit: Option<Duration>,
-    f: F,
-) -> Result<F::Output, tokio::time::error::Elapsed> {
-    match limit {
-        Some(l) => tokio::time::timeout(l, f).await,
-        None => Ok(f.await),
-    }
-}
-
 /// Starts the tasks on the child's pipes for `io`.
 fn pipes(child: &mut tokio::process::Child, io: Io, counts: &Arc<Counts>) -> Pipes {
     let (out, err) = (child.stdout.take(), child.stderr.take());
@@ -548,99 +507,6 @@ impl Pipes {
             h.send_replace(true);
         }
         all.await;
-    }
-}
-
-/// Reads one pipe of an attached command to its end: each read at most what keeps the chunk
-/// with its carry within [`sally_proto::MAX_OUTPUT_CHUNK`], escaped by this stream's own
-/// escaper (the RT-CLI-01 control), and queued, waiting for room. Ends at the pipe's end, at [`DRAIN_LIMIT`] of
-/// idleness once the client exited, or when halted.
-async fn stream(
-    mut r: impl AsyncRead + Unpin + Send + 'static,
-    which: Stream,
-    tx: mpsc::Sender<Chunk>,
-    (mut halt, mut exited): (watch::Receiver<bool>, watch::Receiver<bool>),
-    counts: Arc<Counts>,
-) {
-    let mut esc = StreamEscaper::default();
-    let mut buf = vec![0u8; sally_proto::MAX_OUTPUT_CHUNK];
-    let counter = match which {
-        Stream::Stdout => &counts.stdout,
-        Stream::Stderr => &counts.stderr,
-    };
-    loop {
-        let want = read_len(esc.held());
-        let Some(space) = buf.get_mut(..want) else {
-            return;
-        };
-        let idle = async {
-            let _ = exited.wait_for(|e| *e).await;
-            tokio::time::sleep(DRAIN_LIMIT).await;
-        };
-        let n = tokio::select! {
-            biased;
-            () = until(&mut halt) => return,
-            r = r.read(space) => match r {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
-            },
-            () = idle => break,
-        };
-        counter.fetch_add(u64::try_from(n).unwrap_or(u64::MAX), Ordering::Relaxed);
-        let text = esc.push(buf.get(..n).unwrap_or_default());
-        if !send(&tx, which, text, &mut halt).await {
-            return;
-        }
-    }
-    let rest = esc.finish();
-    let _ = send(&tx, which, rest, &mut halt).await;
-}
-
-/// Queues `text` (nothing when empty), waiting for room; `false` once halted or the queue's
-/// reader is gone.
-async fn send(
-    tx: &mpsc::Sender<Chunk>,
-    stream: Stream,
-    text: String,
-    halt: &mut watch::Receiver<bool>,
-) -> bool {
-    if text.is_empty() {
-        return true;
-    }
-    tokio::select! {
-        biased;
-        () = until(halt) => false,
-        r = tx.send(Chunk { stream, text }) => r.is_ok(),
-    }
-}
-
-/// Resolves once `w` is `true` or its sender is gone.
-async fn until(w: &mut watch::Receiver<bool>) {
-    let _ = w.wait_for(|v| *v).await;
-}
-
-/// Writes each input to the command's standard input in order and tells whether it was
-/// written; closes the pipe after an input with `eof`. Once a write failed or the pipe was
-/// closed, every later input is answered `false`.
-async fn write_input(
-    w: tokio::process::ChildStdin,
-    mut rx: mpsc::Receiver<Input>,
-    counts: Arc<Counts>,
-) {
-    let mut w = Some(w);
-    while let Some(input) = rx.recv().await {
-        let ok = match w.as_mut() {
-            Some(pipe) => pipe.write_all(&input.data).await.is_ok() && pipe.flush().await.is_ok(),
-            None => false,
-        };
-        if ok {
-            let n = u64::try_from(input.data.len()).unwrap_or(u64::MAX);
-            counts.stdin.fetch_add(n, Ordering::Relaxed);
-        }
-        if !ok || input.eof {
-            w = None;
-        }
-        let _ = input.done.send(ok);
     }
 }
 

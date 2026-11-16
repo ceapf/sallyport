@@ -24,6 +24,7 @@ pub mod fetch_url;
 pub mod fs;
 pub mod ops;
 pub mod path;
+pub mod pipe;
 pub mod procs;
 pub mod shell;
 pub mod tag;
