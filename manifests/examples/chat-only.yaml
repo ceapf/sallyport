@@ -8,6 +8,8 @@ name: chat-only
 description: Plain chat with a local model. The sandbox can see nothing and reach nothing.
 
 runtime:
+  # No image is named: a bundled workspace image is a placeholder until #88. To run this
+  # manifest now, add `image:` naming one you have by digest; docs/dev/TRY_IT.md §2 shows how.
   cpus: 2
   memory: 2GiB
   pids: 64
