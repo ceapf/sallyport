@@ -197,7 +197,7 @@ mod tests {
     }
 
     fn listener() -> (tempdir::Dir, UnixListener) {
-        let d = tempdir::Dir::new();
+        let d = tempdir::Dir::create();
         let l = UnixListener::bind(d.path().join("s.sock")).unwrap();
         (d, l)
     }
@@ -206,7 +206,7 @@ mod tests {
         //! A private temporary directory removed on drop.
         pub struct Dir(std::path::PathBuf);
         impl Dir {
-            pub fn new() -> Self {
+            pub fn create() -> Self {
                 let p = std::env::temp_dir().join(format!(
                     "sp-listen-{}-{}",
                     std::process::id(),

@@ -249,6 +249,14 @@ impl SessionPaths {
     /// # Errors
     /// [`ArgvError::Input`] if a root is not absolute.
     pub fn new(id: SessionId, sockets: &Path, data: &Path) -> Result<Self, ArgvError> {
+        Self::under(id, sockets, data)
+    }
+
+    /// [`SessionPaths::new`]: the session's directories under the `sockets` and `data` roots.
+    ///
+    /// # Errors
+    /// [`ArgvError::Input`] if a root is not absolute.
+    pub fn under(id: SessionId, sockets: &Path, data: &Path) -> Result<Self, ArgvError> {
         if !sockets.is_absolute() || !data.is_absolute() {
             return input("session roots must be absolute paths");
         }
@@ -491,8 +499,21 @@ mod tests {
                 Path::new("/d/sp/infer/i-1")
             ]
         );
+        for (s, d) in [("r", "/d"), ("/r", "d"), ("r", "d")] {
+            let e = InstancePaths::under(id.clone(), Path::new(s), Path::new(d)).unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                "sandbox argv input: instance roots must be absolute",
+                "{s} {d}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_lives_under_sessions_in_both_roots_and_needs_absolute_roots() {
+        let id = SessionId::parse("i-1").unwrap();
         let s =
-            SessionPaths::new(id.clone(), Path::new("/r/sallyport"), Path::new("/d/sp")).unwrap();
+            SessionPaths::under(id.clone(), Path::new("/r/sallyport"), Path::new("/d/sp")).unwrap();
         assert_eq!(
             s.created_dirs(),
             [
@@ -500,11 +521,12 @@ mod tests {
                 Path::new("/d/sp/sessions/i-1")
             ]
         );
+        assert_eq!(s.id(), &id);
         for (s, d) in [("r", "/d"), ("/r", "d"), ("r", "d")] {
-            let e = InstancePaths::under(id.clone(), Path::new(s), Path::new(d)).unwrap_err();
+            let e = SessionPaths::under(id.clone(), Path::new(s), Path::new(d)).unwrap_err();
             assert_eq!(
                 e.to_string(),
-                "sandbox argv input: instance roots must be absolute",
+                "sandbox argv input: session roots must be absolute paths",
                 "{s} {d}"
             );
         }

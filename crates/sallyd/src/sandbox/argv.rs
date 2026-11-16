@@ -140,7 +140,9 @@ struct Argv {
 }
 
 impl Argv {
-    fn new(c: &CommonArgs, name: String, role: Role) -> Result<Self, ArgvError> {
+    /// The `create` argv every role starts with: the checked runtime, the empty hooks
+    /// directory and mounts file, the container name and label, and the role's confinement.
+    fn begin(c: &CommonArgs, name: String, role: Role) -> Result<Self, ArgvError> {
         let mut a = Self {
             args: Vec::new(),
             intent: Intent::begin(role, c.ids, c.profiles.clone()),
@@ -355,7 +357,7 @@ pub fn workspace_build(
         return input("the launch scan belongs to another manifest");
     }
     let scans = scans_by_mount(v, scan.git())?;
-    let mut a = Argv::new(c, format!("sp-ws-{}", paths.id().as_str()), Role::Workspace)?;
+    let mut a = Argv::begin(c, format!("sp-ws-{}", paths.id().as_str()), Role::Workspace)?;
     a.tmpfs(m.runtime.tmp_size.bytes(), m.runtime.tmp_exec);
     a.limits(
         m.runtime.pids,
@@ -574,7 +576,7 @@ pub fn harness_build(
     v: &ValidatedManifest,
     default_image: &ImageRef,
 ) -> Result<Built, ArgvError> {
-    let mut a = Argv::new(c, format!("sp-h-{}", paths.id().as_str()), Role::Harness)?;
+    let mut a = Argv::begin(c, format!("sp-h-{}", paths.id().as_str()), Role::Harness)?;
     a.tmpfs(SMALL_TMP, false);
     a.limits(
         HARNESS_PIDS,
@@ -623,7 +625,7 @@ pub fn inference_argv(c: &CommonArgs, s: &InferenceSpec) -> Result<Vec<String>, 
 /// # Errors
 /// As [`workspace_argv`].
 pub fn inference_build(c: &CommonArgs, s: &InferenceSpec) -> Result<Built, ArgvError> {
-    let mut a = Argv::new(
+    let mut a = Argv::begin(
         c,
         format!("sp-infer-{}", s.instance.as_str()),
         Role::Inference,

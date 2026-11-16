@@ -20,6 +20,12 @@ impl Rate {
     /// `rate` requests per second on average, `burst` at once. Both are at least 1.
     #[must_use]
     pub fn new(rate: u32, burst: u32) -> Self {
+        Self::per_second(rate, burst)
+    }
+
+    /// [`Rate::new`]: one request per `1 s / rate` (a zero rate is one), `burst` at once.
+    #[must_use]
+    pub fn per_second(rate: u32, burst: u32) -> Self {
         Self::every(Duration::from_secs(1) / rate.max(1), burst)
     }
 
@@ -156,5 +162,17 @@ mod tests {
         assert!(!r.allow());
         tokio::time::advance(Duration::from_millis(1)).await;
         assert!(r.allow());
+    }
+
+    /// `rate` per second is one per `1 s / rate` (a zero rate is one), with `burst - 1`
+    /// intervals of tolerance; `new` is the same limit.
+    #[tokio::test(start_paused = true)]
+    async fn per_second_spaces_requests_one_second_over_the_rate() {
+        let r = Rate::per_second(4, 3);
+        assert_eq!(r.interval, Duration::from_millis(250));
+        assert_eq!(r.tolerance, Duration::from_millis(500));
+        assert_eq!(Rate::per_second(0, 1).interval, Duration::from_secs(1));
+        assert_eq!(Rate::new(4, 3).interval, r.interval);
+        assert_eq!(Rate::new(4, 3).tolerance, r.tolerance);
     }
 }
