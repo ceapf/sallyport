@@ -411,11 +411,12 @@ error: tools.acknowledge_unapproved: shell: allow with destructive_requires_appr
 warning: tools.shell: "allow": shell commands run without approval unless tagged destructive [risky]
 ```
 
-All errors are reported at once. Diagnostics are single-line; a diagnostic's path and its
-message are each at most 300 characters (a cut one ends in `...`), and
-token-looking values (20+ characters with a digit and no spaces/slashes) are masked in both the
-message and the path, so a credential pasted into the wrong field does not reach the UI or the
-audit log. The bracketed code is stable (tests and the UI match on it,
+All errors are reported at once. Diagnostics are single-line (control characters become
+spaces); a diagnostic's path and its message are each at most 300 characters, the cut marker
+included (a cut one ends in `...`). Token-looking values (20 or more characters with a digit and
+no space, slash or backslash) are masked before the cut: in the message when it quotes them (in
+`"…"` or backticks), in the path as any dot-separated segment, so a credential pasted into the
+wrong field does not reach the UI or the audit log. The bracketed code is stable (tests and the UI match on it,
 never on message text); the field path uses `a.b[0].c` form.
 
 | Code | Meaning |
