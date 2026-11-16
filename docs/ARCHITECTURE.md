@@ -1249,9 +1249,10 @@ sallyport/
     are tried; `intercept` is true for a grant host (Task 9a-2).
   - `egress.request` (decision `allow`, intercepted tunnels only), before the head goes
     upstream: `{host, port, method, target, target_bytes, target_cut, injected}`; method and
-    target escaped and cut as below; `injected` lists `secret:NAME` for each grant set on the
-    request (Task 9a-3; never a value). The grant headers are built before this entry and set
-    only after it is written (architect D13, ruling Q4); a failed append drops them unsent.
+    target masked with the session's own forms first, then cut and escaped as below (§7
+    Redaction); `injected` lists `secret:NAME` for each grant set on the request (Task 9a-3;
+    never a value). The grant headers are built before this entry and set only after it is
+    written (architect D13, ruling Q4); a failed append drops them unsent.
   - `egress.response` (no decision; intercepted tunnels only), one per response whose head is
     forwarded (refusals have their own entry instead): `{host, port, target, target_bytes,
     target_cut, status, end, redacted_bytes, redacted}`; `redacted` lists, in grant order,
@@ -1265,9 +1266,10 @@ sallyport/
     after `egress.close` (#72). Residual: redacted bytes streamed mid-body precede the entry
     (Task 9a-3, architect Q13, superseding D13's "no redaction count").
   - `egress.deny` (decision `deny`), before the reply: `{reason, target, target_bytes,
-    target_cut}` (the request-target escaped and cut at 256 bytes, never a header), or `{reason,
-    head_bytes}` when no target was parsed; `filter: "host-addresses-unavailable"` when the
-    host's own addresses could not be read.
+    target_cut}` (the request-target masked with the session's own forms first, then cut at 256
+    bytes and escaped, never a header; §7 Redaction), or `{reason, head_bytes}` when no target
+    was parsed; `filter: "host-addresses-unavailable"` when the host's own addresses could not
+    be read.
   - `egress.limit` (decision `deny`): as `egress.deny`, for `too-many-connections` (decided at
     accept: `{reason}` only), `head-too-large`, `head-timeout`, `request-too-large` and
     `response-too-large`.
