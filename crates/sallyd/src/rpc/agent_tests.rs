@@ -278,10 +278,22 @@ async fn legacy_state_belongs_to_one_connection() {
 
 /// RT-AG-06: control-plane methods on the session socket are not found, and audited: every
 /// method `control.sock` serves (architect Q72), and the control families still to come.
+/// In-test control: a tool call first reaches the handler (`calls` 1, one `rpc.request`), and
+/// `calls` is still exactly 1 at the end.
 #[tokio::test]
 async fn rt_ag_06_control_methods_on_agent_sock_are_not_found() {
     let (agent, fake, sink) = setup();
     let mut c = start(&agent);
+    // Control (first): a tool call on the same connection reaches the handler and is recorded.
+    let r = c.call(&call(100, "echo")).await;
+    assert_eq!(r["result"]["isError"], json!(false), "control: {r}");
+    assert_eq!(
+        fake.calls.load(Ordering::SeqCst),
+        1,
+        "control: handler calls"
+    );
+    let base = sink.rows().len();
+    assert_eq!(base, 1, "control: one rpc.request");
     let mut methods = crate::rpc::mcp::CONTROL_METHODS.to_vec();
     methods.extend([
         "secrets.set",
@@ -302,14 +314,14 @@ async fn rt_ag_06_control_methods_on_agent_sock_are_not_found() {
         }
     }
     let rows = sink.rows();
-    assert_eq!(rows.len(), 2 * methods.len());
-    for (r, m) in rows.iter().zip(methods.iter().flat_map(|m| [m, m])) {
+    assert_eq!(rows.len(), base + 2 * methods.len());
+    for (r, m) in rows[base..].iter().zip(methods.iter().flat_map(|m| [m, m])) {
         assert_eq!(r.event, "rpc.deny");
         assert_eq!(r.decision.as_deref(), Some("deny"));
         assert_eq!(r.args["method"], json!(m));
         assert_eq!(r.args["reason"], json!("method-not-found"));
     }
-    assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
 }
 
 /// RT-AG-13: resources, prompts, sampling, logging, unknown methods, batches and oversize frames

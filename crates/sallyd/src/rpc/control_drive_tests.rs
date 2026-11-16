@@ -55,8 +55,8 @@ async fn rt_drv_05_a_session_not_declared_driven_has_no_drive_methods() {
     let (theirs, calls) = driven(&f, "s-2", TWO);
     let r = w.call("sessions.drive", json!({"id": "s-2"})).await;
     assert_eq!(r["result"]["turn"], json!(1), "control: {r}");
-    assert_eq!(theirs.events(), ["drive.turn"], "control");
-    assert_eq!(*calls.lock().unwrap(), ["echo"], "control");
+    assert_eq!(theirs.events(), ["drive.turn"], "control: entries");
+    assert_eq!(*calls.lock().unwrap(), ["echo"], "control: calls");
     let r = w.call("sessions.drive", json!({"id": "s-1"})).await;
     assert_eq!(r["error"]["code"], json!(REFUSED));
     assert_eq!(reason(&r), "not-driven");
@@ -420,8 +420,8 @@ async fn rt_drv_07_drive_takes_a_session_id_and_nothing_else() {
     // call, recorded by the same `calls` and the session's own entries.
     let r = w.call("sessions.drive", json!({"id": "s-1"})).await;
     assert_eq!(r["result"]["turn"], json!(1), "control: {r}");
-    assert_eq!(*calls.lock().unwrap(), ["echo"], "control");
-    assert_eq!(own.events(), ["drive.turn"], "control");
+    assert_eq!(*calls.lock().unwrap(), ["echo"], "control: calls");
+    assert_eq!(own.events(), ["drive.turn"], "control: entries");
     for extra in [
         json!({"id": "s-1", "name": "shell"}),
         json!({"id": "s-1", "arguments": {}}),

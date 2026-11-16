@@ -379,12 +379,28 @@ async fn rt_ag_14_fetch_a_write_reaches_the_upstream_only_once_approved() {
             .unwrap()
             .starts_with("POST /echo HTTP/1.1")
     );
+    // The approved leg is the in-test control of every `nothing_sent` above (architect Q168):
+    // the same dial count, upstream log and egress sink record it, exactly once.
     assert_eq!(r.seen().len(), 1);
     assert!(r.seen()[0].ends_with("secret notes"));
     assert!(r.seen()[0].contains("x-trace: t-1\r\n"), "{}", r.seen()[0]);
+    assert_eq!(*r.dials.lock().unwrap(), 1, "control: dials");
+    let allowed = || {
+        r.sink
+            .events()
+            .iter()
+            .filter(|e| *e == "egress.allow")
+            .count()
+    };
+    assert_eq!(allowed(), 1, "control: {:?}", r.sink.events());
     // The approval is single-use.
     assert!(decide(&f.desk, &p.id, Decision::Approve, ME).await.is_err());
     assert_eq!(r.seen().len(), 1, "a reused approval sends nothing");
+    assert_eq!(
+        *r.dials.lock().unwrap(),
+        1,
+        "a reused approval dials nothing"
+    );
     // A read runs without a prompt.
     let got = bounded(
         "get",

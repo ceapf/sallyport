@@ -272,11 +272,15 @@ async fn rt_ag_02_c_a_cancel_during_preparation_keeps_the_call_from_ever_being_s
     assert!(ran(&f).is_empty());
     // When the call ends, nothing is kept for it.
     until("call ended", || f.gate.kept() == (0, 0)).await;
-    // The connection still works, and a later call with the same id is asked normally.
+    // Control (after, so `prepared` and the withdraw's call number above keep their values):
+    // the connection still works, and a later call with the same id is shown and, approved,
+    // runs exactly once.
     c.send(&touch(1)).await;
     let p = shown(&f, 1).await;
-    decide(&f.desk, &p.id, Decision::Deny, ME).await.unwrap();
-    assert_eq!(text(&c.recv().await), "denied: denied");
+    decide(&f.desk, &p.id, Decision::Approve, ME).await.unwrap();
+    assert_eq!(text(&c.recv().await), "ran", "control: the reply");
+    assert_eq!(ran(&f).len(), 1, "control: the executor");
+    assert_eq!(f.shown.prompts.lock().unwrap().len(), 1, "control: prompts");
     assert_eq!(f.gate.kept(), (0, 0));
 }
 
@@ -323,6 +327,15 @@ async fn rt_ag_02_c_a_close_during_preparation_keeps_the_call_from_ever_being_sh
     assert!(f.shown.prompts.lock().unwrap().is_empty());
     assert!(ran(&f).is_empty());
     until("call ended", || f.gate.kept() == (0, 0)).await;
+    // Control (after, so `prepared` above keeps its value): the same call on a new connection
+    // to the same handler is shown and, approved, runs exactly once.
+    let mut d = open(&f);
+    d.send(&touch(1)).await;
+    let p = shown(&f, 1).await;
+    decide(&f.desk, &p.id, Decision::Approve, ME).await.unwrap();
+    assert_eq!(text(&d.recv().await), "ran", "control: the reply");
+    assert_eq!(ran(&f).len(), 1, "control: the executor");
+    assert_eq!(f.shown.prompts.lock().unwrap().len(), 1, "control: prompts");
 }
 
 fn ran(f: &Fx) -> Vec<Bound> {
@@ -333,29 +346,41 @@ fn ran(f: &Fx) -> Vec<Bound> {
 async fn rt_ag_02_a_a_call_nobody_answers_times_out_and_never_runs() {
     let f = fx(Duration::from_secs(30), 5);
     let mut c = open(&f);
+    approved_control(&f, &mut c).await;
     c.send(&touch(1)).await;
-    let p = shown(&f, 1).await;
+    let p = shown(&f, 2).await;
     let r = c.recv().await;
     assert_eq!(text(&r), "denied: timeout");
     assert_eq!(r["result"]["isError"], true);
-    assert!(ran(&f).is_empty());
+    assert_eq!(ran(&f).len(), 1);
     assert_eq!(f.sink.last("approval.expire")["id"], p.id.as_str());
     assert_eq!(
         decide(&f.desk, &p.id, Decision::Approve, ME).await,
         Err(DecideError::UnknownId)
     );
-    assert!(ran(&f).is_empty());
+    assert_eq!(ran(&f).len(), 1);
+}
+
+/// The in-test control of RT-AG-02 a and b: the same call, approved, on the same connection
+/// runs exactly once on the recording executor.
+async fn approved_control(f: &Fx, c: &mut Conn) {
+    c.send(&touch(100)).await;
+    let p = shown(f, 1).await;
+    decide(&f.desk, &p.id, Decision::Approve, ME).await.unwrap();
+    assert_eq!(text(&c.recv().await), "ran", "control: the reply");
+    assert_eq!(ran(f).len(), 1, "control: the executor");
 }
 
 #[tokio::test]
 async fn rt_ag_02_b_a_denied_call_never_runs() {
     let f = fx(Duration::from_secs(300), 5);
     let mut c = open(&f);
+    approved_control(&f, &mut c).await;
     c.send(&touch(1)).await;
-    let p = shown(&f, 1).await;
+    let p = shown(&f, 2).await;
     decide(&f.desk, &p.id, Decision::Deny, ME).await.unwrap();
     assert_eq!(text(&c.recv().await), "denied: denied");
-    assert!(ran(&f).is_empty());
+    assert_eq!(ran(&f).len(), 1);
 }
 
 #[tokio::test]
@@ -477,6 +502,10 @@ async fn rt_ag_02_d_other_arguments_under_the_same_id_never_run_as_the_approved_
 }
 
 /// RT-AG-03 through the socket: 1 000 `shell` calls as fast as `agent.sock` reads them.
+///
+/// In-test control (after the flood, architect Q169, so no flood count moves): past the
+/// refill, one more call on the same connection is shown as the sixth prompt, approved, and
+/// run exactly once by the same recording executor.
 #[tokio::test(start_paused = true)]
 async fn rt_ag_03_a_call_flood_through_agent_sock_runs_nothing() {
     let f = fx(Duration::from_secs(300), 5);
@@ -492,14 +521,14 @@ async fn rt_ag_03_a_call_flood_through_agent_sock_runs_nothing() {
             }
             replies.push(serde_json::from_str::<Value>(&line).unwrap());
         }
-        replies
+        (replies, r)
     });
     for id in 0..1000 {
         let frame = serde_json::to_vec(&touch(id)).unwrap();
         w.write_all(&frame).await.unwrap();
         w.write_all(b"\n").await.unwrap();
     }
-    let replies = tokio::time::timeout(Duration::from_secs(3600), reader)
+    let (replies, r) = tokio::time::timeout(Duration::from_secs(3600), reader)
         .await
         .unwrap()
         .unwrap();
@@ -529,6 +558,22 @@ async fn rt_ag_03_a_call_flood_through_agent_sock_runs_nothing() {
     assert_eq!(
         events.iter().filter(|e| *e == "tool.pending").count() + flooded,
         f.exec.prepared.load(Ordering::SeqCst)
+    );
+
+    tokio::time::advance(super::queue::REFILL * 10).await;
+    let mut c = Conn { r, w };
+    let control = touch(1000);
+    c.send(&control).await;
+    let p = shown(&f, 6).await;
+    decide(&f.desk, &p.id, Decision::Approve, ME).await.unwrap();
+    let reply = c.recv().await;
+    assert_eq!(reply["id"], json!(1000), "control: {reply}");
+    assert_eq!(text(&reply), "ran", "control: {reply}");
+    let ran = ran(&f);
+    assert_eq!(ran.len(), 1, "control: {ran:?}");
+    assert!(
+        matches!(&ran[0].action, Action::Shell { argv, .. } if *argv == ["touch", "/workspace/x"]),
+        "control: {ran:?}"
     );
 }
 
