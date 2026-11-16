@@ -109,10 +109,12 @@ MUTANTS_ENV := TMPDIR=$(MUTANTS_TMP) NEXTEST_PROFILE=mutants \
                CARGO_TARGET_$(MUTANTS_HOST)_RUNNER='prlimit --data=$(MUTANTS_DATA_CAP) --'
 # The gate fails on missed mutants only; a timed-out mutant hangs a test, so it counts as
 # detected and goes to the job summary (maintainer ruling, #36; scripts/mutants-gate.sh).
+# MUTANTS_OUT=<dir> moves mutants.out, as for the wider scope below; unset, it stays in the root.
 mutants:
 	$(mutants_host_check)mkdir -p $(MUTANTS_TMP)
-	$(MUTANTS_ENV) $(DISK_LOCK) cargo mutants --package sally-core --no-shuffle $(foreach f,$(MUTANTS_FILES),--file '$(f)'); \
-	  bash scripts/mutants-gate.sh $$? mutants.out
+	$(MUTANTS_ENV) $(DISK_LOCK) cargo mutants --package sally-core --no-shuffle \
+	  $(if $(MUTANTS_OUT),--output $(MUTANTS_OUT)) $(foreach f,$(MUTANTS_FILES),--file '$(f)'); \
+	  bash scripts/mutants-gate.sh $$? $(if $(MUTANTS_OUT),$(MUTANTS_OUT)/mutants.out,mutants.out)
 
 # The wider scope (CLAUDE.md "Mutation scope"): every other file whose security decisions can be
 # tested without starting a container, zero survivors too. Per mutant only container-free tests
