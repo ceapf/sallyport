@@ -133,9 +133,10 @@ fn parse_port(s: &str) -> Option<u16> {
 /// without secret grants. Returns the text, the length of `raw` in bytes, and whether the masked
 /// text was cut.
 #[must_use]
-// TODO(#162): a form of another live session's secret is masked only by the writer's redactor,
-// after this cut and escape: one that straddles the cut leaves its prefix, and one holding a
-// byte the escape rewrites is logged whole, escaped (architect Q254, Q263).
+// TODO(#162): a form of another live session's secret (for a session without secret grants,
+// any form) is masked only by the writer's redactor, after this cut and escape: one that
+// straddles the cut leaves its prefix, and one holding a byte the escape rewrites is logged
+// whole in its `\xNN` spelling, wherever it stands (architect Q254, Q263).
 pub fn audit_text(raw: &str, forms: Option<&Redactor>) -> (String, usize, bool) {
     let masked = forms.map_or(Cow::Borrowed(raw), |r| r.redact_str(raw));
     let bytes = masked.as_bytes();
