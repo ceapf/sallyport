@@ -21,7 +21,9 @@ pub const BUF_BYTES: usize = 16 * 1024;
 pub const MAX_CONNECTIONS: usize = 32;
 /// Default time a connection may linger, with its server side finished, waiting for the client
 /// to close. Pooled HTTP clients leave such sockets open; without a bound each would hold a slot
-/// forever. Applies only after the server's EOF, so a long response stream is never cut.
+/// forever. It runs from the server-to-client direction's end, or from a failed write toward a
+/// server that stopped reading (`sallyd` only does that by closing): a response stream still
+/// flowing is cut only in that second case, a linger after the server stopped reading.
 pub const LINGER: Duration = Duration::from_secs(30);
 /// Stack for a copy thread: it only holds [`BUF_BYTES`] and a few locals. Must exceed
 /// [`BUF_BYTES`] plus headroom: on musl (the shipped static binary), std raises a small stack
@@ -205,10 +207,12 @@ half!(UnixStream);
 /// connection is torn down both ways so the slot comes back. A client still sending after the
 /// server stopped reading gets the same linger from that failed write (the discard deadline in
 /// [`Direction::ToServer`]); its bytes are discarded meanwhile, and the reply is relayed (#76).
-/// Those two are the only places that shut both ways.
+/// Those two tear the connection down at a deadline; a client's read error (it reset) ends both
+/// directions at once.
 ///
-/// TODO(#155): a client that neither sends nor reads after a reply larger than the buffers
-/// holds its slot: the server-to-client direction stays blocked writing to it.
+/// TODO(#155): a client that does not read a reply larger than the buffers, and neither sends
+/// (nor half-closed after a failed send), holds its slot: the server-to-client direction stays
+/// blocked writing to it.
 fn relay_connection(
     tcp: TcpStream,
     socket: &Path,
@@ -239,9 +243,10 @@ fn relay_connection(
         // Set first, so a discard woken by the shutdowns reads no further: a close that finds
         // the client's bytes unread resets it, and a client that had filled its window learns
         // of the cut at once instead of after the kernel's FIN timeout.
+        // The socket first, so a copy toward the server cannot pass on what it reads meanwhile.
         cut.store(true, Ordering::SeqCst);
-        tcp.close(Shutdown::Both);
         uds.close(Shutdown::Both);
+        tcp.close(Shutdown::Both);
     }
     upstream
         .join()
@@ -253,7 +258,8 @@ fn relay_connection(
 #[derive(Debug, Clone, Copy)]
 enum Direction<'a> {
     /// Server to client. A failed write stops reading the server, so the server's next write
-    /// fails and it learns the client is gone. No discard: nothing would bound it.
+    /// fails and it learns the client is gone. No discard: the linger in [`relay_connection`]
+    /// starts only after this direction ends, so a discard here would have no bound.
     ToClient,
     /// Client to server. A failed write leaves the client's bytes read and discarded, so a
     /// client still sending is not reset before it reads the reply relayed the other way (#76),
@@ -560,7 +566,7 @@ mod tests {
                 Step::Data(b"a"),
                 Step::Data(b"b"),
                 Step::Fail(ErrorKind::Interrupted),
-                Step::Stall(Duration::ZERO),
+                Step::Stall(STALL),
                 Step::Fail(ErrorKind::TimedOut),
                 Step::Data(b"c"),
             ]),
@@ -582,7 +588,14 @@ mod tests {
             waits.iter().all(|w| *w <= LONG && *w > LONG - T_SLACK),
             "{waits:?}"
         );
+        // Each wait is what is left, not the whole linger again: the reads after the stall wait
+        // at least the stall less.
+        let (first, last) = (waits.first().unwrap(), waits.last().unwrap());
+        assert!(*last + STALL <= *first, "{waits:?}");
     }
+
+    /// The stalled read in the discard test above.
+    const STALL: Duration = Duration::from_millis(100);
 
     /// More than a unit test takes; less than [`LONG`].
     const T_SLACK: Duration = Duration::from_secs(10);
@@ -618,7 +631,8 @@ mod tests {
 
     #[test]
     fn the_discard_cuts_both_ways_once_its_linger_has_passed() {
-        let linger = Duration::from_millis(50);
+        // Well above scheduling delays, so the first check still finds time left.
+        let linger = Duration::from_millis(500);
         let (from, to) = (
             Fake::new(vec![
                 Step::Data(b"a"),

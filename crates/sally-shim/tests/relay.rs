@@ -819,21 +819,40 @@ fn deaf_but_chatty(mut s: UnixStream) {
     }
 }
 
-/// Writes `b"y"` until a write fails, the shim having closed; when it failed.
-fn send_until_refused(c: &mut TcpStream) -> Instant {
+/// Writes `chunk`, pausing `pause` between writes, until the shim cuts the connection; when it
+/// did. Only a reset or a broken pipe is a cut: a write that ends on the client's own write
+/// timeout ([`T`]) fails the test, as does a cut that takes longer than `bound`.
+fn send_until_cut(c: &mut TcpStream, chunk: &[u8], pause: Duration, bound: Duration) -> Instant {
     let started = Instant::now();
-    while c.write_all(b"y").is_ok() {
+    loop {
+        if let Err(e) = c.write_all(chunk) {
+            assert!(
+                matches!(
+                    e.kind(),
+                    ErrorKind::BrokenPipe
+                        | ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                ),
+                "the send ended without a cut, after {:?}: {e:?}",
+                started.elapsed()
+            );
+            return Instant::now();
+        }
         assert!(
-            started.elapsed() < SHORT_LINGER + PROMPT,
-            "the shim never closed a client still sending"
+            started.elapsed() < bound,
+            "the shim never cut a client still sending"
         );
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(pause);
     }
-    Instant::now()
+}
+
+/// [`send_until_cut`] one byte at a time, every 20 ms.
+fn send_until_refused(c: &mut TcpStream) -> Instant {
+    send_until_cut(c, b"y", Duration::from_millis(20), SHORT_LINGER + PROMPT)
 }
 
 #[test]
-fn a_failed_write_toward_the_server_is_bounded_by_its_end_and_the_linger() {
+fn a_failed_write_toward_the_server_still_relays_the_server_and_ends_a_linger_later() {
     // Successor of the test that asserted a failed write tears the whole connection down at
     // once (#76): the server's bytes still arrive after the client's send fails, and the
     // connection ends a linger after that failed send.
@@ -856,9 +875,16 @@ fn a_failed_write_toward_the_server_is_bounded_by_its_end_and_the_linger() {
         "the server's end did not reach the client"
     );
     // The server is done; the client, still open and sending, is cut a linger after its failed
-    // send, not before: until then the shim discards what it sends instead of resetting it.
-    let refused_after = send_until_refused(&mut c).duration_since(sent);
-    assert!(refused_after >= SHORT_LINGER / 2, "{refused_after:?}");
+    // send, not before: until then the shim discards what it sends instead of resetting it. The
+    // server ended at most CHATTY after that send, so the cut is still at least
+    // SHORT_LINGER - CHATTY away (a shim that refused the client at the server's end would cut
+    // it at once).
+    let ended = Instant::now();
+    let refused_after = send_until_refused(&mut c).duration_since(ended);
+    assert!(
+        refused_after >= (SHORT_LINGER - CHATTY) / 2,
+        "{refused_after:?}"
+    );
 }
 
 fn answer_unread(mut s: UnixStream) {
@@ -876,11 +902,7 @@ fn a_client_still_sending_reads_the_reply_and_its_slot_comes_back() {
     let mut sender = c.try_clone().unwrap();
     let sending = thread::spawn(move || {
         let chunk = vec![b'a'; 16 * 1024];
-        let started = Instant::now();
-        while sender.write_all(&chunk).is_ok() {
-            assert!(started.elapsed() < T, "the shim never cut the sender");
-        }
-        Instant::now()
+        send_until_cut(&mut sender, &chunk, Duration::ZERO, SHORT_LINGER + PROMPT)
     });
     let mut reply = Vec::new();
     let read = c.read_to_end(&mut reply);
@@ -927,13 +949,8 @@ fn a_client_that_sends_but_never_reads_is_cut_a_linger_after_its_failed_send() {
     let mut c = connect(addr);
     let started = Instant::now();
     let chunk = vec![b'a'; 16 * 1024];
-    while c.write_all(&chunk).is_ok() {
-        assert!(
-            started.elapsed() < SHORT_LINGER + PROMPT,
-            "the shim never cut a client that does not read"
-        );
-    }
-    let refused_after = started.elapsed();
+    let refused_after = send_until_cut(&mut c, &chunk, Duration::ZERO, SHORT_LINGER + PROMPT)
+        .duration_since(started);
     assert!(refused_after >= SHORT_LINGER / 2, "{refused_after:?}");
     // The one slot comes back.
     let mut served = false;
