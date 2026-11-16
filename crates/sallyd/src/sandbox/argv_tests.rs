@@ -2,7 +2,7 @@
 //! file-size ceiling).
 #![allow(clippy::unwrap_used)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::*;
 
@@ -131,5 +131,83 @@ fn scans_must_cover_each_rw_mount_exactly_once() {
     .unwrap();
     let e = workspace_mounts(&mut a, &paths, &v, &BTreeMap::new()).unwrap_err();
     assert!(e.to_string().contains("rw mount has no git scan"), "{e}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Settings whose runtime is an executable `crun` in `dir/<runtime_dir>`, which passes
+/// `CheckedRuntime::check` (user-owned, under `target/`), and whose other paths are clean.
+fn common_args(dir: &Path, runtime_dir: &str) -> CommonArgs {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join(runtime_dir);
+    std::fs::create_dir_all(&bin).unwrap();
+    let crun = bin.join("crun");
+    std::fs::write(&crun, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&crun, std::fs::Permissions::from_mode(0o755)).unwrap();
+    CommonArgs {
+        runtime: crate::sandbox::CheckedRuntime::check(&crun).unwrap(),
+        ids: crate::sandbox::UserIds { uid: 1, gid: 1 },
+        profiles: dir.join("profiles"),
+        hooks_dir: dir.join("hooks"),
+        mounts_file: dir.join("mounts.conf"),
+        installation: super::super::types::Installation::parse(
+            "00000000-0000-4000-8000-000000000001",
+        )
+        .unwrap(),
+    }
+}
+
+/// Architect Q215 (a): `Argv::begin` passes the runtime, the hooks directory, the mounts file
+/// and the role's seccomp profile through `path_arg`, and refuses each by its own label; the
+/// clean settings are the control.
+#[test]
+fn begin_refuses_each_unclean_path_by_its_label() {
+    let dir = std::env::current_dir()
+        .unwrap()
+        .join("../../target/argv-unit")
+        .join(format!("begin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir = std::fs::canonicalize(&dir).unwrap();
+    let ok = common_args(&dir, "bin");
+    let a = Argv::begin(&ok, "sp-ws-s".to_owned(), Role::Workspace).unwrap();
+    let crun = ok.runtime.path().to_str().unwrap();
+    let seccomp = format!("seccomp={}/seccomp-workspace.json", ok.profiles.display());
+    let wanted = ["--runtime", crun, "create", "sp-ws-s", "--network=none"];
+    for want in wanted.iter().chain([&seccomp.as_str()]) {
+        assert!(a.args.iter().any(|x| x == want), "{want}: {:?}", a.args);
+    }
+    let bad = dir.join("a,b");
+    for (label, c) in [
+        ("runtime", common_args(&dir, "a,b")),
+        (
+            "hooks directory",
+            CommonArgs {
+                hooks_dir: bad.clone(),
+                ..ok.clone()
+            },
+        ),
+        (
+            "mounts file",
+            CommonArgs {
+                mounts_file: bad.clone(),
+                ..ok.clone()
+            },
+        ),
+        (
+            "seccomp profile",
+            CommonArgs {
+                profiles: bad.clone(),
+                ..ok.clone()
+            },
+        ),
+    ] {
+        let Err(e) = Argv::begin(&c, "sp-ws-s".to_owned(), Role::Workspace) else {
+            panic!("{label}: accepted");
+        };
+        assert!(
+            matches!(&e, ArgvError::Input(m) if m.starts_with(&format!("{label}: "))),
+            "{label}: {e:?}"
+        );
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }

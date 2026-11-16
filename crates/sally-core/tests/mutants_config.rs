@@ -812,9 +812,8 @@ fn std_path_call(path: &str) -> bool {
 /// line). cargo-mutants never mutates a function named `new` (Task 9a-3, Q1), so their logic is
 /// untested by the nightly. Task 13 moves each into a named function and empties this list; an
 /// entry that is clean or gone fails the guard, so the list only shrinks.
-const NEW_WITH_LOGIC: [(&str, &str); 10] = [
+const NEW_WITH_LOGIC: [(&str, &str); 9] = [
     ("crates/sally-core/src/manifest/paths.rs", "Denylist"), // TODO(#87)
-    ("crates/sallyd/src/sandbox/argv.rs", "Argv"),           // TODO(#87)
     ("crates/sallyd/src/sandbox/types.rs", "SessionPaths"),  // TODO(#87)
     ("crates/sallyd/src/sandbox/scan.rs", "Walk"),           // TODO(#87)
     ("crates/sallyd/src/sandbox/changes.rs", "Walk"),        // TODO(#87)
