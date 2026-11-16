@@ -553,7 +553,7 @@ impl Pipes {
 
 /// Reads one pipe of an attached command to its end: each read at most what keeps the chunk
 /// with its carry within [`sally_proto::MAX_OUTPUT_CHUNK`], escaped by this stream's own
-/// escaper, and queued, waiting for room. Ends at the pipe's end, at [`DRAIN_LIMIT`] of
+/// escaper (the RT-CLI-01 control), and queued, waiting for room. Ends at the pipe's end, at [`DRAIN_LIMIT`] of
 /// idleness once the client exited, or when halted.
 async fn stream(
     mut r: impl AsyncRead + Unpin + Send + 'static,

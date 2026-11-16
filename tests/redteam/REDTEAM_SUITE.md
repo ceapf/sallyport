@@ -179,6 +179,12 @@ RT-SEC-12 and RT-SEC-07 over every form (`intercept.rs`), and RT-SEC-01 and 02
 | RT-DRV-07 | The caller cannot choose a call or its origin | `sessions.drive` carrying `name`, `arguments`, `tool_calls`, `actor` or `origin`; `sessions.drive` on the agent socket | `-32602` and nothing runs; `-32601` on the session socket's table. Control: `deny_unknown_fields` on the params and the separate method tables (`rt_drv_07_…`, `rt_ag_06_…`; in `rt_drv_07_…`, first, the same method with only the id runs the turn's call) | CI | M1 |
 | RT-DRV-08 | The script is data | a model with a non-scripted kind, `driven: false`, a duplicate key at any depth, an unknown shape, an extra key in a call, too many calls, a script over 256 KiB, a turn after a content or fail turn | `model-invalid`, `scripted-not-driven` or `script-invalid` (the last naming the turn); `session.refuse`; no container starts; the create's `rpc.request` holds the script's size and hash, never its text. Control: the strict parser, its caps and `Script::driven` (`rt_drv_08_a_model_is_refused_…`, in-test first a good driven script starts; the caps: `rt_drv_08_caps_hold_at_their_boundaries` in `llm::scripted`; fuzz target `model_script`) | CI | M1 |
 
+## CLI — line mode (Task 12, AMENDMENTS-01 §6.4, architect Q100, Q149)
+
+| ID | Name | Attack | PASS condition | CI/GPU | M |
+|---|---|---|---|---|---|
+| RT-CLI-01 | Sandbox output cannot drive the terminal | an attached command prints CSI (`ESC [31m`), OSC 52 (clipboard) and OSC 8 (link) ended by ST, a raw C1 CSI byte (0x9b, not UTF-8), U+009B, U+202E and `\r`; once read raw from `session.output`, once through `sally sandbox run` over a real `control.sock` | every `session.output` text is printable ASCII plus `\n`, exactly `a\x1b[31mb\x1b]52;c;eA==\x07\x1b]8;;http://x\x1b\\l\x9b\u{9b}\u{202e}\x0dz` and a newline; the CLI prints exactly that text to stdout, nothing to stderr, and exits with the command's code; `sandbox.exec_result` counts the 44 raw bytes. Control: `sallyd`'s per-stream `StreamEscaper` in the attach readers (`tools/exec.rs`); with it removed both tests fail (hand-checked; the CLI's clean-check then escapes differently and refuses). The clean-check, the second layer, is unit-tested in sally-cli `run_tests.rs` (`rt_cli_01_…` in `crates/sallyd/tests/control/line.rs`) | CI | M1 |
+
 ## AUD — audit integrity
 
 | ID | Name | Attack | PASS condition | CI/GPU | M |
@@ -213,7 +219,7 @@ RT-SEC-12 and RT-SEC-07 over every form (`intercept.rs`), and RT-SEC-01 and 02
 
 ---
 
-### Count: 94 rows (RT-FS 18, NET 12, SEC 15, MDL 9, INF 5, AG 15, DRV 8, AUD 2, MAN 4, SUP 3, UI 3) — 77 of them land in M1 (in part or in full).
+### Count: 97 rows (RT-FS 18, NET 12, SEC 15, MDL 9, INF 5, AG 17, DRV 8, CLI 1, AUD 2, MAN 4, SUP 3, UI 3) — 80 of them land in M1 (in part or in full).
 
 Counted mechanically: every row of the category tables (not the old → new tables), by its
 milestone column. A lettered row counts as its own row: SEC 15 is RT-SEC-01..14 and RT-SEC-06b.

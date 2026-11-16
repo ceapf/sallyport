@@ -341,3 +341,6 @@ fn a_prompt_of_a_live_session_is_answered_over_control() {
         assert_eq!(stopped["result"], json!({"id": id}));
     });
 }
+
+#[path = "control/line.rs"]
+mod line;
