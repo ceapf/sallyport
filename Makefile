@@ -155,7 +155,7 @@ MUTANTS_WIDE_CLI := $(addprefix crates/sally-cli/src/,clean.rs client.rs command
                     secrets.rs local.rs doctor.rs usage.rs drive.rs run.rs)
 MUTANTS_WIDE_TESTS_CORE :=
 MUTANTS_WIDE_TESTS_SALLYD := --lib --test=argv --test=scan
-MUTANTS_WIDE_TESTS_SHIM := --lib --test=relay
+MUTANTS_WIDE_TESTS_SHIM := --lib --test=relay --test=relay_bin --test=relay_write_errors
 MUTANTS_WIDE_TESTS_CLI := --lib --test=cli --test=secrets_argv --test=harden
 MUTANTS_SHARD ?=
 MUTANTS_OUT ?=
