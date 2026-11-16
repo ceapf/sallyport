@@ -490,13 +490,14 @@ fn snapshot(root: &Path) -> Vec<(PathBuf, Entry)> {
 
 /// RT-FS-04: traversal through the brokered tools.
 ///
-/// In-test control (first): a write the grants allow, into the rw mount of the same fixture,
-/// changes [`snapshot`] by exactly that file and is recorded as one `tool.run`, with no prompt.
-/// Then the fixture's whole tree (`outside` and every mount) has the same snapshot before and
-/// after the traversals, and the prompt and `tool.run` counts are still the control's.
+/// In-test controls (first): a write the grants allow, into the rw mount of the same fixture,
+/// changes [`snapshot`] by exactly that file and is recorded as one `tool.run`, with no prompt;
+/// a write the `*.md` glob gates is recorded as one prompt and, denied, changes nothing. Then
+/// the fixture's whole tree (`outside` and every mount) has the same snapshot before and after
+/// the traversals, and the prompt and `tool.run` counts are still the controls'.
 #[tokio::test]
 async fn rt_fs_04_traversal_via_brokered_tools_is_denied_and_touches_nothing() {
-    let f = fx("rt-fs-04", opts(all_modes()));
+    let f = Arc::new(fx("rt-fs-04", opts(all_modes())));
     let notes = f.dir("/workspace/notes").to_owned();
     std::os::unix::fs::symlink(f.outside.join("secret"), notes.join("link")).unwrap();
     std::os::unix::fs::symlink(&f.outside, notes.join("dir")).unwrap();
@@ -522,6 +523,22 @@ async fn rt_fs_04_traversal_via_brokered_tools_is_denied_and_touches_nothing() {
     assert_eq!(after.len(), before.len() + 1, "control: the snapshot");
     assert_eq!(f.prompts().len(), 0, "control: prompts");
     assert_eq!(runs(), 1, "control: tool.run");
+    let f2 = Arc::clone(&f);
+    let gated = tokio::spawn(async move {
+        f2.call(
+            "fs_write",
+            json!({"path": "/workspace/notes/control.md", "content_b64": "eA=="}),
+        )
+        .await
+    });
+    let p = f.until_shown(1).await;
+    assert_eq!(p.tool, "fs_write", "control: the prompt");
+    decide(&f.desk, &p.id, Decision::Deny, ME).await.unwrap();
+    let out = gated.await.unwrap().unwrap();
+    assert_eq!(out.text, "denied: denied", "control: the denied write");
+    assert_eq!(f.prompts().len(), 1, "control: prompts");
+    assert_eq!(runs(), 1, "control: tool.run");
+    assert_eq!(snapshot(&f.base), after, "control: the denied write");
 
     let outside = snapshot(&f.outside);
     for (tool, args) in [
@@ -552,7 +569,7 @@ async fn rt_fs_04_traversal_via_brokered_tools_is_denied_and_touches_nothing() {
     assert_eq!(std::fs::read(f.outside.join("secret")).unwrap(), b"outside");
     assert!(!f.outside.join("new").exists());
     assert!(notes.join("link").symlink_metadata().is_ok());
-    assert_eq!(f.prompts().len(), 0);
+    assert_eq!(f.prompts().len(), 1);
     assert_eq!(runs(), 1);
 }
 
