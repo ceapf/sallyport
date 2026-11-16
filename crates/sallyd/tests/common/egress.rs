@@ -294,7 +294,8 @@ pub type FakeEgress = Egress<Names, Upstream, Owned>;
 pub const STORED: [&str; 4] = ["GITHUB_TOKEN", "MOCK3_TOKEN", "GIT_TOKEN", "HOST_TOKEN"];
 
 /// The canary value the fixtures' store holds for `name`: assembled at runtime, so no
-/// credential-shaped literal is in the tree; `CANARY` makes it easy to grep for (RT-SEC-07).
+/// credential-shaped literal is in the tree; `CANARY` makes it easy to grep for (RT-SEC-07),
+/// except `HOST_TOKEN`'s, which must be lower-case (below): a search for it names it.
 /// `GIT_TOKEN`'s also holds characters a percent-encoder escapes (`/ + ? & = %` and a space),
 /// so each percent spelling differs from the raw value (architect ruling A4); none of the
 /// canaries holds `*`, so a session's filler is `*`. `HOST_TOKEN`'s is a lower-case DNS label

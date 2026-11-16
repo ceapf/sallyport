@@ -600,8 +600,9 @@ fn rt_sec_07_an_entry_written_after_the_release_holds_no_credential_in_its_host(
         let host = format!("{value}.mock.test");
         lx.egress.resolver.set(&host, vec![vec![tls_upstream()]]);
         let sock = lx.paths("sec07h").workspace_sockets().join("net.sock");
-        let tunnel = connect(&sock, &host).await;
+        // Held before the tunnel exists, so it cannot close unheld in between.
         let unhold = lx.events.held(&["egress.close"]);
+        let tunnel = connect(&sock, &host).await;
         // Bounded, so a stop that waited for the held append fails instead of hanging.
         let bound = Duration::from_secs(60);
         let done = tokio::time::timeout(bound, lx.launcher.stop(r))

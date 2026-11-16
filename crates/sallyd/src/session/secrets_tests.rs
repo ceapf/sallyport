@@ -287,11 +287,10 @@ fn a_sessions_egress_entries_are_redacted_with_its_own_forms_after_the_release()
         assert!(!l.contains(&v), "{l}");
         assert!(l.contains("[REDACTED:GITHUB_TOKEN]"), "{l}");
     }
-    for l in own.iter().take(2) {
-        assert!(
-            l.contains("[REDACTED:GITHUB_TOKEN].h.test"),
-            "the host: {l}"
-        );
+    for event in ["egress.allow", "egress.close"] {
+        let tag = format!("\"event\":\"{event}\"");
+        let l = own.iter().find(|l| l.contains(&tag)).unwrap();
+        assert!(l.contains("[REDACTED:GITHUB_TOKEN].h.test"), "{l}");
     }
     let raw: Vec<&str> = text.lines().filter(|l| l.contains("mark-raw")).collect();
     assert_eq!(raw.len(), 6, "{text}");
@@ -301,7 +300,9 @@ fn a_sessions_egress_entries_are_redacted_with_its_own_forms_after_the_release()
 
 /// Architect Q266 (1): the wrapper alone, under a writer with no redactor, redacts a form of
 /// the session's secrets wherever an entry holds it: in a string value, as an object key and as
-/// a number. Control: the same entry appended to the writer directly holds all three.
+/// a number. The entries are appended after the session's forms were registered with the logs'
+/// redactors and unregistered again (the release), so the wrapper's forms outlive the release.
+/// Control: the same entry appended to the writer directly holds all three.
 #[test]
 fn the_session_sink_redacts_a_form_in_a_value_a_key_and_a_number() {
     let dir = scratch("sink-alone");
@@ -312,10 +313,12 @@ fn the_session_sink_redacts_a_form_in_a_value_a_key_and_a_number() {
     let digits = "1357924680135792468";
     let (w, d) = (Secret::new(word.clone()), Secret::new(digits.to_owned()));
     let forms = SessionForms::build([("WORD", &w, vec![]), ("DIGITS", &d, vec![])]);
-    let sink = SessionRedacted::over(
-        Arc::clone(&audit) as Arc<dyn AuditSink>,
-        Arc::new(Redaction::of(forms).unwrap()),
-    );
+    let redaction = Arc::new(Redaction::of(forms).unwrap());
+    let (_a, _b, redactors) = two();
+    redactors.register("s1", Arc::clone(redaction.forms()));
+    redactors.unregister("s1");
+    assert!(redactors.sessions().is_empty());
+    let sink = SessionRedacted::over(Arc::clone(&audit) as Arc<dyn AuditSink>, redaction);
     let entry = |mark: &str| {
         let args = json!({
             "host": format!("{word}.h.test"),
