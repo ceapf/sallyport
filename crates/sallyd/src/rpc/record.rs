@@ -3,11 +3,11 @@
 //! the peer chose (a method, a path, a field name, an id) are escaped and cut before they are
 //! written.
 
-use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use sally_core::audit::{Actor, NewEntry};
 use sally_core::manifest::AuditLevel;
+use sally_core::text::Style;
 use tokio::sync::watch;
 
 use crate::oplog::Oplog;
@@ -264,23 +264,17 @@ impl Recorder {
     }
 }
 
-/// `raw` for an audit entry: printable ASCII other than `\` and `"` as is, every other byte as
-/// `\xNN`; at most [`LOGGED_BYTES`] input bytes, then `…(+N)` with the number left out.
+/// How a short text a sandbox chose (a method, a tool name, an id) is logged: printable ASCII
+/// other than `\` and `"` as is, every other byte as `\xNN`; at most [`LOGGED_BYTES`] input
+/// bytes, then `…(+N)` with the number left out (architect Q288's counted hex format). A builder
+/// declares such a text on its entry ([`sally_core::audit::NewEntry::text`]), so the writer masks
+/// it whole before it is cut and escaped (Q276).
+pub const SHORT_STYLE: Style = Style::HexCounted { max: LOGGED_BYTES };
+
+/// `raw` in [`SHORT_STYLE`], for text the daemon chose or that is never logged.
 #[must_use]
 pub fn escape(raw: &[u8]) -> String {
-    let shown = raw.get(..LOGGED_BYTES).unwrap_or(raw);
-    let mut out = String::with_capacity(shown.len());
-    for &b in shown {
-        if (0x20..0x7f).contains(&b) && b != b'\\' && b != b'"' {
-            out.push(char::from(b));
-        } else {
-            let _ = write!(out, "\\x{b:02x}");
-        }
-    }
-    if raw.len() > shown.len() {
-        let _ = write!(out, "…(+{})", raw.len() - shown.len());
-    }
-    out
+    sally_core::text::hex_counted(raw, LOGGED_BYTES)
 }
 
 #[cfg(test)]

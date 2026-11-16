@@ -952,8 +952,12 @@ fn error_messages_follow_their_codes() {
 
 #[test]
 fn logged_ids_are_escaped() {
-    assert_eq!(logged_id(&Id::Num(-3)), json!(-3));
-    assert_eq!(logged_id(&Id::Str("a\u{1b}".into())), json!("a\\x1b"));
+    let logged = |id: &Id| {
+        let e = with_id(NewEntry::new(Actor::Sallyd, "rpc.cancel"), json!({}), id);
+        e.resolved(&sally_core::audit::Redactor::default())["id"].clone()
+    };
+    assert_eq!(logged(&Id::Num(-3)), json!(-3));
+    assert_eq!(logged(&Id::Str("a\u{1b}".into())), json!("a\\x1b"));
 }
 
 fn driven_setup() -> (Arc<Agent<Arc<Fake>>>, Arc<Fake>, Arc<Sink>) {
