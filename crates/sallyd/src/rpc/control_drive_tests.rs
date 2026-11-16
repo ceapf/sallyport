@@ -50,10 +50,17 @@ async fn rt_drv_05_a_session_not_declared_driven_has_no_drive_methods() {
     let f = fx("drive-none");
     let own = f.session("s-1");
     let mut w = f.connect();
+    // Control (#122, architect Q158, Q170), first: a session of the same fixture declared
+    // driven is driven by the same call, and its own entries record the turn.
+    let (theirs, calls) = driven(&f, "s-2", TWO);
+    let r = w.call("sessions.drive", json!({"id": "s-2"})).await;
+    assert_eq!(r["result"]["turn"], json!(1), "control: {r}");
+    assert_eq!(theirs.events(), ["drive.turn"], "control");
+    assert_eq!(*calls.lock().unwrap(), ["echo"], "control");
     let r = w.call("sessions.drive", json!({"id": "s-1"})).await;
     assert_eq!(r["error"]["code"], json!(REFUSED));
     assert_eq!(reason(&r), "not-driven");
-    assert_eq!(f.events(), ["rpc.request", "session.refuse"]);
+    assert_eq!(f.events(), ["rpc.request", "rpc.request", "session.refuse"]);
     assert_eq!(
         refused(&f, "session.refuse"),
         json!({"method": "sessions.drive", "id": "s-1", "reason": "not-driven",
@@ -177,7 +184,7 @@ fn held(
 /// withdraws its prompt is `agent_tests.rs`'s
 /// `a_dropped_driven_call_runs_to_its_end_and_its_prompt_is_withdrawn`.
 #[tokio::test]
-async fn a_driver_that_closes_mid_step_drops_the_step_and_leaves_the_seat_gone() {
+async fn rt_drv_06_a_driver_that_closes_mid_step_drops_the_step_and_leaves_the_seat_gone() {
     let f = fx("drive-away");
     let (began, _release, dropped) = held(&f, "s-1");
     let mut seat = f.connect();
@@ -204,7 +211,7 @@ async fn a_driver_that_closes_mid_step_drops_the_step_and_leaves_the_seat_gone()
 /// A driver that shuts its write side after the drive is a closed driver: the step is dropped
 /// unanswered and the seat is gone (architect ruling on the H1 fix: half-close fails closed).
 #[tokio::test]
-async fn a_driver_that_half_closes_mid_step_is_a_closed_driver() {
+async fn rt_drv_06_a_driver_that_half_closes_mid_step_is_a_closed_driver() {
     let f = fx("drive-half");
     let (began, _release, dropped) = held(&f, "s-1");
     let mut seat = f.connect();
@@ -341,7 +348,7 @@ async fn one_connection_drives_two_sessions_each_on_its_own_seat() {
 }
 
 #[tokio::test]
-async fn a_connection_that_watches_cannot_take_the_seat() {
+async fn rt_drv_06_a_connection_that_watches_cannot_take_the_seat() {
     let f = fx("drive-watching");
     driven(&f, "s-1", TWO);
     let mut w = f.connect();
@@ -388,6 +395,20 @@ async fn rt_drv_04_a_connection_in_the_driver_seat_cannot_answer_an_approval() {
         tokio::task::yield_now().await;
     }
     assert!(!asked.is_finished(), "the action was not approved");
+    // Control (#122, architect Q168): the same decision from the real approver's connection
+    // answers the same prompt, and the waiting action ends.
+    let r = approver
+        .call(
+            "approvals.decide",
+            json!({"id": p["id"], "decision": "approve", "digest": p["digest"]}),
+        )
+        .await;
+    assert!(r.get("error").is_none(), "control: {r}");
+    let ticket = tokio::time::timeout(std::time::Duration::from_secs(5), asked)
+        .await
+        .expect("control: the approved action ended")
+        .unwrap();
+    assert!(ticket.is_ok(), "control: approved: {ticket:?}");
 }
 
 #[tokio::test]
@@ -395,6 +416,12 @@ async fn rt_drv_07_drive_takes_a_session_id_and_nothing_else() {
     let f = fx("drive-params");
     let (own, calls) = driven(&f, "s-1", TWO);
     let mut w = f.connect();
+    // Control (#122, architect Q158), first: the same method with only the id runs the turn's
+    // call, recorded by the same `calls` and the session's own entries.
+    let r = w.call("sessions.drive", json!({"id": "s-1"})).await;
+    assert_eq!(r["result"]["turn"], json!(1), "control: {r}");
+    assert_eq!(*calls.lock().unwrap(), ["echo"], "control");
+    assert_eq!(own.events(), ["drive.turn"], "control");
     for extra in [
         json!({"id": "s-1", "name": "shell"}),
         json!({"id": "s-1", "arguments": {}}),
@@ -406,7 +433,8 @@ async fn rt_drv_07_drive_takes_a_session_id_and_nothing_else() {
         let r = w.call("sessions.drive", extra).await;
         assert_eq!(r["error"]["code"], json!(-32602));
     }
-    assert!(calls.lock().unwrap().is_empty() && own.events().is_empty());
+    assert_eq!(*calls.lock().unwrap(), ["echo"]);
+    assert_eq!(own.events(), ["drive.turn"]);
 }
 
 fn model(driven: bool, kind: &str, script: &str) -> Value {
@@ -417,6 +445,18 @@ fn model(driven: bool, kind: &str, script: &str) -> Value {
 async fn rt_drv_08_a_model_is_refused_unless_scripted_declared_driven_with_a_good_script() {
     let f = fx("drive-create");
     let mut w = f.connect();
+    // Control (#122, architect Q158), first: a good script declared driven starts, recorded by
+    // the same fake launcher.
+    let r = w
+        .call("sessions.create", model(true, "scripted", TWO))
+        .await;
+    assert!(r.get("error").is_none(), "control: {r}");
+    assert_eq!(
+        f.fake.started.lock().unwrap().len(),
+        1,
+        "control: it started"
+    );
+    let control = f.events();
     for (p, why) in [
         (model(false, "scripted", TWO), "scripted-not-driven"),
         (model(true, "none", TWO), "model-invalid"),
@@ -434,9 +474,13 @@ async fn rt_drv_08_a_model_is_refused_unless_scripted_declared_driven_with_a_goo
         assert_eq!(r["error"]["code"], json!(REFUSED));
         assert_eq!(reason(&r), why);
     }
-    assert!(f.fake.started.lock().unwrap().is_empty(), "nothing started");
     assert_eq!(
-        f.events(),
+        f.fake.started.lock().unwrap().len(),
+        1,
+        "nothing else started"
+    );
+    assert_eq!(
+        f.events()[control.len()..],
         [
             "rpc.request",
             "session.refuse",
