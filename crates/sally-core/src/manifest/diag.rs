@@ -366,7 +366,7 @@ mod tests {
     #[test]
     fn scrub_flattens_and_bounds() {
         assert_eq!(scrub("a\nb\tc"), "a b c");
-        // MANIFEST_SPEC: at most 300 characters, the cut marker included.
+        // MANIFEST_SPEC: a message (or a path) is at most 300 characters, its cut marker included.
         let cut = scrub(&"x".repeat(1000));
         assert_eq!(cut.chars().count(), MAX_TEXT);
         assert!(cut.ends_with("x..."), "{cut}");
@@ -375,6 +375,17 @@ mod tests {
         let over = scrub(&"z".repeat(MAX_TEXT + 1));
         assert_eq!(over.chars().count(), MAX_TEXT);
         assert!(over.ends_with("z..."), "{over}");
+    }
+
+    /// A quoted token that straddles the cut is masked whole before the cut: cutting first
+    /// would leave it unterminated, and an unterminated quote is never masked (security review
+    /// of the 300-character cut).
+    #[test]
+    fn a_token_straddling_the_cut_is_masked_before_it() {
+        let token = "k9".repeat(15);
+        let s = scrub(&format!("{}\"{token}\" tail", "a ".repeat(140)));
+        assert!(s.chars().count() <= MAX_TEXT, "{s}");
+        assert!(!s.contains("k9k9k9"), "{s}");
     }
 
     #[test]

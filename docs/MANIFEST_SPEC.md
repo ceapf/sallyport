@@ -411,7 +411,8 @@ error: tools.acknowledge_unapproved: shell: allow with destructive_requires_appr
 warning: tools.shell: "allow": shell commands run without approval unless tagged destructive [risky]
 ```
 
-All errors are reported at once. Diagnostics are single-line, at most 300 characters, and
+All errors are reported at once. Diagnostics are single-line; a diagnostic's path and its
+message are each at most 300 characters (a cut one ends in `...`), and
 token-looking values (20+ characters with a digit and no spaces/slashes) are masked in both the
 message and the path, so a credential pasted into the wrong field does not reach the UI or the
 audit log. The bracketed code is stable (tests and the UI match on it,

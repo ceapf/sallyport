@@ -7,7 +7,9 @@
 //! the shipped examples meets Q226, with two rules that close the scanner's silent holes: a
 //! non-ASCII escape (`\u{..}` above 7f, `\x80` to `\xff`) on a product line is found like the
 //! character itself, and a `#[cfg(test)]` followed by anything but an inline `mod <name> {`
-//! fails the scan, since the cut at it could hide product code.
+//! fails the scan, since the cut at it could hide product code; so does a test module that is
+//! not the file's unindented tail. Not found: a non-ASCII character built at run time
+//! (`char::from_u32` and the like); none is in the module today.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;
@@ -55,8 +57,8 @@ fn inline_mod(l: &str) -> bool {
 
 /// The lines of `text` before its first `#[cfg(test)]` that are not comment lines and hold a
 /// non-ASCII character or escape, with their 1-based numbers. `Err(n)`: line `n` holds a
-/// `#[cfg(test)]` that is not alone on its line followed by an inline `mod <name> {`, so the cut
-/// could hide product code.
+/// `#[cfg(test)]` that is not alone on its line followed by an inline `mod <name> {`, or (the
+/// first one) whose module is not the file's tail, so the cut could hide product code.
 fn non_ascii_product_lines(text: &str) -> Result<Vec<(usize, &str)>, usize> {
     let lines: Vec<&str> = text.lines().collect();
     for (i, l) in lines.iter().enumerate() {
@@ -65,6 +67,20 @@ fn non_ascii_product_lines(text: &str) -> Result<Vec<(usize, &str)>, usize> {
             if l.trim() != "#[cfg(test)]" || !inline_mod(next) {
                 return Err(i + 1);
             }
+        }
+    }
+    if let Some(at) = lines.iter().position(|l| l.contains("#[cfg(test)]")) {
+        // The cut's module is the file's tail: rustfmt indents its body, so after its opening
+        // line the only line at column 0 is its closing brace, the last non-blank line.
+        let top: Vec<&str> = lines
+            .iter()
+            .skip(at + 2)
+            .filter(|l| !l.trim().is_empty() && !l.starts_with([' ', '\t']))
+            .copied()
+            .collect();
+        let last = lines.iter().rev().find(|l| !l.trim().is_empty()).copied();
+        if lines.get(at) != Some(&"#[cfg(test)]") || top != ["}"] || last != Some("}") {
+            return Err(at + 1);
         }
     }
     Ok(text
@@ -111,20 +127,22 @@ fn no_manifest_product_line_holds_a_non_ascii_character() {
 #[test]
 fn the_scan_finds_a_non_ascii_product_line_only() {
     let text = "/// a \u{2014} b\nlet x = \"\u{2026}\";\nlet e = \"\\u{2014}\";\n\
-                let b = b\"\\xe2\";\nlet ok = \"\\u{41}\\x41\";\n#[cfg(test)]\nmod tests {\n\
-                let y = \"\u{2013}\";\n";
+                let b = b\"\\xe2\";\nlet ok = \"\\u{41}\\x41\\u{7f}\\x7f\";\nlet e8 = \"\\u{80}\";\n\
+                #[cfg(test)]\nmod tests {\n    let y = \"\u{2013}\";\n}\n";
     assert_eq!(
         non_ascii_product_lines(text),
         Ok(vec![
             (2, "let x = \"\u{2026}\";"),
             (3, "let e = \"\\u{2014}\";"),
             (4, "let b = b\"\\xe2\";"),
+            (6, "let e8 = \"\\u{80}\";"),
         ])
     );
 }
 
-/// The cut's control (architect Q237): a `#[cfg(test)]` on an item, on an out-of-line module, or
-/// sharing its line fails the scan at its line, so product code after it cannot be hidden.
+/// The cut's control (architect Q237): a `#[cfg(test)]` on an item, on an out-of-line module,
+/// sharing its line, indented (a test module nested in product code), or whose module is
+/// followed by product code fails the scan at its line, so no product code can be hidden.
 #[test]
 fn a_cfg_test_cut_not_at_an_inline_mod_fails_the_scan() {
     for (text, line) in [
@@ -134,7 +152,15 @@ fn a_cfg_test_cut_not_at_an_inline_mod_fails_the_scan() {
         ),
         ("#[cfg(test)]\n#[path = \"x_tests.rs\"]\nmod x_tests;\n", 1),
         ("let a = 1;\n#[cfg(test)]\nmod x;\nlet b = 2;\n", 2),
-        ("#[cfg(test)] mod tests {\n}\n", 1),
+        ("#[cfg(test)] fn h() {}\nmod tests {\n}\n", 1),
+        (
+            "#[cfg(test)]\nmod tests {\n    fn t() {}\n}\nconst X: &str = \"\u{2014}\";\n",
+            1,
+        ),
+        (
+            "mod inner {\n    #[cfg(test)]\n    mod tests {\n    }\n}\n",
+            2,
+        ),
     ] {
         assert_eq!(non_ascii_product_lines(text), Err(line), "{text}");
     }
