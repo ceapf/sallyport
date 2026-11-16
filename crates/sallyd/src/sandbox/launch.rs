@@ -320,13 +320,18 @@ impl Launcher {
     /// (architect Q219). Safe to call more than once. Off the runtime: the swap takes the audit
     /// writer's lock, which an append holds through its fsync.
     pub async fn release_secrets(&self, id: &str) {
-        let (redactors, id) = (Arc::clone(&self.redactors), id.to_owned());
-        if tokio::task::spawn_blocking(move || redactors.unregister(&id))
+        let redactors = Arc::clone(&self.redactors);
+        let owned = id.to_owned();
+        if tokio::task::spawn_blocking(move || redactors.unregister(&owned))
             .await
             .is_err()
         {
-            self.oplog
-                .error("sandbox", "releasing a session's secrets panicked", &[]);
+            // A panic or a runtime shutdown: the values stay redacted (fails safe).
+            self.oplog.error(
+                "sandbox",
+                "a session's secrets release did not finish",
+                &[("session", id)],
+            );
         }
     }
 

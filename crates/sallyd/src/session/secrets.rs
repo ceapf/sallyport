@@ -76,6 +76,15 @@ impl Redactors {
         }
     }
 
+    /// The daemon's redactors: over `audit`, the writer the launcher and the registry append
+    /// to, and over `oplog` (architect Q220). `serve` builds them only through this.
+    #[must_use]
+    pub fn for_logs(audit: &Arc<SharedAudit>, oplog: &Oplog) -> Self {
+        let audit = Arc::clone(audit) as Arc<dyn RedactorTarget>;
+        let oplog = Arc::new(oplog.clone()) as Arc<dyn RedactorTarget>;
+        Self::new(vec![audit, oplog])
+    }
+
     /// Adds session `id`'s forms (replacing any it had) and swaps in the new union.
     pub fn register(&self, id: &str, forms: Arc<SessionForms>) {
         let mut live = self.lock();

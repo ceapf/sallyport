@@ -51,7 +51,7 @@ use crate::sandbox::{
     outside_system_rule, probe_version, resolve_podman, version_error,
 };
 use crate::session::lookup::SharedEgress;
-use crate::session::secrets::{RedactorTarget, Redactors};
+use crate::session::secrets::Redactors;
 use crate::session::{Registry, RegistryParts};
 
 /// The trusted clients' socket in the locked runtime directory.
@@ -218,12 +218,8 @@ pub fn run(log: &Oplog) -> Result<(), DaemonError> {
     let config = read_config(&dirs.paths.config_file())?;
     let audit = AuditWriter::open(&dirs.paths.audit(), Box::new(SystemClock))?;
     let shared = Arc::new(SharedAudit(Mutex::new(audit)));
-    // The same writer the launcher appends to, and the oplog: the two redactor targets
-    // (architect Q220).
-    let redactors = Arc::new(Redactors::new(vec![
-        Arc::clone(&shared) as Arc<dyn RedactorTarget>,
-        Arc::new(log.clone()) as Arc<dyn RedactorTarget>,
-    ]));
+    // The same writer the launcher appends to, and the oplog (architect Q220).
+    let redactors = Arc::new(Redactors::for_logs(&shared, log));
     let audit: Arc<dyn AuditSink> = shared;
     // Under the single-instance lock, in the state directory the audit log just made.
     let installation = super::install::load_or_create(&dirs.state())?;

@@ -158,13 +158,20 @@ impl Registry {
             .await;
     }
 
-    /// The oplog line of each crash reported after the session's reason was chosen.
-    fn late_crashes(&self, crashes: &mut CrashReceiver) {
+    /// The oplog line of each crash reported after the session's reason was chosen. With the
+    /// panic's payload only while the session's secrets are still redacted (`payload`); after
+    /// their release, the task's name alone.
+    fn late_crashes(&self, crashes: &mut CrashReceiver, payload: bool) {
         while let Ok(c) = crashes.try_recv() {
+            let shown = if payload {
+                c.payload.as_str()
+            } else {
+                "withheld"
+            };
             self.p.oplog.error(
                 LOG,
                 "session task panicked during its stop",
-                &[("task", c.task), ("payload", &c.payload)],
+                &[("task", c.task), ("payload", shown)],
             );
         }
     }
@@ -307,7 +314,9 @@ impl Registry {
                 Ok(()) => {
                     self.live().remove(&sid);
                     if let Some(c) = crashes.as_mut() {
-                        self.late_crashes(c);
+                        // Before the release, so a payload is still redacted (architect Q228;
+                        // tests/redactors.rs `a_crash_reported_during_a_stop_is_logged_redacted`).
+                        self.late_crashes(c, true);
                     }
                     // After `session.stop` (or a failed start's last entry), the teardown and
                     // the late crashes' lines: the session's secrets leave the logs' redactors
@@ -325,6 +334,9 @@ impl Registry {
                         "session stopped",
                         &[("session", &sid), ("reason", reason.as_str())],
                     );
+                    if let Some(c) = crashes.as_mut() {
+                        self.late_crashes(c, false);
+                    }
                     return;
                 }
                 Err(r) => {
