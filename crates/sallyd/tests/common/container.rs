@@ -703,10 +703,7 @@ impl Lx {
     /// session `tag` with exactly one defence left out (`leave_out`), created and started by
     /// hermetic podman outside the launcher; the container id. The container carries the
     /// session's name, so the fixture removes it.
-    ///
-    /// A [`LeaveOut::Bind`] source must lie strictly below this fixture's root (it panics
-    /// otherwise), so a control never mounts anything of the real host.
-    #[allow(dead_code)] // Only the escape and launch tests run controls.
+    #[allow(dead_code)] // Only the escape, launch and session tests run workspace controls.
     pub async fn control_workspace(
         &self,
         v: &ValidatedManifest,
@@ -716,7 +713,7 @@ impl Lx {
         let paths = self.paths(tag);
         let dirs = SessionDirs::create(&paths, &self.xdg, &[], 0).unwrap();
         let scan = sallyd::sandbox::scan_mounts(v, &ScanLimits::default()).unwrap();
-        let mut argv = sallyd::sandbox::workspace_argv(
+        let argv = sallyd::sandbox::workspace_argv(
             &self.common_args(&dirs),
             &paths,
             v,
@@ -724,19 +721,25 @@ impl Lx {
             Some(&test_image()),
         )
         .unwrap();
+        self.control(argv, leave_out).await
+    }
+
+    /// [`Lx::control_workspace`] for any role: `argv` is a product builder's output
+    /// (`workspace_argv`, `harness_argv` or `inference_argv`), never one written by hand.
+    ///
+    /// A [`LeaveOut::Bind`] source must lie strictly below this fixture's root (it panics
+    /// otherwise), so a control never mounts anything of the real host.
+    #[allow(dead_code)] // Only the escape, launch, roles and session tests run controls.
+    pub async fn control(&self, mut argv: Vec<String>, leave_out: LeaveOut<'_>) -> String {
         match leave_out {
-            LeaveOut::Bind { host, guest } => {
-                let root = self.f.root.canonicalize().unwrap();
-                let host = host.canonicalize().unwrap();
-                assert!(
-                    host != root && host.starts_with(&root),
-                    "a control binds only below the fixture root: {}",
-                    host.display()
-                );
-                let image = test_image();
-                let at = argv.iter().position(|a| a == image.as_str()).unwrap();
-                let spec = format!("{}:{guest}:ro,nosuid,nodev,bind", host.display());
-                argv.splice(at..at, ["-v".to_owned(), spec]);
+            LeaveOut::Bind { host, guest } => self.add_binds(&mut argv, &[(host, guest)]),
+            LeaveOut::Binds(binds) => self.add_binds(&mut argv, binds),
+            LeaveOut::Source { guest, host } => {
+                let host = self.below_root(host);
+                let suffix = format!(":{guest}:");
+                let spec = argv.iter_mut().find(|a| a.contains(&suffix)).unwrap();
+                let (_, options) = spec.split_once(&suffix).unwrap();
+                *spec = format!("{}{suffix}{options}", host.display());
             }
             LeaveOut::NonRecursive { guest } => {
                 let suffix = format!(":{guest}:");
@@ -750,13 +753,45 @@ impl Lx {
         }
         self.create_and_start(argv).await
     }
+
+    /// `path` canonicalized; panics unless it lies strictly below this fixture's root.
+    fn below_root(&self, path: &Path) -> PathBuf {
+        let root = self.f.root.canonicalize().unwrap();
+        let path = path.canonicalize().unwrap();
+        assert!(
+            path != root && path.starts_with(&root),
+            "a control binds only below the fixture root: {}",
+            path.display()
+        );
+        path
+    }
+
+    /// Inserts one `ro` bind per `(host, guest)` just before the argv's image.
+    fn add_binds(&self, argv: &mut Vec<String>, binds: &[(&Path, &str)]) {
+        let image = test_image();
+        let at = argv.iter().position(|a| a == image.as_str()).unwrap();
+        let specs = binds.iter().flat_map(|(host, guest)| {
+            let host = self.below_root(host);
+            [
+                "-v".to_owned(),
+                format!("{}:{guest}:ro,nosuid,nodev,bind", host.display()),
+            ]
+        });
+        let specs: Vec<String> = specs.collect();
+        argv.splice(at..at, specs);
+    }
 }
 
-/// The one defence a [`Lx::control_workspace`] container leaves out of the product argv.
-#[allow(dead_code)] // Only the escape and launch tests run controls.
+/// The one defence a [`Lx::control`] container leaves out of the product argv.
+#[allow(dead_code)] // Only the escape, launch, roles and session tests run controls.
 pub enum LeaveOut<'a> {
     /// The mount set: one more `ro` bind of `host` (below the fixture root) at `guest`.
     Bind { host: &'a Path, guest: &'a str },
+    /// The mount set, for one class of host state (architect Q167): one `ro` bind per
+    /// `(host, guest)`, each below the fixture root.
+    Binds(&'a [(&'a Path, &'a str)]),
+    /// The mount set at `guest`: its bind's source becomes `host` (below the fixture root).
+    Source { guest: &'a str, host: &'a Path },
     /// Non-recursive binds: the bind at `guest` becomes `rbind`.
     NonRecursive { guest: &'a str },
 }
