@@ -7,10 +7,10 @@
 //! goes to the command as UTF-8 text, one `sessions.input` at a time, each sent after the last
 //! was written. When the command ends, the session is stopped and `sally` exits with the
 //! command's code (137 if `sallyd` killed it); a refused stop makes it at least 1. A run that
-//! could not go on exits 2 (1 for a refusal), its line printed, and leaves the session to its
-//! connection's end. Any output that failed the clean-check (it is shown escaped) makes the exit
-//! 1 however the run ended, its line last (architect Q149, Q204). Ctrl-C ends `sally`; its
-//! connection's end kills the command and stops the session.
+//! could not go on, or a code outside 0–255, exits 2 (1 for a refusal), its line printed, and
+//! leaves the session to its connection's end. Any output that failed the clean-check (it is
+//! shown escaped) makes the exit 1 however the run ended, its line last (architect Q149,
+//! Q204). Ctrl-C ends `sally`; its connection's end kills the command and stops the session.
 //!
 //! Nothing here asks for a decision: approvals are answered in another terminal (`sally
 //! approve`). Anything prompt-like in the run terminal is the command's output; the exit status

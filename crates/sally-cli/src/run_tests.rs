@@ -643,8 +643,12 @@ fn dirty_output_exits_refused_however_the_run_ended() {
             let tag = format!("{}-{dirty}", e.tag);
             let mut d = daemon(&tag, (e.script)(vec![note("stdout", text)]));
             // Stdin sends nothing until the run is over: an unread input at the fake's close
-            // would reset the connection instead of ending it.
+            // would reset the connection instead of ending it. Bounded, so a run that never
+            // ends (a mutant that takes the stray reply as an input's) fails, never hangs.
             let (open, stdin) = UnixStream::pair().unwrap();
+            stdin
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
             let (code, _, err) = run_with(&d, &tag, stdin);
             drop(open);
             let reqs = d.requests();
@@ -679,12 +683,13 @@ impl std::io::Write for Signalling {
     }
 }
 
-/// Stdin whose one read waits until the output was shown, then brings bytes that are not UTF-8.
+/// Stdin whose one read waits until the output was shown (at most 10 s, so a run that shows
+/// nothing fails instead of hanging), then brings bytes that are not UTF-8.
 struct AfterShown(mpsc::Receiver<()>);
 
 impl Read for AfterShown {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let _ = self.0.recv();
+        let _ = self.0.recv_timeout(std::time::Duration::from_secs(10));
         buf[0] = 0xff;
         Ok(1)
     }
