@@ -57,6 +57,18 @@ impl Prompt {
     /// The prompt for `bound` under approval `id`.
     #[must_use]
     pub fn new(id: String, bound: &Bound, note: Option<&str>, risk_tags: Vec<String>) -> Self {
+        Self::for_bound(id, bound, note, risk_tags)
+    }
+
+    /// [`Prompt::new`]: the action text cut to its bound, the escaped tool and note, and the
+    /// bound request's digest.
+    #[must_use]
+    pub fn for_bound(
+        id: String,
+        bound: &Bound,
+        note: Option<&str>,
+        risk_tags: Vec<String>,
+    ) -> Self {
         let full = action_text(&bound.action);
         let (action, truncated) = cut(&full, ACTION_CHARS);
         Self {
@@ -488,8 +500,11 @@ mod tests {
     #[test]
     fn the_prompt_carries_the_bound_digest_and_its_identity() {
         let b = bound(shell(&["ls"]));
-        let p = Prompt::new("ap-9".to_owned(), &b, None, vec!["destructive".to_owned()]);
+        let p = Prompt::for_bound("ap-9".to_owned(), &b, None, vec!["destructive".to_owned()]);
         assert_eq!(p.digest, b.digest());
+        assert_eq!((&p.action, p.truncated), (&action_text(&b.action), false));
+        assert_eq!(p.full, p.action);
+        assert!(p.note.is_none());
         assert_eq!(
             (p.id.as_str(), p.session.as_str(), p.call),
             ("ap-9", "s-0001", 3)
