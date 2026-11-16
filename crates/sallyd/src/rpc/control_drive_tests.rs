@@ -457,12 +457,7 @@ async fn a_bound_session_may_be_driven() {
     assert!(f.fake.disconnected.lock().unwrap().is_empty());
     w.w.shutdown().await.unwrap();
     w.ended().await;
-    for _ in 0..200 {
-        if !f.fake.disconnected.lock().unwrap().is_empty() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    eventually(|| !f.fake.disconnected.lock().unwrap().is_empty()).await;
     assert_eq!(*f.fake.disconnected.lock().unwrap(), ["s-new"]);
 }
 

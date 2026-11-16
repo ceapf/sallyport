@@ -1421,6 +1421,17 @@ async fn reads_are_rated_daemon_wide() {
     assert_eq!(f.rows().len(), rows);
 }
 
+/// Waits (bounded) until `f` holds.
+async fn eventually(f: impl Fn() -> bool) {
+    for _ in 0..500 {
+        if f() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("never happened");
+}
+
 #[path = "control_drive_tests.rs"]
 mod drive;
 

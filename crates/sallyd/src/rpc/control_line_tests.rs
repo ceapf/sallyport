@@ -57,17 +57,6 @@ fn texts(notes: &[Value]) -> String {
         .collect()
 }
 
-/// Waits (bounded) until `f` holds.
-async fn eventually(f: impl Fn() -> bool) {
-    for _ in 0..500 {
-        if f() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("never happened");
-}
-
 /// Architect Q101: the command's output comes as notifications, then the reply with its code;
 /// the control log has the request, the session's log the command and its result.
 #[tokio::test]
