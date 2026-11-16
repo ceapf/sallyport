@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use sally_core::audit::Actor;
 use sally_core::manifest::{ValidatedManifest, load};
+use sally_core::secrets::StoreNames;
 use sally_core::text::escape_capped;
 use sally_proto::ModelKind;
 use sally_proto::method;
@@ -423,15 +424,20 @@ impl<S: SessionSet> Control<S> {
                 None => return Err(Done::Close),
             }
         };
+        Err(self.refuse_create(reason, &detail, client).await)
+    }
+
+    /// A `sessions.create` refused before validation's verdict: `session.refuse` with `reason`
+    /// and `detail` (escaped, capped), and the same in the reply.
+    async fn refuse_create(&self, reason: &str, detail: &str, client: Client) -> Done {
         let detail = escape_capped(detail.as_bytes(), DETAIL_CHARS);
         let args = json!({
             "method": method::SESSIONS_CREATE, "reason": reason, "detail": detail,
             "client": who(client),
         });
         let data = refusal(reason, Some(detail), Vec::new());
-        Err(self
-            .refuse(Actor::Sallyd, "session.refuse", args, data)
-            .await)
+        self.refuse(Actor::Sallyd, "session.refuse", args, data)
+            .await
     }
 
     async fn create(&self, p: CreateParams, conn: &mut Conn) -> Done {
@@ -442,11 +448,21 @@ impl<S: SessionSet> Control<S> {
             Err(done) => return done,
         };
         let env = Arc::clone(&self.p.env);
-        let catalog = Arc::clone(&self.p.catalog);
-        let loaded = blocking(move || load(&p.manifest, &env, &*catalog)).await;
+        let store = Arc::clone(&self.p.secrets);
+        // A fresh catalog per validation, opened only if the manifest names a secret (Q221).
+        let loaded = blocking(move || {
+            let names = StoreNames::new(store.to_path_buf());
+            let verdict = load(&p.manifest, &env, &names);
+            (verdict, names.failed().map(ToString::to_string))
+        })
+        .await;
         let validated = match loaded {
-            Some(Ok(v)) => v,
-            Some(Err(rejected)) => {
+            // The store could not be read: a store fault, not a manifest fault (Q221).
+            Some((_, Some(store))) => {
+                return self.refuse_create("secret-store", &store, client).await;
+            }
+            Some((Ok(v), None)) => v,
+            Some((Err(rejected), None)) => {
                 let lines: Vec<String> = rejected.errors.iter().map(ToString::to_string).collect();
                 let error = escape_capped(lines.join("; ").as_bytes(), DETAIL_CHARS);
                 let data = refusal("manifest-invalid", None, error_lines(&lines));

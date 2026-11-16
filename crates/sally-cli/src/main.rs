@@ -207,10 +207,19 @@ fn local(cmd: Cmd, paths: &Paths) -> Result<u8, Remote> {
     };
     Ok(match cmd {
         Cmd::Doctor => doctor::doctor(&doctor::facts(paths), &mut o),
-        Cmd::Manifest { cmd } => match cmd {
-            ManifestCmd::Validate { file } => local::manifest_validate(&file, &mut o),
-            ManifestCmd::Summary { file } => local::manifest_summary(&file, &mut o),
-        },
+        Cmd::Manifest { cmd } => {
+            // A manifest that names a secret has the store read for its names (its values are
+            // dropped at once): core dumps go off first, as for `sally secrets`.
+            if let Err(e) = secrets::harden() {
+                let _ = writeln!(o.err, "sally: core dumps could not be turned off: {e}");
+                return Ok(EXIT_FAILED);
+            }
+            let store = paths.secrets_file();
+            match cmd {
+                ManifestCmd::Validate { file } => local::manifest_validate(&file, &store, &mut o),
+                ManifestCmd::Summary { file } => local::manifest_summary(&file, &store, &mut o),
+            }
+        }
         Cmd::Audit { cmd } => match cmd {
             AuditCmd::Verify => local::audit_verify(&paths.audit(), &mut o),
             AuditCmd::Tail { n } => local::audit_tail(&paths.audit(), n, &mut o),

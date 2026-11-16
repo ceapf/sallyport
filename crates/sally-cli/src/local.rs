@@ -1,5 +1,6 @@
 //! The commands that need no daemon (architect Q52, Q109, Q110): `manifest validate|summary`
-//! and `audit verify|tail`. They read files of the user's own; nothing here writes.
+//! and `audit verify|tail`. They read files of the user's own (the secrets store's names too,
+//! when a manifest names a secret); nothing here writes.
 //!
 //! A local manifest verdict is advisory: `sallyd` validates again, against the host facts it
 //! read at start, when a session starts.
@@ -7,19 +8,19 @@
 use std::path::Path;
 
 use sally_core::audit::{HeadStatus, VerifyErrorKind, VerifyReport, tail, verify};
-use sally_core::manifest::{Code, HostEnv, Rejected, Validated, load, summary};
+use sally_core::manifest::{HostEnv, Rejected, Validated, load, summary};
+use sally_core::secrets::StoreNames;
 
 use crate::commands::{Out, Printer, read_manifest};
-use crate::secrets::NOT_YET_USED;
 use crate::{EXIT_FAILED, EXIT_OK, EXIT_REFUSED, clean};
 
 /// The default and the most entries `audit tail` prints.
 pub const TAIL_DEFAULT: usize = 20;
 
-/// Loads `path` as `sallyd` would today: the CLI's host facts and an empty secrets catalog,
-/// because `sallyd` knows no secret names until #99. TODO(#99): both switch to the store's
-/// names together.
-fn validated(path: &Path, o: &mut Out<'_>) -> Result<Validated, u8> {
+/// Loads `path` as `sallyd` does: the CLI's host facts and the names in the secrets store at
+/// `store`, read through the same catalog type, only if the manifest names a secret (architect
+/// Q221). A store that cannot be read is a failure to read (2), never a missing name.
+fn validated(path: &Path, store: &Path, o: &mut Out<'_>) -> Result<Validated, u8> {
     let text = read_manifest(path).map_err(|e| {
         let msg = clean::line(&format!("{}: {e}", path.display())).text;
         let _ = writeln!(o.err, "sally: {msg}");
@@ -29,24 +30,28 @@ fn validated(path: &Path, o: &mut Out<'_>) -> Result<Validated, u8> {
         let _ = writeln!(o.err, "sally: {}", clean::line(&e.to_string()).text);
         EXIT_FAILED
     })?;
-    let none: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    load(&text, &env, &none).map_err(|r| rejected(&r, o))
+    let names = StoreNames::new(store.to_owned());
+    let verdict = load(&text, &env, &names);
+    if let Some(e) = names.failed() {
+        let _ = writeln!(o.err, "sally: {}", clean::line(&e.to_string()).text);
+        return Err(EXIT_FAILED);
+    }
+    verdict.map_err(|r| rejected(&r, o))
 }
 
-/// Prints every error and warning of a rejected manifest (checked) to `err`.
+/// Prints every error and warning of a rejected manifest (checked) to `err`. A missing secret's
+/// error names the `sally secrets set` line that stores it.
 fn rejected(r: &Rejected, o: &mut Out<'_>) -> u8 {
     for d in r.errors.iter().chain(&r.warnings) {
         let _ = writeln!(o.err, "{}", clean::line(&d.to_string()).text);
     }
-    if r.errors.iter().any(|d| d.code == Code::SecretMissing) {
-        let _ = writeln!(o.err, "{NOT_YET_USED}");
-    }
     EXIT_REFUSED
 }
 
-/// `sally manifest validate FILE`: 0 valid (warnings on `err`), 1 rejected, 2 unreadable.
-pub fn manifest_validate(path: &Path, o: &mut Out<'_>) -> u8 {
-    let v = match validated(path, o) {
+/// `sally manifest validate FILE`: 0 valid (warnings on `err`), 1 rejected, 2 unreadable (the
+/// manifest, or the secrets store at `store` when the manifest names a secret).
+pub fn manifest_validate(path: &Path, store: &Path, o: &mut Out<'_>) -> u8 {
+    let v = match validated(path, store, o) {
         Ok(v) => v,
         Err(code) => return code,
     };
@@ -58,9 +63,10 @@ pub fn manifest_validate(path: &Path, o: &mut Out<'_>) -> u8 {
     p.code()
 }
 
-/// `sally manifest summary FILE`: the plain-English summary of a valid manifest only.
-pub fn manifest_summary(path: &Path, o: &mut Out<'_>) -> u8 {
-    let v = match validated(path, o) {
+/// `sally manifest summary FILE`: the plain-English summary of a valid manifest only, validated
+/// against the secrets store at `store` as `manifest validate` is.
+pub fn manifest_summary(path: &Path, store: &Path, o: &mut Out<'_>) -> u8 {
+    let v = match validated(path, store, o) {
         Ok(v) => v,
         Err(code) => return code,
     };

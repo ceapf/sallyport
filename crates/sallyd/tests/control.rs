@@ -4,7 +4,6 @@
 //! live session is answered through `approvals.watch` / `approvals.decide`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,7 +51,8 @@ fn cx() -> Cx {
         hub,
         sessions_dir: Arc::new(sessions_dir),
         env: Arc::new(x.f.env.clone()),
-        catalog: Arc::new(BTreeSet::<String>::new()),
+        // The store the fixture's egress reads its values from (`common::egress::canary_store`).
+        secrets: Arc::new(x.f.root.join("egress-secrets/secrets.toml")),
         crash: sallyd::daemon::crash::CrashReporter::channel().0,
     }));
     Cx {

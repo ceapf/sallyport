@@ -21,7 +21,6 @@
 //! `runtime.timeout` + 300 s after its `podman init`. An inference container has no backstop
 //! and stays until the next start's orphan sweep, which also removes whatever else is left.
 
-use std::collections::BTreeSet;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -397,9 +396,9 @@ async fn serve(
         hub,
         sessions_dir: Arc::new(sessions_dir),
         env: Arc::new(env),
-        // Architect Q87: no secret store yet, so a manifest granting one is refused at
-        // validation (`manifest.refuse`). TODO(#99): the store's names.
-        catalog: Arc::new(BTreeSet::<String>::new()),
+        // The names a manifest may grant: read afresh for each validation (architect Q221),
+        // from the store `sally secrets` writes and the egress reads values from.
+        secrets: Arc::new(dirs.paths.secrets_file()),
         crash: crash.clone(),
     }))
     .listen(bind_control(lock)?, ids.uid, crash.clone());

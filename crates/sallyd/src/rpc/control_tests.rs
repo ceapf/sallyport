@@ -180,8 +180,28 @@ fn fx(tag: &str) -> Fx {
     fx_with(tag, BTreeSet::new())
 }
 
+/// The secrets store of a fixture under `root`, holding `names` (none: no file, an empty store),
+/// each with a value assembled at runtime.
+fn store_of(root: &Path, names: &BTreeSet<String>) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = root.join("secrets");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = dir.join("secrets.toml");
+    if !names.is_empty() {
+        let mut s = sally_core::secrets::SecretStore::empty(path.clone());
+        for n in names {
+            s.set(n, format!("sp-control-{n}-{}", "v".repeat(20)))
+                .unwrap();
+        }
+        s.save().unwrap();
+    }
+    path
+}
+
 fn fx_with(tag: &str, catalog: BTreeSet<String>) -> Fx {
     let scratch = Scratch::new(tag);
+    let secrets = store_of(&scratch.0, &catalog);
     let sessions_dir = crate::sandbox::open_sessions(&scratch.0.join("state")).unwrap();
     let (sink, record) = recorder("");
     let fake = Arc::new(Fake::default());
@@ -192,7 +212,7 @@ fn fx_with(tag: &str, catalog: BTreeSet<String>) -> Fx {
         hub: Arc::clone(&hub),
         sessions_dir: Arc::new(sessions_dir),
         env: Arc::new(env()),
-        catalog: Arc::new(catalog),
+        secrets: Arc::new(secrets),
         crash: crate::daemon::crash::CrashReporter::channel().0,
     }));
     Fx {
@@ -745,13 +765,28 @@ async fn a_valid_manifest_starts_a_session() {
     assert_eq!(f.events(), ["rpc.request"]);
 }
 
-/// Architect Q87: until #99 no secret name is known, so a grant is refused at validation; a
-/// catalog that names it lets the manifest through.
-#[tokio::test]
-async fn a_secret_grant_needs_the_name_in_the_catalog() {
-    let text = format!(
+/// A manifest granting `X_KEY` on `api.example.com`.
+fn granting() -> String {
+    format!(
         "{MANIFEST}network:\n  mode: proxy\n  allow:\n    - {{host: api.example.com, ports: [443]}}\nsecrets:\n  - {{name: X_KEY, inject: {{host: api.example.com, header: X-Key, format: \"{{value}}\"}}}}\n"
-    );
+    )
+}
+
+/// Writes text that is not a store over fixture `f`'s store file (0600, so only its parse fails).
+fn corrupt(f: &Fx) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = f.scratch.0.join("secrets/secrets.toml");
+    std::fs::write(&path, "X_KEY = \"sp-store-file-text\"\nnot a store\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    path
+}
+
+/// Architect Q221: a grant passes validation only when the store names it, and the store is
+/// read afresh for each `sessions.create` (no cached copy): a name stored after a refusal lets
+/// the next create through.
+#[tokio::test]
+async fn a_secret_grant_needs_the_name_in_the_store() {
+    let text = granting();
     let f = fx("secret-none");
     let r = f
         .connect()
@@ -759,6 +794,41 @@ async fn a_secret_grant_needs_the_name_in_the_catalog() {
         .await;
     assert_eq!(reason(&r), "manifest-invalid");
     assert_eq!(f.events(), ["rpc.request", "manifest.refuse"]);
+    store_of(&f.scratch.0, &std::iter::once("X_KEY".to_owned()).collect());
+    let r = f
+        .connect()
+        .call("sessions.create", json!({"manifest": text}))
+        .await;
+    assert_eq!(r["result"]["id"], json!("s-new"), "stored since: {r}");
+}
+
+/// Architect Q221: a store that cannot be read refuses a manifest naming a secret as a store
+/// fault (`session.refuse`, `secret-store`), whose detail names the file and never its text; a
+/// manifest naming no secret never opens the store and is still valid.
+#[tokio::test]
+async fn an_unreadable_store_refuses_a_grant_and_is_not_opened_without_one() {
+    let f = fx("secret-corrupt");
+    corrupt(&f);
+    let r = f
+        .connect()
+        .call("sessions.create", json!({"manifest": granting()}))
+        .await;
+    assert_eq!(reason(&r), "secret-store", "{r}");
+    let detail = r["error"]["data"]["detail"].as_str().unwrap();
+    assert!(detail.contains("secrets.toml"), "{detail}");
+    assert!(!detail.contains("sp-store-file-text"), "{detail}");
+    assert_eq!(f.events(), ["rpc.request", "session.refuse"]);
+    let r = f
+        .connect()
+        .call("sessions.create", json!({"manifest": MANIFEST}))
+        .await;
+    assert_eq!(r["result"]["id"], json!("s-new"), "no secret named: {r}");
+}
+
+/// The fixture's catalog lets a named grant through (the allow side of the tests above).
+#[tokio::test]
+async fn a_secret_grant_needs_the_name_in_the_catalog() {
+    let text = granting();
     let f = fx_with(
         "secret-named",
         std::iter::once("X_KEY".to_owned()).collect(),

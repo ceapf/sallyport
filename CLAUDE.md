@@ -88,7 +88,7 @@ container-free tests run: unit tests, all of sally-core's `tests/`, `sallyd` `ar
 - `make mutants` (deny paths): sally-core `manifest/validate/*.rs`, `manifest/paths.rs`,
   `manifest/host.rs`, `config.rs`.
 - `make mutants-wide-{core,sallyd,shim,cli}` (sharded): sally-core `manifest/{image,hostenv,parse,
-  summary,units}.rs`, `secrets/{store,secret}.rs`, `audit/{entry,redact,verify,writer,layout,tail}.rs`,
+  summary,units}.rs`, `secrets/{store,secret,names}.rs`, `audit/{entry,redact,verify,writer,layout,tail}.rs`,
   `fsutil.rs`, `fd.rs`, `text.rs`, `paths.rs`; sallyd `sandbox/{argv,check,types,profiles,overlap,scan,images,
   changes,cgroup,dirs,podman,binaries,disk,stage,budget,orphans}.rs`, `sandbox/launch/{error,parts}.rs`,
   `sandbox/oci/{mod,config,facts,intent,linux,mounts,process,seccomp}.rs`,

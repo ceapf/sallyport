@@ -162,7 +162,7 @@ fn value_errors_exit_2_only_when_nothing_could_be_read() {
 }
 
 #[test]
-fn set_stores_the_value_and_says_sessions_cannot_use_it_yet() {
+fn set_stores_the_value_quietly() {
     let s = Scratch::new("set");
     let secret = value(SHORT_SECRET_BYTES + 8);
     let given = secret.clone();
@@ -170,7 +170,7 @@ fn set_stores_the_value_and_says_sessions_cannot_use_it_yet() {
     let (code, out, err) = run(|o| set(&s.store(), "API_KEY", &mut read, o));
     assert_eq!(code, EXIT_OK);
     assert_eq!(out, "");
-    assert_eq!(err, format!("{NOT_YET_USED}\n"));
+    assert_eq!(err, "");
     let store = SecretStore::open(&s.store()).unwrap();
     assert_eq!(store.get("API_KEY").unwrap().expose(), &secret);
     assert!(s.0.join("secrets.lock").exists(), "set takes the lock");

@@ -191,7 +191,8 @@ async fn drive_over_control(r: &Rx, id: &str) -> Value {
         hub: Arc::new(Hub::default()),
         sessions_dir: Arc::new(sallyd::sandbox::open_sessions(&state).unwrap()),
         env: Arc::new(r.x.f.env.clone()),
-        catalog: Arc::new(std::collections::BTreeSet::<String>::new()),
+        // No store file: an empty store (these manifests grant no secret).
+        secrets: Arc::new(r.x.f.root.join("no-secrets/secrets.toml")),
         crash: sallyd::daemon::crash::CrashReporter::channel().0,
     }));
     let (client, server) = tokio::io::duplex(1 << 20);
