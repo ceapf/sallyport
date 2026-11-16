@@ -74,12 +74,19 @@ struct Script {
     at_attach: Vec<Value>,
     reply: Value,
     wait_for_eof: bool,
-    /// Inputs are answered `input-closed`, and the first is followed by the attach's reply.
-    input_closed: bool,
-    /// The stop is answered with a reply to an input first (as one sent late by stdin's thread).
-    late_input_reply: bool,
+    /// The connection ends after the attach's frames, with no reply.
+    close_at_attach: bool,
+    /// Inputs are refused for this reason, and the first is followed by the attach's reply.
+    input_refused: Option<&'static str>,
+    /// Frames sent before the stop's answer.
+    before_stop: Vec<Value>,
     /// The stop is refused `stop-failed`.
     stop_refused: bool,
+}
+
+/// A successful reply to request `id`.
+fn reply_to(id: i64) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "result": {}})
 }
 
 /// A refusal of request `id` for `reason`.
@@ -129,6 +136,9 @@ fn daemon(tag: &str, s: Script) -> Daemon {
                     for f in &s.at_attach {
                         send(f);
                     }
+                    if s.close_at_attach {
+                        break;
+                    }
                     if !s.wait_for_eof {
                         send(&json!({"jsonrpc": "2.0", "id": attach_id, "result": s.reply}));
                         attach_id = Value::Null;
@@ -138,8 +148,8 @@ fn daemon(tag: &str, s: Script) -> Daemon {
                 "sessions.input" if attach_id.is_null() => {
                     send(&refusal(&req["id"], "not-attached"));
                 }
-                "sessions.input" if s.input_closed => {
-                    send(&refusal(&req["id"], "input-closed"));
+                "sessions.input" if s.input_refused.is_some() => {
+                    send(&refusal(&req["id"], s.input_refused.unwrap_or_default()));
                     send(&json!({"jsonrpc": "2.0", "id": attach_id, "result": s.reply}));
                     attach_id = Value::Null;
                 }
@@ -153,8 +163,8 @@ fn daemon(tag: &str, s: Script) -> Daemon {
                     }
                 }
                 "sessions.stop" => {
-                    if s.late_input_reply {
-                        send(&refusal(&json!(INPUT_IDS + 7), "not-attached"));
+                    for f in &s.before_stop {
+                        send(f);
                     }
                     if s.stop_refused {
                         send(&refusal(&req["id"], "stop-failed"));
@@ -193,6 +203,11 @@ fn manifest(tag: &str) -> PathBuf {
 
 /// Runs `sandbox run` against `d` with `stdin`: the exit code, stdout, stderr.
 fn run(d: &Daemon, tag: &str, stdin: Vec<u8>) -> (u8, String, String) {
+    run_with(d, tag, Cursor::new(stdin))
+}
+
+/// [`run`] with any stdin.
+fn run_with(d: &Daemon, tag: &str, stdin: impl Read + Send + 'static) -> (u8, String, String) {
     let mut c = Client::connect(&d.path).unwrap();
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let mut o = Out {
@@ -201,7 +216,7 @@ fn run(d: &Daemon, tag: &str, stdin: Vec<u8>) -> (u8, String, String) {
     };
     let m = manifest(tag);
     let argv = vec!["sh".to_owned()];
-    let code = sandbox_run(&mut c, &m, &argv, Cursor::new(stdin), &mut o);
+    let code = sandbox_run(&mut c, &m, &argv, stdin, &mut o);
     drop(c);
     let _ = std::fs::remove_file(&m);
     (
@@ -331,12 +346,136 @@ fn a_late_input_reply_during_the_stop_is_passed_over() {
         "late",
         Script {
             reply: json!({"exit_code": 4}),
-            late_input_reply: true,
+            before_stop: vec![refusal(&json!(INPUT_IDS + 7), "not-attached")],
             ..Script::default()
         },
     );
     let (code, _, err) = run(&d, "late", Vec::new());
     assert_eq!((code, err.as_str()), (4, ""));
+}
+
+/// A reply to no request of the run, during the attach or the stop, fails it: only stdin's
+/// ids (from [`INPUT_IDS`]) are passed over.
+#[test]
+fn a_reply_to_no_request_fails_the_run() {
+    let d = daemon(
+        "stray-attach",
+        Script {
+            at_attach: vec![reply_to(INPUT_IDS - 1)],
+            reply: json!({"exit_code": 0}),
+            wait_for_eof: true,
+            ..Script::default()
+        },
+    );
+    let (code, _, err) = run(&d, "stray-attach", Vec::new());
+    assert_eq!(code, EXIT_FAILED);
+    assert_eq!(err, "sally: sallyd sent an unexpected frame\n");
+
+    let d = daemon(
+        "stray-stop",
+        Script {
+            reply: json!({"exit_code": 0}),
+            before_stop: vec![reply_to(INPUT_IDS - 1)],
+            ..Script::default()
+        },
+    );
+    let (code, _, err) = run(&d, "stray-stop", Vec::new());
+    assert_eq!(code, EXIT_REFUSED);
+    assert_eq!(err, "sally: sallyd sent an unexpected frame\n");
+}
+
+/// A connection that ends during the attach is said to have closed, never blamed on stdin.
+#[test]
+fn a_connection_closed_during_the_attach_is_said_so() {
+    let d = daemon(
+        "closed",
+        Script {
+            close_at_attach: true,
+            ..Script::default()
+        },
+    );
+    let (code, _, err) = run(&d, "closed", Vec::new());
+    assert_eq!(code, EXIT_FAILED);
+    assert_eq!(err, "sally: sallyd closed the connection\n");
+}
+
+/// An input refused for any reason but `input-closed` fails the run.
+#[test]
+fn an_input_refused_otherwise_fails_the_run() {
+    let d = daemon(
+        "input-pending",
+        Script {
+            reply: json!({"exit_code": 0}),
+            wait_for_eof: true,
+            input_refused: Some("input-pending"),
+            ..Script::default()
+        },
+    );
+    let (code, _, err) = run(&d, "input-pending", b"x\n".to_vec());
+    assert_eq!(code, EXIT_REFUSED);
+    assert_eq!(err, "sally: refused: input-pending\n");
+}
+
+/// Stdin as a list of reads: bytes, or an error of a kind.
+struct Reads(std::collections::VecDeque<Result<Vec<u8>, std::io::ErrorKind>>);
+
+impl Read for Reads {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self.0.pop_front() {
+            None => Ok(0),
+            Some(Err(kind)) => Err(kind.into()),
+            Some(Ok(bytes)) => {
+                buf[..bytes.len()].copy_from_slice(&bytes);
+                Ok(bytes.len())
+            }
+        }
+    }
+}
+
+/// The inputs a run sent, as `(data, eof)`.
+fn inputs(reqs: &[Value]) -> Vec<(String, bool)> {
+    reqs.iter()
+        .filter(|r| r["method"] == "sessions.input")
+        .map(|r| {
+            let p = &r["params"];
+            (p["data"].as_str().unwrap().to_owned(), p["eof"] == true)
+        })
+        .collect()
+}
+
+/// An interrupted read is tried again; any other read error ends stdin; a read that brings
+/// only part of a character sends nothing until the rest comes.
+#[test]
+fn stdin_reads_retry_an_interrupt_end_at_an_error_and_wait_for_whole_characters() {
+    use std::io::ErrorKind::{Interrupted, Other};
+    let e = "\u{e9}".as_bytes().to_vec();
+    let script = || Script {
+        reply: json!({"exit_code": 0}),
+        wait_for_eof: true,
+        ..Script::default()
+    };
+    let mut d = daemon("reads", script());
+    let reads = Reads(
+        [
+            Err(Interrupted),
+            Ok(b"a".to_vec()),
+            Ok(e[..1].to_vec()),
+            Ok(e[1..].to_vec()),
+            Err(Other),
+            Ok(b"never".to_vec()),
+        ]
+        .into(),
+    );
+    // (The fake echoes the input as output, unescaped: only what was sent counts here.)
+    let _ = run_with(&d, "reads", reads);
+    assert_eq!(
+        inputs(&d.requests()),
+        [
+            ("a".to_owned(), false),
+            ("\u{e9}".to_owned(), false),
+            (String::new(), true)
+        ]
+    );
 }
 
 /// Architect Q147: `input-closed` stops stdin's inputs; the run goes on to the attach's reply.
@@ -347,7 +486,7 @@ fn input_closed_stops_the_inputs_and_the_run_goes_on() {
         Script {
             reply: json!({"exit_code": 5}),
             wait_for_eof: true,
-            input_closed: true,
+            input_refused: Some("input-closed"),
             ..Script::default()
         },
     );

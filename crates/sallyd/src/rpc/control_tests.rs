@@ -45,6 +45,10 @@ struct Fake {
     lines: StdMutex<std::collections::HashMap<String, Arc<Line<Arc<FakeExec>>>>>,
     /// The sessions stopped because their bound connection closed.
     disconnected: StdMutex<Vec<String>>,
+    /// The session logs of the sessions with a line mode, by id.
+    logs: StdMutex<std::collections::HashMap<String, Arc<Sink>>>,
+    /// For each bound stop, the events its session's log held when the stop began.
+    stop_saw: StdMutex<Vec<Vec<String>>>,
 }
 
 fn info(id: &str) -> SessionInfo {
@@ -72,6 +76,9 @@ impl SessionSet for Arc<Fake> {
         let known = self.live.lock().unwrap().iter().any(|(i, _)| i.id == id);
         let r = known.then(|| {
             self.disconnected.lock().unwrap().push(id.to_owned());
+            if let Some(log) = self.logs.lock().unwrap().get(id) {
+                self.stop_saw.lock().unwrap().push(log.events());
+            }
             match self.stop_fails.lock().unwrap().clone() {
                 Some(why) => StopOutcome::Failed(why),
                 None => StopOutcome::Stopped,

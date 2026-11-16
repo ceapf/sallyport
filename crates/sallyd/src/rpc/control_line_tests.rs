@@ -22,6 +22,11 @@ fn lined(f: &Fx, id: &str, mode: Mode) -> (Arc<Sink>, Arc<FakeExec>, Ops) {
         cwd: "/workspace".into(),
     });
     f.fake.lines.lock().unwrap().insert(id.to_owned(), line);
+    f.fake
+        .logs
+        .lock()
+        .unwrap()
+        .insert(id.to_owned(), Arc::clone(&sink));
     (sink, exec, ops)
 }
 
@@ -132,11 +137,12 @@ async fn an_attached_connection_is_served_input_only() {
     let (_, exec, _) = lined(&f, "s-1", Mode::Deaf);
     let mut w = f.connect();
     w.send("sessions.attach", attach("s-1", &["sh"])).await;
-    for (method, params) in [
-        ("sessions.list", json!({})),
-        ("approvals.watch", json!({})),
-        ("sessions.attach", attach("s-1", &["sh"])),
-        ("sessions.stop", json!({"id": "s-1"})),
+    // The refusal names the session a call names, and none for one that names none.
+    for (method, params, named) in [
+        ("sessions.list", json!({}), None),
+        ("approvals.watch", json!({}), None),
+        ("sessions.attach", attach("s-2", &["sh"]), Some("s-2")),
+        ("sessions.stop", json!({"id": "s-1"}), Some("s-1")),
     ] {
         let r = w.call(method, params).await;
         assert_eq!(reason(&r), "attached", "{method}");
@@ -145,6 +151,7 @@ async fn an_attached_connection_is_served_input_only() {
             (last["method"].as_str(), last["reason"].as_str()),
             (Some(method), Some("attached"))
         );
+        assert_eq!(last["id"].as_str(), named, "{method}");
     }
     assert!(f.fake.stopped.lock().unwrap().is_empty());
     exec.release.notify_one();
@@ -370,6 +377,25 @@ async fn a_reader_paused_past_the_write_timeout_gets_the_command_killed() {
     w.task.await.unwrap();
 }
 
+/// Architect Q144, Q152: output and an input still held when the command's end comes are
+/// sent first, in that order: the output, then the input's answer (`input-closed`, it was
+/// never written), then the reply.
+#[tokio::test]
+async fn what_outlives_the_command_comes_before_its_reply() {
+    let f = fx("line-late");
+    lined(&f, "s-1", Mode::Late);
+    let mut w = f.connect();
+    w.send("sessions.attach", attach("s-1", &["sh"])).await;
+    w.send("sessions.input", json!({"id": "s-1", "data": "x"}))
+        .await;
+    let (notes, ack) = until_reply(&mut w, 2).await;
+    assert_eq!(texts(&notes), "late\n");
+    assert_eq!(reason(&ack), "input-closed");
+    let (rest, reply) = until_reply(&mut w, 1).await;
+    assert!(rest.is_empty(), "{rest:?}");
+    assert_eq!(reply["result"], json!({"exit_code": 0}));
+}
+
 /// Architect Q144: all output comes before the reply, in order.
 #[tokio::test]
 async fn all_output_comes_before_the_reply() {
@@ -412,6 +438,12 @@ async fn a_bound_session_stops_with_its_connection() {
     eventually(|| !f.fake.disconnected.lock().unwrap().is_empty()).await;
     assert_eq!(*f.fake.disconnected.lock().unwrap(), ["s-new"]);
     assert_eq!(sink.last("sandbox.exec_result")["killed"], "disconnect");
+    // The attach ended, its result written, before the bound stop began.
+    assert_eq!(
+        *f.fake.stop_saw.lock().unwrap(),
+        [["sandbox.exec", "sandbox.exec_result"]]
+    );
+    assert_eq!(format!("{:?}", f.control.bind("s-x")), "Bound { .. }");
 
     let mut free = f.connect();
     let r = free

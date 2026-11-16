@@ -125,6 +125,10 @@ pub enum Mode {
     /// Prints 1 KiB lines until its connection is gone (`killed: disconnect`); a full queue
     /// never delays that, as with the real runner.
     Flood,
+    /// Takes one input and exits 0 at once, while its output and that input are still held
+    /// for a moment (as by a reader or stdin writer not yet ended): `late\n` follows the exit
+    /// and the input is never written.
+    Late,
     /// `podman exec` could not be run.
     Fail,
 }
@@ -185,10 +189,20 @@ impl Streamer for Arc<FakeExec> {
                 ran(Status::Exited(0), n, n)
             }
             Mode::Deaf => {
-                tokio::select! {
-                    _ = io.disconnect.wait_for(|g| *g) => ran(Status::Killed(DISCONNECT), 0, 0),
-                    () = self.release.notified() => ran(Status::Exited(0), 0, 0),
+                let gone = tokio::select! {
+                    r = io.disconnect.wait_for(|g| *g) => {
+                        drop(r);
+                        true
+                    }
+                    () = self.release.notified() => false,
+                };
+                if !gone {
+                    return ran(Status::Exited(0), 0, 0);
                 }
+                // A kill takes a moment, so a caller that does not wait for the result sees
+                // it late.
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                ran(Status::Killed(DISCONNECT), 0, 0)
             }
             Mode::Lines(n) => {
                 for i in 0..n {
@@ -216,6 +230,16 @@ impl Streamer for Arc<FakeExec> {
                         }
                     }
                 }
+            }
+            Mode::Late => {
+                let input = io.input.recv().await;
+                let output = io.output;
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    let _ = output.send(say("late\n".into())).await;
+                    drop(input);
+                });
+                ran(Status::Exited(0), 0, 0)
             }
             Mode::Fail => ran(Status::Failed("podman exec: gone".into()), 0, 0),
         }
