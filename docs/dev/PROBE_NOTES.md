@@ -48,6 +48,9 @@ line per fact, with where it was found. Check a note again before relying on it 
   `/etc/…` then `/usr/share/…`; the private `HOME` alone leaves the system files live. (D)
   `podman --default-mounts-file <empty> init <id>`: no `mounts.conf` touched, no mount. Init
   also stats `/etc/system-fips` (FIPS subscription), which the flag does not switch off (#121).
+- `podman exec -i` without `-t` applies no detach keys: stdin `a\020\021b\n` (Ctrl-P Ctrl-Q)
+  reached `cat` whole and the command ran to its end, with and without `--detach-keys=`; the
+  attach passes `--detach-keys=` anyway. (Task 12 PR C3, line mode)
 - strace `-f` on `podman init` never returns: it follows conmon after it daemonizes. `-b execve`
   detaches exec'd children. `sallyd` is not dumpable, so strace cannot read the envp of the
   `execve` calls it makes; podman is dumpable after exec, so `-e inject=execve:delay_exit=<µs>`

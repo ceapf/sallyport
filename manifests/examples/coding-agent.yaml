@@ -17,7 +17,10 @@ name: coding-agent
 description: Edits ~/code/myproject, installs from PyPI, talks to the GitHub API with your token, runs shell with approval.
 
 runtime:
-  image: ghcr.io/ceapf/sallyport-workspace-python@sha256:0000000000000000000000000000000000000000000000000000000000000000  # replace with the built digest
+  # The digest is a placeholder until a bundled workspace image exists (#88): no image is
+  # published under this name yet. To run this manifest now, name an image you have by digest;
+  # docs/dev/TRY_IT.md §2 shows the developer test image.
+  image: ghcr.io/ceapf/sallyport-workspace-python@sha256:0000000000000000000000000000000000000000000000000000000000000000
   cpus: 6
   memory: 12GiB
   pids: 1024

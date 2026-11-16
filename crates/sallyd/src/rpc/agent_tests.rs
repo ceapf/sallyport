@@ -302,7 +302,7 @@ async fn rt_ag_06_control_methods_on_agent_sock_are_not_found() {
         "audit.tail",
         "audit.note",
     ]);
-    assert_eq!(methods.len(), 13);
+    assert_eq!(methods.len(), 15);
     for (i, m) in (0..).zip(methods.iter().copied()) {
         for msg in [
             req(i, m, json!({"name": "x", "value": "y"})),

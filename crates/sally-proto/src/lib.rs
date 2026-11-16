@@ -24,6 +24,15 @@ pub const MAX_SCRIPT_BYTES: usize = 256 * 1024;
 /// turn, then one `end` step.
 pub const MAX_TURNS: usize = 1024;
 
+/// Strings of an attach's argv at most (architect Q101); at least one.
+pub const MAX_ARGV: usize = 256;
+
+/// Bytes of one `sessions.input` at most (architect Q101).
+pub const MAX_INPUT_BYTES: usize = 64 * 1024;
+
+/// Bytes of sandbox output, before escaping, in one `session.output` at most (architect Q101).
+pub const MAX_OUTPUT_CHUNK: usize = 16 * 1024;
+
 /// The control methods, exactly what `control.sock` serves (architect Q72).
 pub mod method {
     /// Start a session from a manifest's text.
@@ -36,6 +45,10 @@ pub mod method {
     pub const SESSIONS_CHANGES: &str = "sessions.changes";
     /// Run the next scripted turn of a driven session.
     pub const SESSIONS_DRIVE: &str = "sessions.drive";
+    /// Run a command in a session's workspace, its output streamed to this connection.
+    pub const SESSIONS_ATTACH: &str = "sessions.attach";
+    /// Write to the standard input of this connection's attached command.
+    pub const SESSIONS_INPUT: &str = "sessions.input";
     /// The prompts waiting for an answer.
     pub const APPROVALS_LIST: &str = "approvals.list";
     /// Answer one prompt.
@@ -43,20 +56,24 @@ pub mod method {
     /// Attach this connection as an approver.
     pub const APPROVALS_WATCH: &str = "approvals.watch";
     /// Every method, in the order above.
-    pub const ALL: [&str; 8] = [
+    pub const ALL: [&str; 10] = [
         SESSIONS_CREATE,
         SESSIONS_LIST,
         SESSIONS_STOP,
         SESSIONS_CHANGES,
         SESSIONS_DRIVE,
+        SESSIONS_ATTACH,
+        SESSIONS_INPUT,
         APPROVALS_LIST,
         APPROVALS_DECIDE,
         APPROVALS_WATCH,
     ];
 }
 
-/// The notifications a watching connection receives.
+/// The notifications a watching or attached connection receives.
 pub mod notification {
+    /// Output of the attached command: params [`Output`](super::Output).
+    pub const SESSION_OUTPUT: &str = "session.output";
     /// A prompt is waiting: params [`Prompt`](super::Prompt).
     pub const APPROVAL_REQUESTED: &str = "approval.requested";
     /// A session started a flood episode: params [`Flood`](super::Flood).
@@ -74,6 +91,93 @@ pub struct CreateParams {
     /// The session's model; absent means none (architect Q119).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelParams>,
+    /// What the session lives as long as; absent: until it is stopped (architect Q102).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifetime: Option<Lifetime>,
+}
+
+/// A session's lifetime other than the default one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Lifetime {
+    /// Stopped (reason `disconnect`) when the connection that created it closes.
+    Connection,
+}
+
+/// `sessions.attach` params (architect Q101).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttachParams {
+    /// The session.
+    pub id: String,
+    /// The command and its arguments: 1 to [`MAX_ARGV`] strings, none with a NUL.
+    pub argv: Vec<String>,
+    /// The guest working directory; absent: the shell tool's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+/// `sessions.input` params (architect Q101).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputParams {
+    /// The session.
+    pub id: String,
+    /// Bytes for the command's standard input, at most [`MAX_INPUT_BYTES`].
+    pub data: String,
+    /// The input ends after `data`.
+    #[serde(default)]
+    pub eof: bool,
+}
+
+/// Why `sallyd` killed an attached command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KillReason {
+    /// The session stopped.
+    SessionStop,
+    /// The attached connection closed.
+    Disconnect,
+    /// The started process was not found in time.
+    StartTimeout,
+}
+
+/// `sessions.attach` result: sent once both output streams are drained (architect Q101).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum Attached {
+    /// The command ended: `podman exec`'s code (128+N for a signal).
+    Exited {
+        /// The exit code.
+        exit_code: i32,
+    },
+    /// `sallyd` killed it.
+    Killed {
+        /// Why.
+        killed: KillReason,
+    },
+}
+
+/// Which output stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Stream {
+    /// Standard output.
+    Stdout,
+    /// Standard error.
+    Stderr,
+}
+
+/// `session.output` params: at most [`MAX_OUTPUT_CHUNK`] bytes of one stream, escaped by
+/// `sallyd` to printable ASCII and newline (architect Q100).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Output {
+    /// The session.
+    pub id: String,
+    /// The stream.
+    pub stream: Stream,
+    /// The escaped text.
+    pub text: String,
 }
 
 /// The kinds of model a session can have.
@@ -462,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    fn the_method_list_is_the_eight_names() {
+    fn the_method_list_is_the_ten_names() {
         assert_eq!(
             method::ALL,
             [
@@ -471,6 +575,8 @@ mod tests {
                 "sessions.stop",
                 "sessions.changes",
                 "sessions.drive",
+                "sessions.attach",
+                "sessions.input",
                 "approvals.list",
                 "approvals.decide",
                 "approvals.watch",
@@ -521,6 +627,97 @@ mod tests {
             to_value(&s).unwrap(),
             json!({"kind": "scripted", "driven": true, "sha256": "ab", "turns": 3})
         );
+    }
+
+    /// Architect Q101: attach takes an argv of 1–256 strings and an optional cwd, strictly.
+    #[test]
+    fn attach_params_are_strict() {
+        let p: AttachParams = from_value(json!({"id": "a", "argv": ["sh"]})).unwrap();
+        assert_eq!(p.argv, ["sh"]);
+        assert_eq!(p.cwd, None);
+        let p: AttachParams =
+            from_value(json!({"id": "a", "argv": ["ls", "-l"], "cwd": "/workspace"})).unwrap();
+        assert_eq!(p.cwd.as_deref(), Some("/workspace"));
+        for bad in [
+            json!({"id": "a"}),
+            json!({"id": "a", "argv": "sh"}),
+            json!({"id": "a", "argv": ["sh"], "env": {}}),
+            json!({"argv": ["sh"]}),
+        ] {
+            assert!(from_value::<AttachParams>(bad).is_err());
+        }
+    }
+
+    /// Architect Q101: input is data with an optional end of input, strictly.
+    #[test]
+    fn input_params_are_strict() {
+        let p: InputParams = from_value(json!({"id": "a", "data": "ls\n"})).unwrap();
+        assert_eq!(p.data, "ls\n");
+        assert!(!p.eof);
+        let p: InputParams = from_value(json!({"id": "a", "data": "", "eof": true})).unwrap();
+        assert!(p.eof);
+        assert!(from_value::<InputParams>(json!({"id": "a"})).is_err());
+        assert!(from_value::<InputParams>(json!({"id": "a", "data": "", "x": 1})).is_err());
+    }
+
+    /// Architect Q101: an attach ends with the exit code or why it was killed, never both.
+    #[test]
+    fn an_attach_result_in_wire_form() {
+        let code = Attached::Exited { exit_code: 3 };
+        assert_eq!(to_value(&code).unwrap(), json!({"exit_code": 3}));
+        let killed = Attached::Killed {
+            killed: KillReason::Disconnect,
+        };
+        assert_eq!(to_value(&killed).unwrap(), json!({"killed": "disconnect"}));
+        for (r, s) in [
+            (KillReason::SessionStop, "session-stop"),
+            (KillReason::Disconnect, "disconnect"),
+            (KillReason::StartTimeout, "start-timeout"),
+        ] {
+            assert_eq!(to_value(r).unwrap(), json!(s));
+            assert_eq!(from_value::<KillReason>(json!(s)).unwrap(), r);
+        }
+        assert_eq!(
+            from_value::<Attached>(json!({"exit_code": 0})).unwrap(),
+            Attached::Exited { exit_code: 0 }
+        );
+        assert!(from_value::<Attached>(json!({"killed": "timeout"})).is_err());
+    }
+
+    /// Architect Q101: one output notification names its stream.
+    #[test]
+    fn an_output_notification_in_wire_form() {
+        let o = Output {
+            id: "s1".into(),
+            stream: Stream::Stderr,
+            text: "a\\x1bb".into(),
+        };
+        assert_eq!(
+            to_value(&o).unwrap(),
+            json!({"id": "s1", "stream": "stderr", "text": "a\\x1bb"})
+        );
+        assert_eq!(notification::SESSION_OUTPUT, "session.output");
+    }
+
+    /// Architect Q102: a session bound to its connection says so; absent is today's.
+    #[test]
+    fn create_params_take_a_connection_lifetime() {
+        let bare: CreateParams = from_value(json!({"manifest": "x"})).unwrap();
+        assert_eq!(bare.lifetime, None);
+        assert!(to_value(&bare).unwrap().get("lifetime").is_none());
+        let bound: CreateParams =
+            from_value(json!({"manifest": "x", "lifetime": "connection"})).unwrap();
+        assert_eq!(bound.lifetime, Some(Lifetime::Connection));
+        assert!(
+            from_value::<CreateParams>(json!({"manifest": "x", "lifetime": "forever"})).is_err()
+        );
+    }
+
+    #[test]
+    fn the_line_mode_bounds_are_the_ruled_numbers() {
+        assert_eq!(MAX_ARGV, 256);
+        assert_eq!(MAX_INPUT_BYTES, 64 * 1024);
+        assert_eq!(MAX_OUTPUT_CHUNK, 16 * 1024);
     }
 
     #[test]

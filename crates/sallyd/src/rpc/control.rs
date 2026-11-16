@@ -28,6 +28,7 @@ use tokio::net::UnixStream;
 use tokio::sync::watch;
 
 use super::agent::{WRITE_TIMEOUT, error_object, failure, line, success};
+use super::control_line::{Attachment, Bound, Event};
 use super::control_methods::{
     Call, Done, NotAdmitted, READ_BURST, READ_RATE, REFUSED, SessionSet, prompt, value,
 };
@@ -40,6 +41,7 @@ use super::record::{Recorder, escape};
 use crate::approvals::Client;
 use crate::approvals::hub::{Hub, Note, Watch};
 use crate::approvals::queue::who;
+use crate::daemon::crash::CrashReporter;
 
 pub use super::mcp::CONTROL_METHODS;
 
@@ -62,6 +64,9 @@ pub struct ControlParts<S> {
     pub env: Arc<HostEnv>,
     /// The secret names a manifest may grant. TODO(#99): the store's names; until then none.
     pub catalog: Arc<dyn SecretCatalog + Send + Sync>,
+    /// The daemon's crash reporter: the stop of a session whose bound connection closed runs
+    /// in a task of the daemon's (architect Q150).
+    pub crash: CrashReporter,
 }
 
 /// The control socket's server.
@@ -82,6 +87,11 @@ pub(crate) struct Conn {
     /// connection, which makes each seat gone (architect Q121). A connection with a seat is
     /// never an approver.
     pub(crate) seats: Vec<Seat>,
+    /// The command it attached, while it runs (architect Q144).
+    pub(crate) attach: Option<Attachment>,
+    /// The sessions it created bound to it (`lifetime: "connection"`), stopped when it ends.
+    /// Declared last: dropped after the attach.
+    pub(crate) bound: Vec<Bound>,
 }
 
 impl Conn {
@@ -123,16 +133,14 @@ impl<S: SessionSet> Control<S> {
         listen::spawn(listener, self, MAX_CONNECTIONS, uid, "control.sock", crash)
     }
 
-    /// Serves one stream of `peer` to its end.
+    /// Serves one stream of `peer` to its end. Then a command it attached is killed
+    /// (`disconnect`) and its end awaited, and only then are the sessions bound to it stopped
+    /// (architect Q150); a dropped future kills and stops the same way, unawaited.
     pub async fn serve_stream<T: AsyncRead + AsyncWrite + Send + 'static>(
         self: Arc<Self>,
         stream: T,
         peer: Peer,
     ) {
-        let (r, mut w) = tokio::io::split(stream);
-        let mut reader = BufReader::new(r);
-        let stopped = until_true(self.stop.subscribe());
-        tokio::pin!(stopped);
         let mut conn = Conn {
             client: Client {
                 uid: peer.uid,
@@ -140,9 +148,27 @@ impl<S: SessionSet> Control<S> {
             },
             watch: None,
             seats: Vec::new(),
+            attach: None,
+            bound: Vec::new(),
         };
+        self.serve_conn(stream, &mut conn).await;
+        if let Some(a) = conn.attach.take() {
+            a.disconnect().await;
+        }
+    }
+
+    async fn serve_conn<T: AsyncRead + AsyncWrite + Send + 'static>(
+        &self,
+        stream: T,
+        conn: &mut Conn,
+    ) {
+        let (r, mut w) = tokio::io::split(stream);
+        let mut reader = BufReader::new(r);
+        let stopped = until_true(self.stop.subscribe());
+        tokio::pin!(stopped);
         loop {
-            // One read per frame, kept across notifications: it is not cancel-safe.
+            // One read per frame, kept across notifications and an attach's output: it is not
+            // cancel-safe.
             let frame = {
                 let read = frame::read(&mut reader, MAX_FRAME);
                 tokio::pin!(read);
@@ -158,11 +184,16 @@ impl<S: SessionSet> Control<S> {
                                 return;
                             }
                         }
+                        event = next_event(&mut conn.attach) => {
+                            if !self.on_event(event, conn, &mut w).await {
+                                return;
+                            }
+                        }
                     }
                 }
             };
             let reply = match frame {
-                Ok(Frame::Line(l)) => match self.handle(&l, &mut conn, &mut reader).await {
+                Ok(Frame::Line(l)) => match self.handle(&l, conn, &mut reader).await {
                     Some(reply) => reply,
                     None => break,
                 },
@@ -234,16 +265,18 @@ impl<S: SessionSet> Control<S> {
         let done = if matches!(call, Call::Drive(_)) {
             tokio::select! {
                 biased;
-                d = self.run(call, conn) => d,
+                d = self.run(call, conn, &id) => d,
                 () = closed(reader) => Done::Close,
             }
         } else {
-            self.run(call, conn).await
+            self.run(call, conn, &id).await
         };
         match done {
             Done::Ok(result) => Some(success(&id, result)),
             Done::Refused(data) => Some(refused(&id, &data)),
             Done::Close => None,
+            // The serve loop answers it later.
+            Done::Deferred => Some(Vec::new()),
         }
     }
 
@@ -325,6 +358,14 @@ async fn next_note(watch: &mut Option<Watch>) -> Option<Note> {
     }
 }
 
+/// What an attached connection sends next; never, for one that is not attached.
+async fn next_event(attach: &mut Option<Attachment>) -> Event {
+    match attach {
+        Some(a) => a.next().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Returns when `reader`'s peer closed (end of stream, a half-close included, or a read error);
 /// never while bytes wait unread: those are a next request, kept in the buffer for it, and a
 /// close behind them is seen at the next frame's read (a prompt the step waits on meanwhile
@@ -355,7 +396,7 @@ pub(crate) fn notify(note: &Note) -> Vec<u8> {
 }
 
 /// A refusal reply, its `data` the shared [`ErrorData`](sally_proto::ErrorData).
-fn refused(id: &Id, data: &sally_proto::ErrorData) -> Vec<u8> {
+pub(crate) fn refused(id: &Id, data: &sally_proto::ErrorData) -> Vec<u8> {
     let data = value(data);
     failure(
         Some(id),
@@ -363,8 +404,9 @@ fn refused(id: &Id, data: &sally_proto::ErrorData) -> Vec<u8> {
     )
 }
 
-/// Writes one frame within [`WRITE_TIMEOUT`]; whether it was written.
-async fn write<W: AsyncWrite + Unpin>(w: &mut W, line: &[u8]) -> bool {
+/// Writes one frame within [`WRITE_TIMEOUT`]; whether it was written. A write that fails or
+/// times out closes the connection (for an attach: `disconnect`).
+pub(crate) async fn write<W: AsyncWrite + Unpin>(w: &mut W, line: &[u8]) -> bool {
     matches!(
         tokio::time::timeout(WRITE_TIMEOUT, w.write_all(line)).await,
         Ok(Ok(()))

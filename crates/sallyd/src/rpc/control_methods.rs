@@ -16,21 +16,26 @@ use sally_proto::ModelKind;
 use sally_proto::method;
 use sally_proto::{
     Change as WireChange, ChangeKind as WireKind, Changes, CreateParams, DecideParams,
-    Decision as WireDecision, ErrorData, NoParams, Prompt as WirePrompt, Prompts, Session,
-    SessionParams, SessionState as WireState, Sessions, Stopped,
+    Decision as WireDecision, ErrorData, Lifetime, NoParams, Prompt as WirePrompt, Prompts,
+    Session, SessionParams, SessionState as WireState, Sessions, Stopped,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 
+use super::attach::{self, Asked, ConnState};
+pub use super::attach::{AttachCall, InputCall};
 use super::control::{Conn, Control};
 use super::drive::{Driver, Stepped};
+use super::line::Line;
+use super::message::Id;
 use crate::approvals::queue::who;
 use crate::approvals::render::{self, Prompt};
 use crate::approvals::{Client, Decision, Desk, Seen};
 use crate::llm::scripted::Script;
 use crate::sandbox::{Change, ChangeKind, ChangesError, LaunchError, SessionId, session_changes};
 use crate::session::{SessionInfo, SessionState, StartError, StopOutcome};
+use crate::tools::shell::Streamer;
 
 /// `sessions.list`, `sessions.changes` and `approvals.list` per second, daemon-wide (architect
 /// Q77). Tunable: high enough for a UI refreshing a few views, low enough that a loop of them
@@ -54,9 +59,16 @@ pub const REFUSED: i64 = -32000;
 /// The sessions the control socket acts on: the daemon's [`Registry`](crate::session::Registry)
 /// (its implementation is pure delegation), or a test double. Sessions need containers, so
 /// this seam keeps the methods unit-testable (architect Q86).
-pub trait SessionSet: Send + Sync + 'static {
+pub trait SessionSet: Clone + Send + Sync + 'static {
+    /// The runner of an attached command.
+    type Exec: Streamer;
     /// The live sessions, by id.
     fn list(&self) -> Vec<SessionInfo>;
+    /// Session `id`'s line mode (architect Q101).
+    fn line(&self, id: &str) -> Option<Arc<Line<Self::Exec>>>;
+    /// Stops session `id` because the connection it was bound to closed (architect Q102,
+    /// Q150): reason `disconnect`; `None`: no such session (already stopped).
+    fn stop_disconnected(&self, id: &str) -> impl Future<Output = Option<StopOutcome>> + Send;
     /// Session `id`'s approvals desk.
     fn desk(&self, id: &str) -> Option<Desk>;
     /// Session `id`'s drive handle: only a session declared driven at start has one.
@@ -86,6 +98,10 @@ pub enum Call {
     /// `sessions.drive`, its id already canonical. It carries nothing else: the script held by
     /// `sallyd` is the only source of a driven call (architect Q117).
     Drive(SessionId),
+    /// `sessions.attach` ([`AttachCall::admit`]).
+    Attach(AttachCall),
+    /// `sessions.input` ([`InputCall::admit`]).
+    Input(InputCall),
     /// `approvals.list`.
     Approvals,
     /// `approvals.decide`.
@@ -116,6 +132,8 @@ impl Call {
             method::SESSIONS_STOP => Ok(Self::Stop(session_id(params)?)),
             method::SESSIONS_CHANGES => Ok(Self::Changes(session_id(params)?)),
             method::SESSIONS_DRIVE => Ok(Self::Drive(session_id(params)?)),
+            method::SESSIONS_ATTACH => AttachCall::admit(params_of(params)?).map(Self::Attach),
+            method::SESSIONS_INPUT => InputCall::admit(params_of(params)?).map(Self::Input),
             method::APPROVALS_LIST => params_of::<NoParams>(params).map(|_| Self::Approvals),
             method::APPROVALS_DECIDE => Ok(Self::Decide(params_of(params)?)),
             method::APPROVALS_WATCH => params_of::<NoParams>(params).map(|_| Self::Watch),
@@ -132,6 +150,8 @@ impl Call {
             Self::Stop(_) => method::SESSIONS_STOP,
             Self::Changes(_) => method::SESSIONS_CHANGES,
             Self::Drive(_) => method::SESSIONS_DRIVE,
+            Self::Attach(_) => method::SESSIONS_ATTACH,
+            Self::Input(_) => method::SESSIONS_INPUT,
             Self::Approvals => method::APPROVALS_LIST,
             Self::Decide(_) => method::APPROVALS_DECIDE,
             Self::Watch => method::APPROVALS_WATCH,
@@ -140,12 +160,44 @@ impl Call {
 
     /// Whether it draws on the daemon-wide read rate (architect Q77): the reads, and a watch on
     /// a connection that already `watching`, which only lists again (Q94). A first watch never
-    /// waits, so attaching an approver is never delayed.
+    /// waits, so attaching an approver is never delayed. TODO(#142): refusals of the unrated
+    /// methods are entries too, with no rate.
     pub(crate) fn rated(&self, watching: bool) -> bool {
         match self {
             Self::List | Self::Changes(_) | Self::Approvals => true,
             Self::Watch => watching,
-            Self::Create(_) | Self::Stop(_) | Self::Decide(_) | Self::Drive(_) => false,
+            Self::Create(_)
+            | Self::Stop(_)
+            | Self::Decide(_)
+            | Self::Drive(_)
+            | Self::Attach(_)
+            | Self::Input(_) => false,
+        }
+    }
+
+    /// The method as the connection-state gate sees it (architect Q144).
+    pub(crate) fn asked(&self) -> Asked {
+        match self {
+            Self::Attach(_) => Asked::Attach,
+            Self::Input(_) => Asked::Input,
+            Self::Create(_)
+            | Self::List
+            | Self::Stop(_)
+            | Self::Changes(_)
+            | Self::Drive(_)
+            | Self::Approvals
+            | Self::Decide(_)
+            | Self::Watch => Asked::Other,
+        }
+    }
+
+    /// The session id the call names, for a refusal's entry.
+    fn id(&self) -> Option<&SessionId> {
+        match self {
+            Self::Stop(id) | Self::Changes(id) | Self::Drive(id) => Some(id),
+            Self::Attach(a) => Some(&a.id),
+            Self::Input(i) => Some(&i.id),
+            Self::Create(_) | Self::List | Self::Approvals | Self::Decide(_) | Self::Watch => None,
         }
     }
 
@@ -169,9 +221,22 @@ impl Call {
                     m.insert("script_bytes".into(), Value::from(model.script.len()));
                     m.insert("script_sha256".into(), Value::from(sha));
                 }
+                if let Some(l) = p.lifetime {
+                    m.insert("lifetime".into(), json!(l));
+                }
             }
             Self::Stop(id) | Self::Changes(id) | Self::Drive(id) => {
                 m.insert("id".into(), Value::from(id.as_str()));
+            }
+            // The command is `sandbox.exec`'s, in the session's log.
+            Self::Attach(a) => {
+                m.insert("id".into(), Value::from(a.id.as_str()));
+            }
+            // Its size and whether it ends the input, never its bytes (architect Q147).
+            Self::Input(i) => {
+                m.insert("id".into(), Value::from(i.id.as_str()));
+                m.insert("bytes".into(), Value::from(i.data.len()));
+                m.insert("eof".into(), Value::from(i.eof));
             }
             Self::List | Self::Approvals | Self::Decide(_) | Self::Watch => {}
         }
@@ -197,16 +262,28 @@ pub(crate) enum Done {
     Refused(ErrorData),
     /// An entry could not be written: no effect, no reply, the connection closes.
     Close,
+    /// Answered later by the serve loop: an attach when its command ended, an input once it was
+    /// written (architect Q144).
+    Deferred,
 }
 
 impl<S: SessionSet> Control<S> {
-    /// Runs one admitted call (its `rpc.request` is written).
-    pub(crate) async fn run(&self, call: Call, conn: &mut Conn) -> Done {
+    /// Runs one admitted call (its `rpc.request` is written); `id` is its request id, for a
+    /// reply the serve loop sends later.
+    pub(crate) async fn run(&self, call: Call, conn: &mut Conn, id: &Id) -> Done {
         // Seats of sessions that stopped are let go: they drive nothing, and a connection that
         // only holds those is no driver (Q121's refusals are for a live seat).
         conn.seats.retain(|s| !s.ended());
+        let state = ConnState::of(conn.watch.is_some(), conn.drives(), conn.attach.is_some());
+        if let Err(why) = attach::gate(state, call.asked()) {
+            return self
+                .driver_refused(call.method(), call.id(), why, conn.client)
+                .await;
+        }
         match call {
-            Call::Create(p) => self.create(p, conn.client).await,
+            Call::Create(p) => self.create(p, conn).await,
+            Call::Attach(a) => self.attach(a, conn, id).await,
+            Call::Input(i) => self.input(i, conn, id).await,
             Call::List => {
                 let sessions = self.p.sessions.list().iter().map(session).collect();
                 Done::Ok(value(&Sessions { sessions }))
@@ -287,8 +364,9 @@ impl<S: SessionSet> Control<S> {
         }
     }
 
-    /// A refusal of the drive seat's rules: `session.refuse` in the control log.
-    async fn driver_refused(
+    /// A refusal of a connection's or a session's rules (the drive seat's, line mode's):
+    /// `session.refuse` in the control log, nothing in the session's.
+    pub(crate) async fn driver_refused(
         &self,
         method: &str,
         id: Option<&SessionId>,
@@ -356,7 +434,9 @@ impl<S: SessionSet> Control<S> {
             .await)
     }
 
-    async fn create(&self, p: CreateParams, client: Client) -> Done {
+    async fn create(&self, p: CreateParams, conn: &mut Conn) -> Done {
+        let client = conn.client;
+        let bound = p.lifetime == Some(Lifetime::Connection);
         let script = match self.script_of(&p, client).await {
             Ok(s) => s,
             Err(done) => return done,
@@ -383,7 +463,14 @@ impl<S: SessionSet> Control<S> {
             .start(Arc::new(validated.manifest), script)
             .await
         {
-            Ok(info) => Done::Ok(value(&session(&info))),
+            Ok(info) => {
+                // Bound before the reply is written: a connection gone by then stops it at
+                // once (architect Q150).
+                if bound {
+                    conn.bound.push(self.bind(&info.id));
+                }
+                Done::Ok(value(&session(&info)))
+            }
             // Its `sandbox.refuse` could not be written: no reply without an entry (Q93).
             Err(StartError::Launch(LaunchError::Unaudited { .. })) => Done::Close,
             // The launch task ended without a result: no launcher entry, so this one (Q98).

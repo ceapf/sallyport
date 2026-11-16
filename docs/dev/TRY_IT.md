@@ -175,7 +175,57 @@ The session's entries for the call are actor `driver`, never `harness`: `drive.t
 `rpc.request`, `tool.pending`, `tool.run`; the approval is `user`. A turn's entry holds the
 message's size and hash, never its text. `sally audit verify` checks the whole hash chain.
 
-## 8. What is refused
+## 8. Line mode: run one command
+
+`sally sandbox run` starts a session of a manifest, runs one command in its workspace, relays
+your stdin to it and its output to you, then stops the session. No script and no approver are
+involved: you typed the command. The session lives as long as the connection: Ctrl-C, or a
+closed terminal, kills the command and stops the session (reason `disconnect`).
+
+```sh
+cd ~/try-it
+sally sandbox run --manifest m.yaml -- sh -c 'echo hi; ls /workspace/p'
+echo "exit: $?"
+```
+
+```text
+hi
+hello
+exit: 0
+```
+
+Stdin reaches the command as UTF-8 text, and its exit code is yours:
+
+```sh
+printf 'one\ntwo\n' | sally sandbox run --manifest m.yaml -- sh -c 'cat; exit 3'
+echo "exit: $?"
+```
+
+```text
+one
+two
+exit: 3
+```
+
+Output is shown as printable ASCII and newlines: an escape sequence the sandbox prints cannot
+colour, retitle, link or rewrite your terminal.
+
+```sh
+sally sandbox run --manifest m.yaml -- printf '\033[31mred\033]52;c;eA==\007\r\n'
+```
+
+```text
+\x1b[31mred\x1b]52;c;eA==\x07\x0d
+```
+
+Anything there that looks like a prompt, or like a `sally:` line, is the command's output. The
+exit status and `sally audit tail` are what to trust: the session's log holds `sandbox.exec`
+(the command, actor `user`) and `sandbox.exec_result` (how it ended and the byte counts, never
+the bytes). A command that `sallyd` killed exits 137 with one `sally: the command was killed: …`
+line. Stdin that is not UTF-8 ends the run (`sally: stdin is not UTF-8 text; the command was
+ended`). There is no terminal mode yet (`--tty` is refused as an unknown flag).
+
+## 9. What is refused
 
 ```sh
 sally session start m.yaml                  # no script: an ordinary session
@@ -190,7 +240,7 @@ A second connection cannot drive a session another one drives (`driver-busy`), a
 driving connection has closed nobody can (`driver-gone`). The driving connection is never an
 approver: `approvals.decide` on it is refused `driver-seat`.
 
-## 9. Clean up
+## 10. Clean up
 
 Ctrl-C in terminal 1 stops `sallyd`. Remove `~/code/try-it` and `~/try-it` when you are done.
 The test image stays cached; `podman image rm localhost/sallyport-test:local-<hash>` removes it.

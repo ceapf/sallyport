@@ -24,6 +24,7 @@ pub mod fetch_url;
 pub mod fs;
 pub mod ops;
 pub mod path;
+pub mod pipe;
 pub mod procs;
 pub mod shell;
 pub mod tag;
@@ -75,6 +76,15 @@ pub struct Mount {
     pub mode: MountMode,
     /// Where its files are reached.
     pub root: RootSource,
+}
+
+/// Where a command runs when its call names no directory: the first mount's guest path, else
+/// `/`. The shell tool's default, and an attach's (architect Q101).
+#[must_use]
+pub fn default_cwd(mounts: &[Mount]) -> String {
+    mounts
+        .first()
+        .map_or_else(|| "/".to_owned(), |m| m.guest.clone())
 }
 
 /// The session's mounts as the tools reach them: `brokered` and `ro` on the host pin, `rw` and
@@ -714,11 +724,7 @@ impl<R: Runner> Core<R> {
                     .await?,
             },
             Args::Shell { cmd, cwd } => {
-                let cwd = cwd.unwrap_or_else(|| {
-                    self.mounts
-                        .first()
-                        .map_or_else(|| "/".to_owned(), |m| m.guest.clone())
-                });
+                let cwd = cwd.unwrap_or_else(|| default_cwd(&self.mounts));
                 let destructive = tag::destructive(&cmd);
                 return Ok(Prepared {
                     action: Action::Shell { argv: cmd, cwd },

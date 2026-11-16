@@ -23,6 +23,9 @@ pub enum StopReason {
     StartFailed,
     /// The container ended on its own.
     Exited,
+    /// The control connection the session was bound to closed (`lifetime: "connection"`;
+    /// architect Q102).
+    Disconnect,
 }
 
 impl StopReason {
@@ -36,6 +39,7 @@ impl StopReason {
             Self::Shutdown => "shutdown",
             Self::StartFailed => "start-failed",
             Self::Exited => "exited",
+            Self::Disconnect => "disconnect",
         }
     }
 }
@@ -89,6 +93,7 @@ mod tests {
             (StopReason::Shutdown, "shutdown"),
             (StopReason::StartFailed, "start-failed"),
             (StopReason::Exited, "exited"),
+            (StopReason::Disconnect, "disconnect"),
         ];
         for (r, s) in all {
             assert_eq!(r.as_str(), s);

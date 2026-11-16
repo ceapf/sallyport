@@ -2,11 +2,14 @@
 //! sockets. `agent.sock` serves the MCP subset of ARCHITECTURE §4.2 to the untrusted harness.
 
 pub mod agent;
+pub mod attach;
 pub mod control;
+pub mod control_line;
 pub mod control_methods;
 pub mod drive;
 pub(crate) mod frame;
 pub(crate) mod json;
+pub mod line;
 pub mod listen;
 pub mod mcp;
 pub mod message;

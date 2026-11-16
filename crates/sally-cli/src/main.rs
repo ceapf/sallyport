@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 use sally_cli::approve::{Tty, approve};
 use sally_cli::client::{Client, socket_path};
 use sally_cli::commands::{self, Out, failed};
-use sally_cli::{EXIT_FAILED, EXIT_OK, clean, doctor, drive, local, secrets, usage};
+use sally_cli::{EXIT_FAILED, EXIT_OK, clean, doctor, drive, local, run, secrets, usage};
 use sally_core::paths::Paths;
 
 /// Talk to `sallyd`: start, list and stop sessions, see what they staged, answer approvals.
@@ -29,6 +29,11 @@ enum Cmd {
     Session {
         #[command(subcommand)]
         cmd: SessionCmd,
+    },
+    /// Run commands in a sandbox.
+    Sandbox {
+        #[command(subcommand)]
+        cmd: SandboxCmd,
     },
     /// List the prompts waiting for an answer.
     Approvals,
@@ -129,9 +134,28 @@ enum SessionCmd {
     },
 }
 
+#[derive(Subcommand)]
+enum SandboxCmd {
+    /// Run a command in a new session's workspace, in line mode: its output is shown as
+    /// printable ASCII and newlines, stdin is sent as UTF-8 text, and the session stops when
+    /// the command ends or this command is interrupted. Exits with the command's code (137 if
+    /// it was killed). Approvals are answered in another terminal (`sally approve`); anything
+    /// prompt-like here is the command's output, and the exit status and `sally audit tail`
+    /// are what to trust. A reader paused over 10 s gets the command killed.
+    Run {
+        /// The manifest.
+        #[arg(long)]
+        manifest: PathBuf,
+        /// The command and its arguments, after `--`.
+        #[arg(last = true, required = true)]
+        argv: Vec<String>,
+    },
+}
+
 /// The commands that talk to `sallyd`.
 enum Remote {
     Session(SessionCmd),
+    Sandbox(SandboxCmd),
     Approvals,
     Approve,
 }
@@ -193,6 +217,7 @@ fn local(cmd: Cmd, paths: &Paths) -> Result<u8, Remote> {
         },
         Cmd::Secrets { cmd } => run_secrets(cmd, paths, &mut o),
         Cmd::Session { cmd } => return Err(Remote::Session(cmd)),
+        Cmd::Sandbox { cmd } => return Err(Remote::Sandbox(cmd)),
         Cmd::Approvals => return Err(Remote::Approvals),
         Cmd::Approve => return Err(Remote::Approve),
     })
@@ -227,7 +252,7 @@ fn run_remote(cmd: Remote, paths: &Paths) -> u8 {
                 return EXIT_FAILED;
             }
         },
-        Remote::Session(_) | Remote::Approvals => None,
+        Remote::Session(_) | Remote::Sandbox(_) | Remote::Approvals => None,
     };
     let mut client = match socket_path(paths).and_then(|p| Client::connect(&p)) {
         Ok(c) => c,
@@ -247,6 +272,9 @@ fn run_remote(cmd: Remote, paths: &Paths) -> u8 {
             SessionCmd::Stop { id } => commands::session_stop(&mut client, &id, &mut o),
             SessionCmd::Changes { id } => commands::session_changes(&mut client, &id, &mut o),
         },
+        (Remote::Sandbox(SandboxCmd::Run { manifest, argv }), _) => {
+            run::sandbox_run(&mut client, &manifest, &argv, std::io::stdin(), &mut o)
+        }
         (Remote::Approvals, _) => commands::approvals(&mut client, &mut o),
         (Remote::Approve, Some(tty)) => approve_on(&tty, &mut client, o.err),
         (Remote::Approve, None) => EXIT_FAILED,

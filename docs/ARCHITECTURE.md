@@ -556,7 +556,7 @@ peer to be its own uid (architect Q78), and it reads replies under the same 1 Mi
 | `jobs.list` / `jobs.cancel`; notification `job.progress` | long-running work |
 | `infer.load` (model) / `infer.unload` / `infer.status` | inference lifecycle |
 | `chat.complete` (session-less chat using the loaded model; same body as `infer.complete`) | Chat screen |
-| `sessions.create` (manifest text; `model?: {kind: scripted, script, driven}`; task: PR C) / `sessions.list` / `sessions.stop` (id) / `sessions.changes` (id) / `sessions.drive` (id) / `sessions.attach` | agent sessions |
+| `sessions.create` (manifest text; `model?: {kind: scripted, script, driven}`; `lifetime?: "connection"`; task: PR C) / `sessions.list` / `sessions.stop` (id) / `sessions.changes` (id) / `sessions.drive` (id) / `sessions.attach` (id, argv, cwd?) / `sessions.input` (id, data, eof?); notification `session.output` | agent sessions |
 | `ui.send` (session, text) — user → harness; notification `ui.message` — harness → user | chat with an agent |
 | `approvals.list` / `approvals.watch` / `approvals.decide` (id, approve\|deny\|deny_all_session, digest, full_shown?); notification `approval.requested` / `approval.flood` / `approval.closed` | gate |
 | `secrets.set` (name, value) / `secrets.list` (names only) / `secrets.remove` | store; values are write-only |
@@ -576,16 +576,17 @@ line adds the shell-history warning. `audit verify` exits 0 verified, 1 failed v
 unreadable (Q115). The `doctor.*`, `manifests.*`, `secrets.*` and `audit.*` methods above stay
 for the UI.
 
-Task 12 serves eight of them (`sally_proto::method::ALL`: `sessions.create`, `.list`, `.stop`,
-`.changes`, `.drive`, `approvals.list`, `.decide`, `.watch`); every other method is `-32601` and
+Task 12 serves ten of them (`sally_proto::method::ALL`: `sessions.create`, `.list`, `.stop`,
+`.changes`, `.drive`, `.attach`, `.input`, `approvals.list`, `.decide`, `.watch`); every other method is `-32601` and
 recorded `rpc.deny {socket: control}`, and no control method resolves on the session socket's
 table (a unit test holds that). Params are strict (unknown fields, a `model` other than the
 scripted one below, `task` before PR C, a `client` in decide, a malformed session id: `-32602`).
 A request that is never admitted is recorded `rpc.deny`; an admitted one
 `rpc.request {socket, method, client: {uid, pid}}` before its effect (the uid and pid from
-`SO_PEERCRED`, audit detail only; a create adds `manifest_bytes` and `manifest_sha256`, and with
-a model `script_bytes` and `script_sha256`, never the text; a stop, a listing and a drive add
-the parsed `id`). A refused admitted
+`SO_PEERCRED`, audit detail only; a create adds `manifest_bytes` and `manifest_sha256`, with
+a model `script_bytes` and `script_sha256`, never the text, and `lifetime` when one is given; a
+stop, a listing, a drive and an attach add the parsed `id`; an input adds `{id, bytes, eof}`,
+never the data). A refused admitted
 request is `-32000` with `data`
 `{reason, detail?, errors?}` (`sally_proto::ErrorData`):
 
@@ -650,6 +651,66 @@ request is `-32000` with `data`
   call after it: it can over-report an attempt, never under-report an effect. No other method
   is raced so.
   TODO(#126): re-rule the transport once the Task 13 harness launcher lands.
+- **Line mode** (`sessions.attach {id, argv, cwd?}`, `sessions.input {id, data, eof?}`;
+  architect Q100–Q102, Q144–Q153). An attach runs one command in the session's workspace
+  container, `podman exec -i --detach-keys=` (no detach sequence in the relayed stdin) through
+  the shell tool's own runner, and streams its output. Params
+  are strict: `argv` is 1 to 256 strings with no NUL (`MAX_ARGV`), `data` at most 64 KiB
+  (`MAX_INPUT_BYTES`), both `-32602` at parse; an absent `cwd` is the shell tool's default (the
+  first mount's guest path, else `/`), a bad one the shell tool's `bad-arguments`. Input is
+  UTF-8 text (TODO(#139): binary stdin); there is no terminal mode (TODO(#138): `--tty`).
+  - A connection is **plain, watching, driving or attached**, never two. Attach is refused
+    `attach-watching` on a watching connection and `driver-seat` on one holding a drive seat;
+    `unknown-session`, `session-stopping`, and `attach-busy` (the session already has an attach,
+    on any connection). While attached a connection is served only `sessions.input`: any other
+    admitted method, a watch included, is recorded `rpc.request` and refused `attached`, and the
+    attach goes on (a frame error or an unknown method stays `rpc.deny`). An input is refused
+    `not-attached` (on a connection not attached, or naming another session), `input-pending`
+    (one input at a time; its reply is the ack) or `input-closed` (after `eof`, or once a write
+    to the command's stdin failed). Every refusal is a `session.refuse` in the control log,
+    actor `sallyd`.
+  - Order (Q146): the session's attach claim, the session's operation (so a stop drains it),
+    `sandbox.exec {exec, argv, cwd, client}` (actor `user`) in the session's log, then the
+    command. An entry that cannot be written runs nothing and closes the connection.
+  - Output: one `StreamEscaper` per stream (the alphabet above plus `\n`; RT-CLI-01), each read
+    at most 16 KiB of source (`MAX_OUTPUT_CHUNK`), sent as `session.output {id, stream, text}`
+    through a queue of 8 (`OUTPUT_QUEUE`; the worst escaped frame stays under `MAX_FRAME`, a
+    relation test holds it). A full queue pauses the readers, so a client that does not read
+    stalls the command, never `sallyd`; a write to the client that fails or blocks 10 s
+    (`WRITE_TIMEOUT`) is a disconnect. So a client paused for more than 10 s gets its command
+    killed.
+  - End: the reply is `{exit_code}` (`podman exec`'s code; 128+N for a signal) or `{killed:
+    session-stop | disconnect | start-timeout}`, by precedence stop, then disconnect, then the
+    start limit. A kill is never delayed by a blocked client; once killed the pipes are no longer
+    read (queued chunks may still be sent). After the command exits its pipes are drained to
+    their end, 500 ms of idleness, or a stop or disconnect. That bound is on idleness only: a
+    process the command left behind (`setsid`) that keeps writing to the pipes holds the attach,
+    and the session's `attach-busy`, until the client disconnects or the session stops. `sandbox.exec_result {exec,
+    stdin_bytes, stdout_bytes, stderr_bytes, exit_code | killed | failed}` (actor `sallyd`,
+    byte counts, never content) is written when the runner returns, never waiting on the
+    client, so within the stop's drain. A run that failed is `failed: true` and the attach is
+    refused `exec-failed`. A pending input is answered `input-closed` before the attach's reply.
+    A task that ends without a result closes the connection unanswered.
+  - A **disconnect** is end of stream (a half-close included), a failed or timed-out write, or
+    the connection's task dropped: the command is killed `disconnect`.
+  - `lifetime: "connection"` on `sessions.create` (Q150) binds the session to its connection
+    from the start's return, before the reply is written. When the connection ends the session
+    is stopped, reason `disconnect`, by a task under the daemon's crash reporter; one already
+    stopped is left alone; a failed stop writes `session.refuse {id, reason: stop-failed,
+    detail, cause: disconnect}` in the control log and an oplog line. A bound session may be
+    driven. Absent, a session lives until it is stopped.
+  - `sally sandbox run --manifest <file> -- <cmd>…` is the CLI's line mode: a bound create, one
+    attach, stdin relayed as inputs, output printed through `clean::text`, then `sessions.stop`.
+    It exits with the command's code, 137 for a kill (`EXIT_KILLED`); a refused stop makes it at
+    least 1. It refuses (exit 1) when any output failed the clean-check, however the run ended:
+    a run that could not go on (a lost connection, a stray frame, a refused attach, stdin that
+    is not UTF-8, a code outside 0–255) still prints its own line first, and the not-clean line
+    comes last. Dirty output therefore always exits 1, never 0. A clean run that could not go
+    on exits 2 (1 for a refusal), its own line printed. A code alone does not say who ended the
+    run (a command may exit 1, 2 or 137 itself); for a clean run, the `sally:` line on stderr
+    tells them apart.
+    Anything prompt-like in that terminal is sandbox output: the exit status and `sally audit
+    tail` are authoritative (Q149, Q204).
 - `sessions.stop`: an unknown id is `unknown-session` (`session.refuse`); a container not
   confirmed gone is `stop-failed` (`session.refuse` in the control log: the session's own log
   is sealed by then).
@@ -967,6 +1028,8 @@ TODO(#28): the harness container and `llm.sock` (Task 13, Task 12 PR C).
   flight, and a file-system call blocked in a stage walk. A session whose launch tail or stop
   meets one of them, or podman hanging past the budget, may instead end `exited`, by the
   backstop (fail closed).
+- `disconnect`: the control connection that created a session with `lifetime: "connection"`
+  ended (§4.1, architect Q102, Q150).
 
 **Stop order** (Q57, amended by Q59: once a stop returns, nothing from the session has any
 further effect):
@@ -976,8 +1039,9 @@ further effect):
 3. Every pending prompt is withdrawn (`approval.withdraw`, `session-stop`); no call queues after
    it.
 4. The stop signal: a running `shell` is killed (`killed: session-stop`, the kill finished before
-   its `tool.result`), and a write or delete that has not begun aborts (`outcome: aborted`). The
-   agent listener shuts down meanwhile.
+   its `tool.result`), an attached command likewise (its `sandbox.exec_result` `killed:
+   session-stop`, and its attach answered so), and a write or delete that has not begun aborts
+   (`outcome: aborted`). The agent listener shuts down meanwhile.
 5. At most 5 s (`STOP_DRAIN`) for the operations in flight to end, each with its `tool.result`.
    A session task that panics meanwhile is audited `session.crash` (Q67), so `session.crash`
    may precede a `session.stop` of any reason; the reason stays the first one.
@@ -991,7 +1055,9 @@ further effect):
 7. `Launcher::stop`, retried up to 3 times.
 
 So after `session.stop` nothing agent-originated of the session is written: no `tool.*`,
-`approval.*` or `rpc.*` entry, whatever its `in_flight`. Teardown entries may follow it:
+`approval.*` or `rpc.*` entry, whatever its `in_flight`. `sandbox.exec` and
+`sandbox.exec_result` are entries of the session's handle too, so they never follow
+`session.stop` either (Q146). Teardown entries may follow it:
 `sandbox.*` (`sandbox.stop` always does), the watchdog's (`session.resource_limit`,
 `session.kill_failed`) and egress closes (#95). TODO(#94): a final `session.closed`, written
 once teardown has finished, becomes the last entry of a session. A panic reported after the

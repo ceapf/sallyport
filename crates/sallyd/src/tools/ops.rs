@@ -16,6 +16,8 @@ use tokio::sync::watch;
 pub const STOP_DRAIN: Duration = Duration::from_secs(5);
 /// Why a shell was killed, or a write aborted, by its session's stop (`tool.result`).
 pub const SESSION_STOP: &str = "session-stop";
+/// Why an attached command was killed when its connection went away (architect Q101).
+pub const DISCONNECT: &str = "disconnect";
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct State {
@@ -125,6 +127,12 @@ mod tests {
     #[test]
     fn the_drain_bound_is_five_seconds() {
         assert_eq!(STOP_DRAIN, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn the_kill_reasons_are_the_wire_names() {
+        assert_eq!(SESSION_STOP, "session-stop");
+        assert_eq!(DISCONNECT, "disconnect");
     }
 
     #[test]

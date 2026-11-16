@@ -180,30 +180,41 @@ fn opt_u64(a: &Map<String, Value>, key: &str) -> Result<Option<u64>, &'static st
     }
 }
 
-/// 1 to [`MAX_ARGV`] strings; the first not empty; no NUL anywhere (it would cut the argument
-/// short in `execve`, so what ran would not be what was shown).
+/// The shell tool's `cmd`: an array of strings shaped as [`argv_shaped`] says.
 fn argv(v: &Value) -> Result<Vec<String>, &'static str> {
     let Value::Array(items) = v else {
         return Err(BAD);
     };
-    if items.is_empty() || items.len() > MAX_ARGV {
+    if !argv_len_ok(items.len()) {
         return Err(BAD);
     }
     let cmd = items
         .iter()
-        .map(|x| match x {
-            Value::String(s) if !s.contains('\0') => Ok(s.clone()),
-            _ => Err(BAD),
-        })
+        .map(|x| x.as_str().map(str::to_owned).ok_or(BAD))
         .collect::<Result<Vec<_>, _>>()?;
-    if cmd.first().is_none_or(String::is_empty) {
+    if !argv_shaped(&cmd) {
         return Err(BAD);
     }
     Ok(cmd)
 }
 
-/// An absolute guest directory with no `..` and no control bytes, in canonical form.
-fn cwd(s: &str) -> Result<String, &'static str> {
+/// 1 to [`MAX_ARGV`] items: checked before any is copied.
+fn argv_len_ok(n: usize) -> bool {
+    (1..=MAX_ARGV).contains(&n)
+}
+
+/// 1 to [`MAX_ARGV`] strings; the first not empty; no NUL anywhere (it would cut the argument
+/// short in `execve`, so what ran would not be what was shown). The shell tool's `cmd` and an
+/// attach's `argv` (architect Q101).
+pub(crate) fn argv_shaped(cmd: &[String]) -> bool {
+    argv_len_ok(cmd.len())
+        && cmd.first().is_some_and(|a| !a.is_empty())
+        && !cmd.iter().any(|a| a.contains('\0'))
+}
+
+/// An absolute guest directory with no `..` and no control bytes, in canonical form: the shell
+/// tool's `cwd`, and an attach's (architect Q101).
+pub(crate) fn cwd(s: &str) -> Result<String, &'static str> {
     if !s.starts_with('/') || s.len() > MAX_PATH || s.bytes().any(|b| b < 0x20 || b == 0x7f) {
         return Err(BAD);
     }
@@ -380,6 +391,13 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    /// The shell tool's bound is the wire's: an attach and a shell call take the same argv.
+    #[test]
+    fn the_argv_bound_is_the_wires() {
+        assert_eq!(MAX_ARGV, sally_proto::MAX_ARGV);
+        assert_eq!(MAX_ARGV, 256);
     }
 
     #[test]
