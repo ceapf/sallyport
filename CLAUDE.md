@@ -84,7 +84,7 @@ Orchestration that only container tests can prove (`sandbox/launch.rs`, `launch/
 `launch/start.rs`, `launch/harness.rs`, `launch/inference.rs`, `watchdog.rs`, `commands.rs`,
 `inside.rs`, `tools/exec.rs`) stays with the `rt_` tests. Per mutant only
 container-free tests run: unit tests, all of sally-core's `tests/`, `sallyd` `argv` + `scan`,
-`sally-shim` `relay`. A new file that fits the rule joins its list in the same PR. Nightly, two jobs:
+`sally-shim` `relay` + `relay_bin` + `relay_write_errors`. A new file that fits the rule joins its list in the same PR. Nightly, two jobs:
 - `make mutants` (deny paths): sally-core `manifest/validate/*.rs`, `manifest/paths.rs`,
   `manifest/host.rs`, `config.rs`.
 - `make mutants-wide-{core,sallyd,shim,cli}` (sharded): sally-core `manifest/{image,hostenv,parse,
