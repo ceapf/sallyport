@@ -16,6 +16,7 @@ pub mod commands;
 pub mod doctor;
 pub mod drive;
 pub mod local;
+pub mod run;
 pub mod secrets;
 pub mod usage;
 

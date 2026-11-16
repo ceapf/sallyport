@@ -161,16 +161,7 @@ impl Client {
     /// [`Error::Refused`] for an error reply; [`Error::Behind`] when over [`NOTES_BYTES`] of
     /// notifications came first; the others when the connection fails.
     pub fn call(&mut self, method: &str, params: Value) -> Result<Value, Error> {
-        let id = self.next;
-        self.next = self.next.wrapping_add(1);
-        let req = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        let mut line = serde_json::to_vec(&req).map_err(|_| Error::Unexpected)?;
-        // `sallyd` refuses a longer frame and closes; say so here instead, sending nothing.
-        if line.len() > MAX_FRAME {
-            return Err(Error::RequestTooLarge);
-        }
-        line.push(b'\n');
-        self.w.write_all(&line)?;
+        let id = self.send(method, params)?;
         loop {
             let (frame, len) = self.frames.recv().map_err(|_| Error::Closed)??;
             match decode(frame)? {
@@ -179,6 +170,41 @@ impl Client {
                 Decoded::Reply { .. } => return Err(Error::Unexpected),
             }
         }
+    }
+
+    /// Sends `method` without waiting for its reply; the request's id.
+    ///
+    /// # Errors
+    /// [`Error::RequestTooLarge`] (nothing sent), [`Error::Io`].
+    pub fn send(&mut self, method: &str, params: Value) -> Result<i64, Error> {
+        let id = self.next;
+        self.next = self.next.wrapping_add(1);
+        self.w.write_all(&request(id, method, params)?)?;
+        Ok(id)
+    }
+
+    /// The next frame, a held notification first: a reply or a notification.
+    ///
+    /// # Errors
+    /// The connection failed, or a frame that is neither.
+    pub fn recv(&mut self) -> Result<Decoded, Error> {
+        if let Some(n) = self.held() {
+            return Ok(Decoded::Note(n));
+        }
+        let (frame, _) = self.frames.recv().map_err(|_| Error::Closed)??;
+        decode(frame)
+    }
+
+    /// A second writer on this connection, for another thread: its request ids start at
+    /// `first`, so its replies are told apart from this client's.
+    ///
+    /// # Errors
+    /// [`Error::Io`].
+    pub fn writer(&self, first: i64) -> Result<Writer, Error> {
+        Ok(Writer {
+            w: self.w.try_clone()?,
+            next: first,
+        })
     }
 
     fn hold(&mut self, note: Value, len: usize) -> Result<(), Error> {
@@ -222,6 +248,44 @@ impl Client {
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => Err(Error::Closed),
         }
+    }
+}
+
+/// A request frame, newline included. `sallyd` refuses a longer frame and closes; this says so
+/// instead, sending nothing.
+fn request(id: i64, method: &str, params: Value) -> Result<Vec<u8>, Error> {
+    let req = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+    let mut line = serde_json::to_vec(&req).map_err(|_| Error::Unexpected)?;
+    if line.len() > MAX_FRAME {
+        return Err(Error::RequestTooLarge);
+    }
+    line.push(b'\n');
+    Ok(line)
+}
+
+/// A writer of requests on a [`Client`]'s connection, for another thread; the client's reader
+/// takes the replies.
+#[derive(Debug)]
+pub struct Writer {
+    w: UnixStream,
+    next: i64,
+}
+
+impl Writer {
+    /// Sends `method`; the request's id.
+    ///
+    /// # Errors
+    /// [`Error::RequestTooLarge`] (nothing sent), [`Error::Io`].
+    pub fn send(&mut self, method: &str, params: Value) -> Result<i64, Error> {
+        let id = self.next;
+        self.next = self.next.wrapping_add(1);
+        self.w.write_all(&request(id, method, params)?)?;
+        Ok(id)
+    }
+
+    /// Ends the connection both ways: `sallyd` sees it close, and the client's reader ends.
+    pub fn close(&self) {
+        let _ = self.w.shutdown(Shutdown::Both);
     }
 }
 
