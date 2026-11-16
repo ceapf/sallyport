@@ -113,7 +113,7 @@ pub(crate) struct Denylist {
 impl Denylist {
     /// Built-in rules for `env`, plus the manifest's `filesystem.deny` entries (already
     /// expanded to absolute paths).
-    pub(crate) fn new(env: &HostEnv, extra: &[PathBuf]) -> Self {
+    pub(crate) fn for_env(env: &HostEnv, extra: &[PathBuf]) -> Self {
         let mut rules = vec![root_rule(Path::new("/"), "the filesystem root")];
         for h in std::iter::once(&env.home).chain(&env.other_homes) {
             rules.push(root_rule(h, "the home directory root"));
@@ -411,7 +411,7 @@ mod tests {
 
     #[test]
     fn root_only_rules_allow_descendants() {
-        let d = Denylist::new(&env("/home/u"), &[]);
+        let d = Denylist::for_env(&env("/home/u"), &[]);
         assert!(d.refusal(Path::new("/")).is_some());
         assert!(d.refusal(Path::new("/home/u")).is_some());
         assert_eq!(d.refusal(Path::new("/home/u/code")), None);
@@ -420,7 +420,7 @@ mod tests {
 
     #[test]
     fn subtree_rules_refuse_inside_and_ancestors() {
-        let d = Denylist::new(&env("/home/u"), &[]);
+        let d = Denylist::for_env(&env("/home/u"), &[]);
         for p in [
             "/home/u/.ssh",
             "/home/u/.ssh/keys",
@@ -440,7 +440,7 @@ mod tests {
     fn other_homes_are_protected_too() {
         let mut e = env("/tmp/fakehome");
         e.other_homes.push("/home/user".into());
-        let d = Denylist::new(&e, &[]);
+        let d = Denylist::for_env(&e, &[]);
         assert!(d.refusal(Path::new("/home/user/.ssh")).is_some());
         assert!(d.refusal(Path::new("/home/user")).is_some());
         assert_eq!(d.refusal(Path::new("/home/user/code")), None);
@@ -448,7 +448,7 @@ mod tests {
 
     #[test]
     fn extra_rules_apply() {
-        let d = Denylist::new(&env("/home/u"), &[PathBuf::from("/home/u/private")]);
+        let d = Denylist::for_env(&env("/home/u"), &[PathBuf::from("/home/u/private")]);
         assert!(d.refusal(Path::new("/home/u/private/x")).is_some());
         assert_eq!(d.refusal(Path::new("/home/u/public")), None);
     }
@@ -525,7 +525,7 @@ mod tests {
     #[test]
     fn the_identity_of_a_protected_folder_is_refused() {
         let t = TmpHome::new("same");
-        let d = Denylist::new(&env(t.home().to_str().unwrap()), &[]);
+        let d = Denylist::for_env(&env(t.home().to_str().unwrap()), &[]);
         let why = d.refusal_by_id(t.id("home/.ssh")).unwrap();
         assert!(
             why.contains("same directory as") && why.contains(".ssh"),
@@ -540,7 +540,7 @@ mod tests {
     #[test]
     fn the_identity_of_an_ancestor_of_a_protected_folder_is_refused() {
         let t = TmpHome::new("anc");
-        let d = Denylist::new(&env(t.home().to_str().unwrap()), &[]);
+        let d = Denylist::for_env(&env(t.home().to_str().unwrap()), &[]);
         for rel in ["home/.local", "home/.local/share", ""] {
             let why = d.refusal_by_id(t.id(rel)).unwrap();
             assert!(why.contains("which contains"), "{rel}: {why}");
@@ -551,7 +551,7 @@ mod tests {
     #[test]
     fn other_identities_are_allowed() {
         let t = TmpHome::new("ok");
-        let d = Denylist::new(&env(t.home().to_str().unwrap()), &[]);
+        let d = Denylist::for_env(&env(t.home().to_str().unwrap()), &[]);
         for rel in ["home/code", "home/code/x"] {
             assert_eq!(d.refusal_by_id(t.id(rel)), None, "{rel}");
         }
@@ -567,7 +567,7 @@ mod tests {
         std::fs::remove_dir(home.join(".ssh")).unwrap();
         std::fs::create_dir_all(home.join("dotfiles/ssh/keys")).unwrap();
         std::os::unix::fs::symlink(home.join("dotfiles/ssh"), home.join(".ssh")).unwrap();
-        let d = Denylist::new(&env(home.to_str().unwrap()), &[]);
+        let d = Denylist::for_env(&env(home.to_str().unwrap()), &[]);
         let ssh = home.join(".ssh").display().to_string();
         for (rel, how) in [
             ("dotfiles/ssh", "is inside"),

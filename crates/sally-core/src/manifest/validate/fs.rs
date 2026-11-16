@@ -28,7 +28,7 @@ pub(super) fn denylist(m: &Manifest, env: &HostEnv, d: &mut Diags) -> Denylist {
             }
         })
         .collect();
-    Denylist::new(env, &extra)
+    Denylist::for_env(env, &extra)
 }
 
 pub(super) fn check_filesystem(m: &Manifest, env: &HostEnv, d: &mut Diags) -> Vec<ResolvedMount> {
