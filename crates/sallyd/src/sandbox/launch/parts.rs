@@ -178,25 +178,17 @@ mod tests {
     use std::os::unix::fs::MetadataExt as _;
 
     use super::*;
+    use crate::egress::scratch::Scratch;
 
     fn sid(s: &str) -> SessionId {
         SessionId::parse(s).unwrap()
     }
 
-    /// Removes the scratch directory when the test ends, passed or failed.
-    struct Gone(PathBuf);
-
-    impl Drop for Gone {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn scratch(tag: &str) -> (PathBuf, Gone) {
-        let p = std::env::temp_dir().join(format!("sp-parts-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        (p.clone(), Gone(p))
+    /// A fresh directory under `target/parts-unit`, canonical, and its guard, which removes it
+    /// on drop so a failing assertion leaves nothing behind.
+    fn scratch(tag: &str) -> (PathBuf, Scratch) {
+        let guard = crate::egress::scratch::scratch("parts-unit", tag);
+        (std::fs::canonicalize(&*guard).unwrap(), guard)
     }
 
     /// A session's entry names the session and the role; an instance's names no session and
