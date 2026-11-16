@@ -63,6 +63,105 @@ fn a_sessions_secrets_are_redacted_from_start_until_its_stop() {
     });
 }
 
+/// The longest a test waits for a release that follows a lifted hold.
+const BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Waits within [`BOUND`] until no session's secrets are registered.
+async fn until_released(x: &Lx) {
+    let end = std::time::Instant::now() + BOUND;
+    while !x.redactors.sessions().is_empty() {
+        assert!(std::time::Instant::now() < end, "never released");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// A stopped session's values stay redacted through its stop's own entries (`session.stop`,
+/// then the teardown's `sandbox.stop`), and leave only after them (security review M1).
+#[test]
+fn a_stopped_sessions_secrets_stay_redacted_through_its_last_entries() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let reg = x.registry(x.events.clone() as Arc<dyn AuditSink>, Some(test_image()));
+        let gh = canary("GITHUB_TOKEN");
+        let a = reg.start(manifest(&x, ONE)).await.unwrap();
+        x.events.hold(&["sandbox.stop"]);
+        let stopping = {
+            let (reg, id) = (Arc::clone(&reg), a.id.clone());
+            tokio::spawn(async move { reg.stop(&id, StopReason::Request).await })
+        };
+        x.events.until_parked("sandbox.stop", 1).await;
+        assert_eq!(x.redactors.sessions(), std::slice::from_ref(&a.id));
+        assert_eq!(x.redacted.redact(&gh), "[REDACTED:GITHUB_TOKEN]");
+        x.events.hold(&[]);
+        tokio::time::timeout(BOUND, stopping)
+            .await
+            .expect("the stop ends")
+            .unwrap()
+            .unwrap();
+        assert!(x.redactors.sessions().is_empty());
+        assert_eq!(x.redacted.redact(&gh), gh);
+    });
+}
+
+/// A start that fails after its workspace launched (here: `session.start` cannot be written)
+/// keeps the values redacted until the workspace's `sandbox.stop`, then releases them (Rust
+/// review M2: the registry's `discard`).
+#[test]
+fn a_failed_start_releases_its_secrets_after_sandbox_stop() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let reg = x.registry(x.events.clone() as Arc<dyn AuditSink>, Some(test_image()));
+        let gh = canary("GITHUB_TOKEN");
+        x.events.fail(&["session.start"]);
+        x.events.hold(&["sandbox.stop"]);
+        let starting = {
+            let (reg, m) = (Arc::clone(&reg), manifest(&x, ONE));
+            tokio::spawn(async move { reg.start(m).await })
+        };
+        x.events.until_parked("sandbox.stop", 1).await;
+        assert_eq!(x.redactors.sessions().len(), 1);
+        assert_eq!(x.redacted.redact(&gh), "[REDACTED:GITHUB_TOKEN]");
+        x.events.hold(&[]);
+        let started = tokio::time::timeout(BOUND, starting)
+            .await
+            .expect("the start ends")
+            .unwrap();
+        assert!(started.is_err(), "the start fails");
+        assert!(x.redactors.sessions().is_empty());
+        assert_eq!(x.redacted.redact(&gh), gh);
+    });
+}
+
+/// A launch whose caller went away before it finished stops its workspace and releases the
+/// values (Rust review M2: the orphaned launch in `launch_workspace`).
+#[test]
+fn an_orphaned_launch_releases_its_secrets() {
+    rt().block_on(async {
+        let x = Lx::new();
+        x.events.hold(&["sandbox.launch"]);
+        let paths = x.paths("orphan");
+        let id = paths.id().as_str().to_owned();
+        let req = WorkspaceRequest {
+            paths,
+            manifest: manifest(&x, ONE),
+            default_image: Some(test_image()),
+            crash: sallyd::daemon::crash::CrashReporter::channel().0,
+        };
+        let launcher = Arc::clone(&x.launcher);
+        let launch = tokio::spawn(async move { launcher.launch_workspace(req).await });
+        x.events.until_parked("sandbox.launch", 1).await;
+        assert_eq!(x.redactors.sessions(), [id]);
+        launch.abort();
+        assert!(launch.await.unwrap_err().is_cancelled());
+        x.events.hold(&[]);
+        until_released(&x).await;
+        assert!(
+            x.events.all().iter().any(|(e, _)| e == "sandbox.stop"),
+            "the orphan was stopped"
+        );
+    });
+}
+
 /// A launch refused after its egress loaded the values (here: `sandbox.launch` cannot be
 /// written, which takes the same path as any failure after `prepare`, a `net.sock` bind
 /// failure included): the values are redacted while `sandbox.refuse` is written, and released
@@ -89,7 +188,11 @@ fn a_refused_launch_releases_its_secrets_after_sandbox_refuse() {
         assert_eq!(x.redactors.sessions(), [id]);
         assert_eq!(x.redacted.redact(&gh), "[REDACTED:GITHUB_TOKEN]");
         x.events.hold(&[]);
-        assert!(launch.await.unwrap().is_err(), "the launch is refused");
+        let refused = tokio::time::timeout(BOUND, launch)
+            .await
+            .expect("the refusal ends")
+            .unwrap();
+        assert!(refused.is_err(), "the launch is refused");
         assert!(x.redactors.sessions().is_empty());
         assert_eq!(x.redacted.redact(&gh), gh);
         let refused = x.events.all();

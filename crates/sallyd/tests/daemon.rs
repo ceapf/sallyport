@@ -1083,6 +1083,23 @@ fn the_daemon_validates_and_injects_from_the_store_the_cli_writes() {
     assert_eq!(set(&mut err), sally_cli::EXIT_OK);
     let r = create(&mut c);
     started(&mut c, r);
+    // The redactors `serve` wires (Rust review M3, security review M2): a command that carries
+    // the value, run in a session that holds it, is audited redacted in the daemon's own log.
+    let file = env.root.join("m.yaml");
+    std::fs::write(&file, &manifest).unwrap();
+    let argv = ["sh".to_owned(), "-c".to_owned(), format!("true {value}")];
+    let (mut run_out, mut run_err) = (Vec::new(), Vec::new());
+    let code = sally_cli::run::sandbox_run(
+        &mut c,
+        &file,
+        &argv,
+        std::io::empty(),
+        &mut sally_cli::commands::Out {
+            out: &mut run_out,
+            err: &mut run_err,
+        },
+    );
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&run_err));
     drop(c);
     terminate(&mut d);
     let out = d.finish();
@@ -1091,4 +1108,38 @@ fn the_daemon_validates_and_injects_from_the_store_the_cli_writes() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    assert!(
+        !files_holding(&paths.audit(), b"[REDACTED:GH_TOKEN]").is_empty(),
+        "control: the command's argv reached the audit log"
+    );
+    // Everything Sallyport writes (podman's own storage, owned by the mapped ids, is not).
+    let held: Vec<PathBuf> = [
+        "home",
+        "run/sallyport",
+        "data/sallyport",
+        "config/sallyport",
+    ]
+    .iter()
+    .flat_map(|d| files_holding(&env.root.join(d), value.as_bytes()))
+    .collect();
+    assert_eq!(held, std::slice::from_ref(&store));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains(&value));
+}
+
+/// Every regular file under `dir` (symlinks not followed) whose bytes hold `needle`.
+fn files_holding(dir: &Path, needle: &[u8]) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for e in std::fs::read_dir(dir).unwrap() {
+        let path = e.unwrap().path();
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        if meta.is_dir() {
+            found.extend(files_holding(&path, needle));
+        } else if meta.is_file()
+            && let Ok(bytes) = std::fs::read(&path)
+            && bytes.windows(needle.len()).any(|w| w == needle)
+        {
+            found.push(path);
+        }
+    }
+    found
 }

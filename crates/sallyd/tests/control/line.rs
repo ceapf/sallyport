@@ -715,6 +715,11 @@ fn m1_acceptance_line_1_through_sally_sandbox_run() {
         // Let the shell end; the run stops its session.
         (&go).write_all(b"go\n").unwrap();
         drop(go);
+        let end = std::time::Instant::now() + Duration::from_secs(120);
+        while !run.is_finished() {
+            assert!(std::time::Instant::now() < end, "the run never ended");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         let code = run.join().unwrap();
         assert_eq!((code, err.text().as_str()), (0, ""), "{}", out.text());
         let lines: Vec<String> = out.text().lines().map(str::to_owned).collect();

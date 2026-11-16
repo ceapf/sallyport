@@ -111,7 +111,9 @@ fn unregistering_twice_or_an_unknown_id_changes_nothing() {
     assert_eq!(a.redact(&v), "[REDACTED:N]");
 }
 
-/// Architect Q220: concurrent changes end with the exact union, in every target.
+/// Architect Q220: concurrent changes end with the exact union, in every target, one swap per
+/// change. That the swap runs under the lock is covered by reading: a swap moved outside it
+/// fails this test only when a stale union happens to land last.
 #[test]
 fn concurrent_changes_end_with_the_exact_union() {
     let (a, b, r) = two();
