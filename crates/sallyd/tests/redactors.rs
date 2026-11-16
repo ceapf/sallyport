@@ -66,7 +66,8 @@ fn a_sessions_secrets_are_redacted_from_start_until_its_stop() {
 /// A launch refused after its egress loaded the values (here: `sandbox.launch` cannot be
 /// written, which takes the same path as any failure after `prepare`, a `net.sock` bind
 /// failure included): the values are redacted while `sandbox.refuse` is written, and released
-/// after it.
+/// after it. Q129 (one launch path, every Err through `refused()`) is what makes this one
+/// refusal stand for the bind failure (architect Q225).
 #[test]
 fn a_refused_launch_releases_its_secrets_after_sandbox_refuse() {
     rt().block_on(async {
