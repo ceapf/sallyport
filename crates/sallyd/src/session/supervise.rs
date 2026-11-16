@@ -433,6 +433,7 @@ mod tests {
 
     use super::{STOP_ATTEMPTS, STOP_RETRY};
     use crate::egress::net::STOP_GRACE as EGRESS_STOP_GRACE;
+    use crate::rpc::listen::STOP_GRACE as LISTENER_STOP_GRACE;
     use crate::sandbox::{
         BACKSTOP_GRACE, EVENTS_TIMEOUT, PODMAN_TIMEOUT, RM_ATTEMPTS, RM_RETRY, START_GRACE,
         WALK_DEADLINE,
@@ -449,7 +450,9 @@ mod tests {
     ///   clock starts;
     /// - [`EXIT_POLL`]: the exit check that may run first;
     /// - [`STOP_DRAIN`]: the drain and the seal (`session.stop`) share one deadline; the agent
-    ///   listener's shutdown runs alongside it;
+    ///   listener's shutdown is joined with the drain (`drain`), so its grace
+    ///   ([`LISTENER_STOP_GRACE`]) adds no term while it is at most [`STOP_DRAIN`], which the
+    ///   test asserts;
     /// - per [`STOP_ATTEMPTS`]: the watchdog's last reading (up to two [`EVENTS_TIMEOUT`] reads,
     ///   one behind the event observer's lock), the exec gate behind a stage walk
     ///   ([`WALK_DEADLINE`]), and `remove_container`'s `RM_ATTEMPTS - 1` pauses of [`RM_RETRY`];
@@ -465,6 +468,10 @@ mod tests {
     /// the stop finds the container gone (accepted by Q60, Q194).
     #[test]
     fn the_backstop_grace_outlasts_the_timeout_stop_path() {
+        assert!(
+            LISTENER_STOP_GRACE <= STOP_DRAIN,
+            "{LISTENER_STOP_GRACE:?} > {STOP_DRAIN:?}"
+        );
         let waits = [
             START_GRACE,
             EXIT_POLL,

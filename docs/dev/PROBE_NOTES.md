@@ -324,8 +324,10 @@ tests in `egress/intercept_tests.rs` where the behaviour matters to the proxy.
   (read until EOF, 256 KiB or 1 s): 0 of 200. The fix is the drain in `write_reply`.
 - #76 then fixed the shim itself: a failed write stops only its own direction, and after a failed
   write toward the socket the shim discards the client's bytes until its end, and past its end
-  waits for the reply to be relayed, all within the linger from that write. RT-NET-09 asserts the 431 for 20 MiB of headers through busybox `nc`: 30 of 30 runs
-  of the final test (13 of 13 on earlier versions of it).
+  waits for the reply to be relayed, all within the linger from that write. RT-NET-09 asserts
+  the 431 for 20 MiB of headers through busybox `nc`. The final test passed 30 of 30 runs on
+  the shim before its half-close fix (the client's EOF no longer ends the discard's bound) and
+  10 of 10 on the merged shim; earlier versions of the test passed 13 of 13.
   Shutting the TCP read side instead of discarding would not do: after the shim's FIN, Linux
   resets a client that sends on, and busybox `nc` dies on that failed write.
 - A TCP socket that is shut down and then closed sends a reset only if unread bytes are still
