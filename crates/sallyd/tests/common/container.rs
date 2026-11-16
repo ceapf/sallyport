@@ -553,7 +553,9 @@ impl Lx {
             disk_floor: floor,
             egress: egress.clone(),
             redactors: Arc::clone(&redactors),
-            oplog: sallyd::oplog::Oplog::new(std::io::sink()),
+            // The same readable oplog as the redactors' second target, so a test reads the
+            // launcher's lines too (`session.closed` not audited, for one).
+            oplog: oplog.clone(),
             installation: installation.clone(),
         });
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
