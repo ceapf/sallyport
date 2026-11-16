@@ -90,9 +90,10 @@ MUTANTS_FILES := crates/sally-core/src/manifest/validate/*.rs crates/sally-core/
 # Every mutation run holds the per-user `disk-free` lock shared (scripts/disk-lock.sh, architect
 # ruling D1): its copies and builds move the free space the disk-floor tests measure, so those
 # tests wait for it, in either lane. Never add --test=disk to a mutants test list. Run local
-# mutation runs only through these targets, with a file override (e.g. `make mutants-wide-sallyd
-# MUTANTS_WIDE_SALLYD=<file>`); never bare `cargo mutants`: it skips the disk-free lock and the
-# TMPDIR move.
+# mutation runs only through these targets, with a file override and an output directory (e.g.
+# `make mutants-wide-sallyd MUTANTS_WIDE_SALLYD=<file> MUTANTS_OUT=target/<dir>` or `make mutants
+# MUTANTS_FILES=<file> MUTANTS_OUT=target/<dir>`; unset, mutants.out lands in the repo root, the
+# nightly's path); never bare `cargo mutants`: it skips the disk-free lock and the TMPDIR move.
 MUTANTS_TMP := $(CURDIR)/target/mutants-tmp
 DISK_LOCK := bash scripts/disk-lock.sh
 # Every test process a mutation run starts goes through cargo's target runner, which caps its data
