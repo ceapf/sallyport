@@ -51,6 +51,9 @@ pub struct Intent {
     pub memory: Option<u64>,
     /// `--hostname`; `None` lets podman use the container id.
     pub hostname: Option<String>,
+    /// `--timeout`, in seconds: the conmon backstop (#92, architect Q192). Not in the OCI
+    /// config: the verifier compares it with podman's `.Config.Timeout`, and `None` requires 0.
+    pub timeout: Option<u64>,
     /// `--env` pairs, in order.
     pub env: Vec<(String, String)>,
     /// `-v` mounts, in order.
@@ -76,6 +79,7 @@ impl Intent {
             cpu_millis: None,
             memory: None,
             hostname: None,
+            timeout: None,
             env: Vec::new(),
             mounts: Vec::new(),
             image: String::new(),

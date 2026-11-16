@@ -56,8 +56,9 @@ const MIN_GAP: Duration = Duration::from_secs(2);
 const WALK_SPACING: u32 = 4;
 /// How often the observer reads the cgroup's event counters (architect Q48).
 const EVENTS_POLL: Duration = Duration::from_secs(1);
-/// A read of the two event files that takes longer counts as unreadable.
-const EVENTS_TIMEOUT: Duration = Duration::from_secs(5);
+/// A read of the two event files that takes longer counts as unreadable. A stop's last reading
+/// may wait for two of them (the backstop relation test, #92, architect Q198).
+pub(crate) const EVENTS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What a session's stage task measures.
 #[derive(Debug, Clone)]

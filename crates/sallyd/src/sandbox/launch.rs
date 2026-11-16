@@ -74,7 +74,7 @@ const AUDIT_TEXT_CAP: usize = 4096;
 /// How long after `podman start` the container must still be running. An entry point that
 /// cannot run (a missing interpreter, a crash at startup) exits well within it; a later exit is
 /// the session's business (Task 12).
-const START_GRACE: Duration = Duration::from_millis(250);
+pub(crate) const START_GRACE: Duration = Duration::from_millis(250);
 /// How often a launch nobody received retries its `stop`.
 const STOP_RETRY: Duration = Duration::from_secs(2);
 

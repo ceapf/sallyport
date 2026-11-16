@@ -710,10 +710,12 @@ impl Lx {
         }
     }
 
-    /// `podman create <argv>` then `podman start`, both hermetic; the container id.
+    /// `podman create <argv>`, `podman init`, then `podman start`, all hermetic, in the
+    /// launcher's order (conmon, and a `--timeout` clock, start at `init`); the container id.
     pub async fn create_and_start(&self, argv: Vec<String>) -> String {
         let out = self.hermetic(&argv).await;
         let id = out.lines().last().unwrap().to_owned();
+        self.hermetic(&["init".to_owned(), id.clone()]).await;
         self.hermetic(&["start".to_owned(), id.clone()]).await;
         id
     }
@@ -741,18 +743,37 @@ impl Lx {
         tag: &str,
         leave_out: LeaveOut<'_>,
     ) -> String {
+        let argv = self.product_workspace_argv(v, tag);
+        self.control(argv, leave_out).await
+    }
+
+    /// The product-built workspace argv for `v` and session `tag`, its directories made.
+    fn product_workspace_argv(&self, v: &ValidatedManifest, tag: &str) -> Vec<String> {
         let paths = self.paths(tag);
         let dirs = SessionDirs::create(&paths, &self.xdg, &[], 0).unwrap();
         let scan = sallyd::sandbox::scan_mounts(v, &ScanLimits::default()).unwrap();
-        let argv = sallyd::sandbox::workspace_argv(
+        sallyd::sandbox::workspace_argv(
             &self.common_args(&dirs),
             &paths,
             v,
             &scan,
             Some(&test_image()),
         )
-        .unwrap();
-        self.control(argv, leave_out).await
+        .unwrap()
+    }
+
+    /// RT-AG-16 (#92, architect Q196): the product-built workspace argv for `v` and session
+    /// `tag`, checked to carry exactly one `--timeout` of `runtime.timeout` + 300 s, with that
+    /// value replaced by `secs` (a short stand-in), created and started by hermetic podman with
+    /// no `sallyd` at all; the container id.
+    #[allow(dead_code)] // Only the launch tests run the backstop.
+    pub async fn backstop_workspace(&self, v: &ValidatedManifest, tag: &str, secs: u64) -> String {
+        let mut argv = self.product_workspace_argv(v, tag);
+        let at = only_timeout(&argv);
+        let want = v.manifest().runtime.timeout.as_secs() + 300;
+        assert_eq!(argv[at + 1], want.to_string(), "the product backstop");
+        argv[at + 1] = secs.to_string();
+        self.create_and_start(argv).await
     }
 
     /// [`Lx::control_workspace`] for any role: `argv` is a product builder's output
@@ -780,6 +801,10 @@ impl Lx {
                     .unwrap();
                 let recursive = format!("{}rbind", spec.strip_suffix("bind").unwrap());
                 *spec = recursive;
+            }
+            LeaveOut::Timeout => {
+                let at = only_timeout(&argv);
+                argv.drain(at..at + 2);
             }
         }
         self.create_and_start(argv).await
@@ -825,6 +850,37 @@ pub enum LeaveOut<'a> {
     Source { guest: &'a str, host: &'a Path },
     /// Non-recursive binds: the bind at `guest` becomes `rbind`.
     NonRecursive { guest: &'a str },
+    /// The conmon backstop (#92): `--timeout` and its value are removed.
+    Timeout,
+}
+
+/// The index of the argv's one `--timeout` (its value follows); panics unless there is exactly
+/// one.
+fn only_timeout(argv: &[String]) -> usize {
+    let at: Vec<usize> = argv
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.starts_with("--timeout"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(at.len(), 1, "exactly one --timeout in {argv:?}");
+    assert_eq!(argv[at[0]], "--timeout", "two tokens");
+    at[0]
+}
+
+/// Whether `podman ps --all` lists a container named exactly `name`; a failed `ps` panics, so
+/// it never reads as "gone".
+#[allow(dead_code)] // Only the launch tests probe one name.
+pub fn listed_name(name: &str) -> bool {
+    let out = podman(&["ps", "--all", "--format", "{{.Names}}"]);
+    assert!(
+        out.status.success(),
+        "podman ps: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .any(|n| n == name)
 }
 
 pub fn ids() -> UserIds {

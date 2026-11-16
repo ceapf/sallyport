@@ -35,6 +35,7 @@ fn facts() -> Facts {
             rootfs: format!("{G}/overlay/{}/merged", "d".repeat(64)),
             static_dir: s,
             run_dir: r,
+            timeout: 7500,
         },
         image: ImageConfig {
             env: Some(vec!["PATH=/usr/bin:/bin".into()]),
@@ -63,6 +64,7 @@ fn intent() -> Intent {
     i.cpu_millis = Some(4000);
     i.memory = Some(MEM);
     i.hostname = Some("sandbox".into());
+    i.timeout = Some(7500);
     i.env = vec![("HTTP_PROXY".into(), "http://127.0.0.1:3128".into())];
     i.mounts = vec![
         Wanted::Bind {
@@ -334,7 +336,33 @@ fn the_config_podman_writes_for_each_role_passes() {
     inf.role = Role::Inference;
     inf.hostname = None;
     inf.memory = None;
-    check(&good(&inf, &f), &inf, &f).unwrap();
+    inf.timeout = None;
+    let mut fi = facts();
+    fi.paths.timeout = 0;
+    check(&good(&inf, &fi), &inf, &fi).unwrap();
+}
+
+/// RT-AG-16 (#92, architect Q193): podman's `.Config.Timeout` is exactly the argv's
+/// `--timeout`, and 0 (none) when the argv has none; anything else is `timeout`.
+#[test]
+fn the_timeout_podman_recorded_is_exactly_the_argv_s() {
+    let i = intent();
+    let v = good(&i, &facts());
+    check(&v, &i, &facts()).unwrap();
+    let mismatch = |i: &Intent, t: u64| {
+        let mut f = facts();
+        f.paths.timeout = t;
+        check(&v, i, &f).map_err(|e| e.field)
+    };
+    for t in [7499, 7501, 0, u64::MAX] {
+        assert_eq!(mismatch(&i, t), Err("timeout".to_owned()), "{t}");
+    }
+    let mut none = intent();
+    none.timeout = None;
+    assert_eq!(mismatch(&none, 0), Ok(()));
+    for t in [1, 7500] {
+        assert_eq!(mismatch(&none, t), Err("timeout".to_owned()), "{t}");
+    }
 }
 
 #[test]

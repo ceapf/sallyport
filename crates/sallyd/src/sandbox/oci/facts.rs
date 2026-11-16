@@ -1,7 +1,7 @@
 //! What the verifier needs besides the intent, read through hermetic podman at launch time and
 //! checked here (architect Q99, Q101, Q116: the checks are decisions, so they are pure and in the
-//! mutation scope): the container's own directories from `podman inspect`, and the image's
-//! `Config`.
+//! mutation scope): the container's own directories and podman's `.Config.Timeout` (the conmon
+//! backstop, #92, architect Q193) from `podman inspect`, and the image's `Config`.
 
 use serde::Deserialize;
 
@@ -10,7 +10,8 @@ use super::Mismatch;
 /// The `podman inspect --format` template whose output [`ContainerPaths::parse`] reads: one JSON
 /// object, every value JSON-escaped by the template.
 pub const INSPECT_FORMAT: &str = "{\"static\":{{json .StaticDir}},\"config\":{{json .OCIConfigPath}},\
-     \"hostname\":{{json .HostnamePath}},\"rootfs\":{{json .GraphDriver.Data.MergedDir}}}";
+     \"hostname\":{{json .HostnamePath}},\"rootfs\":{{json .GraphDriver.Data.MergedDir}},\
+     \"timeout\":{{json .Config.Timeout}}}";
 
 /// The `podman image inspect --format` template whose output [`ImageConfig::parse`] reads.
 pub const IMAGE_FORMAT: &str = "{{json .Config}}";
@@ -26,9 +27,11 @@ struct Inspected {
     config: String,
     hostname: String,
     rootfs: String,
+    /// A non-negative integer: a string, a float, a negative number or `null` refuses.
+    timeout: u64,
 }
 
-/// The container's own directories, checked against its id.
+/// The container's own directories, checked against its id, and its backstop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerPaths {
     /// The container id (64 lowercase hex digits).
@@ -43,6 +46,9 @@ pub struct ContainerPaths {
     pub hostname: String,
     /// `<graphroot>/overlay/<layer>/merged`.
     pub rootfs: String,
+    /// Podman's `.Config.Timeout`: the seconds after `podman init` at which conmon kills the
+    /// container, 0 for none (#92; not part of the OCI config).
+    pub timeout: u64,
 }
 
 fn inspect_err(why: impl AsRef<str>) -> Mismatch {
@@ -128,6 +134,7 @@ impl ContainerPaths {
             config: i.config,
             hostname: i.hostname,
             rootfs: i.rootfs,
+            timeout: i.timeout,
         })
     }
 }
@@ -204,8 +211,45 @@ mod tests {
     fn inspect(static_dir: &str, config: &str, hostname: &str, rootfs: &str) -> String {
         serde_json::json!({
             "static": static_dir, "config": config, "hostname": hostname, "rootfs": rootfs,
+            "timeout": 7500,
         })
         .to_string()
+    }
+
+    /// `good()` as inspect output, with `timeout` set to `t` (`None`: the key left out).
+    fn with_timeout(t: Option<serde_json::Value>) -> Result<ContainerPaths, Mismatch> {
+        let [a, b, c, d] = good();
+        let mut v: serde_json::Value = serde_json::from_str(&inspect(&a, &b, &c, &d)).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        match t {
+            Some(t) => obj.insert("timeout".into(), t),
+            None => obj.remove("timeout"),
+        };
+        ContainerPaths::parse(v.to_string().as_bytes(), &id())
+    }
+
+    /// RT-AG-16 (#92, architect Q193): podman's `.Config.Timeout` is read as a non-negative
+    /// integer; any other shape, or no key at all, refuses as `inspect`.
+    #[test]
+    fn the_timeout_is_a_strict_non_negative_integer() {
+        use serde_json::json;
+        assert_eq!(parse(&good()).unwrap().timeout, 7500);
+        assert_eq!(with_timeout(Some(json!(0))).unwrap().timeout, 0);
+        assert_eq!(
+            with_timeout(Some(json!(u64::MAX))).unwrap().timeout,
+            u64::MAX
+        );
+        for bad in [
+            json!(-1),
+            json!(7500.5),
+            json!("7500"),
+            json!(null),
+            json!([7500]),
+        ] {
+            let e = with_timeout(Some(bad.clone())).unwrap_err();
+            assert_eq!(e.field, "inspect", "{bad}");
+        }
+        assert_eq!(with_timeout(None).unwrap_err().field, "inspect");
     }
 
     fn good() -> [String; 4] {

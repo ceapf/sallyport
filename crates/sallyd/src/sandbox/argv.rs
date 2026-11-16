@@ -9,8 +9,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::time::Duration;
 
-use sally_core::manifest::{ByteSize, Cpus, MountMode, NetworkMode, ValidatedManifest};
+use sally_core::manifest::{
+    ByteSize, Cpus, Duration as ManifestDuration, MountMode, NetworkMode, ValidatedManifest,
+};
 
 use super::check::{Allowed, Grant, Source, check_argv};
 use super::oci::intent::{Built, Intent, Wanted};
@@ -63,6 +66,24 @@ const HARNESS_PIDS: u32 = 128;
 /// `/tmp` of the harness and inference containers.
 const SMALL_TMP: u64 = 256 * 1024 * 1024;
 const INFERENCE_PIDS: u32 = 64;
+/// How long past `runtime.timeout` conmon kills a session's container by itself (`--timeout`,
+/// #92, architect Q60, Q192): the bound on a workspace or harness container whose `sallyd` was
+/// killed outright. Longer than the supervisor's whole timeout stop, so `session.timeout` comes
+/// first (the relation test in `session/supervise.rs`, Q194). Counted from `podman init`.
+pub(crate) const BACKSTOP_GRACE: Duration = Duration::from_secs(300);
+
+/// The `--timeout` of a session's container, in seconds: `runtime.timeout` +
+/// [`BACKSTOP_GRACE`]. The manifest's duration has whole-second resolution, so nothing is
+/// rounded and the backstop never fires before that.
+///
+/// # Errors
+/// [`ArgvError::Input`] naming `runtime.timeout` when the sum overflows.
+fn backstop_secs(timeout: ManifestDuration) -> Result<u64, ArgvError> {
+    match timeout.as_secs().checked_add(BACKSTOP_GRACE.as_secs()) {
+        Some(s) => Ok(s),
+        None => input("runtime.timeout: too long for the conmon backstop"),
+    }
+}
 
 /// A path as it may appear in a `-v`, `--security-opt` or `--runtime` argument: absolute, UTF-8,
 /// and free of `:`, `,` and control characters, which would change the meaning of the argument.
@@ -197,6 +218,12 @@ impl Argv {
         }
     }
 
+    /// RT-AG-16: the conmon backstop of a session's container (#92, architect Q192).
+    fn backstop(&mut self, secs: u64) {
+        self.intent.timeout = Some(secs);
+        self.push(["--timeout", &secs.to_string()]);
+    }
+
     fn hostname(&mut self, name: &str) {
         self.intent.hostname = Some(name.to_owned());
         self.push(["--hostname", name]);
@@ -258,8 +285,15 @@ impl Argv {
 }
 
 /// The parts of [`Allowed`] every role shares.
-fn allowed(c: &CommonArgs, role: Role, sources: Vec<Source>, scratch: Option<&Path>) -> Allowed {
+fn allowed(
+    c: &CommonArgs,
+    role: Role,
+    sources: Vec<Source>,
+    scratch: Option<&Path>,
+    timeout: Option<u64>,
+) -> Allowed {
     Allowed {
+        timeout,
         role,
         runtime: c.runtime.path().to_owned(),
         hooks_dir: c.hooks_dir.clone(),
@@ -329,6 +363,8 @@ pub fn workspace_build(
         Some(m.runtime.memory.bytes()),
     );
     a.push(["--init", "--env-host=false"]);
+    let backstop = backstop_secs(m.runtime.timeout)?;
+    a.backstop(backstop);
     a.hostname("sandbox");
     workspace_env(&mut a, v);
     let mut sources = workspace_mounts(&mut a, paths, v, &scans)?;
@@ -355,6 +391,7 @@ pub fn workspace_build(
         Role::Workspace,
         sources,
         Some(paths.data_root()),
+        Some(backstop),
     ))
 }
 
@@ -545,6 +582,8 @@ pub fn harness_build(
         Some(HARNESS_MEMORY),
     );
     a.push(["--init", "--env-host=false"]);
+    let backstop = backstop_secs(v.manifest().runtime.timeout)?;
+    a.backstop(backstop);
     a.hostname("sandbox");
     a.env("OPENAI_BASE_URL", OPENAI_BASE_URL);
     a.env("OPENAI_API_KEY", HARNESS_API_KEY);
@@ -564,6 +603,7 @@ pub fn harness_build(
         Role::Harness,
         vec![source(&sockets, SOCKETS_GUEST, Grant::Ro)],
         None,
+        Some(backstop),
     ))
 }
 
@@ -625,123 +665,10 @@ pub fn inference_build(c: &CommonArgs, s: &InferenceSpec) -> Result<Built, ArgvE
             source(&s.socket_dir, SOCKETS_GUEST, Grant::Rw),
         ],
         None,
+        None,
     ))
 }
 
 #[cfg(test)]
-mod tests {
-    #![allow(clippy::unwrap_used)]
-
-    use std::path::PathBuf;
-
-    use super::*;
-
-    /// Each character or segment that would change a `-v`/`--security-opt` argument's meaning
-    /// is refused on its own; the clean path is the control.
-    #[test]
-    fn path_args_refuse_every_separator_and_unclean_segment() {
-        assert_eq!(path_arg(Path::new("/a/b"), "p").unwrap(), "/a/b");
-        for bad in [
-            "/a:b", "/a,b", "/a\nb", "/a//b", "/a/./b", "/a/../b", "/a/b/", "a/b",
-        ] {
-            let e = path_arg(Path::new(bad), "p").unwrap_err();
-            assert!(matches!(e, ArgvError::Input(_)), "{bad:?}: {e:?}");
-        }
-    }
-
-    /// The scanner is the only constructor of a [`GitScan`] outside this crate; the builder still
-    /// re-validates every entry (defense in depth) and these are its refusals.
-    #[test]
-    fn git_entries_are_plain_relative_paths_ending_in_one_git_segment() {
-        for ok in [".git", "a/.git", "a/b-c/.git"] {
-            assert!(git_rel(Path::new(ok), "x").is_ok(), "{ok}");
-        }
-        for bad in [
-            "../x/.git",
-            "/abs/.git",
-            "a:b/.git",
-            "a,ro/.git",
-            "not-git",
-            "a//.git",
-            ".git/modules/x/.git",
-            "x/./.git",
-            "",
-            "a/.git/",
-            "a\n/.git",
-        ] {
-            assert!(git_rel(Path::new(bad), "x").is_err(), "{bad:?}");
-        }
-    }
-
-    fn scan(mount: usize, dirs: &[&str], files: &[&str]) -> GitScan {
-        GitScan::unchecked(
-            mount,
-            dirs.iter().map(PathBuf::from).collect(),
-            files.iter().map(PathBuf::from).collect(),
-        )
-    }
-
-    fn manifest(dir: &Path) -> ValidatedManifest {
-        use sally_core::manifest::{HostEnv, load};
-        let home = dir.join("home");
-        for d in ["a", "b"] {
-            std::fs::create_dir_all(home.join(d)).unwrap();
-        }
-        let env = HostEnv {
-            home: home.clone(),
-            other_homes: Vec::new(),
-            xdg_config_home: None,
-            xdg_data_home: None,
-            xdg_runtime_dir: None,
-            podman_storage: Vec::new(),
-            nproc: 8,
-            mem_bytes: 16 << 30,
-        };
-        let body = "apiVersion: sallyport/v1\nkind: Manifest\nname: t\nmodel:\n  ref: any\n\
-                    filesystem:\n  mounts:\n    - {host: \"~/a\", guest: /workspace/a, mode: rw}\n\
-                    \x20   - {host: \"~/b\", guest: /workspace/b, mode: staged}\n";
-        load(body, &env, &std::collections::BTreeSet::new())
-            .unwrap()
-            .manifest
-    }
-
-    #[test]
-    fn scans_must_cover_each_rw_mount_exactly_once() {
-        let dir = std::env::current_dir()
-            .unwrap()
-            .join("../../target/argv-unit")
-            .join(std::process::id().to_string());
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let dir = std::fs::canonicalize(&dir).unwrap();
-        let v = manifest(&dir);
-        assert!(scans_by_mount(&v, &[scan(0, &[], &[])]).is_ok());
-        for bad in [
-            vec![scan(0, &[], &[]), scan(0, &[], &[])],
-            vec![scan(0, &[], &[]), scan(1, &[".git"], &[])],
-            vec![scan(0, &[], &[]), scan(7, &[".git"], &[])],
-            vec![scan(0, &[".git"], &[".git"])],
-        ] {
-            let e = scans_by_mount(&v, &bad).unwrap_err();
-            assert!(e.to_string().contains("filesystem.mounts["), "{e}");
-        }
-        // A missing scan is refused when the argv is built.
-        let mut a = Argv {
-            args: Vec::new(),
-            intent: Intent::begin(
-                Role::Workspace,
-                crate::sandbox::UserIds { uid: 1, gid: 1 },
-                dir.clone(),
-            ),
-        };
-        let paths = SessionPaths::new(
-            super::super::types::SessionId::parse("s").unwrap(),
-            &dir.join("run"),
-            &dir.join("data"),
-        )
-        .unwrap();
-        let e = workspace_mounts(&mut a, &paths, &v, &BTreeMap::new()).unwrap_err();
-        assert!(e.to_string().contains("rw mount has no git scan"), "{e}");
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-}
+#[path = "argv_tests.rs"]
+mod tests;

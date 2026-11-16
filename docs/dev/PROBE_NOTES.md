@@ -112,6 +112,14 @@ line per fact, with where it was found. Check a note again before relying on it 
 - A `-v src:dst:…,rbind` on 4.9.3 rootless carries a mount made below `src` in podman's own
   mount namespace (`podman unshare mount --bind`) into the container; the product's `…,bind`
   does not. RT-FS-16's control is that one word. (#122)
+- `create --rm --init --timeout N` on 4.9.3 rootless, then `init`, then `start` (the order of
+  `launch/start.rs`): `podman inspect` shows `.Config.Timeout` = N, and conmon's argv carries
+  `--timeout=N`. The value is not in the OCI `config.json`. The clock starts at `init`, when
+  conmon is spawned, not at `start`: with N = 8, create at 0 s, init at 6 s and start at 12 s,
+  the container was gone at 14–15 s. A container frozen with `podman pause` (how the disk
+  watchdog freezes one) is killed at its deadline too, and the `--rm` cleanup then removes it
+  with no podman process left running. Q60 assumed the clock starts at `start`; it starts at
+  `init`. (#92, Q60, Q194)
 
 ## Kernel and namespaces
 

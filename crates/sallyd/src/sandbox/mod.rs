@@ -57,3 +57,12 @@ pub use types::{
     Installation, InstancePaths, OverlayDirs, Role, SessionId, SessionPaths, UserIds,
     VerifiedModel,
 };
+/// For the backstop relation test in `session/supervise.rs` (#92, architect Q194, Q198).
+#[cfg(test)]
+pub(crate) use {
+    argv::BACKSTOP_GRACE,
+    commands::{PODMAN_TIMEOUT, RM_ATTEMPTS, RM_RETRY},
+    launch::START_GRACE,
+    stage::WALK_DEADLINE,
+    watchdog::EVENTS_TIMEOUT,
+};

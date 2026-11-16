@@ -129,6 +129,7 @@ fn the_intent_records_exactly_what_the_argv_asks_for() {
     assert_eq!(i.command, ["/opt/sallyport/entry", "--idle"]);
     assert_eq!(i.image, ws_image().as_str());
     assert!(!i.gpu);
+    assert_eq!(i.timeout, Some(BACKSTOP));
     let access: Vec<(&str, Option<bool>)> = i
         .mounts
         .iter()
@@ -155,10 +156,12 @@ fn the_intent_records_exactly_what_the_argv_asks_for() {
         (Role::Harness, Some(1000), Some(1 << 30))
     );
     assert_eq!(h.env.len(), 2);
+    assert_eq!(h.timeout, Some(BACKSTOP));
     let c = inference_build(&f.common, &inference(&f, false, None))
         .unwrap()
         .intent;
     assert_eq!((c.hostname, c.memory, c.gpu), (None, None, false));
+    assert_eq!(c.timeout, None);
     assert!(
         inference_build(&f.common, &inference(&f, true, None))
             .unwrap()
@@ -525,8 +528,13 @@ fn allowed(f: &Fx, role: Role, project: Grant) -> Allowed {
         ],
         scratch: Some(f.paths.data_root().to_owned()),
         installation: f.common.installation.clone(),
+        // The default runtime.timeout (2 h) plus the backstop grace (#92).
+        timeout: Some(BACKSTOP),
     }
 }
+
+/// `--timeout` of a manifest with the default `runtime.timeout`: 2 h + 300 s.
+const BACKSTOP: u64 = 7500;
 
 fn with(a: &[String], extra: &[&str]) -> Vec<String> {
     // Insert just after `create`, where podman reads options.
@@ -674,6 +682,7 @@ fn checker_requires_swap_equal_to_memory() {
             },
         ],
         scratch: None,
+        timeout: None,
         ..allowed.clone()
     };
     // The control: the same argv without the swap flag is accepted.
@@ -1086,6 +1095,111 @@ fn checker_requires_every_hardening_option_exactly_once() {
     }
 }
 
+/// RT-AG-16 (#92, architect Q192): the workspace and the harness carry exactly one
+/// `--timeout`, their manifest's `runtime.timeout` + 300 s in canonical digits, as two tokens;
+/// inference carries none; and an `Allowed` that does not fit its role is refused.
+#[test]
+fn checker_holds_the_backstop_to_the_manifest_timeout() {
+    let f = Fx::new();
+    let (a, allowed) = base(&f);
+    check_argv(&a, &allowed).unwrap();
+    assert!(a.windows(2).any(|w| w == ["--timeout", "7500"]), "{a:?}");
+    for v in ["7499", "7501", "07500", "+7500", "7500s", "0", ""] {
+        let bad = replacing(&a, "--timeout", &["--timeout", v]);
+        assert_forbidden(&bad, &allowed, &format!("value {v:?}"));
+    }
+    assert_forbidden(&replacing(&a, "--timeout", &[]), &allowed, "missing");
+    let eq = replacing(&a, "--timeout", &["--timeout=7500"]);
+    assert_forbidden(&eq, &allowed, "= form");
+    assert_forbidden(&with(&a, &["--timeout", "7500"]), &allowed, "twice");
+
+    // Another runtime.timeout gives another exact value.
+    let v = f.load(&format!(
+        "runtime:\n  timeout: 1m\n{}",
+        mounts(&[mount("~/code/myproject", "/workspace/p", "ro")])
+    ));
+    let short = workspace_argv(&f.common, &f.paths, &v, &f.scan(&v), Some(&ws_image())).unwrap();
+    assert!(
+        short.windows(2).any(|w| w == ["--timeout", "360"]),
+        "{short:?}"
+    );
+    let at = |t: u64| Allowed {
+        timeout: Some(t),
+        ..allowed.clone()
+    };
+    check_argv(&short, &at(360)).unwrap();
+    assert_forbidden(&short, &allowed, "the default manifest's value");
+
+    // The policy itself: a workspace without a bound, or one podman reads as none or as no
+    // longer than the grace, is refused whatever the argv says.
+    let none = Allowed {
+        timeout: None,
+        ..allowed.clone()
+    };
+    assert_forbidden(&a, &none, "workspace with no timeout");
+    assert_forbidden(&replacing(&a, "--timeout", &[]), &none, "neither");
+    for t in [0, 1, 300] {
+        let argv = replacing(&a, "--timeout", &["--timeout", &t.to_string()]);
+        assert_forbidden(&argv, &at(t), &format!("Some({t})"));
+    }
+    let argv = replacing(&a, "--timeout", &["--timeout", "301"]);
+    check_argv(&argv, &at(301)).unwrap();
+
+    // Harness: the same rule.
+    let h = harness_argv(&f.common, &f.paths, &f.load(""), &image("harness", D0)).unwrap();
+    let ha = Allowed {
+        role: Role::Harness,
+        sources: vec![Source {
+            path: f.paths.harness_sockets(),
+            guest: "/run/sallyport".into(),
+            grant: Grant::Ro,
+        }],
+        scratch: None,
+        ..allowed.clone()
+    };
+    check_argv(&h, &ha).unwrap();
+    assert_forbidden(&replacing(&h, "--timeout", &[]), &ha, "harness missing");
+    let wrong = replacing(&h, "--timeout", &["--timeout", "7501"]);
+    assert_forbidden(&wrong, &ha, "harness wrong value");
+    let ha_none = Allowed {
+        timeout: None,
+        ..ha.clone()
+    };
+    assert_forbidden(&h, &ha_none, "harness with no timeout");
+
+    // Inference: never, and its policy may not name one.
+    let spec = inference(&f, false, None);
+    let inf = inference_argv(&f.common, &spec).unwrap();
+    assert!(!inf.iter().any(|x| x.starts_with("--timeout")), "{inf:?}");
+    let ia = Allowed {
+        role: Role::Inference,
+        sources: vec![
+            Source {
+                path: spec.model.path().to_owned(),
+                guest: "/models/model.gguf".into(),
+                grant: Grant::Ro,
+            },
+            Source {
+                path: spec.socket_dir.clone(),
+                guest: "/run/sallyport".into(),
+                grant: Grant::Rw,
+            },
+        ],
+        scratch: None,
+        timeout: None,
+        ..allowed.clone()
+    };
+    check_argv(&inf, &ia).unwrap();
+    let with_t = with(&inf, &["--timeout", "7500"]);
+    assert_forbidden(&with_t, &ia, "inference --timeout");
+    let ia_some = Allowed {
+        timeout: Some(BACKSTOP),
+        ..ia.clone()
+    };
+    assert_forbidden(&inf, &ia_some, "inference policy with a timeout");
+    assert_forbidden(&with_t, &ia_some, "inference with both");
+}
+
 #[test]
 fn checker_requires_each_roles_fixed_command_and_a_pinned_image() {
     let f = Fx::new();
@@ -1125,6 +1239,7 @@ fn checker_requires_each_roles_fixed_command_and_a_pinned_image() {
             },
         ],
         scratch: None,
+        timeout: None,
         ..allowed.clone()
     };
     check_argv(&inf, &ia).unwrap();
