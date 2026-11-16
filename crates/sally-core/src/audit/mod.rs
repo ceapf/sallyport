@@ -32,7 +32,7 @@ mod tail;
 mod verify;
 mod writer;
 
-pub use declared::Piece;
+pub use declared::{Piece, assembled};
 pub use entry::{
     Actor, Entry, GENESIS_HASH, MAX_ARGS_BYTES, MAX_LINE_BYTES, VerifyErrorKind, parse_line,
 };

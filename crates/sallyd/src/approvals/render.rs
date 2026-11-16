@@ -12,9 +12,17 @@
 //! escape; the full text travels with the prompt so a client can reveal it.
 //! Text the model supplied (a reason, a description) is never part of the action: it is one
 //! line in its own field, cut at [`NOTE_CHARS`], and the terminal labels it as untrusted.
+//!
+//! The text is built once, as pieces ([`action_pieces`]): the broker's own words are literals,
+//! everything the request chose is a raw piece. The prompt shows them assembled, unmasked (the
+//! human approves the exact request, SI-5); an audit entry declares the same pieces, so the
+//! writer masks each raw piece whole before the text is escaped and cut (architect Q276, Q288).
+//! The escape and the cut are sally-core's (`text::escape_backslash_quoted`, `cut_escaped`).
 
 use std::fmt::Write as _;
+use std::sync::Arc;
 
+use sally_core::audit::Piece;
 use sha2::{Digest, Sha256};
 
 use super::action::{Action, Bound, Target, hex};
@@ -147,74 +155,131 @@ fn note_text(n: &str) -> String {
     out
 }
 
-/// The action as text: fixed broker words, then each value escaped and quoted.
+/// The action as text: fixed broker words, then each value escaped and quoted; the
+/// [`action_pieces`] assembled, unmasked and uncut.
 #[must_use]
 pub fn action_text(a: &Action) -> String {
+    sally_core::audit::assembled(&action_pieces(a))
+}
+
+/// The action as pieces (architect Q288 a, c): the broker's fixed words and the sizes and
+/// digests it computed are literals; every value the request chose is a raw piece, quoted, and
+/// the numbers it chose (a read's offset and length) are raw pieces unquoted. The prompt shows
+/// them assembled ([`action_text`]); an audit entry declares them, so the writer masks each raw
+/// piece whole before the text is escaped and cut. Raw pieces are never cut here.
+#[must_use]
+pub fn action_pieces(a: &Action) -> Vec<Piece> {
+    let mut p = Pieces(Vec::new());
     match a {
         Action::Shell { argv, cwd } => {
-            let args: Vec<String> = argv.iter().map(|x| quoted(x)).collect();
-            format!("run [{}] in {}", args.join(" "), quoted(cwd))
+            p.lit("run [");
+            for (i, x) in argv.iter().enumerate() {
+                if i > 0 {
+                    p.lit(" ");
+                }
+                p.quoted(x);
+            }
+            p.lit("] in ");
+            p.quoted(cwd);
         }
         Action::FsRead {
             target,
             offset,
             len,
-        } => format!("read at most {len} bytes at {offset} of {}", place(target)),
-        Action::FsList { target } => format!("list {}", place(target)),
-        Action::FsWrite { target, content } => format!(
-            "write {} bytes (sha256 {}) to {}",
-            content.len(),
-            content.sha256(),
-            place(target)
-        ),
-        Action::FsDelete { target } => format!("delete {}", place(target)),
+        } => {
+            p.lit("read at most ");
+            p.raw(&len.to_string());
+            p.lit(" bytes at ");
+            p.raw(&offset.to_string());
+            p.lit(" of ");
+            p.place(target);
+        }
+        Action::FsList { target } => {
+            p.lit("list ");
+            p.place(target);
+        }
+        Action::FsWrite { target, content } => {
+            p.lit(&format!(
+                "write {} bytes (sha256 {}) to ",
+                content.len(),
+                content.sha256()
+            ));
+            p.place(target);
+        }
+        Action::FsDelete { target } => {
+            p.lit("delete ");
+            p.place(target);
+        }
         Action::Fetch {
             method,
             url,
             headers,
             body,
         } => {
-            let hs: Vec<String> = headers
-                .iter()
-                .map(|(n, v)| format!("{}: {}", quoted(n), quoted(v)))
-                .collect();
-            format!(
-                "fetch {} {} headers [{}] body {} bytes (sha256 {})",
-                quoted(method),
-                quoted(url),
-                hs.join(", "),
+            p.lit("fetch ");
+            p.quoted(method);
+            p.lit(" ");
+            p.quoted(url);
+            p.lit(" headers [");
+            for (i, (n, v)) in headers.iter().enumerate() {
+                if i > 0 {
+                    p.lit(", ");
+                }
+                p.quoted(n);
+                p.lit(": ");
+                p.quoted(v);
+            }
+            p.lit(&format!(
+                "] body {} bytes (sha256 {})",
                 body.len(),
                 body.sha256()
-            )
+            ));
         }
-        Action::Mcp { server, tool, args } => format!(
-            "call {} of MCP server {} with arguments {} ({} bytes, sha256 {})",
-            quoted(tool),
-            quoted(server),
-            quoted(&String::from_utf8_lossy(args.bytes())),
-            args.len(),
-            args.sha256()
-        ),
-    }
-}
-
-fn place(t: &Target) -> String {
-    format!("host {} (guest {})", quoted(&t.host), quoted(&t.guest()))
-}
-
-/// `s` escaped and in double quotes, `"` escaped as `\"`.
-fn quoted(s: &str) -> String {
-    let mut out = String::with_capacity(s.len().saturating_add(2));
-    out.push('"');
-    for c in s.chars() {
-        if c == '"' {
-            out.push_str("\\\"");
-        } else {
-            push_escaped(&mut out, c);
+        Action::Mcp { server, tool, args } => {
+            p.lit("call ");
+            p.quoted(tool);
+            p.lit(" of MCP server ");
+            p.quoted(server);
+            p.lit(" with arguments ");
+            p.quoted(&String::from_utf8_lossy(args.bytes()));
+            p.lit(&format!(
+                " ({} bytes, sha256 {})",
+                args.len(),
+                args.sha256()
+            ));
         }
     }
-    out.push('"');
-    out
+    p.0
+}
+
+/// The pieces of one action text, in order.
+struct Pieces(Vec<Piece>);
+
+impl Pieces {
+    /// Broker text: printable ASCII the broker chose.
+    fn lit(&mut self, s: &str) {
+        self.0.push(Piece::Literal(s.to_owned()));
+    }
+
+    /// Request text, unquoted.
+    fn raw(&mut self, s: &str) {
+        self.0.push(Piece::Raw(Arc::from(s)));
+    }
+
+    /// Request text in double quotes (the raw piece escapes its own `"` as `\"`).
+    fn quoted(&mut self, s: &str) {
+        self.lit("\"");
+        self.raw(s);
+        self.lit("\"");
+    }
+
+    fn place(&mut self, t: &Target) {
+        self.lit("host ");
+        self.quoted(&t.host);
+        self.lit(" (guest ");
+        self.quoted(&t.guest());
+        self.lit(")");
+    }
 }
 
 /// `s` with everything outside printable ASCII escaped (see the module docs): the shared
@@ -233,39 +298,10 @@ fn push_escaped(out: &mut String, c: char) {
 }
 
 /// `text` (escaped ASCII) cut at `max` characters, never inside an escape, with an explicit tail
-/// naming what was cut; whether it was cut.
+/// naming what was cut; whether it was cut. The shared cut, [`sally_core::text::cut_escaped`]
+/// (architect Q288).
 pub(crate) fn cut(text: &str, max: usize) -> (String, bool) {
-    if text.len() <= max {
-        return (text.to_owned(), false);
-    }
-    let at = escape_boundary(text, max);
-    let shown = text.get(..at).unwrap_or_default();
-    let rest = text.len().saturating_sub(at);
-    let sha = hex(&Sha256::digest(text.as_bytes()));
-    (format!("{shown}... (+{rest} bytes, sha256 {sha})"), true)
-}
-
-/// The largest offset at most `max` that does not fall inside a `\…` escape of `text`.
-fn escape_boundary(text: &str, max: usize) -> usize {
-    let bytes = text.as_bytes();
-    let mut i = 0usize;
-    while let Some(&b) = bytes.get(i) {
-        let len = match (b, bytes.get(i.saturating_add(1))) {
-            (b'\\', Some(b'x')) => 4,
-            (b'\\', Some(b'u')) => text
-                .get(i..)
-                .and_then(|r| r.find('}'))
-                .map_or(1, |e| e.saturating_add(1)),
-            (b'\\', Some(_)) => 2,
-            _ => 1,
-        };
-        let next = i.saturating_add(len);
-        if next > max {
-            break;
-        }
-        i = next;
-    }
-    i
+    sally_core::text::cut_escaped(text, max)
 }
 
 #[cfg(test)]

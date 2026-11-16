@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use sally_core::audit::Actor;
+use sally_core::audit::{Actor, NewEntry, Piece};
 use sally_core::manifest::Approvals;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
@@ -45,7 +45,7 @@ use super::policy::{Need, Policy};
 use super::render::{self, Prompt};
 use crate::rpc::agent::Withdraw;
 use crate::rpc::rate::Rate;
-use crate::rpc::record::{Recorder, escape};
+use crate::rpc::record::{Recorder, SHORT_STYLE, escape};
 use crate::tools::STOPPING;
 
 /// One new prompt per this interval, on average (architect ruling Q22; tunable).
@@ -211,6 +211,8 @@ struct Entry {
     id: String,
     call: u64,
     prompt: Arc<Prompt>,
+    /// The action's audit fields, raw (architect Q288 f): never the prompt's escaped text.
+    fields: Fields,
     /// `tool.pending` is written and the approver told: only then can it be decided.
     announced: bool,
     /// A withdraw arrived before it was announced.
@@ -327,11 +329,10 @@ impl Gate {
                 approval: None,
             }),
             Need::Deny(code) => {
-                let args = with(fields(&bound), "code", code);
-                Err(self
-                    .inner
-                    .refuse("tool.deny", Actor::Sallyd, args, code)
-                    .await)
+                let mut f = Fields::of(&bound);
+                add(&mut f.args, "code", Value::from(code));
+                let entry = self.inner.denial(Actor::Sallyd, "tool.deny");
+                Err(self.inner.refused(f.on(entry), code).await)
             }
             Need::Ask => {
                 let tags = if destructive == Some(true) {
@@ -351,7 +352,8 @@ impl Gate {
         tags: Vec<String>,
     ) -> Result<Ticket, Refusal> {
         let inner = &self.inner;
-        let (id, prompt, rx) = match inner.queue(&bound, note, tags) {
+        let mut f = Fields::of(&bound);
+        let (id, rx) = match inner.queue(&bound, f.clone(), note, tags) {
             Ok(q) => q,
             Err(NotQueued::Withdrawn(why)) => {
                 return Err(inner.withdrawn_before_shown(bound.call, None, why).await);
@@ -360,17 +362,16 @@ impl Gate {
                 if episode && !inner.flood_started().await {
                     return Err(Refusal::Unrecorded);
                 }
-                let args = with(fields(&bound), "reason", code);
-                return Err(inner
-                    .refuse("approval.deny", Actor::Sallyd, args, code)
-                    .await);
+                add(&mut f.args, "reason", Value::from(code));
+                let entry = inner.denial(Actor::Sallyd, "approval.deny");
+                return Err(inner.refused(f.on(entry), code).await);
             }
         };
         let guard = Waiting {
             inner: Arc::clone(inner),
             id: id.clone(),
         };
-        if !inner.pending_entry(&prompt, note).await {
+        if !inner.pending_entry(&id, f, note).await {
             return Err(Refusal::Unrecorded);
         }
         match inner.announce(&id) {
@@ -401,12 +402,15 @@ impl Gate {
     }
 
     /// Refuses a call the executor could not turn into an action: `tool.deny` with the tool's
-    /// name (escaped) and the code, before the denial is returned.
+    /// name (declared, see [`call_denied`]) and the code, before the denial is returned.
     pub async fn refuse_call(&self, call: u64, tool: &str, code: &'static str) -> Refusal {
-        let args = json!({"call": call, "tool": escape(tool.as_bytes()), "code": code});
-        self.inner
-            .refuse("tool.deny", Actor::Sallyd, args, code)
-            .await
+        let entry = call_denied(
+            self.inner.denial(Actor::Sallyd, "tool.deny"),
+            call,
+            tool,
+            code,
+        );
+        self.inner.refused(entry, code).await
     }
 
     /// Withdraws the prompt of `call` (#54): a shown prompt leaves the queue and its asker gets
@@ -659,19 +663,18 @@ impl Inner {
 
     /// Writes one `approval.decide` entry; whether it was written.
     async fn decided(&self, e: &Entry, d: Decision, client: Client, how: How<'_>) -> bool {
-        let mut args = fields_of(&e.prompt);
-        add(&mut args, "id", Value::from(e.id.as_str()));
-        add(&mut args, "client", who(client));
+        let mut f = e.fields.clone();
+        add(&mut f.args, "id", Value::from(e.id.as_str()));
+        add(&mut f.args, "client", who(client));
         match how {
-            How::Asked { full_shown: true } => add(&mut args, "full_shown", Value::Bool(true)),
+            How::Asked { full_shown: true } => add(&mut f.args, "full_shown", Value::Bool(true)),
             How::Asked { full_shown: false } => {}
             // Denied together with `v` by its deny_all_session.
-            How::Via(v) => add(&mut args, "via", Value::from(v)),
+            How::Via(v) => add(&mut f.args, "via", Value::from(v)),
         }
-        let entry = self
+        let entry = f.on(self
             .record
-            .entry(Actor::User, "approval.decide", Some(d.as_str()))
-            .args(args);
+            .entry(Actor::User, "approval.decide", Some(d.as_str())));
         self.record.append(entry).await
     }
 
@@ -681,9 +684,10 @@ impl Inner {
     fn queue(
         &self,
         bound: &Bound,
+        fields: Fields,
         note: Option<&str>,
         tags: Vec<String>,
-    ) -> Result<(String, Arc<Prompt>, oneshot::Receiver<Answer>), NotQueued> {
+    ) -> Result<(String, oneshot::Receiver<Answer>), NotQueued> {
         let mut st = self.state();
         if st.flooding && st.pending.is_empty() && st.rate.full() {
             st.flooding = false;
@@ -713,26 +717,29 @@ impl Inner {
         st.pending.push(Entry {
             id: id.clone(),
             call: bound.call,
-            prompt: Arc::clone(&prompt),
+            prompt,
+            fields,
             announced: false,
             withdrawn: None,
             tx,
         });
-        Ok((id, prompt, rx))
+        Ok((id, rx))
     }
 
-    /// Writes `tool.pending` for a queued prompt; whether it was written.
-    async fn pending_entry(&self, prompt: &Prompt, note: Option<&str>) -> bool {
-        let mut args = fields_of(prompt);
-        add(&mut args, "id", Value::from(prompt.id.as_str()));
+    /// Writes `tool.pending` for the queued prompt `id`; whether it was written.
+    async fn pending_entry(&self, id: &str, mut f: Fields, note: Option<&str>) -> bool {
+        add(&mut f.args, "id", Value::from(id));
         if let Some(n) = note {
-            add(&mut args, "note_bytes", Value::from(n.len()));
-            add(&mut args, "note_sha256", Value::from(sha256(n.as_bytes())));
+            add(&mut f.args, "note_bytes", Value::from(n.len()));
+            add(
+                &mut f.args,
+                "note_sha256",
+                Value::from(sha256(n.as_bytes())),
+            );
         }
-        let entry = self
+        let entry = f.on(self
             .record
-            .entry(Actor::Harness, "tool.pending", Some("pending"))
-            .args(args);
+            .entry(Actor::Harness, "tool.pending", Some("pending")));
         self.record.append(entry).await
     }
 
@@ -834,9 +841,19 @@ impl Inner {
         }
     }
 
-    /// Writes a denial entry; the refusal to return.
+    /// Writes a denial entry with `args`; the refusal to return.
     async fn refuse(&self, event: &str, actor: Actor, args: Value, code: &'static str) -> Refusal {
-        let entry = self.record.entry(actor, event, Some("deny")).args(args);
+        self.refused(self.denial(actor, event).args(args), code)
+            .await
+    }
+
+    /// A denial entry named `event`, to fill.
+    fn denial(&self, actor: Actor, event: &str) -> NewEntry {
+        self.record.entry(actor, event, Some("deny"))
+    }
+
+    /// Writes the denial `entry`; the refusal to return.
+    async fn refused(&self, entry: NewEntry, code: &'static str) -> Refusal {
         if self.record.append(entry).await {
             Refusal::Denied(code)
         } else {
@@ -878,37 +895,50 @@ fn withdraw_by(why: Withdraw) -> (Actor, &'static str) {
     }
 }
 
-/// The bounded action fields of an audit entry (architect ruling Q24), from a bound action; the
-/// tools' own entries (`tool.run`, `tool.read`, `tool.result`) start from them too.
-pub(crate) fn fields(b: &Bound) -> Value {
-    let text = render::action_text(&b.action);
-    action_fields(b.call, &b.action.tool(), &text, &b.digest())
+/// The bounded action fields of an audit entry (architect rulings Q24, Q288), from a bound
+/// action; the tools' own entries (`tool.run`, `tool.read`, `tool.result`) start from them too.
+/// The call and the digest are plain args; the tool's name and the action are declared texts,
+/// kept raw until the writer masks every raw part whole, then cuts and escapes the name in
+/// [`SHORT_STYLE`] and escapes, assembles and cuts the action at [`AUDIT_ACTION_CHARS`].
+#[derive(Clone)]
+pub(crate) struct Fields {
+    /// The plain args (`call`, `action_sha256`); a caller adds its own beside them.
+    pub(crate) args: Value,
+    tool: Arc<str>,
+    pieces: Vec<Piece>,
 }
 
-/// The same fields from a prompt, which already holds the text and digest.
-fn fields_of(p: &Prompt) -> Value {
-    action_fields(p.call, &p.tool, &p.full, &p.digest)
+impl Fields {
+    /// The fields of `b`.
+    pub(crate) fn of(b: &Bound) -> Self {
+        Self {
+            args: json!({"call": b.call, "action_sha256": b.digest()}),
+            tool: Arc::from(b.action.tool()),
+            pieces: render::action_pieces(&b.action),
+        }
+    }
+
+    /// `entry` with these fields: the args, the declared tool and the declared action.
+    pub(crate) fn on(self, entry: NewEntry) -> NewEntry {
+        entry
+            .args(self.args)
+            .text("tool", self.tool, SHORT_STYLE)
+            .pieces("action", self.pieces, AUDIT_ACTION_CHARS)
+    }
 }
 
-fn action_fields(call: u64, tool: &str, text: &str, digest: &str) -> Value {
-    let (action, _) = render::cut(text, AUDIT_ACTION_CHARS);
-    json!({
-        "call": call,
-        "tool": escape(tool.as_bytes()),
-        "action": action,
-        "action_sha256": digest,
-    })
+/// The `tool.deny` of a call the executor could not turn into an action: the tool's name is
+/// the harness's, so it is declared (architect Q288 f, Q291) and masked before its cut.
+fn call_denied(entry: NewEntry, call: u64, tool: &str, code: &str) -> NewEntry {
+    entry
+        .args(json!({"call": call, "code": code}))
+        .text("tool", tool, SHORT_STYLE)
 }
 
 fn add(v: &mut Value, key: &str, value: Value) {
     if let Some(o) = v.as_object_mut() {
         o.insert(key.to_owned(), value);
     }
-}
-
-fn with(mut v: Value, key: &str, value: &str) -> Value {
-    add(&mut v, key, Value::from(value));
-    v
 }
 
 /// A deciding client as audited: `{uid, pid}`.

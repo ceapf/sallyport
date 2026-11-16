@@ -275,6 +275,42 @@ fn a_composite_text_masks_each_raw_piece_then_escapes_assembles_and_cuts() {
     }
 }
 
+/// Architect Q288 (a): [`assembled`] is the human's text: literals as they are, raw pieces
+/// escaped with `\"`, nothing masked and nothing cut; with no form and no cut it is the
+/// writer's text too.
+#[test]
+fn assembled_is_the_unmasked_uncut_text_the_writer_assembles() {
+    let raw = format!("a\"b\\c\u{202e}{VALUE}{}", "q".repeat(300));
+    let pieces = vec![
+        Piece::Literal("run ".into()),
+        Piece::Raw(Arc::from(raw.as_str())),
+        Piece::Literal(" end".into()),
+        Piece::Raw(Arc::from("")),
+    ];
+    let whole = assembled(&pieces);
+    assert_eq!(
+        whole,
+        format!("run {} end", text::escape_backslash_quoted(raw.as_bytes()))
+    );
+    assert!(
+        whole.contains(&text::escape_backslash_quoted(VALUE.as_bytes())),
+        "assembled masks nothing"
+    );
+    assert!(whole.len() > 300, "assembled cuts nothing");
+    let d = Declared {
+        key: "a",
+        shape: Shape::Pieces {
+            pieces,
+            max: usize::MAX,
+        },
+    };
+    assert_eq!(
+        resolve(&Value::Null, &[d], &Redactor::default())["a"],
+        Value::from(whole)
+    );
+    assert_eq!(assembled(&[]), "");
+}
+
 /// With no form in it, a composite text is exactly the cut of its escaped assembly.
 #[test]
 fn a_composite_text_without_a_form_is_the_cut_of_its_escaped_assembly() {

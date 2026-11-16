@@ -40,7 +40,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 
 use crate::approvals::action::{Action, Bound, Payload, Target, hex};
-use crate::approvals::queue::fields;
+use crate::approvals::queue::Fields;
 use crate::approvals::{Executor, Prepared, Ticket};
 use crate::daemon::crash::CrashReporter;
 use crate::egress::local::Connector;
@@ -287,6 +287,19 @@ impl<R: Runner> Core<R> {
         self.record.append(e).await
     }
 
+    /// [`Self::record`] for an entry that starts from an action's [`Fields`], whose tool name and
+    /// action text the writer masks before their cut (architect Q288).
+    async fn record_fields(
+        &self,
+        actor: Actor,
+        event: &str,
+        decision: Option<&str>,
+        f: Fields,
+    ) -> bool {
+        let e = f.on(self.record.entry(actor, event, decision));
+        self.record.append(e).await
+    }
+
     async fn run_read(
         &self,
         b: &Bound,
@@ -297,15 +310,15 @@ impl<R: Runner> Core<R> {
     ) -> Option<ToolOutcome> {
         let rel = t.rel.clone();
         let res = on_root(&m.root, self.ids, move |r| fs::read(r, &rel, offset, len)).await;
-        let mut f = fields(b);
-        add(&mut f, "mode", Value::from(mode_str(m.mode)));
-        add(&mut f, "offset", Value::from(offset));
-        add(&mut f, "len", Value::from(len));
+        let mut f = Fields::of(b);
+        add(&mut f.args, "mode", Value::from(mode_str(m.mode)));
+        add(&mut f.args, "offset", Value::from(offset));
+        add(&mut f.args, "len", Value::from(len));
         let out = match res {
             Ok(r) => {
-                add(&mut f, "size", Value::from(r.size));
-                add(&mut f, "bytes", Value::from(r.bytes.len()));
-                add(&mut f, "sha256", Value::from(sha256(&r.bytes)));
+                add(&mut f.args, "size", Value::from(r.size));
+                add(&mut f.args, "bytes", Value::from(r.bytes.len()));
+                add(&mut f.args, "sha256", Value::from(sha256(&r.bytes)));
                 let (encoding, content) = match String::from_utf8(r.bytes) {
                     Ok(s) => ("utf-8", s),
                     Err(e) => (
@@ -319,11 +332,11 @@ impl<R: Runner> Core<R> {
                 }))
             }
             Err(e) => {
-                add(&mut f, "code", Value::from(e.code()));
+                add(&mut f.args, "code", Value::from(e.code()));
                 failed(e.code())
             }
         };
-        self.record(Actor::Harness, "tool.read", Some("allow"), f)
+        self.record_fields(Actor::Harness, "tool.read", Some("allow"), f)
             .await
             .then_some(out)
     }
@@ -331,8 +344,8 @@ impl<R: Runner> Core<R> {
     async fn run_list(&self, b: &Bound, m: &Mount, t: &Target) -> Option<ToolOutcome> {
         let rel = t.rel.clone();
         let res = on_root(&m.root, self.ids, move |r| fs::list(r, &rel)).await;
-        let mut f = fields(b);
-        add(&mut f, "mode", Value::from(mode_str(m.mode)));
+        let mut f = Fields::of(b);
+        add(&mut f.args, "mode", Value::from(mode_str(m.mode)));
         let out = match res {
             Ok(l) => {
                 let entries: Vec<Value> = l
@@ -344,21 +357,21 @@ impl<R: Runner> Core<R> {
                     "path": t.guest(), "entries": entries,
                     "truncated": l.truncated, "unlisted": l.unlisted,
                 });
-                add(&mut f, "entries", Value::from(l.entries.len()));
-                add(&mut f, "truncated", Value::from(l.truncated));
+                add(&mut f.args, "entries", Value::from(l.entries.len()));
+                add(&mut f.args, "truncated", Value::from(l.truncated));
                 add(
-                    &mut f,
+                    &mut f.args,
                     "sha256",
                     Value::from(sha256(body.to_string().as_bytes())),
                 );
                 reply(&body)
             }
             Err(e) => {
-                add(&mut f, "code", Value::from(e.code()));
+                add(&mut f.args, "code", Value::from(e.code()));
                 failed(e.code())
             }
         };
-        self.record(Actor::Harness, "tool.read", Some("allow"), f)
+        self.record_fields(Actor::Harness, "tool.read", Some("allow"), f)
             .await
             .then_some(out)
     }
@@ -372,19 +385,19 @@ impl<R: Runner> Core<R> {
         content: Option<&Payload>,
     ) -> Option<ToolOutcome> {
         let b = ticket.bound();
-        let mut f = fields(b);
+        let mut f = Fields::of(b);
         add(
-            &mut f,
+            &mut f.args,
             "approval",
             ticket.approval().map_or(Value::Null, Value::from),
         );
-        add(&mut f, "mode", Value::from(mode_str(m.mode)));
+        add(&mut f.args, "mode", Value::from(mode_str(m.mode)));
         if let Some(c) = content {
-            add(&mut f, "bytes", Value::from(c.len()));
-            add(&mut f, "sha256", Value::from(c.sha256()));
+            add(&mut f.args, "bytes", Value::from(c.len()));
+            add(&mut f.args, "sha256", Value::from(c.sha256()));
         }
         if !self
-            .record(Actor::Harness, "tool.run", Some("allow"), f)
+            .record_fields(Actor::Harness, "tool.run", Some("allow"), f)
             .await
         {
             return None;
@@ -470,14 +483,14 @@ impl<R: Runner> Core<R> {
 
     async fn run_shell(&self, ticket: &Ticket, argv: &[String], cwd: &str) -> Option<ToolOutcome> {
         let b = ticket.bound();
-        let mut f = fields(b);
+        let mut f = Fields::of(b);
         add(
-            &mut f,
+            &mut f.args,
             "approval",
             ticket.approval().map_or(Value::Null, Value::from),
         );
         if !self
-            .record(Actor::Harness, "tool.run", Some("allow"), f)
+            .record_fields(Actor::Harness, "tool.run", Some("allow"), f)
             .await
         {
             return None;
@@ -554,18 +567,18 @@ impl<R: Runner> Core<R> {
         let (Some(f), Ok(u)) = (self.fetch.as_ref(), fetch_url::parse(url)) else {
             return Some(failed("tool_unavailable"));
         };
-        let mut e = fields(b);
+        let mut e = Fields::of(b);
         add(
-            &mut e,
+            &mut e.args,
             "approval",
             ticket.approval().map_or(Value::Null, Value::from),
         );
-        add(&mut e, "host", Value::from(u.host.clone()));
-        add(&mut e, "port", Value::from(u.port));
-        add(&mut e, "bytes", Value::from(body.len()));
-        add(&mut e, "sha256", Value::from(body.sha256()));
+        add(&mut e.args, "host", Value::from(u.host.clone()));
+        add(&mut e.args, "port", Value::from(u.port));
+        add(&mut e.args, "bytes", Value::from(body.len()));
+        add(&mut e.args, "sha256", Value::from(body.sha256()));
         if !self
-            .record(Actor::Harness, "tool.run", Some("allow"), e)
+            .record_fields(Actor::Harness, "tool.run", Some("allow"), e)
             .await
         {
             return None;

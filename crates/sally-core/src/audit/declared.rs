@@ -9,6 +9,7 @@
 //! pass through; each raw piece is masked whole and escaped with `"` as `\"`; the assembled text
 //! is cut once, never inside an escape, and its tail hash is of the masked text.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
@@ -111,15 +112,7 @@ impl Declared {
                 }
             }
             Shape::Pieces { pieces, max } => {
-                let mut whole = String::new();
-                for p in pieces {
-                    match p {
-                        Piece::Literal(l) => whole.push_str(l),
-                        Piece::Raw(r) => whole.push_str(&text::escape_backslash_quoted(
-                            redactor.redact_str(r).as_bytes(),
-                        )),
-                    }
-                }
+                let whole = assemble(pieces, |r| redactor.redact_str(r));
                 let (shown, _) = text::cut_escaped(&whole, *max);
                 args.insert(self.key.to_owned(), Value::from(shown));
             }
@@ -132,6 +125,26 @@ impl Declared {
             }
         }
     }
+}
+
+/// `pieces` as one text, unmasked and uncut: literals as they are, each raw piece escaped with
+/// `"` as `\"`. The approval prompt a human reads is this text (architect Q288 a); the audit
+/// entry declares the same pieces, which the writer masks before it assembles and cuts them.
+#[must_use]
+pub fn assembled(pieces: &[Piece]) -> String {
+    assemble(pieces, Cow::Borrowed)
+}
+
+/// `pieces` as one text, each raw piece through `mask` before it is escaped.
+fn assemble<'a>(pieces: &'a [Piece], mask: impl Fn(&'a str) -> Cow<'a, str>) -> String {
+    let mut whole = String::new();
+    for p in pieces {
+        match p {
+            Piece::Literal(l) => whole.push_str(l),
+            Piece::Raw(r) => whole.push_str(&text::escape_backslash_quoted(mask(r).as_bytes())),
+        }
+    }
+    whole
 }
 
 /// The final args of an entry: `args` with every declared text filled in, then redacted whole.
