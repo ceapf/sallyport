@@ -94,14 +94,37 @@ fn a_rejected_manifest_prints_its_errors_and_no_summary() {
 
 /// A manifest granting `GH` on `api.github.com`.
 fn granting(s: &Scratch) -> PathBuf {
+    granting_with(s, "")
+}
+
+/// [`granting`], with `extra` (whole top-level sections) after the model.
+fn granting_with(s: &Scratch, extra: &str) -> PathBuf {
     s.file(
         "m.yaml",
         &format!(
-            "{VALID}network:\n  mode: proxy\n  allow:\n    - host: api.github.com\nsecrets:\n  \
-             - name: GH\n    inject:\n      host: api.github.com\n      header: \
+            "{VALID}{extra}network:\n  mode: proxy\n  allow:\n    - host: api.github.com\n\
+             secrets:\n  - name: GH\n    inject:\n      host: api.github.com\n      header: \
              Authorization\n      format: \"Bearer {{value}}\"\n"
         ),
     )
+}
+
+/// Stores `GH` in the scratch store.
+fn store_gh(s: &Scratch) {
+    let mut store = sally_core::secrets::SecretStore::empty(s.store());
+    store
+        .set("GH", format!("sp-cli-{}", "v".repeat(20)))
+        .unwrap();
+    store.save().unwrap();
+}
+
+/// A directory removed on drop.
+struct Gone(PathBuf);
+
+impl Drop for Gone {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Architect Q221: the CLI reads the store's names as `sallyd` does. A grant of a name the
@@ -114,11 +137,7 @@ fn a_secret_grant_needs_the_name_in_the_store() {
     assert_eq!(code, EXIT_REFUSED, "{err}");
     assert!(err.contains("[secret-missing]"), "{err}");
     assert!(err.contains("sally secrets set GH"), "{err}");
-    let mut store = sally_core::secrets::SecretStore::empty(s.store());
-    store
-        .set("GH", format!("sp-cli-{}", "v".repeat(20)))
-        .unwrap();
-    store.save().unwrap();
+    store_gh(&s);
     // Architect Q226: its `[data-can-leave]` warning is plain ASCII, so the run is clean (0).
     let (code, out, err) = run(|o| manifest_validate(&m, &s.store(), o));
     assert_eq!((code, err.as_str()), (EXIT_OK, ""), "{out}");
@@ -126,6 +145,45 @@ fn a_secret_grant_needs_the_name_in_the_store() {
         out.contains("[data-can-leave]")
             && !out.contains("\\u{")
             && out.ends_with("valid (sallyd checks again when a session starts)\n"),
+        "{out}"
+    );
+}
+
+/// Architect Q226, the twin of the test above: manifest text the CLI prints (here a mount's
+/// path, quoted by the `[data-can-leave]` warning and the summary) is still escaped, and a run
+/// that escaped something exits 1 although the manifest is valid.
+#[test]
+fn a_non_ascii_mount_path_is_escaped_and_the_run_exits_1() {
+    let s = Scratch::new("nonascii");
+    // Not below the temp dir: `/tmp` is denylisted as a mount.
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+        "../../target/sc-loc-caf\u{e9}-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let _gone = Gone(dir.clone());
+    let m = granting_with(
+        &s,
+        &format!(
+            "filesystem:\n  mounts:\n    - host: \"{}\"\n      guest: /workspace/p\n      \
+             mode: ro\n",
+            dir.display()
+        ),
+    );
+    store_gh(&s);
+    let (code, out, err) = run(|o| manifest_validate(&m, &s.store(), o));
+    assert_eq!((code, err.as_str()), (EXIT_REFUSED, ""), "{out}");
+    assert!(
+        out.contains("[data-can-leave]")
+            && out.contains("sc-loc-caf\\u{e9}-")
+            && out.is_ascii()
+            && out.ends_with("valid (sallyd checks again when a session starts)\n"),
+        "{out}"
+    );
+    let (code, out, err) = run(|o| manifest_summary(&m, &s.store(), o));
+    assert_eq!((code, err.as_str()), (EXIT_REFUSED, ""), "{out}");
+    assert!(
+        out.contains("sc-loc-caf\\u{e9}-") && out.is_ascii(),
         "{out}"
     );
 }
