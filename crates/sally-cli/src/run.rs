@@ -6,8 +6,9 @@
 //! ASCII and newline, goes to stdout and stderr after the clean-check; this terminal's stdin
 //! goes to the command as UTF-8 text, one `sessions.input` at a time, each sent after the last
 //! was written. When the command ends, the session is stopped and `sally` exits with the
-//! command's code (137 if `sallyd` killed it). Ctrl-C ends `sally`; its connection's end kills
-//! the command and stops the session.
+//! command's code (137 if `sallyd` killed it), or 1 if any output failed the clean-check (it is
+//! shown escaped); a refused stop makes it at least 1. Ctrl-C ends `sally`; its connection's
+//! end kills the command and stops the session.
 //!
 //! Nothing here asks for a decision: approvals are answered in another terminal (`sally
 //! approve`). Anything prompt-like in the run terminal is the command's output; the exit status
@@ -139,17 +140,19 @@ pub fn sandbox_run(
         Ok(ended) => ended,
         Err(code) => return code,
     };
-    let mut code = if stop(c, &session.id, o.err) {
+    let code = if stop(c, &session.id, o.err) {
         code
     } else {
         code.max(EXIT_REFUSED)
     };
     if dirty {
+        // Q149: dirty is EXIT_REFUSED, whatever the command's code: a run that showed
+        // something escaped is refused, never mistaken for the command's own result.
         let _ = writeln!(
             o.err,
             "sally: some output was not clean; it is shown escaped"
         );
-        code = code.max(EXIT_REFUSED);
+        return EXIT_REFUSED;
     }
     code
 }

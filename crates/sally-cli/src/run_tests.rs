@@ -532,6 +532,32 @@ fn dirty_output_is_escaped_and_prompt_like_output_is_only_output() {
     assert_eq!(err, "");
 }
 
+/// Architect Q149: dirty output exits `EXIT_REFUSED` whatever the command's own code, a code
+/// above it and a kill included (ARCHITECTURE "refuses (exit 1)").
+#[test]
+fn dirty_output_exits_refused_whatever_the_commands_code() {
+    for (tag, reply) in [
+        ("dirty-3", json!({"exit_code": 3})),
+        ("dirty-255", json!({"exit_code": 255})),
+        ("dirty-killed", json!({"killed": "session-stop"})),
+    ] {
+        let d = daemon(
+            tag,
+            Script {
+                at_attach: vec![note("stdout", "a\u{1b}[2Jb\n")],
+                reply,
+                ..Script::default()
+            },
+        );
+        let (code, _, err) = run(&d, tag, Vec::new());
+        assert_eq!(code, EXIT_REFUSED, "{tag}");
+        assert!(
+            err.ends_with("sally: some output was not clean; it is shown escaped\n"),
+            "{tag}: {err}"
+        );
+    }
+}
+
 /// Architect Q148: stdin that is not UTF-8 ends the run without an end of input: the
 /// connection closes, which kills the command; no stop is asked.
 #[test]

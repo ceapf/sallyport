@@ -21,6 +21,12 @@ pub mod secrets;
 pub mod usage;
 
 /// The command did what was asked.
+///
+/// `sally sandbox run` is the exception to the codes below: it exits with the sandboxed
+/// command's own code (0–255), [`run::EXIT_KILLED`] (137) when `sallyd` killed the command,
+/// `EXIT_REFUSED` when any output failed the clean-check (whatever the command's code), at
+/// least `EXIT_REFUSED` when the stop was refused, and `EXIT_FAILED` when the run could not go
+/// on or the code is outside 0–255 (architect Q149). The exit status, not anything the command printed, is authoritative.
 pub const EXIT_OK: u8 = 0;
 /// `sallyd` refused, or something was not shown (a cut list, text that failed the
 /// clean-check), or a prompt was denied because the terminal closed. Locally: an invalid
