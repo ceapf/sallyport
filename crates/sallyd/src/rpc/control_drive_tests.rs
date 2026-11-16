@@ -437,6 +437,35 @@ async fn rt_drv_07_drive_takes_a_session_id_and_nothing_else() {
     assert_eq!(own.events(), ["drive.turn"]);
 }
 
+/// Architect Q150: a bound session may be driven. A driven create binds like any other, the
+/// connection that made it drives it, and that connection's end stops it, `disconnect`.
+#[tokio::test]
+async fn a_bound_session_may_be_driven() {
+    let f = fx("drive-bound");
+    let mut w = f.connect();
+    let mut p = model(true, "scripted", TWO);
+    p["lifetime"] = json!("connection");
+    let r = w.call("sessions.create", p).await;
+    assert_eq!(r["result"]["id"], "s-new", "{r}");
+    assert_eq!(f.sink.last("rpc.request")["lifetime"], "connection");
+    assert!(f.fake.scripts.lock().unwrap()[0].is_some());
+    let (own, calls) = driven(&f, "s-new", TWO);
+    let r = w.call("sessions.drive", json!({"id": "s-new"})).await;
+    assert_eq!(r["result"]["turn"], 1, "{r}");
+    assert_eq!(*calls.lock().unwrap(), ["echo"]);
+    assert_eq!(own.events(), ["drive.turn"]);
+    assert!(f.fake.disconnected.lock().unwrap().is_empty());
+    w.w.shutdown().await.unwrap();
+    w.ended().await;
+    for _ in 0..200 {
+        if !f.fake.disconnected.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(*f.fake.disconnected.lock().unwrap(), ["s-new"]);
+}
+
 fn model(driven: bool, kind: &str, script: &str) -> Value {
     json!({"manifest": MANIFEST, "model": {"kind": kind, "script": script, "driven": driven}})
 }
