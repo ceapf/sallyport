@@ -2,15 +2,21 @@
 CARGO ?= cargo --locked
 MUSL  := x86_64-unknown-linux-musl
 
-.PHONY: lint fmt clippy deny forbid-unsafe test test-scripts nextest coverage mutants mutants-wide-core mutants-wide-sallyd mutants-wide-shim mutants-wide-cli zizmor shim shim-check fuzz redteam redteam-gpu e2e-gpu doctor
+.PHONY: lint fmt clippy fuzz-check deny forbid-unsafe test test-scripts nextest coverage mutants mutants-wide-core mutants-wide-sallyd mutants-wide-shim mutants-wide-cli zizmor shim shim-check fuzz redteam redteam-gpu e2e-gpu doctor
 
-lint: fmt clippy forbid-unsafe deny
+lint: fmt clippy fuzz-check forbid-unsafe deny
 
 fmt:
 	$(CARGO) fmt --all -- --check
 
 clippy:
 	$(CARGO) clippy -q --workspace --all-targets -- -D warnings
+
+# The fuzz crate is detached from the workspace, so clippy above never builds it; type-check its
+# targets on the pinned stable toolchain, so a `pub` item they use cannot vanish unnoticed until
+# CI's fuzz job (PROBE_NOTES "Fuzz crate on pinned stable").
+fuzz-check:
+	$(CARGO) check -q --manifest-path fuzz/Cargo.toml --bins --target-dir target/fuzz-check
 
 deny:
 	$(CARGO) deny check

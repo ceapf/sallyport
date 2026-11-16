@@ -356,3 +356,12 @@ tests in `egress/intercept_tests.rs` where the behaviour matters to the proxy.
 - `accept()` reserves its descriptor number before blocking; `/proc/<pid>/fd` does not list it.
   To force EMFILE, set the soft limit to the lowest free number (`prlimit --pid P --nofile=N:`
   keeps the hard limit, so it can be raised again). (#36 shim)
+
+## Fuzz crate on pinned stable
+
+- `fuzz/` is a detached crate; `make lint`'s clippy never builds it, so a removed `pub` item it
+  imports fails only CI's `fuzz` job (#165). `cargo check --locked --manifest-path
+  fuzz/Cargo.toml --bins` works on the pinned stable toolchain: libfuzzer-sys's build script
+  compiles libFuzzer with the host C++ compiler, no nightly or sanitizer needed for a check.
+  About 8 s from an empty `--target-dir` of its own (`target/fuzz-check`), and it fails with
+  E0432 on `escape_target` re-added to `egress_head.rs`'s imports. (architect Q265)
