@@ -325,11 +325,20 @@ async fn rt_ag_06_control_methods_on_agent_sock_are_not_found() {
 }
 
 /// RT-AG-13: resources, prompts, sampling, logging, unknown methods, batches and oversize frames
-/// are refused with `rpc.deny`; `tools/list` works in both lifecycles (above).
+/// are refused with `rpc.deny`; `tools/list` works in both lifecycles (above). In-test control:
+/// a tool call first reaches the handler (`calls` 1), and `calls` is still exactly 1 after the
+/// batch and the malformed frames.
 #[tokio::test]
 async fn rt_ag_13_mcp_surface_abuse_is_refused_and_audited() {
     let (agent, fake, sink) = setup();
     let mut c = start(&agent);
+    let r = c.call(&call(100, "echo")).await;
+    assert_eq!(r["result"]["isError"], json!(false), "control: {r}");
+    assert_eq!(
+        fake.calls.load(Ordering::SeqCst),
+        1,
+        "control: handler calls"
+    );
     let refused = [
         "resources/list",
         "resources/read",
@@ -373,7 +382,7 @@ async fn rt_ag_13_mcp_surface_abuse_is_refused_and_audited() {
         let e = c.recv().await.unwrap();
         assert_eq!(e["error"]["data"]["reason"], json!(reason));
     }
-    assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
     let mut expected = vec!["method-not-found"; refused.len()];
     expected.extend([
         "wrong-lifecycle",

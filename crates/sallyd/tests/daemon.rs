@@ -515,6 +515,20 @@ fn rt_net_11_an_idle_sallyd_connects_nowhere() {
             .any(|l| l.starts_with(&own) && l.ends_with("= 0")),
         "the trace did not follow sallyd:\n{text}"
     );
+    // Control (analogue, #122): the trace shows sallyd's own socket() with its family decoded,
+    // which the filter's first clause (any AF_INET/AF_INET6 socket fails) depends on.
+    let socket = format!("{sallyd} socket(AF_UNIX");
+    // A finished call that returned a descriptor (architect Q190): an `<unfinished ...>` line has
+    // no " = ", `= ?` and `= -1 …` do not start with a digit. A call split across lines resumes
+    // on a line without this prefix, so it never counts: that fails the control, never passes it.
+    let succeeded = |l: &str| {
+        l.rsplit_once(" = ")
+            .is_some_and(|(_, result)| result.starts_with(|c: char| c.is_ascii_digit()))
+    };
+    assert!(
+        text.lines().any(|l| l.starts_with(&socket) && succeeded(l)),
+        "control: no socket(AF_UNIX) of sallyd in the trace:\n{text}"
+    );
     let bad: Vec<&str> = text.lines().filter(|l| outbound(l)).collect();
     assert!(bad.is_empty(), "outbound connects: {bad:#?}");
 }

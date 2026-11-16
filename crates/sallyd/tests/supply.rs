@@ -28,9 +28,10 @@ fn with_image(x: &Lx, image: &str) -> sally_core::manifest::ValidatedManifest {
     ))
 }
 
-fn refused_as_digest_mismatch(x: &Lx, e: &LaunchError) {
+/// `base`: the audit entries written before the refused launch.
+fn refused_as_digest_mismatch(x: &Lx, e: &LaunchError, base: usize) {
     assert!(matches!(e, LaunchError::ImageMissing(_)), "{e}");
-    assert_eq!(x.events.list(), ["sandbox.refuse"]);
+    assert_eq!(x.events.list()[base..], ["sandbox.refuse"]);
     assert_eq!(
         x.events.args("sandbox.refuse").unwrap()["reason"],
         "digest-mismatch"
@@ -38,21 +39,21 @@ fn refused_as_digest_mismatch(x: &Lx, e: &LaunchError) {
 }
 
 /// The base image is present under its name; the same name with another digest is refused,
-/// and so is the base image's own digest under another name.
+/// and so is the base image's own digest under another name. Control, first on each fixture: the
+/// same manifest naming the test image (in local storage, by digest) launches, and its container
+/// is listed by the same probe (`Lx::listed_control`).
 #[test]
 fn rt_sup_01_a_pinned_digest_not_in_local_storage_is_refused() {
     rt().block_on(async {
         let digest = BASE.split_once('@').unwrap().1;
         for image in [absent_image(), format!("localhost/other@{digest}")] {
             let x = Lx::new();
+            let present = with_image(&x, test_image().as_str());
+            let base = x.listed_control(&present, "sup01c").await;
             let v = with_image(&x, &image);
             let e = x.launch(&v, "sup01").await.unwrap_err();
-            refused_as_digest_mismatch(&x, &e);
-            let names = podman(&["ps", "--all", "--format", "{{.Names}}"]);
-            assert!(
-                !String::from_utf8_lossy(&names.stdout).contains(&x.scope),
-                "nothing was created for {image}"
-            );
+            refused_as_digest_mismatch(&x, &e, base);
+            assert!(!x.listed(), "nothing was created for {image}");
         }
     });
 }
@@ -178,7 +179,7 @@ fn rt_sup_02_a_missing_digest_is_refused_without_an_outbound_connection() {
         let image = absent_image();
         let v = with_image(&x, &image);
         let e = x.launch(&v, "sup02").await.unwrap_err();
-        refused_as_digest_mismatch(&x, &e);
+        refused_as_digest_mismatch(&x, &e, 0);
         assert!(e.to_string().contains("not in local storage"), "{e}");
         // A traced podman cannot start the setuid uid-map helpers, so the rootless namespace
         // must already exist: an untraced hermetic call creates it whatever ran before.

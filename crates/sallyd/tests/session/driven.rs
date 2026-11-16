@@ -205,11 +205,10 @@ async fn drive_over_control(r: &Rx, id: &str) -> Value {
     reply["error"]["data"]["reason"].clone()
 }
 
-/// A stop while a step waits on a prompt: the prompt is withdrawn, the step is answered
-/// `denied: withdrawn`, `session.stop` is the last entry of the session's audit handle (only
-/// teardown's `sandbox.*`, written by the launcher, may follow; ARCHITECTURE §5.4), a step on the
-/// same seat afterwards is refused and writes nothing, and a drive over the control socket finds
-/// no session.
+/// One scripted `fs_write` of `/workspace/p/early.txt`: the control's turn.
+const EARLY_WRITE: &str = "{\"tool_calls\":[{\"name\":\"fs_write\",\"arguments\":\
+    {\"path\":\"/workspace/p/early.txt\",\"content_b64\":\"bGF0ZQ==\"}}]}\n";
+
 /// One scripted `fs_write` of `/workspace/p/late.txt`.
 const LATE_WRITE: &str = "{\"tool_calls\":[{\"name\":\"fs_write\",\"arguments\":\
     {\"path\":\"/workspace/p/late.txt\",\"content_b64\":\"bGF0ZQ==\"}}]}\n";
@@ -220,7 +219,8 @@ const LATE_WRITE: &str = "{\"tool_calls\":[{\"name\":\"fs_write\",\"arguments\":
 /// `session.stop {in_flight: 1}` follows that `tool.run`, the file is untouched, and no entry of
 /// the session follows `session.stop`. The write's `tool.result` either lands before it, aborted,
 /// or is refused by the seal with an oplog line naming it (the order is a race once the append is
-/// released, as in RT-AG-15).
+/// released, as in RT-AG-15). Control (architect Q181): the script's first turn, stepped on the
+/// same seat before anything is held, writes `early.txt` and the host sees it.
 #[test]
 fn rt_drv_03_a_driven_call_past_the_drain_writes_nothing_after_the_stop() {
     rt().block_on(async {
@@ -231,9 +231,30 @@ fn rt_drv_03_a_driven_call_past_the_drain_writes_nothing_after_the_stop() {
             "{}tools:\n  builtin: [fs_write]\n",
             mounts(&[mount("~/code/drv03b", "/workspace/p", "rw")])
         )));
-        let s = r.reg.start_with(v, Some(script(LATE_WRITE))).await.unwrap();
-        r.x.events.hold(&["tool.run"]);
+        let two = format!("{EARLY_WRITE}{LATE_WRITE}");
+        let s = r.reg.start_with(v, Some(script(&two))).await.unwrap();
+        // The host's view of the mount: the probe of "the write touched the file".
+        let written = |name: &str| at.join(name).exists();
         let seat = r.reg.driver(&s.id).unwrap().claim().unwrap();
+        // Control (#122): before anything is held, the first turn's write on the same seat runs
+        // and the host sees its file.
+        let Stepped::Step(first) = seat.step().await else {
+            panic!("control: the first turn did not step")
+        };
+        assert_eq!(
+            (first.turn, first.calls.len()),
+            (1, 1),
+            "control: {first:?}"
+        );
+        assert!(
+            !first.calls[0].result.starts_with("denied"),
+            "control: {first:?}"
+        );
+        assert!(
+            written("early.txt"),
+            "control: the first turn's file is not on the host"
+        );
+        r.x.events.hold(&["tool.run"]);
         let step = tokio::spawn(async move { seat.step().await });
         r.x.events.until_parked("tool.run", 1).await;
         let stopping = {
@@ -256,19 +277,49 @@ fn rt_drv_03_a_driven_call_past_the_drain_writes_nothing_after_the_stop() {
         assert!(after.is_empty(), "after session.stop: {after:?}");
         let all = r.x.events.all();
         assert_eq!(all[stop_at].1["in_flight"], 1, "{all:#?}");
-        let run = all.iter().position(|(e, _)| e == "tool.run").unwrap();
+        // The control's entries come first: the late write's are those after its `tool.result`.
+        let control_result = all
+            .iter()
+            .position(|(e, _)| e == "tool.result")
+            .expect("the control's tool.result");
+        let runs = all.iter().filter(|(e, _)| e == "tool.run").count();
+        assert_eq!(
+            runs, 2,
+            "the control's tool.run and the late write's: {all:#?}"
+        );
+        let later = |event: &str| {
+            all[control_result + 1..]
+                .iter()
+                .position(|(e, _)| e == event)
+                .map(|i| control_result + 1 + i)
+        };
+        let run = later("tool.run").expect("the late write's tool.run");
         assert!(run < stop_at, "{all:#?}");
-        assert!(!at.join("late.txt").exists(), "the write touched the file");
-        match all.iter().position(|(e, _)| e == "tool.result") {
+        assert!(!written("late.txt"), "the write touched the file");
+        match later("tool.result") {
             Some(i) => {
                 assert!(i < stop_at, "{all:#?}");
                 assert_eq!(all[i].1["outcome"], "aborted", "{all:#?}");
             }
-            None => r.until_logged("entry refused after session.stop").await,
+            None => {
+                r.until_logged("entry refused after session.stop").await;
+                let text = String::from_utf8_lossy(&r.log.0.lock().unwrap()).into_owned();
+                assert!(
+                    text.lines()
+                        .any(|l| l.contains("entry refused after session.stop")
+                            && l.contains("tool.result")),
+                    "{text}"
+                );
+            }
         }
     });
 }
 
+/// A stop while a step waits on a prompt: the prompt is withdrawn, the step is answered
+/// `denied: withdrawn`, `session.stop` is the last entry of the session's audit handle (only
+/// teardown's `sandbox.*`, written by the launcher, may follow; ARCHITECTURE §5.4), a step on the
+/// same seat afterwards is refused and writes nothing, and a drive over the control socket finds
+/// no session.
 #[test]
 fn rt_drv_03_nothing_of_a_drive_follows_the_stop() {
     rt().block_on(async {
