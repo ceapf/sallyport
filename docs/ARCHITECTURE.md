@@ -1059,10 +1059,12 @@ further effect):
    no effect and no reply. A refused write is an oplog line naming only the session and the
    event. `session.stop` has no other writer (the best-effort `start-failed` one included).
 7. `Launcher::stop`, retried up to 3 times.
-8. Once it succeeded (the container confirmed gone, its tunnels closed, the session released):
-   `session.closed {reason}`, actor `sallyd`, the session's last entry (#94, Q242, Q245), then
-   the session's secrets leave the logs' redactors (`Launcher::close`, Q219). Then the stops are
-   answered.
+8. Once it succeeded (the container confirmed gone, its tunnels closed, the session released;
+   `Launcher::stop` returns a `Confirmed` token, Q252): `session.closed {reason}`, actor
+   `sallyd`, the session's last entry (#94, Q242, Q245), then the session's secrets leave the
+   logs' redactors (`Launcher::close`, which takes the token, Q219). Only then does the session
+   leave the live set and are the stops answered, so a shutdown asking meanwhile waits for its
+   `session.closed` (Q250).
 
 So after `session.stop` nothing agent-originated of the session is written: no `tool.*`,
 `approval.*` or `rpc.*` entry, whatever its `in_flight`. `sandbox.exec` and
@@ -1070,10 +1072,15 @@ So after `session.stop` nothing agent-originated of the session is written: no `
 `session.stop` either (Q146). Teardown entries follow it: `sandbox.*` (`sandbox.stop` always
 does), the watchdog's (`session.resource_limit`, `session.kill_failed`) and egress closes (#95,
 `session-stopped` for a tunnel still open). `session.closed` follows them, and nothing of the
-session follows it (RT-AUD-03), with one residual (Q244, TODO(#156)): an egress or watchdog
-append already inside its blocking write when its task was aborted (the egress grace, the
-watchdog's drop) may still land after `session.closed`; such an entry carries hosts, counts
-and names, never a value. A panic reported after the seal is an oplog line only.
+session follows it (RT-AUD-03), except entries of the egress and watchdog writers still
+outstanding at teardown (Q244, Q251, TODO(#156)): (i) an append whose task was aborted while it
+waited for or ran its blocking write (`EgressHandle::shutdown` aborts after its grace without
+awaiting; the handle's and the watchdog's drop do the same); (ii) an `egress.response` started
+from a body's drop on a detached blocking task, when the abort drops the body or the client
+abandons it within the grace (#72). Such an entry holds the sandbox's own request text (host,
+target), redacted with the session's own forms whenever it lands (the session's egress sink
+redacts each entry with them, Q249; RT-SEC-07), plus counts and secret names; watchdog entries
+hold no sandbox text. A panic reported after the seal is an oplog line only.
 
 A session with no `session.closed` is one whose teardown did not complete, or whose
 `session.closed` append was refused; the oplog names the latter (an error line naming only the
@@ -1586,11 +1593,12 @@ sallyport/
   `sallyd::session::secrets`, Q219, Q220). A session's forms enter both redactors when its
   egress has loaded them, before `net.sock` is bound or a container exists. They leave after
   the session's last entry: `sandbox.refuse` for a refused launch, `session.closed` (§5.4) for
-  a session. A value two live sessions share stays redacted until both have left. Residuals:
-  an egress or watchdog append already inside its blocking write when its task was aborted may
-  land after `session.closed` and the release, carrying hosts, counts and secret names, never a
-  value (Q244, TODO(#156)); a launch or start task that panics after registering never
-  releases its forms, so they stay redacted, and in memory, until `sallyd` exits (TODO(#113)).
+  a session. A value two live sessions share stays redacted until both have left. A proxy
+  session's egress sink also redacts each of its entries with that session's own forms before
+  the writer sees it (`SessionRedacted`, Q249), so an egress entry that lands after the release
+  (§5.4: an aborted or detached append, #156, #72) has its sandbox-chosen text redacted all the
+  same. Residual: a launch or start task that panics after registering never releases its
+  forms, so they stay redacted, and in memory, until `sallyd` exits (TODO(#113)).
 - **Tauri bridge**: Rust side exposes one command `rpc(method: String, params: Value)` that
   forwards to `control.sock` **only** for methods in a compile-time allowlist (no
   `secrets.list` of values exists anyway). Capabilities file grants `core:default` only.
