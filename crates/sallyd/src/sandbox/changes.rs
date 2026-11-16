@@ -109,7 +109,7 @@ fn changes_within(
         Err(Errno::NOENT) => return Ok(Vec::new()),
         Err(e) => return Err(ChangesError::Stage(format!("cannot open stage/: {e}"))),
     };
-    let mut walk = Walk::new(bounds);
+    let mut walk = Walk::bounded(bounds);
     let mut out = Vec::new();
     for (mount, dir) in mounts(&stage, &mut walk).map_err(ChangesError::Stage)? {
         let upper = match beneath(&dir, "upper") {
@@ -196,7 +196,8 @@ struct Walk {
 }
 
 impl Walk {
-    fn new(bounds: StageBounds) -> Self {
+    /// A listing under `bounds`, its deadline `bounds.deadline` from now.
+    fn bounded(bounds: StageBounds) -> Self {
         Self {
             bounds,
             entries: 0,
@@ -372,7 +373,7 @@ mod tests {
             std::fs::create_dir_all(self.0.join(rel)).unwrap();
         }
         fn list(&self, bounds: StageBounds) -> Result<Vec<(String, ChangeKind)>, String> {
-            let found = list_upper(self.fd(), &mut Walk::new(bounds))?;
+            let found = list_upper(self.fd(), &mut Walk::bounded(bounds))?;
             let mut v: Vec<_> = found
                 .into_iter()
                 .map(|(p, k)| (p.display().to_string(), k))
@@ -488,10 +489,10 @@ mod tests {
         assert!(t.list(bounds(3, 3)).unwrap_err().contains("more than 3"));
         assert!(t.list(bounds(4, 2)).unwrap_err().contains("deeper than 2"));
         // One listed path, "a/b/c/d.txt": 11 bytes plus the 64-byte per-entry cost.
-        let mut walk = Walk::new(StageBounds::default());
+        let mut walk = Walk::bounded(StageBounds::default());
         walk.max_bytes = 75;
         assert_eq!(list_upper(t.fd(), &mut walk).unwrap().len(), 1);
-        let mut walk = Walk::new(StageBounds::default());
+        let mut walk = Walk::bounded(StageBounds::default());
         walk.max_bytes = 74;
         assert!(list_upper(t.fd(), &mut walk).is_err());
         let none = StageBounds {
@@ -508,11 +509,11 @@ mod tests {
         for i in 0..8 {
             t.file(&format!("{}{i}", "n".repeat(200)));
         }
-        let mut walk = Walk::new(StageBounds::default());
+        let mut walk = Walk::bounded(StageBounds::default());
         walk.max_bytes = 1000;
         let e = list_upper(t.fd(), &mut walk).unwrap_err();
         assert!(e.contains("exceeds 1000 bytes"), "{e}");
-        let mut walk = Walk::new(StageBounds::default());
+        let mut walk = Walk::bounded(StageBounds::default());
         assert_eq!(list_upper(t.fd(), &mut walk).unwrap().len(), 8);
     }
 
@@ -526,7 +527,7 @@ mod tests {
             rustix::fs::Mode::empty(),
         )
         .unwrap();
-        let walk = Walk::new(StageBounds::default());
+        let walk = Walk::bounded(StageBounds::default());
         match classify(dev.as_fd(), c"null", 1, &walk).unwrap() {
             Some(Entry::Leaf(kind)) => assert_eq!(kind, ChangeKind::Written),
             _ => panic!("/dev/null is a leaf"),

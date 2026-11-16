@@ -347,7 +347,7 @@ pub fn scan_mounts(v: &ValidatedManifest, limits: &ScanLimits) -> Result<LaunchS
         pins: Vec::new(),
     };
     for (i, m) in v.mounts().iter().enumerate() {
-        Walk::new(i, m, limits)?.run(&mut out)?;
+        Walk::of_mount(i, m, limits)?.run(&mut out)?;
     }
     Ok(out)
 }
@@ -365,7 +365,13 @@ struct Walk<'a> {
 }
 
 impl<'a> Walk<'a> {
-    fn new(mount: usize, m: &'a ResolvedMount, limits: &'a ScanLimits) -> Result<Self, ScanError> {
+    /// A walk of mount `mount`: its root opened without following a symlink ([`open_root`]),
+    /// and the root's mount id, which every entry's is compared with.
+    fn of_mount(
+        mount: usize,
+        m: &'a ResolvedMount,
+        limits: &'a ScanLimits,
+    ) -> Result<Self, ScanError> {
         let root = open_root(mount, m)?;
         let root_mnt = rustix::fs::statx(&root, c"", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)
             .map_err(io(mount, Path::new("")))?
