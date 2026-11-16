@@ -299,6 +299,56 @@ fn a_sessions_egress_entries_are_redacted_with_its_own_forms_after_the_release()
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Architect Q266 (1): the wrapper alone, under a writer with no redactor, redacts a form of
+/// the session's secrets wherever an entry holds it: in a string value, as an object key and as
+/// a number. Control: the same entry appended to the writer directly holds all three.
+#[test]
+fn the_session_sink_redacts_a_form_in_a_value_a_key_and_a_number() {
+    let dir = scratch("sink-alone");
+    let audit = Arc::new(SharedAudit(Mutex::new(
+        AuditWriter::open(&dir.join("audit"), Box::new(SystemClock)).unwrap(),
+    )));
+    let word = value("sink");
+    let digits = "1357924680135792468";
+    let (w, d) = (Secret::new(word.clone()), Secret::new(digits.to_owned()));
+    let forms = SessionForms::build([("WORD", &w, vec![]), ("DIGITS", &d, vec![])]);
+    let sink = SessionRedacted::over(
+        Arc::clone(&audit) as Arc<dyn AuditSink>,
+        Arc::new(Redaction::of(forms).unwrap()),
+    );
+    let entry = |mark: &str| {
+        let args = json!({
+            "host": format!("{word}.h.test"),
+            word.clone(): "a key",
+            "n": digits.parse::<u64>().unwrap(),
+            "m": mark,
+        });
+        NewEntry::new(Actor::Sallyd, "egress.close")
+            .session("s1")
+            .args(args)
+    };
+    sink.append(entry("mark-own"), AuditLevel::Full).unwrap();
+    audit.append(entry("mark-raw"), AuditLevel::Full).unwrap();
+    let text = all_text(&dir.join("audit"));
+    let line = |mark: &str| -> serde_json::Value {
+        let l = text.lines().find(|l| l.contains(mark)).unwrap();
+        serde_json::from_str(l).unwrap()
+    };
+    let own = line("mark-own").to_string();
+    assert!(!own.contains(&word) && !own.contains(digits), "{own}");
+    assert!(own.contains("[REDACTED:WORD].h.test"), "the value: {own}");
+    let key = "\"[REDACTED:WORD]\":\"a key\"";
+    assert!(own.contains(key), "the key: {own}");
+    assert!(own.contains("[REDACTED:DIGITS]"), "the number: {own}");
+    let raw = line("mark-raw").to_string();
+    let host = format!("\"{word}.h.test\"");
+    let key = format!("\"{word}\":\"a key\"");
+    for want in [host.as_str(), key.as_str(), digits] {
+        assert!(raw.contains(want), "control: {want} in {raw}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// An oplog writer the test reads back.
 #[derive(Clone, Default)]
 struct Lines(Arc<Mutex<Vec<u8>>>);
