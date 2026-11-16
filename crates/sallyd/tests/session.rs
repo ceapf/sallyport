@@ -418,6 +418,11 @@ async fn exchange(sock: &Path, lines: &[Value]) -> Vec<Value> {
     replies
 }
 
+/// RT-AG-08's look at host directory `dir` from inside a container.
+fn ag08_probe(dir: &Path) -> String {
+    format!("ls -A -- '{}' 2>&1", dir.display())
+}
+
 /// RT-AG-08 (foreign-id clause) through the registry, B live (#61): a request on A's
 /// `agent.sock` naming B's session id in the arguments, in `_meta`, in `params` or as an extra
 /// member reaches only A's tool handler, and every entry it causes carries A's id, never B's.
@@ -436,8 +441,33 @@ fn rt_ag_08_a_foreign_session_id_reaches_only_its_own_session() {
                 mounts(&[mount(&format!("~/code/{dir}"), "/workspace/p", "ro")])
             )))
         };
-        let a = r.reg.start(session("rt-a", "only-a.txt")).await.unwrap();
+        let va = session("rt-a", "only-a.txt");
+        let a = r.reg.start(va.clone()).await.unwrap();
         let b = r.reg.start(session("rt-b", "only-b.txt")).await.unwrap();
+        // B's paths are absent in A: B's harness socket directory and B's granted directory,
+        // by their host paths. Control (#122, architect Q155), asserted first: the same `ls`, in
+        // a container from A's product argv with one of B's directories bound at its host path,
+        // lists it.
+        let b_sockets = r.x.session_paths(&b.id).harness_sockets();
+        let b_dir = r.x.f.root.join("home/code/rt-b");
+        for (n, (dir, holds)) in [(&b_sockets, AGENT_SOCK), (&b_dir, "only-b.txt")]
+            .into_iter()
+            .enumerate()
+        {
+            let guest = dir.display().to_string();
+            let leave_out = LeaveOut::Bind {
+                host: dir,
+                guest: &guest,
+            };
+            let id =
+                r.x.control_workspace(&va, &format!("ag08c{n}"), leave_out)
+                    .await;
+            let (_, out) = exec_in(&id, &["sh", "-c", &ag08_probe(dir)]);
+            assert!(out.contains(holds), "control: {guest}: {out}");
+            let (code, out) = exec_in(&a.container, &["sh", "-c", &ag08_probe(dir)]);
+            assert_ne!(code, 0, "{guest}: {out}");
+            assert!(out.contains("No such file or directory"), "{guest}: {out}");
+        }
         let sock = r.x.session_paths(&a.id).harness_sockets().join(AGENT_SOCK);
         let meta = json!({
             "io.modelcontextprotocol/protocolVersion": "2026-07-28",

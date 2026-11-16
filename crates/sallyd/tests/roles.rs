@@ -206,8 +206,34 @@ fn only_loopback(b: &Boxed) {
     assert_eq!((code, out.trim()), (0, "lo"), "{:?}", b.role);
 }
 
+/// RT-NET-01's busybox `nc` connect to `host` port `port`; exits 0 once connected.
+fn nc_connect(host: &str, port: u16) -> String {
+    format!("nc -w 3 {host} {port} </dev/null")
+}
+
+/// RT-NET-01's control (analogue, architect Q154): in workspace and harness, the same probe
+/// `connect` and the same `nc` form reach a listener on the container's own loopback (its own
+/// network namespace: nothing is bound on the host); in inference, which may open no IP socket,
+/// an `AF_UNIX` socket is created. Leaving `--network=none` out is forbidden by a hard rule.
+fn net01_control(b: &Boxed) {
+    if b.role == Role::Inference {
+        check(b, &[("socket 1 1 0", "ok")]);
+        return;
+    }
+    let script = format!(
+        "nc -l -p 4000 >/dev/null 2>&1 & nc -l -p 4001 >/dev/null 2>&1 & sleep 1; \
+         echo \"probe => $({PROBE} connect 2 1 0 127.0.0.1 4000)\"; \
+         {} && echo 'nc => ok'",
+        nc_connect("127.0.0.1", 4001)
+    );
+    let (_, out) = exec_in(&b.container, &["sh", "-c", &script]);
+    assert!(out.contains("probe => ok"), "control: {:?}: {out}", b.role);
+    assert!(out.contains("nc => ok"), "control: {:?}: {out}", b.role);
+}
+
 /// RT-NET-01: direct TCP and UDP to the internet fail in every role. Workspace and harness may
 /// open IP sockets (loopback only), so `connect` finds no route; inference may not open them.
+/// Control (analogue), asserted first: [`net01_control`].
 #[test]
 fn rt_net_01_direct_tcp_and_udp_find_no_route() {
     rt().block_on(async {
@@ -217,6 +243,7 @@ fn rt_net_01_direct_tcp_and_udp_find_no_route() {
             boxes.push(start(&x, role).await);
         }
         for b in &boxes {
+            net01_control(b);
             only_loopback(b);
             let want = match b.role {
                 Role::Inference => SECCOMP,
@@ -231,7 +258,7 @@ fn rt_net_01_direct_tcp_and_udp_find_no_route() {
                     ("connect 10 2 0 2001:4860:4860::8888 53", want),
                 ],
             );
-            let (code, out) = exec_in(&b.container, &["nc", "-w", "3", "1.1.1.1", "443"]);
+            let (code, out) = exec_in(&b.container, &["sh", "-c", &nc_connect("1.1.1.1", 443)]);
             assert_ne!(code, 0, "{:?}: busybox nc: {out}", b.role);
         }
         finish(&x, boxes).await;
@@ -374,6 +401,106 @@ fn climb(from: &Path, to: &Path) -> String {
     parts.join("/")
 }
 
+/// The broker's `control.sock` as a role would find it beside its own sockets (form D).
+const CONTROL_SOCK: &str = "/run/sallyport/control.sock";
+
+/// The guest path that `rel` reaches from `/run/sallyport` inside a container (`..` stops at
+/// `/`).
+fn inside(rel: &str) -> String {
+    let mut parts = vec!["run", "sallyport"];
+    for c in rel.split('/') {
+        if c == ".." {
+            parts.pop();
+        } else {
+            parts.push(c);
+        }
+    }
+    format!("/{}", parts.join("/"))
+}
+
+/// RT-FS-10's probe strings for a role whose host socket directory is `sockets`, for each
+/// broker path in `host`: its absolute path (form A), under `/run/sallyport/../..` (B), and
+/// the `..` chain from `sockets` (C). On the host, each climb reaches its path.
+fn fs10_tried(sockets: &Path, host: &[PathBuf]) -> Vec<String> {
+    let mut tried: Vec<String> = host.iter().map(|p| p.display().to_string()).collect();
+    tried.extend(
+        host.iter()
+            .map(|p| format!("/run/sallyport/../..{}", p.display())),
+    );
+    for p in host {
+        let up = sockets.join(climb(sockets, p));
+        assert_eq!(up.canonicalize().unwrap(), p.canonicalize().unwrap());
+    }
+    tried.extend(
+        host.iter()
+            .map(|p| format!("/run/sallyport/{}", climb(sockets, p))),
+    );
+    tried
+}
+
+/// `ls -d` of `/run/sallyport`, then of each path, in `container`: one line per path, `found`
+/// or the error. `/run/sallyport` must be found, so the probe tells present from absent.
+fn fs10_probe(container: &str, tried: &[String]) -> Vec<String> {
+    let script: String = std::iter::once("/run/sallyport")
+        .chain(tried.iter().map(String::as_str))
+        .map(|p| format!("r=$(ls -d -- '{p}' 2>&1 >/dev/null) && echo 'found' || echo \"$r\"; "))
+        .collect();
+    let (code, out) = exec_in(container, &["sh", "-c", &script]);
+    assert_eq!(code, 0, "{container}: {out}");
+    let lines: Vec<String> = out.lines().map(str::to_owned).collect();
+    assert_eq!(lines.len(), tried.len() + 1, "{container}: {out}");
+    assert_eq!(lines[0], "found", "{container}: /run/sallyport");
+    lines
+}
+
+/// A harness container for session `tag` from the product argv, with `leave_out`.
+async fn harness_control(x: &Lx, tag: &str, leave_out: LeaveOut<'_>) -> String {
+    let paths = x.paths(tag);
+    let dirs = SessionDirs::create(&paths, &x.xdg, &[], 0).unwrap();
+    let argv = harness_argv(&x.common_args(&dirs), &paths, &x.f.load(""), &test_image()).unwrap();
+    x.control(argv, leave_out).await
+}
+
+/// RT-FS-10's controls (#122, architect Q167), harness role only: every role's probe strings
+/// (`tried`) print `found` in a container with each broker path bound in at its host path and at
+/// the guest path its climb reaches; `control.sock` is found beside the role's sockets when the
+/// broker's socket directory is the source of `/run/sallyport`.
+async fn fs10_controls(x: &Lx, boxes: &[Boxed], host: &[PathBuf], tried: &[Vec<String>]) {
+    let mut guests: Vec<(PathBuf, String)> = Vec::new();
+    for p in host {
+        guests.push((p.clone(), p.display().to_string()));
+        for b in boxes {
+            let at = (p.clone(), inside(&climb(&b.sockets, p)));
+            if !guests.contains(&at) {
+                guests.push(at);
+            }
+        }
+    }
+    assert_eq!(
+        guests.len(),
+        2 * host.len(),
+        "control: one climb target per path: {guests:?}"
+    );
+    let binds: Vec<(&Path, &str)> = guests
+        .iter()
+        .map(|(h, g)| (h.as_path(), g.as_str()))
+        .collect();
+    let id = harness_control(x, "fs10x", LeaveOut::Binds(&binds)).await;
+    for (b, tried) in boxes.iter().zip(tried) {
+        for (p, line) in tried.iter().zip(&fs10_probe(&id, tried)[1..]) {
+            assert_eq!(line, "found", "control: {:?}: {p}", b.role);
+        }
+    }
+    let sockets = host[0].parent().unwrap();
+    let source = LeaveOut::Source {
+        guest: "/run/sallyport",
+        host: sockets,
+    };
+    let id = harness_control(x, "fs10y", source).await;
+    let line = &fs10_probe(&id, &[CONTROL_SOCK.to_owned()])[1];
+    assert_eq!(line, "found", "control: {CONTROL_SOCK}");
+}
+
 /// RT-FS-10, the ENOENT half (#61 item 1; architect Q82): from every role, the broker's state is
 /// out of reach. Each host path by its absolute path, under `/run/sallyport/../..`, and by the
 /// `..` chain that climbs from the role's host socket directory (mounted at `/run/sallyport`) to
@@ -390,33 +517,15 @@ fn rt_fs_10_broker_state_is_enoent_from_every_role() {
         }
         // After the starts: the inference role's blobs directory exists only from then.
         let (host, _control) = broker_state(&x);
-        for b in &boxes {
-            let mut tried: Vec<String> = host.iter().map(|p| p.display().to_string()).collect();
-            tried.extend(
-                host.iter()
-                    .map(|p| format!("/run/sallyport/../..{}", p.display())),
-            );
-            for p in &host {
-                // On the host, the climb reaches the path: from the container it must not.
-                let up = b.sockets.join(climb(&b.sockets, p));
-                assert_eq!(up.canonicalize().unwrap(), p.canonicalize().unwrap());
-            }
-            tried.extend(
-                host.iter()
-                    .map(|p| format!("/run/sallyport/{}", climb(&b.sockets, p))),
-            );
-            tried.push("/run/sallyport/control.sock".into());
-            let script: String = std::iter::once("/run/sallyport")
-                .chain(tried.iter().map(String::as_str))
-                .map(|p| {
-                    format!("r=$(ls -d -- '{p}' 2>&1 >/dev/null) && echo 'found' || echo \"$r\"; ")
-                })
-                .collect();
-            let (code, out) = exec_in(&b.container, &["sh", "-c", &script]);
-            assert_eq!(code, 0, "{:?}: {out}", b.role);
-            let lines: Vec<&str> = out.lines().collect();
-            assert_eq!(lines.len(), tried.len() + 1, "{:?}: {out}", b.role);
-            assert_eq!(lines[0], "found", "{:?}: /run/sallyport", b.role);
+        let tried: Vec<Vec<String>> = boxes
+            .iter()
+            .map(|b| fs10_tried(&b.sockets, &host))
+            .collect();
+        fs10_controls(&x, &boxes, &host, &tried).await;
+        for (b, tried) in boxes.iter().zip(&tried) {
+            let mut tried = tried.clone();
+            tried.push(CONTROL_SOCK.into());
+            let lines = fs10_probe(&b.container, &tried);
             for (p, line) in tried.iter().zip(&lines[1..]) {
                 assert!(
                     line.ends_with("No such file or directory"),
