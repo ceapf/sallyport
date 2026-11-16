@@ -125,23 +125,30 @@ async fn sleeping(container: &str) -> bool {
     out.contains(SLEEP[1])
 }
 
+/// What the RT-CLI-01 commands print on stderr: plain text, so stderr is compared by equality
+/// against a stream that carries something (the allowed case), never only checked for absence.
+const STDERR_MARK: &str = "cli01-stderr\n";
+/// Prints the hostile `$1` on stdout, then [`STDERR_MARK`] on stderr.
+const STDERR_SCRIPT: &str = "printf \"$1\"; echo cli01-stderr >&2";
+
 /// RT-CLI-01, the notification half: every terminal control the command prints reaches the
-/// client as printable text. Control: `sallyd`'s per-stream `StreamEscaper` (`tools/exec.rs`);
+/// client as printable text. Control: `sallyd`'s per-stream `StreamEscaper` (`tools/pipe.rs`);
 /// without it the raw bytes (or their lossy UTF-8) arrive and the text comparison fails.
+/// Allowed case: the command's plain stderr line arrives on stderr exactly, and nothing else.
 #[test]
 fn rt_cli_01_terminal_controls_reach_the_client_escaped() {
     rt().block_on(async {
         let c = cx();
         let mut w = c.connect();
         let (id, _) = create(&c, &mut w, "cli01", false).await;
-        let argv = json!(["sh", "-c", "printf \"$1\"", "sh", HOSTILE]);
+        let argv = json!(["sh", "-c", STDERR_SCRIPT, "sh", HOSTILE]);
         let n = w
             .send("sessions.attach", json!({"id": id, "argv": argv}))
             .await;
         let (reply, notes) = w.until_reply(n).await;
         assert_eq!(reply["result"], json!({"exit_code": 0}), "{reply}");
         assert_eq!(joined(&notes, "stdout"), HOSTILE_ESCAPED);
-        assert_eq!(joined(&notes, "stderr"), "");
+        assert_eq!(joined(&notes, "stderr"), STDERR_MARK);
         for n in &notes {
             let t = n["text"].as_str().unwrap();
             assert!(
@@ -158,11 +165,12 @@ fn rt_cli_01_terminal_controls_reach_the_client_escaped() {
 }
 
 /// RT-CLI-01, the CLI half: `sally sandbox run` over a real `control.sock` prints exactly the
-/// escaped text, nothing on stderr, and exits with the command's code. Control: the
-/// `StreamEscaper` (as above); without it the CLI's clean-check (`run::show`, through
-/// `clean::text`) still escapes, but differently (`\u{fffd}`, `\x0a`), and adds its not-clean
-/// line on stderr, so both the stdout and the stderr assertions fail. The clean-check, the
-/// second layer, has its own tests in sally-cli (`run_tests.rs`).
+/// escaped text, on stderr exactly the command's own plain line (the allowed case) and nothing
+/// of its own, and exits with the command's code. Control: the `StreamEscaper` (as above);
+/// without it the CLI's clean-check (`run::show`, through `clean::text`) still escapes, but
+/// differently (`\u{fffd}`, `\x0a`), adds its not-clean line on stderr and exits 1, so the
+/// stdout, stderr and code assertions all fail. The clean-check, the second layer, has its own
+/// tests in sally-cli (`run_tests.rs`).
 #[test]
 fn rt_cli_01_sally_sandbox_run_prints_the_escaped_text() {
     let c = cx();
@@ -179,7 +187,8 @@ fn rt_cli_01_sally_sandbox_run_prints_the_escaped_text() {
     let served = Served::start(&c, "cli01");
     let mut client = sally_cli::client::Client::connect(&served.path).unwrap();
     let (mut out, mut err) = (Vec::new(), Vec::new());
-    let argv: Vec<String> = ["sh", "-c", "printf \"$1\"; exit 3", "sh", HOSTILE]
+    let script = format!("{STDERR_SCRIPT}; exit 3");
+    let argv: Vec<String> = ["sh", "-c", script.as_str(), "sh", HOSTILE]
         .map(str::to_owned)
         .to_vec();
     let code = {
@@ -194,7 +203,7 @@ fn rt_cli_01_sally_sandbox_run_prints_the_escaped_text() {
         String::from_utf8(err).unwrap(),
     );
     assert_eq!((code, out.as_str()), (3, HOSTILE_ESCAPED), "{err}");
-    assert_eq!(err, "");
+    assert_eq!(err, STDERR_MARK);
     drop(client);
     served.stop();
     // The run stopped its session; the request is the CLI's own `sessions.stop`.
