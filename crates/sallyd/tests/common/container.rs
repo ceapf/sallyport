@@ -407,6 +407,11 @@ pub struct Lx {
     /// name.
     pub redactors: Arc<sallyd::session::secrets::Redactors>,
     pub redacted: Arc<Swapped>,
+    /// An operational log that is the redactors' second target, as the daemon's is, and what it
+    /// wrote: a registry built over it (`registry_logged`) shows what production's oplog
+    /// redacts.
+    pub oplog: sallyd::oplog::Oplog,
+    pub oplog_lines: super::Lines,
     /// Prefix of every session id this fixture makes: `t<run>-<pid>-<n>`, with [`run_id`]
     /// (architect Q24), so every container name carries the run and `Drop` and the wrapper's
     /// sweep remove only their own.
@@ -529,8 +534,11 @@ impl Lx {
         let events = Arc::new(Events::default());
         let egress = super::egress::fake_egress(&f.root);
         let redacted = Arc::new(Swapped::default());
+        let oplog_lines = super::Lines::default();
+        let oplog = sallyd::oplog::Oplog::new(oplog_lines.clone());
         let redactors = Arc::new(sallyd::session::secrets::Redactors::new(vec![
             Arc::clone(&redacted) as Arc<dyn sallyd::session::secrets::RedactorTarget>,
+            Arc::new(oplog.clone()) as Arc<dyn sallyd::session::secrets::RedactorTarget>,
         ]));
         let launcher = Launcher::new(LauncherParts {
             podman: podman.clone(),
@@ -560,6 +568,8 @@ impl Lx {
             egress,
             redactors,
             redacted,
+            oplog,
+            oplog_lines,
             scope: format!("t{}-{}-{n}", run_id(), std::process::id()),
             installation,
             _io: io,

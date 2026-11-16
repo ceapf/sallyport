@@ -1112,7 +1112,9 @@ fn the_daemon_validates_and_injects_from_the_store_the_cli_writes() {
         !files_holding(&paths.audit(), b"[REDACTED:GH_TOKEN]").is_empty(),
         "control: the command's argv reached the audit log"
     );
-    // Everything Sallyport writes (podman's own storage, owned by the mapped ids, is not).
+    // Everything Sallyport writes. Podman's own storage is left out: the value here is this
+    // test's own argv, which podman's records of the exec may hold, not an injected secret, and
+    // its layer files belong to the mapped ids.
     let held: Vec<PathBuf> = [
         "home",
         "run/sallyport",
@@ -1126,19 +1128,23 @@ fn the_daemon_validates_and_injects_from_the_store_the_cli_writes() {
     assert!(!String::from_utf8_lossy(&out.stderr).contains(&value));
 }
 
-/// Every regular file under `dir` (symlinks not followed) whose bytes hold `needle`.
+/// Every regular file under `dir` (symlinks not followed) whose bytes hold `needle`. A
+/// directory or file it cannot read fails the test, naming it: unread is not clean.
 fn files_holding(dir: &Path, needle: &[u8]) -> Vec<PathBuf> {
     let mut found = Vec::new();
-    for e in std::fs::read_dir(dir).unwrap() {
+    let entries =
+        std::fs::read_dir(dir).unwrap_or_else(|e| panic!("cannot list {}: {e}", dir.display()));
+    for e in entries {
         let path = e.unwrap().path();
         let meta = std::fs::symlink_metadata(&path).unwrap();
         if meta.is_dir() {
             found.extend(files_holding(&path, needle));
-        } else if meta.is_file()
-            && let Ok(bytes) = std::fs::read(&path)
-            && bytes.windows(needle.len()).any(|w| w == needle)
-        {
-            found.push(path);
+        } else if meta.is_file() {
+            let bytes = std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            if bytes.windows(needle.len()).any(|w| w == needle) {
+                found.push(path);
+            }
         }
     }
     found

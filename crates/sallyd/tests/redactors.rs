@@ -103,6 +103,63 @@ fn a_stopped_sessions_secrets_stay_redacted_through_its_last_entries() {
     });
 }
 
+/// The oplog line of a session task's panic reported during the session's stop.
+const PANICKED: &str = "session task panicked during its stop";
+
+/// Architect Q228 (security review LOW-1): a crash a session task reports during the session's
+/// stop is logged while the session's secrets are still redacted. Its payload, a value the
+/// session holds, reaches the oplog as the placeholder, never in the clear. Controls: the
+/// session is still registered while the stop is parked, and released after it.
+#[test]
+fn a_crash_reported_during_a_stop_is_logged_redacted() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let reg = x.registry_logged(
+            x.events.clone() as Arc<dyn AuditSink>,
+            Some(test_image()),
+            x.oplog.clone(),
+        );
+        let gh = canary("GITHUB_TOKEN");
+        let a = reg.start(manifest(&x, ONE)).await.unwrap();
+        let reporter = reg.reporter(&a.id).expect("a live session's reporter");
+        x.events.hold(&["sandbox.stop"]);
+        let stopping = {
+            let (reg, id) = (Arc::clone(&reg), a.id.clone());
+            tokio::spawn(async move { reg.stop(&id, StopReason::Request).await })
+        };
+        x.events.until_parked("sandbox.stop", 1).await;
+        let payload = gh.clone();
+        let panicked = tokio::spawn(async move { panic!("{payload}") })
+            .await
+            .unwrap_err();
+        reporter.joined("tool", panicked);
+        assert_eq!(x.redactors.sessions(), std::slice::from_ref(&a.id));
+        assert!(x.oplog.flush(BOUND));
+        assert!(!x.oplog_lines.text().contains(PANICKED), "not logged yet");
+        x.events.hold(&[]);
+        tokio::time::timeout(BOUND, stopping)
+            .await
+            .expect("the stop ends")
+            .unwrap()
+            .unwrap();
+        assert!(x.oplog.flush(BOUND));
+        let text = x.oplog_lines.text();
+        let lines: Vec<&str> = text.lines().filter(|l| l.contains(PANICKED)).collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        assert!(
+            lines[0].contains("tool") && lines[0].contains("[REDACTED:GITHUB_TOKEN]"),
+            "{}",
+            lines[0]
+        );
+        assert!(!text.contains(&gh), "{text}");
+        assert!(x.redactors.sessions().is_empty(), "control: released");
+        assert!(
+            !x.events.all().iter().any(|(e, _)| e == "session.crash"),
+            "late: an oplog line only"
+        );
+    });
+}
+
 /// A start that fails after its workspace launched (here: `session.start` cannot be written)
 /// keeps the values redacted until the workspace's `sandbox.stop`, then releases them (Rust
 /// review M2: the registry's `discard`).

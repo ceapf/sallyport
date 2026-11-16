@@ -205,11 +205,9 @@ fn an_unaudited_session_start_binds_nothing_and_stops_the_workspace() {
             ["sandbox.launch", "session.stop", "sandbox.stop"]
         );
         assert_eq!(stops(&r.x), ["start-failed"]);
-        let names = podman(&["ps", "-a", "--format", "{{.Names}}"]);
-        let names = String::from_utf8_lossy(&names.stdout);
-        // Names are `sp-ws-<scope>-<hex>`; the dashes keep scope `…-1` from matching `…-18`, a
-        // test running beside this one.
-        assert!(!names.contains(&format!("-{}-", r.x.scope)), "{names}");
+        // The fixture's own match: scope `…-1` never matches `…-18`, a test running beside
+        // this one.
+        assert!(!r.x.listed(), "a container of this test is left");
     });
 }
 

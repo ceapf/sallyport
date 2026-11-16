@@ -188,8 +188,9 @@ fn all_text(dir: &Path) -> String {
     out
 }
 
-/// #85 (2): the audit writer behind `SharedAudit` and the oplog are the production targets; an
-/// entry and a line carrying a registered value are redacted, and after unregister are not.
+/// #85 (2): the audit writer behind `SharedAudit` and the oplog are the production targets,
+/// both wired by [`Redactors::for_logs`] (what `serve` calls); an entry and a line carrying a
+/// registered value are redacted, and after unregister are not.
 #[test]
 fn the_audit_writer_and_the_oplog_redact_what_is_registered() {
     let dir = scratch("targets");
@@ -198,10 +199,7 @@ fn the_audit_writer_and_the_oplog_redact_what_is_registered() {
     )));
     let lines = Lines::default();
     let oplog = Oplog::new(lines.clone());
-    let r = Redactors::new(vec![
-        Arc::clone(&audit) as Arc<dyn RedactorTarget>,
-        Arc::new(oplog.clone()) as Arc<dyn RedactorTarget>,
-    ]);
+    let r = Redactors::for_logs(&audit, &oplog);
     let v = value("prod");
     let write = |tag: &str| {
         let entry = NewEntry::new(Actor::Sallyd, "test.entry").args(json!({ "t": tag, "v": v }));
