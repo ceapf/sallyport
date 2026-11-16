@@ -22,6 +22,12 @@ impl Payload {
     /// Wraps `bytes` and hashes them.
     #[must_use]
     pub fn new(bytes: Vec<u8>) -> Self {
+        Self::hashed(bytes)
+    }
+
+    /// [`Payload::new`]: `bytes` with their SHA-256 as lower-case hex.
+    #[must_use]
+    pub fn hashed(bytes: Vec<u8>) -> Self {
         let sha256 = hex(&Sha256::digest(&bytes));
         Self { bytes, sha256 }
     }
@@ -413,6 +419,19 @@ mod tests {
         let d = format!("{p:?}");
         assert!(d.starts_with("Payload(11 bytes, sha256 ") && !d.contains("secret"));
         assert_eq!(p.sha256(), hex(&Sha256::digest(b"secret body")));
+    }
+
+    /// `hashed` keeps the bytes and their SHA-256 (FIPS 180-2 vector for "abc"); `new` is the
+    /// same payload.
+    #[test]
+    fn hashed_keeps_the_bytes_and_their_sha256() {
+        let p = Payload::hashed(b"abc".to_vec());
+        assert_eq!(p.bytes(), b"abc");
+        assert_eq!(
+            p.sha256(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert!(Payload::new(b"abc".to_vec()) == p);
     }
 
     #[test]
