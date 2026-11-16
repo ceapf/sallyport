@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use super::*;
+use crate::egress::scratch::Scratch;
 
 /// RT-AG-16 (#92, architect Q192): the grace is pinned as a literal, and the backstop is
 /// `runtime.timeout` + grace, with overflow refused.
@@ -96,13 +97,7 @@ fn manifest(dir: &Path) -> ValidatedManifest {
 
 #[test]
 fn scans_must_cover_each_rw_mount_exactly_once() {
-    let dir = std::env::current_dir()
-        .unwrap()
-        .join("../../target/argv-unit")
-        .join(std::process::id().to_string());
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let dir = std::fs::canonicalize(&dir).unwrap();
+    let (dir, _gone) = scratch("scans");
     let v = manifest(&dir);
     assert!(scans_by_mount(&v, &[scan(0, &[], &[])]).is_ok());
     for bad in [
@@ -131,7 +126,6 @@ fn scans_must_cover_each_rw_mount_exactly_once() {
     .unwrap();
     let e = workspace_mounts(&mut a, &paths, &v, &BTreeMap::new()).unwrap_err();
     assert!(e.to_string().contains("rw mount has no git scan"), "{e}");
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// Settings whose runtime is an executable `crun` in `dir/<runtime_dir>`, which passes
@@ -163,13 +157,7 @@ fn common_args(dir: &Path, runtime_dir: &str) -> CommonArgs {
 /// clean settings are the control.
 #[test]
 fn begin_refuses_each_unclean_path_by_its_label() {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/argv-unit")
-        .join(format!("begin-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let dir = std::fs::canonicalize(&dir).unwrap();
-    let _gone = Gone(dir.clone());
+    let (dir, _gone) = scratch("begin");
     let ok = common_args(&dir, "bin");
     let a = Argv::begin(&ok, "sp-ws-s".to_owned(), Role::Workspace).unwrap();
     let path = |p: &Path| p.to_str().unwrap().to_owned();
@@ -222,11 +210,9 @@ fn begin_refuses_each_unclean_path_by_its_label() {
     }
 }
 
-/// Removes its directory on drop, so a failing assertion leaves nothing behind.
-struct Gone(PathBuf);
-
-impl Drop for Gone {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
+/// A fresh directory under `target/argv-unit`, canonical, and its guard, which removes it on drop
+/// so a failing assertion leaves nothing behind.
+fn scratch(tag: &str) -> (PathBuf, Scratch) {
+    let guard = crate::egress::scratch::scratch("argv-unit", tag);
+    (std::fs::canonicalize(&*guard).unwrap(), guard)
 }

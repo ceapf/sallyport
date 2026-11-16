@@ -5,25 +5,13 @@
 use std::os::unix::fs::MetadataExt as _;
 
 use super::*;
+use crate::egress::scratch::Scratch;
 
-/// Removes its directory on drop, so a failing assertion leaves nothing behind.
-struct Gone(PathBuf);
-
-impl Drop for Gone {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// A fresh directory under `target/scan-unit`, and its guard.
-fn scratch(tag: &str) -> (PathBuf, Gone) {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/scan-unit")
-        .join(format!("{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let dir = std::fs::canonicalize(&dir).unwrap();
-    (dir.clone(), Gone(dir))
+/// A fresh directory under `target/scan-unit`, canonical, and its guard, which removes it on drop
+/// so a failing assertion leaves nothing behind.
+fn scratch(tag: &str) -> (PathBuf, Scratch) {
+    let guard = crate::egress::scratch::scratch("scan-unit", tag);
+    (std::fs::canonicalize(&*guard).unwrap(), guard)
 }
 
 /// A manifest whose home is `dir/home`, with `~/a` (`rw`, mount 0) and `~/b` (`staged`, mount 1).
