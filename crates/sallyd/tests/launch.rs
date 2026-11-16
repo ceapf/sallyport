@@ -261,25 +261,26 @@ fn rt_ag_09_writing_past_stage_size_into_a_git_overlay_kills_the_session() {
     });
 }
 
-/// RT-FS-13 at launch: refused before anything is created, and audited.
+/// RT-FS-13 at launch: refused before anything is created, and audited. Control, first: the
+/// same manifest before the socket exists launches on the same fixture, and its container is
+/// listed by the same probe (`Lx::listed_control`).
 #[test]
 fn rt_fs_13_a_socket_in_a_mount_refuses_the_launch() {
     rt().block_on(async {
         let x = Lx::new();
+        let v =
+            x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "ro")]));
+        let base = x.listed_control(&v, "sockc").await;
         let dir = x.f.root.join("home/code/myproject");
         let short = std::env::temp_dir().join(format!("sp-l-{}", std::process::id()));
         let _ = std::fs::remove_file(&short);
         std::os::unix::fs::symlink(&dir, &short).unwrap();
         let _l = std::os::unix::net::UnixListener::bind(short.join("agent.sock")).unwrap();
         std::fs::remove_file(&short).unwrap();
-        let v =
-            x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "ro")]));
         let e = x.launch(&v, "sock").await.unwrap_err();
         assert!(e.to_string().contains("socket-in-mount"), "{e}");
-        assert_eq!(x.events.list(), ["sandbox.refuse"]);
-        let out = podman(&["ps", "-a", "--format", "{{.Names}}"]);
-        let names = String::from_utf8_lossy(&out.stdout);
-        assert!(!names.lines().any(|n| n.ends_with("-sock")), "{names}");
+        assert_eq!(x.events.list()[base..], ["sandbox.refuse"]);
+        assert!(!x.listed(), "nothing was created");
     });
 }
 

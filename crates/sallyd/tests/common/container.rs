@@ -615,6 +615,29 @@ impl Lx {
         self.launcher.stop(r).await.unwrap();
     }
 
+    /// Whether `podman ps --all` lists a container of this fixture: its scope is part of every
+    /// session id, so of every container name. The probe of the "nothing was created" checks.
+    #[allow(dead_code)] // Only the launch-refusal tests probe for created containers.
+    pub fn listed(&self) -> bool {
+        let out = podman(&["ps", "--all", "--format", "{{.Names}}"]);
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .any(|n| n.contains(&self.scope))
+    }
+
+    /// The control of a "nothing was created" check (#122): `v`, which the launcher accepts,
+    /// launched as `tag` on this fixture is [`Lx::listed`], and is no longer once stopped. Returns
+    /// the number of audit entries written so far, so a refusal's entries can be read after them.
+    #[allow(dead_code)] // Only the launch-refusal tests probe for created containers.
+    pub async fn listed_control(&self, v: &ValidatedManifest, tag: &str) -> usize {
+        assert!(!self.listed(), "control: listed before any launch");
+        let r = self.launch(v, tag).await.expect("control: the launch");
+        assert!(self.listed(), "control: the launched container is listed");
+        self.stop(r).await;
+        assert!(!self.listed(), "control: still listed after its stop");
+        self.events.list().len()
+    }
+
     /// The harness request of the session `tag` (its workspace launched first).
     #[allow(dead_code)] // Only the role launch tests launch a harness.
     pub fn harness(&self, v: &ValidatedManifest, tag: &str) -> HarnessRequest {

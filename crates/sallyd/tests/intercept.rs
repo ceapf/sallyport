@@ -454,6 +454,28 @@ fn texts(v: &serde_json::Value, out: &mut Vec<String>) {
     }
 }
 
+/// The first credential RT-SEC-07's search finds in one audit entry, if any: the raw canaries
+/// and `CANARY` in the entry's JSON text; `CANARY` and every one of `forms` in every decoded
+/// string, key and number (so JSON escaping cannot hide one). The control and the absence
+/// check run this one function.
+fn credential_in(event: &str, args: &serde_json::Value, forms: &[String]) -> Option<String> {
+    let text = args.to_string();
+    if text.contains(&gh()) || text.contains(&mock3()) || text.contains("CANARY") {
+        return Some(format!("{event}: {text}"));
+    }
+    let mut decoded = vec![event.to_owned()];
+    texts(args, &mut decoded);
+    for t in &decoded {
+        if t.contains("CANARY") {
+            return Some(format!("{event}: {t}"));
+        }
+        if let Some(f) = forms.iter().find(|f| t.contains(f.as_str())) {
+            return Some(format!("{event}: {f} in {t}"));
+        }
+    }
+    None
+}
+
 /// Every independently computed form of every canary of [`FORMS_MANIFEST`]: the forms of each
 /// value, each rendered `Bearer` value, and each `{basic}` grant's rendered value and blobs.
 fn every_form() -> Vec<String> {
@@ -765,7 +787,8 @@ fn rt_sec_06b_compression_is_stripped_and_an_encoded_echo_is_refused() {
 /// of any canary (each independently computed: raw, percent, base64 cores, rendered values,
 /// blobs; searched in every decoded string, key and number, so JSON escaping cannot hide one),
 /// and each `egress.request` names its grant. Control: `request_args` builds `injected` from
-/// grant names (`Prepared::names`), and no entry is built from a header map or a body.
+/// grant names (`Prepared::names`), and no entry is built from a header map or a body. In-test
+/// control of the search (#122): [`credential_in`] finds every form planted in an entry.
 #[test]
 fn rt_sec_07_no_audit_entry_holds_a_credential() {
     rt().block_on(async {
@@ -811,22 +834,25 @@ fn rt_sec_07_no_audit_entry_holds_a_credential() {
             assert!(seen.contains(&basic_blob(user, &git())), "{user}");
         }
         lx.stop(r).await;
-        let all = lx.events.all();
         let forms = every_form();
-        for (event, args) in &all {
-            let text = args.to_string();
-            assert!(
-                !text.contains(&gh()) && !text.contains(&mock3()) && !text.contains("CANARY"),
-                "{event}: {text}"
-            );
-            let mut decoded = vec![event.clone()];
-            texts(args, &mut decoded);
-            for t in &decoded {
-                assert!(!t.contains("CANARY"), "{event}: {t}");
-                for f in &forms {
-                    assert!(!t.contains(f.as_str()), "{event}: {f} in {t}");
-                }
+        // Control (#122): the same search finds each form planted in an entry, as a string
+        // value that JSON escapes, deep in an array, and as a key.
+        for f in &forms {
+            for planted in [
+                json!({"note": format!("\"{f}\"")}),
+                json!({"a": [{"b": [format!("x{f}y")]}]}),
+                json!({ f.as_str(): 1 }),
+            ] {
+                assert!(
+                    credential_in("planted", &planted, &forms).is_some(),
+                    "control: {f} not found in {planted}"
+                );
             }
+        }
+        let all = lx.events.all();
+        for (event, args) in &all {
+            let found = credential_in(event, args, &forms);
+            assert!(found.is_none(), "{found:?}");
         }
         let injected: Vec<(String, serde_json::Value)> = all
             .iter()
@@ -871,7 +897,10 @@ fn rt_sec_11_the_workspace_holds_only_the_placeholder() {
             "env; for f in /proc/[0-9]*/environ; do tr '\\0' '\\n' < $f; done 2>/dev/null",
         )
         .await;
-        assert!(env.contains("GH_TOKEN=sallyport-placeholder"), "{env}");
+        // Control (#122): both halves of the dump are read. The placeholder comes from `env` and
+        // from at least one `/proc/*/environ` (PID 1's and the shell's both carry it).
+        let dumped = env.matches("GH_TOKEN=sallyport-placeholder").count();
+        assert!(dumped >= 2, "control: {dumped} copies in {env}");
         assert!(!env.contains(&gh()) && !env.contains("CANARY"), "{env}");
         let placeholder = "Authorization: Bearer sallyport-placeholder\r\n";
         let _ = over(
