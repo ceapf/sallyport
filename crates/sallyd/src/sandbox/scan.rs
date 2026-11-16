@@ -591,3 +591,7 @@ impl<'a> Walk<'a> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "scan_tests.rs"]
+mod tests;
