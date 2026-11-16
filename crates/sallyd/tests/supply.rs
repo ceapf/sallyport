@@ -93,10 +93,18 @@ fn images_json(x: &Lx) -> String {
 /// The sockets syscalls that can carry an address, and the ones that prove the lookup ran.
 const TRACE: &str = "trace=connect,sendto,sendmsg,sendmmsg,openat,execve";
 
-/// `strace -f` of hermetic podman `args`. Asserts its exit code and stderr, that podman ran and
-/// opened the image store (`store`), and that no `connect`/`send*` names an `AF_INET` or
-/// `AF_INET6` address, loopback included (`AF_UNIX` and netlink are local).
-fn traced(x: &Lx, args: &[&str], store: &str, code: i32, stderr: &str) {
+/// The lines of a trace whose `connect`/`send*` names an `AF_INET` or `AF_INET6` address,
+/// loopback included (`AF_UNIX` and netlink are local).
+fn inet_sends(text: &str) -> Vec<&str> {
+    let sends = ["connect(", "sendto(", "sendmsg(", "sendmmsg("];
+    text.lines()
+        .filter(|l| sends.iter().any(|s| l.contains(s)))
+        .filter(|l| l.contains("AF_INET") || l.contains("inet_addr(") || l.contains("inet_pton("))
+        .collect()
+}
+
+/// `strace -f` of hermetic podman `args`: its output and the trace.
+fn run_traced(x: &Lx, args: &[&str]) -> (std::process::Output, String) {
     let log = x.f.root.join("strace.log");
     let out = Command::new("strace")
         .args(["-f", "-qq", "-e", TRACE, "-o"])
@@ -108,10 +116,17 @@ fn traced(x: &Lx, args: &[&str], store: &str, code: i32, stderr: &str) {
         .stdin(std::process::Stdio::null())
         .output()
         .expect("strace must be installed (CI: container test prerequisites)");
+    let text = std::fs::read_to_string(&log).unwrap();
+    (out, text)
+}
+
+/// [`run_traced`], asserting its exit code and stderr, that podman ran and opened the image
+/// store (`store`), and that the trace has no [`inet_sends`].
+fn traced(x: &Lx, args: &[&str], store: &str, code: i32, stderr: &str) {
+    let (out, text) = run_traced(x, args);
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(code), "podman {args:?}: {err}");
     assert!(err.contains(stderr), "podman {args:?}: {err}");
-    let text = std::fs::read_to_string(&log).unwrap();
     let bin = x.podman.bin().to_string_lossy();
     assert!(
         text.lines()
@@ -123,11 +138,33 @@ fn traced(x: &Lx, args: &[&str], store: &str, code: i32, stderr: &str) {
             .any(|l| l.contains("openat(") && l.contains(&format!("\"{store}\""))),
         "podman {args:?} looked the image up in {store}: {text}"
     );
-    let sends = ["connect(", "sendto(", "sendmsg(", "sendmmsg("];
-    for line in text.lines().filter(|l| sends.iter().any(|s| l.contains(s))) {
-        let inet =
-            line.contains("AF_INET") || line.contains("inet_addr(") || line.contains("inet_pton(");
-        assert!(!inet, "podman {args:?} addressed an IP: {line}");
+    let inet = inet_sends(&text);
+    assert!(inet.is_empty(), "podman {args:?} addressed an IP: {inet:?}");
+}
+
+/// RT-SUP-02's control (#122, architect Q157): the same trace and scan, with `--pull=never`
+/// replaced by `--pull=missing` against a registry on loopback port 1 (nothing listens there;
+/// nothing is bound), flag podman's connect, and every flagged line is loopback.
+fn the_scan_sees_a_pull(x: &Lx, image: &str) {
+    let digest = image.rsplit_once('@').unwrap().1;
+    let reference = format!("127.0.0.1:1/x@{digest}");
+    let args = [
+        "create",
+        "--pull=missing",
+        "--network=none",
+        &reference,
+        "true",
+    ];
+    let (out, text) = run_traced(x, &args);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "control: the pull failed: {err}");
+    let inet = inet_sends(&text);
+    assert!(
+        !inet.is_empty(),
+        "control: the scan flags the pull's connect: {err}"
+    );
+    for line in inet {
+        assert!(line.contains("127.0.0.1"), "control: only loopback: {line}");
     }
 }
 
@@ -146,6 +183,7 @@ fn rt_sup_02_a_missing_digest_is_refused_without_an_outbound_connection() {
         // A traced podman cannot start the setuid uid-map helpers, so the rootless namespace
         // must already exist: an untraced hermetic call creates it whatever ran before.
         hermetic(&x, &["unshare", "true"]);
+        the_scan_sees_a_pull(&x, &image);
         let store = images_json(&x);
         traced(&x, &["image", "exists", &image], &store, 1, "");
         let create = ["create", "--pull=never", "--network=none", &image, "true"];
