@@ -1,24 +1,53 @@
 //! Fuzz target: arbitrary bytes → the egress proxy's request-head parser, then the CONNECT
-//! authority parser and the audit escaping (SI-9; CLAUDE.md: every parser of untrusted bytes has
+//! authority parser and the audit text (SI-9; CLAUDE.md: every parser of untrusted bytes has
 //! one).
 //!
 //! Invariants: never panics; a complete head lies within the first 8 KiB and its target is a
 //! slice of the input; an accepted authority is canonical (it round-trips through `host:port`)
-//! and never an IP literal; the audit text of a target is bounded and printable ASCII.
+//! and never an IP literal; the audit text of a target is bounded and printable ASCII, both for
+//! a session without secret grants (`None`: cut as the raw text is) and for one with a fixed
+//! secret (`Some`: the secret's value never appears, and a cut text holds the full 256 bytes;
+//! architect Q264).
 #![no_main]
 #![forbid(unsafe_code)]
 
+use std::sync::OnceLock;
+
 use libfuzzer_sys::fuzz_target;
+use sally_core::audit::Redactor;
 use sallyd::egress::authority::{self, LOGGED_TARGET_BYTES, audit_text};
 use sallyd::egress::head::{self, MAX_HEAD, Parsed};
+
+/// The fixed secret and its redactor. The value is 14 lower-case letters assembled at run time,
+/// none of them a letter of the placeholder `[REDACTED:C]`, so masking can never rebuild it; a
+/// seed in the corpus carries it as a CONNECT host label.
+fn secret() -> &'static (String, Redactor) {
+    static SECRET: OnceLock<(String, Redactor)> = OnceLock::new();
+    SECRET.get_or_init(|| {
+        let value: String = (b'j'..=b'q').chain(b'u'..=b'z').map(char::from).collect();
+        let redactor = Redactor::new([("C", value.as_str())]);
+        (value, redactor)
+    })
+}
+
+/// Bounded and printable ASCII, whatever the target held.
+fn check_printable(text: &str) {
+    assert!(text.len() <= 4 * LOGGED_TARGET_BYTES, "audit text unbounded");
+    assert!(text.bytes().all(|b| (0x20..0x7f).contains(&b)), "audit text not printable");
+}
 
 fuzz_target!(|data: &[u8]| {
     if let Parsed::Complete(h) = head::parse(data) {
         assert!(h.len <= MAX_HEAD && h.len <= data.len(), "head length out of range");
         let (text, len, cut) = audit_text(h.target, None);
-        assert!(text.len() <= 4 * LOGGED_TARGET_BYTES, "audit text unbounded");
-        assert!(text.bytes().all(|b| (0x20..0x7f).contains(&b)), "audit text not printable");
+        check_printable(&text);
         assert_eq!((len, cut), (h.target.len(), h.target.len() > LOGGED_TARGET_BYTES));
+        let (value, redactor) = secret();
+        let (text, len, cut) = audit_text(h.target, Some(redactor));
+        check_printable(&text);
+        assert_eq!(len, h.target.len(), "raw length not reported");
+        assert!(!text.contains(value.as_str()), "secret value in the audit text");
+        assert!(!cut || text.len() >= LOGGED_TARGET_BYTES, "cut text shorter than the cut");
     }
     let Ok(text) = std::str::from_utf8(data) else {
         return;
