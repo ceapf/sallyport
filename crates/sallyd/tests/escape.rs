@@ -4,6 +4,7 @@
 //! interop). The fixture is `common::container`; these tests never skip.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use sallyd::sandbox::Running;
@@ -34,16 +35,43 @@ fn host_file(x: &Lx, rel: &str, body: &str) {
 }
 
 async fn launch_with(x: &Lx, mode: &str, tag: &str) -> Running {
-    let v =
-        x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", mode)]));
-    x.launch(&v, tag).await.unwrap()
+    x.launch(&manifest(x, mode), tag).await.unwrap()
 }
 
 /// Every top-level directory of the container except the kernel's pseudo filesystems.
 const SEARCH: &str = "$(ls / | grep -vxE 'proc|sys|dev' | sed 's|^|/|')";
 
+/// The workspace manifest [`launch_with`] launches.
+fn manifest(x: &Lx, mode: &str) -> sally_core::manifest::ValidatedManifest {
+    x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", mode)]))
+}
+
+/// `sh -c <script>` in a control container (one started outside the launcher).
+fn exec_control(id: &str, script: &str) -> (i32, String) {
+    exec_in(id, &["sh", "-c", script])
+}
+
+/// RT-FS-01's three probes, run in `id` through `run`: the `cat`/`ls` output, the files whose
+/// content holds `c`, and the exit code and output of `ls` on the host home by its host path.
+async fn fs01_probes<F, Fut>(run: F, c: &str, host: &str) -> (String, String, (i32, String))
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = (i32, String)>,
+{
+    let cat = format!(
+        "cat /home/*/.ssh/* ~/.ssh/* /root/.ssh/* {host}/.ssh/* 2>&1; ls -A /home 2>&1; \
+         echo HOME=$HOME"
+    );
+    let (_, cat) = run(cat).await;
+    let (_, grep) = run(format!("grep -rls '{c}' {SEARCH} 2>/dev/null; echo done")).await;
+    let ls = run(format!("ls {host} {host}/.ssh 2>&1")).await;
+    (cat, grep, ls)
+}
+
 /// RT-FS-01: nothing of the host home is visible. The canary sits in `~/.ssh`, in `~` and in a
 /// sibling of the granted directory; no path finds it and no file in the container holds it.
+/// Control (#122), asserted first: the same probes in a container from the same product argv
+/// with the fixture's `~/.ssh` bound at its host path find the canary and list it.
 #[test]
 fn rt_fs_01_the_host_home_is_invisible() {
     rt().block_on(async {
@@ -52,44 +80,73 @@ fn rt_fs_01_the_host_home_is_invisible() {
         for rel in [".ssh/id_ed25519", "secret.txt", "code/other/notes.txt"] {
             host_file(&x, rel, &c);
         }
-        let r = launch_with(&x, "rw", "fs01").await;
-        let (_, out) = exec(
-            &r,
-            "cat /home/*/.ssh/* ~/.ssh/* /root/.ssh/* 2>&1; ls -A /home 2>&1; echo HOME=$HOME",
-        )
-        .await;
-        assert!(!out.contains(&c), "{out}");
-        let (_, out) = exec(
-            &r,
-            &format!("grep -rls '{c}' {SEARCH} 2>/dev/null; echo done"),
-        )
-        .await;
-        assert_eq!(out.trim(), "done", "a file holds the canary");
         let host = home(&x).display().to_string();
-        let (code, out) = exec(&r, &format!("ls {host} {host}/.ssh 2>&1")).await;
-        assert_ne!(code, 0, "{out}");
+        let ssh = home(&x).join(".ssh");
+        let guest = ssh.display().to_string();
+        let v = manifest(&x, "rw");
+        let id = x
+            .control_workspace(
+                &v,
+                "fs01c",
+                LeaveOut::Bind {
+                    host: &ssh,
+                    guest: &guest,
+                },
+            )
+            .await;
+        let id = &id;
+        let (cat, grep, (code, ls)) =
+            fs01_probes(|s| async move { exec_control(id, &s) }, &c, &host).await;
+        assert!(cat.contains(&c), "control: cat: {cat}");
+        assert!(grep.contains("id_ed25519"), "control: grep: {grep}");
+        assert!(code == 0 && ls.contains("id_ed25519"), "control: ls: {ls}");
+        let r = launch_with(&x, "rw", "fs01").await;
+        let rr = &r;
+        let (cat, grep, (code, ls)) =
+            fs01_probes(|s| async move { exec(rr, &s).await }, &c, &host).await;
+        assert!(!cat.contains(&c), "{cat}");
+        assert_eq!(grep.trim(), "done", "a file holds the canary");
+        assert_ne!(code, 0, "{ls}");
         x.stop(r).await;
     });
 }
 
+/// RT-FS-02's writes into `/workspace/p`.
+const FS02_WRITES: [&str; 4] = [
+    "touch /workspace/p/x",
+    "echo y >> /workspace/p/README",
+    "mkdir /workspace/p/d",
+    "rm /workspace/p/README",
+];
+
 /// RT-FS-02: an `ro` mount refuses creating and deleting with EROFS; the host is unchanged.
+/// Control (#122), asserted first: the same writes into the same directory mounted `rw` succeed
+/// and reach the host.
 #[test]
 fn rt_fs_02_an_ro_mount_is_read_only() {
     rt().block_on(async {
         let x = Lx::new();
+        let dir = home(&x).join("code/myproject");
+        host_file(&x, "code/myproject/README", "keep\n");
+        let r = launch_with(&x, "rw", "fs02c").await;
+        for cmd in FS02_WRITES {
+            let (code, out) = exec(&r, &format!("{cmd} 2>&1")).await;
+            assert_eq!(code, 0, "control: {cmd}: {out}");
+        }
+        assert!(
+            dir.join("x").exists() && dir.join("d").exists() && !dir.join("README").exists(),
+            "control: the writes reached the host"
+        );
+        x.stop(r).await;
+        std::fs::remove_file(dir.join("x")).unwrap();
+        std::fs::remove_dir(dir.join("d")).unwrap();
         host_file(&x, "code/myproject/README", "keep\n");
         let r = launch_with(&x, "ro", "fs02").await;
-        for cmd in [
-            "touch /workspace/p/x",
-            "rm /workspace/p/README",
-            "echo y >> /workspace/p/README",
-            "mkdir /workspace/p/d",
-        ] {
+        for cmd in FS02_WRITES {
             let (code, out) = exec(&r, &format!("{cmd} 2>&1")).await;
             assert_ne!(code, 0, "{cmd}: {out}");
             assert!(out.contains("Read-only file system"), "{cmd}: EROFS: {out}");
         }
-        let dir = home(&x).join("code/myproject");
         assert_eq!(
             std::fs::read_to_string(dir.join("README")).unwrap(),
             "keep\n"
@@ -99,9 +156,24 @@ fn rt_fs_02_an_ro_mount_is_read_only() {
     });
 }
 
+/// RT-FS-03's reads through the host-made `evil -> ~/.ssh` and the sandbox-made `s2` (a link to
+/// the canary's absolute host path).
+const FS03_READS: [&str; 3] = [
+    "cat /workspace/p/evil/id_ed25519",
+    "ls /workspace/p/evil/",
+    "cat /workspace/p/s2",
+];
+
+/// The sandbox's link to the canary key `key` by its absolute host path.
+fn fs03_link(key: &Path) -> String {
+    format!("ln -s '{}' /workspace/p/s2 2>&1", key.display())
+}
+
 /// RT-FS-03: symlinks resolve inside the container. One made in the sandbox to `/etc/shadow`
 /// reads the container's own file (or is refused); one the host made before the launch,
-/// `evil -> ~/.ssh`, points at a path that does not exist in the container.
+/// `evil -> ~/.ssh`, points at a path that does not exist in the container. Control (#122),
+/// asserted first: in a container from the same product argv with the fixture's `~/.ssh`
+/// bound at its host path, the same reads through both links find the canary.
 #[test]
 fn rt_fs_03_symlinks_resolve_inside_the_container() {
     rt().block_on(async {
@@ -109,7 +181,28 @@ fn rt_fs_03_symlinks_resolve_inside_the_container() {
         let c = canary();
         host_file(&x, ".ssh/id_ed25519", &c);
         let dir = home(&x).join("code/myproject");
-        std::os::unix::fs::symlink(home(&x).join(".ssh"), dir.join("evil")).unwrap();
+        let ssh = home(&x).join(".ssh");
+        let key = ssh.join("id_ed25519");
+        std::os::unix::fs::symlink(&ssh, dir.join("evil")).unwrap();
+        let guest = ssh.display().to_string();
+        let leave_out = LeaveOut::Bind {
+            host: &ssh,
+            guest: &guest,
+        };
+        let id = x
+            .control_workspace(&manifest(&x, "rw"), "fs03c", leave_out)
+            .await;
+        let (code, out) = exec_control(&id, &fs03_link(&key));
+        assert_eq!(code, 0, "control: {out}");
+        for cmd in FS03_READS {
+            let (code, out) = exec_control(&id, &format!("{cmd} 2>&1"));
+            assert_eq!(code, 0, "control: {cmd}: {out}");
+            assert!(
+                out.contains(&c) || out.contains("id_ed25519"),
+                "control: {cmd}: {out}"
+            );
+        }
+        std::fs::remove_file(dir.join("s2")).unwrap();
         let r = launch_with(&x, "rw", "fs03").await;
         let (code, out) = exec(&r, "ln -s /etc/shadow /workspace/p/s 2>&1").await;
         assert_eq!(code, 0, "{out}");
@@ -129,18 +222,9 @@ fn rt_fs_03_symlinks_resolve_inside_the_container() {
         };
         assert!(!ids.contains(&host), "s is the host's /etc/shadow: {ids}");
         // A link the sandbox makes to the canary's absolute host path resolves in the container.
-        let key = home(&x).join(".ssh/id_ed25519");
-        let (code, out) = exec(
-            &r,
-            &format!("ln -s '{}' /workspace/p/s2 2>&1", key.display()),
-        )
-        .await;
+        let (code, out) = exec(&r, &fs03_link(&key)).await;
         assert_eq!(code, 0, "{out}");
-        for cmd in [
-            "cat /workspace/p/evil/id_ed25519",
-            "ls /workspace/p/evil/",
-            "cat /workspace/p/s2",
-        ] {
+        for cmd in FS03_READS {
             let (code, out) = exec(&r, &format!("{cmd} 2>&1")).await;
             assert_ne!(code, 0, "{cmd}: {out}");
             assert!(!out.contains(&c), "{cmd}: {out}");
@@ -153,18 +237,37 @@ fn rt_fs_03_symlinks_resolve_inside_the_container() {
     });
 }
 
-/// RT-FS-07: no device node can be created, in `/tmp` or in a mount.
+/// RT-FS-07's node paths and the device each attack asks for there. The 0/0 character node is
+/// one an unprivileged process may make on kernel 5.8 and later (PROBE_NOTES), so there the
+/// profile is the only layer.
+const FS07_NODES: [(&str, &str); 3] = [
+    ("/tmp/sda", "b 8 0"),
+    ("/workspace/p/mem", "c 1 1"),
+    ("/tmp/w", "c 0 0"),
+];
+
+/// RT-FS-07: no device node can be created, in `/tmp` or in a mount: `mknod` fails with ENOSYS,
+/// the seccomp default (the kernel never returns it for `mknod`, so the profile refused).
+/// Control (analogue, #122, architect Q154 as superseded for FS-07), asserted first: the same
+/// paths are writable. The profile refuses every `mknod`, so no node of any kind is a success
+/// analogue; leaving the defence out would need a profile change or `--cap-add`.
 #[test]
 fn rt_fs_07_device_nodes_cannot_be_created() {
     rt().block_on(async {
         let x = Lx::new();
         let r = launch_with(&x, "rw", "fs07").await;
-        for cmd in ["mknod /tmp/sda b 8 0", "mknod /workspace/p/mem c 1 1"] {
+        for (path, _) in FS07_NODES {
+            let cmd = format!("touch {path} && rm {path}");
+            let (code, out) = exec(&r, &format!("{cmd} 2>&1")).await;
+            assert_eq!(code, 0, "control: {cmd}: {out}");
+        }
+        for (path, dev) in FS07_NODES {
+            let cmd = format!("mknod {path} {dev}");
             let (code, out) = exec(&r, &format!("{cmd} 2>&1")).await;
             assert_ne!(code, 0, "{cmd}: {out}");
             assert!(
-                out.contains("Function not implemented") || out.contains("Operation not permitted"),
-                "{cmd}: ENOSYS or EPERM: {out}"
+                out.contains("Function not implemented"),
+                "{cmd}: ENOSYS: {out}"
             );
         }
         assert!(!home(&x).join("code/myproject/mem").exists());
@@ -177,14 +280,30 @@ fn rt_fs_07_device_nodes_cannot_be_created() {
     });
 }
 
+/// RT-FS-08's search for setuid files under `root` on its own filesystem.
+fn find_setuid(root: &str) -> String {
+    format!("find {root} -xdev -perm -4000 2>/dev/null; echo done")
+}
+
 /// RT-FS-08: the image holds no setuid file; mounts are `nosuid` and `no-new-privileges` is
-/// set, so a setuid copy made in the sandbox runs with the same euid.
+/// set, so a setuid copy made in the sandbox runs with the same euid. Control (#122), asserted
+/// first: a setuid file planted in the mount is found by the same search.
 #[test]
 fn rt_fs_08_setuid_never_raises_privileges() {
     rt().block_on(async {
         let x = Lx::new();
+        let planted = home(&x).join("code/myproject/planted");
+        std::fs::write(&planted, "").unwrap();
+        std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o4755)).unwrap();
         let r = launch_with(&x, "rw", "fs08").await;
-        let (_, out) = exec(&r, "find / -xdev -perm -4000 2>/dev/null; echo done").await;
+        let (_, out) = exec(&r, &find_setuid("/workspace/p")).await;
+        assert_eq!(
+            out.trim(),
+            "/workspace/p/planted\ndone",
+            "control: the planted setuid file is found"
+        );
+        std::fs::remove_file(&planted).unwrap();
+        let (_, out) = exec(&r, &find_setuid("/")).await;
         assert_eq!(out.trim(), "done", "setuid files in the image");
         let (_, out) = exec(&r, "grep NoNewPrivs /proc/self/status").await;
         assert_eq!(
@@ -211,26 +330,57 @@ fn rt_fs_08_setuid_never_raises_privileges() {
     });
 }
 
+/// RT-FS-09's writes: `(value, path)` written as `echo <value> > <path>`.
+const FS09_WRITES: [(&str, &str); 5] = [
+    ("c", "/proc/sysrq-trigger"),
+    ("1", "/proc/sys/kernel/sysrq"),
+    ("3", "/proc/sys/vm/drop_caches"),
+    ("x", "/proc/sys/kernel/hostname"),
+    ("1", "/sys/kernel/mm/ksm/run"),
+];
+
+/// RT-FS-09's read of the first 64 bytes of `path`, counted.
+fn head64(path: &str) -> String {
+    format!("head -c 64 {path} 2>/dev/null | wc -c")
+}
+
 /// RT-FS-09: `/proc` and `/sys` give nothing: no sysrq, no `/proc/sys` or `/sys` writes,
-/// `/proc/kcore` is masked (it reads as empty), and PID 1 is the container's entry.
+/// `/proc/kcore` is masked (it reads as empty), and PID 1 is the container's entry. Control
+/// (analogue, #122, architect Q154), asserted first: the same write form to `/tmp` and the same
+/// read of `/proc/self/status` succeed; the masks are read directly (`/proc/kcore` is the
+/// `/dev/null` node, `/sys` is mounted `ro`). Leaving them out would need `--privileged` or
+/// `--security-opt` (a hard rule forbids both).
 #[test]
 fn rt_fs_09_proc_and_sys_are_closed() {
     rt().block_on(async {
         let x = Lx::new();
         let r = launch_with(&x, "rw", "fs09").await;
-        for cmd in [
-            "echo c > /proc/sysrq-trigger",
-            "echo 1 > /proc/sys/kernel/sysrq",
-            "echo 3 > /proc/sys/vm/drop_caches",
-            "echo x > /proc/sys/kernel/hostname",
-            "echo 1 > /sys/kernel/mm/ksm/run",
-            "touch /sys/x",
-        ] {
+        for (value, _) in FS09_WRITES {
+            let cmd = format!("echo {value} > /tmp/w && test \"$(cat /tmp/w)\" = {value}");
+            let (code, out) = exec(&r, &format!("{cmd} 2>&1")).await;
+            assert_eq!(code, 0, "control: {cmd}: {out}");
+        }
+        let (_, out) = exec(&r, &head64("/proc/self/status")).await;
+        assert_eq!(out.trim(), "64", "control: the read sees a /proc file");
+        let (_, out) = exec(&r, "stat -c %F:%t:%T /proc/kcore").await;
+        assert_eq!(
+            out.trim(),
+            "character special file:1:3",
+            "kcore is /dev/null"
+        );
+        let (_, out) = exec(&r, "grep ' /sys ' /proc/self/mountinfo").await;
+        assert!(out.contains(" /sys ro,"), "/sys is read-only: {out}");
+        for (value, path) in FS09_WRITES {
+            let cmd = format!("echo {value} > {path}");
             let (code, out) = exec(&r, &format!("{cmd} 2>&1")).await;
             assert_ne!(code, 0, "{cmd}: {out}");
+            assert!(out.contains("Read-only file system"), "{cmd}: EROFS: {out}");
         }
+        let (code, out) = exec(&r, "touch /sys/x 2>&1").await;
+        assert_ne!(code, 0, "{out}");
+        assert!(out.contains("Read-only file system"), "EROFS: {out}");
         // Masked: podman binds /dev/null over it, so it reads as empty.
-        let (_, out) = exec(&r, "head -c 64 /proc/kcore 2>/dev/null | wc -c").await;
+        let (_, out) = exec(&r, &head64("/proc/kcore")).await;
         assert_eq!(out.trim(), "0", "/proc/kcore yields nothing");
         let (_, out) = exec(&r, "tr '\\0' ' ' < /proc/1/cmdline").await;
         assert!(
@@ -248,13 +398,29 @@ fn wsl_interop() -> Option<std::path::PathBuf> {
     (reg.exists() && cmd.exists()).then(|| cmd.to_owned())
 }
 
-/// RT-FS-11, first part (every host): `/mnt` is absent or empty in the sandbox.
+/// RT-FS-11's count of the entries in `/mnt`.
+const LS_MNT: &str = "ls -A /mnt 2>/dev/null | wc -l";
+
+/// RT-FS-11, first part (every host): `/mnt` is absent or empty in the sandbox. Control (#122),
+/// asserted first: the same count, in a container from the same product argv with a host
+/// directory bound below `/mnt`, finds it.
 #[test]
 fn rt_fs_11_mnt_is_absent_or_empty() {
     rt().block_on(async {
         let x = Lx::new();
+        let drive = x.f.root.join("drive");
+        std::fs::create_dir(&drive).unwrap();
+        let leave_out = LeaveOut::Bind {
+            host: &drive,
+            guest: "/mnt/x",
+        };
+        let id = x
+            .control_workspace(&manifest(&x, "rw"), "fs11c", leave_out)
+            .await;
+        let (_, out) = exec_control(&id, LS_MNT);
+        assert_eq!(out.trim(), "1", "control: /mnt/x is listed");
         let r = launch_with(&x, "rw", "fs11").await;
-        let (_, out) = exec(&r, "ls -A /mnt 2>/dev/null | wc -l").await;
+        let (_, out) = exec(&r, LS_MNT).await;
         assert_eq!(out.trim(), "0", "/mnt is absent or empty");
         x.stop(r).await;
     });

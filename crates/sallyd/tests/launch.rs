@@ -419,6 +419,9 @@ impl Drop for NestedMount {
     }
 }
 
+/// RT-FS-16's look into the nested mount point.
+const FS16_PROBE: &str = "ls -a /workspace/p/nested; cat /workspace/p/nested/canary 2>&1";
+
 /// RT-FS-16: a filesystem mounted below a granted directory (an sshfs, a drive, a bind of a
 /// secret folder) is not visible in the sandbox, in every mount mode: binds are non-recursive and
 /// overlays take one filesystem. The nested mount is made in podman's own mount namespace, where
@@ -455,15 +458,25 @@ fn rt_fs_16_a_nested_host_mount_is_not_visible() {
             "NESTED-SECRET",
             "the nested mount exists"
         );
+        // Control (#122, architect Q156), asserted first: the same probe, in a container from
+        // the same product argv with the granted bind made recursive, finds the canary.
+        for mode in ["ro", "rw", "brokered"] {
+            let v =
+                x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", mode)]));
+            let leave_out = LeaveOut::NonRecursive {
+                guest: "/workspace/p",
+            };
+            let id = x
+                .control_workspace(&v, &format!("{mode}c"), leave_out)
+                .await;
+            let (_, out) = exec_in(&id, &["sh", "-c", FS16_PROBE]);
+            assert!(out.contains("NESTED-SECRET"), "control: {mode}: {out}");
+        }
         for mode in ["ro", "rw", "brokered"] {
             let v =
                 x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", mode)]));
             let r = x.launch(&v, mode).await.unwrap();
-            let (_, out) = exec(
-                &r,
-                "ls -a /workspace/p/nested; cat /workspace/p/nested/canary 2>&1",
-            )
-            .await;
+            let (_, out) = exec(&r, FS16_PROBE).await;
             assert!(!out.contains("NESTED-SECRET"), "{mode}: {out}");
             assert!(out.contains("No such file"), "{mode}: {out}");
             x.stop(r).await;
