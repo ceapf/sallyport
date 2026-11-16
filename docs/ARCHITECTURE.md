@@ -465,7 +465,8 @@ and confirms the container is gone (`podman container exists`). If it is not gon
 keeps its claims and the caller gets the handle back to retry. Otherwise teardown removes
 `git/` and `profiles/` through `podman unshare` (overlay work directories belong to the
 container's user namespace), removes the socket directory, keeps `stage/`, and releases the
-overlap claims.
+overlap claims. After a teardown that succeeded, the registry writes the session's last entry,
+`session.closed`, through `Launcher::close` (§5.4, #94).
 
 **Hermetic podman** (#11). Every podman process gets a cleared environment plus
 `HOME=<data>/podman/home` (empty, never the user's home), the host's `XDG_RUNTIME_DIR`,
@@ -998,7 +999,8 @@ The session registry (`sallyd::session`, Task 12, architect Q57) owns every live
 **Start**, in this order:
 1. `launch_workspace` (§3.5): the image, the overlap claims and fd budget reserved,
    `sandbox.launch` audited, the workspace container started. A failed launch is the
-   launcher's `sandbox.refuse` only, with no `session.start` and no `session.stop`.
+   launcher's `sandbox.refuse` only, with no `session.start`, `session.stop` or
+   `session.closed`.
 2. The container's init is watched for exit.
 3. Approvals, tools and the agent server are built in memory.
 4. Audit `session.start` (`model: {kind: "none"}` until a session can have a model).
@@ -1006,7 +1008,8 @@ The session registry (`sallyd::session`, Task 12, architect Q57) owns every live
 
 A failed `session.start` append binds nothing and stops the workspace. Any failure after it
 ends the session with reason `start-failed`. Every `session.start` gets exactly one
-`session.stop`.
+`session.stop`. Every workspace the registry received gets exactly one `session.closed` once
+its stop is confirmed, including one whose session never started (`start-failed`, Q245).
 
 TODO(#28): the harness container and `llm.sock` (Task 13, Task 12 PR C).
 
@@ -1056,15 +1059,29 @@ further effect):
    no effect and no reply. A refused write is an oplog line naming only the session and the
    event. `session.stop` has no other writer (the best-effort `start-failed` one included).
 7. `Launcher::stop`, retried up to 3 times.
+8. Once it succeeded (the container confirmed gone, its tunnels closed, the session released):
+   `session.closed {reason}`, actor `sallyd`, the session's last entry (#94, Q242, Q245), then
+   the session's secrets leave the logs' redactors (`Launcher::close`, Q219). Then the stops are
+   answered.
 
 So after `session.stop` nothing agent-originated of the session is written: no `tool.*`,
 `approval.*` or `rpc.*` entry, whatever its `in_flight`. `sandbox.exec` and
 `sandbox.exec_result` are entries of the session's handle too, so they never follow
-`session.stop` either (Q146). Teardown entries may follow it:
-`sandbox.*` (`sandbox.stop` always does), the watchdog's (`session.resource_limit`,
-`session.kill_failed`) and egress closes (#95). TODO(#94): a final `session.closed`, written
-once teardown has finished, becomes the last entry of a session. A panic reported after the
-seal is an oplog line only.
+`session.stop` either (Q146). Teardown entries follow it: `sandbox.*` (`sandbox.stop` always
+does), the watchdog's (`session.resource_limit`, `session.kill_failed`) and egress closes (#95,
+`session-stopped` for a tunnel still open). `session.closed` follows them, and nothing of the
+session follows it (RT-AUD-03), with one residual (Q244, TODO(#156)): an egress or watchdog
+append already inside its blocking write when its task was aborted (the egress grace, the
+watchdog's drop) may still land after `session.closed`; such an entry carries hosts, counts
+and names, never a value. A panic reported after the seal is an oplog line only.
+
+A session with no `session.closed` is one whose teardown did not complete, or whose
+`session.closed` append was refused; the oplog names the latter (an error line naming only the
+session and the event), and the stop still answers stopped, since the session is already
+removed and released (Q243). A stop-failed session has none until a later stop succeeds, nor
+does a shutdown that cannot confirm its container gone. A stop that failed only after the
+container was removed (the `sandbox.stop` append, the scratch removal) also has none until a
+retry succeeds; it is reported as not confirmed gone (TODO(#157), Q246).
 
 A file operation already inside its blocking call is never cut. One still running after the
 drain leaves `in_flight > 0`: the stop answers failed and the session stays stop-failed until
@@ -1565,6 +1582,15 @@ sallyport/
   lower-cased, #160) is not redacted anywhere. A store value under 16 bytes is stored and
   reported short (`SHORT_SECRET_BYTES`: its base64 forms are few or none); `sally secrets set`
   warns about it (Task 12).
+  The audit log and the operational log redact every live session's forms (#85,
+  `sallyd::session::secrets`, Q219, Q220). A session's forms enter both redactors when its
+  egress has loaded them, before `net.sock` is bound or a container exists. They leave after
+  the session's last entry: `sandbox.refuse` for a refused launch, `session.closed` (§5.4) for
+  a session. A value two live sessions share stays redacted until both have left. Residuals:
+  an egress or watchdog append already inside its blocking write when its task was aborted may
+  land after `session.closed` and the release, carrying hosts, counts and secret names, never a
+  value (Q244, TODO(#156)); a launch or start task that panics after registering never
+  releases its forms, so they stay redacted, and in memory, until `sallyd` exits (TODO(#113)).
 - **Tauri bridge**: Rust side exposes one command `rpc(method: String, params: Value)` that
   forwards to `control.sock` **only** for methods in a compile-time allowlist (no
   `secrets.list` of values exists anyway). Capabilities file grants `core:default` only.
