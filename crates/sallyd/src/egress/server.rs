@@ -13,14 +13,14 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use sally_core::audit::{Actor, NewEntry};
+use sally_core::audit::{Actor, NewEntry, Redactor};
 use sally_core::manifest::AuditLevel;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Semaphore, watch};
 
 use super::addr;
-use super::authority::{self, Authority, AuthorityError, escape_target};
+use super::authority::{self, Authority, AuthorityError};
 use super::head::{self, MAX_HEAD, Parsed};
 use super::policy::{Policy, Reason, Route};
 use super::tunnel::{self, End, IDLE_LIMIT, Totals};
@@ -223,8 +223,8 @@ enum Seen<'a> {
     Nothing,
     /// A head that never became one: only its size.
     Bytes(usize),
-    /// The request-target, escaped and cut.
-    Target(&'a [u8]),
+    /// The request-target, masked, cut and escaped by [`authority::audit_text`].
+    Target(&'a str),
 }
 
 /// A refusal before anything was dialled.
@@ -335,7 +335,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
                 .await;
             return None;
         };
-        let target = Seen::Target(h.target.as_bytes());
+        let target = Seen::Target(h.target);
         let checked = match authority::parse(h.target) {
             _ if !h.connect => Err(Reason::PlainHttpUnsupported.into()),
             Err(AuthorityError::IpLiteral) => Err(Reason::IpLiteral.into()),
@@ -503,7 +503,13 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         } else {
             "egress.deny"
         };
-        let entry = self.entry(event, Some("deny")).args(refusal_args(r, seen));
+        let forms = self
+            .interception
+            .as_ref()
+            .map(|i| i.credentials().redaction().audit());
+        let entry = self
+            .entry(event, Some("deny"))
+            .args(refusal_args(r, seen, forms));
         if self.append(entry).await && r.reason != Reason::HeadTimeout {
             write_reply(client, r.reason).await;
         }
@@ -569,8 +575,10 @@ fn pinned(found: &[SocketAddr], port: u16) -> Vec<SocketAddr> {
     out
 }
 
-/// Arguments of an `egress.deny` / `egress.limit` entry.
-fn refusal_args(r: Refusal, seen: Seen<'_>) -> Value {
+/// Arguments of an `egress.deny` / `egress.limit` entry. A target is masked with `forms`, the
+/// session's secret forms (`None` for a session without secret grants), before it is cut
+/// (architect Q253).
+fn refusal_args(r: Refusal, seen: Seen<'_>, forms: Option<&Redactor>) -> Value {
     let mut v = json!({"reason": r.reason.as_str()});
     if let Some(obj) = v.as_object_mut() {
         match seen {
@@ -579,7 +587,7 @@ fn refusal_args(r: Refusal, seen: Seen<'_>) -> Value {
                 obj.insert("head_bytes".into(), json!(n));
             }
             Seen::Target(raw) => {
-                let (target, bytes, cut) = escape_target(raw);
+                let (target, bytes, cut) = authority::audit_text(raw, forms);
                 obj.insert("target".into(), json!(target));
                 obj.insert("target_bytes".into(), json!(bytes));
                 obj.insert("target_cut".into(), json!(cut));

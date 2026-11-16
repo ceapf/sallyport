@@ -1,8 +1,10 @@
 //! The CONNECT request-target (`host:port`), the only thing the egress decision reads. Hostnames
 //! only: an IP address in any spelling is refused, even under a `*` rule (SI-9).
 
+use std::borrow::Cow;
 use std::net::Ipv6Addr;
 
+use sally_core::audit::Redactor;
 use sally_core::manifest::{HostError, parse_hostname};
 
 /// Most bytes of a request-target an audit entry carries; the rest is counted, not logged.
@@ -33,6 +35,9 @@ pub enum AuthorityError {
 ///
 /// # Errors
 /// [`AuthorityError`].
+// TODO(#160): the lower-cased host goes into every entry that names it, where a mixed-case form
+// in a label no longer matches the session's forms (a documented residual, architect Q253; the
+// raw target of a refusal is masked by `audit_text`).
 pub fn parse(target: &str) -> Result<Authority, AuthorityError> {
     let (host, port) = target.rsplit_once(':').ok_or(AuthorityError::Malformed)?;
     let port = parse_port(port).ok_or(AuthorityError::Malformed)?;
@@ -120,12 +125,21 @@ fn parse_port(s: &str) -> Option<u16> {
     s.parse::<u16>().ok().filter(|&p| p != 0)
 }
 
-/// A request-target for an audit entry: its first [`LOGGED_TARGET_BYTES`] bytes, with every byte
-/// outside printable ASCII, and `\` and `"`, written as `\xNN`. Returns the escaped text, the
-/// full length in bytes, and whether it was cut.
+/// Text the sandbox chose (a request-target, a method) for an audit entry. In this order: every
+/// secret form `forms` knows is masked in the whole of `raw`; the masked text is cut to its
+/// first [`LOGGED_TARGET_BYTES`] bytes; every byte outside printable ASCII, and `\` and `"`, is
+/// written as `\xNN`. Masking first means no cut or escape can split or rewrite a form of the
+/// session's secrets (architect Q253). `forms` is the session's own forms, `None` for a session
+/// without secret grants. Returns the text, the length of `raw` in bytes, and whether the masked
+/// text was cut.
 #[must_use]
-pub fn escape_target(raw: &[u8]) -> (String, usize, bool) {
-    let shown = raw.get(..LOGGED_TARGET_BYTES).unwrap_or(raw);
+// TODO(#162): a form of another live session's secret is masked only by the writer's redactor,
+// after this cut and escape: one that straddles the cut leaves its prefix, and one holding a
+// byte the escape rewrites is logged whole, escaped (architect Q254, Q263).
+pub fn audit_text(raw: &str, forms: Option<&Redactor>) -> (String, usize, bool) {
+    let masked = forms.map_or(Cow::Borrowed(raw), |r| r.redact_str(raw));
+    let bytes = masked.as_bytes();
+    let shown = bytes.get(..LOGGED_TARGET_BYTES).unwrap_or(bytes);
     let mut out = String::with_capacity(shown.len());
     for &b in shown {
         if (0x20..0x7f).contains(&b) && b != b'\\' && b != b'"' {
@@ -134,7 +148,7 @@ pub fn escape_target(raw: &[u8]) -> (String, usize, bool) {
             out.push_str(&format!("\\x{b:02x}"));
         }
     }
-    (out, raw.len(), raw.len() > shown.len())
+    (out, raw.len(), bytes.len() > shown.len())
 }
 
 #[cfg(test)]
@@ -305,20 +319,91 @@ mod tests {
         );
     }
 
+    /// A session without secret grants: escaped and cut, nothing masked.
     #[test]
     fn audit_text_is_escaped_and_bounded() {
         assert_eq!(
-            escape_target(b"ok.test:443"),
+            audit_text("ok.test:443", None),
             ("ok.test:443".to_owned(), 11, false)
         );
         assert_eq!(
-            escape_target(b"a\"b\\c\x00\x1f\x7f\xff~ "),
-            (r"a\x22b\x5cc\x00\x1f\x7f\xff~ ".to_owned(), 11, false)
+            audit_text("a\"b\\c\x00\x1f\x7f\u{ff}~ ", None),
+            (r"a\x22b\x5cc\x00\x1f\x7f\xc3\xbf~ ".to_owned(), 12, false)
         );
-        let long = vec![b'a'; LOGGED_TARGET_BYTES + 1];
-        let (text, len, cut) = escape_target(&long);
+        let long = "a".repeat(LOGGED_TARGET_BYTES + 1);
+        let (text, len, cut) = audit_text(&long, None);
         assert_eq!((text.len(), len, cut), (LOGGED_TARGET_BYTES, 257, true));
-        let exact = vec![b'a'; LOGGED_TARGET_BYTES];
-        assert!(!escape_target(&exact).2);
+        let exact = "a".repeat(LOGGED_TARGET_BYTES);
+        assert!(!audit_text(&exact, None).2);
+    }
+
+    /// A 40-character canary, assembled at runtime, with no run of one character.
+    fn canary() -> String {
+        ('a'..='z').cycle().step_by(7).take(40).collect()
+    }
+
+    /// Whether any 8-character run of `secret` occurs in `text`.
+    fn holds_a_run_of(secret: &str, text: &str) -> bool {
+        secret
+            .as_bytes()
+            .windows(8)
+            .any(|w| text.contains(std::str::from_utf8(w).unwrap()))
+    }
+
+    /// Architect Q253: a form is masked in the whole raw text before the cut, so one straddling
+    /// the cut (at byte 250) or ending just past it (at byte 220) leaves no run of itself; the
+    /// length is the raw one and the cut is the masked text's.
+    #[test]
+    fn a_form_is_masked_before_the_cut() {
+        let canary = canary();
+        let forms = Redactor::new([("C", canary.as_str())]);
+        for at in [220, 250] {
+            let pad = "/".to_owned() + &"p".repeat(at - 1);
+            let raw = format!("{pad}{canary}{}", "q".repeat(60));
+            assert!(raw.len() > 300);
+            let masked = format!("{pad}[REDACTED:C]{}", "q".repeat(60));
+            let (text, len, cut) = audit_text(&raw, Some(&forms));
+            assert_eq!(text, masked[..LOGGED_TARGET_BYTES], "at {at}");
+            assert_eq!((len, cut), (raw.len(), true), "at {at}");
+            assert!(!holds_a_run_of(&canary, &text), "at {at}: {text}");
+        }
+    }
+
+    /// Architect Q253: the cut is the masked text's, not the raw text's. A raw text over the
+    /// bound whose masked text fits is not cut; one whose masked text is exactly the bound is not
+    /// either.
+    #[test]
+    fn the_cut_is_judged_on_the_masked_text() {
+        let canary = canary();
+        let forms = Redactor::new([("C", canary.as_str())]);
+        let placeholder = "[REDACTED:C]".len();
+        let pad = "p".repeat(LOGGED_TARGET_BYTES - placeholder);
+        let raw = format!("{pad}{canary}");
+        assert!(raw.len() > LOGGED_TARGET_BYTES);
+        let (text, len, cut) = audit_text(&raw, Some(&forms));
+        assert_eq!(text, format!("{pad}[REDACTED:C]"));
+        assert_eq!(
+            (text.len(), len, cut),
+            (LOGGED_TARGET_BYTES, raw.len(), false)
+        );
+        let (_, _, cut) = audit_text(&format!("{raw}q"), Some(&forms));
+        assert!(cut);
+    }
+
+    /// Architect Q253: a form holding `"` and `\` is masked before the escape could rewrite it:
+    /// the placeholder stands where it was, and no escaped remnant of it is left.
+    #[test]
+    fn a_form_holding_quote_and_backslash_is_masked_before_the_escape() {
+        let value = format!(
+            "{}\"{}\\{}",
+            &canary()[..12],
+            &canary()[12..24],
+            &canary()[24..]
+        );
+        let forms = Redactor::new([("Q", value.as_str())]);
+        let (text, len, cut) = audit_text(&format!("/x{value}/y"), Some(&forms));
+        assert_eq!(text, "/x[REDACTED:Q]/y");
+        assert_eq!((len, cut), (value.len() + 4, false));
+        assert!(!text.contains(r"\x22") && !text.contains(r"\x5c"), "{text}");
     }
 }

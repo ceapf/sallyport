@@ -16,7 +16,7 @@ use sally_core::manifest::AuditLevel;
 use serde_json::{Value, json};
 
 use super::State;
-use crate::egress::authority::{Authority, escape_target};
+use crate::egress::authority::{Authority, audit_text};
 use crate::egress::redact::{Ending, OnRedacted, Redaction, Report, Tally};
 use crate::egress::tunnel::End;
 
@@ -86,8 +86,9 @@ impl OnRedacted for ResponseReport {
     }
 }
 
-/// `egress.response`'s arguments: the exchange, how its body ended, and per secret (in grant
-/// order, `secret:NAME` as in `injected`) the bytes its forms covered, with the total.
+/// `egress.response`'s arguments: the exchange (the target masked with the session's forms
+/// before it is cut, architect Q253), how its body ended, and per secret (in grant order,
+/// `secret:NAME` as in `injected`) the bytes its forms covered, with the total.
 pub(super) fn response_args(
     a: &Authority,
     target: &str,
@@ -96,7 +97,7 @@ pub(super) fn response_args(
     r: &Redaction,
     tally: &Tally,
 ) -> Value {
-    let (text, bytes, cut) = escape_target(target.as_bytes());
+    let (text, bytes, cut) = audit_text(target, Some(r.audit()));
     let redacted: Vec<Value> = r
         .named(tally)
         .into_iter()

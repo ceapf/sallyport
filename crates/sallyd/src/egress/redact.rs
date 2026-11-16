@@ -36,7 +36,7 @@ use std::task::{Context, Poll, ready};
 
 use hyper::body::{Body, Bytes, Frame, SizeHint};
 use hyper::http::header::{HeaderMap, HeaderValue};
-use sally_core::audit::SessionForms;
+use sally_core::audit::{Redactor, SessionForms};
 use zeroize::{Zeroize, Zeroizing};
 
 use super::meter::BoxError;
@@ -73,6 +73,9 @@ pub struct Redaction {
     forms: Arc<SessionForms>,
     filler: u8,
     longest: usize,
+    /// The same forms as `[REDACTED:NAME]` patterns, for the text the sandbox chose that goes
+    /// into the session's audit entries (architect Q253).
+    audit: Redactor,
 }
 
 impl fmt::Debug for Redaction {
@@ -81,6 +84,7 @@ impl fmt::Debug for Redaction {
             .field("forms", &self.forms)
             .field("filler", &char::from(self.filler))
             .field("longest", &self.longest)
+            .field("audit", &self.audit)
             .finish()
     }
 }
@@ -104,6 +108,7 @@ impl Redaction {
         }
         let filler = filler_for(&forms).ok_or(RedactionError::NoFiller)?;
         Ok(Self {
+            audit: Redactor::from_forms([Arc::clone(&forms)]),
             forms,
             filler,
             longest,
@@ -114,6 +119,13 @@ impl Redaction {
     #[must_use]
     pub const fn forms(&self) -> &Arc<SessionForms> {
         &self.forms
+    }
+
+    /// The session's forms as an audit redactor, reading the same allocation: what
+    /// [`super::authority::audit_text`] masks sandbox-chosen text with (architect Q253).
+    #[must_use]
+    pub const fn audit(&self) -> &Redactor {
+        &self.audit
     }
 
     /// The byte every covered byte becomes.

@@ -20,6 +20,9 @@ mod inject;
 #[path = "intercept_fetch_tests.rs"]
 mod fetch;
 
+#[path = "intercept_target_tests.rs"]
+mod target;
+
 #[tokio::test]
 async fn a_grant_host_is_intercepted_rewritten_forwarded_and_audited_in_order() {
     let r = rig(Opts::default());

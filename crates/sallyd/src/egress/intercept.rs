@@ -36,12 +36,12 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::time::Instant;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-use super::super::authority::{Authority, escape_target};
+use super::super::authority::{Authority, audit_text};
 use super::super::head::MAX_HEAD;
 use super::super::inject::Credentials;
 use super::super::meter::{BodyEnd, BoxError, Capped, Counts, Meter, OnEnd};
 use super::super::policy::Reason;
-use super::super::redact::{self, Ending, OnRedacted, Redacted};
+use super::super::redact::{self, Ending, OnRedacted, Redacted, Redaction};
 use super::super::rewrite;
 use super::super::tunnel::{Activity, End, Totals};
 use super::intercept_tls::HostTls;
@@ -562,6 +562,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
                 &parts.method,
                 target,
                 grants.names(),
+                st.credentials.redaction(),
             ));
         // TODO(#72): on a session stop this append may land after `egress.close`.
         if !self.append(audited).await {
@@ -598,6 +599,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
             Reason::RequestTooLarge,
             target,
             None,
+            st.credentials.redaction(),
         ));
         Arc::new(RequestEnd {
             state: Arc::clone(st),
@@ -670,6 +672,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
             Reason::ResponseTooLarge,
             target,
             Some("body"),
+            redaction,
         ));
         let on_end = ResponseEnd {
             state: Arc::clone(st),
@@ -717,9 +720,13 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         } else {
             "egress.deny"
         };
-        let entry = self
-            .entry(event, Some("deny"))
-            .args(inside_args(&st.auth, reason, target, part));
+        let entry = self.entry(event, Some("deny")).args(inside_args(
+            &st.auth,
+            reason,
+            target,
+            part,
+            st.credentials.redaction(),
+        ));
         if !self.append(entry).await {
             st.set_end(End::Error);
             return Err("audit append failed".into());
@@ -832,10 +839,18 @@ fn reply_response(reason: Reason) -> Response<Out> {
 }
 
 /// Arguments of `egress.request` (Q34): `injected` lists the grants set on the request as
-/// `secret:NAME`, never a value (Task 9a-3, architect D9, D13).
-fn request_args(a: &Authority, method: &Method, target: &str, injected: &[String]) -> Value {
-    let (method, _, _) = escape_target(method.as_str().as_bytes());
-    let (text, bytes, cut) = escape_target(target.as_bytes());
+/// `secret:NAME`, never a value (Task 9a-3, architect D9, D13). The method and target are the
+/// sandbox's text, masked with the session's forms before they are cut (architect Q253). The
+/// method is cut to 256 bytes like the target, but the entry does not say it was (Q256).
+fn request_args(
+    a: &Authority,
+    method: &Method,
+    target: &str,
+    injected: &[String],
+    r: &Redaction,
+) -> Value {
+    let (method, _, _) = audit_text(method.as_str(), Some(r.audit()));
+    let (text, bytes, cut) = audit_text(target, Some(r.audit()));
     json!({
         "host": a.host,
         "port": a.port,
@@ -847,9 +862,16 @@ fn request_args(a: &Authority, method: &Method, target: &str, injected: &[String
     })
 }
 
-/// Arguments of a refusal inside the tunnel (Q34): reason, host, port, escaped target.
-fn inside_args(a: &Authority, reason: Reason, target: &str, part: Option<&str>) -> Value {
-    let (text, bytes, cut) = escape_target(target.as_bytes());
+/// Arguments of a refusal inside the tunnel (Q34): reason, host, port, and the target masked,
+/// cut and escaped as [`audit_text`] does.
+fn inside_args(
+    a: &Authority,
+    reason: Reason,
+    target: &str,
+    part: Option<&str>,
+    r: &Redaction,
+) -> Value {
+    let (text, bytes, cut) = audit_text(target, Some(r.audit()));
     let mut v = json!({
         "reason": reason.as_str(),
         "host": a.host,

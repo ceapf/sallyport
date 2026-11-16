@@ -31,6 +31,21 @@ fn star(n: usize) -> String {
 
 const TOKEN: &str = "tok_abcdefghijklmnopqrstuvwxyz0123";
 
+/// Architect Q253: the audit redactor masks every form of every secret of the session, each
+/// under its secret's name, and nothing else.
+#[test]
+fn the_audit_redactor_masks_every_form_by_name() {
+    let r = redaction(&[
+        ("A", &[TOKEN, "Bearer tok_x"]),
+        ("B", &["zz-other-form-zz"]),
+    ]);
+    let text = format!("/{TOKEN}/Bearer tok_x/zz-other-form-zz/tok_");
+    assert_eq!(
+        r.audit().redact_str(&text),
+        "/[REDACTED:A]/[REDACTED:A]/[REDACTED:B]/tok_"
+    );
+}
+
 #[test]
 fn a_raw_value_becomes_filler_of_the_same_length() {
     let r = redaction(&[("GITHUB_TOKEN", &[TOKEN])]);
