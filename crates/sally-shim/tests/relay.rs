@@ -931,12 +931,81 @@ fn a_client_still_sending_reads_the_reply_and_its_slot_comes_back() {
     drop(c);
 }
 
-fn deaf_flood(mut s: UnixStream) {
-    // Stops reading, then writes until a write fails: more than the buffers between it and a
-    // client that never reads hold.
+fn deaf_flood(s: UnixStream) {
+    flood_deaf(s, &AtomicBool::new(false));
+}
+
+/// Stops reading and sets `deaf`, then writes until a write fails: more than the buffers
+/// between it and a client that never reads hold.
+fn flood_deaf(mut s: UnixStream, deaf: &AtomicBool) {
     let _ = s.shutdown(Shutdown::Read);
+    deaf.store(true, Ordering::SeqCst);
     let chunk = vec![b'x'; 64 * 1024];
     while s.write_all(&chunk).is_ok() {}
+}
+
+/// Connects to `addr` until a connection is served (it reads the server's first byte, `x`),
+/// that is until the one slot is free again; when that was.
+fn slot_comes_back(addr: SocketAddr, what: &str) -> Instant {
+    for _ in 0..60 {
+        let mut b = connect(addr);
+        if read_exact_one(&mut b) == Some(b'x') {
+            return Instant::now();
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("the slot of {what} was never reclaimed");
+}
+
+static HALFCLOSE_IS_DEAF: AtomicBool = AtomicBool::new(false);
+
+fn deaf_flood_for_halfclose(s: UnixStream) {
+    flood_deaf(s, &HALFCLOSE_IS_DEAF);
+}
+
+#[test]
+fn a_client_that_half_closes_after_a_failed_send_and_never_reads_is_cut_a_linger_later() {
+    // The client's EOF does not end the discard's bound while the reply is still blocked on
+    // its way to the client.
+    let s = Scratch::new("halfdeaf");
+    uds_server(&s.sock(), deaf_flood_for_halfclose);
+    let addr = start_shim_with(&s.sock(), Limiter::with_linger(1, SHORT_LINGER));
+    let mut c = connect(addr);
+    wait_for(&HALFCLOSE_IS_DEAF);
+    c.write_all(b"hello").unwrap();
+    let sent = Instant::now();
+    c.shutdown(Shutdown::Write).unwrap();
+    let back = slot_comes_back(addr, "a client that half-closed").duration_since(sent);
+    assert!(
+        back >= SHORT_LINGER / 2 && back < SHORT_LINGER + PROMPT,
+        "{back:?}"
+    );
+    drop(c);
+}
+
+static SILENT_IS_DEAF: AtomicBool = AtomicBool::new(false);
+
+fn deaf_flood_for_silent(s: UnixStream) {
+    flood_deaf(s, &SILENT_IS_DEAF);
+}
+
+#[test]
+fn a_silent_client_after_a_failed_send_is_cut_a_linger_later() {
+    // Neither sends again, nor closes, nor reads: the discard's read must time out to see its
+    // deadline.
+    let s = Scratch::new("silentdeaf");
+    uds_server(&s.sock(), deaf_flood_for_silent);
+    let addr = start_shim_with(&s.sock(), Limiter::with_linger(1, SHORT_LINGER));
+    let mut c = connect(addr);
+    wait_for(&SILENT_IS_DEAF);
+    c.write_all(b"hello").unwrap();
+    let sent = Instant::now();
+    let back = slot_comes_back(addr, "a silent client").duration_since(sent);
+    assert!(
+        back >= SHORT_LINGER / 2 && back < SHORT_LINGER + PROMPT,
+        "{back:?}"
+    );
+    drop(c);
 }
 
 #[test]
@@ -952,20 +1021,7 @@ fn a_client_that_sends_but_never_reads_is_cut_a_linger_after_its_failed_send() {
     let refused_after = send_until_cut(&mut c, &chunk, Duration::ZERO, SHORT_LINGER + PROMPT)
         .duration_since(started);
     assert!(refused_after >= SHORT_LINGER / 2, "{refused_after:?}");
-    // The one slot comes back.
-    let mut served = false;
-    for _ in 0..60 {
-        let mut b = connect(addr);
-        if read_exact_one(&mut b) == Some(b'x') {
-            served = true;
-            break;
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    assert!(
-        served,
-        "the slot of a client that does not read was never reclaimed"
-    );
+    slot_comes_back(addr, "a client that does not read");
 }
 
 static HALFSTOP_IS_DEAF: AtomicBool = AtomicBool::new(false);

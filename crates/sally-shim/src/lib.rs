@@ -20,4 +20,4 @@ pub mod args;
 pub mod relay;
 
 pub use args::{ArgError, ListenSpec, Mode, parse_args};
-pub use relay::{BUF_BYTES, LINGER, Limiter, MAX_CONNECTIONS, bind, serve, stdio};
+pub use relay::{BUF_BYTES, LINGER, Limiter, MAX_CONNECTIONS, MAX_LINGER, bind, serve, stdio};

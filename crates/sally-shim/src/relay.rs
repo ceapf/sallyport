@@ -5,7 +5,7 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -22,9 +22,13 @@ pub const MAX_CONNECTIONS: usize = 32;
 /// Default time a connection may linger, with its server side finished, waiting for the client
 /// to close. Pooled HTTP clients leave such sockets open; without a bound each would hold a slot
 /// forever. It runs from the server-to-client direction's end, or from a failed write toward a
-/// server that stopped reading (`sallyd` only does that by closing): a response stream still
-/// flowing is cut only in that second case, a linger after the server stopped reading.
+/// server that stopped reading (`sallyd` only does that by closing), whatever the client does
+/// after that write: a response stream still flowing is cut only in that second case, a linger
+/// after the server stopped reading.
 pub const LINGER: Duration = Duration::from_secs(30);
+/// The longest linger [`Limiter::with_linger`] keeps: one day. Longer values are clamped, so a
+/// deadline a linger from now always exists.
+pub const MAX_LINGER: Duration = Duration::from_secs(24 * 60 * 60);
 /// Stack for a copy thread: it only holds [`BUF_BYTES`] and a few locals. Must exceed
 /// [`BUF_BYTES`] plus headroom: on musl (the shipped static binary), std raises a small stack
 /// only to about 2 KiB, so a copy thread would overflow. The assertion below holds it there.
@@ -51,13 +55,13 @@ impl Limiter {
         Self::with_linger(max, LINGER)
     }
 
-    /// A limiter with an explicit linger time.
+    /// A limiter with an explicit linger time, clamped to [`MAX_LINGER`].
     #[must_use]
     pub fn with_linger(max: usize, linger: Duration) -> Arc<Self> {
         Arc::new(Self {
             live: AtomicUsize::new(0),
             max,
-            linger,
+            linger: linger.min(MAX_LINGER),
             last_log: Mutex::new(None),
         })
     }
@@ -204,15 +208,16 @@ half!(UnixStream);
 ///
 /// When the server-to-client direction ends (the server's EOF, a read error, or a failed write
 /// to the client), the client gets [`Limiter::linger`] to close its end; after that the
-/// connection is torn down both ways so the slot comes back. A client still sending after the
-/// server stopped reading gets the same linger from that failed write (the discard deadline in
-/// [`Direction::ToServer`]); its bytes are discarded meanwhile, and the reply is relayed (#76).
+/// connection is torn down both ways so the slot comes back. A client whose send failed because
+/// the server stopped reading gets the same linger from that failed write (the discard deadline
+/// in [`Direction::ToServer`]), whether it then sends on, half-closes or goes silent; its bytes
+/// are discarded meanwhile, and the reply is relayed (#76).
 /// Those two tear the connection down at a deadline; a client's read error (it reset) ends both
 /// directions at once.
 ///
-/// TODO(#155): a client that does not read a reply larger than the buffers, and neither sends
-/// (nor half-closed after a failed send), holds its slot: the server-to-client direction stays
-/// blocked writing to it.
+/// TODO(#155): a client that does not read a reply larger than the buffers, and has had no send
+/// fail (it sends nothing, or half-closed after its sends went through), holds its slot: the
+/// server-to-client direction stays blocked writing to it.
 fn relay_connection(
     tcp: TcpStream,
     socket: &Path,
@@ -223,6 +228,7 @@ fn relay_connection(
     let _ = tcp.set_nodelay(true);
     let (tcp, uds) = (Arc::new(tcp), Arc::new(uds));
     let (done_tx, done_rx) = mpsc::channel::<()>();
+    let (down_done_tx, down_done_rx) = mpsc::channel::<()>();
     let cut = Arc::new(AtomicBool::new(false));
     let upstream = {
         let (from, to) = (Arc::clone(&tcp), Arc::clone(&uds));
@@ -231,11 +237,18 @@ fn relay_connection(
             .name("up".into())
             .stack_size(THREAD_STACK_BYTES)
             .spawn(move || {
-                copy_half(&*from, &*to, Direction::ToServer { linger, cut: &cut });
+                let toward = Direction::ToServer {
+                    linger,
+                    cut: &cut,
+                    down_done: &down_done_rx,
+                };
+                copy_half(&*from, &*to, toward);
                 drop(done_tx);
             })?
     };
     copy_half(&*uds, &*tcp, Direction::ToClient);
+    // Wakes a discard waiting on a client that half-closed (see `discard`).
+    drop(down_done_tx);
     if matches!(
         done_rx.recv_timeout(limiter.linger),
         Err(RecvTimeoutError::Timeout)
@@ -264,11 +277,14 @@ enum Direction<'a> {
     /// Client to server. A failed write leaves the client's bytes read and discarded, so a
     /// client still sending is not reset before it reads the reply relayed the other way (#76),
     /// for at most `linger` from that write, or until `cut` (the linger in [`relay_connection`])
-    /// is set. A client's read error (it reset) also shuts the server's read side: the client can
-    /// read no reply, and the other direction then ends at once.
+    /// is set. The client's EOF does not end that bound: the discard then waits for
+    /// `down_done` (the server-to-client direction's end) until the same deadline. A client's
+    /// read error (it reset) also shuts the server's read side: the client can read no reply,
+    /// and the other direction then ends at once.
     ToServer {
         linger: Duration,
         cut: &'a AtomicBool,
+        down_done: &'a Receiver<()>,
     },
 }
 
@@ -304,29 +320,50 @@ fn copy_half(from: &dyn Half, to: &dyn Half, direction: Direction<'_>) {
     to.close(Shutdown::Write);
     match direction {
         Direction::ToClient => from.close(Shutdown::Read),
-        Direction::ToServer { linger, cut } => {
-            discard(from, to, &mut buf, Instant::now() + linger, cut);
+        Direction::ToServer {
+            linger,
+            cut,
+            down_done,
+        } => {
+            // Cannot overflow: `Limiter::with_linger` clamps the linger to `MAX_LINGER`.
+            let deadline = Instant::now() + linger;
+            discard(from, to, &mut buf, deadline, cut, down_done);
         }
     }
 }
 
-/// Reads the client (`from`) into `buf` and drops the bytes until its EOF, `cut` is set, or
-/// `deadline` passes; at the deadline it shuts both streams both ways, which also wakes the
-/// other direction. A read error shuts `from`'s read side and the server's (`to`) read side.
-fn discard(from: &dyn Half, to: &dyn Half, buf: &mut [u8], deadline: Instant, cut: &AtomicBool) {
+/// Reads the client (`from`) into `buf` and drops the bytes until `cut` is set or `deadline`
+/// passes; at the deadline it shuts both streams both ways, which also wakes the other
+/// direction. At the client's EOF it waits, until the same deadline, for `down_done` to
+/// disconnect (the reply relayed, or the client gone): a client that half-closed but does not
+/// read would otherwise keep the other direction blocked writing to it. A read error shuts
+/// `from`'s read side and the server's (`to`) read side.
+fn discard(
+    from: &dyn Half,
+    to: &dyn Half,
+    buf: &mut [u8],
+    deadline: Instant,
+    cut: &AtomicBool,
+    down_done: &Receiver<()>,
+) {
     loop {
         if cut.load(Ordering::SeqCst) {
             return;
         }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            from.close(Shutdown::Both);
-            to.close(Shutdown::Both);
+            cut_both(from, to);
             return;
         }
         from.read_wait(left);
         match from.read_some(buf) {
-            Ok(0) => return,
+            Ok(0) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if matches!(down_done.recv_timeout(left), Err(RecvTimeoutError::Timeout)) {
+                    cut_both(from, to);
+                }
+                return;
+            }
             Ok(_) => {}
             Err(e) if is_wait(&e) => {}
             Err(_) => {
@@ -336,6 +373,12 @@ fn discard(from: &dyn Half, to: &dyn Half, buf: &mut [u8], deadline: Instant, cu
             }
         }
     }
+}
+
+/// Shuts both streams both ways, as the linger in [`relay_connection`] does.
+fn cut_both(from: &dyn Half, to: &dyn Half) {
+    from.close(Shutdown::Both);
+    to.close(Shutdown::Both);
 }
 
 /// A read that was interrupted or timed out, to be tried again.
@@ -505,8 +548,15 @@ mod tests {
     /// A `cut` flag that is set.
     static CUT: AtomicBool = AtomicBool::new(true);
 
+    /// Toward the server, with the server-to-client direction already done (its sender gone), so
+    /// the client's EOF ends the discard at once. The receiver is leaked: a few bytes per test.
     fn to_server(linger: Duration, cut: &AtomicBool) -> Direction<'_> {
-        Direction::ToServer { linger, cut }
+        let down_done: &'static Receiver<()> = Box::leak(Box::new(mpsc::channel().1));
+        Direction::ToServer {
+            linger,
+            cut,
+            down_done,
+        }
     }
 
     #[test]
@@ -659,6 +709,52 @@ mod tests {
         assert!(from.waits().is_empty(), "{:?}", from.waits());
         assert!(from.closes().is_empty(), "{:?}", from.closes());
         assert_eq!(to.closes(), [Shutdown::Write]);
+    }
+
+    #[test]
+    fn a_client_eof_in_the_discard_waits_for_the_other_direction_until_the_deadline() {
+        // The client half-closes after its failed send; the reply is still on its way to it
+        // (the server-to-client direction's sender is held), so the bound holds.
+        let linger = Duration::from_millis(300);
+        let (_down_running, down_done) = mpsc::channel::<()>();
+        let (from, to) = (Fake::new(vec![Step::Data(b"a")]), Fake::failing_writes());
+        let started = Instant::now();
+        copy_half(
+            &from,
+            &to,
+            Direction::ToServer {
+                linger,
+                cut: &NOT_CUT,
+                down_done: &down_done,
+            },
+        );
+        assert!(started.elapsed() >= linger, "{:?}", started.elapsed());
+        assert_eq!(from.closes(), [Shutdown::Both]);
+        assert_eq!(to.closes(), [Shutdown::Write, Shutdown::Both]);
+    }
+
+    #[test]
+    fn a_client_eof_in_the_discard_ends_it_once_the_other_direction_is_done() {
+        let (from, to) = (Fake::new(vec![Step::Data(b"a")]), Fake::failing_writes());
+        let started = Instant::now();
+        copy_half(&from, &to, to_server(LONG, &NOT_CUT));
+        assert!(started.elapsed() < T_SLACK, "{:?}", started.elapsed());
+        assert!(from.closes().is_empty(), "{:?}", from.closes());
+        assert_eq!(to.closes(), [Shutdown::Write]);
+    }
+
+    #[test]
+    fn the_linger_is_clamped_to_a_day() {
+        let tiny = Duration::from_nanos(1);
+        assert_eq!(MAX_LINGER, Duration::from_secs(86_400));
+        assert_eq!(Limiter::with_linger(1, MAX_LINGER).linger, MAX_LINGER);
+        assert_eq!(
+            Limiter::with_linger(1, MAX_LINGER + tiny).linger,
+            MAX_LINGER
+        );
+        assert_eq!(Limiter::with_linger(1, Duration::MAX).linger, MAX_LINGER);
+        assert_eq!(Limiter::with_linger(1, LINGER).linger, LINGER);
+        assert_eq!(Limiter::new(1).linger, LINGER);
     }
 
     #[test]
