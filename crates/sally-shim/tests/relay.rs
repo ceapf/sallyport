@@ -787,36 +787,129 @@ fn stdio_mode_fails_cleanly_when_stdout_is_closed() {
     assert!(err.contains("sally-shim"), "{err}");
 }
 
+/// How long [`deaf_but_chatty`] talks after it stops reading.
+const CHATTY: Duration = Duration::from_millis(1000);
+/// The short linger the write-error tests run with.
+const SHORT_LINGER: Duration = Duration::from_millis(200);
+
 fn deaf_but_chatty(mut s: UnixStream) {
-    // Stops reading, keeps talking: the shim's write toward this server fails (EPIPE) while its
-    // read from it would go on for seconds.
+    // Stops reading, keeps talking for CHATTY: the shim's write toward this server fails (EPIPE)
+    // while the server's bytes go on arriving.
     let _ = s.shutdown(Shutdown::Read);
-    for _ in 0..40 {
+    for _ in 0..10 {
         if s.write_all(b"x").is_err() {
             return;
         }
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(CHATTY / 10);
     }
 }
 
+/// Writes `b"y"` until a write fails, the shim having closed; the time that took.
+fn send_until_refused(c: &mut TcpStream) -> Duration {
+    let started = Instant::now();
+    while c.write_all(b"y").is_ok() {
+        assert!(
+            started.elapsed() < SHORT_LINGER + PROMPT,
+            "the shim never closed a client still sending"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    started.elapsed()
+}
+
 #[test]
-fn a_write_error_tears_the_whole_connection_down() {
+fn a_failed_write_toward_the_server_is_bounded_by_its_end_and_the_linger() {
+    // Successor of the test that asserted a failed write tears the whole connection down at
+    // once (#76): the server's bytes still arrive after the client's send fails, and the
+    // connection ends at the server's end plus the linger.
     let s = Scratch::new("writeerr");
     uds_server(&s.sock(), deaf_but_chatty);
-    let mut c = connect(start_shim(&s.sock(), 8));
+    let mut c = connect(start_shim_with(
+        &s.sock(),
+        Limiter::with_linger(8, SHORT_LINGER),
+    ));
+    let started = Instant::now();
     // Let the server thread stop reading first, then send what the shim cannot deliver.
     thread::sleep(Duration::from_millis(300));
     c.write_all(b"hello").unwrap();
-    let started = Instant::now();
-    let mut buf = [0u8; 64];
-    loop {
-        match c.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
+    let mut after = Vec::new();
+    c.read_to_end(&mut after).unwrap();
+    assert!(!after.is_empty(), "nothing arrived after the failed send");
+    assert!(after.iter().all(|&b| b == b'x'), "{after:?}");
+    assert!(
+        started.elapsed() < CHATTY + PROMPT,
+        "the server's end did not reach the client"
+    );
+    // The server is done; the client, still open and sending, is cut after the linger, not
+    // before: until then the shim discards what it sends instead of resetting it.
+    let refused_after = send_until_refused(&mut c);
+    assert!(refused_after >= SHORT_LINGER / 2, "{refused_after:?}");
+}
+
+fn answer_unread(mut s: UnixStream) {
+    // Answers and closes without reading a byte, as `sallyd` does when it refuses a request
+    // line it stopped reading.
+    let _ = s.write_all(b"reply");
+}
+
+#[test]
+fn a_client_still_sending_reads_the_reply_and_its_slot_comes_back() {
+    let s = Scratch::new("sendon");
+    uds_server(&s.sock(), answer_unread);
+    let addr = start_shim_with(&s.sock(), Limiter::with_linger(1, SHORT_LINGER));
+    let mut c = connect(addr);
+    let mut sender = c.try_clone().unwrap();
+    let sending = thread::spawn(move || {
+        let chunk = vec![b'a'; 16 * 1024];
+        let started = Instant::now();
+        while sender.write_all(&chunk).is_ok() {
+            assert!(started.elapsed() < T, "the shim never cut the sender");
         }
-        assert!(
-            started.elapsed() < PROMPT,
-            "the connection outlived a failed write"
-        );
+        Instant::now()
+    });
+    let mut reply = Vec::new();
+    let read = c.read_to_end(&mut reply);
+    let replied = Instant::now();
+    assert_eq!(reply, b"reply", "{read:?}");
+    // Until the linger runs out the shim discards what the client sends, so a client that
+    // would stop at a refused send still gets to read the reply (#76).
+    let refused_after = sending.join().unwrap().saturating_duration_since(replied);
+    assert!(refused_after >= SHORT_LINGER / 2, "{refused_after:?}");
+    // The one slot comes back after the linger, though the first client never closed.
+    let mut served = false;
+    for _ in 0..60 {
+        let mut b = connect(addr);
+        let mut got = Vec::new();
+        if b.read_to_end(&mut got).is_ok() && got == b"reply" {
+            served = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
     }
+    assert!(
+        served,
+        "the slot of a client still sending was never reclaimed"
+    );
+    drop(c);
+}
+
+fn deaf_then_answers(mut s: UnixStream) {
+    // Stops reading at once, so the shim's write of the client's request fails (EPIPE); only
+    // after that does it answer and close, as `sallyd` does after a refusal (#76).
+    let _ = s.shutdown(Shutdown::Read);
+    thread::sleep(Duration::from_millis(600));
+    let _ = s.write_all(b"reply");
+}
+
+#[test]
+fn a_write_error_stops_only_its_own_direction() {
+    let s = Scratch::new("halfstop");
+    uds_server(&s.sock(), deaf_then_answers);
+    let mut c = connect(start_shim(&s.sock(), 8));
+    thread::sleep(Duration::from_millis(300));
+    c.write_all(b"hello").unwrap();
+    let mut got = Vec::new();
+    let read = c.read_to_end(&mut got);
+    assert_eq!(got, b"reply", "{read:?}");
+    assert!(read.is_ok(), "{read:?}");
 }

@@ -194,8 +194,10 @@ half!(UnixStream);
 
 /// One TCP connection: connect to the Unix socket, then copy both ways until done.
 ///
-/// When the server side finishes (EOF), the client gets [`Limiter::linger`] to close its end;
-/// after that the connection is torn down so the slot comes back.
+/// When the server side finishes (EOF, or a failed or refused read or write), the client gets
+/// [`Limiter::linger`] to close its end; after that the connection is torn down so the slot
+/// comes back. The same bound ends a client still sending after the server stopped reading: its
+/// bytes are discarded meanwhile, and the reply was relayed before (#76).
 fn relay_connection(
     tcp: TcpStream,
     socket: &Path,
@@ -212,11 +214,11 @@ fn relay_connection(
             .name("up".into())
             .stack_size(THREAD_STACK_BYTES)
             .spawn(move || {
-                copy_half(&*from, &*to);
+                copy_half(&*from, &*to, OnFailedWrite::Discard);
                 drop(done_tx);
             })?
     };
-    copy_half(&*uds, &*tcp);
+    copy_half(&*uds, &*tcp, OnFailedWrite::Stop);
     if matches!(
         done_rx.recv_timeout(limiter.linger),
         Err(RecvTimeoutError::Timeout)
@@ -229,10 +231,25 @@ fn relay_connection(
         .map_err(|_| io::Error::other("copy thread panicked"))
 }
 
-/// Copies `from` → `to` with a fixed buffer. On EOF it half-closes `to` (so the peer sees the
-/// end of the request but can still answer); on an error it closes both streams, which wakes the
-/// other direction. TODO(#76): that close can cut a reply the other direction is still relaying.
-fn copy_half(from: &dyn Half, to: &dyn Half) {
+/// What a direction does once a write to its destination has failed.
+#[derive(Debug, Clone, Copy)]
+enum OnFailedWrite {
+    /// Toward the client: stop reading the server, so the server's next write fails and it
+    /// learns the client is gone. No discard: nothing would bound it.
+    Stop,
+    /// Toward the server: read the client on and discard it until its end or a read error, so a
+    /// client still sending is never reset before it reads the reply relayed the other way
+    /// (#76). The linger in [`relay_connection`] bounds it.
+    Discard,
+}
+
+/// Copies `from` → `to` with a fixed buffer, for one direction only: it shuts down at most the
+/// read side of `from` and the write side of `to`, never the other direction's halves (only the
+/// linger in [`relay_connection`] closes both ways).
+/// - At EOF it half-closes `to`, so the peer sees the end but can still answer.
+/// - At a read error it shuts `from`'s read side and half-closes `to`.
+/// - At a failed write it half-closes `to`, then acts as `on_failed_write` says.
+fn copy_half(from: &dyn Half, to: &dyn Half, on_failed_write: OnFailedWrite) {
     let mut buf = [0u8; BUF_BYTES];
     loop {
         match from.read_some(&mut buf) {
@@ -245,11 +262,33 @@ fn copy_half(from: &dyn Half, to: &dyn Half) {
                 _ => break,
             },
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => break,
+            Err(_) => {
+                from.close(Shutdown::Read);
+                to.close(Shutdown::Write);
+                return;
+            }
         }
     }
-    from.close(Shutdown::Both);
-    to.close(Shutdown::Both);
+    to.close(Shutdown::Write);
+    match on_failed_write {
+        OnFailedWrite::Stop => from.close(Shutdown::Read),
+        OnFailedWrite::Discard => discard(from, &mut buf),
+    }
+}
+
+/// Reads `from` into `buf` and drops the bytes until EOF; a read error shuts its read side.
+fn discard(from: &dyn Half, buf: &mut [u8]) {
+    loop {
+        match from.read_some(buf) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => {
+                from.close(Shutdown::Read);
+                return;
+            }
+        }
+    }
 }
 
 /// Relays `input` → the Unix socket and the socket → `output` (flushing every chunk), until the
@@ -389,43 +428,87 @@ mod tests {
         }
     }
 
+    const BOTH_WAYS: [OnFailedWrite; 2] = [OnFailedWrite::Stop, OnFailedWrite::Discard];
+
     #[test]
     fn copy_half_retries_an_interrupted_read_and_half_closes_at_eof() {
-        let (from, to) = (
-            Fake::new(vec![Step::Fail(ErrorKind::Interrupted), Step::Data(b"ab")]),
-            Fake::new(Vec::new()),
-        );
-        copy_half(&from, &to);
-        assert_eq!(to.written(), b"ab");
-        assert_eq!(to.closes(), [Shutdown::Write]);
-        assert!(from.closes().is_empty());
+        for way in BOTH_WAYS {
+            let (from, to) = (
+                Fake::new(vec![Step::Fail(ErrorKind::Interrupted), Step::Data(b"ab")]),
+                Fake::new(Vec::new()),
+            );
+            copy_half(&from, &to, way);
+            assert_eq!(to.written(), b"ab", "{way:?}");
+            assert_eq!(to.closes(), [Shutdown::Write], "{way:?}");
+            assert!(from.closes().is_empty(), "{way:?}");
+        }
     }
 
     #[test]
-    fn copy_half_stops_at_a_read_error_and_closes_both_streams() {
-        let (from, to) = (
-            Fake::new(vec![
-                Step::Fail(ErrorKind::ConnectionReset),
-                Step::Data(b"zz"),
-            ]),
-            Fake::new(Vec::new()),
-        );
-        copy_half(&from, &to);
-        assert_eq!(to.written(), b"");
-        assert_eq!(from.closes(), [Shutdown::Both]);
-        assert_eq!(to.closes(), [Shutdown::Both]);
+    fn copy_half_stops_at_a_read_error_and_closes_only_its_own_direction() {
+        for way in BOTH_WAYS {
+            let (from, to) = (
+                Fake::new(vec![
+                    Step::Fail(ErrorKind::ConnectionReset),
+                    Step::Data(b"zz"),
+                ]),
+                Fake::new(Vec::new()),
+            );
+            copy_half(&from, &to, way);
+            assert_eq!(to.written(), b"", "{way:?}");
+            assert_eq!(from.unread(), 1, "read on after a read error ({way:?})");
+            assert_eq!(from.closes(), [Shutdown::Read], "{way:?}");
+            assert_eq!(to.closes(), [Shutdown::Write], "{way:?}");
+        }
     }
 
     #[test]
-    fn copy_half_stops_at_a_failed_write_and_closes_both_streams() {
+    fn copy_half_toward_the_client_stops_at_a_failed_write_and_closes_only_its_own_direction() {
         let (from, to) = (
             Fake::new(vec![Step::Data(b"a"), Step::Data(b"b")]),
             Fake::failing_writes(),
         );
-        copy_half(&from, &to);
+        copy_half(&from, &to, OnFailedWrite::Stop);
         assert_eq!(from.unread(), 1, "read on after a failed write");
-        assert_eq!(from.closes(), [Shutdown::Both]);
-        assert_eq!(to.closes(), [Shutdown::Both]);
+        assert_eq!(from.closes(), [Shutdown::Read]);
+        assert_eq!(to.closes(), [Shutdown::Write]);
+    }
+
+    #[test]
+    fn copy_half_toward_the_server_discards_the_client_to_its_end_after_a_failed_write() {
+        let (from, to) = (
+            Fake::new(vec![
+                Step::Data(b"a"),
+                Step::Data(b"b"),
+                Step::Fail(ErrorKind::Interrupted),
+                Step::Data(b"c"),
+            ]),
+            Fake::failing_writes(),
+        );
+        copy_half(&from, &to, OnFailedWrite::Discard);
+        assert_eq!(
+            from.unread(),
+            0,
+            "stopped discarding before the client's end"
+        );
+        assert!(from.closes().is_empty(), "{:?}", from.closes());
+        assert_eq!(to.closes(), [Shutdown::Write]);
+    }
+
+    #[test]
+    fn a_read_error_ends_the_discard() {
+        let (from, to) = (
+            Fake::new(vec![
+                Step::Data(b"a"),
+                Step::Fail(ErrorKind::ConnectionReset),
+                Step::Data(b"zz"),
+            ]),
+            Fake::failing_writes(),
+        );
+        copy_half(&from, &to, OnFailedWrite::Discard);
+        assert_eq!(from.unread(), 1, "read on after a read error");
+        assert_eq!(from.closes(), [Shutdown::Read]);
+        assert_eq!(to.closes(), [Shutdown::Write]);
     }
 
     #[test]
