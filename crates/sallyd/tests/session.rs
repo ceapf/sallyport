@@ -207,7 +207,9 @@ fn an_unaudited_session_start_binds_nothing_and_stops_the_workspace() {
         assert_eq!(stops(&r.x), ["start-failed"]);
         let names = podman(&["ps", "-a", "--format", "{{.Names}}"]);
         let names = String::from_utf8_lossy(&names.stdout);
-        assert!(!names.contains(&r.x.scope), "{names}");
+        // Names are `sp-ws-<scope>-<hex>`; the dashes keep scope `…-1` from matching `…-18`, a
+        // test running beside this one.
+        assert!(!names.contains(&format!("-{}-", r.x.scope)), "{names}");
     });
 }
 
