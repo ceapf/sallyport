@@ -515,6 +515,14 @@ fn rt_net_11_an_idle_sallyd_connects_nowhere() {
             .any(|l| l.starts_with(&own) && l.ends_with("= 0")),
         "the trace did not follow sallyd:\n{text}"
     );
+    // Control (analogue, #122): the trace shows sallyd's own socket() with its family decoded,
+    // which the filter's first clause (any AF_INET/AF_INET6 socket fails) depends on.
+    let socket = format!("{sallyd} socket(AF_UNIX");
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with(&socket) && !l.contains("= -1")),
+        "control: no socket(AF_UNIX) of sallyd in the trace:\n{text}"
+    );
     let bad: Vec<&str> = text.lines().filter(|l| outbound(l)).collect();
     assert!(bad.is_empty(), "outbound connects: {bad:#?}");
 }

@@ -9,7 +9,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{Fixture, HEADER, assert_rejects, fake_token, rendered};
+use common::{Fixture, HEADER, assert_ok, assert_rejects, fake_token, rendered};
 use sally_core::manifest::{Code, MAX_MANIFEST_BYTES, parse, parse_bytes, to_yaml, validate};
 
 // ---- RT-MAN-01: schema fuzz --------------------------------------------------------------------
@@ -350,71 +350,90 @@ fn rt_man_02_privilege_escalation_attempts_rejected_with_documented_codes() {
         )
     };
     let proxy = "network:\n  mode: proxy\n  allow:\n    - host: api.github.com\n";
-    let cases: Vec<(String, &str, Code, &str)> = vec![
+    let digest = "0".repeat(64);
+    let secret = |host: &str| {
+        format!(
+            "{proxy}secrets:\n  - {{name: GITHUB_TOKEN, inject: {{host: \"{host}\", header: Authorization, format: \"{{value}}\"}}}}\n"
+        )
+    };
+    // Each rejected case and its control (#122): an accepted twin through the same `f.load`,
+    // differing only in the attribute under test.
+    let cases: Vec<(String, String, &str, Code, &str)> = vec![
         (
             m("~", "/workspace/h"),
+            m("~/code/myproject", "/workspace/h"),
             "filesystem.mounts[0].host",
             Code::Denylisted,
             r#"error: filesystem.mounts[0].host: "~" is the home directory root (denylisted) [denylisted]"#,
         ),
         (
             m("~/", "/workspace/h"),
+            m("~/code/myproject", "/workspace/h"),
             "filesystem.mounts[0].host",
             Code::Denylisted,
             r#"error: filesystem.mounts[0].host: "~/" is the home directory root (denylisted) [denylisted]"#,
         ),
         (
             m("/", "/workspace/r"),
+            m("~/code/myproject", "/workspace/r"),
             "filesystem.mounts[0].host",
             Code::Denylisted,
             r#"error: filesystem.mounts[0].host: "/" is the filesystem root (denylisted) [denylisted]"#,
         ),
         (
             m("~/.config/sallyport", "/workspace/c"),
+            m("~/code/myproject", "/workspace/c"),
             "filesystem.mounts[0].host",
             Code::Denylisted,
             r#"error: filesystem.mounts[0].host: "~/.config/sallyport" is inside $ROOT/home/.config — configuration folders are never mountable (denylisted) [denylisted]"#,
         ),
         (
             m("~/code/myproject", "/etc"),
+            m("~/code/myproject", "/workspace/etc"),
             "filesystem.mounts[0].guest",
             Code::GuestPath,
             r#"error: filesystem.mounts[0].guest: "/etc" must be under /workspace/ [guest-path]"#,
         ),
         (
             m("~/code/myproject", "/workspace/../root"),
+            m("~/code/myproject", "/workspace/root"),
             "filesystem.mounts[0].guest",
             Code::GuestPath,
             r#"error: filesystem.mounts[0].guest: "/workspace/../root" contains ".." [guest-path]"#,
         ),
         (
             "runtime:\n  image: ghcr.io/x/harness:latest\n".into(),
+            format!("runtime:\n  image: ghcr.io/x/harness@sha256:{digest}\n"),
             "runtime.image",
             Code::NotPinned,
             r#"error: runtime.image: "ghcr.io/x/harness:latest" must be pinned by digest: <image>@sha256:<64 hex chars> [not-pinned]"#,
         ),
         (
             "network:\n  mode: proxy\n  allow:\n    - host: \"*\"\n".into(),
+            // The acknowledgement is the defence's own switch (architect Q184).
+            "network:\n  mode: proxy\n  allow:\n    - host: \"*\"\n  acknowledge_unrestricted_egress: true\n"
+                .into(),
             "network.allow[0].host",
             Code::UnacknowledgedWildcard,
             r#"error: network.allow[0].host: "*" requires network.acknowledge_unrestricted_egress: true [unacknowledged-wildcard]"#,
         ),
         (
-            format!(
-                "{proxy}secrets:\n  - {{name: GITHUB_TOKEN, inject: {{host: \"*\", header: Authorization, format: \"{{value}}\"}}}}\n"
-            ),
+            secret("*"),
+            secret("api.github.com"),
             "secrets[0].inject.host",
             Code::NotExactHost,
             r#"error: secrets[0].inject.host: "*": host must be exact (no wildcards) [not-exact-host]"#,
         ),
         (
             "runtime:\n  cpus: 1000000\n".into(),
+            "runtime:\n  cpus: 8\n".into(),
             "runtime.cpus",
             Code::OutOfRange,
             r#"error: runtime.cpus: 1000000 is outside 0.5–8 (host CPUs) [out-of-range]"#,
         ),
     ];
-    for (body, path, code, message) in cases {
+    for (body, twin, path, code, message) in cases {
+        assert_ok(&f.load(&twin));
         let r = f.load(&body);
         assert_rejects(&r, path, code);
         assert_eq!(
@@ -442,6 +461,8 @@ fn rt_man_02_image_transport_prefixes_are_refused() {
         "docker://ghcr.io/a/b",
     ] {
         for field in ["runtime", "harness"] {
+            // Control (#122): the registry form with the same digest is accepted.
+            assert_ok(&f.load(&format!("{field}:\n  image: \"ghcr.io/a/b@sha256:{d}\"\n")));
             let r = f.load(&format!("{field}:\n  image: \"{image}@sha256:{d}\"\n"));
             assert_rejects(&r, &format!("{field}.image"), Code::NotPinned);
         }
@@ -625,9 +646,12 @@ fn rt_sec_08_original_rows(f: &Fixture) {
     let proxy = "network:\n  mode: proxy\n  allow:\n    - host: api.openai.com\n";
     let canary = fake_token(&["s", "k-"], "canary");
 
-    let inline_value = format!(
-        "{proxy}secrets:\n  - name: X\n    value: \"{canary}\"\n    inject: {{host: api.openai.com, header: Authorization, format: \"Bearer {{value}}\"}}\n"
-    );
+    // Each rejected case's control (#122): an accepted twin through the same `f.load`, differing
+    // only in the attribute under test.
+    let inject =
+        "    inject: {host: api.openai.com, header: Authorization, format: \"Bearer {value}\"}\n";
+    assert_ok(&f.load(&format!("{proxy}secrets:\n  - name: X\n{inject}")));
+    let inline_value = format!("{proxy}secrets:\n  - name: X\n    value: \"{canary}\"\n{inject}");
     let r = f.load(&inline_value);
     assert_rejects(&r, "secrets[0].value", Code::Schema);
     assert!(rendered(&r)[0].contains("unknown field `value`"));
@@ -636,17 +660,30 @@ fn rt_sec_08_original_rows(f: &Fixture) {
         "error must not echo the value"
     );
 
-    let wildcard = format!(
-        "{proxy}secrets:\n  - {{name: X, inject: {{host: \"*\", header: Authorization, format: \"{{value}}\"}}}}\n"
-    );
-    let r = f.load(&wildcard);
+    let wildcard = |host: &str| {
+        format!(
+            "{proxy}secrets:\n  - {{name: X, inject: {{host: \"{host}\", header: Authorization, format: \"{{value}}\"}}}}\n"
+        )
+    };
+    assert_ok(&f.load(&wildcard("api.openai.com")));
+    let r = f.load(&wildcard("*"));
     assert_rejects(&r, "secrets[0].inject.host", Code::NotExactHost);
     assert!(rendered(&r)[0].contains("host must be exact"));
 
-    let env = format!(
-        "tools:\n  mcp:\n    - name: llm\n      command: [server]\n      env: {{OPENAI_API_KEY: \"{canary}\"}}\n"
+    let env = |name: &str, value: &str| {
+        format!(
+            "tools:\n  mcp:\n    - name: llm\n      command: [server]\n      env: {{{name}: \"{value}\"}}\n"
+        )
+    };
+    // The canary value is refused on its own too, so the pair that differs only in the name
+    // carries a plain value; the canary case below is the original row.
+    assert_ok(&f.load(&env("LLM_MODE", "1")));
+    assert_rejects(
+        &f.load(&env("OPENAI_API_KEY", "1")),
+        "tools.mcp[0].env.OPENAI_API_KEY",
+        Code::SecretLikeEnv,
     );
-    let r = f.load(&env);
+    let r = f.load(&env("OPENAI_API_KEY", &canary));
     assert_rejects(&r, "tools.mcp[0].env.OPENAI_API_KEY", Code::SecretLikeEnv);
     assert!(rendered(&r)[0].contains("secret-like env name"));
     assert!(

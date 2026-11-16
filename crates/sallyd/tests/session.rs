@@ -666,6 +666,20 @@ fn rt_ag_15_nothing_of_a_session_follows_its_stop() {
             ps.lines().any(|l| l.trim() == "sleep 307")
         })
         .await;
+        // The host's view of the call's processes: the probe of "no process of the call is left".
+        let left = || {
+            std::fs::read_dir("/proc")
+                .unwrap()
+                .flatten()
+                .filter_map(|e| std::fs::read(e.path().join("cmdline")).ok())
+                .filter(|c| c.as_slice() == b"sleep\x00307\x00")
+                .count()
+        };
+        // Control (#122): the same scan finds the command while it runs.
+        assert!(
+            left() >= 1,
+            "control: the host scan misses the running command"
+        );
         assert_eq!(
             r.reg.stop(&s.id, StopReason::Request).await,
             Some(StopOutcome::Stopped)
@@ -688,13 +702,7 @@ fn rt_ag_15_nothing_of_a_session_follows_its_stop() {
             "entries after session.stop: {after:?}"
         );
         assert!(!exists(&s.container));
-        let left = std::fs::read_dir("/proc")
-            .unwrap()
-            .flatten()
-            .filter_map(|e| std::fs::read(e.path().join("cmdline")).ok())
-            .filter(|c| c.as_slice() == b"sleep\x00307\x00")
-            .count();
-        assert_eq!(left, 0, "a process of the call is left");
+        assert_eq!(left(), 0, "a process of the call is left");
         drop(conn);
     });
 }
@@ -870,6 +878,28 @@ fn rt_ag_15_a_call_during_the_stop_is_denied_before_anything_runs() {
         let s = r.reg.start(v).await.unwrap();
         let sock = r.x.session_paths(&s.id).harness_sockets().join(AGENT_SOCK);
         let (mut conn, _dir) = connect(&sock).await;
+        // The host's view of the mount: the probe of "the command had an effect".
+        let made = |name: &str| at.join(name).exists();
+        // Control (#122): before anything is held, a granted call of the same tool on the same
+        // connection writes a sibling path, and the host sees it.
+        let control = json!({"jsonrpc": "2.0", "id": 0, "method": "tools/call",
+            "params": {"_meta": meta(), "name": "shell",
+                       "arguments": {"cmd": ["touch", "/workspace/p/made-control"],
+                                     "cwd": "/workspace/p"}}});
+        conn.write_all(format!("{control}\n").as_bytes())
+            .await
+            .unwrap();
+        let mut reply = String::new();
+        BufReader::new(&mut conn)
+            .read_line(&mut reply)
+            .await
+            .unwrap();
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_ne!(reply["result"]["isError"], json!(true), "control: {reply}");
+        assert!(
+            made("made-control"),
+            "control: the granted call's file is not on the host"
+        );
         // Phase 1: the call's `rpc.request` waits in the sink, holding the seal's order.
         r.x.events.hold(&["rpc.request", "session.crash"]);
         let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -890,10 +920,18 @@ fn rt_ag_15_a_call_during_the_stop_is_denied_before_anything_runs() {
         // Phase 2: `rpc.request` lands; `session.crash` takes the order and waits in the sink,
         // so the supervisor is held in step 2 while the call goes on to the tools.
         r.x.events.hold(&["session.crash"]);
+        // The control's `rpc.request` is the first; the held call's is the second.
         until(
             "the call's rpc.request lands",
             Duration::from_secs(10),
-            || r.x.events.list().iter().any(|e| e == "rpc.request"),
+            || {
+                r.x.events
+                    .list()
+                    .iter()
+                    .filter(|e| *e == "rpc.request")
+                    .count()
+                    == 2
+            },
         )
         .await;
         r.x.events.until_parked("session.crash", 1).await;
@@ -915,11 +953,17 @@ fn rt_ag_15_a_call_during_the_stop_is_denied_before_anything_runs() {
             .position(|(e, a)| e == "tool.deny" && a["code"] == "session-stopping")
             .unwrap_or_else(|| panic!("no tool.deny session-stopping: {all:#?}"));
         assert!(denied < stop_at, "{all:#?}");
+        // The one `tool.run` is the control's, before its own `tool.result`: the call never ran.
+        let runs: Vec<usize> = (0..all.len()).filter(|&i| all[i].0 == "tool.run").collect();
+        let control_result = all
+            .iter()
+            .position(|(e, _)| e == "tool.result")
+            .expect("the control's tool.result");
         assert!(
-            !all.iter().any(|(e, _)| e == "tool.run"),
+            runs.len() == 1 && runs[0] < control_result,
             "the call ran: {all:#?}"
         );
-        assert!(!at.join("made").exists(), "the command had an effect");
+        assert!(!made("made"), "the command had an effect");
         drop(conn);
     });
 }
@@ -967,6 +1011,24 @@ fn rt_ag_15_an_operation_past_the_drain_and_a_panic_during_the_stop_end_before_s
         let s = reg.start(v).await.unwrap();
         let sock = x.session_paths(&s.id).harness_sockets().join(AGENT_SOCK);
         let (mut conn, _dir) = connect(&sock).await;
+        // The host's view of the mount: the probe of "the aborted write touched the file".
+        let written = |name: &str| at.join(name).exists();
+        // Control (#122): before anything is held, a granted `fs_write` on the same connection
+        // writes a sibling path, and the host sees it.
+        let control = json!({"jsonrpc": "2.0", "id": 0, "method": "tools/call",
+            "params": {"_meta": meta(), "name": "fs_write",
+                       "arguments": {"path": "/workspace/p/early.txt", "content_b64": "bGF0ZQ=="}}});
+        conn.write_all(format!("{control}\n").as_bytes())
+            .await
+            .unwrap();
+        let mut reply = String::new();
+        BufReader::new(&mut conn)
+            .read_line(&mut reply)
+            .await
+            .unwrap();
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_ne!(reply["result"]["isError"], json!(true), "control: {reply}");
+        assert!(written("early.txt"), "control: the granted write is not on the host");
         x.events.hold(&["tool.run"]);
         let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": {"_meta": meta(), "name": "fs_write",
@@ -974,13 +1036,14 @@ fn rt_ag_15_an_operation_past_the_drain_and_a_panic_during_the_stop_end_before_s
         conn.write_all(format!("{call}\n").as_bytes())
             .await
             .unwrap();
+        // The control's `rpc.request` is the first; the held write's is the second.
         until("the write's section runs", Duration::from_secs(10), || {
             x.events
                 .list()
                 .iter()
                 .filter(|e| *e == "rpc.request")
                 .count()
-                == 1
+                == 2
         })
         .await;
         x.events.until_parked("tool.run", 1).await;
@@ -1012,20 +1075,26 @@ fn rt_ag_15_an_operation_past_the_drain_and_a_panic_during_the_stop_end_before_s
         assert!(after.is_empty(), "after session.stop: {after:?}");
         assert_eq!(all[stop_at].1["in_flight"], 1, "{all:#?}");
         assert_eq!(all[stop_at].1["reason"], "request", "{all:#?}");
-        let run = all
+        // The control's entries come first: the write's are those after its `tool.result`.
+        let control_result = all
             .iter()
-            .position(|(e, _)| e == "tool.run")
-            .expect("tool.run");
+            .position(|(e, _)| e == "tool.result")
+            .expect("the control's tool.result");
+        let runs = all.iter().filter(|(e, _)| e == "tool.run").count();
+        assert_eq!(runs, 2, "the control's tool.run and the write's: {all:#?}");
+        let run = control_result
+            + 1
+            + all[control_result + 1..]
+                .iter()
+                .position(|(e, _)| e == "tool.run")
+                .expect("the write's tool.run");
         let crashed = all
             .iter()
             .position(|(e, _)| e == "session.crash")
             .expect("session.crash");
         assert!(run < stop_at && crashed < stop_at, "{all:#?}");
         assert_eq!(all[crashed].1["task"], "tool");
-        assert!(
-            !at.join("late.txt").exists(),
-            "the aborted write touched the file"
-        );
+        assert!(!written("late.txt"), "the aborted write touched the file");
         // Its `tool.result` races the seal for the order once the hold ends: either it landed
         // before `session.stop` (as aborted) or the seal refused it with an oplog line (the
         // refusal itself is pinned in `rpc::record`'s unit tests).
@@ -1034,7 +1103,11 @@ fn rt_ag_15_an_operation_past_the_drain_and_a_panic_during_the_stop_end_before_s
         let refused = text
             .lines()
             .any(|l| l.contains("entry refused after session.stop") && l.contains("tool.result"));
-        match all.iter().position(|(e, _)| e == "tool.result") {
+        let write_result = all[control_result + 1..]
+            .iter()
+            .position(|(e, _)| e == "tool.result")
+            .map(|i| control_result + 1 + i);
+        match write_result {
             Some(i) => {
                 assert!(i < stop_at, "{all:#?}");
                 assert_eq!(all[i].1["outcome"], "aborted", "{all:#?}");

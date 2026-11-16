@@ -622,7 +622,15 @@ impl Lx {
         let out = podman(&["ps", "--all", "--format", "{{.Names}}"]);
         String::from_utf8_lossy(&out.stdout)
             .lines()
-            .any(|n| n.contains(&self.scope))
+            .any(|n| self.owns(n))
+    }
+
+    /// Whether a container name is one of this fixture's: a known prefix, then the scope and a
+    /// dash, so scope `…-1` never matches `…-10`. The one match of [`Lx::listed`] and `Drop`.
+    fn owns(&self, name: &str) -> bool {
+        PREFIXES
+            .iter()
+            .any(|p| name.starts_with(&format!("{p}{}-", self.scope)))
     }
 
     /// The control of a "nothing was created" check (#122): `v`, which the launcher accepts,
@@ -832,10 +840,7 @@ impl Drop for Lx {
     fn drop(&mut self) {
         let names = podman(&["ps", "--all", "--format", "{{.Names}}"]);
         for name in String::from_utf8_lossy(&names.stdout).lines() {
-            if PREFIXES
-                .iter()
-                .any(|p| name.starts_with(&format!("{p}{}-", self.scope)))
-            {
+            if self.owns(name) {
                 let _ = podman(&["rm", "--force", "--time", "0", name]);
             }
         }

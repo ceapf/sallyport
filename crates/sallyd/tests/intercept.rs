@@ -892,16 +892,23 @@ fn rt_sec_11_the_workspace_holds_only_the_placeholder() {
             "format: \"Bearer {value}\"}\n    expose_env: GH_TOKEN\n",
         );
         let r = session_of(&lx, "sec11", &manifest).await;
-        let (_, env) = exec(
+        let (_, env) = exec(&r, "env").await;
+        let (_, procs) = exec(
             &r,
-            "env; for f in /proc/[0-9]*/environ; do tr '\\0' '\\n' < $f; done 2>/dev/null",
+            "for f in /proc/[0-9]*/environ; do tr '\\0' '\\n' < $f; done 2>/dev/null",
         )
         .await;
-        // Control (#122): both halves of the dump are read. The placeholder comes from `env` and
-        // from at least one `/proc/*/environ` (PID 1's and the shell's both carry it).
-        let dumped = env.matches("GH_TOKEN=sallyport-placeholder").count();
-        assert!(dumped >= 2, "control: {dumped} copies in {env}");
-        assert!(!env.contains(&gh()) && !env.contains("CANARY"), "{env}");
+        // Control (#122): each dump is shown to read the environment: both carry the placeholder,
+        // and the `/proc` one from PID 1 and from the shell that reads it.
+        let copies = |dump: &str| dump.matches("GH_TOKEN=sallyport-placeholder").count();
+        assert!(copies(&env) >= 1, "control: the env dump misses it: {env}");
+        assert!(
+            copies(&procs) >= 2,
+            "control: the /proc dump misses it: {procs}"
+        );
+        for dump in [&env, &procs] {
+            assert!(!dump.contains(&gh()) && !dump.contains("CANARY"), "{dump}");
+        }
         let placeholder = "Authorization: Bearer sallyport-placeholder\r\n";
         let _ = over(
             &lx,
