@@ -79,8 +79,21 @@ fn of_mount_refuses_a_root_replaced_since_validation() {
     std::fs::create_dir(&m.host).unwrap();
     let e = Walk::of_mount(1, m, &limits).err().unwrap();
     assert!(matches!(e, ScanError::Changed { mount: 1, .. }), "{e:?}");
+    let replaced = format!("{} was replaced since validation", m.host.display());
+    assert!(
+        matches!(&e, ScanError::Changed { msg, .. } if *msg == replaced),
+        "{e:?}"
+    );
     std::fs::remove_dir(&m.host).unwrap();
     std::os::unix::fs::symlink(&moved, &m.host).unwrap();
     let e = Walk::of_mount(1, m, &limits).err().unwrap();
     assert!(matches!(e, ScanError::Changed { mount: 1, .. }), "{e:?}");
+    let symlink = format!(
+        "{} can no longer be opened as a directory without following a symlink: ",
+        m.host.display()
+    );
+    assert!(
+        matches!(&e, ScanError::Changed { msg, .. } if msg.starts_with(&symlink)),
+        "{e:?}"
+    );
 }
