@@ -12,6 +12,7 @@ use std::sync::Arc;
 use sally_core::audit::Actor;
 use sally_core::manifest::{ValidatedManifest, load};
 use sally_core::text::escape_capped;
+use sally_proto::ModelKind;
 use sally_proto::method;
 use sally_proto::{
     Change as WireChange, ChangeKind as WireKind, Changes, CreateParams, DecideParams,
@@ -23,9 +24,11 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 
 use super::control::{Conn, Control};
+use super::drive::{Driver, Stepped};
 use crate::approvals::queue::who;
 use crate::approvals::render::{self, Prompt};
 use crate::approvals::{Client, Decision, Desk, Seen};
+use crate::llm::scripted::Script;
 use crate::sandbox::{Change, ChangeKind, ChangesError, LaunchError, SessionId, session_changes};
 use crate::session::{SessionInfo, SessionState, StartError, StopOutcome};
 
@@ -56,10 +59,13 @@ pub trait SessionSet: Send + Sync + 'static {
     fn list(&self) -> Vec<SessionInfo>;
     /// Session `id`'s approvals desk.
     fn desk(&self, id: &str) -> Option<Desk>;
-    /// Starts a session for `manifest`.
+    /// Session `id`'s drive handle: only a session declared driven at start has one.
+    fn driver(&self, id: &str) -> Option<Arc<Driver>>;
+    /// Starts a session for `manifest`; with a `script`, declared driven (architect Q119).
     fn start(
         &self,
         manifest: Arc<ValidatedManifest>,
+        script: Option<Script>,
     ) -> impl Future<Output = Result<SessionInfo, StartError>> + Send;
     /// Stops session `id` (a client's request); `None`: no such session.
     fn stop(&self, id: &str) -> impl Future<Output = Option<StopOutcome>> + Send;
@@ -77,6 +83,9 @@ pub enum Call {
     Stop(SessionId),
     /// `sessions.changes`, its id already canonical.
     Changes(SessionId),
+    /// `sessions.drive`, its id already canonical. It carries nothing else: the script held by
+    /// `sallyd` is the only source of a driven call (architect Q117).
+    Drive(SessionId),
     /// `approvals.list`.
     Approvals,
     /// `approvals.decide`.
@@ -106,6 +115,7 @@ impl Call {
             method::SESSIONS_LIST => params_of::<NoParams>(params).map(|_| Self::List),
             method::SESSIONS_STOP => Ok(Self::Stop(session_id(params)?)),
             method::SESSIONS_CHANGES => Ok(Self::Changes(session_id(params)?)),
+            method::SESSIONS_DRIVE => Ok(Self::Drive(session_id(params)?)),
             method::APPROVALS_LIST => params_of::<NoParams>(params).map(|_| Self::Approvals),
             method::APPROVALS_DECIDE => Ok(Self::Decide(params_of(params)?)),
             method::APPROVALS_WATCH => params_of::<NoParams>(params).map(|_| Self::Watch),
@@ -121,6 +131,7 @@ impl Call {
             Self::List => method::SESSIONS_LIST,
             Self::Stop(_) => method::SESSIONS_STOP,
             Self::Changes(_) => method::SESSIONS_CHANGES,
+            Self::Drive(_) => method::SESSIONS_DRIVE,
             Self::Approvals => method::APPROVALS_LIST,
             Self::Decide(_) => method::APPROVALS_DECIDE,
             Self::Watch => method::APPROVALS_WATCH,
@@ -134,7 +145,7 @@ impl Call {
         match self {
             Self::List | Self::Changes(_) | Self::Approvals => true,
             Self::Watch => watching,
-            Self::Create(_) | Self::Stop(_) | Self::Decide(_) => false,
+            Self::Create(_) | Self::Stop(_) | Self::Decide(_) | Self::Drive(_) => false,
         }
     }
 
@@ -150,8 +161,16 @@ impl Call {
                     crate::approvals::action::hex(&sha2::Sha256::digest(p.manifest.as_bytes()));
                 m.insert("manifest_bytes".into(), Value::from(p.manifest.len()));
                 m.insert("manifest_sha256".into(), Value::from(sha));
+                // The script's size and hash, never its text (architect Q119).
+                if let Some(model) = &p.model {
+                    let sha = crate::approvals::action::hex(&sha2::Sha256::digest(
+                        model.script.as_bytes(),
+                    ));
+                    m.insert("script_bytes".into(), Value::from(model.script.len()));
+                    m.insert("script_sha256".into(), Value::from(sha));
+                }
             }
-            Self::Stop(id) | Self::Changes(id) => {
+            Self::Stop(id) | Self::Changes(id) | Self::Drive(id) => {
                 m.insert("id".into(), Value::from(id.as_str()));
             }
             Self::List | Self::Approvals | Self::Decide(_) | Self::Watch => {}
@@ -183,6 +202,9 @@ pub(crate) enum Done {
 impl<S: SessionSet> Control<S> {
     /// Runs one admitted call (its `rpc.request` is written).
     pub(crate) async fn run(&self, call: Call, conn: &mut Conn) -> Done {
+        // Seats of sessions that stopped are let go: they drive nothing, and a connection that
+        // only holds those is no driver (Q121's refusals are for a live seat).
+        conn.seats.retain(|s| !s.ended());
         match call {
             Call::Create(p) => self.create(p, conn.client).await,
             Call::List => {
@@ -191,8 +213,15 @@ impl<S: SessionSet> Control<S> {
             }
             Call::Stop(id) => self.stop(&id, conn.client).await,
             Call::Changes(id) => self.changes(id, conn.client).await,
+            Call::Drive(id) => self.drive(id, conn).await,
             Call::Approvals => Done::Ok(value(&self.prompts())),
+            Call::Decide(p) if conn.drives() => self.driver_decides(&p.id, conn.client).await,
             Call::Decide(p) => self.decide(p, conn.client).await,
+            Call::Watch if conn.drives() => {
+                let method = method::APPROVALS_WATCH;
+                self.driver_refused(method, None, "driver-seat", conn.client)
+                    .await
+            }
             Call::Watch => {
                 // Attached first, then listed: no prompt falls between (architect Q73.4). A
                 // second watch on the connection lists again and keeps its one watcher.
@@ -214,7 +243,124 @@ impl<S: SessionSet> Control<S> {
         }
     }
 
+    /// `sessions.drive`: one scripted turn of a driven session, on the seat of this connection
+    /// (architect Q117, Q121). Every refusal is an entry of the control log, none of the
+    /// session's: a refused drive writes nothing to the session.
+    async fn drive(&self, id: SessionId, conn: &mut Conn) -> Done {
+        let client = conn.client;
+        let method = method::SESSIONS_DRIVE;
+        let Some(driver) = self.p.sessions.driver(id.as_str()) else {
+            // A live session without a drive handle was not declared driven.
+            let live = self.p.sessions.list().iter().any(|s| s.id == id.as_str());
+            return if live {
+                self.driver_refused(method, Some(&id), "not-driven", client)
+                    .await
+            } else {
+                self.unknown_session(method, &id, client).await
+            };
+        };
+        if driver.ended() {
+            let why = crate::tools::STOPPING;
+            return self.driver_refused(method, Some(&id), why, client).await;
+        }
+        if !conn.holds(&driver) {
+            if conn.watch.is_some() {
+                let why = "driver-watching";
+                return self.driver_refused(method, Some(&id), why, client).await;
+            }
+            match driver.claim() {
+                Ok(seat) => conn.seats.push(seat),
+                Err(r) => {
+                    return self
+                        .driver_refused(method, Some(&id), r.reason(), client)
+                        .await;
+                }
+            }
+        }
+        let Some(seat) = conn.seat_of(&driver) else {
+            return Done::Close;
+        };
+        match seat.step().await {
+            Stepped::Step(step) => Done::Ok(value(&step)),
+            Stepped::Refused(why) => self.driver_refused(method, Some(&id), why, client).await,
+            Stepped::Close => Done::Close,
+        }
+    }
+
+    /// A refusal of the drive seat's rules: `session.refuse` in the control log.
+    async fn driver_refused(
+        &self,
+        method: &str,
+        id: Option<&SessionId>,
+        reason: &str,
+        client: Client,
+    ) -> Done {
+        let args = json!({
+            "method": method, "id": id.map(SessionId::as_str), "reason": reason,
+            "client": who(client),
+        });
+        let data = refusal(reason, None, Vec::new());
+        self.refuse(Actor::Sallyd, "session.refuse", args, data)
+            .await
+    }
+
+    /// `approvals.decide` on a connection that holds a drive seat: refused for any prompt, which
+    /// stays pending (architect Q121). The driver is never an approver.
+    async fn driver_decides(&self, id: &str, client: Client) -> Done {
+        let args = json!({
+            "id": escape_capped(id.as_bytes(), ID_CHARS), "reason": "driver-seat",
+            "client": who(client),
+        });
+        let data = refusal("driver-seat", None, Vec::new());
+        self.refuse(Actor::User, "approval.decide", args, data)
+            .await
+    }
+
+    /// The script of a create's `model`, parsed whole before anything launches (architect Q119):
+    /// `Ok(None)` without a model. Only a scripted model declared driven starts, in this task,
+    /// and its script ends at its first content or fail turn ([`Script::driven`]). The parse
+    /// runs off the runtime: a script is up to [`sally_proto::MAX_SCRIPT_BYTES`].
+    /// TODO(#53): `driven: false` waits for the `llm.sock` backend (Task 13).
+    async fn script_of(&self, p: &CreateParams, client: Client) -> Result<Option<Script>, Done> {
+        let Some(m) = &p.model else {
+            return Ok(None);
+        };
+        let (reason, detail) = if m.kind != ModelKind::Scripted {
+            (
+                "model-invalid",
+                "model.kind: only scripted is accepted".to_owned(),
+            )
+        } else if !m.driven {
+            (
+                "scripted-not-driven",
+                "model.driven: a scripted model is served to a driver only".to_owned(),
+            )
+        } else {
+            let text = m.script.clone();
+            let parsed =
+                blocking(move || Script::parse(&text).and_then(|s| s.driven().map(|()| s)));
+            match parsed.await {
+                Some(Ok(s)) => return Ok(Some(s)),
+                Some(Err(e)) => ("script-invalid", e.to_string()),
+                None => return Err(Done::Close),
+            }
+        };
+        let detail = escape_capped(detail.as_bytes(), DETAIL_CHARS);
+        let args = json!({
+            "method": method::SESSIONS_CREATE, "reason": reason, "detail": detail,
+            "client": who(client),
+        });
+        let data = refusal(reason, Some(detail), Vec::new());
+        Err(self
+            .refuse(Actor::Sallyd, "session.refuse", args, data)
+            .await)
+    }
+
     async fn create(&self, p: CreateParams, client: Client) -> Done {
+        let script = match self.script_of(&p, client).await {
+            Ok(s) => s,
+            Err(done) => return done,
+        };
         let env = Arc::clone(&self.p.env);
         let catalog = Arc::clone(&self.p.catalog);
         let loaded = blocking(move || load(&p.manifest, &env, &*catalog)).await;
@@ -231,7 +377,12 @@ impl<S: SessionSet> Control<S> {
             }
             None => return Done::Close,
         };
-        match self.p.sessions.start(Arc::new(validated.manifest)).await {
+        match self
+            .p
+            .sessions
+            .start(Arc::new(validated.manifest), script)
+            .await
+        {
             Ok(info) => Done::Ok(value(&session(&info))),
             // Its `sandbox.refuse` could not be written: no reply without an entry (Q93).
             Err(StartError::Launch(LaunchError::Unaudited { .. })) => Done::Close,
@@ -483,6 +634,7 @@ pub(crate) fn session(s: &SessionInfo) -> Session {
             SessionState::Running => WireState::Running,
             SessionState::StopFailed => WireState::StopFailed,
         },
+        model: s.model.clone(),
     }
 }
 

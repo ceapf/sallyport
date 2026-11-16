@@ -4,6 +4,7 @@ pub mod body;
 pub mod head;
 pub(crate) mod io;
 pub(crate) mod reply;
+pub mod scripted;
 pub mod server;
 
 #[cfg(test)]

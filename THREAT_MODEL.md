@@ -205,8 +205,18 @@ G5 Get a denied action executed
 ├─ Let it time out                                  [default deny → RT-AG-02]
 ├─ Call a control-plane method from the session socket
 │                                                   [separate sockets, separate method tables → RT-AG-06]
-└─ Call a tool the manifest doesn't grant           [tool allowlist → RT-AG-01]
+├─ Call a tool the manifest doesn't grant           [tool allowlist → RT-AG-01]
+├─ Answer a prompt from a driven session's own connection
+│                                                   [a seat connection is refused decide and watch → RT-DRV-04]
+└─ Pass a driven call off as the agent's, or run one past the gate
+                                                    [one gate, driver actor fixed at the recorder → RT-DRV-02]
 ```
+
+A **driven session** (`sessions.drive`) has no harness: its model is a script, which is untrusted
+data. It can only produce model output, the drive loop turns that into tool calls through the
+agent socket's own dispatch, and `sallyd` serves no `agent.sock` or `llm.sock` for it. Which
+connection drives is decided by where the call arrives (the control table), never by anything the
+caller or the script sends.
 
 ### G6. Tamper with evidence (A5)
 ```
@@ -276,6 +286,7 @@ G7 Make the machine unusable
 | User approves a correctly rendered bad action | Human-in-the-loop is the design | Better risk tags, dry-run previews (v2) |
 | Resource limits are **silently dropped** by Podman on cgroup v1 (WSL2 default) | Fixed on the dev machine with `cgroup_no_v1=all` in `.wslconfig`; other users may not have it | `sally doctor` fails (not warns) when `/sys/fs/cgroup` is not cgroup2 (a statfs test that agrees with `podman info`, PROBE_NOTES); `install.sh` prints the `.wslconfig` fix |
 | Secrets plaintext at rest (0600) | Same-UID attacker is out of scope | v2 OS keychain |
+| The driver seat is not a boundary against the host user (Task 12, architect Q121): the rule that a connection in the drive seat cannot decide an approval stops the driver from answering its own prompts, but any process of the same uid can open a second control connection and decide | `control.sock` trusts the user's own processes (SO_PEERCRED uid check); a driven session exists so that the user can watch a scripted run, and a prompt still names the exact canonical request | A separate approval channel for the UI bridge (M5) |
 | A signal from outside the terminal (SIGTERM, SIGHUP, SIGKILL) ends `sally secrets set` at its prompt with terminal echo still off (Task 12, Q112). Ctrl-C does not: at the prompt it is a cancel character, and every return restores the terminal and discards unread input | Restoring it on a signal needs a handler, hence `unsafe` or a new dependency; nothing was read with echo on, and the help names `stty echo` | — |
 | A secret value typed as an argument (`sally secrets set NAME VALUE`) is in shell history before `sally` runs | The CLI never takes a value from argv: it refuses the line, repeats no argument, and says to rotate the secret (maintainer ruling, Task 12) | — |
 | Whole audit chain can be rewritten by the user | Single-user machine | Paid tier: remote anchoring |

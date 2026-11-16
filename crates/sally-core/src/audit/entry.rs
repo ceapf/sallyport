@@ -33,6 +33,10 @@ pub enum Actor {
     Harness,
     /// The broker itself.
     Sallyd,
+    /// The host-side driver of a driven session (architect ruling Q118): what a harness's tool
+    /// call would be, made through `sessions.drive` instead. A driven session has no `harness`
+    /// entry.
+    Driver,
 }
 
 /// One audit line. Field order is the canonical serialization order.

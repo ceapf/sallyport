@@ -137,8 +137,9 @@ MUTANTS_WIDE_SALLYD := $(addprefix crates/sallyd/src/sandbox/,argv.rs check.rs t
                        hostaddrs.rs tunnel.rs net.rs ca.rs roots.rs rewrite.rs intercept.rs \
                        intercept_tls.rs intercept_report.rs meter.rs inject.rs redact.rs local.rs) \
                        $(addprefix crates/sallyd/src/rpc/,agent.rs control.rs control_methods.rs frame.rs \
-                       json.rs listen.rs mcp.rs message.rs rate.rs record.rs) \
-                       $(addprefix crates/sallyd/src/llm/,body.rs head.rs io.rs reply.rs server.rs) \
+                       json.rs listen.rs mcp.rs message.rs rate.rs record.rs drive.rs) \
+                       $(addprefix crates/sallyd/src/llm/,body.rs head.rs io.rs reply.rs scripted.rs \
+                       server.rs) \
                        $(addprefix crates/sallyd/src/approvals/,action.rs glob.rs handler.rs hub.rs \
                        policy.rs queue.rs render.rs) \
                        $(addprefix crates/sallyd/src/tools/,args.rs path.rs tag.rs fs.rs shell.rs procs.rs \
@@ -148,7 +149,7 @@ MUTANTS_WIDE_SHIM := $(addprefix crates/sally-shim/src/,args.rs relay.rs)
 # the approve loop, and the local commands (secrets, manifest/audit, doctor's decisions); its clap
 # definitions and main.rs are out. Its tests start no container (a fake daemon on a Unix socket).
 MUTANTS_WIDE_CLI := $(addprefix crates/sally-cli/src/,clean.rs client.rs commands.rs approve.rs \
-                    secrets.rs local.rs doctor.rs usage.rs)
+                    secrets.rs local.rs doctor.rs usage.rs drive.rs)
 MUTANTS_WIDE_TESTS_CORE :=
 MUTANTS_WIDE_TESTS_SALLYD := --lib --test=argv --test=scan
 MUTANTS_WIDE_TESTS_SHIM := --lib --test=relay
@@ -177,7 +178,7 @@ zizmor:
 # Fuzz smoke: 60 s per target (needs nightly + cargo-fuzz; CI pins both).
 FUZZ_TARGETS := manifest secrets audit_line egress_head egress_rewrite egress_redact \
                 jsonrpc_message llm_request tool_path tool_args proc_stat fetch_url cli_frame \
-                oci_config oci_facts
+                oci_config oci_facts model_script
 FUZZ_SECS ?= 60
 CARGO_FUZZ_TOOLCHAIN ?= +nightly
 fuzz:

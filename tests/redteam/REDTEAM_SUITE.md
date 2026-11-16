@@ -21,12 +21,12 @@ a tracked issue number and an expiry date in the skip reason; CI fails on expire
   fixtures allow `mock.test` → the mock's address through the egress proxy's constructor seams
   (resolver, dialer, host addresses: Task 8 decision 10); production wires the system resolver and
   TCP dialer once, and no test-only code path exists in `sallyd`.
-- **Malicious mock model** (`crates/sallyd/tests/common/mock_model.rs`, scripts in
-  `attacks/model_scripts/*.jsonl`): a `sallyd::llm::server::Backend` the test hands to the
-  `llm.sock` server's constructor; deterministic replies and tool-call sequences used by RT-AG
-  tests in CI. `sallyd` has no mock, no script parser and no switch for one (Task 7 ruling Q3).
-  When this harness crate needs it, it moves to a `publish = false` crate used only as a
-  dev-dependency.
+- **Malicious mock model** (`sallyd::llm::scripted`, scripts in `attacks/model_scripts/*.jsonl`):
+  the scripted model, a `sallyd::llm::server::Backend` the test hands to the `llm.sock` server's
+  constructor; deterministic replies and tool-call sequences used by RT-AG tests in CI. It is
+  production code (architect Q46, Q119 on R3): one strict parser, enabled only by the explicit
+  `model` param of `sessions.create`, which declares the session driven; there it is a turn
+  source for `sessions.drive`, never a model a harness talks to (RT-DRV).
 - Output: `target/redteam/results.md` table (ID, name, PASS/FAIL, evidence snippet) uploaded as a
   CI artifact and pasted into `docs/reports/M<n>.md`.
 
@@ -165,6 +165,19 @@ RT-SEC-12 and RT-SEC-07 over every form (`intercept.rs`), and RT-SEC-01 and 02
 | RT-AG-14 | Approvals beyond shell | `fetch` POST with a mount present; MCP tool call with `approve: always` | pending until approved; denied on timeout. Fetch: Task 10 at the gate; on the wire `rt_ag_14_fetch_…` (#75, ruling Q9: container-free in sallyd, the real gate, tools and proxy against a TLS mock upstream; nothing dialled or sent while pending, after a timeout or a deny; one request once approved; a reused approval sends nothing); from a real harness container: M4 e2e; MCP: M4 (#68) | CI | M1 / M4 |
 | RT-AG-15 | Nothing after stop | A session with a command running, a write waiting at the exec gate and a prompt pending; stop it | the stop answers `Stopped`; the command is killed (`tool.result` `killed: session-stop`), the write never begins (`outcome: aborted`), the prompt is withdrawn (`approval.withdraw session-stop`), all before `session.stop {in_flight: 0}`; no tool, approval or rpc entry of the session follows it; the file is unchanged and no process of the call is left. An `rpc.request` whose append is still running when the listener aborts its connection lands before `session.stop`, never after (#91); with `in_flight > 0` no `tool.result` follows `session.stop` either (the seal refuses it), and a panic during the stop is `session.crash` before it. A call sent while the stop waits in its first entry is denied `session-stopping` with no `tool.run` and no effect (step 1 closes the operations first) (architect Q59, Q63, Q67, Q68: `rt_ag_15_a_call_during_the_stop_…`, `rt_ag_15_an_operation_past_the_drain_…` and the other `rt_ag_15_…` tests in `crates/sallyd/tests/session.rs`; the seal is unit-tested in `rpc::record`, the parked write, a fetch in flight at the stop (`tool.result` `killed: session-stop`, its connection dropped; #75) and the withdraw in `tools::tests` and `approvals::queue_tests`, and the pending prompt joins the container test with #65) | CI | M1 |
 
+## DRV — driven sessions (Task 12, architect Q117–Q122 on the maintainer's R3)
+
+| ID | Name | Attack | PASS condition | CI/GPU | M |
+|---|---|---|---|---|---|
+| RT-DRV-01 | Driven session serves no socket | start a session declared driven (scripted model) and look for `agent.sock`, `llm.sock` and anything else under its harness socket directory | none exists; `session.start` names `model: {kind: scripted, driven: true, sha256, turns}`; an ordinary session has no drive handle. Control: the registry's driven branch that skips the bind (`rt_drv_01_…` in `crates/sallyd/tests/session/driven.rs`) | CI | M1 |
+| RT-DRV-02 | A driven call meets the same gate, and no entry is the agent's | script a shell call in an approve-mode session with no approver, then with one that approves from its own desk | denied `no-approver` and nothing ran; approved, it ran once; every entry of the session is `driver`, `sallyd` or `user`, none `harness` (`rpc.request`, `drive.turn` are `driver`). Control: the recorder's driven origin and the shared `Agent::drive_call` (`rt_drv_02_…` in `session/driven.rs`; unit tests in `rpc::agent_tests` and `rpc::record`) | CI | M1 |
+| RT-DRV-03 | Nothing of a drive after stop | stop a three-turn session while its first step waits on a prompt, holding the seat outside the step; then step that seat again, and drive the session over a control socket | the prompt is withdrawn before `session.stop`, the last entry of the session's audit handle (only teardown's `sandbox.*` follow, ARCHITECTURE §5.4); the step answers `denied: withdrawn` and the command did not run; the next step on the held seat is refused `session-stopping`; the control drive is `unknown-session`; no session entry follows `session.stop`. Control: the closed-operations check in `Seat::step`, and the seal (`rt_drv_03_…`) | CI | M1 |
+| RT-DRV-04 | The driver cannot answer an approval | on the connection that holds the drive seat: `approvals.decide` for a pending prompt of another session; `approvals.watch` | each refused `driver-seat` (`approval.decide` `refuse`, actor `user`, in the control log); the prompt stays pending and its action does not run; only the real approver is attached. Control: the seat check in `Control::run` (`rt_drv_04_…` in `rpc/control_drive_tests.rs`) | CI | M1 |
+| RT-DRV-05 | Drive refused on a non-driven session | `sessions.drive` for a live session that was not declared driven, and for an unknown one | `not-driven` and `unknown-session`; each a `session.refuse` in the control log; nothing written to the session; no tool effect. Control: the driven check in `Control::drive` (`rt_drv_05_…`) | CI | M1 |
+| RT-DRV-06 | One driver | a second connection drives a three-turn script while the first holds the seat; then after the first closed; a driver that closes while its step waits | `driver-busy`, then `driver-gone`; the script's cursor did not move; a connection that watches gets `driver-watching`; the waiting step is dropped (its prompt withdrawn) and the seat is gone, while a request pipelined behind a step does not drop it. Control: the seat claim (`rt_drv_06_…`) and the end-of-stream race on a drive in `Control::handle` | CI | M1 |
+| RT-DRV-07 | The caller cannot choose a call or its origin | `sessions.drive` carrying `name`, `arguments`, `tool_calls`, `actor` or `origin`; `sessions.drive` on the agent socket | `-32602` and nothing runs; `-32601` on the session socket's table. Control: `deny_unknown_fields` on the params and the separate method tables (`rt_drv_07_…`, `rt_ag_06_…`) | CI | M1 |
+| RT-DRV-08 | The script is data | a model with a non-scripted kind, `driven: false`, a duplicate key at any depth, an unknown shape, an extra key in a call, too many calls, a script over 256 KiB, a turn after a content or fail turn | `model-invalid`, `scripted-not-driven` or `script-invalid` (the last naming the turn); `session.refuse`; no container starts; the create's `rpc.request` holds the script's size and hash, never its text. Control: the strict parser, its caps and `Script::driven` (`rt_drv_08_…`; `llm::scripted` unit tests; fuzz target `model_script`) | CI | M1 |
+
 ## AUD — audit integrity
 
 | ID | Name | Attack | PASS condition | CI/GPU | M |
@@ -199,7 +212,7 @@ RT-SEC-12 and RT-SEC-07 over every form (`intercept.rs`), and RT-SEC-01 and 02
 
 ---
 
-### Count: 85 rows (RT-FS 18, NET 12, SEC 15, MDL 9, INF 5, AG 14, AUD 2, MAN 4, SUP 3, UI 3) — 68 of them land in M1 (in part or in full).
+### Count: 93 rows (RT-FS 18, NET 12, SEC 15, MDL 9, INF 5, AG 14, DRV 8, AUD 2, MAN 4, SUP 3, UI 3) — 76 of them land in M1 (in part or in full).
 
 Counted mechanically: every row of the category tables (not the old → new tables), by its
 milestone column. A lettered row counts as its own row: SEC 15 is RT-SEC-01..14 and RT-SEC-06b.

@@ -4,6 +4,7 @@
 pub mod agent;
 pub mod control;
 pub mod control_methods;
+pub mod drive;
 pub(crate) mod frame;
 pub(crate) mod json;
 pub mod listen;

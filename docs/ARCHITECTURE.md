@@ -513,7 +513,7 @@ peer to be its own uid (architect Q78), and it reads replies under the same 1 Mi
 | `jobs.list` / `jobs.cancel`; notification `job.progress` | long-running work |
 | `infer.load` (model) / `infer.unload` / `infer.status` | inference lifecycle |
 | `chat.complete` (session-less chat using the loaded model; same body as `infer.complete`) | Chat screen |
-| `sessions.create` (manifest text; task, model?: PR C) / `sessions.list` / `sessions.stop` (id) / `sessions.changes` (id) / `sessions.attach` | agent sessions |
+| `sessions.create` (manifest text; `model?: {kind: scripted, script, driven}`; task: PR C) / `sessions.list` / `sessions.stop` (id) / `sessions.changes` (id) / `sessions.drive` (id) / `sessions.attach` | agent sessions |
 | `ui.send` (session, text) — user → harness; notification `ui.message` — harness → user | chat with an agent |
 | `approvals.list` / `approvals.watch` / `approvals.decide` (id, approve\|deny\|deny_all_session, digest, full_shown?); notification `approval.requested` / `approval.flood` / `approval.closed` | gate |
 | `secrets.set` (name, value) / `secrets.list` (names only) / `secrets.remove` | store; values are write-only |
@@ -533,14 +533,16 @@ line adds the shell-history warning. `audit verify` exits 0 verified, 1 failed v
 unreadable (Q115). The `doctor.*`, `manifests.*`, `secrets.*` and `audit.*` methods above stay
 for the UI.
 
-Task 12 serves seven of them (`sally_proto::method::ALL`: `sessions.create`, `.list`, `.stop`,
-`.changes`, `approvals.list`, `.decide`, `.watch`); every other method is `-32601` and recorded
-`rpc.deny {socket: control}`, and no control method resolves on the session socket's table (a
-unit test holds that). Params are strict (unknown fields, `model`/`task` before PR C, a `client`
-in decide, a malformed session id: `-32602`). A request that is never admitted is recorded
-`rpc.deny`; an admitted one `rpc.request {socket, method, client: {uid, pid}}` before its effect
-(the uid and pid from `SO_PEERCRED`, audit detail only; a create adds `manifest_bytes` and
-`manifest_sha256`, never the text; a stop and a listing add the parsed `id`). A refused admitted
+Task 12 serves eight of them (`sally_proto::method::ALL`: `sessions.create`, `.list`, `.stop`,
+`.changes`, `.drive`, `approvals.list`, `.decide`, `.watch`); every other method is `-32601` and
+recorded `rpc.deny {socket: control}`, and no control method resolves on the session socket's
+table (a unit test holds that). Params are strict (unknown fields, a `model` other than the
+scripted one below, `task` before PR C, a `client` in decide, a malformed session id: `-32602`).
+A request that is never admitted is recorded `rpc.deny`; an admitted one
+`rpc.request {socket, method, client: {uid, pid}}` before its effect (the uid and pid from
+`SO_PEERCRED`, audit detail only; a create adds `manifest_bytes` and `manifest_sha256`, and with
+a model `script_bytes` and `script_sha256`, never the text; a stop, a listing and a drive add
+the parsed `id`). A refused admitted
 request is `-32000` with `data`
 `{reason, detail?, errors?}` (`sally_proto::ErrorData`):
 
@@ -553,6 +555,58 @@ request is `-32000` with `data`
   result is `start-failed` with its own `session.refuse` naming the session (architect Q98;
   TODO(#113): what such a task leaves behind). Any other start failure is `shutting-down` or
   `start-failed` with its own `session.refuse`.
+- `sessions.create` with a `model` (architect Q119): only `{kind: "scripted", script, driven:
+  true}` starts. `script` is JSON Lines text of at most 256 KiB (`sally_proto::MAX_SCRIPT_BYTES`;
+  `sallyd` opens no file), parsed whole before anything launches: each line is exactly one of
+  `{"content"}`, `{"tool_calls": [{name, arguments}]}` (at most 8 calls) or `{"fail": true}`;
+  at most 1024 turns and 64 KiB a line; a duplicate key at any depth, any other shape or an
+  extra key in a call is refused. A bad script is `script-invalid`, `driven: false` is
+  `scripted-not-driven` (TODO(#53): `llm.sock` serves no backend until Task 13), another kind is
+  `model-invalid`; each is a `session.refuse` and nothing starts. `session.start` carries
+  `model: {kind, driven, sha256, turns}` for a scripted session (`{kind: "none"}` otherwise) and
+  `sessions.list` shows it.
+- **Driven sessions** (`sessions.drive {id}`; architect Q117, Q120–Q122 on the maintainer's R3).
+  A session declared driven at start serves no `agent.sock` and no `llm.sock`: the harness has
+  no socket to reach it by, and its calls come from the script held by `sallyd`. The method
+  exists only in this table, takes the session id and nothing else, and one request runs one
+  scripted turn: its `drive.turn` entry first (`{turn, kind, calls}`, a message's size and
+  SHA-256, never the text), then the turn's calls one at a time through `Agent::drive_call`,
+  the front half of the agent socket's own dispatch: the same classifier, in-flight slot,
+  `rpc.request`, policy, approvals and audit entries. A step ends at the first call the
+  classifier refuses; a tool's own denial is a result, as to a model. The reply (`Step`:
+  `turn`, `kind`, `content`, `calls: [{name, result}]`, `done`) carries texts escaped and cut
+  by `sallyd` at named caps; `done` marks the end of the script, a message or a failure (a
+  driven script ends at its first message or failure: `sessions.create` refuses a turn after
+  one, `script-invalid`), or a call the classifier refused (that ends the step, not the script:
+  the next `sessions.drive` runs the next turn, and the refused turn's later calls never run).
+  Every
+  entry that would be the harness's is written as actor `driver` (the recorder's origin is
+  fixed where the registry picks the transport; nothing in a request, a script or a flag can
+  choose it), so a driven session's log holds no `harness` entry; entries whose actor is
+  `sallyd` or `user` keep it, and `session.start`'s model object marks the session.
+  The first `sessions.drive` of a session takes its **seat** for that connection, for the
+  session's life: another connection is `driver-busy`, and once the driver's connection has
+  closed the seat is `driver-gone` (the session is not stopped). A session that was not
+  declared driven is `not-driven`, an unknown one `unknown-session`, a step after the stop
+  began `session-stopping` (also when the stop seals the log under a call of the step); a
+  seat whose session stopped is let go at its connection's next request, which is then no
+  driver; a connection that watches cannot take the seat
+  (`driver-watching`). Each refusal is a `session.refuse` in the control log, and nothing is
+  written to the session's. A connection in the seat is refused `approvals.decide` (the
+  prompt stays pending; `approval.decide` `refuse`, reason `driver-seat`, actor `user`) and
+  `approvals.watch`: the driver is never an approver. This is not a boundary against the host
+  user: any process of the same uid may open a second connection and decide (THREAT_MODEL).
+  While a step runs, the connection's end of stream is watched, a half-close included (bytes
+  sent meanwhile are the next request and are kept; a close after them is seen at the next
+  read, so such a driver's prompt waits until it is decided or times out, a deny). When the
+  driver's connection closes mid-step (or shuts its write side) the step is dropped,
+  unanswered, and the seat is gone: the call in flight runs to its end with its entries, a
+  prompt it waits on is withdrawn (`Withdraw::Closed`), as on a closed `agent.sock`
+  connection, and the turn's later calls do not run. An entry being written when the step is
+  dropped is still written whole, so the log may show an `rpc.request` or `drive.turn` with no
+  call after it: it can over-report an attempt, never under-report an effect. No other method
+  is raced so.
+  TODO(#126): re-rule the transport once the Task 13 harness launcher lands.
 - `sessions.stop`: an unknown id is `unknown-session` (`session.refuse`); a container not
   confirmed gone is `stop-failed` (`session.refuse` in the control log: the session's own log
   is sealed by then).
@@ -585,6 +639,19 @@ text is over 256 KiB is sent `full_unavailable` and can only be denied (TODO(#10
 entry, and latches the session: every later prompt is denied `session-denied` unasked, while
 actions that need no approval still run. It cannot be undone. There is no "allow for this
 session". With no client attached, every prompt is denied `no-approver`.
+
+**Output neutralization** (AMENDMENTS-01 §6.4; architect Q50, Q100). Untrusted text a client
+prints (model output, tool output, file names, sandbox output) is shown as printable ASCII:
+printable ASCII stays as it is, `\` becomes `\\`, every other ASCII byte (`\t`, `\r`, other controls, DEL) and every byte
+that is not valid UTF-8 becomes `\xNN`, and every other character becomes `\u{…}`, so no ESC,
+CSI, OSC (OSC 52, OSC 8), C1 control (raw `0x9b` or U+009B) or bidirectional control (U+202E)
+reaches a terminal (`sally_core::text::escape`; the CLI's one-line form is `clean::line`). Line
+mode output keeps `\n` as well and nothing else (`sally_core::text::StreamEscaper`, one per
+stream): a character cut across two chunks is carried, at most 3 bytes, and escaped whole, so
+the output does not depend on where chunks end; bytes still carried when the stream ends are
+`\xNN`. `sally session drive` prints whole lines, never a stream, through `clean::line`, so a
+tool result cannot forge a `turn N: …` line. TODO(#130): readable non-ASCII text passed through
+on a terminal known to take it.
 
 ### 4.2 `agent.sock` — untrusted client (the harness). **Method table is a strict allowlist.**
 
@@ -737,8 +804,10 @@ on; the shim passes half-close on). The cost: a peer that disconnects during a w
 (non-streamed) completion is noticed only at the first write, so the backend runs on with
 nobody listening, bounded by the connection cap and the rate; the M3 backend must stop such a
 completion (#60). The backend is a constructor argument:
-until M3 none is wired in production (#53), and the scripted mock model exists only in the test
-tree.
+until M3 none is served in production (#53). The scripted model is `sallyd::llm::scripted`
+(architect Q46, Q119): one strict parser and a `Backend` over it, used by the llm server's tests
+and, as its turn source, by driven sessions (§4.1); only the explicit `model` param of
+`sessions.create` enables it, and it answers a driver, never a harness.
 
 ## 5. Data flows
 
@@ -1251,7 +1320,10 @@ sallyport/
     also `invalid-params`.
   - `rpc.request` on `control.sock` (actor `user`, no decision): `{socket: "control", method,
     client: {uid, pid}}`, before the request's effect; `sessions.create` adds `manifest_bytes`
-    and `manifest_sha256` (never the text); `sessions.stop` and `sessions.changes` add `id`.
+    and `manifest_sha256` (never the text), and with a model `script_bytes` and
+    `script_sha256`; `sessions.stop`, `sessions.changes` and `sessions.drive` add `id`.
+  - `drive.turn` (actor `driver`, decision `allow`, in the session's log): `{turn, kind, calls}`
+    and for a message `content_bytes`, `content_sha256`; written before the turn's first call.
   - `manifest.refuse` (actor `sallyd`, decision `refuse`): `{error}`, the validator's errors,
     escaped, at most 1024 characters; nothing is launched.
   - `session.refuse` (actor `sallyd`, decision `refuse`): `{method, id?, reason, detail?,
@@ -1335,7 +1407,7 @@ sallyport/
     action fields, `mode`, and `offset`, `len`, `size`, `bytes`, `sha256` (`fs_read`) or
     `entries`, `truncated`, `sha256` of the listing (`fs_list`), or `code`. Stricter than §4.3's
     old "audited at `audit.level: full`": `rpc.request` never carries the path.
-- **Audit entry**: `{seq, ts, session, actor: user|harness|sallyd, event, decision, args
+- **Audit entry**: `{seq, ts, session, actor: user|harness|sallyd|driver, event, decision, args
   (redacted, ≤ 4 KiB), args_sha256, prev_hash, hash}` with `hash = sha256(prev_hash ||
   canonical_json(entry_without_hash))`; canonical JSON is compact with the fields in that order
   and object keys sorted, and a reader rejects any line that is not byte-for-byte what the

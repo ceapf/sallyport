@@ -26,8 +26,18 @@ use serde_json::{Map, Value, json};
 
 mod common;
 use common::container::*;
-use common::mock_model::{Backed, MockModel, Turn};
 use common::{mount, mounts};
+use sallyd::llm::scripted::{Script, Scripted, Turn};
+
+/// `tests/redteam/attacks/model_scripts/<name>`, parsed whole; panics on a broken fixture.
+fn load_script(name: &str) -> Arc<Scripted> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/redteam/attacks/model_scripts")
+        .join(name);
+    let text = std::fs::read_to_string(path).unwrap();
+    let script = Script::parse(&text).unwrap_or_else(|e| panic!("{name}: {e}"));
+    Arc::new(Scripted::from_script(&script))
+}
 
 /// The harness's loopback port for `llm.sock` (ARCHITECTURE §2.1, the shim row).
 const LLM_PORT: u16 = 8080;
@@ -70,7 +80,7 @@ struct Harness {
     container: String,
     agent: Handle,
     llm: Handle,
-    model: Arc<MockModel>,
+    model: Arc<Scripted>,
 }
 
 /// Starts a harness container with `agent.sock` and `llm.sock` served.
@@ -89,12 +99,12 @@ async fn harness(x: &Lx, tag: &str, script: &str) -> Harness {
         uid,
         crash.clone(),
     );
-    let model = MockModel::load(script);
+    let model = load_script(script);
     let settings = Settings {
         model: "local-model".into(),
         context: 4096,
     };
-    let llm = Arc::new(Llm::new(Backed(Arc::clone(&model)), record, settings)).listen(
+    let llm = Arc::new(Llm::new(Arc::clone(&model), record, settings)).listen(
         bind(&sockets.join("llm.sock")).unwrap(),
         uid,
         crash,
@@ -336,7 +346,7 @@ fn rt_fs_10_llm_sock_serves_the_harness_through_the_shim() {
 #[test]
 fn mock_model_scripts_parse_strictly() {
     for name in ["hello.jsonl", "read_ssh_key.jsonl"] {
-        assert!(MockModel::load(name).left() > 0, "{name}");
+        assert!(load_script(name).left() > 0, "{name}");
     }
     assert_eq!(Turn::parse(r#"{"fail": true}"#), Ok(Turn::Fail));
     for bad in [

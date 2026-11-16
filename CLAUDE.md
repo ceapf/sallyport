@@ -87,19 +87,19 @@ container-free tests run: unit tests, all of sally-core's `tests/`, `sallyd` `ar
 - `make mutants` (deny paths): sally-core `manifest/validate/*.rs`, `manifest/paths.rs`,
   `manifest/host.rs`, `config.rs`.
 - `make mutants-wide-{core,sallyd,shim,cli}` (sharded): sally-core `manifest/{image,hostenv,parse,
-  summary,units}.rs`, `secrets/{store,secret}.rs`, `audit/{entry,redact,verify,writer,layout}.rs`,
-  `fsutil.rs`, `fd.rs`, `text.rs`; sallyd `sandbox/{argv,check,types,profiles,overlap,scan,images,
+  summary,units}.rs`, `secrets/{store,secret}.rs`, `audit/{entry,redact,verify,writer,layout,tail}.rs`,
+  `fsutil.rs`, `fd.rs`, `text.rs`, `paths.rs`; sallyd `sandbox/{argv,check,types,profiles,overlap,scan,images,
   changes,cgroup,dirs,podman,binaries,disk,stage,budget,orphans}.rs`, `sandbox/launch/error.rs`,
   `sandbox/oci/{mod,config,facts,intent,linux,mounts,process,seccomp}.rs`,
   `daemon/{mod,crash,startup,stale,install}.rs`,
   `oplog.rs`, `session/{lookup,types,exit}.rs`, `egress/{addr,authority,head,policy,server,
   hostaddrs,tunnel,net,ca,roots,rewrite,intercept,intercept_tls,intercept_report,meter,inject,
   redact,local}.rs` (net.rs tests stay hermetic: nothing leaves the machine),
-  `rpc/{agent,control,control_methods,frame,json,listen,mcp,message,rate,record}.rs`,
-  `llm/{body,head,io,reply,server}.rs`, `approvals/{action,glob,handler,hub,policy,queue,render}.rs`,
+  `rpc/{agent,control,control_methods,drive,frame,json,listen,mcp,message,rate,record}.rs`,
+  `llm/{body,head,io,reply,scripted,server}.rs`, `approvals/{action,glob,handler,hub,policy,queue,render}.rs`,
   `tools/{args,path,tag,fs,shell,procs,mod,dac,ops,fetch,fetch_url,fetch_client}.rs`; sally-shim
   `args.rs`, `relay.rs`; sally-cli `clean.rs`, `client.rs`, `commands.rs`, `approve.rs`,
-  `secrets.rs`, `local.rs`, `doctor.rs`, `usage.rs` (clap definitions and `main.rs` are out).
+  `secrets.rs`, `local.rs`, `doctor.rs`, `usage.rs`, `drive.rs` (clap definitions and `main.rs` are out).
 
 ## Agent / model routing (ECC)
 

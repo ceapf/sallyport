@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 use sally_cli::approve::{Tty, approve};
 use sally_cli::client::{Client, socket_path};
 use sally_cli::commands::{self, Out, failed};
-use sally_cli::{EXIT_FAILED, EXIT_OK, clean, doctor, local, secrets, usage};
+use sally_cli::{EXIT_FAILED, EXIT_OK, clean, doctor, drive, local, secrets, usage};
 use sally_core::paths::Paths;
 
 /// Talk to `sallyd`: start, list and stop sessions, see what they staged, answer approvals.
@@ -105,6 +105,15 @@ enum SessionCmd {
     Start {
         /// The manifest.
         manifest: PathBuf,
+        /// A model script (JSON Lines, at most 256 KiB): the session is driven by this
+        /// terminal's `session drive`, with no harness and no model socket.
+        #[arg(long)]
+        script: Option<PathBuf>,
+    },
+    /// Run a driven session's script to its end, one turn at a time.
+    Drive {
+        /// The session id.
+        id: String,
     },
     /// List the live sessions.
     List,
@@ -230,9 +239,10 @@ fn run_remote(cmd: Remote, paths: &Paths) -> u8 {
     };
     match (cmd, tty) {
         (Remote::Session(cmd), _) => match cmd {
-            SessionCmd::Start { manifest } => {
-                commands::session_start(&mut client, &manifest, &mut o)
+            SessionCmd::Start { manifest, script } => {
+                commands::session_start(&mut client, &manifest, script.as_deref(), &mut o)
             }
+            SessionCmd::Drive { id } => drive::session_drive(&mut client, &id, &mut o),
             SessionCmd::List => commands::session_list(&mut client, &mut o),
             SessionCmd::Stop { id } => commands::session_stop(&mut client, &id, &mut o),
             SessionCmd::Changes { id } => commands::session_changes(&mut client, &id, &mut o),

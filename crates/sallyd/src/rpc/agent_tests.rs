@@ -290,7 +290,7 @@ async fn rt_ag_06_control_methods_on_agent_sock_are_not_found() {
         "audit.tail",
         "audit.note",
     ]);
-    assert_eq!(methods.len(), 12);
+    assert_eq!(methods.len(), 13);
     for (i, m) in (0..).zip(methods.iter().copied()) {
         for msg in [
             req(i, m, json!({"name": "x", "value": "y"})),
@@ -933,4 +933,92 @@ fn error_messages_follow_their_codes() {
 fn logged_ids_are_escaped() {
     assert_eq!(logged_id(&Id::Num(-3)), json!(-3));
     assert_eq!(logged_id(&Id::Str("a\u{1b}".into())), json!("a\\x1b"));
+}
+
+fn driven_setup() -> (Arc<Agent<Arc<Fake>>>, Arc<Fake>, Arc<Sink>) {
+    let fake = Arc::new(Fake::default());
+    let (sink, rec) = recorder("sess-a");
+    let agent = Agent::new(Arc::clone(&fake), rec.driven());
+    (Arc::new(agent), fake, sink)
+}
+
+fn args() -> Map<String, Value> {
+    let mut a = Map::new();
+    a.insert("a".into(), json!(1));
+    a
+}
+
+#[tokio::test]
+async fn a_driven_call_takes_the_agents_path_and_is_the_drivers_entry() {
+    let (agent, fake, sink) = driven_setup();
+    let out = agent.drive_call("echo".into(), args()).await;
+    assert_eq!(
+        out,
+        Driven::Done(ToolOutcome {
+            is_error: false,
+            text: "ran echo".into()
+        })
+    );
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+    let rows = sink.rows();
+    let row = rows.iter().find(|r| r.event == "rpc.request").unwrap();
+    assert!(row.debug.contains("actor: Driver"), "{}", row.debug);
+    assert_eq!(row.args["tool"], "echo");
+    assert_eq!(row.args["argument_keys"], json!(["a"]));
+    assert!(!rows.iter().any(|r| r.debug.contains("actor: Harness")));
+}
+
+#[tokio::test]
+async fn a_driven_call_the_classifier_refuses_never_reaches_the_handler() {
+    let (agent, fake, sink) = driven_setup();
+    for name in [String::new(), "x".repeat(10_000)] {
+        assert_eq!(
+            agent.drive_call(name, Map::new()).await,
+            Driven::Denied("bad-params")
+        );
+    }
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(denies(&sink), ["bad-params", "bad-params"]);
+}
+
+#[tokio::test]
+async fn a_driven_call_whose_entry_fails_does_not_run() {
+    let (agent, fake, sink) = driven_setup();
+    sink.set_failing(true);
+    assert_eq!(
+        agent.drive_call("echo".into(), args()).await,
+        Driven::Unrecorded
+    );
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_handler_that_could_not_record_ends_the_driven_call_unrecorded() {
+    let (agent, _, _) = driven_setup();
+    assert_eq!(
+        agent.drive_call("unrecorded".into(), Map::new()).await,
+        Driven::Unrecorded
+    );
+}
+
+#[tokio::test]
+async fn a_dropped_driven_call_runs_to_its_end_and_its_prompt_is_withdrawn() {
+    let (agent, fake, _) = driven_setup();
+    let step = tokio::spawn({
+        let agent = Arc::clone(&agent);
+        async move { agent.drive_call("block".into(), Map::new()).await }
+    });
+    reach(&fake.calls, 1).await;
+    step.abort();
+    let _ = step.await;
+    let end = std::time::Instant::now() + Duration::from_secs(10);
+    while fake.withdrawn.lock().unwrap().is_empty() {
+        assert!(std::time::Instant::now() < end, "never withdrawn");
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(*fake.withdrawn.lock().unwrap(), [(101, Withdraw::Closed)]);
+    // The call itself was not dropped: it still runs to its end once released.
+    fake.release.notify_one();
+    reach(&fake.done, 1).await;
+    assert_eq!(fake.ended.load(Ordering::SeqCst), 1);
 }

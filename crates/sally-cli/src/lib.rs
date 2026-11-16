@@ -14,6 +14,7 @@ pub mod clean;
 pub mod client;
 pub mod commands;
 pub mod doctor;
+pub mod drive;
 pub mod local;
 pub mod secrets;
 pub mod usage;

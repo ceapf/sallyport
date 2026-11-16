@@ -13,9 +13,11 @@ use crate::approvals::action::{Action, Bound};
 use crate::approvals::policy::Policy;
 use crate::approvals::render::{ACTION_CHARS, FULL_WIRE_BYTES, NOTE_CHARS, Prompt};
 use crate::approvals::{Approver, Desk, Gate, Limits};
+use crate::llm::scripted::Script;
 use crate::rpc::control_methods::{
     DETAIL_CHARS, ID_CHARS, MAX_ERROR_LINES, REPLY_BYTES, error_lines, fit,
 };
+use crate::rpc::drive::Driver;
 use crate::rpc::testkit::{Row, Sink, recorder};
 use crate::sandbox::LaunchError;
 use crate::session::{SessionInfo, SessionState, StartError, StopOutcome};
@@ -34,6 +36,10 @@ struct Fake {
     /// What a stop of a listed session answers (`None`: stopped).
     stop_fails: StdMutex<Option<String>>,
     stopped: StdMutex<Vec<String>>,
+    /// The drive handles of the driven sessions among `live`.
+    drivers: StdMutex<std::collections::HashMap<String, Arc<Driver>>>,
+    /// The script each start was given (`None`: no model).
+    scripts: StdMutex<Vec<Option<Script>>>,
 }
 
 fn info(id: &str) -> SessionInfo {
@@ -42,10 +48,15 @@ fn info(id: &str) -> SessionInfo {
         manifest: "t".to_owned(),
         container: format!("sp-w-{id}"),
         state: SessionState::Running,
+        model: sally_proto::SessionModel::none(),
     }
 }
 
 impl SessionSet for Arc<Fake> {
+    fn driver(&self, id: &str) -> Option<Arc<Driver>> {
+        self.drivers.lock().unwrap().get(id).cloned()
+    }
+
     fn list(&self) -> Vec<SessionInfo> {
         self.live
             .lock()
@@ -65,7 +76,9 @@ impl SessionSet for Arc<Fake> {
     fn start(
         &self,
         manifest: Arc<ValidatedManifest>,
+        script: Option<Script>,
     ) -> impl Future<Output = Result<SessionInfo, StartError>> + Send {
+        self.scripts.lock().unwrap().push(script);
         let r = match self.start_err.lock().unwrap().take() {
             Some(e) => Err(e),
             None => {
@@ -329,9 +342,10 @@ async fn exchange(lines: &[&[u8]]) -> (Vec<Value>, Vec<Row>) {
     (replies, f.rows())
 }
 
-/// Architect Q72: exactly these seven, in this order, and the CLI's names are the same ones.
+/// Architect Q72, Q117: exactly these eight, in this order, and the CLI's names are the same
+/// ones.
 #[test]
-fn the_control_table_is_exactly_the_seven_methods() {
+fn the_control_table_is_exactly_the_eight_methods() {
     assert_eq!(
         CONTROL_METHODS,
         [
@@ -339,6 +353,7 @@ fn the_control_table_is_exactly_the_seven_methods() {
             "sessions.list",
             "sessions.stop",
             "sessions.changes",
+            "sessions.drive",
             "approvals.list",
             "approvals.decide",
             "approvals.watch",
@@ -360,6 +375,7 @@ fn every_method_parses_names_itself_and_only_reads_are_rated() {
     let params = [
         json!({"manifest": MANIFEST}),
         json!({}),
+        json!({"id": "s-1"}),
         json!({"id": "s-1"}),
         json!({"id": "s-1"}),
         json!({}),
@@ -424,7 +440,7 @@ fn only_a_create_records_the_manifest_size_and_hash() {
     let decide = Call::parse("approvals.decide", d).unwrap();
     assert!(decide.request_args().is_empty());
     // Architect Q95: a stop and a listing name their (parsed, canonical) session.
-    for m in ["sessions.stop", "sessions.changes"] {
+    for m in ["sessions.stop", "sessions.changes", "sessions.drive"] {
         let Value::Object(p) = json!({"id": "s-1"}) else {
             unreachable!()
         };
@@ -627,7 +643,8 @@ async fn sessions_list_records_the_request_then_lists() {
     let r = w.call("sessions.list", json!({})).await;
     assert_eq!(
         r["result"]["sessions"][1],
-        json!({"id": "s-1", "manifest": "t", "container": "sp-w-s-1", "state": "running"})
+        json!({"id": "s-1", "manifest": "t", "container": "sp-w-s-1", "state": "running",
+               "model": {"kind": "none", "driven": false}})
     );
     let rows = f.rows();
     assert_eq!(rows.len(), 1);
@@ -1367,3 +1384,6 @@ async fn reads_are_rated_daemon_wide() {
     other.ended().await;
     assert_eq!(f.rows().len(), rows);
 }
+
+#[path = "control_drive_tests.rs"]
+mod drive;

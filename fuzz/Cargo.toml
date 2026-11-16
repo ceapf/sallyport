@@ -126,6 +126,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "model_script"
+path = "fuzz_targets/model_script.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "cli_frame"
 path = "fuzz_targets/cli_frame.rs"
 test = false

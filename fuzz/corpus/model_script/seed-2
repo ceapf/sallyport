@@ -1,0 +1,3 @@
+{"content":"a","content":"b"}
+{"tool_calls":[{"name":"x","name":"y","arguments":{}}]}
+{"tool_calls":[{"name":"x","arguments":[]}]}
