@@ -581,7 +581,7 @@ fn rt_sec_07_a_target_written_after_the_release_holds_no_credential() {
         let r = session(&lx, "sec07r").await;
         let id = lx.paths("sec07r").id().as_str().to_owned();
         assert_eq!(lx.redactors.sessions(), std::slice::from_ref(&id));
-        lx.events.hold(&["egress.request"]);
+        let unhold = lx.events.held(&["egress.request"]);
         let sending = {
             let raw = get_req("mock.test", &format!("/echo-headers?t={}", gh()), "");
             let sock = lx.paths("sec07r").workspace_sockets().join("net.sock");
@@ -596,12 +596,21 @@ fn rt_sec_07_a_target_written_after_the_release_holds_no_credential() {
             })
         };
         lx.events.until_parked("egress.request", 1).await;
-        let done = lx.launcher.stop(r).await.unwrap();
-        lx.launcher
-            .close(done, sallyd::session::StopReason::Request)
-            .await;
+        // Bounded, so a stop that waited for the held append fails instead of hanging.
+        let bound = Duration::from_secs(60);
+        let done = tokio::time::timeout(bound, lx.launcher.stop(r))
+            .await
+            .expect("the stop waited for the held append")
+            .unwrap();
+        tokio::time::timeout(
+            bound,
+            lx.launcher
+                .close(done, sallyd::session::StopReason::Request),
+        )
+        .await
+        .expect("session.closed waited for the held append");
         assert!(lx.redactors.sessions().is_empty(), "the forms stayed");
-        lx.events.hold(&[]);
+        drop(unhold);
         let mut request = None;
         for _ in 0..200 {
             let all = lx.events.all();

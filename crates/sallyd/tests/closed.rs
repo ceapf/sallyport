@@ -153,16 +153,6 @@ fn rt_aud_03_a_failed_start_ends_with_session_closed() {
     });
 }
 
-/// Lifts every hold of the events when dropped, so a failed assertion never leaves an append
-/// parked for good (the runtime's drop would wait for it, and the test would hang).
-struct Unhold<'a>(&'a Events);
-
-impl Drop for Unhold<'_> {
-    fn drop(&mut self) {
-        self.0.hold(&[]);
-    }
-}
-
 /// Q250 (amending Q243's order): a session stays listed until its `session.closed` is written,
 /// so a shutdown and a stop asked while that append runs both wait for it, and both are then
 /// answered `Stopped`, with `session.closed` written once. Control: with the session removed
@@ -174,8 +164,7 @@ fn a_session_stays_listed_until_its_session_closed_is_written() {
         let x = Lx::new();
         let reg = registry(&x);
         let s = reg.start(Arc::new(x.f.load(""))).await.unwrap();
-        x.events.hold(&["session.closed"]);
-        let _unhold = Unhold(&x.events);
+        let _unhold = x.events.held(&["session.closed"]);
         let ask = |reg: &Arc<Registry>| {
             let (reg, id) = (Arc::clone(reg), s.id.clone());
             tokio::spawn(async move { reg.stop(&id, StopReason::Request).await })

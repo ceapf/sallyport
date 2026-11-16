@@ -32,14 +32,15 @@ use sally_core::manifest::AuditLevel;
 use crate::oplog::Oplog;
 use crate::sandbox::{AuditSink, SharedAudit};
 
-/// A proxy session's egress audit sink: each entry is redacted with that session's own forms
+/// The egress audit sink of a proxy session with secret grants (interception; without grants
+/// there are no forms): each entry is redacted with that session's own forms
 /// before it goes on to the audit log, which redacts it again with the live sessions' union
 /// (architect Q249). An egress entry can land after the session's `session.closed` and the
 /// release of its forms (an append aborted mid-write, a dropped body's report; Q251, #156);
 /// its sandbox-chosen text (`target`, `host`) is still redacted with the session's forms. The
 /// launcher wraps the session's sink right after its egress loaded the forms. Append-only:
 /// it swaps no redactor.
-pub struct SessionRedacted {
+pub(crate) struct SessionRedacted {
     inner: Arc<dyn AuditSink>,
     redactor: Redactor,
 }
@@ -47,7 +48,7 @@ pub struct SessionRedacted {
 impl SessionRedacted {
     /// `inner` with every entry redacted by `forms` first.
     #[must_use]
-    pub fn over(inner: Arc<dyn AuditSink>, forms: Arc<SessionForms>) -> Self {
+    pub(crate) fn over(inner: Arc<dyn AuditSink>, forms: Arc<SessionForms>) -> Self {
         Self {
             inner,
             redactor: Redactor::from_forms([forms]),

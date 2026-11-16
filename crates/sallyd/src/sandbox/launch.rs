@@ -206,10 +206,11 @@ impl Running {
 
 /// Proof that a workspace's stop succeeded: its container confirmed gone, its tunnels closed,
 /// its scratch removed and its claims released. Only [`Launcher::stop`] makes one, on its Ok
-/// path, and only [`Launcher::close`] takes it, so `session.closed` and the release of the
-/// session's forms follow a confirmed stop by construction (#94, architect Q252). No `Clone`
-/// and no public constructor.
+/// path, and only [`Launcher::close`] takes it, so a received session's `session.closed` and
+/// the release of its forms follow a confirmed stop by construction (#94, architect Q252). No
+/// `Clone` and no public constructor.
 #[derive(Debug)]
+#[must_use = "dropping it skips the session's `session.closed` and the release of its forms"]
 pub struct Confirmed {
     id: String,
     level: AuditLevel,
@@ -567,7 +568,7 @@ impl Launcher {
             if let Some(i) = &s.interception {
                 let forms = Arc::clone(i.credentials().redaction().forms());
                 redactors.register(&id, Arc::clone(&forms));
-                s.audit = Arc::new(SessionRedacted::over(Arc::clone(&s.audit), forms));
+                s.audit = Arc::new(SessionRedacted::over(s.audit, forms));
             }
             Ok(s)
         })

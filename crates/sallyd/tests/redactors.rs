@@ -86,7 +86,7 @@ fn a_stopped_sessions_secrets_stay_redacted_through_its_last_entries() {
         let reg = x.registry(x.events.clone() as Arc<dyn AuditSink>, Some(test_image()));
         let gh = canary("GITHUB_TOKEN");
         let a = reg.start(manifest(&x, ONE)).await.unwrap();
-        x.events.hold(&["sandbox.stop"]);
+        let _unhold = x.events.held(&["sandbox.stop"]);
         let stopping = {
             let (reg, id) = (Arc::clone(&reg), a.id.clone());
             tokio::spawn(async move { reg.stop(&id, StopReason::Request).await })
@@ -134,7 +134,7 @@ fn a_crash_reported_during_a_stop_is_logged_redacted() {
         let gh = canary("GITHUB_TOKEN");
         let a = reg.start(manifest(&x, ONE)).await.unwrap();
         let reporter = reg.reporter(&a.id).expect("a live session's reporter");
-        x.events.hold(&["sandbox.stop"]);
+        let _unhold = x.events.held(&["sandbox.stop"]);
         let stopping = {
             let (reg, id) = (Arc::clone(&reg), a.id.clone());
             tokio::spawn(async move { reg.stop(&id, StopReason::Request).await })
@@ -182,7 +182,7 @@ fn a_failed_start_releases_its_secrets_after_sandbox_stop() {
         let reg = x.registry(x.events.clone() as Arc<dyn AuditSink>, Some(test_image()));
         let gh = canary("GITHUB_TOKEN");
         x.events.fail(&["session.start"]);
-        x.events.hold(&["sandbox.stop"]);
+        let _unhold = x.events.held(&["sandbox.stop"]);
         let starting = {
             let (reg, m) = (Arc::clone(&reg), manifest(&x, ONE));
             tokio::spawn(async move { reg.start(m).await })
