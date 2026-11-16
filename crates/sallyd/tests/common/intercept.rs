@@ -1,6 +1,7 @@
 //! The rig of `tests/intercept.rs`: TLS over a session's `net.sock`, raw HTTP parsing, the
 //! canaries, and the checks RT-SEC-07 and RT-SEC-12 run.
 
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,11 +9,13 @@ use std::time::Duration;
 use rustls::RootCertStore;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use sallyd::egress::server::Dialer as _;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio_rustls::client::TlsStream;
 
 use super::container::Lx;
+use super::egress::tls_upstream;
 use super::forms::{Line, basic_blob, basic_forms, echo_body, echo_lines, forms_of};
 use crate::common;
 
@@ -49,11 +52,11 @@ pub(crate) async fn connect(sock: &Path, host: &str) -> UnixStream {
 }
 
 /// TLS over `s`, verifying the server for `name` against `root` alone.
-pub(crate) async fn tls(
-    s: UnixStream,
+pub(crate) async fn tls<S: AsyncRead + AsyncWrite + Unpin>(
+    s: S,
     name: &str,
     root: &CertificateDer<'static>,
-) -> std::io::Result<TlsStream<UnixStream>> {
+) -> std::io::Result<TlsStream<S>> {
     let mut roots = RootCertStore::empty();
     roots.add(root.clone()).unwrap();
     let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -71,7 +74,7 @@ pub(crate) async fn tls(
 }
 
 /// Sends `raw` and returns everything until the server closes.
-async fn exchange(t: &mut TlsStream<UnixStream>, raw: &str) -> String {
+async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(t: &mut TlsStream<S>, raw: &str) -> String {
     t.write_all(raw.as_bytes()).await.unwrap();
     let _ = t.shutdown().await;
     let mut out = Vec::new();
@@ -109,6 +112,21 @@ pub(crate) async fn over(lx: &Lx, tag: &str, host: &str, raw: &str) -> String {
         session_ca(lx, tag)
     };
     let mut t = tls(connect(&sock, host).await, host, &root)
+        .await
+        .unwrap_or_else(|e| panic!("{host}: {e}"));
+    exchange(&mut t, raw).await
+}
+
+/// What the mock upstream itself answers to `raw` for `host`, on a dial of the test's own that
+/// bypasses the proxy: the in-test proof of what the proxy was sent. The dial and the request are
+/// recorded like any other ([`Upstream::dials`], [`Upstream::seen`]).
+///
+/// [`Upstream::dials`]: super::egress::Upstream::dials
+/// [`Upstream::seen`]: super::egress::Upstream::seen
+pub(crate) async fn upstream_reply(lx: &Lx, host: &str, raw: &str) -> String {
+    let to = SocketAddr::new(tls_upstream(), 443);
+    let s = lx.egress.dialer.dial(to).await.unwrap();
+    let mut t = tls(s, host, &test_ca(lx))
         .await
         .unwrap_or_else(|e| panic!("{host}: {e}"));
     exchange(&mut t, raw).await

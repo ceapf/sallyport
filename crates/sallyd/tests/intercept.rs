@@ -22,7 +22,7 @@ use common::egress::tls_upstream;
 use common::forms::{ALPHABETS, PCTS, b64, basic_blob, basic_forms, core_range, forms_of, pct};
 use common::intercept::{
     allow_routes, body_and_length, check_echo_forms, connect, credential_in, filled, get_req, gh,
-    git, header_values, mock3, over, rendered, responses, session_ca, test_ca, tls,
+    git, header_values, mock3, over, rendered, responses, session_ca, test_ca, tls, upstream_reply,
 };
 use sallyd::sandbox::{Running, WorkspaceRequest};
 use serde_json::json;
@@ -519,7 +519,8 @@ fn rt_sec_06_an_echo_in_body_and_header_is_redacted_at_the_same_length() {
 /// RT-SEC-06b: compressed echoes. `Accept-Encoding` never reaches the grant host, so its echo
 /// comes back uncompressed and redacted; a response encoded anyway is refused with 502
 /// `upstream-encoded` and never forwarded (decision 1). Controls: `Accept-Encoding` in
-/// `rewrite::REQUEST_DROPPED`; the `Content-Encoding` check in `rewrite::response`.
+/// `rewrite::REQUEST_DROPPED`; the `Content-Encoding` check in `rewrite::response`. In-test
+/// control: the mock, asked directly, does send the encoded marker the 502 must not carry.
 #[test]
 fn rt_sec_06b_compression_is_stripped_and_an_encoded_echo_is_refused() {
     rt().block_on(async {
@@ -555,6 +556,12 @@ fn rt_sec_06b_compression_is_stripped_and_an_encoded_echo_is_refused() {
         assert!(encoded.starts_with("HTTP/1.1 502 "), "{encoded}");
         assert!(encoded.contains("upstream-encoded"), "{encoded}");
         assert!(!encoded.contains("GZIPPED"), "{encoded}");
+        // The control of the line above: asked around the proxy, the mock sends the marker.
+        let direct =
+            upstream_reply(&lx, "mock.test", &get_req("mock.test", "/echo-gzip", gzip)).await;
+        assert!(direct.starts_with("HTTP/1.1 200 OK"), "{direct}");
+        assert_eq!(header_values(&direct, "content-encoding"), ["gzip"]);
+        assert_eq!(body_and_length(&direct), ("GZIPPED", 7), "{direct}");
         lx.stop(r).await;
     });
 }
