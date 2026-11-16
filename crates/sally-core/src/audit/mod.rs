@@ -24,6 +24,7 @@
 //! chain (THREAT_MODEL, "whole audit chain can be rewritten by the user"). The directory is never
 //! mounted into a sandbox.
 
+mod declared;
 mod entry;
 mod layout;
 mod redact;
@@ -31,6 +32,7 @@ mod tail;
 mod verify;
 mod writer;
 
+pub use declared::Piece;
 pub use entry::{
     Actor, Entry, GENESIS_HASH, MAX_ARGS_BYTES, MAX_LINE_BYTES, VerifyErrorKind, parse_line,
 };

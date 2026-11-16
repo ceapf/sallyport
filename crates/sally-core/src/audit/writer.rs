@@ -15,11 +15,13 @@ use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use jiff::Timestamp;
 use rustix::fs::{FlockOperation, Mode, OFlags};
 use serde_json::{Value, json};
 
+use super::declared::{self, Declared, Piece, Shape};
 use super::entry::{
     Actor, Entry, GENESIS_HASH, MAX_ARGS_BYTES, MAX_LINE_BYTES, is_decision, is_event, is_session,
     parse_line, sha256_hex, truncation_marker,
@@ -28,6 +30,7 @@ use super::layout::{HEAD_FILE, HEAD_TMP, Head, LOCK_FILE, list_log_files, log_fi
 use super::redact::Redactor;
 use crate::fsutil::{FsIssue, check_private_dir};
 use crate::manifest::AuditLevel;
+use crate::text::Style;
 
 /// Source of time. Tests inject a fixed one.
 pub trait Clock: Send {
@@ -67,9 +70,11 @@ pub struct NewEntry {
     session: Option<String>,
     decision: Option<String>,
     args: Value,
+    texts: Vec<Declared>,
     detail: Detail,
 }
 
+/// `Debug` omits the declared texts as it omits the args: both are unredacted until written.
 impl std::fmt::Debug for NewEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NewEntry")
@@ -93,6 +98,7 @@ impl NewEntry {
             session: None,
             decision: None,
             args: Value::Null,
+            texts: Vec::new(),
             detail: Detail::Decision,
         }
     }
@@ -103,11 +109,71 @@ impl NewEntry {
         &self.event
     }
 
-    /// The arguments as given, **before redaction** (they are redacted when written). For audit
+    /// The arguments as given, **before redaction** (they are redacted when written). Declared
+    /// texts are not in them: [`Self::resolved`] gives the args as they are written. For audit
     /// sinks and tests; never log or display them (CLAUDE.md: no secret values in logs).
     #[must_use]
     pub fn arguments(&self) -> &Value {
         &self.args
+    }
+
+    /// The args as the writer writes them (architect Q290): each declared text masked whole by
+    /// `redactor`, then cut and escaped in its style and put under its key, then the whole
+    /// redacted by `redactor`. The writer calls it under its lock with the live sessions'
+    /// redactor; a test sink calls it with [`Redactor::default`] to record what a writer with no
+    /// secrets would write. A declared key wins over an arg of the same name, but the writer
+    /// refuses such an entry before this runs.
+    #[must_use]
+    pub fn resolved(&self, redactor: &Redactor) -> Value {
+        declared::resolve(&self.args, &self.texts, redactor)
+    }
+
+    /// Declares `raw`, text the sandbox chose, as the arg `key`, written in `style` once masked
+    /// (architect Q276, Q288).
+    #[must_use]
+    pub fn text(self, key: &'static str, raw: impl Into<Arc<str>>, style: Style) -> Self {
+        self.declare(key, raw.into(), style, None)
+    }
+
+    /// [`Self::text`], with the boolean arg `cut_key` saying whether the masked text was cut.
+    #[must_use]
+    pub fn text_and_cut(
+        self,
+        key: &'static str,
+        cut_key: &'static str,
+        raw: impl Into<Arc<str>>,
+        style: Style,
+    ) -> Self {
+        self.declare(key, raw.into(), style, Some(cut_key))
+    }
+
+    fn declare(
+        mut self,
+        key: &'static str,
+        raw: Arc<str>,
+        style: Style,
+        cut_key: Option<&'static str>,
+    ) -> Self {
+        self.texts.push(Declared {
+            key,
+            shape: Shape::Styled {
+                raw,
+                style,
+                cut_key,
+            },
+        });
+        self
+    }
+
+    /// Declares a composite text as the arg `key`: `pieces` assembled once each raw piece is
+    /// masked and escaped, then cut at `max` bytes ([`crate::text::cut_escaped`]).
+    #[must_use]
+    pub fn pieces(mut self, key: &'static str, pieces: Vec<Piece>, max: usize) -> Self {
+        self.texts.push(Declared {
+            key,
+            shape: Shape::Pieces { pieces, max },
+        });
+        self
     }
 
     /// The decision as given (`allow`, `deny`, …), if any.
@@ -140,10 +206,12 @@ impl NewEntry {
     /// The entry with its args redacted by `redactor` now ([`Redactor::redact_value`]), on top
     /// of the writer's own redaction when it is written: an entry that may be written after its
     /// session's forms left the writer's redactor carries its session's own redaction (architect
-    /// Q249).
+    /// Q249). Declared texts are masked too, but left uncut and unescaped: the writer still cuts
+    /// and escapes them after its own mask (architect Q276).
     #[must_use]
     pub fn redacted(mut self, redactor: &Redactor) -> Self {
         self.args = redactor.redact_value(&self.args);
+        self.texts = self.texts.iter().map(|d| d.masked(redactor)).collect();
         self
     }
 
@@ -164,6 +232,10 @@ impl NewEntry {
         }
         if self.decision.as_deref().is_some_and(|d| !is_decision(d)) {
             return bad("decision must be lowercase, at most 32 bytes");
+        }
+        // Fail closed (architect Q290): a declared text never silently replaces an arg.
+        if declared::collides(&self.args, &self.texts) {
+            return bad("a declared text's key is used twice, or the args are not an object");
         }
         Ok(())
     }
@@ -407,7 +479,7 @@ impl AuditWriter {
     }
 
     fn build_entry(&self, new: &NewEntry, now: Timestamp) -> Entry {
-        let redacted = self.redactor.redact_value(&new.args);
+        let redacted = new.resolved(&self.redactor);
         let full = serde_json::to_string(&redacted).unwrap_or_default();
         let args_sha256 = sha256_hex(full.as_bytes());
         let args = if full.len() > MAX_ARGS_BYTES {
