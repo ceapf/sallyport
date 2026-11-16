@@ -80,11 +80,51 @@ fn refusals(lx: &Lx, event: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// The allowed name the seam controls connect to.
+const ALLOWED: &str = "ok.mock.test";
+
+/// The control for a test whose fake resolver and dialer must see nothing of its attacks (#122,
+/// architect Q159), run first on session `r`: one allowed `CONNECT` is looked up once and
+/// dialled once through the same seams. Returns everything the seams have seen so far, which is
+/// all they may hold at the end of the test.
+async fn seams_see_an_allowed_connect(lx: &Lx, r: &Running) -> (Vec<String>, Vec<SocketAddr>) {
+    let (before_l, before_d) = (lx.egress.resolver.lookups(), lx.egress.dialer.dials());
+    lx.egress.resolver.set(ALLOWED, vec![vec![public(1)]]);
+    let got = tunnel(r, &format!("{}ping", connect(&format!("{ALLOWED}:443")))).await;
+    assert_eq!(status(&got), "200", "control: {got}");
+    let seen = (lx.egress.resolver.lookups(), lx.egress.dialer.dials());
+    let want = (
+        [before_l, vec![ALLOWED.to_owned()]].concat(),
+        [before_d, vec![SocketAddr::new(public(1), 443)]].concat(),
+    );
+    assert_eq!(seen, want, "control: the seams saw the allowed CONNECT");
+    seen
+}
+
+/// RT-NET-02's in-sandbox DNS control (analogue, #122, architect Q154): `nslookup` sends its
+/// query (a UDP listener on the sandbox's own loopback receives it) and `getent` answers from
+/// `/etc/hosts`; leaving `--network=none` out is forbidden by a hard rule.
+async fn resolvers_work_on_loopback(r: &Running) {
+    let (_, out) = exec(
+        r,
+        "(nc -u -l -p 5353 > /tmp/q &); sleep 0.5; timeout 3 nslookup ok.test 127.0.0.1:5353 \
+         >/dev/null 2>&1; test -s /tmp/q && echo query=sent; \
+         getent hosts localhost >/dev/null && echo getent=ok",
+    )
+    .await;
+    assert!(out.contains("query=sent"), "control: nslookup sends: {out}");
+    assert!(out.contains("getent=ok"), "control: getent answers: {out}");
+}
+
+/// RT-NET-02. Controls, asserted first: [`resolvers_work_on_loopback`] and
+/// [`seams_see_an_allowed_connect`].
 #[test]
 fn rt_net_02_a_denied_name_is_never_resolved_inside_or_by_the_host() {
     rt().block_on(async {
         let lx = Lx::new();
         let r = session(&lx, NET, "n02").await;
+        resolvers_work_on_loopback(&r).await;
+        let seen = seams_see_an_allowed_connect(&lx, &r).await;
         let canary = format!("c{:x}.attacker.test", std::process::id());
         // A name that exists fails too: the failure is the missing network, not NXDOMAIN.
         for cmd in [
@@ -100,8 +140,9 @@ fn rt_net_02_a_denied_name_is_never_resolved_inside_or_by_the_host() {
         let got = via_shim(&r, &connect(&format!("{canary}:443"))).await;
         assert_eq!(status(&got), "403", "{got}");
         assert!(got.ends_with("host-not-allowed\n"), "{got}");
-        assert!(
-            lx.egress.resolver.lookups().is_empty(),
+        assert_eq!(
+            lx.egress.resolver.lookups(),
+            seen.0,
             "the host looked a denied name up"
         );
         assert_eq!(
@@ -168,6 +209,7 @@ fn rt_net_03_a_host_off_the_list_is_refused_and_the_upstream_sees_nothing() {
     rt().block_on(async {
         let lx = Lx::new();
         let r = session(&lx, NET, "n03").await;
+        let seen = seams_see_an_allowed_connect(&lx, &r).await;
         let tls = via_shim(&r, &connect("example.org:443")).await;
         assert_eq!(status(&tls), "403", "{tls}");
         let plain = via_shim(
@@ -181,8 +223,8 @@ fn rt_net_03_a_host_off_the_list_is_refused_and_the_upstream_sees_nothing() {
         assert_eq!(denied[0]["reason"], json!("host-not-allowed"));
         assert_eq!(denied[0]["target"], json!("example.org:443"));
         assert_eq!(denied[1]["target"], json!("http://example.org/"));
-        assert!(lx.egress.dialer.dials().is_empty());
-        assert!(lx.egress.resolver.lookups().is_empty());
+        assert_eq!(lx.egress.dialer.dials(), seen.1);
+        assert_eq!(lx.egress.resolver.lookups(), seen.0);
         lx.stop(r).await;
     });
 }
@@ -192,12 +234,14 @@ fn rt_net_04_an_allowed_host_on_another_port_is_refused() {
     rt().block_on(async {
         let lx = Lx::new();
         let r = session(&lx, NET, "n04").await;
+        let seen = seams_see_an_allowed_connect(&lx, &r).await;
         for target in ["mock.test:22", "mock.test:8443", "a.mock.test:8443"] {
             let got = via_shim(&r, &connect(target)).await;
             assert_eq!(status(&got), "403", "{target}: {got}");
             assert!(got.ends_with("port-not-allowed\n"), "{target}: {got}");
         }
-        assert!(lx.egress.resolver.lookups().is_empty());
+        assert_eq!(lx.egress.resolver.lookups(), seen.0);
+        assert_eq!(lx.egress.dialer.dials(), seen.1);
         lx.stop(r).await;
     });
 }
@@ -207,6 +251,7 @@ fn rt_net_05_only_the_request_target_decides_and_ip_literals_are_refused() {
     rt().block_on(async {
         let lx = Lx::new();
         let r = session(&lx, NET, "n05").await;
+        seams_see_an_allowed_connect(&lx, &r).await;
         let one = Ipv4Addr::new(1, 1, 1, 1);
         let cases: Vec<(String, &str, &str)> = vec![
             (
@@ -240,6 +285,9 @@ fn rt_net_05_only_the_request_target_decides_and_ip_literals_are_refused() {
         let any = "network:\n  mode: proxy\n  acknowledge_unrestricted_egress: true\n  allow:\n    \
                    - host: \"*\"\n";
         let r = session(&lx, any, "n05any").await;
+        // The control's own entries are `egress.allow`, never `egress.deny`, so the deny list
+        // below is the attacks' alone; the seams' totals are the two controls'.
+        let seen = seams_see_an_allowed_connect(&lx, &r).await;
         let literals = [
             format!("{one}:443"),
             "16843009:443".to_owned(),
@@ -265,8 +313,8 @@ fn rt_net_05_only_the_request_target_decides_and_ip_literals_are_refused() {
         for d in denied.iter().skip(cases.len()) {
             assert_eq!(d["reason"], json!("ip-literal"), "{d}");
         }
-        assert!(lx.egress.resolver.lookups().is_empty());
-        assert!(lx.egress.dialer.dials().is_empty());
+        assert_eq!(lx.egress.resolver.lookups(), seen.0);
+        assert_eq!(lx.egress.dialer.dials(), seen.1);
         lx.stop(r).await;
     });
 }
@@ -301,6 +349,7 @@ fn rt_net_07_names_that_resolve_to_internal_or_own_addresses_are_refused() {
     rt().block_on(async {
         let lx = Lx::new();
         let r = session(&lx, NET, "n07").await;
+        let seen = seams_see_an_allowed_connect(&lx, &r).await;
         let names = &lx.egress.resolver;
         names.set("lo.mock.test", vec![vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]]);
         names.set(
@@ -332,7 +381,13 @@ fn rt_net_07_names_that_resolve_to_internal_or_own_addresses_are_refused() {
             assert_eq!(status(&got), "403", "{host}");
             assert!(got.ends_with("ip-range-denied\n"), "{host}");
         }
-        assert!(lx.egress.dialer.dials().is_empty());
+        // Each name was looked up once (the refusal comes after resolution) and none dialled.
+        let looked: Vec<String> = ["lo", "ten", "meta", "v6", "mix", "lan", "own"]
+            .iter()
+            .map(|h| format!("{h}.mock.test"))
+            .collect();
+        assert_eq!(names.lookups(), [seen.0.clone(), looked].concat());
+        assert_eq!(lx.egress.dialer.dials(), seen.1);
         // Rebinding: public on the first lookup, loopback on the second.
         names.set(
             "rebind.mock.test",
@@ -342,7 +397,8 @@ fn rt_net_07_names_that_resolve_to_internal_or_own_addresses_are_refused() {
         assert_eq!(status(&first), "200", "{first}");
         let second = via_shim(&r, &connect("rebind.mock.test:443")).await;
         assert_eq!(status(&second), "403", "{second}");
-        assert_eq!(lx.egress.dialer.dials(), [SocketAddr::new(public(2), 443)]);
+        let rebound = vec![SocketAddr::new(public(2), 443)];
+        assert_eq!(lx.egress.dialer.dials(), [seen.1, rebound].concat());
         lx.stop(r).await;
     });
 }
@@ -642,9 +698,13 @@ fn rt_net_10_replacing_the_shim_gains_nothing() {
              echo left=$(shims | wc -l); \
              (nc -l -p 3128 > /dev/null 2>/tmp/own-listener &); sleep 0.5; cat /tmp/own-listener; \
              grep -qsE ':0C38 0+:0000 0A' /proc/net/tcp /proc/net/tcp6 && echo own=listening; \
+             timeout 5 nc -w 2 127.0.0.1 3128 < /dev/null; echo loop=$?; \
              timeout 5 nc -w 2 1.1.1.1 443 < /dev/null; echo direct=$?",
         )
         .await;
+        // Control (analogue, #122, architect Q154): the same `nc` form reaches the sandbox's own
+        // listener on its loopback; leaving `--network=none` out is forbidden by a hard rule.
+        assert!(out.contains("loop=0"), "control: nc reaches its own listener: {out}");
         assert_eq!(code, 0, "{out}");
         // The listening shim is gone, and its port taken by our own listener, before anything is
         // sent to net.sock.
