@@ -28,16 +28,21 @@ use common::*;
 struct Cx {
     x: Lx,
     control: Arc<Control<Arc<Registry>>>,
+    /// The registry's operational log, and what it wrote.
+    oplog: sallyd::oplog::Oplog,
+    log: Lines,
 }
 
 fn cx() -> Cx {
     let x = Lx::new();
     let audit = x.events.clone() as Arc<dyn AuditSink>;
     let hub = Arc::new(Hub::default());
+    let log = Lines::default();
+    let oplog = sallyd::oplog::Oplog::new(log.clone());
     let reg = x.registry_hub(
         Arc::clone(&audit),
         Some(test_image()),
-        sallyd::oplog::Oplog::new(std::io::sink()),
+        oplog.clone(),
         Arc::clone(&hub),
     );
     let sessions_dir = open_sessions(&x.f.root.join("home/.local/share/sallyport")).unwrap();
@@ -50,7 +55,12 @@ fn cx() -> Cx {
         catalog: Arc::new(BTreeSet::<String>::new()),
         crash: sallyd::daemon::crash::CrashReporter::channel().0,
     }));
-    Cx { x, control }
+    Cx {
+        x,
+        control,
+        oplog,
+        log,
+    }
 }
 
 /// One control connection, as the peer `PEER`.

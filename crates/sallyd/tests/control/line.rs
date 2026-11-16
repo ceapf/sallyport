@@ -322,6 +322,67 @@ fn input_reaches_the_attached_command_and_eof_ends_it() {
     });
 }
 
+/// Maintainer Q202: an attached command's bytes reach the audit log and the operational log only
+/// as counts. A canary goes in through `sessions.input` (never argv, which is audited) and comes
+/// back on both streams; the control is that the client sees it on each. No audit entry and no
+/// oplog line carries it, and `sandbox.exec_result` counts every byte of it. The session runs at
+/// the default `audit.level`, full (architect Q223), and the test sink keeps every entry's
+/// arguments whatever the level, so no level could record more than is checked here.
+#[test]
+fn attached_bytes_reach_the_logs_only_as_counts() {
+    rt().block_on(async {
+        let c = cx();
+        let mut w = c.connect();
+        let (id, _) = create(&c, &mut w, "counts", false).await;
+        let canary = format!("sp-output-canary-{}", "q".repeat(24));
+        let argv = ["sh", "-c", "read l; echo \"$l\"; echo \"$l\" >&2"];
+        let n = w
+            .send("sessions.attach", json!({"id": id, "argv": argv}))
+            .await;
+        let input = w
+            .send(
+                "sessions.input",
+                json!({"id": id, "data": format!("{canary}\n"), "eof": true}),
+            )
+            .await;
+        let (ack, before) = w.until_reply(input).await;
+        assert_eq!(ack["result"], json!({}), "{ack}");
+        let (reply, after) = w.until_reply(n).await;
+        assert_eq!(reply["result"], json!({"exit_code": 0}), "{reply}");
+        let notes = [before, after].concat();
+        let line = format!("{canary}\n");
+        assert_eq!(
+            (joined(&notes, "stdout"), joined(&notes, "stderr")),
+            (line.clone(), line.clone()),
+            "control: the canary came back on both streams"
+        );
+        let result = until_entry(&c, "sandbox.exec_result", |_| true).await;
+        let args = c.x.events.all()[result].1.clone();
+        let len = line.len() as u64;
+        assert_eq!(
+            (
+                args["stdin_bytes"].as_u64(),
+                args["stdout_bytes"].as_u64(),
+                args["stderr_bytes"].as_u64()
+            ),
+            (Some(len), Some(len), Some(len)),
+            "{args}"
+        );
+        w.call("sessions.stop", json!({"id": id})).await;
+        let audited: Vec<String> =
+            c.x.events
+                .all()
+                .iter()
+                .map(|(e, a)| format!("{e} {a}"))
+                .filter(|t| t.contains(&canary))
+                .collect();
+        assert_eq!(audited, Vec::<String>::new());
+        assert!(c.oplog.flush(Duration::from_secs(10)), "the oplog drained");
+        let logged = c.log.text();
+        assert!(!logged.contains(&canary), "{logged}");
+    });
+}
+
 /// Q102 (a): a bound session whose connection ends before any attach stops `disconnect`, and
 /// its container is gone.
 #[test]

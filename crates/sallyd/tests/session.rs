@@ -968,20 +968,6 @@ fn rt_ag_15_a_call_during_the_stop_is_denied_before_anything_runs() {
     });
 }
 
-/// An oplog writer the test reads back.
-#[derive(Clone, Default)]
-struct Lines(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for Lines {
-    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(b);
-        Ok(b.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 /// Ruling 1 with `in_flight > 0` (Q63), and Q67. A write whose `tool.run` append is still
 /// running past the drain keeps the operation in flight: `session.stop {in_flight: 1}` follows
 /// that `tool.run`, the stop answers failed, the write aborts without touching the file, and its
