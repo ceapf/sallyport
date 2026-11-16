@@ -322,6 +322,14 @@ tests in `egress/intercept_tests.rs` where the behaviour matters to the proxy.
   answers and closes, behind the real `sally-shim` in a private network namespace (`unshare
   -rn`), 100 KiB request line: 21 of 200 replies empty. With a bounded drain after the reply
   (read until EOF, 256 KiB or 1 s): 0 of 200. The fix is the drain in `write_reply`.
+- #76 then fixed the shim itself: a failed write stops only its own direction, and after a failed
+  write toward the socket the shim discards the client's bytes until its end (bounded by the
+  linger). RT-NET-09 asserts the 431 for 20 MiB of headers through busybox `nc`: 13 of 13 runs.
+  Shutting the TCP read side instead of discarding would not do: after the shim's FIN, Linux
+  resets a client that sends on, and busybox `nc` dies on that failed write.
+- busybox `nc` does **not** exit on network EOF while its stdin is open; it runs until its input
+  ends. A test that times the server's close from inside the sandbox uses `sally-shim --stdio`,
+  which exits when the server closes. (RT-NET-09 slowloris, Q235)
 
 ## Test writing
 
