@@ -33,12 +33,11 @@ pub enum AuthorityError {
 /// the result must then be a canonical hostname by sally-core's rules (the ones manifests use),
 /// so the policy compares like with like.
 ///
-/// TODO(#160): the lower-cased host goes into every entry that names it, where a mixed-case
-/// form in a label no longer matches the session's forms (a documented residual, architect
-/// Q253; the raw target of a refusal is masked by [`audit_text`]).
-///
 /// # Errors
 /// [`AuthorityError`].
+// TODO(#160): the lower-cased host goes into every entry that names it, where a mixed-case form
+// in a label no longer matches the session's forms (a documented residual, architect Q253; the
+// raw target of a refusal is masked by `audit_text`).
 pub fn parse(target: &str) -> Result<Authority, AuthorityError> {
     let (host, port) = target.rsplit_once(':').ok_or(AuthorityError::Malformed)?;
     let port = parse_port(port).ok_or(AuthorityError::Malformed)?;
@@ -129,10 +128,13 @@ fn parse_port(s: &str) -> Option<u16> {
 /// Text the sandbox chose (a request-target, a method) for an audit entry. In this order: every
 /// secret form `forms` knows is masked in the whole of `raw`; the masked text is cut to its
 /// first [`LOGGED_TARGET_BYTES`] bytes; every byte outside printable ASCII, and `\` and `"`, is
-/// written as `\xNN`. Masking first means no cut or escape can split or rewrite a form before
-/// the redaction sees it (architect Q253). `forms` is `None` for a session without secret
-/// grants. Returns the text, the length of `raw` in bytes, and whether the masked text was cut.
+/// written as `\xNN`. Masking first means no cut or escape can split or rewrite a form of the
+/// session's secrets (architect Q253). `forms` is the session's own forms, `None` for a session
+/// without secret grants. Returns the text, the length of `raw` in bytes, and whether the masked
+/// text was cut.
 #[must_use]
+// TODO(#162): a form of another live session's secret is masked only by the writer's redactor,
+// after this cut, so one that straddles the cut leaves its prefix (architect Q254).
 pub fn audit_text(raw: &str, forms: Option<&Redactor>) -> (String, usize, bool) {
     let masked = forms.map_or(Cow::Borrowed(raw), |r| r.redact_str(raw));
     let bytes = masked.as_bytes();

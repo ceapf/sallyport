@@ -390,28 +390,32 @@ async fn a_form_across_the_cut_of_a_refused_connect_is_masked() {
     let target = straddling_connect();
     let got = rig.send(&connect(&target)).await;
     assert_eq!(got, reply(Reason::Malformed));
+    assert_eq!(rig.lookups(), 0);
     let args = rig.sink.args("egress.deny");
     let masked = target.replace(&value(0), "[REDACTED:T0]");
     assert_eq!(args["target"], json!(masked[..256]), "{args}");
     assert_eq!(args["target_bytes"], json!(target.len()));
     assert_eq!(args["target_cut"], json!(true));
     let v = value(0);
-    let run = v.as_bytes().windows(8).find(|w| {
-        args.to_string()
-            .contains(std::str::from_utf8(w).unwrap_or_default())
-    });
+    let run = v
+        .as_bytes()
+        .windows(8)
+        .find(|w| args.to_string().contains(std::str::from_utf8(w).unwrap()));
     assert!(run.is_none(), "{args}");
 }
 
-/// Architect Q253: a session without secret grants has no forms to mask; its targets are cut and
-/// escaped as before.
+/// The `None` branch's regression test, not a masking test (architect Q255): a session without
+/// secret grants has no forms, so a refused target is cut and escaped as before. The two bytes
+/// before the cut are escaped (`\` and `"`), the bytes after it are not shown.
 #[tokio::test]
-async fn a_session_without_grants_cuts_a_target_unmasked() {
+async fn a_session_without_grants_cuts_and_escapes_a_target() {
     let rig = Setup::default().rig();
-    let target = straddling_connect();
-    rig.send(&connect(&target)).await;
+    let target = format!("{}\\\"{}.test", "h".repeat(254), "z".repeat(60));
+    let got = rig.send(&connect(&target)).await;
+    assert_eq!(got, reply(Reason::Malformed));
     let args = rig.sink.args("egress.deny");
-    assert_eq!(args["target"], json!(target[..256]));
+    let want = format!(r"{}\x5c\x22", "h".repeat(254));
+    assert_eq!(args["target"], json!(want), "{args}");
     assert_eq!(args["target_bytes"], json!(target.len()));
     assert_eq!(args["target_cut"], json!(true));
 }

@@ -840,7 +840,8 @@ fn reply_response(reason: Reason) -> Response<Out> {
 
 /// Arguments of `egress.request` (Q34): `injected` lists the grants set on the request as
 /// `secret:NAME`, never a value (Task 9a-3, architect D9, D13). The method and target are the
-/// sandbox's text, masked with the session's forms before they are cut (architect Q253).
+/// sandbox's text, masked with the session's forms before they are cut (architect Q253). The
+/// method is cut to 256 bytes like the target, but the entry does not say it was (Q256).
 fn request_args(
     a: &Authority,
     method: &Method,

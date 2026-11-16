@@ -94,7 +94,9 @@ async fn a_form_across_the_cut_is_masked_in_a_limit_inside_the_tunnel() {
     assert_masked(&r, "egress.limit");
 }
 
-/// The entry of a body the client dropped is built by the same function as a complete one's.
+/// A path check (architect Q257): the entry of a body the client dropped, written from a
+/// detached task, carries the same masked target. Its control is `audit_text`'s call in
+/// `intercept_report.rs`, the one builder it shares with the complete case.
 #[tokio::test]
 async fn a_form_across_the_cut_is_masked_in_a_dropped_responses_entry() {
     let r = rig(Opts {
@@ -140,7 +142,28 @@ async fn a_form_across_the_cut_is_masked_in_a_dropped_responses_entry() {
     assert_masked(&r, "egress.response");
 }
 
-/// An extension method is the sandbox's text too.
+/// An extension method is the sandbox's text too: one across the cut is masked before it is
+/// cut (architect Q256). Token characters only, as a method must be.
+#[tokio::test]
+async fn a_form_across_the_cut_of_an_extension_method_is_masked() {
+    let r = ok_rig();
+    let pad = "M".repeat(LOGGED_TARGET_BYTES - value(0).len() / 2);
+    let method = format!("{pad}{}{}", value(0), "N".repeat(60));
+    assert!(method.len() > 300);
+    let raw = format!("{method} /m HTTP/1.1\r\nHost: {HOST}\r\n\r\n");
+    let out = r.talk(&raw).await;
+    assert!(out.starts_with("HTTP/1.1 200 "), "{out}");
+    let args = r.sink.args("egress.request");
+    let masked = method.replace(&value(0), "[REDACTED:T0]");
+    assert_eq!(
+        args["method"],
+        json!(masked[..LOGGED_TARGET_BYTES]),
+        "{args}"
+    );
+    assert!(!holds_a_run(&args.to_string()), "{args}");
+}
+
+/// A method shorter than the cut is masked whole.
 #[tokio::test]
 async fn a_form_as_the_method_is_masked() {
     let r = ok_rig();
