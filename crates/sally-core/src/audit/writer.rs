@@ -137,6 +137,16 @@ impl NewEntry {
         self
     }
 
+    /// The entry with its args redacted by `redactor` now ([`Redactor::redact_value`]), on top
+    /// of the writer's own redaction when it is written: an entry that may be written after its
+    /// session's forms left the writer's redactor carries its session's own redaction (architect
+    /// Q249).
+    #[must_use]
+    pub fn redacted(mut self, redactor: &Redactor) -> Self {
+        self.args = redactor.redact_value(&self.args);
+        self
+    }
+
     /// Marks the entry as decision-level or detail.
     #[must_use]
     pub const fn detail(mut self, detail: Detail) -> Self {
@@ -693,6 +703,35 @@ mod tests {
                 assert!(matches!(got, Err(AuditError::InvalidEntry(_))));
             }
         }
+    }
+
+    /// Architect Q249: `redacted` redacts the args as the writer's own redactor would (strings,
+    /// object keys, numbers), and changes nothing else of the entry.
+    #[test]
+    fn redacted_redacts_the_args_as_redact_value_does() {
+        let word = "plum7".repeat(5);
+        let digits = "1357924680".repeat(2);
+        let r = Redactor::new([("WORD", word.as_str()), ("DIGITS", digits.as_str())]);
+        let args = serde_json::json!({
+            "target": format!("/x?t={word}"),
+            word.clone(): "a key",
+            "n": digits.parse::<u128>().unwrap(),
+            "list": [format!("pre{word}post"), 3],
+        });
+        let e = NewEntry::new(Actor::Sallyd, "egress.request")
+            .session("s1")
+            .decision("allow")
+            .args(args.clone());
+        let before = format!("{e:?}");
+        let out = e.redacted(&r);
+        assert_eq!(out.arguments(), &r.redact_value(&args));
+        let text = out.arguments().to_string();
+        assert!(!text.contains(&word) && !text.contains(&digits), "{text}");
+        assert!(text.contains("[REDACTED:WORD]") && text.contains("[REDACTED:DIGITS]"));
+        assert_eq!(format!("{out:?}"), before, "only the args change");
+        // Control: an empty redactor leaves the args as they were.
+        let plain = NewEntry::new(Actor::Sallyd, "egress.request").args(args.clone());
+        assert_eq!(plain.redacted(&Redactor::default()).arguments(), &args);
     }
 
     #[test]

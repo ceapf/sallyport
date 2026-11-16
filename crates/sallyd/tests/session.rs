@@ -112,13 +112,23 @@ fn session_events(x: &Lx) -> Vec<String> {
         .collect()
 }
 
-fn stops(x: &Lx) -> Vec<String> {
+/// The reasons of the `entry` entries, in order.
+fn reasons(x: &Lx, entry: &str) -> Vec<String> {
     x.events
         .all()
         .into_iter()
-        .filter(|(e, _)| e == "session.stop")
+        .filter(|(e, _)| e == entry)
         .map(|(_, a)| a["reason"].as_str().unwrap().to_owned())
         .collect()
+}
+
+fn stops(x: &Lx) -> Vec<String> {
+    reasons(x, "session.stop")
+}
+
+/// The reasons of the `session.closed` entries (#94), in order.
+fn closes(x: &Lx) -> Vec<String> {
+    reasons(x, "session.closed")
 }
 
 async fn until(what: &str, limit: Duration, mut f: impl FnMut() -> bool) {
@@ -179,10 +189,12 @@ fn a_session_starts_in_order_and_stops_once_on_request() {
                 "sandbox.launch",
                 "session.start",
                 "session.stop",
-                "sandbox.stop"
+                "sandbox.stop",
+                "session.closed"
             ]
         );
         assert_eq!(stops(&r.x), ["request"]);
+        assert_eq!(closes(&r.x), ["request"]);
     });
 }
 
@@ -202,9 +214,15 @@ fn an_unaudited_session_start_binds_nothing_and_stops_the_workspace() {
         assert!(r.reg.list().is_empty());
         assert_eq!(
             session_events(&r.x),
-            ["sandbox.launch", "session.stop", "sandbox.stop"]
+            [
+                "sandbox.launch",
+                "session.stop",
+                "sandbox.stop",
+                "session.closed"
+            ]
         );
         assert_eq!(stops(&r.x), ["start-failed"]);
+        assert_eq!(closes(&r.x), ["start-failed"]);
         // The fixture's own match: scope `…-1` never matches `…-18`, a test running beside
         // this one.
         assert!(!r.x.listed(), "a container of this test is left");
@@ -214,7 +232,9 @@ fn an_unaudited_session_start_binds_nothing_and_stops_the_workspace() {
 /// Rust review HIGH: the workspace of a failed start that cannot be confirmed gone is not left to
 /// an untracked retry loop. It stays listed as stop-failed (with no desk: its session never
 /// started); a stop request retries it, and shutdown counts it while it still fails and clears
-/// it once it stops.
+/// it once it stops. Its `session.closed` (`start-failed`) is written only then (#94, Q245).
+/// Here the stop fails after removal (the `sandbox.stop` append), which is reported as not
+/// confirmed gone (TODO(#157)); `tests/closed.rs` covers a container that really stays.
 #[test]
 fn a_failed_starts_workspace_not_confirmed_gone_stays_listed_and_is_retried() {
     rt().block_on(async {
@@ -234,14 +254,23 @@ fn a_failed_starts_workspace_not_confirmed_gone_stays_listed_and_is_retried() {
             Some(StopOutcome::Failed(_))
         ));
         assert_eq!(r.reg.shutdown().await, std::slice::from_ref(&id));
-        r.x.events.fail(&[]);
-        assert!(r.reg.shutdown().await.is_empty());
-        assert!(r.reg.list().is_empty());
+        // Stop-failed: no `session.closed` yet, at the request or at shutdown (#94, Q246).
         assert!(
             !session_events(&r.x)
                 .iter()
                 .any(|e| e.starts_with("session."))
         );
+        r.x.events.fail(&[]);
+        assert!(r.reg.shutdown().await.is_empty());
+        assert!(r.reg.list().is_empty());
+        // Once its stop succeeded: `session.closed` once, last, its only session entry (Q245).
+        let session: Vec<String> = session_events(&r.x)
+            .into_iter()
+            .filter(|e| e.starts_with("session."))
+            .collect();
+        assert_eq!(session, ["session.closed"]);
+        assert_eq!(r.x.events.list().last().unwrap(), "session.closed");
+        assert_eq!(closes(&r.x), ["start-failed"]);
     });
 }
 
@@ -285,10 +314,12 @@ fn a_bind_failure_ends_the_session_start_failed() {
                 "sandbox.launch",
                 "session.start",
                 "session.stop",
-                "sandbox.stop"
+                "sandbox.stop",
+                "session.closed"
             ]
         );
         assert_eq!(stops(&r.x), ["start-failed"]);
+        assert_eq!(closes(&r.x), ["start-failed"]);
     });
 }
 
@@ -696,9 +727,12 @@ fn rt_ag_15_nothing_of_a_session_follows_its_stop() {
             .expect("the command's tool.result");
         assert!(result < stop, "{all:#?}");
         assert_eq!(all[result].1["killed"], "session-stop");
+        // Only the teardown's `sandbox.*` follow, then `session.closed` once, last (#94).
         let after: Vec<&String> = all[stop + 1..].iter().map(|(e, _)| e).collect();
+        let (closed, teardown) = after.split_last().expect("entries after session.stop");
+        assert_eq!(*closed, "session.closed", "{after:?}");
         assert!(
-            after.iter().all(|e| e.starts_with("sandbox.")),
+            teardown.iter().all(|e| e.starts_with("sandbox.")),
             "entries after session.stop: {after:?}"
         );
         assert!(!exists(&s.container));
@@ -1046,6 +1080,8 @@ fn rt_ag_15_an_operation_past_the_drain_and_a_panic_during_the_stop_end_before_s
         // Past the drain (5 s): the operation is still in flight, its entry still being written.
         tokio::time::sleep(Duration::from_secs(6)).await;
         assert!(!x.events.list().contains(&"session.stop".to_owned()));
+        // In flight: no `session.closed` until the later stop succeeds (#94, Q246).
+        assert!(!x.events.list().contains(&"session.closed".to_owned()));
         x.events.hold(&[]);
         let outcome = stopping.await.unwrap();
         assert!(
@@ -1056,7 +1092,14 @@ fn rt_ag_15_an_operation_past_the_drain_and_a_panic_during_the_stop_end_before_s
             !exists(&s.container)
         })
         .await;
+        // Then exactly one `session.closed`, with the stop's reason, last.
+        until("session.closed", Duration::from_secs(60), || {
+            x.events.list().contains(&"session.closed".to_owned())
+        })
+        .await;
         let all = x.events.all();
+        assert_eq!(closes(&x), ["request"]);
+        assert_eq!(all.last().unwrap().0, "session.closed", "{all:#?}");
         let (stop_at, after) = after_stop(&x);
         assert!(after.is_empty(), "after session.stop: {after:?}");
         assert_eq!(all[stop_at].1["in_flight"], 1, "{all:#?}");

@@ -206,7 +206,7 @@ fn texts(v: &serde_json::Value, out: &mut Vec<String>) {
 }
 
 /// The first credential RT-SEC-07's search finds in one audit entry, if any: the raw canaries
-/// and `CANARY` in the entry's JSON text; `CANARY` and every one of `forms` in every decoded
+/// (`HOST_TOKEN`'s lower-case one too) and `CANARY` in the entry's JSON text; `CANARY` and every one of `forms` in every decoded
 /// string, key and number (so JSON escaping cannot hide one). The control and the absence
 /// check run this one function.
 pub(crate) fn credential_in(
@@ -215,7 +215,9 @@ pub(crate) fn credential_in(
     forms: &[String],
 ) -> Option<String> {
     let text = args.to_string();
-    if text.contains(&gh()) || text.contains(&mock3()) || text.contains("CANARY") {
+    let raw = [gh(), mock3(), common::egress::canary("HOST_TOKEN")];
+    let found = raw.iter().any(|c| text.contains(c.as_str()));
+    if found || text.contains("CANARY") {
         return Some(format!("{event}: {text}"));
     }
     let mut decoded = vec![event.to_owned()];

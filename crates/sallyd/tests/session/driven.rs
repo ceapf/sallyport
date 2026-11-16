@@ -319,7 +319,8 @@ fn rt_drv_03_a_driven_call_past_the_drain_writes_nothing_after_the_stop() {
 
 /// A stop while a step waits on a prompt: the prompt is withdrawn, the step is answered
 /// `denied: withdrawn`, `session.stop` is the last entry of the session's audit handle (only
-/// teardown's `sandbox.*`, written by the launcher, may follow; ARCHITECTURE §5.4), a step on the
+/// teardown's `sandbox.*` and then `session.closed`, written by the launcher, may follow;
+/// ARCHITECTURE §5.4), a step on the
 /// same seat afterwards is refused and writes nothing, and a drive over the control socket finds
 /// no session.
 #[test]

@@ -566,6 +566,93 @@ fn rt_sec_06b_compression_is_stripped_and_an_encoded_echo_is_refused() {
     });
 }
 
+/// `mock.test` (a `GITHUB_TOKEN` grant), `mock3.test` (a `HOST_TOKEN` grant) and any host
+/// under `*.mock.test` (allowed, no grant, so spliced: a grant host must be exact; architect
+/// Q279).
+const HOST_MANIFEST: &str = "network:\n  mode: proxy\n  allow:\n    - host: mock.test\n    \
+                             - host: mock3.test\n    - host: \"*.mock.test\"\n\
+                             secrets:\n  - name: GITHUB_TOKEN\n    inject: {host: mock.test, \
+                             header: Authorization, format: \"Bearer {value}\"}\n  \
+                             - name: HOST_TOKEN\n    inject: {host: mock3.test, \
+                             header: X-Api-Key, format: \"{value}\"}\n";
+
+/// RT-SEC-07, after the release (#94, architect Q249, Q266, Q279): a sandbox that knows a
+/// granted value (here it is simply given it) opens a tunnel to `<value>.mock.test`, a host the
+/// wildcard rule allows, so the value stands in the CONNECT host, which `sallyd` logs as the
+/// sandbox sent it, lower-cased, and does not mask before the sink (#160). The session stops
+/// with the tunnel open; its `egress.close` append is held until the stop is done,
+/// `session.closed` is written and the session's forms have left the logs' redactors. When it
+/// lands, after `session.closed`, its `host` is `[REDACTED:HOST_TOKEN].mock.test`, and the
+/// value is nowhere in it, because the session's egress sink redacts with the session's own
+/// forms. Only the raw form can stand in a host (a lower-case DNS label); this test proves
+/// nothing about the other forms. The test sink never redacts, so the per-session redaction is
+/// the only one it shows; `egress.allow`, written while the session is live, is checked too,
+/// as an extra. Control (hand-checked once, uncommitted): the launcher passing the session's
+/// unwrapped sink to its egress fails it, the raw value in the host.
+#[test]
+fn rt_sec_07_an_entry_written_after_the_release_holds_no_credential_in_its_host() {
+    rt().block_on(async {
+        let lx = Lx::new();
+        let r = session_of(&lx, "sec07h", HOST_MANIFEST).await;
+        let id = lx.paths("sec07h").id().as_str().to_owned();
+        assert_eq!(lx.redactors.sessions(), std::slice::from_ref(&id));
+        let value = common::egress::canary("HOST_TOKEN");
+        let host = format!("{value}.mock.test");
+        lx.egress.resolver.set(&host, vec![vec![tls_upstream()]]);
+        let sock = lx.paths("sec07h").workspace_sockets().join("net.sock");
+        // Held before the tunnel exists, so it cannot close unheld in between.
+        let unhold = lx.events.held(&["egress.close"]);
+        let tunnel = connect(&sock, &host).await;
+        // Bounded, so a stop that waited for the held append fails instead of hanging.
+        let bound = Duration::from_secs(60);
+        let done = tokio::time::timeout(bound, lx.launcher.stop(r))
+            .await
+            .expect("the stop waited for the held append")
+            .unwrap();
+        lx.events.until_parked("egress.close", 1).await;
+        tokio::time::timeout(
+            bound,
+            lx.launcher
+                .close(done, sallyd::session::StopReason::Request),
+        )
+        .await
+        .expect("session.closed waited for the held append");
+        assert!(lx.redactors.sessions().is_empty(), "the forms stayed");
+        drop(unhold);
+        let mut close = None;
+        for _ in 0..200 {
+            let all = lx.events.all();
+            let closed = all.iter().position(|(e, _)| e == "session.closed");
+            let late = all.iter().position(|(e, _)| e == "egress.close");
+            if let (Some(c), Some(q)) = (closed, late) {
+                assert!(c < q, "control: the close landed before the release");
+                close = Some(all[q].1.clone());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let close = close.expect("the held egress.close landed");
+        let allow = lx
+            .events
+            .all()
+            .into_iter()
+            .find(|(e, a)| e == "egress.allow" && a["intercept"] == json!(false))
+            .expect("the tunnel's egress.allow")
+            .1;
+        for (event, entry) in [("egress.close", &close), ("egress.allow", &allow)] {
+            assert_eq!(
+                entry["host"],
+                json!("[REDACTED:HOST_TOKEN].mock.test"),
+                "{event}: {entry}"
+            );
+            assert!(!entry.to_string().contains(&value), "{event}: {entry}");
+            let found = credential_in(event, entry, &forms_of(&value));
+            assert!(found.is_none(), "{found:?}");
+        }
+        drop(tunnel);
+    });
+}
+
 /// RT-SEC-07: after injected and echoed exchanges on every grant host (`Bearer`, a bare value,
 /// three `{basic}` grants, the encoded echoes of `/echo-forms`), no audit entry holds any form
 /// of any canary (each independently computed: raw, percent, base64 cores, rendered values,

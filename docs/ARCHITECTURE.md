@@ -465,7 +465,8 @@ and confirms the container is gone (`podman container exists`). If it is not gon
 keeps its claims and the caller gets the handle back to retry. Otherwise teardown removes
 `git/` and `profiles/` through `podman unshare` (overlay work directories belong to the
 container's user namespace), removes the socket directory, keeps `stage/`, and releases the
-overlap claims.
+overlap claims. After a teardown that succeeded, the registry writes the session's last entry,
+`session.closed`, through `Launcher::close` (§5.4, #94).
 
 **Hermetic podman** (#11). Every podman process gets a cleared environment plus
 `HOME=<data>/podman/home` (empty, never the user's home), the host's `XDG_RUNTIME_DIR`,
@@ -998,7 +999,8 @@ The session registry (`sallyd::session`, Task 12, architect Q57) owns every live
 **Start**, in this order:
 1. `launch_workspace` (§3.5): the image, the overlap claims and fd budget reserved,
    `sandbox.launch` audited, the workspace container started. A failed launch is the
-   launcher's `sandbox.refuse` only, with no `session.start` and no `session.stop`.
+   launcher's `sandbox.refuse` only, with no `session.start`, `session.stop` or
+   `session.closed`.
 2. The container's init is watched for exit.
 3. Approvals, tools and the agent server are built in memory.
 4. Audit `session.start` (`model: {kind: "none"}` until a session can have a model).
@@ -1006,7 +1008,8 @@ The session registry (`sallyd::session`, Task 12, architect Q57) owns every live
 
 A failed `session.start` append binds nothing and stops the workspace. Any failure after it
 ends the session with reason `start-failed`. Every `session.start` gets exactly one
-`session.stop`.
+`session.stop`. Every workspace the registry received gets exactly one `session.closed` once
+its stop is confirmed, including one whose session never started (`start-failed`, Q245).
 
 TODO(#28): the harness container and `llm.sock` (Task 13, Task 12 PR C).
 
@@ -1056,15 +1059,36 @@ further effect):
    no effect and no reply. A refused write is an oplog line naming only the session and the
    event. `session.stop` has no other writer (the best-effort `start-failed` one included).
 7. `Launcher::stop`, retried up to 3 times.
+8. Once it succeeded (the container confirmed gone, its tunnels closed, the session released;
+   `Launcher::stop` returns a `Confirmed` token, Q252): `session.closed {reason}`, actor
+   `sallyd`, the session's last entry (#94, Q242, Q245), then the session's secrets leave the
+   logs' redactors (`Launcher::close`, which takes the token, Q219). Only then does the session
+   leave the live set and are the stops answered, so a shutdown asking meanwhile waits for its
+   `session.closed` (Q250).
 
 So after `session.stop` nothing agent-originated of the session is written: no `tool.*`,
 `approval.*` or `rpc.*` entry, whatever its `in_flight`. `sandbox.exec` and
 `sandbox.exec_result` are entries of the session's handle too, so they never follow
-`session.stop` either (Q146). Teardown entries may follow it:
-`sandbox.*` (`sandbox.stop` always does), the watchdog's (`session.resource_limit`,
-`session.kill_failed`) and egress closes (#95). TODO(#94): a final `session.closed`, written
-once teardown has finished, becomes the last entry of a session. A panic reported after the
-seal is an oplog line only.
+`session.stop` either (Q146). Teardown entries follow it: `sandbox.*` (`sandbox.stop` always
+does), the watchdog's (`session.resource_limit`, `session.kill_failed`) and egress closes (#95,
+`session-stopped` for a tunnel still open). `session.closed` follows them, and nothing of the
+session follows it (RT-AUD-03), except entries of the egress and watchdog writers still
+outstanding at teardown (Q244, Q251, TODO(#156)): (i) an append whose task was aborted while it
+waited for or ran its blocking write (`EgressHandle::shutdown` aborts after its grace without
+awaiting; the handle's and the watchdog's drop do the same); (ii) an `egress.response` started
+from a body's drop on a detached blocking task, when the abort drops the body or the client
+abandons it within the grace (#72). Such an entry holds the sandbox's own request text (host,
+target), redacted with the session's own forms whenever it lands (the session's egress sink
+redacts each entry with them, Q249; RT-SEC-07), plus counts and secret names; watchdog entries
+hold no sandbox text. A panic reported after the seal is an oplog line only.
+
+A session with no `session.closed` is one whose teardown did not complete, or whose
+`session.closed` append was refused; the oplog names the latter (an error line naming only the
+session and the event), and the stop still answers stopped, since the session is already
+removed and released (Q243). A stop-failed session has none until a later stop succeeds, nor
+does a shutdown that cannot confirm its container gone. A stop that failed only after the
+container was removed (the `sandbox.stop` append, the scratch removal) also has none until a
+retry succeeds; it is reported as not confirmed gone (TODO(#157), Q246).
 
 A file operation already inside its blocking call is never cut. One still running after the
 drain leaves `in_flight > 0`: the stop answers failed and the session stays stop-failed until
@@ -1225,9 +1249,10 @@ sallyport/
     are tried; `intercept` is true for a grant host (Task 9a-2).
   - `egress.request` (decision `allow`, intercepted tunnels only), before the head goes
     upstream: `{host, port, method, target, target_bytes, target_cut, injected}`; method and
-    target escaped and cut as below; `injected` lists `secret:NAME` for each grant set on the
-    request (Task 9a-3; never a value). The grant headers are built before this entry and set
-    only after it is written (architect D13, ruling Q4); a failed append drops them unsent.
+    target masked with the session's own forms first, then cut and escaped as below (§7
+    Redaction); `injected` lists `secret:NAME` for each grant set on the request (Task 9a-3;
+    never a value). The grant headers are built before this entry and set only after it is
+    written (architect D13, ruling Q4); a failed append drops them unsent.
   - `egress.response` (no decision; intercepted tunnels only), one per response whose head is
     forwarded (refusals have their own entry instead): `{host, port, target, target_bytes,
     target_cut, status, end, redacted_bytes, redacted}`; `redacted` lists, in grant order,
@@ -1241,9 +1266,10 @@ sallyport/
     after `egress.close` (#72). Residual: redacted bytes streamed mid-body precede the entry
     (Task 9a-3, architect Q13, superseding D13's "no redaction count").
   - `egress.deny` (decision `deny`), before the reply: `{reason, target, target_bytes,
-    target_cut}` (the request-target escaped and cut at 256 bytes, never a header), or `{reason,
-    head_bytes}` when no target was parsed; `filter: "host-addresses-unavailable"` when the
-    host's own addresses could not be read.
+    target_cut}` (the request-target masked with the session's own forms first, then cut at 256
+    bytes and escaped, never a header; §7 Redaction), or `{reason, head_bytes}` when no target
+    was parsed; `filter: "host-addresses-unavailable"` when the host's own addresses could not
+    be read.
   - `egress.limit` (decision `deny`): as `egress.deny`, for `too-many-connections` (decided at
     accept: `{reason}` only), `head-too-large`, `head-timeout`, `request-too-large` and
     `response-too-large`.
@@ -1558,13 +1584,25 @@ sallyport/
   secret in the same text (for a session without secret grants, any form) is masked only by
   the writer's redactor, after the cut and the escape: one that straddles byte 256 leaves its
   prefix, and one holding `"`, `\` or a byte outside printable ASCII is logged whole in its
-  `\xNN` spelling, which no redactor matches (#162, Q254, Q263). `target_bytes` is the raw length and
-  `target_cut` says whether the masked text was cut; the method is masked, then cut to 256
-  bytes, and the entry does not say it was cut (Q256). Redaction covers forms only: text that
-  is not a form of a secret (a value the sandbox transformed, a CONNECT host it logs
-  lower-cased, #160) is not redacted anywhere. A store value under 16 bytes is stored and
-  reported short (`SHORT_SECRET_BYTES`: its base64 forms are few or none); `sally secrets set`
-  warns about it (Task 12).
+  `\xNN` spelling, wherever it stands, which no redactor matches (#162, Q254, Q263).
+  `target_bytes` is the raw length and `target_cut` says whether the masked text was cut; the
+  method is masked, then cut to 256 bytes, and the entry does not say it was cut (Q256).
+  Redaction covers forms only: text that is not a form of a secret (a value the sandbox
+  transformed, a CONNECT host it logs lower-cased, #160) is not redacted anywhere. A store
+  value under 16 bytes is stored and reported short (`SHORT_SECRET_BYTES`: its base64 forms are
+  few or none); `sally secrets set` warns about it (Task 12).
+  The audit log and the operational log redact every live session's forms (#85,
+  `sallyd::session::secrets`, Q219, Q220). A session's forms enter both redactors when its
+  egress has loaded them, before `net.sock` is bound or a container exists. They leave after
+  the session's last entry: `sandbox.refuse` for a refused launch, `session.closed` (§5.4) for
+  a session. A value two live sessions share stays redacted until both have left. The egress
+  sink of a proxy session with secret grants (interception) also redacts each of its entries
+  with that session's own forms, read from its `Redaction` (the patterns `audit_text` masks
+  with), before the writer sees it (`SessionRedacted`, Q249, Q278). So an egress entry that
+  lands after the release (§5.4: an aborted or detached append, #156, #72) is redacted exactly
+  as a live session's entry is: forms only (Q253). Residual: a launch or start task that
+  panics after registering never releases its forms, so they stay redacted, and in memory,
+  until `sallyd` exits (TODO(#113)).
 - **Tauri bridge**: Rust side exposes one command `rpc(method: String, params: Value)` that
   forwards to `control.sock` **only** for methods in a compile-time allowlist (no
   `secrets.list` of values exists anyway). Capabilities file grants `core:default` only.

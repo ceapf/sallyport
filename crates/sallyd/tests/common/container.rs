@@ -317,6 +317,26 @@ impl Events {
         *self.2.lock().unwrap() = events.to_vec();
     }
 
+    /// [`hold`](Self::hold), and a guard that lifts every hold when dropped: a failed assertion
+    /// inside the held window then fails the test instead of hanging it (a parked append is a
+    /// blocking task, which the runtime's drop waits for).
+    #[allow(dead_code)] // Not every test binary that includes this module holds appends.
+    pub fn held(&self, events: &[&'static str]) -> Unhold<'_> {
+        self.hold(events);
+        Unhold(self)
+    }
+}
+
+/// Lifts every hold of its [`Events`] when dropped ([`Events::held`]).
+pub struct Unhold<'a>(&'a Events);
+
+impl Drop for Unhold<'_> {
+    fn drop(&mut self) {
+        self.0.hold(&[]);
+    }
+}
+
+impl Events {
     /// Waits until `n` appends of `event` are waiting in a hold; panics after 10 s.
     #[allow(dead_code)] // Not every test binary that includes this module holds appends.
     pub async fn until_parked(&self, event: &str, n: usize) {
@@ -553,7 +573,9 @@ impl Lx {
             disk_floor: floor,
             egress: egress.clone(),
             redactors: Arc::clone(&redactors),
-            oplog: sallyd::oplog::Oplog::new(std::io::sink()),
+            // The same readable oplog as the redactors' second target, so a test reads the
+            // launcher's lines too (`session.closed` not audited, for one).
+            oplog: oplog.clone(),
             installation: installation.clone(),
         });
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -655,7 +677,8 @@ impl Lx {
     }
 
     pub async fn stop(&self, r: Running) {
-        self.launcher.stop(r).await.unwrap();
+        // A launcher-level stop: no registry, so no `session.closed` (the token is dropped).
+        let _done = self.launcher.stop(r).await.unwrap();
     }
 
     /// Whether `podman ps --all` lists a container of this fixture: its scope is part of every

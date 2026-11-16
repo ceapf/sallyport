@@ -147,8 +147,9 @@ pub struct Diagnostic {
 
 impl Diagnostic {
     /// Every diagnostic goes through here: path and message become single-line, bounded, and
-    /// token-looking quoted values are masked, so diagnostics are safe for the UI and the audit
-    /// log even when the user pasted a secret into the wrong field.
+    /// token-looking quoted values and path segments are masked before the cut, so diagnostics
+    /// are safe for the UI and the audit log even when the user pasted a token-looking secret
+    /// into the wrong field.
     fn new(severity: Severity, path: String, code: Code, message: &str) -> Self {
         Self {
             severity,
@@ -168,30 +169,43 @@ const TOKEN_MIN: usize = 20;
 
 /// Single-line, bounded, token-masked.
 pub(crate) fn scrub(s: &str) -> String {
-    let flat: String = s
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    let masked = mask_quoted(&flat);
-    if masked.chars().count() <= MAX_TEXT {
-        return masked;
-    }
-    let keep = MAX_TEXT.saturating_sub(CUT.len());
-    match masked.char_indices().nth(keep) {
-        Some((i, _)) => format!("{}{CUT}", masked.get(..i).unwrap_or_default()),
-        None => masked,
-    }
+    bounded(mask_quoted(&flattened(s)))
 }
 
 /// Paths can contain user-supplied keys (an unknown field's name is its last segment), so
-/// token-looking segments are masked too.
+/// token-looking segments are masked too, before the cut: a cut first could leave a token's
+/// remainder too short, or without its digits, to look like one (architect Q248).
 fn scrub_path(path: &str) -> String {
-    let flat = scrub(path);
-    flat.split('.')
+    bounded(mask_segments(&mask_quoted(&flattened(path))))
+}
+
+/// Control characters become spaces.
+fn flattened(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+/// At most [`MAX_TEXT`] characters, a cut one ending in [`CUT`]. Runs last, after every mask.
+fn bounded(s: String) -> String {
+    if s.chars().count() <= MAX_TEXT {
+        return s;
+    }
+    let keep = MAX_TEXT.saturating_sub(CUT.chars().count());
+    match s.char_indices().nth(keep) {
+        Some((i, _)) => format!("{}{CUT}", s.get(..i).unwrap_or_default()),
+        None => s,
+    }
+}
+
+/// Each dot-separated segment that looks like a token becomes its first 4 characters and
+/// [`CUT`].
+fn mask_segments(path: &str) -> String {
+    path.split('.')
         .map(|seg| {
             if looks_like_token(without_index(seg)) {
                 let head: String = seg.chars().take(4).collect();
-                format!("{head}...")
+                format!("{head}{CUT}")
             } else {
                 seg.to_owned()
             }
@@ -386,6 +400,46 @@ mod tests {
         let s = scrub(&format!("{}\"{token}\" tail", "a ".repeat(140)));
         assert!(s.chars().count() <= MAX_TEXT, "{s}");
         assert!(!s.contains("k9k9k9"), "{s}");
+    }
+
+    /// A path of `len` characters: one long digit-free segment and a dot, so the next segment
+    /// starts at character `len`.
+    fn path_prefix(len: usize) -> String {
+        format!("{}.", "a".repeat(len - 1))
+    }
+
+    /// Architect Q248: a token segment that starts at any of the 19 characters before the cut
+    /// is masked before it; cutting first left a remainder too short to look like a token.
+    #[test]
+    fn a_token_segment_just_before_the_cut_is_masked_before_it() {
+        let token = "k9".repeat(15);
+        let at = MAX_TEXT - CUT.len();
+        for k in 1..TOKEN_MIN {
+            let prefix = path_prefix(at - k);
+            let s = scrub_path(&format!("{prefix}{token}.tail"));
+            assert!(!s.contains("k9k9k"), "{k} before the cut: {s}");
+            let whole = format!("{prefix}k9k9{CUT}.tail");
+            if whole.chars().count() <= MAX_TEXT {
+                assert_eq!(s, whole, "{k}: kept whole");
+            } else {
+                assert_eq!(s.chars().count(), MAX_TEXT, "{k}: {s}");
+                assert!(s.ends_with(CUT), "{k}: {s}");
+            }
+        }
+    }
+
+    /// Architect Q248: a long token whose digits all lie after the cut is masked: cutting first
+    /// left a digit-free remainder that did not look like a token.
+    #[test]
+    fn a_token_segment_whose_digits_follow_the_cut_is_masked() {
+        let token = format!("{}{}", "abcdefghijklmnopqrstuvwxy", "0123456789");
+        let at = MAX_TEXT - CUT.len();
+        let s = scrub_path(&format!("{}{token}", path_prefix(at - 25)));
+        assert!(!s.contains("abcde"), "{s}");
+        assert!(s.chars().count() <= MAX_TEXT, "{s}");
+        assert!(s.ends_with("abcd..."), "{s}");
+        // Control: the same segment far from the cut is masked the same way.
+        assert_eq!(scrub_path(&format!("x.{token}")), "x.abcd...");
     }
 
     #[test]

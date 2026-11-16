@@ -31,7 +31,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use sally_core::audit::{AuditError, AuditWriter, NewEntry};
+use sally_core::audit::{Actor, AuditError, AuditWriter, NewEntry};
 use sally_core::manifest::{AuditLevel, MountMode, NetworkMode, ValidatedManifest};
 use serde_json::json;
 
@@ -50,7 +50,8 @@ use super::types::{CheckedRuntime, ImageRef, Installation, Role, SessionPaths, U
 use super::watchdog::{Target, WatchPlan, Watchdog, watch_plan};
 use crate::daemon::crash::CrashReporter;
 use crate::oplog::Oplog;
-use crate::session::secrets::Redactors;
+use crate::session::secrets::{Redactors, SessionRedacted};
+use crate::session::types::StopReason;
 
 mod error;
 mod harness;
@@ -203,6 +204,18 @@ impl Running {
     }
 }
 
+/// Proof that a workspace's stop succeeded: its container confirmed gone, its tunnels closed,
+/// its scratch removed and its claims released. Only [`Launcher::stop`] makes one, on its Ok
+/// path, and only [`Launcher::close`] takes it, so a received session's `session.closed` and
+/// the release of its forms follow a confirmed stop by construction (#94, architect Q252). No
+/// `Clone` and no public constructor.
+#[derive(Debug)]
+#[must_use = "dropping it skips the session's `session.closed` and the release of its forms"]
+pub struct Confirmed {
+    id: String,
+    level: AuditLevel,
+}
+
 /// What a workspace launch needs.
 #[derive(Debug, Clone)]
 pub struct WorkspaceRequest {
@@ -315,11 +328,28 @@ impl Launcher {
         })
     }
 
+    /// The session's last entry, `session.closed {reason}`, written once its teardown has
+    /// finished, which `done` proves (#94, architect Q242, Q245, Q252). Then its secrets leave
+    /// the logs' redactors (Q219). The registry calls it once per `Running` it received; a
+    /// launch the launcher refused or stopped itself gets none. A refused append is an oplog
+    /// line naming only the session and the event, and the forms are released anyway: the
+    /// stop is done (Q243). RT-AUD-03 (`tests/closed.rs`).
+    pub async fn close(&self, done: Confirmed, reason: StopReason) {
+        let Confirmed { id, level } = done;
+        let entry = NewEntry::new(Actor::Sallyd, "session.closed")
+            .session(&id)
+            .args(json!({"reason": reason.as_str()}));
+        if self.audit(entry, level).await.is_err() {
+            self.unaudited("session.closed", &id);
+        }
+        self.release_secrets(&id).await;
+    }
+
     /// Drops session `id`'s secrets from the logs' redactors, once its last entry is written:
-    /// by the launcher after `sandbox.refuse`, by the registry after `session.stop` and teardown
-    /// (architect Q219). Safe to call more than once. Off the runtime: the swap takes the audit
-    /// writer's lock, which an append holds through its fsync.
-    pub async fn release_secrets(&self, id: &str) {
+    /// after `sandbox.refuse` for a refused launch, after `session.closed` ([`Self::close`])
+    /// for a session (architect Q219). Safe to call more than once. Off the runtime: the swap
+    /// takes the audit writer's lock, which an append holds through its fsync.
+    async fn release_secrets(&self, id: &str) {
         let redactors = Arc::clone(&self.redactors);
         let owned = id.to_owned();
         if tokio::task::spawn_blocking(move || redactors.unregister(&owned))
@@ -530,11 +560,15 @@ impl Launcher {
             req.paths.id().as_str().to_owned(),
         );
         // The forms are registered in the same closure that loaded them: no await point between,
-        // and before `net.sock` is bound or the container exists (architect Q219).
+        // and before `net.sock` is bound or the container exists (architect Q219). The session's
+        // egress entries are redacted with its own forms too, so one that lands after the
+        // release is still redacted (Q249, Q278).
         let s = blocking(move || {
-            let s = egress.prepare(&dir, s).map_err(LaunchError::Egress)?;
+            let mut s = egress.prepare(&dir, s).map_err(LaunchError::Egress)?;
             if let Some(i) = &s.interception {
-                redactors.register(&id, Arc::clone(i.credentials().redaction().forms()));
+                let redaction = Arc::clone(i.credentials().redaction());
+                redactors.register(&id, Arc::clone(redaction.forms()));
+                s.audit = Arc::new(SessionRedacted::over(s.audit, redaction));
             }
             Ok(s)
         })

@@ -230,6 +230,128 @@ fn the_audit_writer_and_the_oplog_redact_what_is_registered() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Architect Q249: an egress entry written through a session's [`SessionRedacted`] sink is
+/// redacted with that session's own forms even when the writer's redactor no longer holds them
+/// (the state after the session's release): the sandbox-chosen `host` of `egress.allow` and
+/// `egress.close` (a wildcard-allowed CONNECT host, which `audit_text` does not mask; Q266,
+/// Q279) and `target` of `egress.request`, `egress.deny`, `egress.limit` and a dropped
+/// `egress.response` hold no form. Control: the same entries appended to the writer directly
+/// are in the clear.
+#[test]
+fn a_sessions_egress_entries_are_redacted_with_its_own_forms_after_the_release() {
+    let dir = scratch("own-forms");
+    let audit = Arc::new(SharedAudit(Mutex::new(
+        AuditWriter::open(&dir.join("audit"), Box::new(SystemClock)).unwrap(),
+    )));
+    let v = value("own");
+    let redaction = Redaction::of(forms("GITHUB_TOKEN", &v)).unwrap();
+    let sink = SessionRedacted::over(
+        Arc::clone(&audit) as Arc<dyn AuditSink>,
+        Arc::new(redaction),
+    );
+    let entries = |mark: &str| {
+        let target = format!("/x?t={v}&m={mark}");
+        let host = format!("{v}.h.test");
+        [
+            (
+                "egress.allow",
+                json!({"host": host, "intercept": false, "m": mark}),
+            ),
+            ("egress.close", json!({"host": host, "m": mark})),
+            (
+                "egress.request",
+                json!({"host": "h.test", "target": target}),
+            ),
+            (
+                "egress.deny",
+                json!({"host": format!("{v}.h.test"), "target": target}),
+            ),
+            ("egress.limit", json!({"target": target, "limit": "body"})),
+            (
+                "egress.response",
+                json!({"target": target, "end": "dropped"}),
+            ),
+        ]
+        .map(|(e, a)| NewEntry::new(Actor::Sallyd, e).session("s1").args(a))
+    };
+    for e in entries("mark-own") {
+        sink.append(e, AuditLevel::Full).unwrap();
+    }
+    for e in entries("mark-raw") {
+        audit.append(e, AuditLevel::Full).unwrap();
+    }
+    let text = all_text(&dir.join("audit"));
+    let own: Vec<&str> = text.lines().filter(|l| l.contains("mark-own")).collect();
+    assert_eq!(own.len(), 6, "{text}");
+    for l in &own {
+        assert!(!l.contains(&v), "{l}");
+        assert!(l.contains("[REDACTED:GITHUB_TOKEN]"), "{l}");
+    }
+    for event in ["egress.allow", "egress.close"] {
+        let tag = format!("\"event\":\"{event}\"");
+        let l = own.iter().find(|l| l.contains(&tag)).unwrap();
+        assert!(l.contains("[REDACTED:GITHUB_TOKEN].h.test"), "{l}");
+    }
+    let raw: Vec<&str> = text.lines().filter(|l| l.contains("mark-raw")).collect();
+    assert_eq!(raw.len(), 6, "{text}");
+    assert!(raw.iter().all(|l| l.contains(&v)), "control: {raw:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Architect Q266 (1): the wrapper alone, under a writer with no redactor, redacts a form of
+/// the session's secrets wherever an entry holds it: in a string value, as an object key and as
+/// a number. The entries are appended after the session's forms were registered with the logs'
+/// redactors and unregistered again (the release), so the wrapper's forms outlive the release.
+/// Control: the same entry appended to the writer directly holds all three.
+#[test]
+fn the_session_sink_redacts_a_form_in_a_value_a_key_and_a_number() {
+    let dir = scratch("sink-alone");
+    let audit = Arc::new(SharedAudit(Mutex::new(
+        AuditWriter::open(&dir.join("audit"), Box::new(SystemClock)).unwrap(),
+    )));
+    let word = value("sink");
+    let digits = "1357924680135792468";
+    let (w, d) = (Secret::new(word.clone()), Secret::new(digits.to_owned()));
+    let forms = SessionForms::build([("WORD", &w, vec![]), ("DIGITS", &d, vec![])]);
+    let redaction = Arc::new(Redaction::of(forms).unwrap());
+    let (_a, _b, redactors) = two();
+    redactors.register("s1", Arc::clone(redaction.forms()));
+    redactors.unregister("s1");
+    assert!(redactors.sessions().is_empty());
+    let sink = SessionRedacted::over(Arc::clone(&audit) as Arc<dyn AuditSink>, redaction);
+    let entry = |mark: &str| {
+        let args = json!({
+            "host": format!("{word}.h.test"),
+            word.clone(): "a key",
+            "n": digits.parse::<u64>().unwrap(),
+            "m": mark,
+        });
+        NewEntry::new(Actor::Sallyd, "egress.close")
+            .session("s1")
+            .args(args)
+    };
+    sink.append(entry("mark-own"), AuditLevel::Full).unwrap();
+    audit.append(entry("mark-raw"), AuditLevel::Full).unwrap();
+    let text = all_text(&dir.join("audit"));
+    let line = |mark: &str| -> serde_json::Value {
+        let l = text.lines().find(|l| l.contains(mark)).unwrap();
+        serde_json::from_str(l).unwrap()
+    };
+    let own = line("mark-own").to_string();
+    assert!(!own.contains(&word) && !own.contains(digits), "{own}");
+    assert!(own.contains("[REDACTED:WORD].h.test"), "the value: {own}");
+    let key = "\"[REDACTED:WORD]\":\"a key\"";
+    assert!(own.contains(key), "the key: {own}");
+    assert!(own.contains("[REDACTED:DIGITS]"), "the number: {own}");
+    let raw = line("mark-raw").to_string();
+    let host = format!("\"{word}.h.test\"");
+    let key = format!("\"{word}\":\"a key\"");
+    for want in [host.as_str(), key.as_str(), digits] {
+        assert!(raw.contains(want), "control: {want} in {raw}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// An oplog writer the test reads back.
 #[derive(Clone, Default)]
 struct Lines(Arc<Mutex<Vec<u8>>>);

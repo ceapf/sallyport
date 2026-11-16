@@ -291,14 +291,20 @@ impl HostAddrs for Owned {
 pub type FakeEgress = Egress<Names, Upstream, Owned>;
 
 /// The secrets the fixtures' store holds (the names the test manifests grant).
-pub const STORED: [&str; 3] = ["GITHUB_TOKEN", "MOCK3_TOKEN", "GIT_TOKEN"];
+pub const STORED: [&str; 4] = ["GITHUB_TOKEN", "MOCK3_TOKEN", "GIT_TOKEN", "HOST_TOKEN"];
 
 /// The canary value the fixtures' store holds for `name`: assembled at runtime, so no
-/// credential-shaped literal is in the tree; `CANARY` makes it easy to grep for (RT-SEC-07).
+/// credential-shaped literal is in the tree; `CANARY` makes it easy to grep for (RT-SEC-07),
+/// except `HOST_TOKEN`'s, which must be lower-case (below): a search for it names it.
 /// `GIT_TOKEN`'s also holds characters a percent-encoder escapes (`/ + ? & = %` and a space),
 /// so each percent spelling differs from the raw value (architect ruling A4); none of the
-/// canaries holds `*`, so a session's filler is `*`.
+/// canaries holds `*`, so a session's filler is `*`. `HOST_TOKEN`'s is a lower-case DNS label
+/// (33 bytes of `a-z0-9`, a letter first): the only form that can stand in a CONNECT host,
+/// which `sallyd` logs lower-cased (architect Q279, #160).
 pub fn canary(name: &str) -> String {
+    if name == "HOST_TOKEN" {
+        return format!("sallycanaryhost{}", "c0ffee".repeat(3));
+    }
     let base = format!("SALLY_CANARY_{name}_{}", "c0ffee".repeat(4));
     if name == "GIT_TOKEN" {
         format!("{base}/a+b c?d&e=f%g")
