@@ -17,11 +17,21 @@ use common::*;
 /// The control of a "the host tree is identical" check (#122): a sibling directory `rel` under
 /// `~/code`, filled by the same `fill`, mounted `rw` at the same guest path, and the same
 /// `script` run in it. During that session the host tree has changed, seen by the same
-/// `tree_state`, with `present` there and `absent` gone; the session is stopped after.
+/// `tree_state`: read from its value before and after, `absent` is there before and gone after,
+/// and `present` the other way round (architect Q190). The session is stopped after.
 async fn rw_control(x: &Lx, rel: &str, fill: fn(&Path), script: &str, present: &str, absent: &str) {
     let c = x.f.root.join("home/code").join(rel);
     fill(&c);
+    // A `tree_state` line is `"{rel} {mode} …"`: the trailing space makes the prefix exact.
+    let has = |state: &[String], name: &str| {
+        let prefix = format!("{name} ");
+        state.iter().any(|l| l.starts_with(&prefix))
+    };
     let before = tree_state(&c);
+    assert!(
+        has(&before, absent) && !has(&before, present),
+        "control: the fill does not hold {absent} without {present}: {before:#?}"
+    );
     let v = x.f.load(&mounts(&[mount(
         &format!("~/code/{rel}"),
         "/workspace/p",
@@ -30,18 +40,15 @@ async fn rw_control(x: &Lx, rel: &str, fill: fn(&Path), script: &str, present: &
     let r = x.launch(&v, rel).await.expect("control: the rw launch");
     let (code, out) = exec(&r, script).await;
     assert_eq!(code, 0, "control: {out}");
-    assert_ne!(
-        tree_state(&c),
-        before,
-        "control: the rw host tree did not change"
+    let after = tree_state(&c);
+    assert_ne!(after, before, "control: the rw host tree did not change");
+    assert!(
+        has(&after, present),
+        "control: {present} is not on the host: {after:#?}"
     );
     assert!(
-        c.join(present).exists(),
-        "control: {present} is not on the host"
-    );
-    assert!(
-        !c.join(absent).exists(),
-        "control: {absent} is still on the host"
+        !has(&after, absent),
+        "control: {absent} is still on the host: {after:#?}"
     );
     x.stop(r).await;
 }

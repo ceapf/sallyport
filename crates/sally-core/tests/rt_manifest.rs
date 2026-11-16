@@ -9,8 +9,19 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{Fixture, HEADER, assert_ok, assert_rejects, fake_token, rendered};
+use common::{Fixture, HEADER, assert_rejects, fake_token, rendered};
 use sally_core::manifest::{Code, MAX_MANIFEST_BYTES, parse, parse_bytes, to_yaml, validate};
+
+/// The control of a return-value refusal (#122): `body`, which differs from the refused case
+/// only in the attribute under test, is accepted by the same load.
+fn twin_ok(f: &Fixture, body: &str) {
+    let r = f.load(body);
+    assert!(
+        r.is_ok(),
+        "control: the accepted twin is refused: {body}: {:#?}",
+        r.as_ref().err()
+    );
+}
 
 // ---- RT-MAN-01: schema fuzz --------------------------------------------------------------------
 
@@ -433,7 +444,7 @@ fn rt_man_02_privilege_escalation_attempts_rejected_with_documented_codes() {
         ),
     ];
     for (body, twin, path, code, message) in cases {
-        assert_ok(&f.load(&twin));
+        twin_ok(&f, &twin);
         let r = f.load(&body);
         assert_rejects(&r, path, code);
         assert_eq!(
@@ -462,7 +473,10 @@ fn rt_man_02_image_transport_prefixes_are_refused() {
     ] {
         for field in ["runtime", "harness"] {
             // Control (#122): the registry form with the same digest is accepted.
-            assert_ok(&f.load(&format!("{field}:\n  image: \"ghcr.io/a/b@sha256:{d}\"\n")));
+            twin_ok(
+                &f,
+                &format!("{field}:\n  image: \"ghcr.io/a/b@sha256:{d}\"\n"),
+            );
             let r = f.load(&format!("{field}:\n  image: \"{image}@sha256:{d}\"\n"));
             assert_rejects(&r, &format!("{field}.image"), Code::NotPinned);
         }
@@ -650,7 +664,7 @@ fn rt_sec_08_original_rows(f: &Fixture) {
     // only in the attribute under test.
     let inject =
         "    inject: {host: api.openai.com, header: Authorization, format: \"Bearer {value}\"}\n";
-    assert_ok(&f.load(&format!("{proxy}secrets:\n  - name: X\n{inject}")));
+    twin_ok(f, &format!("{proxy}secrets:\n  - name: X\n{inject}"));
     let inline_value = format!("{proxy}secrets:\n  - name: X\n    value: \"{canary}\"\n{inject}");
     let r = f.load(&inline_value);
     assert_rejects(&r, "secrets[0].value", Code::Schema);
@@ -665,7 +679,7 @@ fn rt_sec_08_original_rows(f: &Fixture) {
             "{proxy}secrets:\n  - {{name: X, inject: {{host: \"{host}\", header: Authorization, format: \"{{value}}\"}}}}\n"
         )
     };
-    assert_ok(&f.load(&wildcard("api.openai.com")));
+    twin_ok(f, &wildcard("api.openai.com"));
     let r = f.load(&wildcard("*"));
     assert_rejects(&r, "secrets[0].inject.host", Code::NotExactHost);
     assert!(rendered(&r)[0].contains("host must be exact"));
@@ -675,9 +689,21 @@ fn rt_sec_08_original_rows(f: &Fixture) {
             "tools:\n  mcp:\n    - name: llm\n      command: [server]\n      env: {{{name}: \"{value}\"}}\n"
         )
     };
-    // The canary value is refused on its own too, so the pair that differs only in the name
-    // carries a plain value; the canary case below is the original row.
-    assert_ok(&f.load(&env("LLM_MODE", "1")));
+    // The canary value is refused on its own too (shown here: an ordinary name with the canary,
+    // refused by the value, not echoed), so the pair that differs only in the name carries a
+    // plain value; the canary case below is the original row (architect Q189).
+    let by_value = f.load(&env("LLM_MODE", &canary));
+    assert_rejects(&by_value, "tools.mcp[0].env.LLM_MODE", Code::SecretLikeEnv);
+    assert!(
+        rendered(&by_value)[0].contains("value looks like a credential"),
+        "{:?}",
+        rendered(&by_value)
+    );
+    assert!(
+        !rendered(&by_value)[0].contains(&canary),
+        "error must not echo the value"
+    );
+    twin_ok(f, &env("LLM_MODE", "1"));
     assert_rejects(
         &f.load(&env("OPENAI_API_KEY", "1")),
         "tools.mcp[0].env.OPENAI_API_KEY",
