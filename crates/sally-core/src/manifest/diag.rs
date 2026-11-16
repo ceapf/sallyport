@@ -159,8 +159,10 @@ impl Diagnostic {
     }
 }
 
-/// Longest diagnostic text kept, in characters.
+/// Longest diagnostic text kept, in characters, the cut marker included.
 const MAX_TEXT: usize = 300;
+/// What ends a cut text.
+const CUT: &str = "...";
 /// Quoted spans at least this long that look like tokens are masked.
 const TOKEN_MIN: usize = 20;
 
@@ -171,8 +173,12 @@ pub(crate) fn scrub(s: &str) -> String {
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
     let masked = mask_quoted(&flat);
-    match masked.char_indices().nth(MAX_TEXT) {
-        Some((i, _)) => format!("{}...", masked.get(..i).unwrap_or_default()),
+    if masked.chars().count() <= MAX_TEXT {
+        return masked;
+    }
+    let keep = MAX_TEXT.saturating_sub(CUT.len());
+    match masked.char_indices().nth(keep) {
+        Some((i, _)) => format!("{}{CUT}", masked.get(..i).unwrap_or_default()),
         None => masked,
     }
 }
@@ -360,7 +366,15 @@ mod tests {
     #[test]
     fn scrub_flattens_and_bounds() {
         assert_eq!(scrub("a\nb\tc"), "a b c");
-        assert_eq!(scrub(&"x".repeat(1000)).chars().count(), MAX_TEXT + 3);
+        // MANIFEST_SPEC: at most 300 characters, the cut marker included.
+        let cut = scrub(&"x".repeat(1000));
+        assert_eq!(cut.chars().count(), MAX_TEXT);
+        assert!(cut.ends_with("x..."), "{cut}");
+        let whole = "y".repeat(MAX_TEXT);
+        assert_eq!(scrub(&whole), whole, "exactly the bound is kept whole");
+        let over = scrub(&"z".repeat(MAX_TEXT + 1));
+        assert_eq!(over.chars().count(), MAX_TEXT);
+        assert!(over.ends_with("z..."), "{over}");
     }
 
     #[test]

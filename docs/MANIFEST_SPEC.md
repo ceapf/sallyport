@@ -408,7 +408,7 @@ error: filesystem.mounts[0].host: "~/" is the home directory root (denylisted) [
 error: secrets[0].inject.host: "*.github.com": host must be exact (no wildcards) [not-exact-host]
 error: network.allow[2].host: "*" requires network.acknowledge_unrestricted_egress: true [unacknowledged-wildcard]
 error: tools.acknowledge_unapproved: shell: allow with destructive_requires_approval: false runs every command without approval; add "shell" to tools.acknowledge_unapproved to accept this [unacknowledged-risk]
-warning: tools.shell: "allow" — shell commands run without approval unless tagged destructive [risky]
+warning: tools.shell: "allow": shell commands run without approval unless tagged destructive [risky]
 ```
 
 All errors are reported at once. Diagnostics are single-line, at most 300 characters, and
