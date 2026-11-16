@@ -1552,13 +1552,17 @@ sallyport/
   (`sally-core::audit::secret_forms`, held per session in `SessionForms`) plus each grant's
   rendered value and `{basic}` blob, with a same-length filler and no name (Tasks 9a-3, 9b).
   Text the sandbox chose that an egress entry carries (a request-target, a method) is masked
-  with its session's forms, as `[REDACTED:NAME]`, in the whole text before it is cut to 256
-  bytes and escaped (`egress::authority::audit_text`, architect Q253), so no cut or escape can
-  split or rewrite a form ahead of the writer's redactor; `target_bytes` is the raw length and
-  `target_cut` says whether the masked text was cut. Redaction covers forms only: text that is
-  not a form of a secret (a value the sandbox transformed, a CONNECT host it logs lower-cased,
-  #160) is not redacted anywhere. A store value under 16 bytes is stored and reported short (`SHORT_SECRET_BYTES`: its base64
-  forms are few or none); `sally secrets set` warns about it (Task 12).
+  with its own session's forms, as `[REDACTED:NAME]`, in the whole text before it is cut to
+  256 bytes and escaped (`egress::authority::audit_text`, architect Q253), so no cut or escape
+  can split or rewrite a form of that session's secrets; a form of another live session's
+  secret in the same text is masked only by the writer's redactor, after the cut, so one that
+  straddles byte 256 leaves its prefix (#162, Q254). `target_bytes` is the raw length and
+  `target_cut` says whether the masked text was cut; the method is masked, then cut to 256
+  bytes, and the entry does not say it was cut (Q256). Redaction covers forms only: text that
+  is not a form of a secret (a value the sandbox transformed, a CONNECT host it logs
+  lower-cased, #160) is not redacted anywhere. A store value under 16 bytes is stored and
+  reported short (`SHORT_SECRET_BYTES`: its base64 forms are few or none); `sally secrets set`
+  warns about it (Task 12).
 - **Tauri bridge**: Rust side exposes one command `rpc(method: String, params: Value)` that
   forwards to `control.sock` **only** for methods in a compile-time allowlist (no
   `secrets.list` of values exists anyway). Capabilities file grants `core:default` only.
