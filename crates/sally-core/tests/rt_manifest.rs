@@ -397,7 +397,7 @@ fn rt_man_02_privilege_escalation_attempts_rejected_with_documented_codes() {
             m("~/code/myproject", "/workspace/c"),
             "filesystem.mounts[0].host",
             Code::Denylisted,
-            r#"error: filesystem.mounts[0].host: "~/.config/sallyport" is inside $ROOT/home/.config — configuration folders are never mountable (denylisted) [denylisted]"#,
+            r#"error: filesystem.mounts[0].host: "~/.config/sallyport" is inside $ROOT/home/.config: configuration folders are never mountable (denylisted) [denylisted]"#,
         ),
         (
             m("~/code/myproject", "/etc"),
@@ -441,7 +441,7 @@ fn rt_man_02_privilege_escalation_attempts_rejected_with_documented_codes() {
             "runtime:\n  cpus: 8\n".into(),
             "runtime.cpus",
             Code::OutOfRange,
-            r#"error: runtime.cpus: 1000000 is outside 0.5–8 (host CPUs) [out-of-range]"#,
+            r#"error: runtime.cpus: 1000000 is outside 0.5 to 8 (host CPUs) [out-of-range]"#,
         ),
     ];
     for (body, twin, path, code, message) in cases {

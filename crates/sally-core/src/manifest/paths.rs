@@ -153,7 +153,7 @@ impl Denylist {
     /// Returns a description of why `candidate` (absolute, normalized) is refused, if it is.
     pub(crate) fn refusal(&self, candidate: &Path) -> Option<String> {
         self.rules.iter().find_map(|r| {
-            let why = r.reason.map_or_else(String::new, |w| format!(" — {w}"));
+            let why = r.reason.map_or_else(String::new, |w| format!(": {w}"));
             r.forms.iter().find_map(|f| match r.scope {
                 Scope::RootOnly if candidate == f => Some(format!("is {}{why}", r.label)),
                 Scope::RootOnly => None,
@@ -174,7 +174,7 @@ impl Denylist {
     /// are not detected: TODO(#28) (the same ancestry gap as the overlap rule's re-review M-2,
     /// #17).
     pub(crate) fn refusal_by_id(&self, id: DirId) -> Option<String> {
-        let why = |r: &Rule| r.reason.map_or_else(String::new, |w| format!(" — {w}"));
+        let why = |r: &Rule| r.reason.map_or_else(String::new, |w| format!(": {w}"));
         let same = self.rules.iter().find(|r| r.ids.contains(&id));
         if let Some(r) = same {
             return Some(format!("is the same directory as {}{}", r.label, why(r)));
@@ -276,7 +276,7 @@ pub(crate) fn expand(raw: &str, home: &Path) -> Result<PathBuf, String> {
         home.join(rest)
     } else if raw.starts_with('~') {
         return Err(format!(
-            "{raw:?}: only \"~\" and \"~/…\" are supported, not \"~user\""
+            "{raw:?}: only \"~\" and \"~/...\" are supported, not \"~user\""
         ));
     } else {
         PathBuf::from(raw)

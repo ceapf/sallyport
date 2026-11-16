@@ -172,7 +172,7 @@ pub(crate) fn scrub(s: &str) -> String {
         .collect();
     let masked = mask_quoted(&flat);
     match masked.char_indices().nth(MAX_TEXT) {
-        Some((i, _)) => format!("{}…", masked.get(..i).unwrap_or_default()),
+        Some((i, _)) => format!("{}...", masked.get(..i).unwrap_or_default()),
         None => masked,
     }
 }
@@ -185,7 +185,7 @@ fn scrub_path(path: &str) -> String {
         .map(|seg| {
             if looks_like_token(without_index(seg)) {
                 let head: String = seg.chars().take(4).collect();
-                format!("{head}…")
+                format!("{head}...")
             } else {
                 seg.to_owned()
             }
@@ -213,7 +213,7 @@ fn mask_quoted(s: &str) -> String {
         out.push(q);
         if looks_like_token(body) {
             let head: String = body.chars().take(4).collect();
-            out.push_str(&format!("{head}…[{} chars hidden]", body.chars().count()));
+            out.push_str(&format!("{head}...[{} chars hidden]", body.chars().count()));
         } else {
             out.push_str(body);
         }
@@ -337,12 +337,12 @@ mod tests {
         ));
         assert_eq!(
             m,
-            format!("invalid value: string \"{gh}…[30 chars hidden]\", expected x")
+            format!("invalid value: string \"{gh}...[30 chars hidden]\", expected x")
         );
         let m = scrub(&format!(
             "unknown field `{sk}proj-abcdefghij0123456789`, expected one of a"
         ));
-        assert!(m.contains(&format!("`{sk}p…[28 chars hidden]`")), "{m}");
+        assert!(m.contains(&format!("`{sk}p...[28 chars hidden]`")), "{m}");
     }
 
     #[test]
@@ -360,7 +360,7 @@ mod tests {
     #[test]
     fn scrub_flattens_and_bounds() {
         assert_eq!(scrub("a\nb\tc"), "a b c");
-        assert_eq!(scrub(&"x".repeat(1000)).chars().count(), MAX_TEXT + 1);
+        assert_eq!(scrub(&"x".repeat(1000)).chars().count(), MAX_TEXT + 3);
     }
 
     #[test]
@@ -375,15 +375,15 @@ mod tests {
         );
         let tok = ["gh", "p_", "abcdefghij0123456789xyz"].concat();
         // A token-like key stays masked, with or without an index-looking suffix.
-        assert_eq!(scrub_path(&format!("tools.{tok}")), "tools.ghp_…");
-        assert_eq!(scrub_path(&format!("tools.{tok}[0]")), "tools.ghp_…");
-        assert_eq!(scrub_path(&format!("tools.x[{tok}]")), "tools.x[gh…");
+        assert_eq!(scrub_path(&format!("tools.{tok}")), "tools.ghp_...");
+        assert_eq!(scrub_path(&format!("tools.{tok}[0]")), "tools.ghp_...");
+        assert_eq!(scrub_path(&format!("tools.x[{tok}]")), "tools.x[gh...");
         // A long digit run is not an index: it is masked with its segment.
         let digits = "1234567890123456789012";
-        assert_eq!(scrub_path(&format!("tools.x[{digits}]")), "tools.x[12…");
+        assert_eq!(scrub_path(&format!("tools.x[{digits}]")), "tools.x[12...");
         assert_eq!(
             scrub_path(&format!("tools.acknowledge_unapproved[{digits}]")),
-            "tools.ackn…"
+            "tools.ackn..."
         );
     }
 }

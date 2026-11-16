@@ -37,7 +37,7 @@ pub(crate) fn data_can_leave(
         ""
     };
     Some(format!(
-        "Anything this agent reads — {} — can be sent to {}.{fetch}",
+        "Anything this agent reads ({}) can be sent to {}.{fetch}",
         join(&readable),
         join(&destinations)
     ))

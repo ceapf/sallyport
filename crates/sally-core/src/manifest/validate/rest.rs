@@ -38,7 +38,7 @@ pub(super) fn in_range<T: PartialOrd + Copy>(
         d.error(
             path,
             Code::OutOfRange,
-            format!("{} is outside {}–{}", show(v), show(min), show(max)),
+            format!("{} is outside {} to {}", show(v), show(min), show(max)),
         );
     }
 }
@@ -99,7 +99,7 @@ pub(super) fn check_runtime(r: &Runtime, env: &HostEnv, d: &mut Diags) {
         d.error(
             "runtime.cpus",
             Code::OutOfRange,
-            format!("{} is outside 0.5–{max_cpus} (host CPUs)", r.cpus),
+            format!("{} is outside 0.5 to {max_cpus} (host CPUs)", r.cpus),
         );
     }
     let max_mem = env.mem_bytes / 4 * 3;
@@ -220,7 +220,7 @@ fn check_shell(m: &Manifest, d: &mut Diags) {
             d.warn(
                 "tools.shell",
                 Code::Risky,
-                format!("\"allow\" — shell commands run without approval {tail}"),
+                format!("\"allow\": shell commands run without approval {tail}"),
             );
         }
         (ShellPolicy::Deny, true) => d.warn(

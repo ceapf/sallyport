@@ -119,10 +119,12 @@ fn a_secret_grant_needs_the_name_in_the_store() {
         .set("GH", format!("sp-cli-{}", "v".repeat(20)))
         .unwrap();
     store.save().unwrap();
-    let (_, out, err) = run(|o| manifest_validate(&m, &s.store(), o));
-    assert_eq!(err, "");
+    // Architect Q226: its `[data-can-leave]` warning is plain ASCII, so the run is clean (0).
+    let (code, out, err) = run(|o| manifest_validate(&m, &s.store(), o));
+    assert_eq!((code, err.as_str()), (EXIT_OK, ""), "{out}");
     assert!(
         out.contains("[data-can-leave]")
+            && !out.contains("\\u{")
             && out.ends_with("valid (sallyd checks again when a session starts)\n"),
         "{out}"
     );
