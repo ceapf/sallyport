@@ -462,17 +462,18 @@ fn rt_net_09_oversized_heads_slow_clients_and_too_many_connections_are_limited()
         .1;
         let took = t0.elapsed();
         assert!(timed.is_empty(), "{timed:?}");
-        // Closed at about 10 s, before the 17 s drip would have ended on its own.
+        // Closed at about 10 s, before the drip's 19 one-second steps would have ended.
         assert!(took >= Duration::from_secs(9) && took < Duration::from_secs(17), "{took:?}");
         assert_eq!(refusals(&lx, "egress.limit")[3]["reason"], json!("head-timeout"));
         // The same drip through the TCP relay gets no reply either. The shim discards what the
         // client still sends after the proxy closed (#76), so it ends at its own end, below the
-        // shim's linger, not at the proxy's close.
+        // shim's linger, not at the proxy's close: a shim that reset it on its next byte after
+        // the close would end it at about 11 s.
         let t0 = Instant::now();
         let through_tcp = exec(&r, &format!("{drip} | nc 127.0.0.1 3128")).await.1;
         let took = t0.elapsed();
         assert!(through_tcp.is_empty(), "{through_tcp:?}");
-        assert!(took < Duration::from_secs(30), "{took:?}");
+        assert!(took >= Duration::from_secs(15) && took < Duration::from_secs(30), "{took:?}");
         assert_eq!(refusals(&lx, "egress.limit")[4]["reason"], json!("head-timeout"));
         // Two held tunnels fill max_connections: the third is refused at accept.
         let held = exec(

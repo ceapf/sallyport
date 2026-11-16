@@ -327,6 +327,12 @@ tests in `egress/intercept_tests.rs` where the behaviour matters to the proxy.
   linger). RT-NET-09 asserts the 431 for 20 MiB of headers through busybox `nc`: 13 of 13 runs.
   Shutting the TCP read side instead of discarding would not do: after the shim's FIN, Linux
   resets a client that sends on, and busybox `nc` dies on that failed write.
+- A TCP socket that is shut down and then closed sends a reset only if unread bytes are still
+  queued at `close()`. If a thread drains the queue after `shutdown(Both)` (a read returns the
+  queued bytes, then 0), the close is clean. A client whose window toward that socket was 0 then
+  gets only ACKs to its probes, no reset, until `tcp_fin_timeout` (60 s here). So the shim's
+  linger and discard deadline stop reading at the cut (a shared `cut` flag) instead of draining.
+  (#76 review, 5 of 249 under 3×nproc busy loops before the flag)
 - busybox `nc` does **not** exit on network EOF while its stdin is open; it runs until its input
   ends. A test that times the server's close from inside the sandbox uses `sally-shim --stdio`,
   which exits when the server closes. (RT-NET-09 slowloris, Q235)
