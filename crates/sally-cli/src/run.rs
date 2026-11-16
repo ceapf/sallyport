@@ -6,9 +6,11 @@
 //! ASCII and newline, goes to stdout and stderr after the clean-check; this terminal's stdin
 //! goes to the command as UTF-8 text, one `sessions.input` at a time, each sent after the last
 //! was written. When the command ends, the session is stopped and `sally` exits with the
-//! command's code (137 if `sallyd` killed it), or 1 if any output failed the clean-check (it is
-//! shown escaped); a refused stop makes it at least 1. Ctrl-C ends `sally`; its connection's
-//! end kills the command and stops the session.
+//! command's code (137 if `sallyd` killed it); a refused stop makes it at least 1. A run that
+//! could not go on exits 2 (1 for a refusal), its line printed, and leaves the session to its
+//! connection's end. Any output that failed the clean-check (it is shown escaped) makes the exit
+//! 1 however the run ended, its line last (architect Q149, Q204). Ctrl-C ends `sally`; its
+//! connection's end kills the command and stops the session.
 //!
 //! Nothing here asks for a decision: approvals are answered in another terminal (`sally
 //! approve`). Anything prompt-like in the run terminal is the command's output; the exit status
@@ -134,20 +136,18 @@ pub fn sandbox_run(
         Ok(s) => s,
         Err(e) => return failed(&e, o.err),
     };
-    // A run that failed leaves the session to its connection's end: `sally` exits, and the
-    // bound session stops (`disconnect`).
-    let (code, dirty) = match attach(c, &session.id, argv, stdin, o) {
-        Ok(ended) => ended,
-        Err(code) => return code,
-    };
-    let code = if stop(c, &session.id, o.err) {
-        code
-    } else {
-        code.max(EXIT_REFUSED)
+    let (ran, dirty) = attach(c, &session.id, argv, stdin, o);
+    let code = match ran {
+        Ok(code) if stop(c, &session.id, o.err) => code,
+        Ok(code) => code.max(EXIT_REFUSED),
+        // A run that failed leaves the session to its connection's end: `sally` exits, and the
+        // bound session stops (`disconnect`).
+        Err(code) => code,
     };
     if dirty {
-        // Q149: dirty is EXIT_REFUSED, whatever the command's code: a run that showed
-        // something escaped is refused, never mistaken for the command's own result.
+        // Q149, Q204: dirty is EXIT_REFUSED, whatever the command's code and however the run
+        // ended: a run that showed something escaped is refused, never mistaken for the
+        // command's own result. Its own line, if any, came first.
         let _ = writeln!(
             o.err,
             "sally: some output was not clean; it is shown escaped"
@@ -157,19 +157,24 @@ pub fn sandbox_run(
     code
 }
 
-/// Attaches `argv` and relays until its reply: `Ok` with the command's exit code and whether any
-/// output failed the clean-check; `Err` with the exit code of a failed run.
+/// Attaches `argv` and relays until its reply: `Ok` with the command's exit code, or `Err` with
+/// the exit code of a failed run (its line printed); beside it, whether any output failed the
+/// clean-check, however the run ended.
 fn attach(
     c: &mut Client,
     id: &str,
     argv: &[String],
     stdin: impl Read + Send + 'static,
     o: &mut Out<'_>,
-) -> Result<(u8, bool), u8> {
-    let attach = c
-        .send(method::SESSIONS_ATTACH, json!({"id": id, "argv": argv}))
-        .map_err(|e| failed(&e, o.err))?;
-    let writer = c.writer(INPUT_IDS).map_err(|e| failed(&e, o.err))?;
+) -> (Result<u8, u8>, bool) {
+    let attach = match c.send(method::SESSIONS_ATTACH, json!({"id": id, "argv": argv})) {
+        Ok(a) => a,
+        Err(e) => return (Err(failed(&e, o.err)), false),
+    };
+    let writer = match c.writer(INPUT_IDS) {
+        Ok(w) => w,
+        Err(e) => return (Err(failed(&e, o.err)), false),
+    };
     let (permits, granted) = mpsc::sync_channel(1);
     let _ = permits.try_send(());
     let invalid = Arc::new(AtomicBool::new(false));
@@ -186,8 +191,8 @@ fn attach(
     if shown.open {
         let _ = writeln!(o.err);
     }
-    match end {
-        Relayed::Reply(result) => ended(result, o).map(|code| (code, shown.dirty)),
+    let ran = match end {
+        Relayed::Reply(result) => ended(result, o),
         Relayed::Failed(e) => Err(failed(&e, o.err)),
         Relayed::NotUtf8 => {
             let _ = writeln!(
@@ -196,7 +201,8 @@ fn attach(
             );
             Err(EXIT_FAILED)
         }
-    }
+    };
+    (ran, shown.dirty)
 }
 
 /// What the command's output did to the terminal so far.

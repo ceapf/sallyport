@@ -82,6 +82,8 @@ struct Script {
     before_stop: Vec<Value>,
     /// The stop is refused `stop-failed`.
     stop_refused: bool,
+    /// The attach's reply is a refusal for this reason instead of `reply`.
+    attach_refused: Option<&'static str>,
 }
 
 /// A successful reply to request `id`.
@@ -140,7 +142,10 @@ fn daemon(tag: &str, s: Script) -> Daemon {
                         break;
                     }
                     if !s.wait_for_eof {
-                        send(&json!({"jsonrpc": "2.0", "id": attach_id, "result": s.reply}));
+                        send(&match s.attach_refused {
+                            Some(why) => refusal(&attach_id, why),
+                            None => json!({"jsonrpc": "2.0", "id": attach_id, "result": s.reply}),
+                        });
                         attach_id = Value::Null;
                     }
                 }
@@ -532,30 +537,220 @@ fn dirty_output_is_escaped_and_prompt_like_output_is_only_output() {
     assert_eq!(err, "");
 }
 
-/// Architect Q149: dirty output exits `EXIT_REFUSED` whatever the command's own code, a code
-/// above it and a kill included (ARCHITECTURE "refuses (exit 1)").
-#[test]
-fn dirty_output_exits_refused_whatever_the_commands_code() {
-    for (tag, reply) in [
-        ("dirty-3", json!({"exit_code": 3})),
-        ("dirty-255", json!({"exit_code": 255})),
-        ("dirty-killed", json!({"killed": "session-stop"})),
-    ] {
-        let d = daemon(
-            tag,
+/// Output that fails the clean-check, and its clean twin.
+const DIRTY: &str = "a\u{1b}[2Jb\n";
+const CLEAN: &str = "ok\n";
+/// `sally`'s line for dirty output.
+const NOT_CLEAN: &str = "sally: some output was not clean; it is shown escaped\n";
+/// What stderr starts with after [`DIRTY`]: shown escaped, its newline too, it does not end its
+/// line, so `sally` ends it before its own lines.
+const AFTER_DIRTY: &str = "\n";
+
+/// One way a run can end after its output: the script after the output, the clean run's code
+/// and own stderr, and whether the run asks for the stop.
+struct End {
+    tag: &'static str,
+    script: fn(Vec<Value>) -> Script,
+    code: u8,
+    own: &'static str,
+    stops: bool,
+}
+
+/// The attach sends `at_attach`, then replies `reply` at once.
+fn replying(reply: Value, at_attach: Vec<Value>) -> Script {
+    Script {
+        at_attach,
+        reply,
+        ..Script::default()
+    }
+}
+
+const ENDS: [End; 7] = [
+    End {
+        tag: "exit-3",
+        script: |a| replying(json!({"exit_code": 3}), a),
+        code: 3,
+        own: "",
+        stops: true,
+    },
+    End {
+        tag: "exit-255",
+        script: |a| replying(json!({"exit_code": 255}), a),
+        code: 255,
+        own: "",
+        stops: true,
+    },
+    End {
+        tag: "killed",
+        script: |a| replying(json!({"killed": "session-stop"}), a),
+        code: EXIT_KILLED,
+        own: "sally: the command was killed: the session stopped\n",
+        stops: true,
+    },
+    End {
+        tag: "out-of-range",
+        script: |a| replying(json!({"exit_code": 300}), a),
+        code: EXIT_FAILED,
+        own: "sally: sallyd sent an exit code out of range (300)\n",
+        stops: false,
+    },
+    End {
+        tag: "closed",
+        script: |at_attach| Script {
+            at_attach,
+            close_at_attach: true,
+            ..Script::default()
+        },
+        code: EXIT_FAILED,
+        own: "sally: sallyd closed the connection\n",
+        stops: false,
+    },
+    End {
+        tag: "stray",
+        script: |mut at_attach| {
+            at_attach.push(reply_to(INPUT_IDS - 1));
             Script {
-                at_attach: vec![note("stdout", "a\u{1b}[2Jb\n")],
-                reply,
+                at_attach,
+                wait_for_eof: true,
+                ..Script::default()
+            }
+        },
+        code: EXIT_FAILED,
+        own: "sally: sallyd sent an unexpected frame\n",
+        stops: false,
+    },
+    End {
+        tag: "attach-refused",
+        script: |at_attach| Script {
+            at_attach,
+            attach_refused: Some("exec-failed"),
+            ..Script::default()
+        },
+        code: EXIT_REFUSED,
+        own: "sally: refused: exec-failed\n",
+        stops: false,
+    },
+];
+
+/// Architect Q149, Q204: dirty output exits `EXIT_REFUSED` however the run ended (the
+/// command's code, a kill, a code out of range, a lost connection, a stray frame, a refused
+/// attach). The run's own line comes first and the not-clean line last; a clean run keeps its
+/// code and prints no not-clean line. Only a run that got its reply asks for the stop.
+#[test]
+fn dirty_output_exits_refused_however_the_run_ended() {
+    for e in &ENDS {
+        for (dirty, text) in [(true, DIRTY), (false, CLEAN)] {
+            let tag = format!("{}-{dirty}", e.tag);
+            let mut d = daemon(&tag, (e.script)(vec![note("stdout", text)]));
+            // Stdin sends nothing until the run is over: an unread input at the fake's close
+            // would reset the connection instead of ending it.
+            let (open, stdin) = UnixStream::pair().unwrap();
+            let (code, _, err) = run_with(&d, &tag, stdin);
+            drop(open);
+            let reqs = d.requests();
+            if dirty {
+                assert_eq!(code, EXIT_REFUSED, "{tag}");
+                assert_eq!(err, format!("{AFTER_DIRTY}{}{NOT_CLEAN}", e.own), "{tag}");
+            } else {
+                assert_eq!(code, e.code, "{tag}");
+                assert_eq!(err, e.own, "{tag}");
+            }
+            assert_eq!(
+                methods(&reqs).contains(&"sessions.stop"),
+                e.stops,
+                "{tag}: {reqs:?}"
+            );
+        }
+    }
+}
+
+/// Stdout that signals once something was written to it.
+struct Signalling(Vec<u8>, mpsc::SyncSender<()>);
+
+impl std::io::Write for Signalling {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.extend_from_slice(b);
+        let _ = self.1.try_send(());
+        Ok(b.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Stdin whose one read waits until the output was shown, then brings bytes that are not UTF-8.
+struct AfterShown(mpsc::Receiver<()>);
+
+impl Read for AfterShown {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let _ = self.0.recv();
+        buf[0] = 0xff;
+        Ok(1)
+    }
+}
+
+/// Architect Q148, Q204: stdin that turns out not to be UTF-8 after dirty output exits
+/// `EXIT_REFUSED`, its own line first; after clean output, `EXIT_FAILED`. No stop is asked.
+#[test]
+fn dirty_output_then_stdin_not_utf8_exits_refused() {
+    for (dirty, text) in [(true, DIRTY), (false, CLEAN)] {
+        let tag = format!("binary-after-{dirty}");
+        let mut d = daemon(
+            &tag,
+            Script {
+                at_attach: vec![note("stdout", text)],
+                reply: json!({"exit_code": 0}),
+                wait_for_eof: true,
                 ..Script::default()
             },
         );
-        let (code, _, err) = run(&d, tag, Vec::new());
-        assert_eq!(code, EXIT_REFUSED, "{tag}");
-        assert!(
-            err.ends_with("sally: some output was not clean; it is shown escaped\n"),
-            "{tag}: {err}"
+        // Stdin turns invalid only once the output was written: `show` marks it dirty on the
+        // same thread before the relay reads again.
+        let (shown, wait) = mpsc::sync_channel(1);
+        let mut c = Client::connect(&d.path).unwrap();
+        let mut out = Signalling(Vec::new(), shown);
+        let mut err = Vec::new();
+        let m = manifest(&tag);
+        let code = sandbox_run(
+            &mut c,
+            &m,
+            &["sh".to_owned()],
+            AfterShown(wait),
+            &mut Out {
+                out: &mut out,
+                err: &mut err,
+            },
         );
+        drop(c);
+        let _ = std::fs::remove_file(&m);
+        let err = String::from_utf8(err).unwrap();
+        let own = "sally: stdin is not UTF-8 text; the command was ended\n";
+        if dirty {
+            assert_eq!(
+                (code, err),
+                (EXIT_REFUSED, format!("{AFTER_DIRTY}{own}{NOT_CLEAN}"))
+            );
+        } else {
+            assert_eq!((code, err.as_str()), (EXIT_FAILED, own));
+        }
+        assert!(!methods(&d.requests()).contains(&"sessions.stop"));
     }
+}
+
+/// A refused stop makes the code at least `EXIT_REFUSED`, and keeps a higher one.
+#[test]
+fn a_refused_stop_keeps_a_higher_code() {
+    let d = daemon(
+        "stop-refused-3",
+        Script {
+            reply: json!({"exit_code": 3}),
+            stop_refused: true,
+            ..Script::default()
+        },
+    );
+    let (code, _, err) = run(&d, "stop-refused-3", Vec::new());
+    assert_eq!((code, err.as_str()), (3, "sally: refused: stop-failed\n"));
 }
 
 /// Architect Q148: stdin that is not UTF-8 ends the run without an end of input: the

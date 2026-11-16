@@ -701,9 +701,13 @@ request is `-32000` with `data`
     driven. Absent, a session lives until it is stopped.
   - `sally sandbox run --manifest <file> -- <cmd>…` is the CLI's line mode: a bound create, one
     attach, stdin relayed as inputs, output printed through `clean::text`, then `sessions.stop`.
-    It exits with the command's code, 137 for a kill (`EXIT_KILLED`), and refuses (exit 1) when
-    any output failed the clean-check. Anything prompt-like in that terminal is sandbox output:
-    the exit status and `sally audit tail` are authoritative (Q149).
+    It exits with the command's code, 137 for a kill (`EXIT_KILLED`); a refused stop makes it at
+    least 1. It refuses (exit 1) when any output failed the clean-check, however the run ended:
+    a run that could not go on (a lost connection, a stray frame, a refused attach, stdin that
+    is not UTF-8, a code outside 0–255) still prints its own line first, and the not-clean line
+    comes last. Exit 2 therefore means the run could not go on and no output was dirty.
+    Anything prompt-like in that terminal is sandbox output: the exit status and `sally audit
+    tail` are authoritative (Q149, Q204).
 - `sessions.stop`: an unknown id is `unknown-session` (`session.refuse`); a container not
   confirmed gone is `stop-failed` (`session.refuse` in the control log: the session's own log
   is sealed by then).

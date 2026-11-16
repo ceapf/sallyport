@@ -7,6 +7,15 @@
 //! The binary (`main.rs`) parses arguments and calls one command here; every command takes the
 //! client (if any) and the writers it prints to, so each is tested without a terminal. A
 //! command line that does not parse gets fixed text ([`usage`]).
+//!
+//! Exit codes are [`EXIT_OK`], [`EXIT_REFUSED`] and [`EXIT_FAILED`], with one exception:
+//! `sally sandbox run` ([`run`]; architect Q149, Q204) exits with the sandboxed command's own
+//! code (0–255), or [`run::EXIT_KILLED`] (137) when `sallyd` killed the command. A refused stop
+//! makes that code at least `EXIT_REFUSED`. A run that could not go on, or a code outside
+//! 0–255, is `EXIT_FAILED` (or `EXIT_REFUSED` for a refusal) when no output was dirty. Any
+//! output that failed the clean-check makes the exit `EXIT_REFUSED`, whatever the command's
+//! code and however the run ended. The exit status, not anything the command printed, is
+//! authoritative.
 #![forbid(unsafe_code)]
 
 pub mod approve;
@@ -21,12 +30,6 @@ pub mod secrets;
 pub mod usage;
 
 /// The command did what was asked.
-///
-/// `sally sandbox run` is the exception to the codes below: it exits with the sandboxed
-/// command's own code (0–255), [`run::EXIT_KILLED`] (137) when `sallyd` killed the command,
-/// `EXIT_REFUSED` when any output failed the clean-check (whatever the command's code), at
-/// least `EXIT_REFUSED` when the stop was refused, and `EXIT_FAILED` when the run could not go
-/// on or the code is outside 0–255 (architect Q149). The exit status, not anything the command printed, is authoritative.
 pub const EXIT_OK: u8 = 0;
 /// `sallyd` refused, or something was not shown (a cut list, text that failed the
 /// clean-check), or a prompt was denied because the terminal closed. Locally: an invalid
