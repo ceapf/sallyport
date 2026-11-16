@@ -351,6 +351,71 @@ async fn a_long_target_is_logged_escaped_and_cut_never_echoed() {
     assert_eq!(args["target_cut"], json!(true));
 }
 
+/// A session with one secret grant (`T0` on `b.mock.test`, holding [`value`]`(0)`), so the
+/// proxy holds its forms.
+fn granted() -> Rig {
+    use crate::egress::ca::{SessionTls, Validity};
+    use crate::egress::roots::Roots;
+    let v = Validity::for_session(std::time::SystemTime::now(), Duration::from_secs(60)).unwrap();
+    let roots = Roots {
+        store: Arc::new(rustls::RootCertStore::empty()),
+        pem: String::new(),
+        skipped: 0,
+        path: "/roots.pem".into(),
+    };
+    let tls = SessionTls::mint(&["b.mock.test".to_owned()], v).unwrap();
+    let creds = crate::egress::inject::testing::credentials(&["b.mock.test"]);
+    Setup {
+        grants: vec!["b.mock.test".into()],
+        interception: Some(Interception::new(tls, roots, creds).unwrap()),
+        ..Setup::default()
+    }
+    .rig()
+}
+
+/// A CONNECT target of more than 300 bytes holding `T0`'s value across the 256-byte cut. No
+/// port, so it is refused `malformed` before any lookup.
+fn straddling_connect() -> String {
+    use crate::egress::inject::testing::value;
+    let at = authority::LOGGED_TARGET_BYTES - value(0).len() / 2;
+    format!("{}{}{}.test", "h".repeat(at), value(0), "z".repeat(60))
+}
+
+/// Architect Q253: in a session with secret grants, a form in a refused CONNECT target is masked
+/// before the cut, so none of it is left.
+#[tokio::test]
+async fn a_form_across_the_cut_of_a_refused_connect_is_masked() {
+    use crate::egress::inject::testing::value;
+    let rig = granted();
+    let target = straddling_connect();
+    let got = rig.send(&connect(&target)).await;
+    assert_eq!(got, reply(Reason::Malformed));
+    let args = rig.sink.args("egress.deny");
+    let masked = target.replace(&value(0), "[REDACTED:T0]");
+    assert_eq!(args["target"], json!(masked[..256]), "{args}");
+    assert_eq!(args["target_bytes"], json!(target.len()));
+    assert_eq!(args["target_cut"], json!(true));
+    let v = value(0);
+    let run = v.as_bytes().windows(8).find(|w| {
+        args.to_string()
+            .contains(std::str::from_utf8(w).unwrap_or_default())
+    });
+    assert!(run.is_none(), "{args}");
+}
+
+/// Architect Q253: a session without secret grants has no forms to mask; its targets are cut and
+/// escaped as before.
+#[tokio::test]
+async fn a_session_without_grants_cuts_a_target_unmasked() {
+    let rig = Setup::default().rig();
+    let target = straddling_connect();
+    rig.send(&connect(&target)).await;
+    let args = rig.sink.args("egress.deny");
+    assert_eq!(args["target"], json!(target[..256]));
+    assert_eq!(args["target_bytes"], json!(target.len()));
+    assert_eq!(args["target_cut"], json!(true));
+}
+
 /// Architect Q39: a grant host the proxy cannot intercept (no session CA) is refused, never
 /// spliced, before any lookup or dial.
 #[tokio::test]
