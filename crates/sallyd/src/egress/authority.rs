@@ -134,7 +134,8 @@ fn parse_port(s: &str) -> Option<u16> {
 /// text was cut.
 #[must_use]
 // TODO(#162): a form of another live session's secret is masked only by the writer's redactor,
-// after this cut, so one that straddles the cut leaves its prefix (architect Q254).
+// after this cut and escape: one that straddles the cut leaves its prefix, and one holding a
+// byte the escape rewrites is logged whole, escaped (architect Q254, Q263).
 pub fn audit_text(raw: &str, forms: Option<&Redactor>) -> (String, usize, bool) {
     let masked = forms.map_or(Cow::Borrowed(raw), |r| r.redact_str(raw));
     let bytes = masked.as_bytes();

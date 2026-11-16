@@ -1555,8 +1555,10 @@ sallyport/
   with its own session's forms, as `[REDACTED:NAME]`, in the whole text before it is cut to
   256 bytes and escaped (`egress::authority::audit_text`, architect Q253), so no cut or escape
   can split or rewrite a form of that session's secrets; a form of another live session's
-  secret in the same text is masked only by the writer's redactor, after the cut, so one that
-  straddles byte 256 leaves its prefix (#162, Q254). `target_bytes` is the raw length and
+  secret in the same text (for a session without secret grants, any form) is masked only by
+  the writer's redactor, after the cut and the escape: one that straddles byte 256 leaves its
+  prefix, and one holding `"`, `\` or a byte outside printable ASCII is logged whole in its
+  `\xNN` spelling, which no redactor matches (#162, Q254, Q263). `target_bytes` is the raw length and
   `target_cut` says whether the masked text was cut; the method is masked, then cut to 256
   bytes, and the entry does not say it was cut (Q256). Redaction covers forms only: text that
   is not a form of a secret (a value the sandbox transformed, a CONNECT host it logs
