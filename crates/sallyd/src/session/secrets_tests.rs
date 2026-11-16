@@ -230,6 +230,60 @@ fn the_audit_writer_and_the_oplog_redact_what_is_registered() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Architect Q249: an egress entry written through a session's [`SessionRedacted`] sink is
+/// redacted with that session's own forms even when the writer's redactor no longer holds them
+/// (the state after the session's release): the sandbox-chosen `target` of `egress.request`,
+/// `egress.deny`, `egress.limit` and a dropped `egress.response` holds no form. Control: the
+/// same entries appended to the writer directly are in the clear.
+#[test]
+fn a_sessions_egress_entries_are_redacted_with_its_own_forms_after_the_release() {
+    let dir = scratch("own-forms");
+    let audit = Arc::new(SharedAudit(Mutex::new(
+        AuditWriter::open(&dir.join("audit"), Box::new(SystemClock)).unwrap(),
+    )));
+    let v = value("own");
+    let sink = SessionRedacted::over(
+        Arc::clone(&audit) as Arc<dyn AuditSink>,
+        forms("GITHUB_TOKEN", &v),
+    );
+    let entries = |mark: &str| {
+        let target = format!("/x?t={v}&m={mark}");
+        [
+            (
+                "egress.request",
+                json!({"host": "h.test", "target": target}),
+            ),
+            (
+                "egress.deny",
+                json!({"host": format!("{v}.h.test"), "target": target}),
+            ),
+            ("egress.limit", json!({"target": target, "limit": "body"})),
+            (
+                "egress.response",
+                json!({"target": target, "end": "dropped"}),
+            ),
+        ]
+        .map(|(e, a)| NewEntry::new(Actor::Sallyd, e).session("s1").args(a))
+    };
+    for e in entries("mark-own") {
+        sink.append(e, AuditLevel::Full).unwrap();
+    }
+    for e in entries("mark-raw") {
+        audit.append(e, AuditLevel::Full).unwrap();
+    }
+    let text = all_text(&dir.join("audit"));
+    let own: Vec<&str> = text.lines().filter(|l| l.contains("mark-own")).collect();
+    assert_eq!(own.len(), 4, "{text}");
+    for l in &own {
+        assert!(!l.contains(&v), "{l}");
+        assert!(l.contains("[REDACTED:GITHUB_TOKEN]"), "{l}");
+    }
+    let raw: Vec<&str> = text.lines().filter(|l| l.contains("mark-raw")).collect();
+    assert_eq!(raw.len(), 4, "{text}");
+    assert!(raw.iter().all(|l| l.contains(&v)), "control: {raw:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// An oplog writer the test reads back.
 #[derive(Clone, Default)]
 struct Lines(Arc<Mutex<Vec<u8>>>);

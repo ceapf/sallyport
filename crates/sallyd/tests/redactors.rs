@@ -1,8 +1,9 @@
 //! #85 over the real launcher and registry (architect Q219, Q220): a session's secret forms
 //! reach the logs' redactors once its egress has loaded them, and leave them only after the
 //! session's last entry: `sandbox.refuse` for a refused launch, `session.closed` (after
-//! `session.stop` and the teardown) for a session. The test sink never applies the redactor ([`Swapped`] keeps the last one
-//! swapped in), so these tests read what production's audit writer and oplog would apply.
+//! `session.stop` and the teardown) for a session. The test sink never applies the redactor
+//! ([`Swapped`] keeps the last one swapped in), so these tests read what production's audit
+//! writer and oplog would apply.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::Arc;
@@ -98,6 +99,11 @@ fn a_stopped_sessions_secrets_stay_redacted_through_its_last_entries() {
         x.events.until_parked("session.closed", 1).await;
         assert_eq!(x.redactors.sessions(), std::slice::from_ref(&a.id));
         assert_eq!(x.redacted.redact(&gh), "[REDACTED:GITHUB_TOKEN]");
+        // No stop is answered before `session.closed` is written (Q243).
+        assert!(
+            !stopping.is_finished(),
+            "the stop was answered before session.closed"
+        );
         x.events.hold(&[]);
         tokio::time::timeout(BOUND, stopping)
             .await
@@ -184,6 +190,16 @@ fn a_failed_start_releases_its_secrets_after_sandbox_stop() {
         x.events.until_parked("sandbox.stop", 1).await;
         assert_eq!(x.redactors.sessions().len(), 1);
         assert_eq!(x.redacted.redact(&gh), "[REDACTED:GITHUB_TOKEN]");
+        // Its last entry, `session.closed` (`start-failed`), is still written under the
+        // redactor, and the start has not returned yet (#94, Q242, Q245).
+        x.events.hold(&["session.closed"]);
+        x.events.until_parked("session.closed", 1).await;
+        assert_eq!(x.redactors.sessions().len(), 1);
+        assert_eq!(x.redacted.redact(&gh), "[REDACTED:GITHUB_TOKEN]");
+        assert!(
+            !starting.is_finished(),
+            "the start returned before session.closed"
+        );
         x.events.hold(&[]);
         let started = tokio::time::timeout(BOUND, starting)
             .await

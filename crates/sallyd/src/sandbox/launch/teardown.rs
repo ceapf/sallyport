@@ -7,8 +7,8 @@ use sally_core::manifest::AuditLevel;
 use serde_json::json;
 
 use super::{
-    LaunchError, Launcher, Progress, RoleRunning, RoleStopError, Running, STOP_RETRY, StopError,
-    blocking, capped,
+    Confirmed, LaunchError, Launcher, Progress, RoleRunning, RoleStopError, Running, STOP_RETRY,
+    StopError, blocking, capped,
 };
 use crate::sandbox::commands::rm_args;
 use crate::sandbox::orphans::{Orphan, orphans, ps_args};
@@ -98,8 +98,10 @@ impl Launcher {
     pub(super) async fn stop_unreceived(&self, mut running: Running) {
         let mut reported = false;
         loop {
+            // Nobody received this launch, so it gets no `session.closed` (Q245): the token is
+            // dropped.
             let e = match self.stop(running).await {
-                Ok(()) => return,
+                Ok(_) => return,
                 Err(e) => e,
             };
             if !reported {
@@ -243,13 +245,14 @@ impl Launcher {
 
     /// Stops and removes the container, discards the `.git` overlays, the profiles and the
     /// socket directory, keeps the `staged` upper directories, and releases the session's
-    /// mounts. Audits `sandbox.stop` first.
+    /// mounts. Audits `sandbox.stop` first. On success, the [`Confirmed`] token for
+    /// [`Launcher::close`].
     ///
     /// # Errors
     /// [`StopError`] when the container cannot be confirmed gone: the session keeps its claims
     /// and the error carries the handle back for a retry. A failure after that (scratch
-    /// removal) is reported too, but the session is released.
-    pub async fn stop(&self, mut r: Running) -> Result<(), Box<StopError>> {
+    /// removal) is reported too, but the session is released; it yields no token (#157).
+    pub async fn stop(&self, mut r: Running) -> Result<Confirmed, Box<StopError>> {
         let sid = r.paths.id().as_str().to_owned();
         if let Some(w) = &r.watchdog {
             w.last_reading().await;
@@ -281,9 +284,13 @@ impl Launcher {
         }
         let cleaned = self.remove_dirs(&r.paths, true).await;
         self.sessions.release(&sid);
-        audited
-            .and(cleaned)
-            .map_err(|error| Box::new(StopError { running: r, error }))
+        match audited.and(cleaned) {
+            Ok(()) => Ok(Confirmed {
+                id: sid,
+                level: r.level,
+            }),
+            Err(error) => Err(Box::new(StopError { running: r, error })),
+        }
     }
 
     /// Removes the session's scratch. Files in overlay work directories belong to the

@@ -50,7 +50,7 @@ use super::types::{CheckedRuntime, ImageRef, Installation, Role, SessionPaths, U
 use super::watchdog::{Target, WatchPlan, Watchdog, watch_plan};
 use crate::daemon::crash::CrashReporter;
 use crate::oplog::Oplog;
-use crate::session::secrets::Redactors;
+use crate::session::secrets::{Redactors, SessionRedacted};
 use crate::session::types::StopReason;
 
 mod error;
@@ -202,13 +202,17 @@ impl Running {
     pub fn paths(&self) -> &SessionPaths {
         &self.paths
     }
+}
 
-    /// The session's audit level, for its `session.closed`, which is written after
-    /// [`Launcher::stop`] has consumed the handle.
-    #[must_use]
-    pub fn level(&self) -> AuditLevel {
-        self.level
-    }
+/// Proof that a workspace's stop succeeded: its container confirmed gone, its tunnels closed,
+/// its scratch removed and its claims released. Only [`Launcher::stop`] makes one, on its Ok
+/// path, and only [`Launcher::close`] takes it, so `session.closed` and the release of the
+/// session's forms follow a confirmed stop by construction (#94, architect Q252). No `Clone`
+/// and no public constructor.
+#[derive(Debug)]
+pub struct Confirmed {
+    id: String,
+    level: AuditLevel,
 }
 
 /// What a workspace launch needs.
@@ -323,21 +327,21 @@ impl Launcher {
         })
     }
 
-    /// Session `id`'s last entry, `session.closed {reason}`, written once its teardown has
-    /// finished: its container confirmed gone and the session released (#94, architect Q242,
-    /// Q245). Then its secrets leave the logs' redactors, so nothing of the session is logged
-    /// after them (Q219). The registry calls it once per `Running` it received, after a stop
-    /// that succeeded; a launch the launcher refused or stopped itself gets none. A refused
-    /// append is an oplog line naming only the session and the event, and the forms are
-    /// released anyway: the stop is done (Q243). RT-AUD-03 (`tests/closed.rs`).
-    pub async fn close(&self, id: &str, reason: StopReason, level: AuditLevel) {
+    /// The session's last entry, `session.closed {reason}`, written once its teardown has
+    /// finished, which `done` proves (#94, architect Q242, Q245, Q252). Then its secrets leave
+    /// the logs' redactors (Q219). The registry calls it once per `Running` it received; a
+    /// launch the launcher refused or stopped itself gets none. A refused append is an oplog
+    /// line naming only the session and the event, and the forms are released anyway: the
+    /// stop is done (Q243). RT-AUD-03 (`tests/closed.rs`).
+    pub async fn close(&self, done: Confirmed, reason: StopReason) {
+        let Confirmed { id, level } = done;
         let entry = NewEntry::new(Actor::Sallyd, "session.closed")
-            .session(id)
+            .session(&id)
             .args(json!({"reason": reason.as_str()}));
         if self.audit(entry, level).await.is_err() {
-            self.unaudited("session.closed", id);
+            self.unaudited("session.closed", &id);
         }
-        self.release_secrets(id).await;
+        self.release_secrets(&id).await;
     }
 
     /// Drops session `id`'s secrets from the logs' redactors, once its last entry is written:
@@ -555,11 +559,15 @@ impl Launcher {
             req.paths.id().as_str().to_owned(),
         );
         // The forms are registered in the same closure that loaded them: no await point between,
-        // and before `net.sock` is bound or the container exists (architect Q219).
+        // and before `net.sock` is bound or the container exists (architect Q219). The session's
+        // egress entries are redacted with its own forms too, so one that lands after the
+        // release is still redacted (Q249).
         let s = blocking(move || {
-            let s = egress.prepare(&dir, s).map_err(LaunchError::Egress)?;
+            let mut s = egress.prepare(&dir, s).map_err(LaunchError::Egress)?;
             if let Some(i) = &s.interception {
-                redactors.register(&id, Arc::clone(i.credentials().redaction().forms()));
+                let forms = Arc::clone(i.credentials().redaction().forms());
+                redactors.register(&id, Arc::clone(&forms));
+                s.audit = Arc::new(SessionRedacted::over(Arc::clone(&s.audit), forms));
             }
             Ok(s)
         })

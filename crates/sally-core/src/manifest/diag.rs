@@ -147,8 +147,9 @@ pub struct Diagnostic {
 
 impl Diagnostic {
     /// Every diagnostic goes through here: path and message become single-line, bounded, and
-    /// token-looking quoted values and path segments are masked before the cut, so diagnostics are safe for the UI and the audit
-    /// log even when the user pasted a secret into the wrong field.
+    /// token-looking quoted values and path segments are masked before the cut, so diagnostics
+    /// are safe for the UI and the audit log even when the user pasted a token-looking secret
+    /// into the wrong field.
     fn new(severity: Severity, path: String, code: Code, message: &str) -> Self {
         Self {
             severity,
@@ -190,7 +191,7 @@ fn bounded(s: String) -> String {
     if s.chars().count() <= MAX_TEXT {
         return s;
     }
-    let keep = MAX_TEXT.saturating_sub(CUT.len());
+    let keep = MAX_TEXT.saturating_sub(CUT.chars().count());
     match s.char_indices().nth(keep) {
         Some((i, _)) => format!("{}{CUT}", s.get(..i).unwrap_or_default()),
         None => s,

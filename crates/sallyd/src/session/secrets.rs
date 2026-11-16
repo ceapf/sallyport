@@ -13,21 +13,53 @@
 //! redacted until both are unregistered. Nothing here loads a value, and nothing is copied: the
 //! redactors read the forms in place, and the last holder's drop wipes them.
 //!
-//! Residuals (security review of #85; architect Q244): `session.closed` is a session's last
-//! entry except an egress or watchdog append already inside its blocking write when its task
-//! was aborted (an egress connection whose shutdown grace ran out, the watchdog's drop); such an
-//! entry may land after `session.closed` and after the release, and carries hosts, counts and
-//! secret names, never a value (TODO(#156): a sealable per-session teardown handle). A launch or
-//! start task that panics after registering never releases its
-//! session's forms (TODO(#113)): its values stay redacted, and in `sallyd`'s memory, until the
-//! daemon exits.
+//! Residuals (security review of #85; architect Q244, Q251): `session.closed` is a session's
+//! last entry except entries of the egress and watchdog writers still outstanding at teardown:
+//! an append whose task was aborted while it waited for or ran its blocking write, and an
+//! `egress.response` started from a body's drop on a detached task (#72). Such an entry may
+//! land after `session.closed` and after the release (TODO(#156): a sealable per-session
+//! teardown handle). It holds the sandbox's own request text (host, target), redacted with the
+//! session's own forms by [`SessionRedacted`] whenever it lands (Q249), plus counts and secret
+//! names; watchdog entries hold no sandbox text. A launch or start task that panics after
+//! registering never releases its session's forms (TODO(#113)): its values stay redacted, and
+//! in `sallyd`'s memory, until the daemon exits.
 
 use std::sync::{Arc, Mutex};
 
-use sally_core::audit::{Redactor, SessionForms};
+use sally_core::audit::{AuditError, NewEntry, Redactor, SessionForms};
+use sally_core::manifest::AuditLevel;
 
 use crate::oplog::Oplog;
-use crate::sandbox::SharedAudit;
+use crate::sandbox::{AuditSink, SharedAudit};
+
+/// A proxy session's egress audit sink: each entry is redacted with that session's own forms
+/// before it goes on to the audit log, which redacts it again with the live sessions' union
+/// (architect Q249). An egress entry can land after the session's `session.closed` and the
+/// release of its forms (an append aborted mid-write, a dropped body's report; Q251, #156);
+/// its sandbox-chosen text (`target`, `host`) is still redacted with the session's forms. The
+/// launcher wraps the session's sink right after its egress loaded the forms. Append-only:
+/// it swaps no redactor.
+pub struct SessionRedacted {
+    inner: Arc<dyn AuditSink>,
+    redactor: Redactor,
+}
+
+impl SessionRedacted {
+    /// `inner` with every entry redacted by `forms` first.
+    #[must_use]
+    pub fn over(inner: Arc<dyn AuditSink>, forms: Arc<SessionForms>) -> Self {
+        Self {
+            inner,
+            redactor: Redactor::from_forms([forms]),
+        }
+    }
+}
+
+impl AuditSink for SessionRedacted {
+    fn append(&self, entry: NewEntry, level: AuditLevel) -> Result<(), AuditError> {
+        self.inner.append(entry.redacted(&self.redactor), level)
+    }
+}
 
 /// A log whose redactor [`Redactors`] replaces. Implemented by the audit writer behind
 /// [`SharedAudit`] and by the [`Oplog`]; `AuditSink` itself stays append-only, so no holder of

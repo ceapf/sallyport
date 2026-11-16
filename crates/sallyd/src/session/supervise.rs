@@ -15,20 +15,23 @@
 //!    in_flight}` is written, and every later write of the handle fails (an oplog line names
 //!    its session and event);
 //! 7. `Launcher::stop`, retried a bounded number of times;
-//! 8. once it succeeded (the container confirmed gone, the session released):
-//!    `session.closed {reason}`, the session's last entry, then its secrets leave the logs'
-//!    redactors (`Launcher::close`, #94, architect Q242, Q243).
+//! 8. once it succeeded (the container confirmed gone, the session released; its
+//!    `Confirmed` token): `session.closed {reason}`, the session's last entry, then its secrets
+//!    leave the logs' redactors (`Launcher::close`, #94, architect Q242, Q252); only then is
+//!    it removed from the live set and are the stops answered (Q243 as amended by Q250).
 //!
 //! So after `session.stop` no tool, approval or rpc entry of the session is written, whatever
 //! its `in_flight`: a write in flight at the deadline lands before it or fails, and a failed
 //! write means no effect. Teardown entries (`sandbox.*`, the watchdog's, egress closes) follow
-//! it, and `session.closed` follows them; the one exception is an egress or watchdog append
-//! already inside its blocking write when its task was aborted, which may land after
-//! `session.closed` and carries hosts, counts and names, never a value (Q244, TODO(#156)). A
-//! stop-failed session has no `session.closed` until a later stop succeeds; a refused
-//! `session.closed` append is an oplog line, and the stop still answers `Stopped`. A shell is
-//! killed and a fetch's
-//! exchange dropped at the stop signal, so an operation still running past the
+//! it, and `session.closed` follows them, except entries of the egress and watchdog writers
+//! still outstanding at teardown (Q244, Q251, TODO(#156)): an append whose task was aborted
+//! while it waited for or ran its blocking write, and an `egress.response` started from a
+//! body's drop on a detached task (#72). Such an entry holds the sandbox's own request text
+//! (host, target), redacted with the session's own forms whenever it lands (Q249), plus counts
+//! and secret names; watchdog entries hold no sandbox text. A stop-failed session has no
+//! `session.closed` until a later stop succeeds; a refused `session.closed` append is an oplog
+//! line, and the stop still answers `Stopped`. A shell is killed and a fetch's exchange dropped
+//! at the stop signal, so an operation still running past the
 //! bound is a file operation inside its blocking call, which is never cut: the stop then
 //! answers `Failed`, the session stays stop-failed with its claims and its watchdog, and the
 //! supervisor removes the container by itself once the operation returns (its `tool.result` is
@@ -48,7 +51,7 @@ use crate::approvals::queue::Desk;
 use crate::daemon::crash::{Crash, CrashReceiver, CrashReporter};
 use crate::rpc::listen::Handle;
 use crate::rpc::record::Recorder;
-use crate::sandbox::Running;
+use crate::sandbox::{Confirmed, Running};
 use crate::tools::ops::{Ops, STOP_DRAIN};
 
 /// `Launcher::stop` attempts per stop before the session is left stop-failed.
@@ -316,13 +319,10 @@ impl Registry {
         reason: StopReason,
         mut crashes: Option<CrashReceiver>,
     ) {
-        // Read before `stop_bounded` consumes the handle (architect Q242).
-        let level = running.level();
         let mut running = running;
         loop {
             match self.stop_bounded(running).await {
-                Ok(()) => {
-                    self.live().remove(&sid);
+                Ok(done) => {
                     if let Some(c) = crashes.as_mut() {
                         // Before the release, so a payload is still redacted (architect Q228;
                         // tests/redactors.rs `a_crash_reported_during_a_stop_is_logged_redacted`).
@@ -331,8 +331,12 @@ impl Registry {
                     // After `session.stop` (or a failed start's last entry), the teardown and
                     // the late crashes' lines: `session.closed`, then the session's secrets
                     // leave the logs' redactors, before any stop is answered (#94, architect
-                    // Q219, Q243).
-                    self.p.launcher.close(&sid, reason, level).await;
+                    // Q219, Q243 as amended by Q250).
+                    self.p.launcher.close(done, reason).await;
+                    // Listed until its last entry is written, so a shutdown asking meanwhile
+                    // waits for it (Q250); removed before the requests close, so an ask in
+                    // between is still answered here.
+                    self.live().remove(&sid);
                     requests.close();
                     while let Ok((_, reply)) = requests.try_recv() {
                         replies.extend(reply);
@@ -382,12 +386,12 @@ impl Registry {
         }
     }
 
-    /// `Launcher::stop`, at most [`STOP_ATTEMPTS`] times.
-    pub(super) async fn stop_bounded(&self, running: Running) -> Result<(), Box<Running>> {
+    /// `Launcher::stop`, at most [`STOP_ATTEMPTS`] times; the token of the one that succeeded.
+    pub(super) async fn stop_bounded(&self, running: Running) -> Result<Confirmed, Box<Running>> {
         let mut r = running;
         for attempt in 1..=STOP_ATTEMPTS {
             match self.p.launcher.stop(r).await {
-                Ok(()) => return Ok(()),
+                Ok(done) => return Ok(done),
                 Err(e) => {
                     let detail = e.error.to_string();
                     self.p.oplog.warn(

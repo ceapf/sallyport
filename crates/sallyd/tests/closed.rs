@@ -153,6 +153,85 @@ fn rt_aud_03_a_failed_start_ends_with_session_closed() {
     });
 }
 
+/// Lifts every hold of the events when dropped, so a failed assertion never leaves an append
+/// parked for good (the runtime's drop would wait for it, and the test would hang).
+struct Unhold<'a>(&'a Events);
+
+impl Drop for Unhold<'_> {
+    fn drop(&mut self) {
+        self.0.hold(&[]);
+    }
+}
+
+/// Q250 (amending Q243's order): a session stays listed until its `session.closed` is written,
+/// so a shutdown and a stop asked while that append runs both wait for it, and both are then
+/// answered `Stopped`, with `session.closed` written once. Control: with the session removed
+/// from the live set before `close` (the old order), the shutdown returns at once and the
+/// listing is empty while `session.closed` waits.
+#[test]
+fn a_session_stays_listed_until_its_session_closed_is_written() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let reg = registry(&x);
+        let s = reg.start(Arc::new(x.f.load(""))).await.unwrap();
+        x.events.hold(&["session.closed"]);
+        let _unhold = Unhold(&x.events);
+        let ask = |reg: &Arc<Registry>| {
+            let (reg, id) = (Arc::clone(reg), s.id.clone());
+            tokio::spawn(async move { reg.stop(&id, StopReason::Request).await })
+        };
+        let stopping = ask(&reg);
+        x.events.until_parked("session.closed", 1).await;
+        assert_eq!(reg.list().len(), 1, "unlisted before its last entry");
+        let shutdown = {
+            let reg = Arc::clone(&reg);
+            tokio::spawn(async move { reg.shutdown().await })
+        };
+        let asked = ask(&reg);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown returned before session.closed"
+        );
+        assert!(
+            !asked.is_finished(),
+            "a stop was answered before session.closed"
+        );
+        assert!(
+            !stopping.is_finished(),
+            "the stop was answered before session.closed"
+        );
+        x.events.hold(&[]);
+        for done in [stopping, asked] {
+            let outcome = tokio::time::timeout(BOUND, done).await.unwrap().unwrap();
+            assert_eq!(outcome, Some(StopOutcome::Stopped));
+        }
+        let unconfirmed = tokio::time::timeout(BOUND, shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(unconfirmed.is_empty(), "{unconfirmed:?}");
+        assert!(reg.list().is_empty());
+        assert_closed_last(&x, &s.id, "request");
+    });
+}
+
+/// Q245: a launch the launcher refused after its egress loaded the session's forms (here
+/// `sandbox.launch` cannot be written, the same `refused` path as any failure after `prepare`)
+/// writes no `session.closed`: `sandbox.refuse` stays its last entry, and the forms are released.
+#[test]
+fn a_launch_refused_after_its_egress_started_writes_no_session_closed() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let reg = registry(&x);
+        x.events.fail(&["sandbox.launch"]);
+        reg.start(Arc::new(x.f.load(GRANT))).await.unwrap_err();
+        assert_eq!(x.events.list(), ["sandbox.refuse"]);
+        assert!(x.redactors.sessions().is_empty(), "the forms stayed");
+        assert!(reg.list().is_empty(), "{:?}", reg.list());
+    });
+}
+
 /// Q243: a refused `session.closed` append still answers `Stopped` and releases the session's
 /// forms; one oplog line names only the session and the event, and carries no secret.
 #[test]
@@ -188,6 +267,12 @@ fn a_refused_session_closed_still_answers_stopped_and_releases_the_forms() {
 /// confirmed gone; otherwise the real one.
 fn rm_failing_podman(at: &Path, real: &Path) -> PathBuf {
     let (at, real) = (at.display(), real.display());
+    for p in [at.to_string(), real.to_string()] {
+        assert!(
+            !p.contains(['\'', '"', '\\', ' ']),
+            "the test writes {p:?} into a script unescaped"
+        );
+    }
     let script = format!(
         "#!/bin/sh\nv=; skip=\nfor a; do\n\
          if [ -n \"$skip\" ]; then skip=; continue; fi\n\

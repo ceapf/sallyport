@@ -465,15 +465,14 @@ impl Registry {
     /// supervisor that retries it on request (and at shutdown).
     async fn discard(self: &Arc<Self>, running: Running, manifest: &str) {
         let sid = running.paths().id().as_str().to_owned();
-        let level = running.level();
-        let Err(r) = self.stop_bounded(running).await else {
-            // It is gone: `session.closed`, then its forms leave the redactors (#94, architect
-            // Q219, Q245).
-            self.p
-                .launcher
-                .close(&sid, StopReason::StartFailed, level)
-                .await;
-            return;
+        let r = match self.stop_bounded(running).await {
+            Ok(done) => {
+                // It is gone: `session.closed`, then its forms leave the redactors (#94,
+                // architect Q219, Q245, Q252).
+                self.p.launcher.close(done, StopReason::StartFailed).await;
+                return;
+            }
+            Err(r) => r,
         };
         self.p.oplog.error(
             LOG,

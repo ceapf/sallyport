@@ -566,6 +566,63 @@ fn rt_sec_06b_compression_is_stripped_and_an_encoded_echo_is_refused() {
     });
 }
 
+/// RT-SEC-07, after the release (#94, architect Q249): a sandbox that knows a granted value
+/// (here it is simply given it) sends it in a request target to its grant host while the
+/// session stops. The `egress.request` append is held until the stop is done, `session.closed`
+/// is written and the session's forms have left the logs' redactors; when it lands, its
+/// `target` holds no form of the value, only `[REDACTED:GITHUB_TOKEN]`, because the session's
+/// egress sink redacts with the session's own forms. The test sink never redacts, so the
+/// per-session redaction is the only one it shows. Control (hand-checked once, uncommitted):
+/// the launcher passing the session's unwrapped sink to its egress fails it.
+#[test]
+fn rt_sec_07_a_target_written_after_the_release_holds_no_credential() {
+    rt().block_on(async {
+        let lx = Lx::new();
+        let r = session(&lx, "sec07r").await;
+        let id = lx.paths("sec07r").id().as_str().to_owned();
+        assert_eq!(lx.redactors.sessions(), std::slice::from_ref(&id));
+        lx.events.hold(&["egress.request"]);
+        let sending = {
+            let raw = get_req("mock.test", &format!("/echo-headers?t={}", gh()), "");
+            let sock = lx.paths("sec07r").workspace_sockets().join("net.sock");
+            let root = session_ca(&lx, "sec07r");
+            tokio::spawn(async move {
+                let s = connect(&sock, "mock.test").await;
+                if let Ok(mut t) = tls(s, "mock.test", &root).await {
+                    let _ = t.write_all(raw.as_bytes()).await;
+                    let mut back = Vec::new();
+                    let _ = t.read_to_end(&mut back).await;
+                }
+            })
+        };
+        lx.events.until_parked("egress.request", 1).await;
+        let done = lx.launcher.stop(r).await.unwrap();
+        lx.launcher
+            .close(done, sallyd::session::StopReason::Request)
+            .await;
+        assert!(lx.redactors.sessions().is_empty(), "the forms stayed");
+        lx.events.hold(&[]);
+        let mut request = None;
+        for _ in 0..200 {
+            let all = lx.events.all();
+            let closed = all.iter().position(|(e, _)| e == "session.closed");
+            let req = all.iter().position(|(e, _)| e == "egress.request");
+            if let (Some(c), Some(q)) = (closed, req) {
+                assert!(c < q, "control: the request landed before the release");
+                request = Some(all[q].1.clone());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let request = request.expect("the held egress.request landed");
+        let target = request["target"].as_str().unwrap_or_default().to_owned();
+        assert!(target.contains("[REDACTED:GITHUB_TOKEN]"), "{request}");
+        let found = credential_in("egress.request", &request, &forms_of(&gh()));
+        assert!(found.is_none(), "{found:?}");
+        sending.abort();
+    });
+}
+
 /// RT-SEC-07: after injected and echoed exchanges on every grant host (`Bearer`, a bare value,
 /// three `{basic}` grants, the encoded echoes of `/echo-forms`), no audit entry holds any form
 /// of any canary (each independently computed: raw, percent, base64 cores, rendered values,
