@@ -29,9 +29,33 @@ const DEEP_MARKER: &str = "[REDACTED:too-deep]";
 const STANDARD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 const URL_SAFE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
+/// Where a pattern's text lives: owned by the redactor ([`Redactor::new`]), or read in place
+/// from one of the sessions' forms it holds ([`Redactor::from_forms`]; never copied, architect
+/// Q220).
+enum Needle {
+    Owned(Secret<String>),
+    Held {
+        set: usize,
+        secret: usize,
+        form: usize,
+    },
+}
+
 struct Pattern {
-    needle: Secret<String>,
+    needle: Needle,
     placeholder: String,
+}
+
+/// The text of `needle`: its own, or the form it points at in `held`.
+fn text<'r>(held: &'r [Arc<SessionForms>], needle: &'r Needle) -> Option<&'r str> {
+    match needle {
+        Needle::Owned(s) => Some(s.expose().as_str()),
+        Needle::Held { set, secret, form } => held
+            .get(*set)
+            .and_then(|f| f.secrets.get(*secret))
+            .and_then(|(_, list)| list.get(*form))
+            .map(|s| s.expose().as_str()),
+    }
 }
 
 /// Replaces secret values (and their encodings) in strings and JSON values.
@@ -39,6 +63,8 @@ pub struct Redactor {
     secrets: usize,
     /// Longest first, so a secret that contains another is replaced whole.
     patterns: Vec<Pattern>,
+    /// The sessions' forms the [`Needle::Held`] patterns read.
+    held: Vec<Arc<SessionForms>>,
 }
 
 impl fmt::Debug for Redactor {
@@ -73,18 +99,65 @@ impl Redactor {
             count += 1;
             let placeholder = format!("[REDACTED:{name}]");
             for needle in forms(value.as_bytes(), value) {
-                if !patterns.iter().any(|p| p.needle.expose() == &needle) {
+                if !patterns
+                    .iter()
+                    .any(|p| text(&[], &p.needle) == Some(&needle))
+                {
                     patterns.push(Pattern {
-                        needle: Secret::new(needle),
+                        needle: Needle::Owned(Secret::new(needle)),
                         placeholder: placeholder.clone(),
                     });
                 }
             }
         }
-        patterns.sort_by_key(|p| std::cmp::Reverse(p.needle.expose().len()));
+        patterns.sort_by_key(|p| std::cmp::Reverse(text(&[], &p.needle).map_or(0, str::len)));
         Self {
             secrets: count,
             patterns,
+            held: Vec::new(),
+        }
+    }
+
+    /// The patterns of every form in `sets`: the live sessions' secrets, as the egress built
+    /// them (sally-core's [`secret_forms`] of each value, plus each grant's rendered header value
+    /// and `{basic}` blob). Each match becomes `[REDACTED:NAME]`. The redactor holds the
+    /// [`Arc`]s and reads the forms in place: no copy is made, and a value stays in memory while
+    /// any redactor or session holds its set (architect Q220).
+    #[must_use]
+    pub fn from_forms(sets: impl IntoIterator<Item = Arc<SessionForms>>) -> Self {
+        Self::hold(sets.into_iter().collect())
+    }
+
+    /// [`Self::from_forms`]'s work. A form already a pattern (two sessions sharing a secret) is
+    /// kept once, under the first name.
+    fn hold(held: Vec<Arc<SessionForms>>) -> Self {
+        let mut count = 0;
+        let mut patterns: Vec<Pattern> = Vec::new();
+        for (set, forms) in held.iter().enumerate() {
+            for (secret, (name, list)) in forms.secrets.iter().enumerate() {
+                if list.is_empty() {
+                    continue;
+                }
+                count += 1;
+                let placeholder = format!("[REDACTED:{name}]");
+                for (form, f) in list.iter().enumerate() {
+                    let known = patterns
+                        .iter()
+                        .any(|p| text(&held, &p.needle) == Some(f.expose().as_str()));
+                    if !known {
+                        patterns.push(Pattern {
+                            needle: Needle::Held { set, secret, form },
+                            placeholder: placeholder.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        patterns.sort_by_key(|p| std::cmp::Reverse(text(&held, &p.needle).map_or(0, str::len)));
+        Self {
+            secrets: count,
+            patterns,
+            held,
         }
     }
 
@@ -96,7 +169,9 @@ impl Redactor {
     pub fn redact_str<'s>(&self, s: &'s str) -> Cow<'s, str> {
         let mut hits: Vec<(usize, usize, &str)> = Vec::new();
         for p in &self.patterns {
-            let needle = p.needle.expose().as_str();
+            let Some(needle) = text(&self.held, &p.needle) else {
+                continue;
+            };
             for (start, _) in s.match_indices(needle) {
                 hits.push((
                     start,
@@ -175,10 +250,8 @@ impl Redactor {
 /// The forms of one session's secrets, built once at launch and shared, never copied: the type
 /// can only be held through the [`Arc`] [`SessionForms::build`] returns, it has no `Clone`,
 /// `Default` or `Serialize`, and every form is a [`Secret`], so the bytes are wiped when the last
-/// holder drops. The egress proxy's response redaction reads them in place.
-///
-/// TODO(#81): the session registry registers the same `Arc` with the audit writer's redactor at
-/// session start and drops it at stop (lane B, after Task 9a-3).
+/// holder drops. The egress proxy's response redaction reads them in place, and so does the
+/// audit and operational logs' [`Redactor::from_forms`], over the sets of every live session.
 pub struct SessionForms {
     secrets: Vec<(String, Vec<Secret<String>>)>,
 }
@@ -405,6 +478,94 @@ mod tests {
         want.push("Token x".into());
         assert_eq!(got[0].1, want);
         assert_eq!(got[1], ("B".to_owned(), vec!["b-value".to_owned()]));
+    }
+
+    /// Architect Q220: on the same value, `from_forms` replaces everything `new` does (raw,
+    /// percent-encoded, JSON-escaped, and the base64 of a string holding it), the same way.
+    #[test]
+    fn from_forms_redacts_what_new_redacts() {
+        let value = format!("sp-redact-{}/ x\"y", "k".repeat(20));
+        let v = s(&value);
+        let by_value = Redactor::new([("N", value.as_str())]);
+        let by_forms = Redactor::from_forms([SessionForms::build([("N", &v, vec![])])]);
+        let mut corpus = vec![format!("a {value} b"), format!("{value}{value}")];
+        corpus.extend(
+            secret_forms(&value)
+                .iter()
+                .map(|f| format!("<{}>", f.expose())),
+        );
+        for lead in ["", "q", "qq"] {
+            let joined = format!("{lead}{value}");
+            corpus.push(base64_no_pad(joined.as_bytes(), STANDARD).to_string());
+        }
+        for text in &corpus {
+            let want = by_value.redact_str(text);
+            assert_ne!(want.as_ref(), text.as_str(), "control: new redacts {text}");
+            assert_eq!(by_forms.redact_str(text), want, "{text}");
+        }
+    }
+
+    /// The forms only the egress knows: a short secret's `{basic}` blob (its own base64 is too
+    /// short to be a pattern) and a rendered header value are replaced whole by `from_forms`.
+    #[test]
+    fn from_forms_also_redacts_the_rendered_values() {
+        let short = s("abc");
+        let blob = basic_credential("x", "abc");
+        let header = format!("Basic {}", blob.expose());
+        let unpadded = blob.expose().trim_end_matches('=').to_owned();
+        let forms = SessionForms::build([(
+            "S",
+            &short,
+            vec![s(&header), s(&unpadded), s(blob.expose())],
+        )]);
+        let r = Redactor::from_forms([forms]);
+        let text = format!("h={header}; b={}; u={unpadded}.", blob.expose());
+        assert_eq!(
+            r.redact_str(&text),
+            "h=[REDACTED:S]; b=[REDACTED:S]; u=[REDACTED:S]."
+        );
+        let by_value = Redactor::new([("S", "abc")]);
+        assert_eq!(
+            by_value.redact_str(blob.expose()),
+            blob.expose().as_str(),
+            "control: new does not know the blob"
+        );
+    }
+
+    /// Architect Q220: the forms are read in place, never copied; a form two sessions share is
+    /// one pattern, under the first name; a secret with no form is not counted.
+    #[test]
+    fn from_forms_holds_the_sets_and_reads_them_in_place() {
+        let (a, b, none) = (s("shared-value-1234"), s("own-value-56789"), s(""));
+        let one = SessionForms::build([("A", &a, vec![]), ("E", &none, vec![])]);
+        let two = SessionForms::build([("B", &a, vec![]), ("C", &b, vec![])]);
+        let r = Redactor::from_forms([Arc::clone(&one), Arc::clone(&two)]);
+        assert_eq!(Arc::strong_count(&one), 2);
+        let first = one.secrets().next().unwrap().1[0].expose().as_ptr();
+        let read: Vec<*const u8> = r
+            .patterns
+            .iter()
+            .filter_map(|p| text(&r.held, &p.needle))
+            .map(str::as_ptr)
+            .collect();
+        assert!(
+            read.contains(&first),
+            "the raw value is read where it lives"
+        );
+        assert_eq!(
+            r.redact_str("shared-value-1234 own-value-56789"),
+            "[REDACTED:A] [REDACTED:C]"
+        );
+        let forms = |v: &str| secret_forms(v).len();
+        assert_eq!(
+            format!("{r:?}"),
+            format!(
+                "Redactor {{ secrets: 3, patterns: {} }}",
+                forms("shared-value-1234") + forms("own-value-56789")
+            )
+        );
+        drop(r);
+        assert_eq!(Arc::strong_count(&one), 1);
     }
 
     #[test]
