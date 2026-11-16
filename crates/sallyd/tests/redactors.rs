@@ -1,7 +1,7 @@
 //! #85 over the real launcher and registry (architect Q219, Q220): a session's secret forms
 //! reach the logs' redactors once its egress has loaded them, and leave them only after the
-//! session's last entry: `sandbox.refuse` for a refused launch, `session.stop` and the teardown
-//! for a session. The test sink never applies the redactor ([`Swapped`] keeps the last one
+//! session's last entry: `sandbox.refuse` for a refused launch, `session.closed` (after
+//! `session.stop` and the teardown) for a session. The test sink never applies the redactor ([`Swapped`] keeps the last one
 //! swapped in), so these tests read what production's audit writer and oplog would apply.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -76,7 +76,8 @@ async fn until_released(x: &Lx) {
 }
 
 /// A stopped session's values stay redacted through its stop's own entries (`session.stop`,
-/// then the teardown's `sandbox.stop`), and leave only after them (security review M1).
+/// the teardown's `sandbox.stop`, then `session.closed`), and leave only after them (security
+/// review M1, #94).
 #[test]
 fn a_stopped_sessions_secrets_stay_redacted_through_its_last_entries() {
     rt().block_on(async {
@@ -90,6 +91,11 @@ fn a_stopped_sessions_secrets_stay_redacted_through_its_last_entries() {
             tokio::spawn(async move { reg.stop(&id, StopReason::Request).await })
         };
         x.events.until_parked("sandbox.stop", 1).await;
+        assert_eq!(x.redactors.sessions(), std::slice::from_ref(&a.id));
+        assert_eq!(x.redacted.redact(&gh), "[REDACTED:GITHUB_TOKEN]");
+        // The last entry, `session.closed`, is still written under the redactor (#94, Q242).
+        x.events.hold(&["session.closed"]);
+        x.events.until_parked("session.closed", 1).await;
         assert_eq!(x.redactors.sessions(), std::slice::from_ref(&a.id));
         assert_eq!(x.redacted.redact(&gh), "[REDACTED:GITHUB_TOKEN]");
         x.events.hold(&[]);

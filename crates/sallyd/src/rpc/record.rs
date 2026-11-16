@@ -17,7 +17,8 @@ use crate::sandbox::AuditSink;
 pub const LOGGED_BYTES: usize = 64;
 
 /// Where one session's socket entries go. Clones share one [`seal`](Recorder::seal): once it
-/// has written the session's last entry, no clone writes again.
+/// has written the handle's last entry (`session.stop`), no clone writes again. The teardown's
+/// entries and `session.closed` follow it through the launcher, never through this handle.
 #[derive(Clone)]
 pub struct Recorder {
     audit: Arc<dyn AuditSink>,
@@ -232,7 +233,7 @@ impl Recorder {
         }
     }
 
-    /// Writes the session's last entry (`session.stop`) and closes the handle: no new write
+    /// Writes the handle's last entry (`session.stop`) and closes the handle: no new write
     /// begins; those in flight get up to `bound` to end; then `last` is written, and every
     /// write after it fails, in this recorder and all its clones. A write still in flight at
     /// the bound either landed before `last` or fails. Sealed even when `last` is not written.

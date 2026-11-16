@@ -5,16 +5,20 @@
 //! their forms ([`SessionForms`]: each value's `secret_forms`, each grant's rendered header value
 //! and `{basic}` blob). The launcher registers that same [`Arc`] here right after `prepare`
 //! returns, before `net.sock` is bound or any container exists; whoever writes the session's
-//! last entry unregisters it (the launcher after `sandbox.refuse`, the registry after
-//! `session.stop` and teardown). Every change rebuilds one [`Redactor`] over the union of the
+//! last entry unregisters it (the launcher after `sandbox.refuse`; for a session,
+//! `Launcher::close` right after `session.closed`, which follows `session.stop` and the
+//! teardown, #94). Every change rebuilds one [`Redactor`] over the union of the
 //! registered sets and swaps it into each [`RedactorTarget`], under one lock, so the audit log
 //! and the operational log always redact the same set. A value two live sessions share stays
 //! redacted until both are unregistered. Nothing here loads a value, and nothing is copied: the
 //! redactors read the forms in place, and the last holder's drop wipes them.
 //!
-//! Residuals (security review of #85): an egress connection whose shutdown grace ran out may
-//! finish an audit append after the release; such entries carry hosts, counts and secret names,
-//! never a value. A launch or start task that panics after registering never releases its
+//! Residuals (security review of #85; architect Q244): `session.closed` is a session's last
+//! entry except an egress or watchdog append already inside its blocking write when its task
+//! was aborted (an egress connection whose shutdown grace ran out, the watchdog's drop); such an
+//! entry may land after `session.closed` and after the release, and carries hosts, counts and
+//! secret names, never a value (TODO(#156): a sealable per-session teardown handle). A launch or
+//! start task that panics after registering never releases its
 //! session's forms (TODO(#113)): its values stay redacted, and in `sallyd`'s memory, until the
 //! daemon exits.
 
