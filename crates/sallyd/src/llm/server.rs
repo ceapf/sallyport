@@ -41,7 +41,7 @@ use super::io::{Gate, Io};
 use super::reply::{self, Out};
 use crate::rpc::listen::{self, Peer, Server, until_true};
 use crate::rpc::rate::Rate;
-use crate::rpc::record::{Recorder, escape};
+use crate::rpc::record::{Recorder, SHORT_STYLE};
 
 /// Connections per session at once (architect Q8).
 pub const MAX_CONNECTIONS: usize = 4;
@@ -392,18 +392,22 @@ impl<B: Backend> Llm<B> {
         h: Option<&Head>,
         field: Option<&str>,
     ) -> bool {
-        let mut args = json!({"reason": reason, "status": status});
-        if let (Some(h), Some(a)) = (h, args.as_object_mut()) {
-            a.insert("method".into(), Value::from(escape(h.method.as_bytes())));
-            a.insert("path".into(), Value::from(escape(h.path.as_bytes())));
-        }
-        if let (Some(f), Some(a)) = (field, args.as_object_mut()) {
-            a.insert("field".into(), Value::from(escape(f.as_bytes())));
-        }
-        let entry = self
+        // The harness chose the method, path and field: declared, so the writer masks them whole
+        // before it cuts and escapes them (architect Q276).
+        let mut entry = self
             .record
             .entry(Actor::Sallyd, "llm.deny", Some("deny"))
-            .args(args);
+            .args(json!({"reason": reason, "status": status}));
+        if let Some(h) = h {
+            entry = entry.text("method", h.method.as_str(), SHORT_STYLE).text(
+                "path",
+                h.path.as_str(),
+                SHORT_STYLE,
+            );
+        }
+        if let Some(f) = field {
+            entry = entry.text("field", f, SHORT_STYLE);
+        }
         self.record.append(entry).await
     }
 
