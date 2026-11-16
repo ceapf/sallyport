@@ -705,9 +705,10 @@ request is `-32000` with `data`
     least 1. It refuses (exit 1) when any output failed the clean-check, however the run ended:
     a run that could not go on (a lost connection, a stray frame, a refused attach, stdin that
     is not UTF-8, a code outside 0–255) still prints its own line first, and the not-clean line
-    comes last. Dirty output therefore never exits 0 or the command's own code. A code alone
-    does not say who ended the run (a command may exit 1, 2 or 137 itself); for a clean run,
-    the `sally:` line on stderr tells them apart.
+    comes last. Dirty output therefore always exits 1, never 0. A clean run that could not go
+    on exits 2 (1 for a refusal), its own line printed. A code alone does not say who ended the
+    run (a command may exit 1, 2 or 137 itself); for a clean run, the `sally:` line on stderr
+    tells them apart.
     Anything prompt-like in that terminal is sandbox output: the exit status and `sally audit
     tail` are authoritative (Q149, Q204).
 - `sessions.stop`: an unknown id is `unknown-session` (`session.refuse`); a container not
