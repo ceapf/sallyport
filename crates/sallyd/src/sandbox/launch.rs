@@ -317,9 +317,17 @@ impl Launcher {
 
     /// Drops session `id`'s secrets from the logs' redactors, once its last entry is written:
     /// by the launcher after `sandbox.refuse`, by the registry after `session.stop` and teardown
-    /// (architect Q219). Safe to call more than once.
-    pub fn release_secrets(&self, id: &str) {
-        self.redactors.unregister(id);
+    /// (architect Q219). Safe to call more than once. Off the runtime: the swap takes the audit
+    /// writer's lock, which an append holds through its fsync.
+    pub async fn release_secrets(&self, id: &str) {
+        let (redactors, id) = (Arc::clone(&self.redactors), id.to_owned());
+        if tokio::task::spawn_blocking(move || redactors.unregister(&id))
+            .await
+            .is_err()
+        {
+            self.oplog
+                .error("sandbox", "releasing a session's secrets panicked", &[]);
+        }
     }
 
     /// The oplog line for a session's cgroup event files that stopped being readable, which
@@ -400,7 +408,7 @@ impl Launcher {
             if let Err(Ok(orphan)) = tx.send(result) {
                 let id = orphan.paths.id().as_str().to_owned();
                 this.stop_unreceived(orphan).await;
-                this.release_secrets(&id);
+                this.release_secrets(&id).await;
             }
         });
         // TODO(#113): what a panicked launch task leaves behind.

@@ -152,10 +152,14 @@ impl Registry {
             self.wait_out(&sid, &ops, &mut replies, &mut requests, in_flight)
                 .await;
         }
-        // 7.
-        self.retry_stop(sid, running, replies, requests, reason)
+        // 7. A crash reported after the reason was chosen is not lost: `retry_stop` logs it
+        // before the session's secrets leave the oplog's redactor.
+        self.retry_stop(sid, running, replies, requests, reason, Some(crashes))
             .await;
-        // A crash reported after the reason was chosen is not lost.
+    }
+
+    /// The oplog line of each crash reported after the session's reason was chosen.
+    fn late_crashes(&self, crashes: &mut CrashReceiver) {
         while let Ok(c) = crashes.try_recv() {
             self.p.oplog.error(
                 LOG,
@@ -286,7 +290,8 @@ impl Registry {
     }
 
     /// `Launcher::stop` until the container is confirmed gone: bounded attempts, then
-    /// stop-failed, retried on each later request. Answers every request it has.
+    /// stop-failed, retried on each later request. Answers every request it has. `crashes`: a
+    /// supervised session's crash reports, logged before its secrets are released.
     pub(super) async fn retry_stop(
         &self,
         sid: String,
@@ -294,16 +299,20 @@ impl Registry {
         mut replies: Vec<Reply>,
         mut requests: mpsc::Receiver<Request>,
         reason: StopReason,
+        mut crashes: Option<CrashReceiver>,
     ) {
         let mut running = running;
         loop {
             match self.stop_bounded(running).await {
                 Ok(()) => {
                     self.live().remove(&sid);
-                    // After `session.stop` (or a failed start's last entry) and the teardown:
-                    // the session's secrets leave the logs' redactors before any stop is
-                    // answered (architect Q219).
-                    self.p.launcher.release_secrets(&sid);
+                    if let Some(c) = crashes.as_mut() {
+                        self.late_crashes(c);
+                    }
+                    // After `session.stop` (or a failed start's last entry), the teardown and
+                    // the late crashes' lines: the session's secrets leave the logs' redactors
+                    // before any stop is answered (architect Q219).
+                    self.p.launcher.release_secrets(&sid).await;
                     requests.close();
                     while let Ok((_, reply)) = requests.try_recv() {
                         replies.extend(reply);

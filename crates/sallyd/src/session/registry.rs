@@ -467,7 +467,7 @@ impl Registry {
         let sid = running.paths().id().as_str().to_owned();
         let Err(r) = self.stop_bounded(running).await else {
             // Its last entry is written and it is gone (architect Q219).
-            self.p.launcher.release_secrets(&sid);
+            self.p.launcher.release_secrets(&sid).await;
             return;
         };
         self.p.oplog.error(
@@ -501,7 +501,7 @@ impl Registry {
                 Some((_, reply)) => reply.into_iter().collect(),
                 None => Vec::new(),
             };
-            this.retry_stop(sid, *r, replies, rx, StopReason::StartFailed)
+            this.retry_stop(sid, *r, replies, rx, StopReason::StartFailed, None)
                 .await;
         });
     }

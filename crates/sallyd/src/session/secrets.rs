@@ -11,6 +11,12 @@
 //! and the operational log always redact the same set. A value two live sessions share stays
 //! redacted until both are unregistered. Nothing here loads a value, and nothing is copied: the
 //! redactors read the forms in place, and the last holder's drop wipes them.
+//!
+//! Residuals (security review of #85): an egress connection whose shutdown grace ran out may
+//! finish an audit append after the release; such entries carry hosts, counts and secret names,
+//! never a value. A launch or start task that panics after registering never releases its
+//! session's forms (TODO(#113)): its values stay redacted, and in `sallyd`'s memory, until the
+//! daemon exits.
 
 use std::sync::{Arc, Mutex};
 

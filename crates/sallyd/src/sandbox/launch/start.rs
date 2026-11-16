@@ -261,7 +261,7 @@ impl Launcher {
         let refused = self
             .refused(&req.subject(), req.role(), e, req.level(), outcome)
             .await;
-        self.forget(req);
+        self.forget(req).await;
         refused
     }
 
@@ -293,7 +293,7 @@ impl Launcher {
                     self.unclaim(req);
                 }
                 let refused = self.refused(&subject, role, e, level, outcome).await;
-                self.forget(req);
+                self.forget(req).await;
                 Err(refused)
             }
         }
@@ -302,9 +302,9 @@ impl Launcher {
     /// After a refused workspace's `sandbox.refuse`, its last entry: its secrets leave the logs'
     /// redactors (architect Q219). A harness shares its session's id, so only a workspace
     /// request releases them.
-    fn forget(&self, req: &Request) {
+    async fn forget(&self, req: &Request) {
         if let Request::Workspace(r) = req {
-            self.release_secrets(r.paths.id().as_str());
+            self.release_secrets(r.paths.id().as_str()).await;
         }
     }
 
