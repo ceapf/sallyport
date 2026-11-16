@@ -436,9 +436,15 @@ impl FirstFailure {
     }
 }
 
-/// How long the tests of a client that stops reading wait for the server's write to fail: as
-/// many kernel rounds as fit, so only the slot's own return is held to a ceiling.
-const FAILS_WITHIN: Duration = Duration::from_secs(10);
+/// How long the tests of a client that stops reading wait for the server's write to fail: a
+/// liveness bound equal to the clients' own timeout. At [`MUTE_LINGER`] it leaves room for
+/// about three times the rounds measured (PROBE_NOTES), and it is the longest wait for which a
+/// passing run of the mute-client test stays within nextest's slow period.
+const FAILS_WITHIN: Duration = T;
+/// The slow period of `.config/nextest.toml` (7.5 s): a passing run past it fails the
+/// mutation baseline gate.
+const _: () =
+    assert!(FAILS_WITHIN.as_millis() + MUTE_LINGER.as_millis() + PROMPT.as_millis() <= 7500);
 
 /// Writes until a write fails, without reading and without shutting its read side: more than
 /// the buffers between it and a client that never reads hold. On the first connection, notes

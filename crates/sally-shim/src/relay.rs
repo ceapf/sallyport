@@ -244,8 +244,8 @@ half!(UnixStream);
 /// bound, as long as its reads free room in the send queue (see [`LINGER`]). A client cut this
 /// way that reads again gets what was queued for it, then an EOF (a reset instead, if it had
 /// sent bytes the relay never read): the reply cut short then ends like a complete one, and only
-/// the relayed protocol's framing tells them apart. Writes to the
-/// server are not bounded here: `sallyd` keeps its own limits.
+/// the relayed protocol's framing tells them apart. Writes to the server are not bounded here:
+/// `sallyd` keeps its own limits.
 ///
 /// # Errors
 /// Failure to bound writes to the client, to connect to `socket`, or to start the copy thread;

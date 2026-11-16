@@ -216,9 +216,10 @@ impl Drop for ScratchDir {
 
 #[test]
 fn relay_connection_bounds_writes_to_the_client_by_the_limiter_s_linger() {
-    // A linger other than the default, so the value is the limiter's; a whole number of clock
-    // ticks at every kernel tick rate (100, 250, 300, 1000 Hz), so it reads back exactly.
-    let linger = Duration::from_millis(1700);
+    // A linger other than the default, so the value is the limiter's; whole seconds, so it
+    // reads back exactly at any kernel tick rate (a fraction is rounded up to whole ticks,
+    // which at 300 Hz is not a whole number of microseconds).
+    let linger = Duration::from_secs(2);
     let dir = ScratchDir::create("wired");
     let sock = dir.0.join("u.sock");
     // The server closes at once and the client is gone, so the relay ends promptly.
@@ -244,8 +245,8 @@ fn relay_connection_bounds_writes_to_the_client_by_the_limiter_s_linger() {
 fn write_wait_bounds_each_later_write_on_a_tcp_stream() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let tcp = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-    // A whole number of clock ticks at every kernel tick rate, so it reads back exactly.
-    let wait = Duration::from_millis(1500);
+    // Whole seconds, so it reads back exactly at any kernel tick rate.
+    let wait = Duration::from_secs(3);
     tcp.write_wait(wait).unwrap();
     assert_eq!(tcp.write_timeout().unwrap(), Some(wait));
     // std refuses a zero timeout; a zero linger still bounds the write, by the smallest one
