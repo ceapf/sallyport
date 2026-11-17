@@ -175,13 +175,25 @@ fn the_reader_ends_when_its_client_is_gone() {
     t.join().unwrap();
 }
 
-/// The end of the stream is told as `Closed`, not only by the queue disconnecting.
+/// The end of the stream is told as `Closed`, not only by the queue disconnecting, and nothing
+/// follows it: the reader returns. It runs on its own thread and every wait is bounded, so a
+/// reader that queues nothing, or keeps queuing after the end, fails here instead of hanging.
 #[test]
 fn the_end_of_the_stream_is_told() {
+    let wait = Duration::from_secs(5);
     let (tx, rx) = mpsc::sync_channel(4);
-    read_frames(BufReader::new(&b"{\"method\":\"n\"}\n"[..]), &tx);
-    assert!(matches!(rx.recv().unwrap(), Ok((_, 14))));
-    assert!(matches!(rx.recv().unwrap(), Err(Error::Closed)));
+    let reader =
+        std::thread::spawn(move || read_frames(BufReader::new(&b"{\"method\":\"n\"}\n"[..]), &tx));
+    assert!(matches!(rx.recv_timeout(wait).unwrap(), Ok((_, 14))));
+    assert!(matches!(rx.recv_timeout(wait).unwrap(), Err(Error::Closed)));
+    assert!(
+        matches!(
+            rx.recv_timeout(wait),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ),
+        "nothing after the end, and the reader has returned"
+    );
+    reader.join().unwrap();
 }
 
 fn note_of(len: usize) -> Frame {

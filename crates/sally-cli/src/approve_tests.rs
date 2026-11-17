@@ -18,6 +18,19 @@ type Hook = Box<dyn FnMut(&SyncSender<Frame>)>;
 /// sending side: it still reads, so whatever the client sends after is kept).
 type Handler = Box<dyn FnMut(&Value) -> (Vec<Value>, bool) + Send>;
 
+/// How long the fake waits for the client's next request before it gives up and closes the
+/// connection. A real request comes within milliseconds; a client that never sends one then fails
+/// its test well inside cargo-mutants' 20 s minimum timeout instead of hanging it.
+const FAKE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether a read ended at [`FAKE_WAIT`] (Linux reports a socket read timeout as `WouldBlock`).
+fn timed_out(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
 /// A fake `sallyd` on a Unix socket: one connection, scripted replies, every request kept.
 struct Fake {
     path: PathBuf,
@@ -34,9 +47,17 @@ impl Fake {
         let reqs = Arc::clone(&requests);
         let thread = std::thread::spawn(move || {
             let (s, _) = listener.accept().unwrap();
+            s.set_read_timeout(Some(FAKE_WAIT)).unwrap();
             let mut w = s.try_clone().unwrap();
             for l in BufReader::new(s).lines() {
-                let Ok(l) = l else { return };
+                let l = match l {
+                    Ok(l) => l,
+                    Err(e) => {
+                        // A client that neither sends nor goes fails the test that joins this.
+                        assert!(!timed_out(&e), "the client neither sent nor went: {e}");
+                        return;
+                    }
+                };
                 let req: Value = serde_json::from_str(&l).unwrap();
                 reqs.lock().unwrap().push(req.clone());
                 let (frames, close) = handler(&req);

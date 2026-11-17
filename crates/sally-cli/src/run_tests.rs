@@ -102,6 +102,20 @@ struct Daemon {
     thread: Option<JoinHandle<Vec<Value>>>,
 }
 
+/// How long a fake waits for the client's next request before it gives up and closes the
+/// connection. A real request comes within milliseconds; a client that never sends one (an
+/// input the pump never sends, say) then fails its test well inside cargo-mutants' 20 s minimum
+/// timeout instead of hanging it.
+const FAKE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether a read ended at [`FAKE_WAIT`] (Linux reports a socket read timeout as `WouldBlock`).
+fn timed_out(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
 fn note(stream: &str, text: &str) -> Value {
     json!({"jsonrpc": "2.0", "method": "session.output",
         "params": {"id": "s-1", "stream": stream, "text": text}})
@@ -115,6 +129,7 @@ fn daemon(tag: &str, s: Script) -> Daemon {
     let listener = UnixListener::bind(&path).unwrap();
     let thread = std::thread::spawn(move || {
         let (sock, _) = listener.accept().unwrap();
+        sock.set_read_timeout(Some(FAKE_WAIT)).unwrap();
         let mut w = sock.try_clone().unwrap();
         let mut r = BufReader::new(sock);
         let mut seen = Vec::new();
@@ -122,8 +137,12 @@ fn daemon(tag: &str, s: Script) -> Daemon {
         let mut send = |v: &Value| writeln!(w, "{v}").is_ok();
         loop {
             let mut line = String::new();
-            if r.read_line(&mut line).unwrap_or(0) == 0 {
-                break;
+            match r.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {}
+                // The client neither sent nor went: `requests` fails the test.
+                Err(e) if timed_out(&e) => panic!("the client neither sent nor went: {e}"),
+                Err(_) => break,
             }
             let req: Value = serde_json::from_str(&line).unwrap();
             seen.push(req.clone());
@@ -195,8 +214,16 @@ impl Daemon {
 }
 
 impl Drop for Daemon {
+    /// A test that never asked for the requests still learns how its fake ended: a fake that
+    /// gave up on a client which neither sent nor went fails it.
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+        if let Some(t) = self.thread.take()
+            && t.join().is_err()
+            && !std::thread::panicking()
+        {
+            panic!("the fake daemon failed (see its panic above)");
+        }
     }
 }
 
@@ -790,6 +817,7 @@ fn a_refused_create_attaches_nothing() {
     let listener = UnixListener::bind(&path).unwrap();
     let t = std::thread::spawn(move || {
         let (s, _): (UnixStream, _) = listener.accept().unwrap();
+        s.set_read_timeout(Some(FAKE_WAIT)).unwrap();
         let mut w = s.try_clone().unwrap();
         let mut r = BufReader::new(s);
         let mut line = String::new();
