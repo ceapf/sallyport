@@ -147,6 +147,14 @@ fn a_socket_named_with_a_form_is_masked_in_the_refusal_detail() {
     let short = std::env::temp_dir().join(format!("sp-scan-{}", std::process::id()));
     let _ = std::fs::remove_file(&short);
     std::os::unix::fs::symlink(dir.join("home/a"), &short).unwrap();
+    // Removes the short link if anything below panics before it is removed.
+    struct Unlink(PathBuf);
+    impl Drop for Unlink {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _unlink = Unlink(short.clone());
     let _l = std::os::unix::net::UnixListener::bind(short.join(NAMED)).unwrap();
     std::fs::remove_file(&short).unwrap();
     let e = scan_mounts(&m, &ScanLimits::default()).err().unwrap();

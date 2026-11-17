@@ -41,7 +41,8 @@ fn msg(m: Value) -> Value {
 /// Architect Q306 (3): a refused key's path is shorter than the body that holds it, for every
 /// shape that puts a body-chosen key into the field, so a field is under [`MAX_BODY`]. A
 /// one-byte key is the tightest case: the path's prefix and the body's syntax around the key
-/// do not grow with it. An escaped key decodes shorter than its spelling.
+/// do not grow with it. An escaped key decodes shorter than its spelling. The shapes are
+/// listed by hand: a new `object()` call site with a body-chosen key joins this table.
 #[test]
 fn a_refused_keys_path_is_shorter_than_its_body() {
     let user = r#"{"messages":[{"role":"user"}]"#;
@@ -50,7 +51,8 @@ fn a_refused_keys_path_is_shorter_than_its_body() {
     let ten_tools = [tool; 10].join(",");
     let cases = [
         (r#"{"k":0}"#.to_owned(), "k"),
-        (r#"{"k":0}"#.to_owned(), "k"),
+        // The key spelled as a JSON escape, six bytes for one.
+        (format!(r#"{{"{}u006b":0}}"#, '\\'), "k"),
         (r#"{"messages":[{"k":0}]}"#.to_owned(), "messages[0].k"),
         (
             format!(r#"{{"messages":[{ten_users},{{"k":0}}]}}"#),

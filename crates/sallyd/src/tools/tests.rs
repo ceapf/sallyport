@@ -1302,7 +1302,9 @@ async fn a_call_after_the_close_is_denied_and_nothing_runs() {
 
 /// Architect Q289 (1), Q294 (5): the tool name of an MCP call denied at the stop stays in plain
 /// args whole, uncut and unescaped, so the writer's whole-args pass masks a live session's
-/// form in it. Control: the same args without that pass keep a run of the value.
+/// form in it. Control: the same args without that pass keep a run of the value. What it pins
+/// in production is the stop's builder keeping the name whole and raw; the test applies the
+/// whole-args pass itself, and RT-SEC-15 pins the writer's own pass.
 #[tokio::test]
 async fn an_mcp_tool_name_denied_at_the_stop_is_masked_whole() {
     let f = fx("mcp-stop", opts(all_modes()));

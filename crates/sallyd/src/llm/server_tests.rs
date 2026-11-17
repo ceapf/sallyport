@@ -893,10 +893,13 @@ fn a_denied_requests_method_path_and_field_are_masked_before_their_cut() {
     use sally_core::audit::Redactor;
     let value = "q\"u\\o\x01te-secret-0123456789";
     let union = Redactor::new([("Y", value)]);
+    // A run of the value, raw or in the style's `\xNN` spelling.
+    let spelt = sally_core::text::hex_counted(value.as_bytes(), usize::MAX);
     let run = |text: &str| {
         value
             .as_bytes()
             .windows(8)
+            .chain(spelt.as_bytes().windows(8))
             .filter_map(|w| std::str::from_utf8(w).ok())
             .any(|w| text.contains(w))
     };
@@ -934,8 +937,12 @@ fn a_refused_key_filling_the_largest_body_is_masked_before_its_cut() {
     let raw = format!("{open}{key}{close}");
     assert_eq!(raw.len(), body::MAX_BODY);
     let r = body::check(raw.as_bytes(), 4096).expect_err("an unknown key is refused");
-    assert!(r.field.len() < body::MAX_BODY);
-    assert_eq!(r.field, key, "the field is the whole key");
+    // The field is the whole key, so it is under the body by the JSON around the key.
+    assert!(
+        r.field == key,
+        "the field is not the whole key: {} bytes",
+        r.field.len()
+    );
     let e = NewEntry::new(Actor::Sallyd, "llm.deny");
     let v = deny_entry(e, r.reason.as_str(), Some(400), None, Some(&r.field)).resolved(&union);
     let shown = v["field"].as_str().expect("the field is logged");

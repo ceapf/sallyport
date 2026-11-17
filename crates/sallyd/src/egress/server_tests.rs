@@ -239,9 +239,12 @@ fn connect(target: &str) -> Vec<u8> {
 
 /// RT-SEC-15, the host case (#162, architect Q289 (2), Q301 (i)): session X, without grants,
 /// CONNECTs under the `*.mock.test` rule to a host whose label is live session Y's value. The
-/// proxy's own `egress.allow` and `egress.close` builders put the host in plain args, uncut
-/// and unescaped, so the writer's pass with Y's forms masks it whole. Control: the same flow
-/// without Y's forms logs the label.
+/// proxy's own `egress.allow` and `egress.close` builders put the host in plain args in its
+/// parsed spelling, and the writer's pass with Y's forms masks it whole. Control: the same
+/// flow without Y's forms logs the label. What it pins: the writer's whole-args pass, and a
+/// builder that keeps the label whole (dropping the host, respelling it, or cutting it short of
+/// the label fails it). A DNS-safe label holds nothing an escape would change, and a cut longer
+/// than the label changes nothing either; neither is something this test can show.
 #[tokio::test]
 async fn rt_sec_15_a_live_sessions_value_as_a_wildcard_host_is_masked_in_allow_and_close() {
     let label = format!("ylabel{}", "q7".repeat(12));

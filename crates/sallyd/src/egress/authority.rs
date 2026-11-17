@@ -191,6 +191,8 @@ mod tests {
 
     /// Architect Q302: `with_target` writes the raw length into object or `Null` args, beside
     /// the args the builder chose, and passes any other args through for the writer to refuse.
+    /// That refusal (args that are not an object beside a declared text) is pinned in
+    /// sally-core's `tests/audit.rs`, through a real writer.
     #[test]
     fn the_raw_length_joins_the_args_or_the_entry_is_refused() {
         let e = || NewEntry::new(Actor::Sallyd, "egress.deny");
@@ -229,7 +231,13 @@ mod tests {
         let shown = v["target"].as_str().unwrap();
         // The cut may fall inside the placeholder itself.
         assert!(shown.contains("[REDACTED:"), "{shown}");
-        for w in value.as_bytes().windows(8) {
+        // No run of the value, raw or in this style's spelling.
+        let spelt = sally_core::text::styled(value, Style::Hex { max: usize::MAX }).0;
+        for w in value
+            .as_bytes()
+            .windows(8)
+            .chain(spelt.as_bytes().windows(8))
+        {
             let w = std::str::from_utf8(w).unwrap();
             assert!(!shown.contains(w), "{w:?} in {shown}");
         }
