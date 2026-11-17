@@ -808,28 +808,25 @@ fn std_path_call(path: &str) -> bool {
     !CONSTRUCTORS.contains(method) && qualifiers.iter().any(|q| q.is_empty() || STD.contains(q))
 }
 
-/// `fn new` bodies in mutation scope that hold logic today, by file and `impl` type (never by
-/// line). cargo-mutants never mutates a function named `new` (Task 9a-3, Q1), so their logic is
-/// untested by the nightly. Task 13 moves each into a named function and empties this list; an
-/// entry that is clean or gone fails the guard, so the list only shrinks.
-const NEW_WITH_LOGIC: [(&str, &str); 1] = [
-    ("crates/sallyd/src/approvals/queue.rs", "Ticket"), // TODO(#87)
-];
+/// A `fn new` in mutation scope, by file and `impl` type, that delegates in one call: the guard
+/// must find it and judge it clean, so a scan that finds no `fn new` at all cannot pass.
+const CLEAN_NEW: (&str, &str) = ("crates/sallyd/src/rpc/rate.rs", "Rate");
 
 /// Architect Q12 (R3): decision logic never lives in a function named `new` in mutation scope.
+/// cargo-mutants skips a method or trait function named `new` (a free one too, by this rule), so
+/// logic there would go untested by the nightly. There is no allowlist (Q354).
 #[test]
 fn no_fn_new_in_mutation_scope_holds_logic() {
     let mut found = Vec::new();
-    let mut used = Vec::new();
+    let mut clean = Vec::new();
     for file in mutation_scope() {
         let src =
             std::fs::read_to_string(root().join(&file)).unwrap_or_else(|e| panic!("{file}: {e}"));
         let code = without_test_modules(&strip_literals(&src));
         for (ty, body) in news(&code) {
-            let Some(why) = logic_in(&body) else { continue };
-            match NEW_WITH_LOGIC.iter().find(|(f, t)| *f == file && *t == ty) {
-                Some(entry) => used.push(*entry),
-                None => found.push(format!("{file}: {ty}::new holds {why}")),
+            match logic_in(&body) {
+                Some(why) => found.push(format!("{file}: {ty}::new holds {why}")),
+                None => clean.push((file.clone(), ty)),
             }
         }
     }
@@ -838,13 +835,10 @@ fn no_fn_new_in_mutation_scope_holds_logic() {
         "move this logic into a named function (CLAUDE.md):\n{}",
         found.join("\n")
     );
-    let stale: Vec<_> = NEW_WITH_LOGIC
-        .iter()
-        .filter(|e| !used.contains(e))
-        .collect();
+    let (file, ty) = CLEAN_NEW;
     assert!(
-        stale.is_empty(),
-        "clean or gone, remove from NEW_WITH_LOGIC: {stale:?}"
+        clean.iter().any(|(f, t)| f == file && t == ty),
+        "the guard did not judge {file}: {ty}::new clean; it read {clean:?}"
     );
 }
 

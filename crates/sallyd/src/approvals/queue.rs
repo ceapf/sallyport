@@ -166,7 +166,17 @@ pub fn new(
     record: Recorder,
     approver: Option<Arc<dyn Approver>>,
 ) -> (Gate, Desk) {
-    let burst = u32::try_from(limits.max_pending).unwrap_or(u32::MAX);
+    halves(session, policy, limits, record, approver)
+}
+
+/// [`new`]'s work: both halves over one shared state, the rate bucket sized by [`burst`].
+fn halves(
+    session: String,
+    policy: Policy,
+    limits: Limits,
+    record: Recorder,
+    approver: Option<Arc<dyn Approver>>,
+) -> (Gate, Desk) {
     let inner = Arc::new(Inner {
         policy,
         limits,
@@ -180,7 +190,7 @@ pub fn new(
             latched: false,
             stopping: false,
             flooding: false,
-            rate: Rate::every(REFILL, burst),
+            rate: Rate::every(REFILL, burst(limits.max_pending)),
         }),
         calls: AtomicU64::new(0),
         deciding: Arc::new(tokio::sync::Mutex::new(())),
@@ -191,6 +201,11 @@ pub fn new(
         },
         Desk { inner },
     )
+}
+
+/// The burst of new prompts: `max_pending`, saturating at `u32::MAX` (the bucket's width).
+fn burst(max_pending: usize) -> u32 {
+    u32::try_from(max_pending).unwrap_or(u32::MAX)
 }
 
 impl Gate {

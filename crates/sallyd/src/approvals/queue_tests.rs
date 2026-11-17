@@ -996,6 +996,13 @@ async fn the_pending_bound_alone_refuses_and_refused_calls_take_no_rate_slot() {
     let _ = (hc.await, hd.await);
 }
 
+#[test]
+fn the_burst_is_max_pending_and_saturates_at_u32_max() {
+    assert_eq!(burst(7), 7);
+    assert_eq!(burst(1), 1);
+    assert_eq!(burst(usize::MAX), u32::MAX);
+}
+
 #[tokio::test(start_paused = true)]
 async fn new_prompts_come_at_most_one_per_refill_after_the_burst() {
     let f = fx(3);
