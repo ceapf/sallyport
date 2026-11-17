@@ -151,7 +151,8 @@ pub(super) fn client_builder(head: Duration) -> hyper::server::conn::http1::Buil
     b
 }
 
-/// The reply to a refusal inside the tunnel: as Task 8's [`super::super::reply`], closing the tunnel.
+/// The reply to a refusal inside the tunnel: as Task 8's [`super::super::reply`], closing the
+/// tunnel.
 pub(super) fn reply_response(reason: Reason) -> Response<Out> {
     let body = format!("{}\n", reason.as_str());
     let mut r = Response::new(Out::Reply(Some(Bytes::from(body))));
@@ -163,8 +164,7 @@ pub(super) fn reply_response(reason: Reason) -> Response<Out> {
 }
 
 /// Arguments of `egress.request` (Q34): `injected` lists the grants set on the request as
-/// `egress.request` (Q34): `injected` lists the grants set on the request as `secret:NAME`,
-/// never a value (Task 9a-3, architect D9, D13). The method and target are the sandbox's text,
+/// `secret:NAME`, never a value (Task 9a-3, architect D9, D13). The method and target are the sandbox's text,
 /// declared masked with the session's own forms; the writer masks them with every live
 /// session's forms before it cuts and escapes them (architect Q253, Q276). The method is cut to
 /// 256 bytes like the target, but the entry does not say it was (Q256).
