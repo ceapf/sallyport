@@ -55,6 +55,14 @@ line per fact, with where it was found. Check a note again before relying on it 
   detaches exec'd children. `sallyd` is not dumpable, so strace cannot read the envp of the
   `execve` calls it makes; podman is dumpable after exec, so `-e inject=execve:delay_exit=<µs>`
   holds each new process long enough to read `/proc/<pid>/environ`. (Task 14, Q120)
+- `/proc` reads of a process that exits (kernel 6.18 WSL2, probed with a child of the prober):
+  opened while alive and read after the exit, `environ` and `cmdline` each read `Ok` with
+  0 bytes. Opened once it is a zombie, `environ` fails `EACCES`, `cmdline` reads `Ok` with
+  0 bytes, and the `exe` link fails `ENOENT`. So a reader that opens `environ` just before the
+  exit records an empty environment the process never had (#187). rt_sup_04 keeps a reading
+  only when two back-to-back reads agree and the argv is not empty (Q390). Read in kernel
+  source and not observed here: during `execve`, the `exe` link names the new image before its
+  environment is set, so `environ` and `cmdline` read empty there too.
 - The OCI config, Podman 4.9.3 rootless crun: `capabilities: {}`; rlimits CORE, NOFILE, NPROC
   (the last two podman's own hard limits); hostname = 12-hex short id without `--hostname`;
   `/etc/passwd`, `/etc/group`, `/dev/shm` bind from `<graphroot>/…/userdata`, `/etc/hostname`

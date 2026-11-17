@@ -640,10 +640,120 @@ struct Seen {
     argv: String,
 }
 
+/// One raw reading of a process: its executable link, then its environment, then its argv,
+/// each as `/proc` gives it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Raw {
+    exe: PathBuf,
+    env: Vec<u8>,
+    argv: Vec<u8>,
+}
+
+/// Reads `pid` once, in the order of [`Raw`]; `None` when any part fails.
+fn raw(pid: i32) -> Option<Raw> {
+    Some(Raw {
+        exe: std::fs::read_link(format!("/proc/{pid}/exe")).ok()?,
+        env: std::fs::read(format!("/proc/{pid}/environ")).ok()?,
+        argv: std::fs::read(format!("/proc/{pid}/cmdline")).ok()?,
+    })
+}
+
+/// How long strace holds each new process after its `execve`, in microseconds, so its `/proc`
+/// entries can be read. It counts inside `sandbox::VERSION_TIMEOUT` for a version probe.
+const EXEC_HOLD_US: u64 = 1_000_000;
+
+/// Why a process's reading was not kept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Dropped {
+    /// A part of either reading failed: the process was gone.
+    Gone,
+    /// The two readings differ: the process exec'd or exited between them.
+    Unstable,
+    /// The argv is empty: the process is a zombie or not yet past `execve`.
+    NoArgv,
+}
+
+/// The reading of two back-to-back raw readings that counts (architect Q390, #187): both whole,
+/// byte-identical, with a non-empty argv. A process that exits between its reads (a zombie's
+/// `environ` and `cmdline` read back empty but `Ok`), or one caught inside `execve` before its
+/// new image has its arguments, gives no reading. The environment's content is never a
+/// criterion, so a process that really runs with an empty environment is kept and fails the
+/// equality.
+fn reading(first: Option<Raw>, second: Option<Raw>) -> Result<Raw, Dropped> {
+    let (Some(first), Some(second)) = (first, second) else {
+        return Err(Dropped::Gone);
+    };
+    if first != second {
+        return Err(Dropped::Unstable);
+    }
+    if first.argv.is_empty() {
+        return Err(Dropped::NoArgv);
+    }
+    Ok(first)
+}
+
+#[test]
+fn a_process_reading_counts_only_when_stable_and_past_exec() {
+    let full = Raw {
+        exe: PathBuf::from("/usr/bin/podman"),
+        env: b"PATH=/usr/bin\0HOME=/h\0".to_vec(),
+        argv: b"podman\0info\0".to_vec(),
+    };
+    let no_env = Raw {
+        env: Vec::new(),
+        ..full.clone()
+    };
+    let empty = Raw {
+        env: Vec::new(),
+        argv: Vec::new(),
+        ..full.clone()
+    };
+    let no_argv = Raw {
+        argv: Vec::new(),
+        ..full.clone()
+    };
+    let other_env = Raw {
+        env: b"PATH=/bin\0".to_vec(),
+        ..full.clone()
+    };
+    let other_argv = Raw {
+        argv: b"podman\0ps\0".to_vec(),
+        ..full.clone()
+    };
+    let other_exe = Raw {
+        exe: PathBuf::from("/usr/bin/crun"),
+        ..full.clone()
+    };
+    let some = |r: &Raw| Some(r.clone());
+    let cases = [
+        (some(&full), some(&full), Ok(full.clone())),
+        // A real empty environment is kept, so the equality sees it.
+        (some(&no_env), some(&no_env), Ok(no_env.clone())),
+        (some(&empty), some(&empty), Err(Dropped::NoArgv)),
+        (some(&no_argv), some(&no_argv), Err(Dropped::NoArgv)),
+        (some(&full), None, Err(Dropped::Gone)),
+        (None, some(&full), Err(Dropped::Gone)),
+        (some(&full), some(&other_env), Err(Dropped::Unstable)),
+        (some(&full), some(&other_argv), Err(Dropped::Unstable)),
+        (some(&full), some(&other_exe), Err(Dropped::Unstable)),
+    ];
+    let wrong: Vec<String> = cases
+        .into_iter()
+        .enumerate()
+        .filter_map(|(n, (first, second, want))| {
+            let got = reading(first, second);
+            (got != want).then(|| format!("case {n}: got {got:?}, want {want:?}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// The children of `parent` whose executable is one of `exes` (podman, and the runtime whose
 /// `--version` `sallyd` records at start), read from `/proc` (they, unlike `sallyd`, are
-/// dumpable).
-fn known_children(parent: i32, exes: &[&Path]) -> Vec<(i32, Seen)> {
+/// dumpable). Each is read twice and kept only under [`reading`]'s rule, also naming the
+/// executable it was picked by; otherwise the reason it was dropped. A dropped process is read
+/// again at the next poll, and one never read fails the test (every exec must be read).
+fn known_children(parent: i32, exes: &[&Path]) -> Vec<(i32, Result<Seen, Dropped>)> {
     let mut out = Vec::new();
     for e in std::fs::read_dir("/proc").unwrap().flatten() {
         let Ok(pid) = e.file_name().to_string_lossy().parse::<i32>() else {
@@ -665,26 +775,20 @@ fn known_children(parent: i32, exes: &[&Path]) -> Vec<(i32, Seen)> {
         else {
             continue;
         };
-        let (Ok(env), Ok(argv)) = (
-            std::fs::read(format!("/proc/{pid}/environ")),
-            std::fs::read(format!("/proc/{pid}/cmdline")),
-        ) else {
-            continue;
-        };
         let split = |b: &[u8]| -> Vec<String> {
             b.split(|&c| c == 0)
                 .filter(|s| !s.is_empty())
                 .map(|s| String::from_utf8_lossy(s).into_owned())
                 .collect()
         };
-        out.push((
-            pid,
-            Seen {
-                exe,
-                env: split(&env),
-                argv: split(&argv).join(" "),
-            },
-        ));
+        let kept = reading(raw(pid), raw(pid))
+            .and_then(|r| (r.exe == exe).then_some(r).ok_or(Dropped::Unstable))
+            .map(|r| Seen {
+                exe: r.exe,
+                env: split(&r.env),
+                argv: split(&r.argv).join(" "),
+            });
+        out.push((pid, kept));
     }
     out
 }
@@ -724,8 +828,10 @@ fn user_podman(env: &Env) -> (PathBuf, PathBuf) {
 /// environment and no hostile value in its environment or argv. `PATH` is never consulted
 /// (R1, architect Q128): a user-owned `podman` first on it never runs, and every podman seen is
 /// the system search's root-owned binary (this fails if `sallyd` looks at `PATH`).
-/// strace holds each new process for a moment after `execve` so `/proc/<pid>/environ` can be
-/// read. The control: the same scan finds every hostile value in `sallyd`'s own `execve`.
+/// strace holds each new process for [`EXEC_HOLD_US`] after `execve` so `/proc/<pid>/environ`
+/// can be read. A reading counts only when it is stable and past `execve`, and every exec'd pid
+/// must have one (architect Q390, #187). The control: the same scan finds every hostile value
+/// in `sallyd`'s own `execve`.
 #[test]
 fn rt_sup_04_hostile_variables_in_sallyd_s_environment_never_reach_podman() {
     let env = Env::new();
@@ -737,20 +843,9 @@ fn rt_sup_04_hostile_variables_in_sallyd_s_environment_never_reach_podman() {
     let trace = env.root.join("trace");
     let mut strace = Command::new("strace");
     strace
-        .args([
-            "-f",
-            "-qq",
-            "-v",
-            "-s",
-            "65536",
-            "-e",
-            "trace=execve",
-            "-e",
-            "inject=execve:delay_exit=1000000",
-            "-e",
-            "signal=none",
-            "-o",
-        ])
+        .args(["-f", "-qq", "-v", "-s", "65536", "-e", "trace=execve", "-e"])
+        .arg(format!("inject=execve:delay_exit={EXEC_HOLD_US}"))
+        .args(["-e", "signal=none", "-o"])
         .arg(&trace)
         .arg(env!("CARGO_BIN_EXE_sallyd"));
     let mut c = env.command(strace);
@@ -765,6 +860,9 @@ fn rt_sup_04_hostile_variables_in_sallyd_s_environment_never_reach_podman() {
     let sock = env.state().join("control.sock");
     let end = Instant::now() + Duration::from_secs(120);
     let mut seen = std::collections::BTreeMap::new();
+    let mut dropped = std::collections::BTreeMap::<i32, std::collections::BTreeSet<Dropped>>::new();
+    let mut gap = Duration::ZERO;
+    let mut last: Option<Instant> = None;
     let mut done: Option<Instant> = None;
     // Until two seconds after control.sock appeared (startup's podman calls are over).
     while done.is_none_or(|d| d.elapsed() < Duration::from_secs(2)) {
@@ -773,8 +871,19 @@ fn rt_sup_04_hostile_variables_in_sallyd_s_environment_never_reach_podman() {
         }
         assert!(Instant::now() < end, "control.sock never appeared");
         if let Some(&sallyd) = tracer.children().first() {
-            for (pid, s) in known_children(sallyd, &[&podman, &runtime]) {
-                seen.entry(pid).or_insert(s);
+            if let Some(at) = last {
+                gap = gap.max(at.elapsed());
+            }
+            last = Some(Instant::now());
+            for (pid, kept) in known_children(sallyd, &[&podman, &runtime]) {
+                match kept {
+                    Ok(s) => {
+                        seen.entry(pid).or_insert(s);
+                    }
+                    Err(why) => {
+                        dropped.entry(pid).or_default().insert(why);
+                    }
+                }
             }
         }
         if done.is_none() && sock.exists() {
@@ -785,6 +894,17 @@ fn rt_sup_04_hostile_variables_in_sallyd_s_environment_never_reach_podman() {
     let sallyd = *tracer.children().first().expect("strace runs sallyd");
     signal(sallyd, rustix::process::Signal::TERM);
     let _ = tracer.finish();
+    let later = dropped.keys().filter(|p| seen.contains_key(p)).count();
+    let diag = format!(
+        "hold {EXEC_HOLD_US} us, longest poll gap {gap:?}, dropped readings {dropped:?} \
+         ({later} of those pids read later)"
+    );
+    let unfinished = std::fs::read_to_string(&trace)
+        .unwrap()
+        .lines()
+        .filter(|l| l.contains("execve(") && l.contains("<unfinished"))
+        .count();
+    eprintln!("rt_sup_04 observer: {diag}; execve lines split <unfinished: {unfinished}");
     // R1 (architect Q128): checked first, so a `sallyd` that consults `PATH` fails here.
     assert!(!canary.exists(), "the podman first on PATH was run");
     assert!(
@@ -794,7 +914,7 @@ fn rt_sup_04_hostile_variables_in_sallyd_s_environment_never_reach_podman() {
     // R1 (architect Q127): the runtime's `--version` at start, with `PATH` alone.
     assert!(
         seen.values().any(|s| s.exe == runtime),
-        "the runtime's version probe was not seen"
+        "the runtime's version probe was not seen; {diag}"
     );
     let runtime_want: std::collections::BTreeMap<String, String> = [(
         "PATH".to_owned(),
@@ -858,7 +978,10 @@ fn rt_sup_04_hostile_variables_in_sallyd_s_environment_never_reach_podman() {
         "no exec by sallyd's children in the trace"
     );
     for pid in &blind {
-        assert!(seen.contains_key(pid), "pid {pid} exec'd unread: {blind:?}");
+        assert!(
+            seen.contains_key(pid),
+            "pid {pid} exec'd unread: {blind:?}; {diag}"
+        );
     }
     // The control: sallyd's own execve (made by strace, before sallyd hardens) shows them all.
     let own = text
