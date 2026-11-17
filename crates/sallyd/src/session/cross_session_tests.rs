@@ -10,7 +10,8 @@
 //! backslash and a non-printable byte, and straddles its cut (256, 64, `AUDIT_ACTION_CHARS`;
 //! the oplog's 4096). X runs once without grants and once with its own grant (its own pass
 //! intact). Control: the same entries in a writer the redactors never reach (the union pass
-//! removed) keep a run of Y's secret in every case.
+//! removed) keep a run of Y's secret in every case. Checked by hand once: the writer masking
+//! after it styles a declared text (sally-core `declared.rs`) fails this test too.
 
 use serde_json::Map;
 
@@ -209,8 +210,22 @@ fn rt_sec_15_no_form_of_a_live_sessions_secret_reaches_a_log_from_another_sessio
     for v in [Y_PLAIN, Y_ODD, Y_HOST] {
         assert_eq!(run_of(&logged, v), None, "a run of {v:?} in the logs");
     }
+    // Presence in each log on its own, and on every audit line of session x (each held a run
+    // of Y's secret in the control below): the text was masked, not dropped.
+    let audit_text = all_text(&dir.join("audit"));
     for name in ["Y_PLAIN", "Y_ODD", "Y_HOST"] {
-        assert!(logged.contains(&format!("[REDACTED:{name}]")), "{name}");
+        assert!(audit_text.contains(&format!("[REDACTED:{name}]")), "{name}");
+    }
+    for name in ["Y_PLAIN", "Y_ODD"] {
+        assert!(
+            lines.text().contains(&format!("[REDACTED:{name}]")),
+            "{name}"
+        );
+    }
+    let x_lines: Vec<&str> = audit_text.lines().filter(|l| l.contains("\"x\"")).collect();
+    assert!(x_lines.len() > 20, "{}", x_lines.len());
+    for l in &x_lines {
+        assert!(l.contains("[REDACTED"), "no placeholder in {l}");
     }
     // Control: without the writer's union pass, every entry keeps a run of Y's secret.
     let raw = all_text(&dir.join("control"));
