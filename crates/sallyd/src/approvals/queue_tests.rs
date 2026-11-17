@@ -3,13 +3,17 @@
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::Ordering::SeqCst;
 
-use sally_core::manifest::{ApproveGlobs, BuiltinTool, FetchWrites, MountMode, ShellPolicy};
+use sally_core::manifest::{
+    Approvals, ApproveGlobs, BuiltinTool, FetchWrites, MountMode, ShellPolicy,
+};
 
 use super::super::action::{Action, Payload, Target};
 use super::super::policy::MountRule;
+use super::super::render;
 use super::*;
+use crate::rpc::record::escape;
 use crate::rpc::testkit::{Sink, recorder};
-use sally_core::audit::NewEntry;
+use sally_core::audit::{NewEntry, Piece};
 
 /// Records what an approver is told.
 #[derive(Default)]

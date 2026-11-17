@@ -1,7 +1,8 @@
 //! The pending queue: the [`Gate`] a tool handler asks, the [`Desk`] a host client answers
 //! (SI-5; maintainer's Task 10 decisions 1–7; architect rulings Q19, Q22–Q25).
 //!
-//! TODO(#93): over the 800-line ceiling; a move-only split follows PR A.
+//! Its children: `types` (the public vocabulary), `fields` (the entries' audit fields) and
+//! `decide` (deciding a shown prompt).
 //!
 //! - **Who answers.** [`new`] returns the two halves apart. The tool handler behind `agent.sock`
 //!   holds only the `Gate` (ask, withdraw); the `Desk` (list, decide) belongs to control-side
@@ -35,103 +36,31 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use sally_core::audit::{Actor, NewEntry, Piece};
-use sally_core::manifest::Approvals;
+use sally_core::audit::{Actor, NewEntry};
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
 use super::action::{Bound, hex};
 use super::policy::{Need, Policy};
-use super::render::{self, Prompt};
+use super::render::Prompt;
 use crate::rpc::agent::Withdraw;
 use crate::rpc::rate::Rate;
-use crate::rpc::record::{Recorder, SHORT_STYLE, escape};
+use crate::rpc::record::Recorder;
 use crate::tools::STOPPING;
+
+mod decide;
+mod fields;
+mod types;
+
+pub use fields::AUDIT_ACTION_CHARS;
+pub(crate) use fields::{Fields, who};
+use fields::{add, call_denied};
+pub use types::{Approver, Client, DecideError, Decision, Limits, Refusal, Seen};
 
 /// One new prompt per this interval, on average (architect ruling Q22; tunable).
 pub const REFILL: Duration = Duration::from_secs(2);
-/// Characters of action text in an audit entry: escaped ASCII doubles at most in JSON, so the
-/// entry stays under the writer's 4 KiB (architect ruling Q24).
-pub const AUDIT_ACTION_CHARS: usize = 1024;
 /// Attempts at `getrandom(2)` before an id is unavailable (it is interrupted only by signals).
 const ID_ATTEMPTS: usize = 3;
-
-/// A human's answer to one prompt (ARCHITECTURE §4.1). v1 has no "allow for this session".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Decision {
-    /// Run this one action, once.
-    Approve,
-    /// Deny this one action.
-    Deny,
-    /// Deny this action and every pending one, and deny every later prompt of the session
-    /// without asking; actions that need no approval still run. It cannot be undone.
-    DenyAllSession,
-}
-
-impl Decision {
-    /// The wire and audit form.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Approve => "approve",
-            Self::Deny => "deny",
-            Self::DenyAllSession => "deny_all_session",
-        }
-    }
-}
-
-/// The host client that decided, from `SO_PEERCRED` on `control.sock` (never from params).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Client {
-    /// Peer uid.
-    pub uid: u32,
-    /// Peer pid.
-    pub pid: i32,
-}
-
-/// Where prompts go: the UI or CLI notifier. Answers come back through the [`Desk`]. Called
-/// from async code outside the queue's lock: implementations must not block.
-pub trait Approver: Send + Sync + 'static {
-    /// Whether a client is attached to answer (architect Q73: one that called
-    /// `approvals.watch`). Called under the queue's lock: a lock-free read. With none, every
-    /// prompt is denied `no-approver`.
-    fn attached(&self) -> bool;
-    /// A prompt is waiting.
-    fn requested(&self, prompt: &Prompt);
-    /// The session started a flood episode (one call per episode).
-    fn flood(&self, session: &str);
-    /// The shown prompt `id` is gone (decided, expired, withdrawn or dropped).
-    fn closed(&self, id: &str);
-}
-
-/// Per-session bounds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Limits {
-    /// How long a prompt waits; expiry = deny.
-    pub timeout: Duration,
-    /// Prompts waiting at once, and the burst of new prompts.
-    pub max_pending: usize,
-}
-
-impl Limits {
-    /// The manifest's `approvals`.
-    #[must_use]
-    pub fn from_manifest(a: &Approvals) -> Self {
-        Self {
-            timeout: Duration::from_secs(a.timeout.as_secs()),
-            max_pending: usize::try_from(a.max_pending).unwrap_or(usize::MAX),
-        }
-    }
-}
-
-/// Why an action does not run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Refusal {
-    /// Denied, entry written: reply `denied: <code>`.
-    Denied(&'static str),
-    /// An entry could not be written: nothing runs and no reply is sent.
-    Unrecorded,
-}
 
 /// Leave to run one action: the only input an executor takes. Not `Clone`; made only here.
 #[derive(Debug, PartialEq, Eq)]
@@ -158,46 +87,6 @@ impl Ticket {
     pub fn approval(&self) -> Option<&str> {
         self.approval.as_deref()
     }
-}
-
-/// Why a decision was not taken.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum DecideError {
-    /// No pending prompt has this id (never issued, decided, expired or withdrawn).
-    #[error("unknown-id")]
-    UnknownId,
-    /// The decision could not be audited, so it was not taken (an approval becomes a refusal).
-    #[error("audit-failed")]
-    Unrecorded,
-    /// An approve named another digest than the prompt's: it was not for this action. The
-    /// prompt stays pending.
-    #[error("digest-mismatch")]
-    DigestMismatch,
-    /// An approve of a cut prompt whose full text the client did not show, or could not be
-    /// sent ([`render::FULL_WIRE_BYTES`](super::render::FULL_WIRE_BYTES)). The prompt stays
-    /// pending.
-    #[error("full-text-not-shown")]
-    FullTextNotShown,
-}
-
-/// Which prompt an `approval.decide` entry is for.
-#[derive(Clone, Copy)]
-enum How<'a> {
-    /// The one the client answered; `full_shown` for an approval of a cut prompt.
-    Asked { full_shown: bool },
-    /// Another one, denied with the answered prompt `via` by its `deny_all_session`.
-    Via(&'a str),
-}
-
-/// What the deciding client says it showed (architect Q74), checked for an approval only: a
-/// deny needs nothing but the id. `full_shown` is a trusted client's claim, a guard against
-/// client bugs rather than a boundary.
-#[derive(Debug, Clone, Copy)]
-pub struct Seen<'a> {
-    /// The digest of the prompt the client showed.
-    pub digest: &'a str,
-    /// The client showed the full action text of a cut prompt.
-    pub full_shown: bool,
 }
 
 enum Answer {
@@ -531,55 +420,6 @@ impl Desk {
             .map(|e| Arc::clone(&e.prompt))
             .collect()
     }
-
-    /// Answers prompt `id` for `client`. The entry is written before the asker learns the
-    /// answer; a `deny_all_session` latches before its entry is written and stays latched if
-    /// that write fails (the client is told `Unrecorded`, `audit-failed`); an approval
-    /// that cannot be written is not given. Once it has taken the prompt it finishes in its own
-    /// task, so dropping this future loses no entry.
-    ///
-    /// An approve must name the digest the client showed and, for a cut prompt, say the full
-    /// text was shown (`seen`, architect Q74); refused, it leaves the prompt pending.
-    ///
-    /// # Errors
-    /// `UnknownId`, `DigestMismatch` or `FullTextNotShown` (each audited); `Unrecorded` if an
-    /// entry failed.
-    pub async fn decide(
-        &self,
-        id: &str,
-        d: Decision,
-        client: Client,
-        seen: Seen<'_>,
-    ) -> Result<(), DecideError> {
-        let inner = Arc::clone(&self.inner);
-        let turn = Arc::clone(&inner.deciding).lock_owned().await;
-        let first = match inner.take_checked(id, d, seen) {
-            Ok(e) => e,
-            Err(refused) => {
-                drop(turn);
-                let args = json!({
-                    "id": escape(id.as_bytes()), "reason": refused.to_string(),
-                    "client": who(client),
-                });
-                let entry = inner
-                    .record
-                    .entry(Actor::User, "approval.decide", Some("refuse"))
-                    .args(args);
-                return if inner.record.append(entry).await {
-                    Err(refused)
-                } else {
-                    Err(DecideError::Unrecorded)
-                };
-            }
-        };
-        let full_shown = d == Decision::Approve && first.prompt.truncated;
-        let task = tokio::spawn(async move {
-            let result = inner.finish(first, d, client, full_shown).await;
-            drop(turn);
-            result
-        });
-        task.await.unwrap_or(Err(DecideError::Unrecorded))
-    }
 }
 
 impl Inner {
@@ -590,92 +430,6 @@ impl Inner {
             st.latched = true;
             st
         })
-    }
-
-    /// Takes the shown prompt `id` out of the queue, so it is decided once; an approve whose
-    /// `seen` does not fit the prompt leaves it there (architect Q74).
-    fn take_checked(&self, id: &str, d: Decision, seen: Seen<'_>) -> Result<Entry, DecideError> {
-        let mut st = self.state();
-        let i = st
-            .pending
-            .iter()
-            .position(|e| e.announced && e.id == id)
-            .ok_or(DecideError::UnknownId)?;
-        if d == Decision::Approve {
-            let p = &st.pending.get(i).ok_or(DecideError::UnknownId)?.prompt;
-            if p.digest != seen.digest {
-                return Err(DecideError::DigestMismatch);
-            }
-            if p.truncated && (!seen.full_shown || p.full_on_wire().is_none()) {
-                return Err(DecideError::FullTextNotShown);
-            }
-        }
-        Ok(st.pending.remove(i))
-    }
-
-    /// Writes and delivers a decision on a taken prompt. A `DenyAllSession` latches the session
-    /// first (maintainer's Task 11 audit: a failed entry never leaves it open), then writes its
-    /// entry and denies every other shown prompt, each with its own entry.
-    /// `full_shown`: an approval of a cut prompt, whose full text the client showed; its entry
-    /// records that claim.
-    async fn finish(
-        &self,
-        first: Entry,
-        d: Decision,
-        client: Client,
-        full_shown: bool,
-    ) -> Result<(), DecideError> {
-        let rest: Vec<Entry> = if d == Decision::DenyAllSession {
-            let mut st = self.state();
-            st.latched = true;
-            let (rest, keep) = st.pending.drain(..).partition(|e| e.announced);
-            st.pending = keep;
-            rest
-        } else {
-            Vec::new()
-        };
-        let via = first.id.clone();
-        let mut result = Ok(());
-        if self
-            .decided(&first, d, client, How::Asked { full_shown })
-            .await
-        {
-            let answer = match d {
-                Decision::Approve => Answer::Approve,
-                Decision::Deny | Decision::DenyAllSession => Answer::Deny("denied"),
-            };
-            self.close(first, answer);
-        } else {
-            self.close(first, Answer::Unrecorded);
-            result = Err(DecideError::Unrecorded);
-        }
-        for e in rest {
-            let answer = if self.decided(&e, d, client, How::Via(&via)).await {
-                Answer::Deny("session-denied")
-            } else {
-                result = Err(DecideError::Unrecorded);
-                Answer::Unrecorded
-            };
-            self.close(e, answer);
-        }
-        result
-    }
-
-    /// Writes one `approval.decide` entry; whether it was written.
-    async fn decided(&self, e: &Entry, d: Decision, client: Client, how: How<'_>) -> bool {
-        let mut f = e.fields.clone();
-        add(&mut f.args, "id", Value::from(e.id.as_str()));
-        add(&mut f.args, "client", who(client));
-        match how {
-            How::Asked { full_shown: true } => add(&mut f.args, "full_shown", Value::Bool(true)),
-            How::Asked { full_shown: false } => {}
-            // Denied together with `v` by its deny_all_session.
-            How::Via(v) => add(&mut f.args, "via", Value::from(v)),
-        }
-        let entry = f.on(self
-            .record
-            .entry(Actor::User, "approval.decide", Some(d.as_str())));
-        self.record.append(entry).await
     }
 
     /// Queues a prompt for `bound` or says why not. Check order (architect ruling Q22): an
@@ -893,57 +647,6 @@ fn withdraw_by(why: Withdraw) -> (Actor, &'static str) {
         Withdraw::Closed => (Actor::Sallyd, "closed"),
         Withdraw::SessionStop => (Actor::Sallyd, "session-stop"),
     }
-}
-
-/// The bounded action fields of an audit entry (architect rulings Q24, Q288), from a bound
-/// action; the tools' own entries (`tool.run`, `tool.read`, `tool.result`) start from them too.
-/// The call and the digest are plain args; the tool's name and the action are declared texts,
-/// kept raw until the writer masks every raw part whole, then cuts and escapes the name in
-/// [`SHORT_STYLE`] and escapes, assembles and cuts the action at [`AUDIT_ACTION_CHARS`].
-#[derive(Clone)]
-pub(crate) struct Fields {
-    /// The plain args (`call`, `action_sha256`); a caller adds its own beside them.
-    pub(crate) args: Value,
-    tool: Arc<str>,
-    pieces: Vec<Piece>,
-}
-
-impl Fields {
-    /// The fields of `b`.
-    pub(crate) fn of(b: &Bound) -> Self {
-        Self {
-            args: json!({"call": b.call, "action_sha256": b.digest()}),
-            tool: Arc::from(b.action.tool()),
-            pieces: render::action_pieces(&b.action),
-        }
-    }
-
-    /// `entry` with these fields: the args, the declared tool and the declared action.
-    pub(crate) fn on(self, entry: NewEntry) -> NewEntry {
-        entry
-            .args(self.args)
-            .text("tool", self.tool, SHORT_STYLE)
-            .pieces("action", self.pieces, AUDIT_ACTION_CHARS)
-    }
-}
-
-/// The `tool.deny` of a call the executor could not turn into an action: the tool's name is
-/// the harness's, so it is declared (architect Q288 f, Q291) and masked before its cut.
-fn call_denied(entry: NewEntry, call: u64, tool: &str, code: &str) -> NewEntry {
-    entry
-        .args(json!({"call": call, "code": code}))
-        .text("tool", tool, SHORT_STYLE)
-}
-
-fn add(v: &mut Value, key: &str, value: Value) {
-    if let Some(o) = v.as_object_mut() {
-        o.insert(key.to_owned(), value);
-    }
-}
-
-/// A deciding client as audited: `{uid, pid}`.
-pub(crate) fn who(c: Client) -> Value {
-    json!({"uid": c.uid, "pid": c.pid})
 }
 
 fn sha256(b: &[u8]) -> String {

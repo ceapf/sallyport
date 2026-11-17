@@ -99,6 +99,7 @@ container-free tests run: unit tests, all of sally-core's `tests/`, `sallyd` `ar
   `rpc/{agent,control,control_methods,control_line,drive,attach,line,frame,json,listen,mcp,message,
   rate,record}.rs`,
   `llm/{body,head,io,reply,scripted,server}.rs`, `approvals/{action,glob,handler,hub,policy,queue,render}.rs`,
+  `approvals/queue/{decide,fields,types}.rs`,
   `tools/{args,path,tag,fs,shell,procs,mod,dac,ops,fetch,fetch_url,fetch_client,pipe}.rs`; sally-shim
   `args.rs`, `relay.rs`; sally-cli `clean.rs`, `client.rs`, `commands.rs`, `approve.rs`,
   `secrets.rs`, `local.rs`, `doctor.rs`, `usage.rs`, `drive.rs`, `run.rs` (clap definitions and
