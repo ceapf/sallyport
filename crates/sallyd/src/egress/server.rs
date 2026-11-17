@@ -589,19 +589,15 @@ fn refusal_entry(e: NewEntry, r: Refusal, seen: Seen<'_>, forms: Option<&Redacto
             Seen::Bytes(n) => {
                 obj.insert("head_bytes".into(), json!(n));
             }
-            Seen::Target(raw) => {
-                obj.insert("target_bytes".into(), json!(raw.len()));
-                target = Some(raw);
-            }
+            Seen::Target(raw) => target = Some(raw),
         }
         if let Some(f) = r.filter {
             obj.insert("filter".into(), json!(f));
         }
     }
-    let e = e.args(v);
     match target {
-        Some(raw) => authority::with_target(e, raw, forms),
-        None => e,
+        Some(raw) => authority::with_target(e, v, raw, forms),
+        None => e.args(v),
     }
 }
 

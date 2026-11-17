@@ -8,7 +8,8 @@
 //! a session without secret grants (`None`: cut as the raw text is) and with a fixed secret,
 //! masked by the session's own pass or by the writer's pass over every live session's forms
 //! (the secret's value never appears, and a cut text holds the full 256 bytes; architect Q264,
-//! Q276).
+//! Q276). In every case `target_bytes` is the raw target's length, never the masked text's
+//! (Q302).
 #![no_main]
 #![forbid(unsafe_code)]
 
@@ -20,13 +21,14 @@ use sallyd::egress::authority::{self, LOGGED_TARGET_BYTES, with_target};
 use sallyd::egress::head::{self, MAX_HEAD, Parsed};
 
 /// The target as the audit writer logs it (architect Q276, Q290): declared with the session's
-/// own pass `forms`, resolved with the writer's `writer` redactor. The text and whether it
-/// was cut.
-fn logged(raw: &str, forms: Option<&Redactor>, writer: &Redactor) -> (String, bool) {
-    let e = with_target(NewEntry::new(Actor::Sallyd, "egress.deny"), raw, forms);
-    let v = e.resolved(writer);
+/// own pass `forms`, resolved with the writer's `writer` redactor. The text, whether it was
+/// cut, and the raw length the entry reports.
+fn logged(raw: &str, forms: Option<&Redactor>, writer: &Redactor) -> (String, bool, u64) {
+    let e = NewEntry::new(Actor::Sallyd, "egress.deny");
+    let v = with_target(e, serde_json::Value::Null, raw, forms).resolved(writer);
     let text = v["target"].as_str().unwrap_or_default().to_owned();
-    (text, v["target_cut"].as_bool().unwrap_or_default())
+    let len = v["target_bytes"].as_u64().unwrap_or(u64::MAX);
+    (text, v["target_cut"].as_bool().unwrap_or_default(), len)
 }
 
 /// The fixed secret and its redactor. The value is 14 lower-case letters assembled at run time,
@@ -51,14 +53,17 @@ fuzz_target!(|data: &[u8]| {
     if let Parsed::Complete(h) = head::parse(data) {
         assert!(h.len <= MAX_HEAD && h.len <= data.len(), "head length out of range");
         let none = Redactor::default();
-        let (text, cut) = logged(h.target, None, &none);
+        let raw_len = u64::try_from(h.target.len()).unwrap_or(u64::MAX);
+        let (text, cut, len) = logged(h.target, None, &none);
         check_printable(&text);
         assert_eq!(cut, h.target.len() > LOGGED_TARGET_BYTES);
+        assert_eq!(len, raw_len, "raw length not reported");
         let (value, redactor) = secret();
         // The session's own pass, and the writer's pass over every live session's forms.
         for (forms, writer) in [(Some(redactor), &none), (None, redactor)] {
-            let (text, cut) = logged(h.target, forms, writer);
+            let (text, cut, len) = logged(h.target, forms, writer);
             check_printable(&text);
+            assert_eq!(len, raw_len, "raw length not reported");
             assert!(!text.contains(value.as_str()), "secret value in the audit text");
             assert!(!cut || text.len() >= LOGGED_TARGET_BYTES, "cut text shorter than the cut");
         }

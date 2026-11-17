@@ -7,6 +7,7 @@ use std::sync::Arc;
 use sally_core::audit::{NewEntry, Redactor};
 use sally_core::manifest::{HostError, parse_hostname};
 use sally_core::text::Style;
+use serde_json::Value;
 
 /// Most bytes of a request-target an audit entry carries; the rest is counted, not logged.
 pub const LOGGED_TARGET_BYTES: usize = 256;
@@ -147,11 +148,23 @@ pub fn own_masked(raw: &str, forms: Option<&Redactor>) -> Arc<str> {
     }
 }
 
-/// `e` with the sandbox's request-target `raw` declared as its `target`, with `target_cut`
-/// saying whether the masked text was cut. The builder puts the raw length in `target_bytes`.
+/// `e` with `args`, the raw length of the sandbox's request-target `raw` in `target_bytes`
+/// (the one place that writes it; architect Q302), and `raw` declared as its `target`, with
+/// `target_cut` saying whether the masked text was cut. `args` is an object or `Null`; any
+/// other value is passed through as it is, so the writer refuses the entry.
 #[must_use]
-pub fn with_target(e: NewEntry, raw: &str, forms: Option<&Redactor>) -> NewEntry {
-    e.text_and_cut("target", "target_cut", own_masked(raw, forms), TARGET_STYLE)
+pub fn with_target(e: NewEntry, args: Value, raw: &str, forms: Option<&Redactor>) -> NewEntry {
+    let len = Value::from(raw.len());
+    let args = match args {
+        Value::Null => serde_json::json!({ "target_bytes": len }),
+        Value::Object(mut m) => {
+            m.insert("target_bytes".into(), len);
+            Value::Object(m)
+        }
+        other => other,
+    };
+    e.args(args)
+        .text_and_cut("target", "target_cut", own_masked(raw, forms), TARGET_STYLE)
 }
 
 #[cfg(test)]
@@ -163,10 +176,30 @@ mod tests {
     /// The target as a writer with no secrets logs it: the text, the raw length, and whether
     /// it was cut. `forms` is the session's own pass.
     fn logged(raw: &str, forms: Option<&Redactor>) -> (String, usize, bool) {
-        let e = with_target(NewEntry::new(Actor::Sallyd, "egress.deny"), raw, forms);
-        let v = e.resolved(&Redactor::default());
+        let e = NewEntry::new(Actor::Sallyd, "egress.deny");
+        let v = with_target(e, Value::Null, raw, forms).resolved(&Redactor::default());
         let text = v["target"].as_str().unwrap().to_owned();
-        (text, raw.len(), v["target_cut"].as_bool().unwrap())
+        let len = usize::try_from(v["target_bytes"].as_u64().unwrap()).unwrap();
+        (text, len, v["target_cut"].as_bool().unwrap())
+    }
+
+    /// Architect Q302: `with_target` writes the raw length into object or `Null` args, beside
+    /// the args the builder chose, and passes any other args through for the writer to refuse.
+    #[test]
+    fn the_raw_length_joins_the_args_or_the_entry_is_refused() {
+        let e = || NewEntry::new(Actor::Sallyd, "egress.deny");
+        let none = Redactor::default();
+        let v = with_target(e(), Value::Null, "/abc", None).resolved(&none);
+        assert_eq!(v["target_bytes"], 4);
+        let args = serde_json::json!({"reason": "r"});
+        let v = with_target(e(), args, "/abc", None).resolved(&none);
+        assert_eq!((&v["reason"], &v["target_bytes"]), (&"r".into(), &4.into()));
+        // The raw length, not the length after the session's own pass.
+        let forms = Redactor::new([("S", "abc")]);
+        let v = with_target(e(), Value::Null, "/abc", Some(&forms)).resolved(&none);
+        assert_eq!(v["target_bytes"], 4);
+        let odd = with_target(e(), serde_json::json!([1]), "/abc", None);
+        assert_eq!(*odd.arguments(), serde_json::json!([1]));
     }
 
     fn ok(host: &str, port: u16) -> Result<Authority, AuthorityError> {

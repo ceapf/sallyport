@@ -106,11 +106,10 @@ pub(super) fn response_entry(
     let args = json!({
         "host": a.host,
         "port": a.port,
-        "target_bytes": target.len(),
         "status": status.as_u16(),
         "end": end,
         "redacted_bytes": tally.total(),
         "redacted": redacted,
     });
-    with_target(e.args(args), target, Some(r.audit()))
+    with_target(e, args, target, Some(r.audit()))
 }

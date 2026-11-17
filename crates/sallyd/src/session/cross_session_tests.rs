@@ -81,7 +81,9 @@ fn entries(v: &str, own: Option<&Redaction>) -> Vec<NewEntry> {
                 let m = hyper::http::Method::from_bytes(b"EXT").unwrap();
                 crate::egress::server::request_entry(x("egress.request"), &a, &m, &target, &[], r)
             }
-            None => authority::with_target(x("egress.deny"), &target, None),
+            None => {
+                authority::with_target(x("egress.deny"), serde_json::Value::Null, &target, None)
+            }
         });
     }
     if let Some(r) = own {

@@ -857,11 +857,10 @@ pub(crate) fn request_entry(
     let args = json!({
         "host": a.host,
         "port": a.port,
-        "target_bytes": target.len(),
         "injected": injected,
     });
     let method = own_masked(method.as_str(), Some(r.audit()));
-    with_target(e.args(args), target, Some(r.audit())).text("method", method, TARGET_STYLE)
+    with_target(e, args, target, Some(r.audit())).text("method", method, TARGET_STYLE)
 }
 
 /// A refusal inside the tunnel (Q34): reason, host, port, and the target declared as
@@ -878,12 +877,11 @@ fn inside_entry(
         "reason": reason.as_str(),
         "host": a.host,
         "port": a.port,
-        "target_bytes": target.len(),
     });
     if let (Some(obj), Some(p)) = (v.as_object_mut(), part) {
         obj.insert("part".into(), json!(p));
     }
-    with_target(e.args(v), target, Some(r.audit()))
+    with_target(e, v, target, Some(r.audit()))
 }
 
 #[path = "intercept_report.rs"]

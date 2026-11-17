@@ -317,10 +317,9 @@ fn the_session_sink_masks_a_declared_target_before_the_writers_cut() {
     // placeholder fits before it.
     let target = format!("/{}{v}", "a".repeat(229));
     let entry = |mark: &str| {
-        let e = NewEntry::new(Actor::Sallyd, "egress.request")
-            .session("s1")
-            .args(json!({"host": "h.test", "m": mark}));
-        crate::egress::authority::with_target(e, &target, None)
+        let e = NewEntry::new(Actor::Sallyd, "egress.request").session("s1");
+        let args = json!({"host": "h.test", "m": mark});
+        crate::egress::authority::with_target(e, args, &target, None)
     };
     sink.append(entry("mark-own"), AuditLevel::Full).unwrap();
     audit.append(entry("mark-raw"), AuditLevel::Full).unwrap();
