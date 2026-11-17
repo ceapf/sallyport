@@ -53,7 +53,7 @@ fn read(x: &Lx, r: &Running, dir: &std::path::Path, file: &str) -> String {
         Ok(text) => text,
         Err(e) => {
             let there = dir.is_dir();
-            // Printed before podman is asked, so a podman that stalls cannot hide it.
+            // Printed before podman is asked; podman then gets at most STATE_LIMIT.
             eprintln!(
                 "{file} in {}: {e}; directory still there: {there}",
                 dir.display()
@@ -61,31 +61,105 @@ fn read(x: &Lx, r: &Running, dir: &std::path::Path, file: &str) -> String {
             panic!(
                 "{file} in {}: {e}; directory still there: {there}; container: {}; audit: {:?}",
                 dir.display(),
-                container_state(x, r),
+                container_state(x, r, STATE_LIMIT),
                 x.events.list()
             )
         }
     }
 }
 
+/// How long a failed [`read`] waits for podman to describe the container. Generous: the failure
+/// shows under load, and a false time-out would lose the state on the run that matters.
+const STATE_LIMIT: Duration = Duration::from_secs(30);
+
 /// The container's status, exit code and OOM-killed flag from hermetic podman, or why podman
-/// could not say. Only a failed [`read`] asks, so it blocks the runtime's thread.
-fn container_state(x: &Lx, r: &Running) -> String {
+/// could not say within `limit`. Only a failed [`read`] asks, so it blocks the runtime's
+/// thread, for at most `limit`.
+fn container_state(x: &Lx, r: &Running, limit: Duration) -> String {
     let fields = "{{.State.Status}} exit {{.State.ExitCode}} oom-killed {{.State.OOMKilled}}";
     let mut c = x.podman.command();
-    let out = c
+    let cmd = c
         .as_std_mut()
-        .args(["inspect", "--format", fields, r.container()])
-        .output();
-    match out {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_owned(),
-        Ok(o) => format!(
-            "podman inspect failed ({}): {}",
+        .args(["inspect", "--format", fields, r.container()]);
+    bounded_output(cmd, limit, "podman inspect")
+}
+
+/// Runs `cmd` in a process group of its own and waits at most `limit` for it to exit and close
+/// its pipes (a process it started may hold one); past that the whole group is killed. Never
+/// panics: every outcome is text, so it cannot replace the panic it reports for.
+fn bounded_output(cmd: &mut std::process::Command, limit: Duration, what: &str) -> String {
+    use std::os::unix::process::CommandExt as _;
+    let spawned = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn();
+    let child = match spawned {
+        Ok(child) => child,
+        Err(e) => return format!("{what} did not run: {e}"),
+    };
+    let leader = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(limit) {
+        Ok(Ok(o)) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_owned(),
+        Ok(Ok(o)) => format!(
+            "{what} failed ({}): {}",
             o.status,
             String::from_utf8_lossy(&o.stderr).trim()
         ),
-        Err(e) => format!("podman inspect did not run: {e}"),
+        Ok(Err(e)) => format!("{what} did not finish: {e}"),
+        Err(_) => {
+            kill_group(leader);
+            format!("{what} timed out after {limit:?}")
+        }
     }
+}
+
+/// Kills the process group led by `leader`.
+fn kill_group(leader: u32) {
+    let pid = i32::try_from(leader)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw);
+    if let Some(pid) = pid {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
+}
+
+/// [`bounded_output`] gives up on a query whose pipes never close, says so, and kills its group.
+/// No container: the query is a shell that exits at once, leaving a sleeper that holds its
+/// stdout and stderr and writes its pid to a file.
+#[test]
+fn a_stalled_state_query_times_out_and_its_group_is_killed() {
+    let limit = Duration::from_millis(200);
+    let file = std::env::temp_dir().join(format!("sp-bombs-sleeper-{}", std::process::id()));
+    let mut cmd = std::process::Command::new("sh");
+    cmd.args(["-c", "sleep 60 & echo $! > \"$1\"", "sh"])
+        .arg(&file);
+    let started = std::time::Instant::now();
+    let text = bounded_output(&mut cmd, limit, "the query");
+    let took = started.elapsed();
+    assert_eq!(text, format!("the query timed out after {limit:?}"));
+    assert!(took < Duration::from_secs(5), "returned after {took:?}");
+    let pid = std::fs::read_to_string(&file).unwrap();
+    std::fs::remove_file(&file).unwrap();
+    let stat = std::path::Path::new("/proc").join(pid.trim()).join("stat");
+    // Killed: gone, or a zombie (Z) or being reaped (X) by its new parent.
+    let dead = || {
+        std::fs::read_to_string(&stat).map_or(true, |s| {
+            s.rsplit_once(") ")
+                .is_some_and(|(_, rest)| rest.starts_with(['Z', 'X']))
+        })
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut killed = dead();
+    while !killed && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        killed = dead();
+    }
+    assert!(killed, "the sleeper {} outlived the time-out", pid.trim());
 }
 
 /// The `name` counter of a cgroup `*.events` file.
