@@ -258,8 +258,10 @@ pub(crate) fn stderr_text(err: &[u8], max: usize) -> String {
     }
 }
 
+/// A launch task that did not finish: `internal`, with a daemon-chosen detail, never tokio's
+/// text (architect Q297).
 pub(super) fn join_err(e: tokio::task::JoinError) -> LaunchError {
-    LaunchError::Internal(e.to_string())
+    LaunchError::Internal(crate::daemon::crash::join_text(&e).into())
 }
 
 /// The result the launch task of session `sid` sent; [`LaunchError::Lost`] if it sent none.
@@ -275,6 +277,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use crate::daemon::crash::JOIN_PANICKED;
 
     /// Architect Q295: a failed command's stderr is its error text whole (trimmed) up to the
     /// bound, and withheld whole past it: no byte of it, never a cut that a mask could miss.
@@ -401,6 +404,17 @@ mod tests {
         let e = LaunchError::Lost(sid());
         assert_eq!(e.reason(), "start-failed");
         assert_eq!(e.detail(), "the launch task ended without a result");
+    }
+
+    /// Architect Q297: a launch task that panicked is refused `internal` with a fixed detail,
+    /// never tokio's text (the panic message escaped, before the writer's mask).
+    #[tokio::test]
+    async fn a_panicked_launch_task_is_internal_with_a_fixed_detail() {
+        let h = tokio::task::spawn_blocking(|| panic!("sp-q\"uote-vvvvvvvvvvvv"));
+        let e = join_err(h.await.unwrap_err());
+        assert_eq!(e.reason(), "internal");
+        assert_eq!(e.detail(), format!("internal: {JOIN_PANICKED}"));
+        assert_eq!(e.to_string(), format!("internal: {JOIN_PANICKED}"));
     }
 
     /// Architect Q105: a launch whose cgroup event files cannot be opened is refused

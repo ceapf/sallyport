@@ -704,6 +704,29 @@ mod tests {
         }
     }
 
+    /// Architect Q297: a launch task that panicked with a live form in its message (quote,
+    /// backslash, non-printable) is refused with the fixed detail; no run of the form. Control:
+    /// tokio's text (the old `join_err`) escapes the message before the writer's mask.
+    #[tokio::test]
+    async fn a_panicked_launch_tasks_detail_holds_no_byte_of_its_message() {
+        let value = "q\"u\\o\x01te-secret-value-0123456789";
+        let r = sally_core::audit::Redactor::new([("Y", value)]);
+        let h = tokio::task::spawn_blocking(move || panic!("scan of {value} failed"));
+        let e = join_err(h.await.unwrap_err());
+        let v = NewEntry::new(Actor::Sallyd, "sandbox.refuse")
+            .text("detail", e.to_string(), DETAIL_STYLE)
+            .resolved(&r);
+        let shown = v["detail"].as_str().expect("the detail is logged");
+        assert_eq!(
+            shown,
+            format!("internal: {}", crate::daemon::crash::JOIN_PANICKED)
+        );
+        for w in value.as_bytes().windows(8) {
+            let w = std::str::from_utf8(w).unwrap();
+            assert!(!shown.contains(w), "{w:?} in {shown}");
+        }
+    }
+
     /// #48 (architect Q45): a session over the descriptor budget is refused `fd-budget`, the
     /// message naming needed, free and limit; an overlap keeps its own reason.
     #[test]

@@ -101,6 +101,23 @@ pub fn payload(p: &(dyn Any + Send)) -> String {
     }
 }
 
+/// What a log says of a task that panicked when it was joined (architect Q297): its message is
+/// only in the oplog's panic line, held whole by [`payload`] and masked there.
+pub const JOIN_PANICKED: &str = "the task panicked (its message is in the oplog's panic line)";
+/// What a log says of a task that was cancelled when it was joined.
+pub const JOIN_CANCELLED: &str = "the task was cancelled";
+
+/// A failed join as a log shows it: a daemon-chosen literal, never tokio's text, which quotes
+/// the panic message escaped (`{:?}`) where no mask after it can match (architect Q297).
+#[must_use]
+pub fn join_text(e: &JoinError) -> &'static str {
+    if e.is_panic() {
+        JOIN_PANICKED
+    } else {
+        JOIN_CANCELLED
+    }
+}
+
 /// `e` as the `session.crash` of `c`: the task and the reason as args, the payload declared in
 /// [`PAYLOAD_STYLE`], so the writer masks it whole before it cuts it (architect Q293).
 #[must_use]
@@ -262,5 +279,21 @@ mod tests {
         drop(rx);
         let h = tokio::spawn(async { panic!("late") });
         r.joined("agent.sock", h.await.unwrap_err());
+    }
+
+    /// Architect Q297: a failed join says only which way it failed. tokio's own text quotes the
+    /// panic message escaped (`{:?}`), which no mask after it can match.
+    #[tokio::test]
+    async fn a_failed_join_is_a_literal_with_no_byte_of_the_message() {
+        let message = "sp-q\"u\\o\u{1}te-vvvvvvvvvvvv";
+        let h = tokio::task::spawn_blocking(move || panic!("{message}"));
+        let e = h.await.unwrap_err();
+        assert!(e.to_string().contains("sp-q\\\"u"), "tokio's text: {e}");
+        assert_eq!(join_text(&e), JOIN_PANICKED);
+        assert!(!JOIN_PANICKED.contains("sp-q"));
+        let h = tokio::spawn(std::future::pending::<()>());
+        h.abort();
+        assert_eq!(join_text(&h.await.unwrap_err()), JOIN_CANCELLED);
+        assert_ne!(JOIN_PANICKED, JOIN_CANCELLED);
     }
 }

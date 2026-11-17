@@ -44,7 +44,7 @@ use super::launch::{DETAIL_STYLE, LaunchError, Launcher};
 use super::scan::LaunchScan;
 use super::stage::{Area, StageBounds, Verdict, measure};
 use super::types::SessionPaths;
-use crate::daemon::crash::CrashReporter;
+use crate::daemon::crash::{CrashReporter, join_text};
 
 /// How often the floor task reads free space.
 pub(super) const FLOOR_POLL: Duration = Duration::from_millis(250);
@@ -253,7 +253,8 @@ impl Shared {
         let read = tokio::task::spawn_blocking(move || events.read());
         let now = match tokio::time::timeout(EVENTS_TIMEOUT, read).await {
             Ok(Ok(r)) => r?,
-            Ok(Err(e)) => return Err(ReadError::Failed(e.to_string())),
+            // Never tokio's text: it escapes the panic message before the oplog's mask (Q297).
+            Ok(Err(e)) => return Err(ReadError::Failed(join_text(&e).into())),
             Err(_) => {
                 return Err(ReadError::Failed(format!(
                     "the event files took longer than {} s",
@@ -432,7 +433,7 @@ async fn spaces(watched: &Arc<Vec<Watched>>) -> Result<Vec<Space>, String> {
     });
     match tokio::time::timeout(STATFS_TIMEOUT, read).await {
         Ok(Ok(r)) => r,
-        Ok(Err(e)) => Err(e.to_string()),
+        Ok(Err(e)) => Err(join_text(&e).into()),
         Err(_) => Err(format!(
             "statfs took longer than {} s",
             STATFS_TIMEOUT.as_secs()
@@ -581,7 +582,7 @@ async fn stage_task(s: Arc<Shared>) {
         .await
         .unwrap_or_else(|e| Verdict::Unmeasurable {
             area: "watchdog".into(),
-            reason: e.to_string(),
+            reason: join_text(&e).into(),
         });
         next = Instant::now() + MIN_GAP.max(started.elapsed().saturating_mul(WALK_SPACING));
         match verdict {
