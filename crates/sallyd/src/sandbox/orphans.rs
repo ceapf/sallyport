@@ -13,7 +13,7 @@
 //! string ([`ps_args`]; podman prints `""` for a missing label), so a label value holding a
 //! newline cannot forge a line (PROBE_NOTES). Only that one label is asked for, never the whole
 //! set: a container's labels include its image's, so a line would otherwise be as long as an
-//! image author likes (architect Q307). A line is now daemon-bounded (ID, name and UUID, about
+//! image author likes (architect Q307). A line is daemon-bounded (ID, name and UUID, about
 //! 180 bytes), so about 360 containers fit under the launcher's 64 KiB stdout cap; a longer
 //! listing is refused there (#173). A line that does not parse fails the whole sweep, never
 //! skips silently. An orphan is removed by its full ID, never its name, which a new container
@@ -74,8 +74,8 @@ struct Listed {
 /// The orphans in `listing` (the output of [`ps_args`]).
 ///
 /// # Errors
-/// A line that is not a full container ID and a name (JSON strings) followed by a JSON object or
-/// `null`, naming the line number.
+/// A line that is not exactly three JSON strings (a full container ID, a name and the
+/// installation label), naming the line number. Any other label value or a fourth value is one.
 pub fn orphans(
     listing: &str,
     installation: &Installation,
@@ -286,11 +286,10 @@ mod tests {
 
     #[test]
     fn a_newline_in_a_label_cannot_forge_a_line() {
-        let forged = format!(
-            "{OWN}\n\"{}\" \"sp-ws-victim\" {{\"{INSTALLATION_LABEL}\": \"{OWN}\"}}",
-            cid("victim")
-        );
-        let listing = line("sp-ws-a-1", Some(&forged));
+        let victim = format!("\"{}\" \"sp-ws-victim\" \"{OWN}\"", cid("victim"));
+        // On a line of its own the payload is an orphan, so only the escape keeps it out.
+        assert_eq!(names(&victim, "", &[]), ["sp-ws-victim"]);
+        let listing = line("sp-ws-a-1", Some(&format!("{OWN}\n{victim}")));
         assert_eq!(listing.lines().count(), 1);
         assert!(names(&listing, "", &[]).is_empty());
     }
