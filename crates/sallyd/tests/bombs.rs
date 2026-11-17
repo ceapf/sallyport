@@ -51,29 +51,37 @@ async fn cgroup(x: &Lx, r: &Running) -> std::path::PathBuf {
 fn read(x: &Lx, r: &Running, dir: &std::path::Path, file: &str) -> String {
     match std::fs::read_to_string(dir.join(file)) {
         Ok(text) => text,
-        Err(e) => panic!(
-            "{file} in {}: {e}; directory still there: {}; container: {}; audit: {:?}",
-            dir.display(),
-            dir.is_dir(),
-            state(x, r),
-            x.events.list()
-        ),
+        Err(e) => {
+            let there = dir.is_dir();
+            // Printed before podman is asked, so a podman that stalls cannot hide it.
+            eprintln!(
+                "{file} in {}: {e}; directory still there: {there}",
+                dir.display()
+            );
+            panic!(
+                "{file} in {}: {e}; directory still there: {there}; container: {}; audit: {:?}",
+                dir.display(),
+                container_state(x, r),
+                x.events.list()
+            )
+        }
     }
 }
 
 /// The container's status, exit code and OOM-killed flag from hermetic podman, or why podman
-/// could not say. Only a failed [`read`] asks, so it blocks.
-fn state(x: &Lx, r: &Running) -> String {
-    let format = "{{.State.Status}} exit {{.State.ExitCode}} oom-killed {{.State.OOMKilled}}";
+/// could not say. Only a failed [`read`] asks, so it blocks the runtime's thread.
+fn container_state(x: &Lx, r: &Running) -> String {
+    let fields = "{{.State.Status}} exit {{.State.ExitCode}} oom-killed {{.State.OOMKilled}}";
     let mut c = x.podman.command();
     let out = c
         .as_std_mut()
-        .args(["inspect", "--format", format, r.container()])
+        .args(["inspect", "--format", fields, r.container()])
         .output();
     match out {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_owned(),
         Ok(o) => format!(
-            "podman inspect failed: {}",
+            "podman inspect failed ({}): {}",
+            o.status,
             String::from_utf8_lossy(&o.stderr).trim()
         ),
         Err(e) => format!("podman inspect did not run: {e}"),
