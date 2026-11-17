@@ -209,12 +209,18 @@ G5 Get a denied action executed
 │                                                   [control socket only, the user's own uid; no attach
 │                                                    method on the session socket → RT-AG-06; audited
 │                                                    `sandbox.exec` first; RESIDUAL: §6]
-├─ Drive the user's terminal with the output of an attached command (`session.output`):
-│  CSI, OSC 52 clipboard, OSC 8 links, C1 controls, bidi overrides, `\r`
+├─ Drive the user's terminal with the output of an attached command (`session.output`, line
+│  mode): CSI, OSC 52 clipboard, OSC 8 links, C1 controls, bidi overrides, `\r`
 │                                                   [`sallyd` escapes each stream to printable ASCII
-│                                                    and `\n` before it leaves; `sally sandbox run`
-│                                                    checks again and shows anything else escaped,
-│                                                    exit 1 → RT-CLI-01]
+│                                                    and `\n` before it leaves → RT-CLI-01;
+│                                                    `sally sandbox run` checks again: a chunk with
+│                                                    anything else is shown wholly escaped, said so
+│                                                    on stderr, exit 1 → sally-cli `run_tests.rs`;
+│                                                    RESIDUAL: `\n` is kept, so the command can print
+│                                                    lines that look like `sally`'s own or a prompt;
+│                                                    no decision is asked in that terminal (`sally
+│                                                    approve` runs apart). `--tty` (#138) would be
+│                                                    raw by design]
 ├─ Call a tool the manifest doesn't grant           [tool allowlist → RT-AG-01]
 ├─ Answer a prompt from a driven session's own connection
 │                                                   [a seat connection is refused decide and watch → RT-DRV-04]
@@ -262,7 +268,7 @@ G7 Make the machine unusable
 | Tool allowlist per manifest; shell modes; destructive tags | `sallyd::tools` | RT-AG-01, 02, 07 |
 | Approval queue: canonical args, single-use, timeout-deny, flood control, escaped rendering | `sallyd::approvals` | RT-AG-02..05 |
 | Separate control vs session sockets; method tables; peer-cred check | `sallyd::rpc` | RT-AG-06, 08 |
-| Line-mode output neutralization: one escaper per stream of an attached command, to printable ASCII and `\n`, before `session.output` leaves; the CLI's clean-check as a second layer | `sallyd::tools::pipe`; `sally-cli` (`sally sandbox run`) | RT-CLI-01 |
+| Line-mode output neutralization: one escaper per stream of an attached command, to printable ASCII and `\n`, before `session.output` leaves; the CLI's clean-check as a second layer | `sally-core::text` (`StreamEscaper`), applied in `sallyd::tools::pipe`; `sally-cli` (`sally sandbox run`) | RT-CLI-01 (the escaper); the clean-check: sally-cli `run_tests.rs` |
 | Resource limits (`--pids-limit`, `--memory`, `--cpus`, timeout) | `sallyd::sandbox` | RT-AG-09 |
 | Extension allowlist, magic bytes, strict GGUF/safetensors parsers, SHA-256, immutability | `sally-core::model` | RT-MDL-01..04, 06..08 |
 | Zip import hardening | `sally-core::model::import` | RT-MDL-05 |
