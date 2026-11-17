@@ -7,7 +7,7 @@ use std::sync::Mutex;
 
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use sally_core::audit::AuditError;
+use sally_core::audit::{AuditError, NewEntry};
 use sally_core::manifest::{AuditLevel, parse_host_pattern};
 use tokio::io::DuplexStream;
 
