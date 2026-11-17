@@ -232,10 +232,20 @@ pub enum GlobError {
 /// Guests must be unique and non-nested (a nested mount shadows part of another). Hosts must not
 /// overlap: a `rw` mount of a parent would bypass a `brokered` child's approvals, and two views
 /// of one directory with different modes are never what the user meant.
+///
+/// A guest that failed its own check (it already has that error) takes no part in the guest
+/// checks, and the host-overlap error names the other mount by index, never by its guest: a
+/// diagnostic about one field never echoes another field's unchecked value (Q376, Q395).
 fn check_overlaps(m: &Manifest, resolved: &[(usize, ResolvedMount)], d: &mut Diags) {
+    let checked = |guest: &str| paths::check_guest(guest).is_ok();
+    // TODO(#195): a guest that passed its check and a host realpath both hold `/`, so a quoted
+    // one is never masked.
     let mounts = &m.filesystem.mounts;
     let mut seen_guest = HashSet::new();
     for (i, a) in mounts.iter().enumerate() {
+        if !checked(&a.guest) {
+            continue;
+        }
         if !seen_guest.insert(a.guest.as_str()) {
             d.error(
                 format!("filesystem.mounts[{i}].guest"),
@@ -250,6 +260,7 @@ fn check_overlaps(m: &Manifest, resolved: &[(usize, ResolvedMount)], d: &mut Dia
                     std::path::Path::new(&a.guest),
                     std::path::Path::new(&b.guest),
                 )
+                && checked(&b.guest)
         });
         if let Some(b) = nested {
             d.error(
@@ -260,18 +271,37 @@ fn check_overlaps(m: &Manifest, resolved: &[(usize, ResolvedMount)], d: &mut Dia
         }
     }
     for (n, (i, a)) in resolved.iter().enumerate() {
-        let mut earlier = resolved.iter().take(n).map(|(_, b)| b);
-        if let Some(b) = earlier.find(|b| paths::overlaps(&a.host, &b.host)) {
+        let mut earlier = resolved.iter().take(n);
+        if let Some((j, b)) = earlier.find(|(_, b)| paths::overlaps(&a.host, &b.host)) {
             d.error(
                 format!("filesystem.mounts[{i}].host"),
                 Code::Overlap,
-                format!(
-                    "{:?} overlaps {:?} (mounted at {})",
-                    a.host.display().to_string(),
-                    b.host.display().to_string(),
-                    b.guest
-                ),
+                overlap_message(&a.host, &b.host, *j),
             );
         }
+    }
+}
+
+/// The host-overlap message: it names the other mount by its index `j`, never by its guest.
+fn overlap_message(host: &Path, other: &Path, j: usize) -> String {
+    format!(
+        "{:?} overlaps {:?} (filesystem.mounts[{j}])",
+        host.display().to_string(),
+        other.display().to_string(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pinned on short paths: through the validator, a long checkout path can push the index
+    /// past the diagnostic cut.
+    #[test]
+    fn a_host_overlap_names_the_other_mount_by_index() {
+        assert_eq!(
+            overlap_message(Path::new("/h/a/b"), Path::new("/h/a"), 3),
+            "\"/h/a/b\" overlaps \"/h/a\" (filesystem.mounts[3])"
+        );
     }
 }

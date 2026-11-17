@@ -223,3 +223,139 @@ fn a_shared_malformed_expose_env_gets_only_its_own_errors() {
     );
     assert_not_echoed(&rendered_all(&r));
 }
+
+/// A manifest with these `(host, guest)` mounts, all `ro`; YAML single quotes keep the guest
+/// literal.
+fn mounts(list: &[(&str, &str)]) -> String {
+    let each: Vec<String> = list
+        .iter()
+        .map(|(host, guest)| {
+            format!("    - host: \"{host}\"\n      guest: '{guest}'\n      mode: ro\n")
+        })
+        .collect();
+    format!("filesystem:\n  mounts:\n{}", each.concat())
+}
+
+/// The errors at `filesystem.mounts[..]` paths, in order.
+fn mount_errors(r: &Result<Validated, Rejected>) -> Vec<(String, Code)> {
+    errors(r)
+        .into_iter()
+        .filter(|(path, _)| path.starts_with("filesystem.mounts["))
+        .collect()
+}
+
+/// The one rendered error at `path`.
+#[track_caller]
+fn rendered_at(r: &Result<Validated, Rejected>, path: &str) -> String {
+    let Err(e) = r else {
+        panic!("accepted: {r:#?}")
+    };
+    let found: Vec<String> = e
+        .errors
+        .iter()
+        .filter(|d| d.path == path)
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(found.len(), 1, "{r:#?}");
+    found.into_iter().next().unwrap()
+}
+
+/// fs.rs (Q395): a guest that failed its check is not echoed by another mount's host-overlap
+/// error, which names the other mount by its index (pinned on short paths in fs.rs: here the
+/// fixture's realpaths can push the index past the diagnostic cut).
+#[test]
+fn a_host_overlap_does_not_echo_the_other_mounts_guest() {
+    let f = Fixture::new();
+    let r = f.load(&mounts(&[
+        ("~/code", &pasted()),
+        ("~/code/myproject", "/workspace/p"),
+    ]));
+    assert_eq!(
+        mount_errors(&r),
+        vec![
+            ("filesystem.mounts[0].guest".to_owned(), Code::GuestPath),
+            ("filesystem.mounts[1].host".to_owned(), Code::Overlap),
+        ]
+    );
+    assert_not_echoed(&rendered_all(&r));
+}
+
+/// fs.rs (Q395): two mounts sharing a guest that failed its check get its own error each, and
+/// no duplicate error.
+#[test]
+fn a_shared_invalid_guest_gets_only_its_own_errors() {
+    let f = Fixture::new();
+    let r = f.load(&mounts(&[
+        ("~/code/myproject", "/tmp/a"),
+        ("~/code/other", "/tmp/a"),
+    ]));
+    assert_eq!(
+        mount_errors(&r),
+        vec![
+            ("filesystem.mounts[0].guest".to_owned(), Code::GuestPath),
+            ("filesystem.mounts[1].guest".to_owned(), Code::GuestPath),
+        ]
+    );
+}
+
+/// fs.rs (Q395): a valid guest nested with one that failed its check gets no nested error, in
+/// either order.
+#[test]
+fn a_valid_guest_is_not_nested_with_an_invalid_one() {
+    for (first, second, bad) in [
+        ("/workspace/p/q", "/workspace/p/", 1),
+        ("/workspace/p/", "/workspace/p/q", 0),
+    ] {
+        let f = Fixture::new();
+        let r = f.load(&mounts(&[
+            ("~/code/myproject", first),
+            ("~/code/other", second),
+        ]));
+        assert_eq!(
+            mount_errors(&r),
+            vec![(format!("filesystem.mounts[{bad}].guest"), Code::GuestPath)],
+            "{first} then {second}"
+        );
+    }
+}
+
+/// fs.rs (Q395), the allowed twins: valid guests still get the duplicate and nested errors, and
+/// valid guests on overlapping hosts still get the host-overlap error.
+#[test]
+fn valid_guests_still_get_duplicate_nested_and_overlap_errors() {
+    let f = Fixture::new();
+    let cases = [
+        (
+            [
+                ("~/code/myproject", "/workspace/p"),
+                ("~/code/other", "/workspace/p"),
+            ],
+            "filesystem.mounts[1].guest",
+            Code::Duplicate,
+        ),
+        (
+            [
+                ("~/code/myproject", "/workspace/p"),
+                ("~/code/other", "/workspace/p/q"),
+            ],
+            "filesystem.mounts[1].guest",
+            Code::Overlap,
+        ),
+        (
+            [
+                ("~/code", "/workspace/a"),
+                ("~/code/myproject", "/workspace/b"),
+            ],
+            "filesystem.mounts[1].host",
+            Code::Overlap,
+        ),
+    ];
+    for (list, path, code) in cases {
+        let r = f.load(&mounts(&list));
+        assert_eq!(mount_errors(&r), vec![(path.to_owned(), code)], "{list:?}");
+        if path.ends_with(".host") {
+            let shown = rendered_at(&r, path);
+            assert!(!shown.contains("/workspace/a"), "{shown}");
+        }
+    }
+}
