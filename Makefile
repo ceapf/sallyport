@@ -146,7 +146,8 @@ MUTANTS_WIDE_SALLYD := $(addprefix crates/sallyd/src/sandbox/,argv.rs check.rs t
                        $(addprefix crates/sallyd/src/session/,lookup.rs types.rs exit.rs secrets.rs) \
                        $(addprefix crates/sallyd/src/egress/,addr.rs authority.rs head.rs policy.rs server.rs \
                        hostaddrs.rs tunnel.rs net.rs ca.rs roots.rs rewrite.rs intercept.rs \
-                       intercept_tls.rs intercept_report.rs meter.rs inject.rs redact.rs local.rs) \
+                       intercept_parts.rs intercept_tls.rs intercept_report.rs meter.rs inject.rs redact.rs \
+                       local.rs) \
                        $(addprefix crates/sallyd/src/rpc/,agent.rs control.rs control_methods.rs frame.rs \
                        json.rs listen.rs mcp.rs message.rs rate.rs record.rs drive.rs attach.rs \
                        line.rs control_line.rs) \
