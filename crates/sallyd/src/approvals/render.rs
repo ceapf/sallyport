@@ -451,6 +451,26 @@ mod tests {
         assert_ne!(lossy(b"\xff"), lossy(b"\xfe"));
     }
 
+    /// Headers are listed apart, in order, each pair once (the separator comes before every
+    /// header but the first).
+    #[test]
+    fn fetch_headers_are_listed_apart_in_order() {
+        let f = Action::Fetch {
+            method: "GET".to_owned(),
+            url: "https://api.mock.test/".to_owned(),
+            headers: vec![
+                ("X-A".to_owned(), "1".to_owned()),
+                ("X-B".to_owned(), "2".to_owned()),
+            ],
+            body: Payload::new(Vec::new()),
+        };
+        let t = action_text(&f);
+        assert!(
+            t.contains(" headers [\"X-A\": \"1\", \"X-B\": \"2\"] body 0 bytes"),
+            "{t}"
+        );
+    }
+
     /// The wire cap is inclusive: a full text of exactly the cap is offered, one byte more is
     /// not (architect Q74 (b)); 256 KiB, so JSON's doubling stays inside a 1 MiB frame.
     #[test]
