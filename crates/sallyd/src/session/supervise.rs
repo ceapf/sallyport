@@ -40,7 +40,7 @@
 
 use std::time::Duration;
 
-use sally_core::audit::Actor;
+use sally_core::audit::{Actor, NewEntry};
 use serde_json::json;
 use tokio::sync::mpsc;
 
@@ -424,10 +424,11 @@ impl Registry {
                 ("payload", &c.payload),
             ],
         );
-        self.note(
+        let entry = record.entry(Actor::Sallyd, "session.crash", Some("deny"));
+        self.noted(
             record,
             "session.crash",
-            json!({"task": c.task, "reason": "panic", "payload": c.payload}),
+            crate::daemon::crash::crash_entry(entry, c),
         )
         .await;
     }
@@ -436,6 +437,11 @@ impl Registry {
     /// oplog line and changes nothing else.
     async fn note(&self, record: &Recorder, event: &'static str, args: serde_json::Value) {
         let entry = record.entry(Actor::Sallyd, event, Some("deny")).args(args);
+        self.noted(record, event, entry).await;
+    }
+
+    /// [`Self::note`] of a built `entry`.
+    async fn noted(&self, record: &Recorder, event: &'static str, entry: NewEntry) {
         if !record.append(entry).await {
             self.p.oplog.error(
                 LOG,
