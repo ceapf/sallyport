@@ -389,7 +389,7 @@ fn a_command_line_that_does_not_parse_repeats_no_argument() {
 
 /// `sandbox run` parse errors are the fixed texts, exit 2, and contact no daemon. There is no
 /// terminal mode yet (TODO(#138)): `--tty` is an unknown flag, refused like any other and never
-/// named back. Each line also carries a marker the output must not repeat (Q113).
+/// named back. Each line also carries a marker the output must not repeat.
 #[test]
 fn sandbox_run_parse_errors_are_fixed_texts_and_tty_is_unknown() {
     const MARK: &str = "MARKq7zX";
