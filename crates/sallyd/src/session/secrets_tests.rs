@@ -298,6 +298,47 @@ fn a_sessions_egress_entries_are_redacted_with_its_own_forms_after_the_release()
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Architect Q290 (6): a declared target holding a form of the session's secret that straddles
+/// the 256-byte cut goes through the session sink to a writer with no redactor: the wrapper
+/// masks the declared raw text uncut, so the writer's cut finds the placeholder whole.
+/// Control: the same entry appended to the writer directly keeps a cut prefix of the form.
+#[test]
+fn the_session_sink_masks_a_declared_target_before_the_writers_cut() {
+    let dir = scratch("declared");
+    let audit = Arc::new(SharedAudit(Mutex::new(
+        AuditWriter::open(&dir.join("audit"), Box::new(SystemClock)).unwrap(),
+    )));
+    let v = value("own");
+    let sink = SessionRedacted::over(
+        Arc::clone(&audit) as Arc<dyn AuditSink>,
+        Arc::new(Redaction::of(forms("GITHUB_TOKEN", &v)).unwrap()),
+    );
+    // The form starts at byte 230 of the target, so it straddles the cut at 256 while the
+    // placeholder fits before it.
+    let target = format!("/{}{v}", "a".repeat(229));
+    let entry = |mark: &str| {
+        let e = NewEntry::new(Actor::Sallyd, "egress.request")
+            .session("s1")
+            .args(json!({"host": "h.test", "m": mark}));
+        crate::egress::authority::with_target(e, &target, None)
+    };
+    sink.append(entry("mark-own"), AuditLevel::Full).unwrap();
+    audit.append(entry("mark-raw"), AuditLevel::Full).unwrap();
+    let text = all_text(&dir.join("audit"));
+    let line = |mark: &str| text.lines().find(|l| l.contains(mark)).unwrap().to_owned();
+    let own = line("mark-own");
+    assert!(own.contains("\"target\":"), "{own}");
+    assert!(own.contains("[REDACTED:GITHUB_TOKEN]"), "{own}");
+    assert!(own.contains("\"target_cut\":false"), "{own}");
+    for w in v.as_bytes().windows(8) {
+        assert!(!own.contains(std::str::from_utf8(w).unwrap()), "{own}");
+    }
+    let raw = line("mark-raw");
+    assert!(raw.contains("\"target_cut\":true"), "control: {raw}");
+    assert!(raw.contains(&v[..12]), "control: {raw}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Architect Q266 (1): the wrapper alone, under a writer with no redactor, redacts a form of
 /// the session's secrets wherever an entry holds it: in a string value, as an object key and as
 /// a number. The entries are appended after the session's forms were registered with the logs'
