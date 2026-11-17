@@ -108,7 +108,8 @@ pub fn cut_escaped(text: &str, max: usize) -> (String, bool) {
     (format!("{shown}... (+{rest} bytes, sha256 {sha})"), true)
 }
 
-/// The largest offset at most `max` that does not fall inside a `\…` escape of `text`.
+/// The largest offset at most `max` that does not fall inside a `\…` escape or a character of
+/// `text`.
 fn escape_boundary(text: &str, max: usize) -> usize {
     let bytes = text.as_bytes();
     let mut i = 0usize;
@@ -120,7 +121,11 @@ fn escape_boundary(text: &str, max: usize) -> usize {
                 .and_then(|r| r.find('}'))
                 .map_or(1, |e| e.saturating_add(1)),
             (b'\\', Some(_)) => 2,
-            _ => 1,
+            // One whole character: a literal piece may hold one outside ASCII.
+            _ => text
+                .get(i..)
+                .and_then(|r| r.chars().next())
+                .map_or(1, char::len_utf8),
         };
         let next = i.saturating_add(len);
         if next > max {
@@ -313,10 +318,13 @@ fn char_text(c: char, quote: Quote) -> String {
 }
 
 fn push_char(c: char, quote: Quote, out: &mut String) {
-    match (c, quote) {
-        ('"', Quote::Hex) => out.push_str("\\x22"),
-        ('"', Quote::Backslash) => out.push_str("\\\""),
-        _ => push_unquoted(c, out),
+    if c != '"' {
+        return push_unquoted(c, out);
+    }
+    match quote {
+        Quote::Hex => out.push_str("\\x22"),
+        Quote::Backslash => out.push_str("\\\""),
+        Quote::None => push_unquoted(c, out),
     }
 }
 
@@ -352,6 +360,17 @@ mod tests {
             (format!("abcd... (+6 bytes, sha256 {sha})"), true)
         );
         assert_eq!(cut_escaped(text, 10), (text.to_owned(), false));
+    }
+
+    /// A character outside ASCII (a literal piece is daemon-chosen, never escaped) is kept or
+    /// cut whole: the shown text is never emptied by a cut inside it.
+    #[test]
+    fn a_cut_never_falls_inside_a_character() {
+        let (shown, cut) = cut_escaped("aé b", 2);
+        assert!(cut);
+        assert!(shown.starts_with("a... (+4 bytes, sha256 "), "{shown}");
+        let (shown, _) = cut_escaped("aé b", 3);
+        assert!(shown.starts_with("aé... (+2 bytes, sha256 "), "{shown}");
     }
 
     /// A styled text says it was cut only past its bound, in every style that reports a cut
