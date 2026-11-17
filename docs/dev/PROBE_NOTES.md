@@ -27,6 +27,14 @@ line per fact, with where it was found. Check a note again before relying on it 
 - On an OOM kill, the container's conmon writes an empty `oom` file into the working directory of
   the podman that *started* the container (`podman exec` does not). Hermetic podman runs from its
   state directory for that reason. (6c-2)
+- Memory used by the RT-AG-09 fork bomb (`runtime.memory` 64 MiB, `runtime.pids` 64, no swap):
+  `memory.peak` of `<CgroupPath>/container`, read from the host after the bomb's 3 s and before
+  the stop, was 20.3, 26.4, 42.5, 45.9 and 49.5 MiB in 5 runs of the test alone, and 37.8, 44.6,
+  34.6, 30.8, 45.1, 27.8, 42.8 and 33.1 MiB in 8 runs with 32 busy loops on 32 cores.
+  `memory.events` read all zero every time (`max 0`, `oom 0`, `oom_kill 0`): the limit was never
+  reached. Highest 49.5 MiB, 77 % of the limit; CPU load did not raise it. Not measured: under
+  the full test suite or under memory pressure, so an OOM kill is neither shown nor excluded as
+  the cause of #141. (scratch probe for #141, kernel 6.18 WSL2)
 - `userdata/config.json` (`podman inspect --format '{{.OCIConfigPath}}'`) is subuid-owned under
   keep-id: read it with `podman unshare cat`. (6c-2)
 - Correction to 6b: hermetic podman (CONTAINERS_CONF, empty XDG_CONFIG_HOME,
