@@ -41,7 +41,7 @@ use super::io::{Gate, Io};
 use super::reply::{self, Out};
 use crate::rpc::listen::{self, Peer, Server, until_true};
 use crate::rpc::rate::Rate;
-use crate::rpc::record::{Recorder, escape};
+use crate::rpc::record::{Recorder, SHORT_STYLE};
 
 /// Connections per session at once (architect Q8).
 pub const MAX_CONNECTIONS: usize = 4;
@@ -392,19 +392,11 @@ impl<B: Backend> Llm<B> {
         h: Option<&Head>,
         field: Option<&str>,
     ) -> bool {
-        let mut args = json!({"reason": reason, "status": status});
-        if let (Some(h), Some(a)) = (h, args.as_object_mut()) {
-            a.insert("method".into(), Value::from(escape(h.method.as_bytes())));
-            a.insert("path".into(), Value::from(escape(h.path.as_bytes())));
-        }
-        if let (Some(f), Some(a)) = (field, args.as_object_mut()) {
-            a.insert("field".into(), Value::from(escape(f.as_bytes())));
-        }
-        let entry = self
-            .record
-            .entry(Actor::Sallyd, "llm.deny", Some("deny"))
-            .args(args);
-        self.record.append(entry).await
+        let e = self.record.entry(Actor::Sallyd, "llm.deny", Some("deny"));
+        let request = h.map(|h| (h.method.as_str(), h.path.as_str()));
+        self.record
+            .append(deny_entry(e, reason, status, request, field))
+            .await
     }
 
     async fn append(&self, entry: NewEntry) -> Result<(), Closed> {
@@ -552,6 +544,28 @@ fn hex(bytes: &[u8]) -> String {
             s
         },
     )
+}
+
+/// The `llm.deny` entry. The harness chose the request's method and path and the field:
+/// declared raw, so the writer masks them whole before it cuts and escapes them (architect
+/// Q276, Q304).
+fn deny_entry(
+    e: NewEntry,
+    reason: &str,
+    status: Option<u16>,
+    request: Option<(&str, &str)>,
+    field: Option<&str>,
+) -> NewEntry {
+    let mut e = e.args(json!({"reason": reason, "status": status}));
+    if let Some((method, path)) = request {
+        e = e
+            .text("method", method, SHORT_STYLE)
+            .text("path", path, SHORT_STYLE);
+    }
+    match field {
+        Some(f) => e.text("field", f, SHORT_STYLE),
+        None => e,
+    }
 }
 
 #[cfg(test)]

@@ -9,6 +9,7 @@ use super::super::action::{Action, Payload, Target};
 use super::super::policy::MountRule;
 use super::*;
 use crate::rpc::testkit::{Sink, recorder};
+use sally_core::audit::NewEntry;
 
 /// Records what an approver is told.
 #[derive(Default)]
@@ -673,7 +674,7 @@ async fn a_withdraw_for_a_call_that_ended_or_never_began_is_not_kept() {
 async fn a_withdraw_on_a_queued_prompt_keeps_its_first_cause() {
     let f = fx(5);
     let b = shell(5, &["ls"]);
-    let Ok((id, _, _rx)) = f.gate.inner.queue(&b, None, vec![]) else {
+    let Ok((id, _rx)) = f.gate.inner.queue(&b, Fields::of(&b), None, vec![]) else {
         panic!("not queued");
     };
     f.gate.withdraw(5, Withdraw::Cancel).await;
@@ -797,7 +798,7 @@ async fn after_the_seal_a_decide_or_withdraw_writes_nothing_and_runs_nothing() {
 async fn a_prompt_not_yet_shown_at_the_stop_is_never_shown() {
     let f = fx(5);
     let b = shell(5, &["ls"]);
-    let Ok((id, _, _rx)) = f.gate.inner.queue(&b, None, vec![]) else {
+    let Ok((id, _rx)) = f.gate.inner.queue(&b, Fields::of(&b), None, vec![]) else {
         panic!("not queued");
     };
     f.desk.stop().await.unwrap();
@@ -820,7 +821,7 @@ async fn a_prompt_not_yet_shown_at_the_stop_is_never_shown() {
 async fn a_withdraw_before_the_prompt_is_shown_keeps_its_reason() {
     let f = fx(5);
     let b = shell(5, &["ls"]);
-    let Ok((id, _, _rx)) = f.gate.inner.queue(&b, None, vec![]) else {
+    let Ok((id, _rx)) = f.gate.inner.queue(&b, Fields::of(&b), None, vec![]) else {
         panic!("not queued");
     };
     f.gate.withdraw(5, Withdraw::Closed).await;
@@ -840,7 +841,7 @@ async fn a_withdraw_before_the_prompt_is_shown_keeps_its_reason() {
 async fn a_latch_set_while_the_entry_is_written_denies_the_prompt() {
     let f = fx(5);
     let b = shell(5, &["ls"]);
-    let Ok((id, _, _rx)) = f.gate.inner.queue(&b, None, vec![]) else {
+    let Ok((id, _rx)) = f.gate.inner.queue(&b, Fields::of(&b), None, vec![]) else {
         panic!("not queued");
     };
     f.gate.inner.state().latched = true;
@@ -901,7 +902,8 @@ async fn a_decision_takes_the_prompt_it_names() {
 #[tokio::test(start_paused = true)]
 async fn a_prompt_leaving_unshown_keeps_the_rest_in_order() {
     let f = fx(5);
-    let Ok((x, _, _rx)) = f.gate.inner.queue(&shell(9, &["ls"]), None, vec![]) else {
+    let x9 = shell(9, &["ls"]);
+    let Ok((x, _rx)) = f.gate.inner.queue(&x9, Fields::of(&x9), None, vec![]) else {
         panic!("not queued");
     };
     let (a, _ha) = asking(&f, shell(1, &["ls"])).await;
@@ -1130,6 +1132,262 @@ async fn the_pending_entry_stays_under_the_writer_bound_in_the_worst_case() {
     // So does the decision entry, which carries the same fields and the client.
     let d = f.sink.last("approval.decide").to_string().len();
     assert!(d < 4096, "{d}");
+}
+
+/// A live session's secret with a quote, a backslash and a non-printable byte (architect Q276).
+const FORM: &str = "q\"u\\o\x01te-secret-value-0123456789";
+
+fn form_redactor() -> sally_core::audit::Redactor {
+    sally_core::audit::Redactor::new([("Y", FORM)])
+}
+
+/// No 8-byte run of `FORM` in any spelling a log could hold: raw, the action text's escape and
+/// the hex escape.
+fn assert_no_form(shown: &str) {
+    let spellings = [
+        FORM.to_owned(),
+        sally_core::text::escape_backslash_quoted(FORM.as_bytes()),
+        sally_core::text::hex_capped(FORM.as_bytes(), usize::MAX).0,
+    ];
+    for s in &spellings {
+        for w in s.as_bytes().windows(8) {
+            let w = std::str::from_utf8(w).unwrap();
+            assert!(!shown.contains(w), "{w:?} in {shown:?}");
+        }
+    }
+}
+
+fn on_call(call: u64, action: Action) -> Bound {
+    Bound {
+        session: "s-1".to_owned(),
+        call,
+        action,
+    }
+}
+
+fn file_at(host: &str) -> Target {
+    Target {
+        mount: "/workspace/notes".to_owned(),
+        rel: "a".to_owned(),
+        host: host.to_owned(),
+    }
+}
+
+/// Raw text whose action text puts `FORM` at byte `at` of a shell action: `run ["<pad>" "FORM"]`.
+fn shell_with_form_at(at: usize) -> Action {
+    let pad = "a".repeat(at - "run [\"".len() - "\" \"".len());
+    Action::Shell {
+        argv: vec![pad, FORM.to_owned()],
+        cwd: "/workspace/p".to_owned(),
+    }
+}
+
+/// One action of every kind with `FORM` in each sandbox-chosen part (Q276's header-value case
+/// is the fetch tool's), and shell actions whose form straddles [`AUDIT_ACTION_CHARS`].
+fn actions_with_a_form() -> Vec<Action> {
+    let fetch = Action::Fetch {
+        method: format!("M{FORM}"),
+        url: format!("https://h/?q={FORM}"),
+        headers: vec![(format!("x-{FORM}"), format!("Bearer {FORM}"))],
+        body: Payload::new(b"b".to_vec()),
+    };
+    vec![
+        Action::Shell {
+            argv: vec![FORM.to_owned()],
+            cwd: format!("/workspace/{FORM}"),
+        },
+        shell_with_form_at(AUDIT_ACTION_CHARS - 14),
+        shell_with_form_at(AUDIT_ACTION_CHARS - 30),
+        Action::FsRead {
+            target: file_at(&format!("/home/u/notes/{FORM}")),
+            offset: 0,
+            len: 1,
+        },
+        Action::FsList {
+            target: file_at(&format!("/home/u/{FORM}")),
+        },
+        Action::FsWrite {
+            target: file_at(&format!("/home/u/{FORM}")),
+            content: Payload::new(FORM.as_bytes().to_vec()),
+        },
+        Action::FsDelete {
+            target: file_at(&format!("/home/u/{FORM}")),
+        },
+        fetch,
+        Action::Mcp {
+            server: "srv".to_owned(),
+            tool: format!("t{FORM}"),
+            args: Payload::new(format!("{{\"k\":\"{FORM}\"}}").into_bytes()),
+        },
+    ]
+}
+
+/// `action` with every `FORM` in its raw text replaced by the placeholder the writer writes.
+fn with_placeholder(action: &Action) -> Action {
+    let p = |s: &str| s.replace(FORM, "[REDACTED:Y]");
+    let t = |t: &Target| Target {
+        mount: t.mount.clone(),
+        rel: t.rel.clone(),
+        host: p(&t.host),
+    };
+    match action {
+        Action::Shell { argv, cwd } => Action::Shell {
+            argv: argv.iter().map(|a| p(a)).collect(),
+            cwd: p(cwd),
+        },
+        Action::FsRead {
+            target,
+            offset,
+            len,
+        } => Action::FsRead {
+            target: t(target),
+            offset: *offset,
+            len: *len,
+        },
+        Action::FsList { target } => Action::FsList { target: t(target) },
+        Action::FsWrite { target, content } => Action::FsWrite {
+            target: t(target),
+            content: content.clone(),
+        },
+        Action::FsDelete { target } => Action::FsDelete { target: t(target) },
+        Action::Fetch {
+            method,
+            url,
+            headers,
+            body,
+        } => Action::Fetch {
+            method: p(method),
+            url: p(url),
+            headers: headers.iter().map(|(n, v)| (p(n), p(v))).collect(),
+            body: body.clone(),
+        },
+        Action::Mcp { server, tool, args } => Action::Mcp {
+            server: p(server),
+            tool: p(tool),
+            args: Payload::new(p(&String::from_utf8_lossy(args.bytes())).into_bytes()),
+        },
+    }
+}
+
+/// The audit action of `action` built by hand: each raw piece with `FORM` replaced by its
+/// placeholder, then assembled and cut. Sizes and digests stay those of the raw payload.
+fn masked_by_hand(action: &Action) -> String {
+    let pieces: Vec<Piece> = render::action_pieces(action)
+        .into_iter()
+        .map(|p| match p {
+            Piece::Raw(r) => Piece::Raw(Arc::from(r.replace(FORM, "[REDACTED:Y]").as_str())),
+            literal @ Piece::Literal(_) => literal,
+        })
+        .collect();
+    render::cut(&sally_core::audit::assembled(&pieces), AUDIT_ACTION_CHARS).0
+}
+
+fn audited(b: &Bound, r: &sally_core::audit::Redactor) -> Value {
+    Fields::of(b)
+        .on(NewEntry::new(Actor::Harness, "tool.pending"))
+        .resolved(r)
+}
+
+/// Architect Q276, Q288 (a, d): every raw part of an action is masked whole before the action
+/// text is escaped and cut, so the audited action is exactly the cut of the action text with
+/// each form replaced by its placeholder, tail digest included. Controls: the action text
+/// escaped before the mask (today's `fields`), or masked after the cut.
+#[test]
+fn an_actions_forms_are_masked_before_its_text_is_escaped_and_cut() {
+    let r = form_redactor();
+    for (call, action) in (0u64..).zip(actions_with_a_form()) {
+        let got = audited(&on_call(call, action.clone()), &r);
+        let shown = got["action"].as_str().expect("the action is logged");
+        assert_no_form(shown);
+        let tool = got["tool"].as_str().expect("the tool is logged");
+        assert_no_form(tool);
+        assert_eq!(shown, masked_by_hand(&action), "call {call}");
+        if !matches!(action, Action::Mcp { .. }) {
+            // No payload text: the same as the action text of the action with placeholders.
+            let want = render::action_text(&with_placeholder(&action));
+            assert_eq!(
+                shown,
+                render::cut(&want, AUDIT_ACTION_CHARS).0,
+                "call {call}"
+            );
+        }
+        assert!(shown.contains("[REDACTED:Y]"), "{shown}");
+    }
+}
+
+/// Architect Q288 (b): with no form, the audited action is today's: the action text cut at
+/// [`AUDIT_ACTION_CHARS`], byte for byte, and the tool today's escaped name.
+#[test]
+fn an_action_with_no_form_is_audited_as_its_cut_action_text() {
+    let long = "\u{202e}\\\"x".repeat(AUDIT_ACTION_CHARS);
+    let mut actions: Vec<Action> = actions_with_a_form().iter().map(with_placeholder).collect();
+    actions.push(Action::Shell {
+        argv: vec![long.clone(), String::new()],
+        cwd: "/w".to_owned(),
+    });
+    actions.push(Action::Mcp {
+        server: "s".to_owned(),
+        tool: "\u{1b}t".repeat(40),
+        args: Payload::new(vec![0xff, b'"', 0x00]),
+    });
+    for (call, action) in (0u64..).zip(actions) {
+        let b = on_call(call, action);
+        let got = audited(&b, &sally_core::audit::Redactor::default());
+        let want = render::cut(&render::action_text(&b.action), AUDIT_ACTION_CHARS).0;
+        assert_eq!(got["action"], json!(want), "call {call}");
+        assert_eq!(got["tool"], json!(escape(b.action.tool().as_bytes())));
+        assert_eq!(got["call"], json!(call));
+        assert_eq!(got["action_sha256"], json!(b.digest()));
+    }
+}
+
+/// Architect Q288 (e): a raw piece is never cut before the mask; at the tool-call frame cap,
+/// a form at its start and one at its end are both masked, and the text stays bounded.
+#[test]
+fn a_frame_sized_piece_is_masked_whole_and_cut_once() {
+    let fill = "z".repeat(crate::rpc::agent::MAX_FRAME - 2 * FORM.len());
+    let big = format!("{FORM}{fill}{FORM}");
+    let r = form_redactor();
+    for action in [
+        Action::Shell {
+            argv: vec![big.clone()],
+            cwd: "/w".to_owned(),
+        },
+        Action::Mcp {
+            server: "s".to_owned(),
+            tool: "t".to_owned(),
+            args: Payload::new(big.clone().into_bytes()),
+        },
+    ] {
+        let got = audited(&on_call(1, action.clone()), &r);
+        let shown = got["action"].as_str().unwrap();
+        assert_no_form(shown);
+        assert!(shown.contains("[REDACTED:Y]"), "{shown}");
+        assert!(shown.len() < AUDIT_ACTION_CHARS + 100, "{}", shown.len());
+        assert_eq!(shown, masked_by_hand(&action));
+    }
+}
+
+/// Architect Q288 (f), Q291: the tool name a refused call carries is the harness's, so it is
+/// masked before its cut and escape. Control: the name escaped in the builder.
+#[test]
+fn a_refused_calls_tool_name_is_masked_before_its_cut() {
+    let r = form_redactor();
+    let straddle = format!("{}{FORM}", "t".repeat(50));
+    for tool in [FORM.to_owned(), straddle] {
+        let e = call_denied(NewEntry::new(Actor::Sallyd, "tool.deny"), 3, &tool, "x");
+        let got = e.resolved(&r);
+        let shown = got["tool"].as_str().expect("the tool is logged");
+        assert_no_form(shown);
+        assert!(shown.contains("[REDACTED:Y]"), "{shown}");
+        assert_eq!(got["call"], json!(3));
+        assert_eq!(got["code"], json!("x"));
+    }
+    let plain = call_denied(NewEntry::new(Actor::Sallyd, "tool.deny"), 3, "a\u{1b}", "x");
+    assert_eq!(
+        plain.resolved(&sally_core::audit::Redactor::default())["tool"],
+        json!("a\\x1b")
+    );
 }
 
 #[test]

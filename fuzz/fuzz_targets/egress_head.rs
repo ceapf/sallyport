@@ -5,18 +5,31 @@
 //! Invariants: never panics; a complete head lies within the first 8 KiB and its target is a
 //! slice of the input; an accepted authority is canonical (it round-trips through `host:port`)
 //! and never an IP literal; the audit text of a target is bounded and printable ASCII, both for
-//! a session without secret grants (`None`: cut as the raw text is) and for one with a fixed
-//! secret (`Some`: the secret's value never appears, and a cut text holds the full 256 bytes;
-//! architect Q264).
+//! a session without secret grants (`None`: cut as the raw text is) and with a fixed secret,
+//! masked by the session's own pass or by the writer's pass over every live session's forms
+//! (the secret's value never appears, and a cut text holds the full 256 bytes; architect Q264,
+//! Q276). In every case `target_bytes` is the raw target's length, never the masked text's
+//! (Q302).
 #![no_main]
 #![forbid(unsafe_code)]
 
 use std::sync::OnceLock;
 
 use libfuzzer_sys::fuzz_target;
-use sally_core::audit::Redactor;
-use sallyd::egress::authority::{self, LOGGED_TARGET_BYTES, audit_text};
+use sally_core::audit::{Actor, NewEntry, Redactor};
+use sallyd::egress::authority::{self, LOGGED_TARGET_BYTES, with_target};
 use sallyd::egress::head::{self, MAX_HEAD, Parsed};
+
+/// The target as the audit writer logs it (architect Q276, Q290): declared with the session's
+/// own pass `forms`, resolved with the writer's `writer` redactor. The text, whether it was
+/// cut, and the raw length the entry reports.
+fn logged(raw: &str, forms: Option<&Redactor>, writer: &Redactor) -> (String, bool, u64) {
+    let e = NewEntry::new(Actor::Sallyd, "egress.deny");
+    let v = with_target(e, serde_json::Value::Null, raw, forms).resolved(writer);
+    let text = v["target"].as_str().unwrap_or_default().to_owned();
+    let len = v["target_bytes"].as_u64().unwrap_or(u64::MAX);
+    (text, v["target_cut"].as_bool().unwrap_or_default(), len)
+}
 
 /// The fixed secret and its redactor. The value is 14 lower-case letters assembled at run time,
 /// none of them a letter of the placeholder `[REDACTED:C]`, so masking can never rebuild it; a
@@ -39,15 +52,21 @@ fn check_printable(text: &str) {
 fuzz_target!(|data: &[u8]| {
     if let Parsed::Complete(h) = head::parse(data) {
         assert!(h.len <= MAX_HEAD && h.len <= data.len(), "head length out of range");
-        let (text, len, cut) = audit_text(h.target, None);
+        let none = Redactor::default();
+        let raw_len = u64::try_from(h.target.len()).unwrap_or(u64::MAX);
+        let (text, cut, len) = logged(h.target, None, &none);
         check_printable(&text);
-        assert_eq!((len, cut), (h.target.len(), h.target.len() > LOGGED_TARGET_BYTES));
+        assert_eq!(cut, h.target.len() > LOGGED_TARGET_BYTES);
+        assert_eq!(len, raw_len, "raw length not reported");
         let (value, redactor) = secret();
-        let (text, len, cut) = audit_text(h.target, Some(redactor));
-        check_printable(&text);
-        assert_eq!(len, h.target.len(), "raw length not reported");
-        assert!(!text.contains(value.as_str()), "secret value in the audit text");
-        assert!(!cut || text.len() >= LOGGED_TARGET_BYTES, "cut text shorter than the cut");
+        // The session's own pass, and the writer's pass over every live session's forms.
+        for (forms, writer) in [(Some(redactor), &none), (None, redactor)] {
+            let (text, cut, len) = logged(h.target, forms, writer);
+            check_printable(&text);
+            assert_eq!(len, raw_len, "raw length not reported");
+            assert!(!text.contains(value.as_str()), "secret value in the audit text");
+            assert!(!cut || text.len() >= LOGGED_TARGET_BYTES, "cut text shorter than the cut");
+        }
     }
     let Ok(text) = std::str::from_utf8(data) else {
         return;

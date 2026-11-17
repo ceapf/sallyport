@@ -15,6 +15,7 @@ use sally_core::audit::{
     MAX_LINE_BYTES, NewEntry, Redactor, VerifyErrorKind, parse_line, verify,
 };
 use sally_core::manifest::AuditLevel;
+use sally_core::text::Style;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -370,6 +371,17 @@ fn malformed_event_session_and_decision_are_rejected_and_not_written() {
         note("ok.event").session(&long),
         note("ok.event").decision("ALLOW"),
         note("ok.event").decision(""),
+        // A declared text never silently replaces an arg (architect Q290): its key already in
+        // the args, declared twice, or args that are not an object.
+        note("ok.event")
+            .args(json!({"t": 1}))
+            .text("t", "v", Style::Plain { max: 9 }),
+        note("ok.event")
+            .text("t", "v", Style::Plain { max: 9 })
+            .text("t", "w", Style::Plain { max: 9 }),
+        note("ok.event")
+            .args(json!([1]))
+            .text("t", "v", Style::Plain { max: 9 }),
     ];
     for e in bad {
         let err = w.append(e, AuditLevel::Full).unwrap_err();

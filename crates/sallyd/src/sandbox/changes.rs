@@ -253,7 +253,11 @@ fn opaque(fd: impl AsFd) -> Result<bool, String> {
 }
 
 /// The changes under one upper directory, depth-first with one open directory per level.
-/// TODO(#28): share one walker with `stage::measure`; name the relative path in errors.
+/// TODO(#28): share one walker with `stage::measure`; name the relative path in errors. A path
+/// named there is raw, never Debug: the listing error is declared in `REFUSAL_STYLE`, and the
+/// writer must see it unescaped to mask it (architect Q303). Naming a path there must restate
+/// `REFUSAL_STYLE`'s largest raw text and move its at-size test to it (architect Q305); a path
+/// with no finite bound comes back to the architect first (Q304 (2)).
 fn list_upper(upper: OwnedFd, walk: &mut Walk) -> Result<Vec<(PathBuf, ChangeKind)>, String> {
     let first =
         rustix::fs::Dir::new(upper).map_err(|e| format!("cannot read the upper directory: {e}"))?;

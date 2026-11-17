@@ -58,7 +58,7 @@ impl AuditSink for Sink {
         self.rows.lock().unwrap().push(Row {
             event: e.event().to_owned(),
             decision: e.decision_value().map(str::to_owned),
-            args: e.arguments().clone(),
+            args: e.resolved(&sally_core::audit::Redactor::default()),
             debug: format!("{e:?}"),
         });
         Ok(())

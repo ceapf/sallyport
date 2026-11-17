@@ -29,7 +29,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use sally_core::audit::Actor;
+use sally_core::audit::{Actor, NewEntry};
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -44,7 +44,7 @@ use super::message::{
     PARSE_ERROR,
 };
 use super::rate::Rate;
-use super::record::{Recorder, escape};
+use super::record::{Recorder, SHORT_STYLE};
 
 /// Why a call's prompt is withdrawn ([`ToolHandler::withdraw`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -373,10 +373,12 @@ impl<T: ToolHandler> Agent<T> {
         if let Call::ToolsCall { name, arguments } = call {
             return self.dispatch(conn, id, era, name, arguments).await;
         }
-        let entry = self
-            .record
-            .entry(Actor::Harness, "rpc.request", Some("allow"))
-            .args(json!({"method": method, "id": logged_id(&id), "lifecycle": era.as_str()}));
+        let entry = with_id(
+            self.record
+                .entry(Actor::Harness, "rpc.request", Some("allow")),
+            json!({"method": method, "lifecycle": era.as_str()}),
+            &id,
+        );
         if !self.record.append(entry).await {
             return false;
         }
@@ -405,10 +407,14 @@ impl<T: ToolHandler> Agent<T> {
         let Ok(slot) = Arc::clone(&self.in_flight).try_acquire_owned() else {
             return Err(Unadmitted::Full);
         };
-        let entry = self
-            .record
-            .entry(Actor::Harness, "rpc.request", Some("allow"))
-            .args(call_args(id, era, name, arguments));
+        let entry = call_entry(
+            self.record
+                .entry(Actor::Harness, "rpc.request", Some("allow")),
+            id,
+            era,
+            name,
+            arguments,
+        );
         if !self.record.append(entry).await {
             return Err(Unadmitted::Unrecorded);
         }
@@ -485,10 +491,11 @@ impl<T: ToolHandler> Agent<T> {
         else {
             return true;
         };
-        let entry = self
-            .record
-            .entry(Actor::Harness, "rpc.cancel", None)
-            .args(json!({"id": logged_id(request)}));
+        let entry = with_id(
+            self.record.entry(Actor::Harness, "rpc.cancel", None),
+            json!({}),
+            request,
+        );
         if !self.record.append(entry).await {
             return false;
         }
@@ -514,19 +521,28 @@ impl<T: ToolHandler> Agent<T> {
 
     /// Records `rpc.deny`; whether it was written.
     async fn deny(&self, id: Option<&Id>, method: Option<&str>, reason: &str) -> bool {
-        let mut args = json!({"reason": reason});
-        if let (Some(m), Some(a)) = (method, args.as_object_mut()) {
-            a.insert("method".into(), Value::from(escape(m.as_bytes())));
-        }
-        if let (Some(i), Some(a)) = (id, args.as_object_mut()) {
-            a.insert("id".into(), logged_id(i));
-        }
-        let entry = self
-            .record
-            .entry(Actor::Sallyd, "rpc.deny", Some("deny"))
-            .args(args);
-        self.record.append(entry).await
+        let e = self.record.entry(Actor::Sallyd, "rpc.deny", Some("deny"));
+        self.record.append(deny_entry(e, id, method, reason)).await
     }
+}
+
+/// An `rpc.deny` entry: the reason, and the peer's id and method (an unknown or extension
+/// method is the sandbox's text) declared raw, masked whole before their cut (architect Q276).
+pub(crate) fn deny_entry(
+    e: NewEntry,
+    id: Option<&Id>,
+    method: Option<&str>,
+    reason: &str,
+) -> NewEntry {
+    let args = json!({"reason": reason});
+    let mut entry = match id {
+        Some(i) => with_id(e, args, i),
+        None => e.args(args),
+    };
+    if let Some(m) = method {
+        entry = entry.text("method", m, SHORT_STYLE);
+    }
+    entry
 }
 
 impl<T: ToolHandler> Server for Agent<T> {
@@ -573,30 +589,46 @@ fn lock<V>(m: &Mutex<V>) -> std::sync::MutexGuard<'_, V> {
 /// The `rpc.request` arguments of a `tools/call` (architect ruling Q16): which tool, and the
 /// shape of its arguments, never their values. The handler's own entry carries each tool's
 /// fields (ARCHITECTURE §4.3) before its effect. Bounded so the writer never truncates it: at
-/// most [`LOGGED_KEYS`] keys, each escaped and cut like every peer string.
-fn call_args(id: &Id, era: Era, name: &str, arguments: &Map<String, Value>) -> Value {
-    let keys: Vec<String> = arguments
+/// most [`LOGGED_KEYS`] keys, each escaped and cut like every peer string. The tool name, a
+/// string id and the keys (a declared list, Q291) are declared raw, so the writer masks them
+/// whole before their cut (architect Q276).
+pub(crate) fn call_entry(
+    e: NewEntry,
+    id: &Id,
+    era: Era,
+    name: &str,
+    arguments: &Map<String, Value>,
+) -> NewEntry {
+    // The keys go raw to the writer, which masks each whole before it cuts and escapes it
+    // (architect Q291); how many are logged is the builder's choice.
+    let keys: Vec<Arc<str>> = arguments
         .keys()
         .take(LOGGED_KEYS)
-        .map(|k| escape(k.as_bytes()))
+        .map(|k| Arc::from(k.as_str()))
         .collect();
     let bytes = serde_json::to_vec(arguments).map_or(0, |b| b.len());
-    json!({
+    let args = json!({
         "method": "tools/call",
-        "id": logged_id(id),
         "lifecycle": era.as_str(),
-        "tool": escape(name.as_bytes()),
         "argument_count": arguments.len(),
-        "argument_keys": keys,
         "arguments_bytes": bytes,
-    })
+    });
+    with_id(e, args, id)
+        .text("tool", name, SHORT_STYLE)
+        .texts("argument_keys", keys, SHORT_STYLE)
 }
 
-/// An id as an audit entry shows it: a number as is, a string escaped and cut.
-fn logged_id(id: &Id) -> Value {
+/// `e` with `args` and `id` as an audit entry shows it: a number as the arg `id`, a string
+/// declared in [`SHORT_STYLE`], masked whole before its cut (architect Q276).
+fn with_id(e: NewEntry, mut args: Value, id: &Id) -> NewEntry {
     match id {
-        Id::Num(n) => Value::from(*n),
-        Id::Str(s) => Value::from(escape(s.as_bytes())),
+        Id::Num(n) => {
+            if let Some(a) = args.as_object_mut() {
+                a.insert("id".into(), Value::from(*n));
+            }
+            e.args(args)
+        }
+        Id::Str(s) => e.args(args).text("id", s.as_str(), SHORT_STYLE),
     }
 }
 

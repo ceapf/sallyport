@@ -883,3 +883,74 @@ async fn a_stream_one_byte_over_the_cap_in_two_chunks_is_cut_after_the_first() {
     );
     assert_eq!(out.len(), 1);
 }
+
+/// Architect Q276, Q304 (4): an `llm.deny`'s method, path and field are masked whole before
+/// their cut at 64: a form at the start and straddling the cut, with a quote, a backslash and a
+/// non-printable byte. Control: the builder escaping them itself (the old one) leaves the
+/// escaped spelling, which the writer cannot match.
+#[test]
+fn a_denied_requests_method_path_and_field_are_masked_before_their_cut() {
+    use sally_core::audit::Redactor;
+    let value = "q\"u\\o\x01te-secret-0123456789";
+    let union = Redactor::new([("Y", value)]);
+    // A run of the value, raw or in the style's `\xNN` spelling.
+    let spelt = sally_core::text::hex_counted(value.as_bytes(), usize::MAX);
+    let run = |text: &str| {
+        value
+            .as_bytes()
+            .windows(8)
+            .chain(spelt.as_bytes().windows(8))
+            .filter_map(|w| std::str::from_utf8(w).ok())
+            .any(|w| text.contains(w))
+    };
+    for t in [value.to_owned(), format!("{}{value}", "a".repeat(64 - 10))] {
+        let e = NewEntry::new(Actor::Sallyd, "llm.deny");
+        let v = deny_entry(e, "bad-request", Some(400), Some((&t, &t)), Some(&t)).resolved(&union);
+        for key in ["method", "path", "field"] {
+            let shown = v[key].as_str().expect("the text is logged");
+            // Straddling, the cut may fall inside the placeholder itself.
+            assert!(shown.contains("[REDACTED:"), "{key}: {shown}");
+            assert!(!run(shown), "{key}: {shown}");
+        }
+    }
+}
+
+/// Architect Q304 (3), Q306: the largest text declared in `SHORT_STYLE` is a refused key's path
+/// from a body of [`body::MAX_BODY`] bytes. One unknown top-level key fills such a body, the
+/// real body check names it, and `llm.deny`'s builder declares it: forms throughout and one
+/// across the cut at 64 are masked before the cut. The key needs no JSON escape, so the field
+/// is the whole key; the value needs no `\xNN` either, so a run of it is its only spelling.
+/// Control: masking after the cut leaves the straddling form's head.
+#[test]
+fn a_refused_key_filling_the_largest_body_is_masked_before_its_cut() {
+    use crate::rpc::record::LOGGED_BYTES;
+    use sally_core::audit::{MAX_ARGS_BYTES, Redactor};
+    let value = "te-secret-0123456789abcdef";
+    let union = Redactor::new([("Y", value)]);
+    let (open, close) = ("{\"", "\":0}");
+    let room = body::MAX_BODY - open.len() - close.len();
+    let mut key = "a".repeat(LOGGED_BYTES - 10);
+    while key.len() + value.len() <= room {
+        key.push_str(value);
+    }
+    key.push_str(&"z".repeat(room - key.len()));
+    let raw = format!("{open}{key}{close}");
+    assert_eq!(raw.len(), body::MAX_BODY);
+    let r = body::check(raw.as_bytes(), 4096).expect_err("an unknown key is refused");
+    // The field is the whole key, so it is under the body by the JSON around the key.
+    assert!(
+        r.field == key,
+        "the field is not the whole key: {} bytes",
+        r.field.len()
+    );
+    let e = NewEntry::new(Actor::Sallyd, "llm.deny");
+    let v = deny_entry(e, r.reason.as_str(), Some(400), None, Some(&r.field)).resolved(&union);
+    let shown = v["field"].as_str().expect("the field is logged");
+    // The cut may fall inside the placeholder itself.
+    assert!(shown.contains("[REDACTED:"), "{shown}");
+    for w in value.as_bytes().windows(8) {
+        let w = std::str::from_utf8(w).expect("ASCII");
+        assert!(!shown.contains(w), "{w:?} in {shown}");
+    }
+    assert!(v.to_string().len() <= MAX_ARGS_BYTES);
+}

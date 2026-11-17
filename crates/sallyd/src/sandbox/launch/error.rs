@@ -246,8 +246,22 @@ pub(super) fn running_as(state: &str, pid: u32) -> Result<(), LaunchError> {
     }
 }
 
+/// A failed podman command's stderr as its error text (architect Q295): whole, trimmed, up to
+/// `max` bytes; a longer one withheld whole, never cut. The text can name what a sandbox
+/// wrote, and the logs mask it before they cut it: a cut here, before the mask, could leave a
+/// partial form that masking the rest brings inside their cut.
+pub(crate) fn stderr_text(err: &[u8], max: usize) -> String {
+    if err.len() <= max {
+        String::from_utf8_lossy(err).trim().to_owned()
+    } else {
+        format!("stderr withheld: over {max} bytes")
+    }
+}
+
+/// A launch task that did not finish: `internal`, with a daemon-chosen detail, never tokio's
+/// text (architect Q297).
 pub(super) fn join_err(e: tokio::task::JoinError) -> LaunchError {
-    LaunchError::Internal(e.to_string())
+    LaunchError::Internal(crate::daemon::crash::join_text(&e).into())
 }
 
 /// The result the launch task of session `sid` sent; [`LaunchError::Lost`] if it sent none.
@@ -263,6 +277,25 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use crate::daemon::crash::JOIN_PANICKED;
+
+    /// Architect Q295: a failed command's stderr is its error text whole (trimmed) up to the
+    /// bound, and withheld whole past it: no byte of it, never a cut that a mask could miss.
+    #[test]
+    fn stderr_is_whole_up_to_the_bound_and_withheld_past_it() {
+        let max = 24;
+        assert_eq!(
+            stderr_text(b"  no such container\n", max),
+            "no such container"
+        );
+        let at = "z".repeat(max);
+        assert_eq!(stderr_text(at.as_bytes(), max), at);
+        let over = "z".repeat(max + 1);
+        let withheld = stderr_text(over.as_bytes(), max);
+        assert_eq!(withheld, "stderr withheld: over 24 bytes");
+        assert!(!withheld.contains('z'));
+        assert_eq!(stderr_text(&[0xff, b'a'], max), "\u{fffd}a");
+    }
 
     fn sid() -> SessionId {
         SessionId::parse("s-1").unwrap()
@@ -371,6 +404,17 @@ mod tests {
         let e = LaunchError::Lost(sid());
         assert_eq!(e.reason(), "start-failed");
         assert_eq!(e.detail(), "the launch task ended without a result");
+    }
+
+    /// Architect Q297: a launch task that panicked is refused `internal` with a fixed detail,
+    /// never tokio's text (the panic message escaped, before the writer's mask).
+    #[tokio::test]
+    async fn a_panicked_launch_task_is_internal_with_a_fixed_detail() {
+        let h = tokio::task::spawn_blocking(|| panic!("sp-q\"uote-vvvvvvvvvvvv"));
+        let e = join_err(h.await.unwrap_err());
+        assert_eq!(e.reason(), "internal");
+        assert_eq!(e.detail(), format!("internal: {JOIN_PANICKED}"));
+        assert_eq!(e.to_string(), format!("internal: {JOIN_PANICKED}"));
     }
 
     /// Architect Q105: a launch whose cgroup event files cannot be opened is refused

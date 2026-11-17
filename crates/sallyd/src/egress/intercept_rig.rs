@@ -280,10 +280,10 @@ impl AuditSink for Sink {
         if self.fail_on == Some(e.event()) {
             return Err(AuditError::InvalidEntry("fake failure"));
         }
-        self.rows
-            .lock()
-            .unwrap()
-            .push((e.event().to_owned(), e.arguments().clone()));
+        self.rows.lock().unwrap().push((
+            e.event().to_owned(),
+            e.resolved(&sally_core::audit::Redactor::default()),
+        ));
         Ok(())
     }
 }

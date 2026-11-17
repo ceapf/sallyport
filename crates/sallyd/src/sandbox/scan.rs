@@ -63,8 +63,9 @@ pub enum ScanError {
     },
     /// A Unix socket inside a mount (RT-FS-13).
     #[error(
-        "filesystem.mounts[{mount}]: {rel:?} is a Unix socket; a sandbox could connect to the \
-         program behind it (socket-in-mount). Remove it or mount a directory without it"
+        "filesystem.mounts[{mount}]: \"{}\" is a Unix socket; a sandbox could connect to the \
+         program behind it (socket-in-mount). Remove it or mount a directory without it",
+        shown(.rel)
     )]
     SocketInMount {
         /// Manifest index.
@@ -96,7 +97,7 @@ pub enum ScanError {
         advice: &'static str,
     },
     /// An I/O error.
-    #[error("filesystem.mounts[{mount}]: {rel:?}: {source}")]
+    #[error("filesystem.mounts[{mount}]: \"{}\": {source}", shown(.rel))]
     Io {
         /// Manifest index.
         mount: usize,
@@ -235,14 +236,26 @@ impl LaunchScan {
                 identity(&fd, pin.mount, &pin.rel)?
             };
             if (dev, ino) != (pin.dev, pin.ino) {
-                return changed(
-                    pin.mount,
-                    format!("{:?} changed since the launch scan", pin.rel),
-                );
+                return changed(pin.mount, changed_text(&pin.rel, "since the launch scan"));
             }
         }
         Ok(())
     }
+}
+
+/// `rel` as a scan message shows it: raw, lossy UTF-8, `.` for the mount root; never Debug,
+/// whose escapes no mask after it can match (architect Q303). The audit writer masks it, and
+/// a control reply escapes it for the terminal.
+fn shown(rel: &Path) -> std::borrow::Cow<'_, str> {
+    if rel.as_os_str().is_empty() {
+        return ".".into();
+    }
+    rel.to_string_lossy()
+}
+
+/// The message of an entry at `rel` that changed `when`.
+fn changed_text(rel: &Path, when: &str) -> String {
+    format!("\"{}\" changed {when}", shown(rel))
 }
 
 fn changed<T>(mount: usize, msg: impl Into<String>) -> Result<T, ScanError> {
@@ -470,10 +483,7 @@ impl<'a> Walk<'a> {
                 .map_err(io(self.mount, rel))?
         };
         if identity(&fd, self.mount, rel)?.1 != ino {
-            return changed(
-                self.mount,
-                format!("{rel:?} changed during the launch scan"),
-            );
+            return changed(self.mount, changed_text(rel, "during the launch scan"));
         }
         let dir = rustix::fs::Dir::read_from(&fd).map_err(io(self.mount, rel))?;
         for entry in dir {

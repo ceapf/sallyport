@@ -1577,16 +1577,45 @@ sallyport/
   `[REDACTED:NAME]`. The token proxy's response redaction uses the same forms
   (`sally-core::audit::secret_forms`, held per session in `SessionForms`) plus each grant's
   rendered value and `{basic}` blob, with a same-length filler and no name (Tasks 9a-3, 9b).
-  Text the sandbox chose that an egress entry carries (a request-target, a method) is masked
-  with its own session's forms, as `[REDACTED:NAME]`, in the whole text before it is cut to
-  256 bytes and escaped (`egress::authority::audit_text`, architect Q253), so no cut or escape
-  can split or rewrite a form of that session's secrets; a form of another live session's
-  secret in the same text (for a session without secret grants, any form) is masked only by
-  the writer's redactor, after the cut and the escape: one that straddles byte 256 leaves its
-  prefix, and one holding `"`, `\` or a byte outside printable ASCII is logged whole in its
-  `\xNN` spelling, wherever it stands, which no redactor matches (#162, Q254, Q263).
-  `target_bytes` is the raw length and `target_cut` says whether the masked text was cut; the
-  method is masked, then cut to 256 bytes, and the entry does not say it was cut (Q256).
+  Text the sandbox chose, and any text that can carry it (podman's and the kernel's messages,
+  a panic payload), is never cut or escaped by the code that builds an entry. The entry
+  declares it beside its args (`NewEntry::text`, `texts` and `pieces`; sally-core
+  `audit::declared`, architect Q276, Q288, Q290, Q291), raw, with a style from sally-core
+  `text::Style`: `Hex` and `HexCounted` (a byte cap, `\xNN` for everything outside printable
+  ASCII and for `\` and `"`), `Text` (the shared escape, the cap on its escaped length) or
+  `Plain` (a character-boundary cut, unescaped). One text, a list of texts (`argument_keys`,
+  each element masked and styled on its own, never joined), or a composite: the approval
+  action text, whose broker words are literals and whose request-chosen values are raw
+  pieces; the prompt shows the pieces assembled, unmasked (SI-5), and the entry masks each raw
+  piece whole, then escapes, assembles and cuts the text at `AUDIT_ACTION_CHARS`. The writer
+  resolves an entry under its lock (`NewEntry::resolved`): it masks each declared text whole
+  with every live session's forms, then cuts and escapes it, inserts it into the args, and
+  then redacts the whole args as before; the writer and every test sink obtain args from
+  `resolved` and nothing else. So no cut or escape can split or rewrite a form of any live
+  session's secret, whichever session's entry holds it (RT-SEC-15). An egress builder also
+  declares its text masked with its own session's forms (`authority::own_masked`, Q253), the
+  pass that keeps a late entry masked after the release (below): the passes run in sequence,
+  the session's own first. `target_bytes` is the raw length and `target_cut` says whether the
+  masked text was cut; the method is masked, then cut to 256 bytes, and the entry does not say
+  it was cut (Q256). Text a builder puts in plain args uncut and unescaped (an `egress.allow`
+  host, lower-cased only, Q289) needs no declaration: the writer's whole-args pass masks it.
+  A panic payload, and a failed podman command's stderr, is held whole up to 64 KiB or
+  withheld whole, never cut before the logs mask it (Q293, Q295). A path the launch scan names
+  in a refusal is shown raw, never Debug-escaped (Q303); a detail in the plain style escapes
+  nothing itself, so it can hold DEL, C1 controls and bidi overrides that the audit line's
+  JSON encoding leaves as they are: a viewer of the audit escapes them for display. A failed
+  task join is a
+  daemon-chosen constant (`crash::join_text`, Q297): tokio's own text escapes the panic
+  message, so the payload is only in the oplog's panic line. The operational log masks a value
+  before it escapes and caps it; its callers pass values raw. The work under the writer's lock
+  for one entry is bounded by the largest declared text (Q298, Q306): an `llm.deny` field, a
+  refused key's path, under `llm::body::MAX_BODY` (4 MiB raw), masked whole and then cut at 64
+  bytes; it costs one mask per refused request, at most the LLM server's rate per session
+  (`llm::server::RATE`, 5 per second, burst 10, taken before any refusal), measured at 0.05 s
+  for the body check and the resolve together in a debug build. The lock is the daemon's one
+  writer, so several sessions each at that rate add up. A tool call's texts are under
+  the tool-call frame cap (256 KiB raw) and are escaped and hashed whole; #174 streams the
+  escape and the digest.
   Redaction covers forms only: text that is not a form of a secret (a value the sandbox
   transformed, a CONNECT host it logs lower-cased, #160) is not redacted anywhere. A store
   value under 16 bytes is stored and reported short (`SHORT_SECRET_BYTES`: its base64 forms are
@@ -1595,10 +1624,13 @@ sallyport/
   `sallyd::session::secrets`, Q219, Q220). A session's forms enter both redactors when its
   egress has loaded them, before `net.sock` is bound or a container exists. They leave after
   the session's last entry: `sandbox.refuse` for a refused launch, `session.closed` (§5.4) for
-  a session. A value two live sessions share stays redacted until both have left. The egress
+  a session. A value two live sessions share stays redacted until both have left. A stored
+  value no live session is granted is in neither redactor (Q275): keeping every stored value
+  resident would need a second store loader. Revisit this if any new path lets a store value
+  reach a sandbox other than the user's own mount or an upstream echo. The egress
   sink of a proxy session with secret grants (interception) also redacts each of its entries
-  with that session's own forms, read from its `Redaction` (the patterns `audit_text` masks
-  with), before the writer sees it (`SessionRedacted`, Q249, Q278). So an egress entry that
+  with that session's own forms, read from its `Redaction` (the patterns `own_masked` masks
+  with), masking its declared texts uncut, before the writer sees it (`SessionRedacted`, Q249, Q278). So an egress entry that
   lands after the release (§5.4: an aborted or detached append, #156, #72) is redacted exactly
   as a live session's entry is: forms only (Q253). Residual: a launch or start task that
   panics after registering never releases its forms, so they stay redacted, and in memory,

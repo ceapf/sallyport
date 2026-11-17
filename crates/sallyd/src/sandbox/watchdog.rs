@@ -40,11 +40,11 @@ use serde_json::{Value, json};
 
 use super::cgroup::{Events, ReadError, Resource, cgroup_root, risen};
 use super::disk::{DiskFloor, Space, Watched, admits, below, watch};
-use super::launch::{LaunchError, Launcher, capped};
+use super::launch::{DETAIL_STYLE, LaunchError, Launcher};
 use super::scan::LaunchScan;
 use super::stage::{Area, StageBounds, Verdict, measure};
 use super::types::SessionPaths;
-use crate::daemon::crash::CrashReporter;
+use crate::daemon::crash::{CrashReporter, join_text};
 
 /// How often the floor task reads free space.
 pub(super) const FLOOR_POLL: Duration = Duration::from_millis(250);
@@ -253,7 +253,8 @@ impl Shared {
         let read = tokio::task::spawn_blocking(move || events.read());
         let now = match tokio::time::timeout(EVENTS_TIMEOUT, read).await {
             Ok(Ok(r)) => r?,
-            Ok(Err(e)) => return Err(ReadError::Failed(e.to_string())),
+            // Never tokio's text: it escapes the panic message before the oplog's mask (Q297).
+            Ok(Err(e)) => return Err(ReadError::Failed(join_text(&e).into())),
             Err(_) => {
                 return Err(ReadError::Failed(format!(
                     "the event files took longer than {} s",
@@ -293,9 +294,10 @@ impl Shared {
         }
     }
 
-    /// Audits `session.resource_limit` with `args`, then kills the container. Only the first
-    /// caller acts.
-    async fn enforce(&self, args: Value) {
+    /// Audits `session.resource_limit` with `args` and, if given, a `detail` declared raw
+    /// (it can name what the sandbox wrote: the writer masks it before its cut, Q288), then
+    /// kills the container. Only the first caller acts.
+    async fn enforce(&self, args: Value, detail: Option<&str>) {
         if self.ended.swap(true, Ordering::Relaxed) {
             return;
         }
@@ -303,6 +305,10 @@ impl Shared {
             .session(&self.target.sid)
             .decision("deny")
             .args(args);
+        let entry = match detail {
+            Some(d) => entry.text("detail", d, DETAIL_STYLE),
+            None => entry,
+        };
         if self.launcher.audit(entry, self.target.level).await.is_err() {
             self.launcher
                 .unaudited("session.resource_limit", &self.target.sid);
@@ -378,8 +384,8 @@ impl Watchdog {
         let s = &self.shared;
         // A container that ended on its own has no cgroup left: nothing more to report.
         if let Err(ReadError::Failed(detail)) = s.observe().await {
-            s.launcher
-                .events_unreadable(&s.target.sid, &capped(&detail));
+            // Raw: the oplog masks a value before it escapes and caps it (Q276).
+            s.launcher.events_unreadable(&s.target.sid, &detail);
         }
     }
 }
@@ -401,8 +407,7 @@ async fn events_task(s: Arc<Shared>) {
             Err(ReadError::Failed(detail)) => {
                 if !logged {
                     logged = true;
-                    s.launcher
-                        .events_unreadable(&s.target.sid, &capped(&detail));
+                    s.launcher.events_unreadable(&s.target.sid, &detail);
                 }
             }
         }
@@ -428,7 +433,7 @@ async fn spaces(watched: &Arc<Vec<Watched>>) -> Result<Vec<Space>, String> {
     });
     match tokio::time::timeout(STATFS_TIMEOUT, read).await {
         Ok(Ok(r)) => r,
-        Ok(Err(e)) => Err(e.to_string()),
+        Ok(Err(e)) => Err(join_text(&e).into()),
         Err(_) => Err(format!(
             "statfs took longer than {} s",
             STATFS_TIMEOUT.as_secs()
@@ -449,8 +454,8 @@ async fn floor_task(s: Arc<Shared>, watched: Arc<Vec<Watched>>) {
             Ok(r) => r,
             Err(detail) => {
                 let args = json!({"role": "workspace", "resource": "disk",
-                    "reason": "disk-floor", "detail": capped(&detail)});
-                return s.enforce(args).await;
+                    "reason": "disk-floor"});
+                return s.enforce(args, Some(&detail)).await;
             }
         };
         for (w, space) in watched.iter().zip(read) {
@@ -458,7 +463,7 @@ async fn floor_task(s: Arc<Shared>, watched: Arc<Vec<Watched>>) {
                 let args = json!({"role": "workspace", "resource": "disk",
                     "reason": "disk-floor", "filesystem": w.label, "free": space.free,
                     "floor": floor.bytes(space.total)});
-                return s.enforce(args).await;
+                return s.enforce(args, None).await;
             }
             if w.state {
                 s.note_used(space.used);
@@ -563,7 +568,7 @@ async fn stage_task(s: Arc<Shared>) {
             Err(PauseError::Failed(detail)) => {
                 drop(gate);
                 return s
-                    .enforce(stage_args(watch, None, "pause-failed", &detail))
+                    .enforce(stage_args(watch, None, "pause-failed"), Some(&detail))
                     .await;
             }
         };
@@ -577,7 +582,7 @@ async fn stage_task(s: Arc<Shared>) {
         .await
         .unwrap_or_else(|e| Verdict::Unmeasurable {
             area: "watchdog".into(),
-            reason: e.to_string(),
+            reason: join_text(&e).into(),
         });
         next = Instant::now() + MIN_GAP.max(started.elapsed().saturating_mul(WALK_SPACING));
         match verdict {
@@ -595,7 +600,7 @@ async fn stage_task(s: Arc<Shared>) {
                 if let Err(detail) = paused.resume().await {
                     drop(gate);
                     return s
-                        .enforce(stage_args(watch, None, "unpause-failed", &detail))
+                        .enforce(stage_args(watch, None, "unpause-failed"), Some(&detail))
                         .await;
                 }
             }
@@ -603,16 +608,16 @@ async fn stage_task(s: Arc<Shared>) {
             Verdict::Over { bytes, largest } => {
                 paused.keep();
                 drop(gate);
-                let mut args = stage_args(watch, Some(bytes), "stage-size", "");
+                let mut args = stage_args(watch, Some(bytes), "stage-size");
                 args["area"] = json!(largest);
-                return s.enforce(args).await;
+                return s.enforce(args, Some("")).await;
             }
             Verdict::Unmeasurable { area, reason } => {
                 paused.keep();
                 drop(gate);
-                let mut args = stage_args(watch, None, "unmeasurable", &reason);
+                let mut args = stage_args(watch, None, "unmeasurable");
                 args["area"] = json!(area);
-                return s.enforce(args).await;
+                return s.enforce(args, Some(&reason)).await;
             }
         }
     }
@@ -637,14 +642,14 @@ impl Shared {
     }
 }
 
-fn stage_args(watch: &StageWatch, measured: Option<u64>, reason: &str, detail: &str) -> Value {
+/// A stage limit's args; its `detail` is declared by [`Shared::enforce`].
+fn stage_args(watch: &StageWatch, measured: Option<u64>, reason: &str) -> Value {
     json!({
         "role": "workspace",
         "resource": "stage_size",
         "reason": reason,
         "limit": watch.limit,
         "measured": measured,
-        "detail": capped(detail),
     })
 }
 
@@ -670,10 +675,8 @@ async fn kill(launcher: &Launcher, t: &Target) {
             let entry = NewEntry::new(Actor::Sallyd, "session.kill_failed")
                 .session(&t.sid)
                 .decision("deny")
-                .args(json!({
-                    "container": t.container,
-                    "detail": capped(&detail),
-                }));
+                .args(json!({"container": t.container}))
+                .text("detail", detail, DETAIL_STYLE);
             if launcher.audit(entry, t.level).await.is_err() {
                 launcher.unaudited("session.kill_failed", &t.sid);
             }

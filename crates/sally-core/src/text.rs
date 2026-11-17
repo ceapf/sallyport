@@ -7,14 +7,22 @@
 //! bound and names what it cut; it never cuts inside an escape. [`escape_quoted_capped`] also
 //! escapes `"`, for a value written between quotes. [`StreamEscaper`] is the line-mode form
 //! (architect Q100): the same alphabet plus `\n`, for output that arrives in chunks.
+//!
+//! Every cut and escape of sandbox-chosen audit text lives here too (architect Q276, Q288), as
+//! the closed set [`Style`]: the hex formats ([`hex_capped`], [`hex_counted`]), the text format
+//! above, and the plain cut ([`plain_capped`]); plus the approval action text's
+//! [`escape_backslash_quoted`] and [`cut_escaped`]. An audit entry declares such text raw and
+//! the writer masks it whole before [`styled`] cuts and escapes it.
 
 use std::fmt::Write as _;
+
+use sha2::{Digest, Sha256};
 
 /// `raw` as printable ASCII.
 #[must_use]
 pub fn escape(raw: &[u8]) -> String {
     let mut out = String::with_capacity(raw.len());
-    for piece in pieces(raw, false) {
+    for piece in pieces(raw, Quote::None) {
         out.push_str(&piece.text);
     }
     out
@@ -25,29 +33,181 @@ pub fn escape(raw: &[u8]) -> String {
 /// where `N` is the count of input bytes not shown.
 #[must_use]
 pub fn escape_capped(raw: &[u8], max: usize) -> String {
-    capped(raw, max, false)
+    capped(raw, max, Quote::None).0
 }
 
 /// [`escape_capped`] for a value written between double quotes: `"` becomes `\x22` too, and the
 /// cut measures that escaped form.
 #[must_use]
 pub fn escape_quoted_capped(raw: &[u8], max: usize) -> String {
-    capped(raw, max, true)
+    capped(raw, max, Quote::Hex).0
 }
 
-fn capped(raw: &[u8], max: usize, quote: bool) -> String {
+/// [`escape`] with `"` written as `\"`: one quoted value of a text whose quotes are `"…"`, as
+/// the approval action text writes them. Uncut: the assembled text is cut by [`cut_escaped`].
+#[must_use]
+pub fn escape_backslash_quoted(raw: &[u8]) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for piece in pieces(raw, Quote::Backslash) {
+        out.push_str(&piece.text);
+    }
+    out
+}
+
+/// The hex format (architect Q288): printable ASCII other than `\` and `"` as is, every other
+/// byte `\xNN`, of the first `max` bytes of `raw`; and whether `raw` was longer.
+#[must_use]
+pub fn hex_capped(raw: &[u8], max: usize) -> (String, bool) {
+    let shown = raw.get(..max).unwrap_or(raw);
+    let mut out = String::with_capacity(shown.len());
+    for &b in shown {
+        if (0x20..0x7f).contains(&b) && b != b'\\' && b != b'"' {
+            out.push(char::from(b));
+        } else {
+            let _ = write!(out, "\\x{b:02x}");
+        }
+    }
+    (out, raw.len() > shown.len())
+}
+
+/// [`hex_capped`], with `…(+N)` after a cut text, `N` the bytes of `raw` not shown.
+#[must_use]
+pub fn hex_counted(raw: &[u8], max: usize) -> String {
+    let (mut out, cut) = hex_capped(raw, max);
+    if cut {
+        let _ = write!(out, "\u{2026}(+{})", raw.len().saturating_sub(max));
+    }
+    out
+}
+
+/// The plain format: at most `max` bytes of `s`, cut at a character boundary, `…` after a cut
+/// text. Nothing is escaped: for free text whose consumers escape it themselves.
+#[must_use]
+pub fn plain_capped(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_owned();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    format!("{}\u{2026}", s.get(..end).unwrap_or_default())
+}
+
+/// `text`, already escaped, cut at `max` bytes, never inside a `\…` escape, with a tail that
+/// names the bytes cut and the SHA-256 of the whole `text`; and whether it was cut.
+#[must_use]
+pub fn cut_escaped(text: &str, max: usize) -> (String, bool) {
+    if text.len() <= max {
+        return (text.to_owned(), false);
+    }
+    let at = escape_boundary(text, max);
+    let shown = text.get(..at).unwrap_or_default();
+    let rest = text.len().saturating_sub(at);
+    let sha = sha256_hex(text.as_bytes());
+    (format!("{shown}... (+{rest} bytes, sha256 {sha})"), true)
+}
+
+/// The largest offset at most `max` that does not fall inside a `\…` escape or a character of
+/// `text`.
+fn escape_boundary(text: &str, max: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while let Some(&b) = bytes.get(i) {
+        let len = match (b, bytes.get(i.saturating_add(1))) {
+            (b'\\', Some(b'x')) => 4,
+            (b'\\', Some(b'u')) => text
+                .get(i..)
+                .and_then(|r| r.find('}'))
+                .map_or(1, |e| e.saturating_add(1)),
+            (b'\\', Some(_)) => 2,
+            // One whole character: a literal piece may hold one outside ASCII.
+            _ => text
+                .get(i..)
+                .and_then(|r| r.chars().next())
+                .map_or(1, char::len_utf8),
+        };
+        let next = i.saturating_add(len);
+        if next > max {
+            break;
+        }
+        i = next;
+    }
+    i
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    let mut out = String::with_capacity(64);
+    for b in Sha256::digest(data) {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// How a `"` is written by the text format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quote {
+    /// As is.
+    None,
+    /// As `\x22`.
+    Hex,
+    /// As `\"`.
+    Backslash,
+}
+
+/// How sandbox-chosen text is cut and escaped for an audit entry (architect Q288). The text is
+/// always masked whole before it is styled, so a cut or an escape cannot split or rewrite a form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Style {
+    /// [`hex_capped`]: the cut is reported apart from the text.
+    Hex {
+        /// Input bytes kept.
+        max: usize,
+    },
+    /// [`hex_counted`].
+    HexCounted {
+        /// Input bytes kept.
+        max: usize,
+    },
+    /// [`escape_capped`]'s alphabet and tail, with `quote` for `"`.
+    Text {
+        /// Escaped bytes kept.
+        max: usize,
+        /// How a `"` is written.
+        quote: Quote,
+    },
+    /// [`plain_capped`].
+    Plain {
+        /// Bytes kept.
+        max: usize,
+    },
+}
+
+/// `raw` in `style`, and whether it was cut.
+#[must_use]
+pub fn styled(raw: &str, style: Style) -> (String, bool) {
+    let bytes = raw.as_bytes();
+    match style {
+        Style::Hex { max } => hex_capped(bytes, max),
+        Style::HexCounted { max } => (hex_counted(bytes, max), bytes.len() > max),
+        Style::Text { max, quote } => capped(bytes, max, quote),
+        Style::Plain { max } => (plain_capped(raw, max), raw.len() > max),
+    }
+}
+
+fn capped(raw: &[u8], max: usize, quote: Quote) -> (String, bool) {
     let mut out = String::new();
     let mut shown = 0usize;
     for piece in pieces(raw, quote) {
         if out.len().saturating_add(piece.text.len()) > max {
             let dropped = raw.len().saturating_sub(shown);
             let _ = write!(out, "...(+{dropped} bytes)");
-            return out;
+            return (out, true);
         }
         out.push_str(&piece.text);
         shown = shown.saturating_add(piece.input);
     }
-    out
+    (out, false)
 }
 
 /// One unit of output: its escaped text and the input bytes it stands for.
@@ -56,7 +216,7 @@ struct Piece {
     input: usize,
 }
 
-fn pieces(raw: &[u8], quote: bool) -> impl Iterator<Item = Piece> + '_ {
+fn pieces(raw: &[u8], quote: Quote) -> impl Iterator<Item = Piece> + '_ {
     raw.utf8_chunks().flat_map(move |chunk| {
         let valid = chunk.valid().chars().map(move |c| Piece {
             text: char_text(c, quote),
@@ -140,7 +300,7 @@ fn line_char(c: char, out: &mut String) {
     if c == '\n' {
         out.push('\n');
     } else {
-        push_char(c, false, out);
+        push_char(c, Quote::None, out);
     }
 }
 
@@ -151,16 +311,26 @@ fn bytes_text(bytes: &[u8], out: &mut String) {
     }
 }
 
-fn char_text(c: char, quote: bool) -> String {
+fn char_text(c: char, quote: Quote) -> String {
     let mut out = String::new();
     push_char(c, quote, &mut out);
     out
 }
 
-fn push_char(c: char, quote: bool, out: &mut String) {
+fn push_char(c: char, quote: Quote, out: &mut String) {
+    if c != '"' {
+        return push_unquoted(c, out);
+    }
+    match quote {
+        Quote::Hex => out.push_str("\\x22"),
+        Quote::Backslash => out.push_str("\\\""),
+        Quote::None => push_unquoted(c, out),
+    }
+}
+
+fn push_unquoted(c: char, out: &mut String) {
     match c {
         '\\' => out.push_str("\\\\"),
-        '"' if quote => out.push_str("\\x22"),
         ' '..='~' => out.push(c),
         '\0'..='\x7f' => {
             let _ = write!(out, "\\x{:02x}", u32::from(c));
@@ -176,6 +346,42 @@ fn push_char(c: char, quote: bool, out: &mut String) {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    /// A cut escaped text names the bytes cut and the SHA-256 of the whole text.
+    #[test]
+    fn a_cut_escaped_text_names_the_rest_and_the_whole_texts_digest() {
+        let text = "abcdefghij";
+        let mut sha = String::new();
+        for b in Sha256::digest(text.as_bytes()) {
+            let _ = write!(sha, "{b:02x}");
+        }
+        assert_eq!(
+            cut_escaped(text, 4),
+            (format!("abcd... (+6 bytes, sha256 {sha})"), true)
+        );
+        assert_eq!(cut_escaped(text, 10), (text.to_owned(), false));
+    }
+
+    /// A character outside ASCII (a literal piece is daemon-chosen, never escaped) is kept or
+    /// cut whole: the shown text is never emptied by a cut inside it.
+    #[test]
+    fn a_cut_never_falls_inside_a_character() {
+        let (shown, cut) = cut_escaped("aé b", 2);
+        assert!(cut);
+        assert!(shown.starts_with("a... (+4 bytes, sha256 "), "{shown}");
+        let (shown, _) = cut_escaped("aé b", 3);
+        assert!(shown.starts_with("aé... (+2 bytes, sha256 "), "{shown}");
+    }
+
+    /// A styled text says it was cut only past its bound, in every style that reports a cut
+    /// from the raw length.
+    #[test]
+    fn styled_says_cut_only_past_the_bound() {
+        for style in [Style::HexCounted { max: 4 }, Style::Plain { max: 4 }] {
+            assert!(!styled("abcd", style).1, "{style:?}");
+            assert!(styled("abcde", style).1, "{style:?}");
+        }
+    }
 
     fn printable(s: &str) -> bool {
         s.bytes().all(|b| (b' '..=b'~').contains(&b))
@@ -227,6 +433,134 @@ mod tests {
         let all = "\"".repeat(100);
         let cut = escape_quoted_capped(all.as_bytes(), 40);
         assert_eq!(cut, format!("{}...(+90 bytes)", "\\x22".repeat(10)));
+    }
+
+    #[test]
+    fn the_hex_format_cuts_input_bytes_and_says_whether_it_cut() {
+        assert_eq!(
+            hex_capped(b"ok.test:443", 256),
+            ("ok.test:443".into(), false)
+        );
+        assert_eq!(
+            hex_capped("a\"b\\c\x00\x1f\x7f\u{ff}~ ".as_bytes(), 256).0,
+            "a\\x22b\\x5cc\\x00\\x1f\\x7f\\xc3\\xbf~ "
+        );
+        assert_eq!(hex_capped(b"abc", 3), ("abc".into(), false));
+        assert_eq!(hex_capped(b"abcd", 3), ("abc".into(), true));
+        assert_eq!(hex_capped(b"\x00\x01", 1), ("\\x00".into(), true));
+        assert_eq!(hex_capped(b"", 0), (String::new(), false));
+    }
+
+    #[test]
+    fn the_counted_hex_format_names_the_bytes_left_out() {
+        assert_eq!(hex_counted(b"tools/list", 64), "tools/list");
+        assert_eq!(hex_counted(b"abc", 3), "abc");
+        assert_eq!(hex_counted(b"abcde", 3), "abc\u{2026}(+2)");
+        assert_eq!(hex_counted(b"\"\\", 1), "\\x22\u{2026}(+1)");
+    }
+
+    #[test]
+    fn the_plain_format_cuts_at_a_character_boundary_without_escaping() {
+        assert_eq!(plain_capped("short", 10), "short");
+        assert_eq!(plain_capped("abcdef", 6), "abcdef");
+        assert_eq!(plain_capped("abcdef", 4), "abcd\u{2026}");
+        // é is two bytes: a cut at 2 would split it, so it falls back to 1.
+        assert_eq!(plain_capped("aéz", 2), "a\u{2026}");
+        assert_eq!(plain_capped("a\x1b[2J", 10), "a\x1b[2J", "no escape");
+    }
+
+    #[test]
+    fn the_backslash_quoted_form_writes_a_quote_as_backslash_quote() {
+        assert_eq!(escape_backslash_quoted(b"a\"b\\c"), "a\\\"b\\\\c");
+        assert_eq!(
+            escape_backslash_quoted("\u{202e}\x1b".as_bytes()),
+            "\\u{202e}\\x1b"
+        );
+        assert_eq!(escape_backslash_quoted(b""), "");
+    }
+
+    #[test]
+    fn an_escaped_text_is_cut_outside_an_escape_with_its_hash() {
+        assert_eq!(cut_escaped("short", 10), ("short".into(), false));
+        let text = "ab\\u{e9}c\\x00d";
+        let sha = sha256_hex(text.as_bytes());
+        assert_eq!(
+            cut_escaped(text, 5),
+            (format!("ab... (+12 bytes, sha256 {sha})"), true)
+        );
+        assert_eq!(
+            cut_escaped(text, 8),
+            (format!("ab\\u{{e9}}... (+6 bytes, sha256 {sha})"), true)
+        );
+        assert_eq!(
+            cut_escaped(text, 12),
+            (format!("ab\\u{{e9}}c... (+5 bytes, sha256 {sha})"), true)
+        );
+        assert_eq!(
+            cut_escaped("a\\\\b", 2),
+            (
+                format!("a... (+3 bytes, sha256 {})", sha256_hex(b"a\\\\b")),
+                true
+            )
+        );
+    }
+
+    #[test]
+    fn a_style_picks_its_format() {
+        let raw = "a\"b\u{e9}cdef";
+        assert_eq!(
+            styled(raw, Style::Hex { max: 4 }),
+            ("a\\x22b\\xc3".into(), true)
+        );
+        assert_eq!(
+            styled(raw, Style::HexCounted { max: 4 }),
+            ("a\\x22b\\xc3\u{2026}(+5)".into(), true)
+        );
+        assert_eq!(
+            styled(
+                raw,
+                Style::Text {
+                    max: 100,
+                    quote: Quote::None
+                }
+            ),
+            ("a\"b\\u{e9}cdef".into(), false)
+        );
+        assert_eq!(
+            styled(
+                raw,
+                Style::Text {
+                    max: 100,
+                    quote: Quote::Hex
+                }
+            ),
+            ("a\\x22b\\u{e9}cdef".into(), false)
+        );
+        assert_eq!(
+            styled(
+                raw,
+                Style::Text {
+                    max: 100,
+                    quote: Quote::Backslash
+                }
+            ),
+            ("a\\\"b\\u{e9}cdef".into(), false)
+        );
+        assert_eq!(
+            styled(
+                raw,
+                Style::Text {
+                    max: 3,
+                    quote: Quote::None
+                }
+            ),
+            ("a\"b...(+6 bytes)".into(), true)
+        );
+        assert_eq!(
+            styled(raw, Style::Plain { max: 4 }),
+            ("a\"b\u{2026}".into(), true)
+        );
+        assert_eq!(styled("ab", Style::Plain { max: 4 }), ("ab".into(), false));
     }
 
     /// The whole of `raw` through one [`StreamEscaper`], in chunks cut at `cuts`.

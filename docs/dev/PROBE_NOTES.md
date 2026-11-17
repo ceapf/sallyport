@@ -381,5 +381,6 @@ tests in `egress/intercept_tests.rs` where the behaviour matters to the proxy.
   imports fails only CI's `fuzz` job (#165). `cargo check --locked --manifest-path
   fuzz/Cargo.toml --bins` works on the pinned stable toolchain: libfuzzer-sys's build script
   compiles libFuzzer with the host C++ compiler, no nightly or sanitizer needed for a check.
-  About 8 s from an empty `--target-dir` of its own (`target/fuzz-check`), and it fails with
+  About 8 s from an empty `--target-dir` of its own (`target/fuzz-check`), about 0.1 s warm
+  with nothing changed, and it fails with
   E0432 on `escape_target` re-added to `egress_head.rs`'s imports. (architect Q265)

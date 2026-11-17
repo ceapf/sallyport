@@ -137,9 +137,10 @@ pub enum StartError {
     /// `agent.sock` could not be bound; the session ended `start-failed`.
     #[error("{AGENT_SOCK}: {0}")]
     Socket(#[source] io::Error),
-    /// An audit append's task failed.
+    /// An audit append's task failed: a daemon-chosen text, never tokio's, which quotes the
+    /// panic message escaped before any mask (architect Q297).
     #[error("audit task: {0}")]
-    Join(#[source] tokio::task::JoinError),
+    Join(&'static str),
     /// The start's own task ended without an answer (it panicked; `sallyd` is stopping).
     #[error("the start task ended: {0}")]
     Task(#[source] oneshot::error::RecvError),
@@ -238,7 +239,7 @@ impl Registry {
         let sink = Arc::clone(&self.p.audit);
         tokio::task::spawn_blocking(move || sink.append(entry, level))
             .await
-            .map_err(StartError::Join)?
+            .map_err(|e| StartError::Join(crate::daemon::crash::join_text(&e)))?
             .map_err(StartError::Audit)
     }
 
@@ -689,6 +690,18 @@ fn unanswered(live: &mut HashMap<String, Live>, id: &str) -> StopOutcome {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// Architect Q297: an audit append's task that panicked is a fixed text, never tokio's
+    /// (the panic message escaped, before any mask: `session.refuse` carries this text).
+    #[tokio::test]
+    async fn a_panicked_audit_task_is_a_fixed_text() {
+        let h = tokio::task::spawn_blocking(|| panic!("sp-q\"uote-vvvvvvvvvvvv"));
+        let e = StartError::Join(crate::daemon::crash::join_text(&h.await.unwrap_err()));
+        assert_eq!(
+            e.to_string(),
+            format!("audit task: {}", crate::daemon::crash::JOIN_PANICKED)
+        );
+    }
 
     #[test]
     fn a_session_whose_supervisor_died_fails_its_stop_once() {

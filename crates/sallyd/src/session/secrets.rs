@@ -39,13 +39,14 @@ use crate::sandbox::{AuditSink, SharedAudit};
 /// wrapped and has no forms. Each entry is redacted with that session's own forms before it
 /// goes on to the audit log, which redacts it again with the live sessions' union (Q249). It
 /// reads the session's [`Redaction`], the same patterns
-/// [`crate::egress::authority::audit_text`] masks with (Q278). An egress entry can land after
+/// [`crate::egress::authority::own_masked`] masks with (Q278). An egress entry can land after
 /// the session's `session.closed` and the release of its forms (an append aborted mid-write, a
 /// dropped body's report; Q251, #156); its sandbox-chosen text is still redacted with the
-/// session's forms. A target and a method are masked by `audit_text` already; this pass is the
-/// only one after the release for the `host` of `egress.allow` and `egress.close` (a host a
-/// wildcard rule allowed, which no builder masks) and for any field a later builder adds
-/// without `audit_text` (Q266). The launcher wraps the session's sink right after its egress
+/// session's forms. A target and a method are declared masked by `own_masked` already (this
+/// pass masks declared texts too, uncut; Q276); this pass is the only one after the release for
+/// the `host` of `egress.allow` and `egress.close` (a host a wildcard rule allowed, which no
+/// builder masks) and for any field a later builder adds without `own_masked` (Q266). The
+/// launcher wraps the session's sink right after its egress
 /// loaded the forms. Append-only: it swaps no redactor.
 pub(crate) struct SessionRedacted {
     inner: Arc<dyn AuditSink>,

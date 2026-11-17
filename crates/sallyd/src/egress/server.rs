@@ -174,6 +174,9 @@ fn permits(n: usize) -> usize {
 mod intercept;
 #[path = "intercept_tls.rs"]
 mod intercept_tls;
+/// The `egress.request` builder, for RT-SEC-15 (`session/cross_session_tests.rs`).
+#[cfg(test)]
+pub(crate) use intercept::request_entry;
 pub use intercept::{MAX_REQUEST_HEAD, MAX_RESPONSE_HEAD, Summary, upstream_builder};
 pub use intercept_tls::{Interception, trusting, upstream_client};
 
@@ -223,7 +226,7 @@ enum Seen<'a> {
     Nothing,
     /// A head that never became one: only its size.
     Bytes(usize),
-    /// The request-target, masked, cut and escaped by [`authority::audit_text`].
+    /// The request-target, declared by [`authority::with_target`].
     Target(&'a str),
 }
 
@@ -507,9 +510,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
             .interception
             .as_ref()
             .map(|i| i.credentials().redaction().audit());
-        let entry = self
-            .entry(event, Some("deny"))
-            .args(refusal_args(r, seen, forms));
+        let entry = refusal_entry(self.entry(event, Some("deny")), r, seen, forms);
         if self.append(entry).await && r.reason != Reason::HeadTimeout {
             write_reply(client, r.reason).await;
         }
@@ -575,34 +576,35 @@ fn pinned(found: &[SocketAddr], port: u16) -> Vec<SocketAddr> {
     out
 }
 
-/// Arguments of an `egress.deny` / `egress.limit` entry. A target is masked with `forms`, the
-/// session's secret forms (`None` for a session without secret grants), before it is cut
-/// (architect Q253).
-fn refusal_args(r: Refusal, seen: Seen<'_>, forms: Option<&Redactor>) -> Value {
+/// An `egress.deny` / `egress.limit` entry. A target is declared as [`authority::with_target`]
+/// does, masked with `forms`, the session's secret forms (`None` for a session without secret
+/// grants), and then by the writer with every live session's forms, before it is cut (architect
+/// Q253, Q276).
+fn refusal_entry(e: NewEntry, r: Refusal, seen: Seen<'_>, forms: Option<&Redactor>) -> NewEntry {
     let mut v = json!({"reason": r.reason.as_str()});
+    let mut target = None;
     if let Some(obj) = v.as_object_mut() {
         match seen {
             Seen::Nothing => {}
             Seen::Bytes(n) => {
                 obj.insert("head_bytes".into(), json!(n));
             }
-            Seen::Target(raw) => {
-                let (target, bytes, cut) = authority::audit_text(raw, forms);
-                obj.insert("target".into(), json!(target));
-                obj.insert("target_bytes".into(), json!(bytes));
-                obj.insert("target_cut".into(), json!(cut));
-            }
+            Seen::Target(raw) => target = Some(raw),
         }
         if let Some(f) = r.filter {
             obj.insert("filter".into(), json!(f));
         }
     }
-    v
+    match target {
+        Some(raw) => authority::with_target(e, v, raw, forms),
+        None => e.args(v),
+    }
 }
 
 /// Arguments of an `egress.close` entry: the address used (or `connected: false`), the byte
 /// counts, how it ended, whether it was intercepted and, if so, its requests and status classes
-/// (architect Q34).
+/// (architect Q34). The `host` is the parsed authority, which no cut or escape touches before
+/// the writer masks it, so it stays a plain arg and is not declared (architect Q289).
 fn close_args(a: &Authority, used: Option<SocketAddr>, t: Totals, s: Option<Summary>) -> Value {
     let mut v = json!({
         "host": a.host,

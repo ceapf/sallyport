@@ -79,8 +79,9 @@ fn assert_closed_last(x: &Lx, id: &str, reason: &str) {
 ///
 /// Control (hand-checked once, uncommitted): `session.closed` appended before `Launcher::stop`
 /// in `retry_stop`, or before `egress.shutdown` in `Launcher::stop`, fails the order assertion.
-/// Residual (Q244, #156): an egress or watchdog append already inside its blocking write when
-/// its task is aborted may still land after it.
+/// Residual (Q244, Q251, #156): entries of the egress and watchdog writers still outstanding at
+/// teardown may land after it: an append whose task was aborted while it waited for or ran its
+/// blocking write, and an `egress.response` started from a body's drop on a detached task (#72).
 #[test]
 fn rt_aud_03_nothing_of_a_session_follows_session_closed() {
     rt().block_on(async {

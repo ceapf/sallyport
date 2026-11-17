@@ -880,6 +880,59 @@ async fn the_worst_case_call_entry_stays_under_the_writer_cap() {
     );
 }
 
+/// Architect Q291 (6): the worst case with a form of a live session's secret in every named key
+/// (straddling the 64-byte cut) and in the tool name: each is masked whole before its cut and
+/// escape, and the entry stays under the writer's cap.
+#[test]
+fn the_worst_case_call_entry_with_a_form_in_every_key_is_masked_and_bounded() {
+    let value = "q\"u\\o\x01te-secret-value-0123456789";
+    let r = sally_core::audit::Redactor::new([("Y", value)]);
+    let lead = "\u{1}".repeat(40);
+    let mut arguments = Map::new();
+    for (i, filler) in [
+        100_000, 100_000, 10_000, 10_000, 10_000, 10_000, 10_000, 1_000,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let tag = char::from(b'a' + u8::try_from(i).unwrap());
+        arguments.insert(
+            format!("{lead}{value}{tag}{}", "f".repeat(filler)),
+            json!(1),
+        );
+    }
+    for i in 0..4 {
+        arguments.insert(format!("z{i}"), json!(1));
+    }
+    let id = Id::Str("\u{1}".repeat(crate::rpc::message::MAX_ID_BYTES));
+    let name = format!(
+        "{value}{}",
+        "\u{1}".repeat(crate::rpc::mcp::MAX_TOOL_NAME - value.len())
+    );
+    let e = NewEntry::new(Actor::Harness, "rpc.request");
+    let args = call_entry(e, &id, Era::Modern, &name, &arguments).resolved(&r);
+    let spelt = sally_core::text::hex_capped(value.as_bytes(), usize::MAX).0;
+    let keys = args["argument_keys"].as_array().unwrap();
+    assert_eq!(keys.len(), LOGGED_KEYS);
+    let tool = args["tool"].as_str().unwrap();
+    for shown in keys.iter().map(|k| k.as_str().unwrap()).chain([tool]) {
+        assert!(shown.contains("[REDACTED:Y]"), "{shown}");
+        for w in value
+            .as_bytes()
+            .windows(8)
+            .chain(spelt.as_bytes().windows(8))
+        {
+            let w = std::str::from_utf8(w).unwrap();
+            assert!(!shown.contains(w), "{w:?} in {shown:?}");
+        }
+    }
+    let size = serde_json::to_vec(&args).unwrap().len();
+    assert!(
+        size <= sally_core::audit::MAX_ARGS_BYTES - 512,
+        "{size} bytes"
+    );
+}
+
 /// Architect ruling Q17: session teardown drops in-flight calls. A dropped handle aborts a
 /// blocked call at once and frees its slot; an orderly shutdown waits STOP_GRACE first.
 #[tokio::test(start_paused = true)]
@@ -950,10 +1003,46 @@ fn error_messages_follow_their_codes() {
     }
 }
 
+/// Architect Q291: an argument key holding a form of a live session's secret (at byte 0,
+/// straddling the 64-byte cut, with a quote, a backslash and a non-printable byte) is masked
+/// whole before it is cut and escaped. Control: the keys escaped and cut in the builder.
+#[test]
+fn argument_keys_holding_a_form_are_masked_before_their_cut() {
+    let value = "q\"u\\o\x01te-secret-value-0123456789";
+    let r = sally_core::audit::Redactor::new([("Y", value)]);
+    let straddle = format!("{}{value}", "k".repeat(50));
+    let mut arguments = Map::new();
+    for k in [value.to_owned(), straddle, "plain".to_owned()] {
+        arguments.insert(k, json!(1));
+    }
+    let e = NewEntry::new(Actor::Harness, "rpc.request");
+    let v = call_entry(e, &Id::Num(1), Era::Modern, "t", &arguments).resolved(&r);
+    let keys = v["argument_keys"].as_array().unwrap();
+    assert_eq!(keys.len(), 3, "every key is logged");
+    let spelt = sally_core::text::hex_capped(value.as_bytes(), usize::MAX).0;
+    for k in keys {
+        let k = k.as_str().unwrap();
+        for w in value
+            .as_bytes()
+            .windows(8)
+            .chain(spelt.as_bytes().windows(8))
+        {
+            let w = std::str::from_utf8(w).unwrap();
+            assert!(!k.contains(w), "{w:?} in {k:?}");
+        }
+    }
+    assert!(keys.contains(&json!("[REDACTED:Y]")), "{keys:?}");
+    assert!(keys.contains(&json!("plain")), "{keys:?}");
+}
+
 #[test]
 fn logged_ids_are_escaped() {
-    assert_eq!(logged_id(&Id::Num(-3)), json!(-3));
-    assert_eq!(logged_id(&Id::Str("a\u{1b}".into())), json!("a\\x1b"));
+    let logged = |id: &Id| {
+        let e = with_id(NewEntry::new(Actor::Sallyd, "rpc.cancel"), json!({}), id);
+        e.resolved(&sally_core::audit::Redactor::default())["id"].clone()
+    };
+    assert_eq!(logged(&Id::Num(-3)), json!(-3));
+    assert_eq!(logged(&Id::Str("a\u{1b}".into())), json!("a\\x1b"));
 }
 
 fn driven_setup() -> (Arc<Agent<Arc<Fake>>>, Arc<Fake>, Arc<Sink>) {

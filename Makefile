@@ -14,7 +14,8 @@ clippy:
 
 # The fuzz crate is detached from the workspace, so clippy above never builds it; type-check its
 # targets on the pinned stable toolchain, so a `pub` item they use cannot vanish unnoticed until
-# CI's fuzz job (PROBE_NOTES "Fuzz crate on pinned stable").
+# CI's fuzz job (PROBE_NOTES "Fuzz crate on pinned stable"). This only type-checks: it neither
+# builds with the sanitizer nor runs a target; CI's fuzz job stays the real build.
 fuzz-check:
 	$(CARGO) check -q --manifest-path fuzz/Cargo.toml --bins --target-dir target/fuzz-check
 
@@ -133,7 +134,8 @@ mutants:
 MUTANTS_WIDE_CORE := $(addprefix crates/sally-core/src/,manifest/image.rs manifest/hostenv.rs \
                      manifest/parse.rs manifest/summary.rs manifest/units.rs secrets/store.rs \
                      secrets/secret.rs secrets/names.rs audit/entry.rs audit/redact.rs audit/verify.rs \
-                     audit/writer.rs audit/layout.rs audit/tail.rs fsutil.rs fd.rs text.rs paths.rs)
+                     audit/writer.rs audit/declared.rs audit/layout.rs audit/tail.rs fsutil.rs fd.rs \
+                     text.rs paths.rs)
 MUTANTS_WIDE_SALLYD := $(addprefix crates/sallyd/src/sandbox/,argv.rs check.rs types.rs profiles.rs \
                        overlap.rs scan.rs images.rs changes.rs cgroup.rs dirs.rs podman.rs binaries.rs \
                        disk.rs stage.rs \

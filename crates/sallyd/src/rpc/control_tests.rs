@@ -15,7 +15,7 @@ use crate::approvals::render::{ACTION_CHARS, FULL_WIRE_BYTES, NOTE_CHARS, Prompt
 use crate::approvals::{Approver, Desk, Gate, Limits};
 use crate::llm::scripted::Script;
 use crate::rpc::control_methods::{
-    DETAIL_CHARS, ID_CHARS, MAX_ERROR_LINES, REPLY_BYTES, error_lines, fit,
+    DETAIL_CHARS, ID_CHARS, MAX_ERROR_LINES, REPLY_BYTES, error_lines, fit, refusal_entry,
 };
 use crate::rpc::drive::Driver;
 use crate::rpc::line::Line;
@@ -1500,6 +1500,138 @@ async fn eventually(f: impl Fn() -> bool) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("never happened");
+}
+
+/// Architect Q288 (8): a stop's or a listing's failure can name what a sandbox wrote, so its
+/// `session.refuse` text is declared raw: a form of a live session's secret (with a quote, a
+/// backslash and a non-printable byte, and straddling the cut) is masked before the escape and
+/// the cut; with no form the text is `escape_capped`'s. Control: the text escaped and capped
+/// before it is declared (the old builders).
+#[test]
+fn a_refusals_failure_text_is_masked_before_its_escape_and_cut() {
+    use sally_core::audit::{NewEntry, Redactor};
+    use sally_core::text::escape_capped;
+    let value = "q\"u\\o\x01te-secret-value-0123456789";
+    let r = Redactor::new([("Y", value)]);
+    let shown = |raw: &str, r: &Redactor| {
+        let e = NewEntry::new(Actor::Sallyd, "session.refuse");
+        let v = refusal_entry(e, json!({"reason": "stop-failed"}), "detail", raw).resolved(r);
+        assert_eq!(v["reason"], json!("stop-failed"));
+        v["detail"]
+            .as_str()
+            .expect("the detail is logged")
+            .to_owned()
+    };
+    let plain = "container\x1b[2J stuck\"\\".repeat(200);
+    assert_eq!(
+        shown(&plain, &r),
+        escape_capped(plain.as_bytes(), DETAIL_CHARS)
+    );
+    let spelt = escape_capped(value.as_bytes(), usize::MAX);
+    for at in [0, DETAIL_CHARS - 20, DETAIL_CHARS - 12] {
+        let raw = format!("{}{value} tail", "x".repeat(at));
+        let got = shown(&raw, &r);
+        assert!(got.contains("[REDACTED:Y]"), "{got}");
+        for w in value
+            .as_bytes()
+            .windows(8)
+            .chain(spelt.as_bytes().windows(8))
+        {
+            let w = std::str::from_utf8(w).unwrap();
+            assert!(!got.contains(w), "{w:?} in {got:?}");
+        }
+    }
+}
+
+/// A file name's longest length in bytes on Linux.
+const NAME_MAX: usize = 255;
+/// The largest raw failure text declared in `REFUSAL_STYLE`, as its doc states it (architect
+/// Q305): one `stage/` name escaped four characters a byte, plus room for the fixed text, the
+/// errno text and the numbers.
+const REFUSAL_RAW_MAX: usize = 4 * NAME_MAX + 256;
+
+/// Architect Q305 (3): the numbers `REFUSAL_STYLE`'s doc quotes are the real ones. 1276 is the
+/// bound; a name of `NAME_MAX` bytes is the longest the host takes; an id is at most 64 bytes.
+#[test]
+fn the_refusal_bound_ties_to_name_max_and_the_id_grammar() {
+    assert_eq!(REFUSAL_RAW_MAX, 1276);
+    let s = Scratch::new("name-max");
+    let byte = "\x01";
+    std::fs::create_dir(s.0.join(byte.repeat(NAME_MAX))).unwrap();
+    let over = std::fs::create_dir(s.0.join(byte.repeat(NAME_MAX + 1))).unwrap_err();
+    assert_eq!(
+        over.raw_os_error(),
+        Some(rustix::io::Errno::NAMETOOLONG.raw_os_error())
+    );
+    assert!(crate::sandbox::SessionId::parse(&"a".repeat(64)).is_ok());
+    assert!(crate::sandbox::SessionId::parse(&"a".repeat(65)).is_err());
+}
+
+/// Architect Q305 (3): every stop-failed text, at its largest (a 64-byte id, the largest
+/// count), is under the bound. Pinned by copy: the three texts `session/supervise.rs` builds
+/// inline; `registry.rs`'s `unanswered` text is pinned by its own test too. A copy cannot see
+/// a changed or new text in `supervise.rs`: such a change restates this list (and the bound).
+#[test]
+fn every_stop_failed_text_is_under_the_refusal_bound() {
+    let sid = "a".repeat(64);
+    let n = usize::MAX;
+    for why in [
+        format!("{n} operations of session {sid} still running"),
+        format!("the container of session {sid} could not be confirmed gone"),
+        format!("the supervisor of session {sid} ended"),
+    ] {
+        assert!(why.len() < REFUSAL_RAW_MAX, "{why}");
+    }
+}
+
+/// Architect Q305 (3): the longest listing error is a `stage/` name of `NAME_MAX` bytes, each
+/// escaped as four characters; a real listing over one is under the bound.
+#[test]
+fn the_longest_listing_error_is_under_the_refusal_bound() {
+    use crate::sandbox::SessionId;
+    use rustix::fd::AsFd as _;
+    let s = Scratch::new("listing-bound");
+    let sessions = crate::sandbox::open_sessions(&s.0.join("state")).unwrap();
+    let name = "\x01".repeat(NAME_MAX);
+    mkdirs(&s.0.join("state/sessions/s-1/stage").join(&name));
+    let id = SessionId::parse("s-1").unwrap();
+    let e = crate::sandbox::session_changes(sessions.as_fd(), &id).unwrap_err();
+    let why = e.to_string();
+    assert!(why.contains(&"\\x01".repeat(NAME_MAX)), "{why}");
+    assert!(why.len() < REFUSAL_RAW_MAX, "{} bytes", why.len());
+}
+
+/// Architect Q304 (3), Q305 (4): a failure text at the bound, a live session's form across the
+/// cut at `DETAIL_CHARS` and then to the end, is masked before its escape and cut: the
+/// placeholder shows, no 8 bytes of the value or its escaped spelling do, and the entry fits
+/// the args cap. Control: masking after the cut leaves the straddling form's head.
+#[test]
+fn a_refusal_text_at_its_bound_is_masked_before_its_cut() {
+    use sally_core::audit::{MAX_ARGS_BYTES, NewEntry, Redactor};
+    use sally_core::text::escape_capped;
+    let value = "q\"u\\o\x01te-secret-value-0123456789";
+    let union = Redactor::new([("Y", value)]);
+    let mut raw = "x".repeat(DETAIL_CHARS - 20);
+    while raw.len() + value.len() <= REFUSAL_RAW_MAX {
+        raw.push_str(value);
+    }
+    raw.push_str(&"z".repeat(REFUSAL_RAW_MAX - raw.len()));
+    assert_eq!(raw.len(), REFUSAL_RAW_MAX);
+    let e = NewEntry::new(Actor::Sallyd, "session.refuse");
+    let v = refusal_entry(e, json!({"reason": "listing-failed"}), "error", &raw).resolved(&union);
+    let got = v["error"].as_str().expect("the error is logged");
+    // The cut may fall inside the placeholder itself.
+    assert!(got.contains("[REDACTED:"), "{got}");
+    let spelt = escape_capped(value.as_bytes(), usize::MAX);
+    for w in value
+        .as_bytes()
+        .windows(8)
+        .chain(spelt.as_bytes().windows(8))
+    {
+        let w = std::str::from_utf8(w).unwrap();
+        assert!(!got.contains(w), "{w:?} in {got:?}");
+    }
+    assert!(v.to_string().len() <= MAX_ARGS_BYTES);
 }
 
 #[path = "control_drive_tests.rs"]
