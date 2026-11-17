@@ -235,6 +235,7 @@ pub fn format_line(
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
     fn none() -> Redactor {
@@ -361,16 +362,19 @@ mod tests {
         assert!(l.trim_end().ends_with("...(+1 fields)"), "{}", l.len());
     }
 
-    /// A writer that records lines, optionally blocking until released.
+    /// A writer that records lines, optionally blocking until released, and counts the calls to
+    /// `write` that have begun (before the gate).
     #[derive(Clone, Default)]
     struct Sink {
         lines: Arc<Mutex<Vec<u8>>>,
         gate: Arc<Mutex<()>>,
+        entered: Arc<AtomicUsize>,
         fail: bool,
     }
 
     impl Write for Sink {
         fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.entered.fetch_add(1, Ordering::SeqCst);
             let _held = self.gate.lock().unwrap();
             if self.fail {
                 return Err(std::io::ErrorKind::BrokenPipe.into());
@@ -445,13 +449,21 @@ mod tests {
     }
 
     /// `flush` returns once every queued line is written, and gives up at its limit on a stuck
-    /// writer; a dropped line is not waited for.
+    /// writer; a dropped line is not waited for. The rest of the lines are logged only once the
+    /// writer has taken the first and is held in `write`, so the number written is exact.
     #[test]
     fn flush_waits_for_queued_lines_within_its_limit() {
         let sink = Sink::default();
         let held = sink.gate.lock().unwrap();
         let log = Oplog::new(sink.clone());
-        for i in 0..(QUEUE + 10) {
+        log.info("t", "line", &[("i", "0")]);
+        let mut tries = 0;
+        while sink.entered.load(Ordering::SeqCst) == 0 {
+            tries += 1;
+            assert!(tries <= 500, "the writer never took the first line");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for i in 1..(QUEUE + 10) {
             log.info("t", "line", &[("i", &i.to_string())]);
         }
         let start = Instant::now();
@@ -460,8 +472,14 @@ mod tests {
         drop(held);
         assert!(log.flush(Duration::from_secs(10)));
         let text = String::from_utf8(sink.lines.lock().unwrap().clone()).unwrap();
-        // Every queued line is there: the writer holds one and the queue the rest.
-        assert!(text.matches(" info t ").count() > QUEUE, "{}", text.len());
+        // Exactly the writer's line and a full queue are written, and the 9 dropped are not: the
+        // writer was seen holding the first line before the rest were logged.
+        assert_eq!(
+            text.matches(" info t ").count(),
+            QUEUE + 1,
+            "{}",
+            text.len()
+        );
         log.info("t", "last", &[]);
         assert!(log.flush(Duration::from_secs(10)));
         let text = String::from_utf8(sink.lines.lock().unwrap().clone()).unwrap();

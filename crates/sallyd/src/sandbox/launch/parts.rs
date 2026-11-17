@@ -264,7 +264,6 @@ mod tests {
         );
         std::fs::remove_dir(&p).unwrap();
         assert!(pin.recheck().is_err(), "gone");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A symlink is refused at the pin and at the re-check, at the end of the path or inside it.
@@ -284,7 +283,6 @@ mod tests {
         std::fs::rename(dir.join("real"), dir.join("moved")).unwrap();
         std::os::unix::fs::symlink(dir.join("moved"), dir.join("real")).unwrap();
         assert!(pin.recheck().is_err(), "the same inode through a symlink");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -313,6 +311,5 @@ mod tests {
         std::fs::write(&new, b"GGUF").unwrap();
         std::fs::rename(&new, &blob).unwrap();
         assert!(pin.recheck().is_err(), "a new file at the same path");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
