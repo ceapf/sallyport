@@ -130,6 +130,12 @@ fn parse_port(s: &str) -> Option<u16> {
 /// How text the sandbox chose (a request-target, a method) is logged: its first
 /// [`LOGGED_TARGET_BYTES`] bytes, every byte outside printable ASCII, and `\` and `"`, as `\xNN`
 /// (architect Q288's hex format).
+///
+/// The texts declared in it, and their largest raw length (architect Q304): an egress entry's
+/// request-target ([`with_target`]) and an intercepted request's method, each at most
+/// [`MAX_HEAD`](super::head::MAX_HEAD) bytes, the head bound of both readers (a CONNECT head in
+/// `server.rs`; an intercepted request head in `intercept.rs`, at most `MAX_HEAD -
+/// REQUEST_READ`). Tested at that size by `a_target_at_the_head_bound_is_masked_before_its_cut`.
 pub const TARGET_STYLE: Style = Style::Hex {
     max: LOGGED_TARGET_BYTES,
 };
@@ -200,6 +206,38 @@ mod tests {
         assert_eq!(v["target_bytes"], 4);
         let odd = with_target(e(), serde_json::json!([1]), "/abc", None);
         assert_eq!(*odd.arguments(), serde_json::json!([1]));
+    }
+
+    /// Architect Q304: a target at the head bound, the largest raw text declared in
+    /// [`TARGET_STYLE`], with a live session's form across the cut and then to the end, is
+    /// masked before it is cut and escaped: the placeholder shows, no 8 bytes of the value do,
+    /// and the entry fits the args cap. Control: masking after the cut leaves the form's head.
+    #[test]
+    fn a_target_at_the_head_bound_is_masked_before_its_cut() {
+        use crate::egress::head::MAX_HEAD;
+        use sally_core::audit::MAX_ARGS_BYTES;
+        let value = "q\"u\\o\x01te-secret-0123456789";
+        let union = Redactor::new([("Y", value)]);
+        let mut raw = "/".repeat(LOGGED_TARGET_BYTES - 20);
+        while raw.len() + value.len() <= MAX_HEAD {
+            raw.push_str(value);
+        }
+        raw.push_str(&"z".repeat(MAX_HEAD - raw.len()));
+        assert_eq!(raw.len(), MAX_HEAD);
+        let e = NewEntry::new(Actor::Sallyd, "egress.deny");
+        let v = with_target(e, Value::Null, &raw, None).resolved(&union);
+        let shown = v["target"].as_str().unwrap();
+        // The cut may fall inside the placeholder itself.
+        assert!(shown.contains("[REDACTED:"), "{shown}");
+        for w in value.as_bytes().windows(8) {
+            let w = std::str::from_utf8(w).unwrap();
+            assert!(!shown.contains(w), "{w:?} in {shown}");
+        }
+        assert_eq!(
+            (&v["target_bytes"], &v["target_cut"]),
+            (&MAX_HEAD.into(), &true.into())
+        );
+        assert!(v.to_string().len() <= MAX_ARGS_BYTES);
     }
 
     fn ok(host: &str, port: u16) -> Result<Authority, AuthorityError> {
