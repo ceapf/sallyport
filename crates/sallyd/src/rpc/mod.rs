@@ -6,6 +6,7 @@ pub mod attach;
 pub mod control;
 pub mod control_line;
 pub mod control_methods;
+mod control_wire;
 pub mod drive;
 pub(crate) mod frame;
 pub(crate) mod json;
