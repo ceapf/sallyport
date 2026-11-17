@@ -390,3 +390,26 @@ tests in `egress/intercept_tests.rs` where the behaviour matters to the proxy.
   About 8 s from an empty `--target-dir` of its own (`target/fuzz-check`), about 0.1 s warm
   with nothing changed, and it fails with
   E0432 on `escape_target` re-added to `egress_head.rs`'s imports. (architect Q265)
+
+## llama.cpp GGUF read path (for the strict parser)
+
+Read at llama.cpp commit a49db739fba21964e5a05c4d8c35e352b293242e (2026-11-17), files
+`ggml/include/ggml.h`, `ggml/src/ggml.c` (`type_traits`), `ggml/src/ggml-common.h` (block
+structs, each with a `static_assert` on its size), `ggml/include/gguf.h`, `ggml/src/gguf.cpp`
+(`gguf_init_from_reader`). No engine is pinned yet; M3 reconciles the type table with the pin
+(#182).
+- ggml types: 36 live ids, 0–43 without 4, 5, 31–33, 36–38 (removed; their `type_traits`
+  entries are placeholders with block size 0). `GGML_TYPE_COUNT` = 44. Ids 40–43 (NVFP4, Q1_0,
+  Q2_0, F8_E4M3) are the newest.
+- gguf value types 0–12; an array's element type is read like any type, and an array of arrays
+  is refused ("invalid GGUF type").
+- Version 0 and 1 refused, above 3 refused, `(version & 0xFFFF) == 0` refused as a byte-order
+  mismatch. Versions 2 and 3 parse the same way.
+- Keys: empty and duplicate refused; no length limit beyond 1 GiB per string; compared as C
+  strings. Bool: any nonzero byte is true. `general.alignment`: must be u32, nonzero, power of 2.
+- Tensor names: length must be < 64 (`GGML_MAX_NAME`), duplicates refused. `n_dims ≤ 4`, each
+  `ne ≥ 0` (zero allowed), element count overflow checked, `ne[0] % block_size == 0`.
+- Offsets: no per-tensor alignment check; instead each offset must equal the running total
+  (first 0, each next = previous + `GGML_PAD(nbytes, alignment)`), so the data is contiguous.
+- The strict parser is narrower on purpose: zero dims, zero tensors, bool bytes other than 0/1,
+  alignment below 8, non-printable keys and NUL in names are refused (rulings in PR text).

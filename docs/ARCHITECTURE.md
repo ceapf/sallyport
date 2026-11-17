@@ -1205,12 +1205,26 @@ sallyport/
   overhead) / (weights / n_layer))`. RAM check: `weights + kv ≤ 0.8 * free RAM` for CPU fallback.
   Show three states: **Fits on GPU** / **Partial (N of L layers)** / **CPU only** / **Won't fit**.
   Calibrate against real llama-server VRAM readings in M3 and adjust the constant.
-- **GGUF strict parser limits**: magic `GGUF`, version ∈ {2,3}, `tensor_count ≤ 65 536`,
-  `kv_count ≤ 4 096`, string len ≤ 65 536 B, array len ≤ 4 194 304, nested arrays depth ≤ 2,
-  tensor name ≤ 64 B and unique, `n_dims ≤ 4`, dims product via `checked_mul`, valid ggml type,
-  offset aligned to `general.alignment` (default 32, must be power of two ≤ 65 536),
-  `data_start + offset + nbytes ≤ file_len`. Parse header + tensor infos only; never read tensor
-  data; never allocate proportional to an untrusted count before bounds are checked.
+- **GGUF strict parser limits** (`sally-core::model::gguf`; detect first: extension exactly
+  `gguf` from the name alone, before any open, then the magic): magic `GGUF`, version ∈ {2,3}
+  (one layout; a byte-swapped file is a bad version), `1 ≤ tensor_count ≤ 65 536` (no tensors is
+  refused), `kv_count ≤ 4 096`, whole header (magic through the last tensor info) ≤ 64 MiB.
+  Keys: 1–256 B of ASCII 0x21–0x7E, unique. String len ≤ 65 536 B, array len ≤ 4 194 304, arrays
+  of arrays refused, bool 0 or 1. `general.alignment`: u32, power of two, 8 ≤ a ≤ 65 536
+  (default 32). Tensor name 1–63 B, UTF-8, no control characters (NUL included), unique.
+  `1 ≤ n_dims ≤ 4`, each dim `1 ≤ d ≤ i64::MAX`, element count ≤ `i64::MAX` via `checked_mul`,
+  first dim a whole number of blocks, ggml type in the table copied from llama.cpp (removed ids
+  refused). Every tensor's `data_start + offset + nbytes ≤ file_len` (checked first), then the
+  tensors lie back to back: the first at offset 0, each next at the previous end rounded up to
+  the alignment (llama.cpp's layout; it implies aligned and non-overlapping); bytes after the
+  last tensor are open (#183). Each file-stated length is checked against its own limit, then the
+  header cap, then the bytes left in the file, before any read or allocation. Parse header +
+  tensor infos only, forward from a reader through one 64 KiB buffer (read-ahead never
+  interpreted); never read tensor data. Kept: scalars, UTF-8 strings ≤ 1 KiB, the chat templates
+  (`tokenizer.chat_template` and `tokenizer.chat_template.<name>`, at most 16, UTF-8) whole;
+  longer strings and arrays as type and length only. `file_len` is the length of the object the
+  reader yields; a parse against an advertised length (the §5.1 header preview, whose 4 MiB range
+  is too small for large vocabularies, #184) is a preview, not the SI-6 check.
 - **Safetensors strict check**: `header_len ≤ 100 MiB` and `8 + header_len ≤ file_len`; header is
   a JSON object; each entry has known `dtype`, `shape` (`checked_mul`), `data_offsets` ascending,
   contiguous, within `file_len - 8 - header_len`; `__metadata__` values are strings.
