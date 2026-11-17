@@ -168,7 +168,6 @@ const CUT: &str = "...";
 const TOKEN_MIN: usize = 20;
 
 /// Single-line, bounded, token-masked.
-/// TODO(#158): this file's credential masking is container-free but in no mutation list yet.
 pub(crate) fn scrub(s: &str) -> String {
     bounded(mask_quoted(&flattened(s)))
 }
@@ -189,14 +188,13 @@ fn flattened(s: &str) -> String {
 
 /// At most [`MAX_TEXT`] characters, a cut one ending in [`CUT`]. Runs last, after every mask.
 fn bounded(s: String) -> String {
-    if s.chars().count() <= MAX_TEXT {
+    if s.chars().nth(MAX_TEXT).is_none() {
         return s;
     }
     let keep = MAX_TEXT.saturating_sub(CUT.chars().count());
-    match s.char_indices().nth(keep) {
-        Some((i, _)) => format!("{}{CUT}", s.get(..i).unwrap_or_default()),
-        None => s,
-    }
+    let mut cut: String = s.chars().take(keep).collect();
+    cut.push_str(CUT);
+    cut
 }
 
 /// Each dot-separated segment that looks like a token becomes its first 4 characters and
@@ -441,6 +439,51 @@ mod tests {
         assert!(s.ends_with("abcd..."), "{s}");
         // Control: the same segment far from the cut is masked the same way.
         assert_eq!(scrub_path(&format!("x.{token}")), "x.abcd...");
+    }
+
+    /// A path whose first segment looks like a token and a message that starts by quoting one,
+    /// each long enough to be cut. The token is assembled at run time.
+    fn hostile() -> (String, String, String) {
+        let token = "k9".repeat(15);
+        let path = format!("{token}.{}", "p".repeat(400));
+        let message = format!("\"{token}\" {}", "m ".repeat(300));
+        (token, path, message)
+    }
+
+    /// Both fields are masked and within the bound, whichever entry point built them.
+    fn assert_scrubbed(d: &Diagnostic, token: &str) {
+        for (what, text) in [("path", &d.path), ("message", &d.message)] {
+            assert_eq!(text.chars().count(), MAX_TEXT, "{what}: {text}");
+            assert!(text.ends_with(CUT), "{what} is cut: {text}");
+            assert!(!text.contains(token.get(..10).unwrap_or(token)), "{what}: {text}");
+        }
+        assert!(d.path.starts_with("k9k9....ppp"), "{}", d.path);
+        assert!(d.message.starts_with("\"k9k9...[30 chars hidden]\" m m"), "{}", d.message);
+    }
+
+    /// Architect Q351: each entry point that builds a diagnostic masks and bounds both fields.
+    #[test]
+    fn every_entry_point_masks_and_bounds_path_and_message() {
+        let (token, path, message) = hostile();
+        let mut d = Diags::default();
+        d.error(path.clone(), Code::InvalidValue, message.clone());
+        d.warn(path.clone(), Code::InvalidValue, message.clone());
+        let Err(rejected) = d.finish() else {
+            panic!("an error was recorded")
+        };
+        let [error] = rejected.errors.as_slice() else {
+            panic!("{rejected:?}")
+        };
+        let [warning] = rejected.warnings.as_slice() else {
+            panic!("{rejected:?}")
+        };
+        assert_scrubbed(error, &token);
+        assert_scrubbed(warning, &token);
+        let single = Rejected::single(path, Code::InvalidValue, message);
+        let [only] = single.errors.as_slice() else {
+            panic!("{single:?}")
+        };
+        assert_scrubbed(only, &token);
     }
 
     #[test]

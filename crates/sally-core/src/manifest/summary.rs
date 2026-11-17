@@ -37,6 +37,7 @@ pub fn summary(v: &ValidatedManifest) -> String {
     lines.extend(tool_lines(m));
     lines.extend(runtime_lines(m));
     let mut out = String::new();
+    // TODO(#196): the summary does not mask token-shaped names the way diagnostics do.
     if let Some(finding) = data_can_leave(m, v.mounts(), v.egress()) {
         out.push_str("[data-can-leave] ");
         out.push_str(&finding);

@@ -132,7 +132,8 @@ mutants:
 # /etc/hosts), so no mutant's run sends a packet off the machine.
 # MUTANTS_SHARD=k/n runs one round-robin shard; MUTANTS_OUT=<dir> moves mutants.out.
 MUTANTS_WIDE_CORE := $(addprefix crates/sally-core/src/,manifest/image.rs manifest/hostenv.rs \
-                     manifest/parse.rs manifest/summary.rs manifest/units.rs secrets/store.rs \
+                     manifest/parse.rs manifest/summary.rs manifest/units.rs manifest/diag.rs \
+                     secrets/store.rs \
                      secrets/secret.rs secrets/names.rs audit/entry.rs audit/redact.rs audit/verify.rs \
                      audit/writer.rs audit/declared.rs audit/layout.rs audit/tail.rs fsutil.rs fd.rs \
                      text.rs paths.rs model/mod.rs model/detect.rs model/gguf/mod.rs \
