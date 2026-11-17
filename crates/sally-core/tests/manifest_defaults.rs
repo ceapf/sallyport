@@ -1,5 +1,5 @@
-//! Every default a manifest takes when a field is omitted, pinned to MANIFEST_SPEC §1 (architect
-//! Q398). An omitted field must mean what the spec says (SI-5: never widened by omission).
+//! Every default a manifest takes when a field is omitted, pinned to MANIFEST_SPEC §1. An
+//! omitted field must mean what the spec says (SI-5: never widened by omission).
 //! cargo-mutants does not mutate `Default` impls or literals, so this test is the control on
 //! the values, and it is what kills the mutants of the named default consts in
 //! `manifest/types.rs`. Each expected value is written here from the spec, never read from the
