@@ -109,6 +109,12 @@ line per fact, with where it was found. Check a note again before relying on it 
   has none; an empty listing is `[]`. The template `{{index .Labels "k"}}` prints an empty value
   for a missing label (`{{.Label "k"}}` is an error), but a label value can hold a newline, so
   the sweep reads the JSON. (Task 12 PR A, ruling Q64)
+- A container's `ps` `.Labels` include its image's labels (an `nvidia/cuda` base image's
+  `maintainer` and `org.opencontainers.image.*` appear beside the `--label` ones), so their size
+  is the image author's. `{{json (index .Labels "k")}}` prints one JSON string per container:
+  the value for a present label, `"x\ny"` on one line for a value holding a newline, and `""`
+  both for a missing label and for a container with no labels at all. The orphan sweep lists
+  with that template. (#173, ruling Q307)
 - `ps --format '{{json .ID}}'` prints the 12-digit short ID; with `--no-trunc` it prints all 64
   lowercase hex digits, which is what the sweep lists and passes to `rm` (a name can be re-used
   between the listing and the removal; an ID cannot). (Task 12 PR A, review PS-L5)

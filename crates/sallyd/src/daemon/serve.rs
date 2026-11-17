@@ -95,8 +95,13 @@ pub enum DaemonError {
     /// Podman or the runtime failed a check.
     #[error(transparent)]
     Podman(#[from] PodmanError),
-    /// Containers a previous `sallyd` left could not be removed.
-    #[error("removing orphaned containers: {0}")]
+    /// Containers a previous `sallyd` left could not be removed. The text says how to list them
+    /// by this installation's label, never by name (architect Q308, Q64).
+    #[error(
+        "removing orphaned containers: {0} (list them with `podman ps --all --filter \
+         label=sallyport.installation=<id>`; the id is the `installation` file in sallyd's \
+         state directory)"
+    )]
     Orphans(#[source] LaunchError),
     /// A file or socket under the runtime directory.
     #[error("{what}: {source}")]
@@ -555,6 +560,23 @@ mod tests {
     fn the_socket_names_are_the_ones_the_cli_derives() {
         assert_eq!(STATE_DIR, sally_core::paths::STATE_DIR);
         assert_eq!(CONTROL_SOCK, sally_core::paths::CONTROL_SOCKET);
+    }
+
+    /// Architect Q308: a start refused at the orphan sweep says how to list this installation's
+    /// containers, by its label (never by an `sp-*` name, Q64), in constant text that adds no
+    /// byte of the listing.
+    #[test]
+    fn a_refused_orphan_sweep_names_the_label_to_list_by() {
+        let e = DaemonError::Orphans(LaunchError::Command {
+            verb: "ps",
+            msg: "stdout refused: over 65536 bytes".into(),
+        });
+        assert_eq!(
+            e.to_string(),
+            "removing orphaned containers: podman ps: stdout refused: over 65536 bytes (list \
+             them with `podman ps --all --filter label=sallyport.installation=<id>`; the id is \
+             the `installation` file in sallyd's state directory)"
+        );
     }
 
     fn scratch(name: &str) -> PathBuf {

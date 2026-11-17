@@ -299,7 +299,17 @@ are released only once the container is confirmed gone.
    removed. The label is compared in `sandbox::orphans`, after podman's own label filter. A
    launch reserves its id before it creates anything, so no sweep takes a launch in progress; a
    container a stop removes during the sweep drops out of its second listing; a failed periodic
-   sweep is an oplog line, retried at the next.
+   sweep is an oplog line, retried at the next. The listing asks podman for one label only,
+   `<full ID> <name> <installation label>`, each a JSON string, never the whole label set: a
+   container's labels include its image's, so a line would be as long as an image author likes
+   (architect Q307). A line is daemon-bounded (ID, name and UUID, about 180 bytes). A listing
+   over 64 KiB is refused whole, never cut (#173): a cut on a line boundary would parse as a
+   shorter listing that misses the containers past it. That cap, not the session budget, bounds
+   the sweep at about 360 containers: past it, the startup sweep refuses the start and a
+   periodic one fails. The refusal names the recovery (Q308): `podman ps --all --filter
+   label=sallyport.installation=<id>` lists this installation's containers, where `<id>` is the
+   `installation` file in the state directory. Containers are listed and removed by that label,
+   never by an `sp-*` name, which other installations and test runs share.
 2. **Checks.** The runtime binary and the podman binary are re-checked (B5), for every role, by
    the one launch path before the role's preparation. Everything podman
    reads from Sallyport's state is re-checked too: the state directory is private, `hooks/` and
@@ -521,7 +531,9 @@ or not one of its candidates) runs, and a warning line says why. The setting com
 `config.toml` under `$XDG_CONFIG_HOME/sallyport/`, which is `sallyd`'s own configuration and a
 trusted input. Whoever sets `sallyd`'s environment can still pick a podman that way; the
 warning line is how that shows.
-Every podman command has its output capped at 64 KiB per stream and is killed after 120 s.
+Every podman command is killed after 120 s. A successful command's stdout over its caller's
+bound (64 KiB unless the caller sets one) is refused, never cut (#173); a failed command's
+stderr is held whole up to 64 KiB or withheld whole (Q295).
 
 **Consequences.**
 - A user whose image store is configured through `~/.config/containers/storage.conf` (a

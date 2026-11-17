@@ -2,7 +2,8 @@
 //! container removal that confirms the container is gone, and `podman unshare rm`. Moved out of
 //! `launch.rs` unchanged in Task 6c, to keep it under the file-size ceiling. A failed command's
 //! stderr becomes its error text whole or not at all (`launch::stderr_text`, architect Q295):
-//! the logs mask that text before they cut it, so it is never cut here.
+//! the logs mask that text before they cut it, so it is never cut here. A successful command's
+//! stdout is parsed, so it is returned whole or refused (`launch::stdout_text`, #173).
 
 use std::ffi::OsString;
 use std::time::Duration;
@@ -10,10 +11,11 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 
 use super::argv::path_arg;
-use super::launch::{LaunchError, Launcher, stderr_text};
+use super::launch::{LaunchError, Launcher, stderr_text, stdout_text};
 
-/// Bytes of podman's stdout kept per command; the rest is read and dropped. A failed command's
-/// stderr is its error text whole up to this many bytes, else withheld whole (architect Q295).
+/// Bytes of podman's stdout [`Launcher::run`] returns: a longer stdout is refused whole (#173).
+/// A failed command's stderr is its error text whole up to this many bytes, else withheld whole
+/// (architect Q295).
 pub(crate) const OUTPUT_CAP: usize = 64 * 1024;
 /// A podman command that takes longer is killed.
 pub(crate) const PODMAN_TIMEOUT: Duration = Duration::from_secs(120);
@@ -100,16 +102,18 @@ impl Launcher {
         .map(|_| ())
     }
 
-    /// Runs one hermetic podman command; stdout on success.
-    /// TODO(#173): a stdout longer than `OUTPUT_CAP` is cut here, not refused.
+    /// Runs one hermetic podman command; stdout on success, whole up to [`OUTPUT_CAP`] bytes.
+    /// A longer stdout is refused, never cut (`launch::stdout_text`, #173): a cut listing would
+    /// parse as a shorter one.
     pub(super) async fn run(
         &self,
         verb: &'static str,
         args: impl IntoIterator<Item = OsString>,
     ) -> Result<String, LaunchError> {
-        self.run_raw(verb, args, OUTPUT_CAP)
-            .await
-            .map(|out| String::from_utf8_lossy(&out).into_owned())
+        let out = self
+            .run_raw(verb, args, OUTPUT_CAP.saturating_add(1))
+            .await?;
+        stdout_text(verb, &out, OUTPUT_CAP)
     }
 
     /// [`run`](Self::run), keeping up to `keep` bytes of stdout as they are. A caller that

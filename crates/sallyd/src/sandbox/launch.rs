@@ -63,8 +63,8 @@ mod teardown;
 mod verify;
 
 use error::join_err;
-pub(crate) use error::stderr_text;
 pub use error::{LaunchError, RoleStopError, StopError};
+pub(crate) use error::{stderr_text, stdout_text};
 pub use harness::HarnessRequest;
 pub use inference::InferenceRequest;
 pub use parts::PinError;
