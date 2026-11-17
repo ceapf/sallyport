@@ -282,7 +282,8 @@ pub(crate) fn fx(name: &str, o: Opts) -> Fx {
         destructive_requires_approval: o.destructive,
         fetch_writes: FetchWrites::Approve,
         mounts: rules,
-        mcp: vec![],
+        // One listed server, so an MCP call reaches the tools (they refuse it, unsupported).
+        mcp: vec![("gh".to_owned(), sally_core::manifest::McpApproval::Never)],
     };
     let limits = Limits {
         timeout: o.approval_timeout,
@@ -1297,6 +1298,42 @@ async fn a_call_after_the_close_is_denied_and_nothing_runs() {
     );
     assert!(f.ran.lock().unwrap().is_empty());
     assert_eq!(f.ops.in_flight(), 0);
+}
+
+/// Architect Q289 (1), Q294 (5): the tool name of an MCP call denied at the stop stays in plain
+/// args whole, uncut and unescaped, so the writer's whole-args pass masks a live session's
+/// form in it. Control: the same args without that pass keep a run of the value.
+#[tokio::test]
+async fn an_mcp_tool_name_denied_at_the_stop_is_masked_whole() {
+    let f = fx("mcp-stop", opts(all_modes()));
+    let value = "q\"u\\o\x01te-secret-value-0123456789";
+    let tool = format!("{}{value}", "t".repeat(300));
+    f.ops.close();
+    let action = Action::Mcp {
+        server: "gh".to_owned(),
+        tool: tool.clone(),
+        args: Payload::new(b"{}".to_vec()),
+    };
+    let out = f.run(action).await.unwrap();
+    assert_eq!(out.text, "denied: session-stopping");
+    let d = f.sink.last("tool.deny");
+    let named = format!("gh__{tool}");
+    assert_eq!(d["tool"].as_str(), Some(named.as_str()), "whole and raw");
+    let union = sally_core::audit::Redactor::new([("Y", value)]);
+    let logged = union.redact_value(&d).to_string();
+    assert!(logged.contains("[REDACTED:Y]"), "{logged}");
+    let run = |text: &str| {
+        value
+            .as_bytes()
+            .windows(8)
+            .filter_map(|w| std::str::from_utf8(w).ok())
+            .any(|w| text.contains(w))
+    };
+    assert!(!run(&logged), "{logged}");
+    assert!(
+        run(&d.to_string()),
+        "control: no run without the union pass"
+    );
 }
 
 /// Q59 (b): a write parked at the exec gate when the stop comes never begins: `tool.result`
