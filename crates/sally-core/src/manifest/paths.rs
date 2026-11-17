@@ -306,6 +306,8 @@ pub(crate) struct DirId {
 /// Order matters: a lexical denylist check first (so `/mnt/c` is `denylisted` even where it
 /// does not exist), then the root's own type via `lstat` (symlink / not-dir / missing), then the
 /// authoritative denylist check on the realpath.
+// TODO(#195): these errors quote the host as written, or its realpath; one holding `/`, a quote
+// or a backslash next to a token is not masked.
 pub(crate) fn check_mount_host(
     raw: &str,
     home: &Path,
