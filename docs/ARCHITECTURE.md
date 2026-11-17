@@ -1223,7 +1223,8 @@ sallyport/
   tensor infos only, forward from a reader through one 64 KiB buffer (read-ahead never
   interpreted); never read tensor data. Kept: scalars, UTF-8 strings ≤ 1 KiB without NUL, the
   chat templates (`tokenizer.chat_template` and `tokenizer.chat_template.<name>`, at most 16,
-  UTF-8, no NUL, else refused: the engine reads them as C strings) whole; longer strings and
+  each a string, UTF-8, no NUL, else refused: the engine reads them as C strings, turns a scalar
+  into template text and drops an array) whole; longer strings and
   arrays as type and length only. `split.count` must be absent or a u16 of 0 or 1: a multi-file
   model makes the engine open sibling files that never passed SI-6, so it is refused. The reader
   starts at the file's first byte, and `file_len` is the length of the object it yields; a parse

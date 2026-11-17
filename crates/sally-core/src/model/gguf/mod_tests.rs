@@ -462,17 +462,25 @@ fn seeds() -> Vec<(&'static str, Gguf, &'static str)> {
         ..Gguf::empty().tensor(Tensor::of("w", I8, &[4]))
     };
     let refused = Gguf::valid().kv(b"n", ARRAY, &array(ARRAY, 1, &[]));
+    let template = Gguf::valid()
+        .kv_str("tokenizer.chat_template", b"{{ messages }}")
+        .kv_str("tokenizer.chat_template.tool_use", b"{{ tools }}");
     vec![
         ("valid-v3", v3, "accepted"),
         ("valid-v2", v2, "accepted"),
         ("refused-nested-array", refused, "nested_array"),
+        ("valid-template", template, "accepted"),
     ]
 }
+
+/// How many seeds there are; `mutated_valid_files_never_panic` draws from all of them.
+const SEEDS: usize = 4;
 
 #[test]
 fn committed_fuzz_seeds_match_the_builder() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/corpus/gguf");
     let write = std::env::var_os("SALLYPORT_WRITE_GGUF_SEEDS").is_some();
+    assert_eq!(seeds().len(), SEEDS);
     for (name, file, expected) in seeds() {
         let bytes = file.bytes();
         assert!(bytes.len() < 1_024, "{name}");
@@ -517,7 +525,7 @@ proptest! {
     /// Valid files with a few bytes overwritten reach deep into the parser.
     #[test]
     fn mutated_valid_files_never_panic(
-        seed in 0usize..3,
+        seed in 0..SEEDS,
         edits in proptest::collection::vec((any::<prop::sample::Index>(), any::<u8>()), 1..6),
     ) {
         let mut bytes = seeds().swap_remove(seed).1.bytes();

@@ -15,6 +15,8 @@
 //!   each next at the previous end rounded up to the alignment;
 //! - no kept key, string or tensor name holds a NUL, and `split.count`, when present, is a u16
 //!   of 0 or 1;
+//! - every chat-template key (`tokenizer.chat_template` or `tokenizer.chat_template.<name>`)
+//!   holds a string, and there are at most 16 of them;
 //! - a name detect accepts holds no `/` and no NUL;
 //! - a refusal's message is printable ASCII and at most MAX_MESSAGE bytes;
 //! - a reader that yields one byte per read gives the same result as the whole slice.
@@ -71,6 +73,18 @@ fn check_accepted(header: &GgufHeader, file_len: u64) {
     assert!(header.retained_text_bytes() <= MAX_RETAINED_TEXT_BYTES);
     assert_eq!(header.file_len(), file_len);
     assert!(header.data_end() <= file_len);
+    let mut templates = 0;
+    for m in header.metadata() {
+        let key = m.key().as_str();
+        if key == "tokenizer.chat_template" || key.starts_with("tokenizer.chat_template.") {
+            templates += 1;
+            assert!(
+                matches!(m.value(), gguf::Value::String(_)),
+                "a chat template that is not a string"
+            );
+        }
+    }
+    assert!(templates <= 16, "more than 16 chat templates");
     for m in header.metadata() {
         assert!(!m.key().as_str().contains('\0'));
         if let gguf::Value::String(s) = m.value() {

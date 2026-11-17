@@ -78,6 +78,8 @@ fn read_key<R: Read>(r: &mut Reader<R>, i: u64) -> Result<String, GgufError> {
 
 /// The id that marks an array.
 const ARRAY: u32 = 9;
+/// The id of a string, the one type a chat template may have.
+const STRING: u32 = 8;
 
 /// The value type with this id; arrays are not a [`ValueType`].
 fn value_type(i: u64, id: u32) -> Result<ValueType, GgufError> {
@@ -90,7 +92,7 @@ fn value_type(i: u64, id: u32) -> Result<ValueType, GgufError> {
         5 => ValueType::I32,
         6 => ValueType::F32,
         7 => ValueType::Bool,
-        8 => ValueType::String,
+        STRING => ValueType::String,
         10 => ValueType::U64,
         11 => ValueType::I64,
         12 => ValueType::F64,
@@ -105,6 +107,11 @@ fn read_value<R: Read>(
     id: u32,
     template: bool,
 ) -> Result<Value, GgufError> {
+    // By type id, before any value byte: the engine turns a scalar template into text and
+    // drops an array one, so only a string is the text these checks see.
+    if template && id != STRING {
+        return Err(GgufError::TemplateNotString(i));
+    }
     if id == ARRAY {
         return read_array(r, i);
     }
