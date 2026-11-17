@@ -847,8 +847,10 @@ fn blind_execs(trace: &str) -> Vec<i32> {
 
 #[test]
 fn a_blind_exec_counts_whether_or_not_strace_splits_its_line() {
-    // Copied from `strace -f -qq -v -s 65536 -e trace=execve -e inject=execve:delay_exit=…
-    // -e signal=none` (strace 6.8) of 40 concurrent execs; only the pids are changed.
+    // Copied from two `strace -f -qq -v -s 65536 -e trace=execve -e inject=execve:delay_exit=…
+    // -e signal=none` (strace 6.8) captures of 40 concurrent execs; only the pids are changed.
+    // The blind lines come from a non-dumpable parent, the readable ones from a dumpable
+    // `env -i` parent.
     let ok = |p: i32| {
         format!("{p} execve(0x722fb53fda90, 0x722fb5220f10, 0x7fff91e0fd30) = 0 (DELAYED)")
     };
