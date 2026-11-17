@@ -77,7 +77,9 @@ const AUDIT_TEXT_CAP: usize = 4096;
 /// The style of a launch or teardown `detail` in an audit entry (architect Q288 (7, 8)): cut at
 /// [`AUDIT_TEXT_CAP`] on a character boundary, unescaped, as [`capped`]. Podman's and the
 /// kernel's messages can name what the sandbox wrote, so an entry declares its detail raw and
-/// the writer masks it whole before the cut.
+/// the writer masks it whole before the cut. The largest raw detail is a [`LaunchError`]'s
+/// text over podman's output, which `commands.rs` reads up to `OUTPUT_CAP` (64 KiB) a stream
+/// (architect Q294 c).
 pub(crate) const DETAIL_STYLE: Style = Style::Plain {
     max: AUDIT_TEXT_CAP,
 };
@@ -656,6 +658,14 @@ mod tests {
         };
         for raw in ["short".to_owned(), "é".repeat(AUDIT_TEXT_CAP)] {
             assert_eq!(detail(&raw, &r), capped(&raw));
+        }
+        // At the stated max: podman's two streams read in full, forms throughout.
+        let largest = value.repeat(2 * 64 * 1024 / value.len() + 1);
+        let shown = detail(&largest, &r);
+        assert!(shown.starts_with("[REDACTED:Y]"), "{}", &shown[..40]);
+        assert!(shown.len() <= AUDIT_TEXT_CAP + "…".len());
+        for w in value.as_bytes().windows(8) {
+            assert!(!shown.contains(std::str::from_utf8(w).unwrap()));
         }
         let straddle = format!("{}{value}", "x".repeat(AUDIT_TEXT_CAP - 20));
         let shown = detail(&straddle, &r);
