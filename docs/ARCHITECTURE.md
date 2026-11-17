@@ -299,7 +299,9 @@ are released only once the container is confirmed gone.
    removed. The label is compared in `sandbox::orphans`, after podman's own label filter. A
    launch reserves its id before it creates anything, so no sweep takes a launch in progress; a
    container a stop removes during the sweep drops out of its second listing; a failed periodic
-   sweep is an oplog line, retried at the next.
+   sweep is an oplog line, retried at the next. A listing over 64 KiB is refused whole, never
+   cut (#173): a cut on a line boundary would parse as a shorter listing that misses the
+   containers past it. So the startup sweep refuses the start, and a periodic one fails.
 2. **Checks.** The runtime binary and the podman binary are re-checked (B5), for every role, by
    the one launch path before the role's preparation. Everything podman
    reads from Sallyport's state is re-checked too: the state directory is private, `hooks/` and

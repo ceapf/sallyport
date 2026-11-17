@@ -258,6 +258,26 @@ pub(crate) fn stderr_text(err: &[u8], max: usize) -> String {
     }
 }
 
+/// A successful podman command's stdout, read with `max + 1` bytes kept (#173, architect Q295
+/// (5)): whole up to `max` bytes; a longer one is refused with a daemon-chosen text, never cut.
+/// Stdout is parsed, so a cut on a line boundary would read as a shorter, well-formed answer
+/// (an orphan sweep missing the containers past it), and an in-band literal could be parsed as
+/// output (Q295 (4)).
+pub(crate) fn stdout_text(
+    verb: &'static str,
+    out: &[u8],
+    max: usize,
+) -> Result<String, LaunchError> {
+    if out.len() <= max {
+        Ok(String::from_utf8_lossy(out).into_owned())
+    } else {
+        Err(LaunchError::Command {
+            verb,
+            msg: format!("stdout refused: over {max} bytes"),
+        })
+    }
+}
+
 /// A launch task that did not finish: `internal`, with a daemon-chosen detail, never tokio's
 /// text (architect Q297).
 pub(super) fn join_err(e: tokio::task::JoinError) -> LaunchError {
@@ -295,6 +315,27 @@ mod tests {
         assert_eq!(withheld, "stderr withheld: over 24 bytes");
         assert!(!withheld.contains('z'));
         assert_eq!(stderr_text(&[0xff, b'a'], max), "\u{fffd}a");
+    }
+
+    /// #173 (architect Q295 (4), (5)): a successful command's stdout is parsed, so it is kept
+    /// whole and untrimmed up to the bound and refused past it, with a constant text that holds
+    /// no byte of it.
+    #[test]
+    fn stdout_is_whole_up_to_the_bound_and_refused_past_it() {
+        let max = 24;
+        assert_eq!(stdout_text("ps", b" a\n", max).unwrap(), " a\n");
+        let at = "z".repeat(max);
+        assert_eq!(stdout_text("ps", at.as_bytes(), max).unwrap(), at);
+        let over = "z".repeat(max + 1);
+        match stdout_text("ps", over.as_bytes(), max) {
+            Err(e @ LaunchError::Command { verb: "ps", .. }) => {
+                let text = e.to_string();
+                assert_eq!(text, "podman ps: stdout refused: over 24 bytes");
+                assert!(!text.contains('z'));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(stdout_text("ps", &[0xff, b'a'], max).unwrap(), "\u{fffd}a");
     }
 
     fn sid() -> SessionId {

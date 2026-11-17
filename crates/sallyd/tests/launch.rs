@@ -700,6 +700,73 @@ fn orphans_of_a_previous_sallyd_are_removed() {
     });
 }
 
+/// A podman whose `ps` prints `<at>/ps-pad` before the real listing while that file exists;
+/// otherwise the real one. `ps` is the first argument the launcher passes.
+fn ps_padding_podman(at: &std::path::Path, real: &std::path::Path) -> PathBuf {
+    let (at, real) = (at.display(), real.display());
+    for p in [at.to_string(), real.to_string()] {
+        assert!(
+            !p.contains(['\'', '"', '\\', ' ']),
+            "the test writes {p:?} into a script unescaped"
+        );
+    }
+    let script = format!(
+        "#!/bin/sh\n\
+         if [ \"$1\" = ps ] && [ -e '{at}/ps-pad' ]; then /bin/cat '{at}/ps-pad'; fi\n\
+         exec '{real}' \"$@\"\n"
+    );
+    let bin = PathBuf::from(at.to_string()).join("podman");
+    executable(&bin, script.as_bytes());
+    bin
+}
+
+/// #173 (architect Q295 (5)): a `podman ps` listing longer than `OUTPUT_CAP` is refused, never
+/// cut. Here the first 64 KiB end on a line boundary, so a cut listing parses and misses the
+/// orphan line past it; the sweep must fail instead, audit nothing, and name no byte of the
+/// listing.
+#[test]
+fn a_ps_listing_over_the_output_cap_is_refused_not_cut() {
+    const CAP: usize = 64 * 1024;
+    const LINE: usize = 128;
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("launch-ps-pad-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _cleanup = RemoveOnDrop(dir.clone());
+    rt().block_on(async {
+        let x = Lx::with_podman(|real| ps_padding_podman(&dir, real));
+        // Well-formed lines of no installation: skipped by the parser, exactly CAP bytes.
+        let filler = format!("\"{}\" \"{}\" null\n", "0".repeat(64), "f".repeat(53));
+        assert_eq!(filler.len(), LINE);
+        let mut pad = filler.repeat(CAP / LINE);
+        // Past the cap: an orphan of this installation, in scope, owned by no live session.
+        pad.push_str(&format!(
+            "\"{}\" \"sp-ws-{}-lost\" {{\"sallyport.installation\":\"{}\"}}\n",
+            "a".repeat(64),
+            x.scope,
+            x.installation.as_str()
+        ));
+        std::fs::write(dir.join("ps-pad"), &pad).unwrap();
+        let refused = x.launcher.remove_orphans(&x.scope, Sweep::Startup).await;
+        match refused {
+            Err(LaunchError::Command { verb: "ps", msg }) => {
+                assert_eq!(msg, format!("stdout refused: over {CAP} bytes"));
+            }
+            other => panic!("expected the listing refused, got {other:?}"),
+        }
+        assert!(x.events.list().is_empty(), "{:?}", x.events.list());
+        // The same sweep with the real listing alone runs.
+        std::fs::remove_file(dir.join("ps-pad")).unwrap();
+        assert!(
+            x.launcher
+                .remove_orphans(&x.scope, Sweep::Startup)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    });
+}
+
 /// `podman create` of a session-named container out of band, with `label` if given.
 fn create_out_of_band(name: &str, label: Option<&str>) {
     let image = test_image();
