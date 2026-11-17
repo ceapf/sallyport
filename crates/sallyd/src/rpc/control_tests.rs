@@ -1568,9 +1568,9 @@ fn the_refusal_bound_ties_to_name_max_and_the_id_grammar() {
 }
 
 /// Architect Q305 (3): every stop-failed text, at its largest (a 64-byte id, the largest
-/// count), is under the bound. Pinned by copy: the three texts `session/supervise.rs` builds
-/// inline; `registry.rs`'s `unanswered` text is pinned by its own test too. A copy cannot see
-/// a changed or new text in `supervise.rs`: such a change restates this list (and the bound).
+/// count), is under the bound. Pinned by copy: the two texts `session/supervise.rs` builds
+/// inline, and `registry.rs`'s `unanswered` text (pinned by its own test too). A copy cannot
+/// see a changed or new text in either file: such a change restates this list (and the bound).
 #[test]
 fn every_stop_failed_text_is_under_the_refusal_bound() {
     let sid = "a".repeat(64);
