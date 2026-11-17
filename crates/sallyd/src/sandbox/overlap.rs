@@ -23,7 +23,9 @@ use std::sync::Mutex;
 use rustix::fs::{Mode, OFlags};
 use sally_core::manifest::{MountMode, ValidatedManifest};
 
-use super::budget::{FdRefusal, SessionLimit, admit, admit_session};
+use super::budget::{
+    FdRefusal, MAX_LIVE_SESSIONS, SessionLimit, admit, admit_session, session_budget,
+};
 
 /// Bound on the ancestor walk (the kernel's path depth is far below it).
 const MAX_ANCESTORS: usize = 4096;
@@ -190,6 +192,13 @@ impl Sessions {
             fd_budget,
             max_sessions,
         }
+    }
+
+    /// The daemon's sessions: half of the raised soft `RLIMIT_NOFILE` as the descriptor budget
+    /// ([`session_budget`]) and at most [`MAX_LIVE_SESSIONS`] live.
+    #[must_use]
+    pub(crate) fn for_daemon(nofile: u64) -> Self {
+        Self::new(session_budget(nofile), MAX_LIVE_SESSIONS)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Live> {
@@ -551,6 +560,29 @@ mod tests {
         for id in ["e", "f", "g"] {
             s.reserve(id, vec![], 0).unwrap();
         }
+    }
+
+    /// The daemon's sessions (what `serve` builds) admit exactly `MAX_LIVE_SESSIONS` sessions
+    /// and share half of the descriptor limit.
+    #[test]
+    fn the_daemons_sessions_hold_the_session_limit_and_half_the_descriptors() {
+        let s = Sessions::for_daemon(1 << 20);
+        for n in 0..MAX_LIVE_SESSIONS {
+            s.reserve(&format!("s{n}"), vec![], 0).unwrap();
+        }
+        assert_eq!(
+            s.reserve("one-more", vec![], 0),
+            Err(ReserveError::SessionLimit(SessionLimit {
+                live: MAX_LIVE_SESSIONS,
+                limit: MAX_LIVE_SESSIONS
+            }))
+        );
+        let s = Sessions::for_daemon(1000);
+        s.reserve("a", vec![], 500).unwrap();
+        assert!(matches!(
+            s.reserve("b", vec![], 1),
+            Err(ReserveError::FdBudget(FdRefusal { limit: 500, .. }))
+        ));
     }
 
     #[test]
