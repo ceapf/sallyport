@@ -3,6 +3,10 @@
 //! `|` -> `^` exclusion is proven equivalent: the flag constants its function combines (with the
 //! flags each call site passes, for a flags parameter) are distinct and pairwise disjoint, so
 //! `a ^ b == a | b` for every combination.
+//!
+//! It also holds the skip-rule guards: what cargo-mutants never mutates (a method named `new`,
+//! an `impl Default`, `mutants::skip`) holds no logic in mutation scope. TODO(#192): split those
+//! into their own test binary (move-only).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::{Path, PathBuf};
@@ -991,12 +995,14 @@ fn no_default_impl_in_mutation_scope_holds_logic() {
 fn the_guard_finds_each_default_impl_with_its_type() {
     let src = strip_literals(
         "impl Default for A {\n    fn default() -> Self {\n        Self::new()\n    }\n}\n\
-         impl<T: Clone> Default for B<T> {\n    fn default() -> Self { Self { v: Vec::new() } }\n}\n\
+         impl<T: Clone> Default for B<T> {\n    \
+         fn default() -> Self { Self { v: Vec::new() } }\n}\n\
          impl std::default::Default for C {\n    fn default() -> Self { Self { n: 4 << 30 } }\n}\n\
          impl Debug for D {\n    fn fmt(&self) -> u8 { if x { 1 } else { 2 } }\n}\n\
          impl DefaultThing for E {\n    fn default() -> Self { Self { n: 1 + 2 } }\n}\n\
          impl F {\n    fn implement() -> Self { Self { n: 3 * 4 } }\n}\n\
-         #[cfg(test)]\nmod tests {\n    impl Default for G { fn default() -> Self { if x { a } else { b } } }\n}\n",
+         #[cfg(test)]\nmod tests {\n    impl Default for G { \
+         fn default() -> Self { if x { a } else { b } } }\n}\n",
     );
     let found = defaults(&without_test_modules(&src));
     let types: Vec<(&str, &str)> = found
@@ -1230,6 +1236,126 @@ fn the_guard_finds_the_body_after_a_braced_return_type() {
     assert_eq!(found[0].0, "Foo");
     assert!(logic_in(&found[0].1).is_some(), "{found:?}");
     assert_eq!(found[1], ("Baz".to_owned(), " [0, 1, 2, 3] ".to_owned()));
+}
+
+/// The cargo-mutants version whose src/visit.rs and src/config.rs the skip-rule guards in this
+/// file were read against (Q359).
+const CARGO_MUTANTS_READ_AT: &str = "27.1.0";
+
+/// Q359: the nightly runs the version the guards were read at, and the public sentence in
+/// `.cargo/mutants.toml` names it. A bump fails here until the re-read is done.
+#[test]
+fn the_nightly_pins_the_cargo_mutants_version_the_guards_were_read_at() {
+    let reread = "before changing CARGO_MUTANTS_READ_AT, re-read cargo-mutants src/visit.rs \
+                  (visit_impl_item_fn, visit_trait_item_fn, visit_item_impl, attrs_excluded, \
+                  fn_sig_excluded) and the config keys in src/config.rs";
+    let nightly = std::fs::read_to_string(root().join(".github/workflows/nightly.yml")).unwrap();
+    let pins: Vec<&str> = nightly
+        .lines()
+        .filter_map(|l| l.trim_start().strip_prefix("CARGO_MUTANTS_VERSION:"))
+        .map(|v| v.trim().trim_matches('"'))
+        .collect();
+    assert_eq!(pins, [CARGO_MUTANTS_READ_AT], "nightly.yml: {reread}");
+    let named = format!("cargo-mutants ({CARGO_MUTANTS_READ_AT},");
+    assert!(
+        config_text().contains(&named),
+        ".cargo/mutants.toml must say `{named}`: {reread}"
+    );
+}
+
+/// Q360: cargo-mutants 27.1.0 config.rs also takes `exclude_globs`, `examine_globs`,
+/// `examine_re`, `skip_calls` and `skip_calls_defaults`, which no check here reads; each would
+/// narrow the nightly unseen.
+#[test]
+fn the_mutants_config_holds_only_the_keys_the_checks_read() {
+    let v: toml::Value = toml::from_str(&config_text()).unwrap();
+    let mut keys: Vec<&str> = v
+        .as_table()
+        .expect("a table")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["exclude_re", "profile", "test_tool"]);
+}
+
+/// `text` names the attribute `mutants::skip`, with any whitespace between its tokens (checked on
+/// the raw text and with comments blanked, so a comment between the tokens does not hide it).
+fn names_mutants_skip(text: &str) -> bool {
+    let squeezed = |t: &str| t.split_whitespace().collect::<String>();
+    squeezed(text).contains("mutants::skip")
+        || squeezed(&strip_literals(text)).contains("mutants::skip")
+}
+
+/// Every `.rs` file under `dir`, recursively.
+fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            rust_files(&path, out);
+        } else if path.extension().is_some_and(|x| x == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// Q360: cargo-mutants skips an item, a `mod foo;` and with it a whole file, or a file through
+/// its inner attributes, when it carries `mutants::skip`, even inside a `cfg_attr` whose
+/// predicate is false (`#[cfg_attr(miri, mutants::skip)]` needs no dependency and never
+/// expands). So no source file of a crate with a file in mutation scope names it, listed or not.
+#[test]
+fn no_source_of_a_mutated_crate_names_mutants_skip() {
+    let scope = mutation_scope();
+    let mut crates: Vec<&str> = scope
+        .iter()
+        .filter_map(|f| f.find("/src/").map(|i| &f[..i + "/src".len()]))
+        .collect();
+    crates.sort_unstable();
+    crates.dedup();
+    let mut files = Vec::new();
+    for dir in &crates {
+        rust_files(&root().join(dir), &mut files);
+    }
+    let read: Vec<String> = files
+        .iter()
+        .map(|p| {
+            p.strip_prefix(root())
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    let unread: Vec<&String> = scope.iter().filter(|f| !read.contains(f)).collect();
+    assert!(unread.is_empty(), "the walk missed scope files: {unread:?}");
+    let named: Vec<&String> = read
+        .iter()
+        .zip(&files)
+        .filter(|(_, p)| names_mutants_skip(&std::fs::read_to_string(p).unwrap()))
+        .map(|(f, _)| f)
+        .collect();
+    assert!(
+        named.is_empty(),
+        "mutants::skip hides code from the nightly: {named:?}"
+    );
+}
+
+#[test]
+fn the_skip_scan_sees_every_spelling_and_nothing_else() {
+    for text in [
+        "#[mutants::skip]\nfn f() {}",
+        "#[cfg_attr(miri, mutants::skip)]\nfn f() {}",
+        "#![cfg_attr(miri, mutants :: skip)]",
+        "#[cfg_attr(miri, mutants\n    ::\n    skip)]",
+        "#[cfg_attr(miri, mutants /* hidden */ :: skip)]",
+    ] {
+        assert!(names_mutants_skip(text), "{text}");
+    }
+    for text in [
+        "fn mutants() { skip(); }",
+        "use crate::mutants;\nlet skip = 1;",
+    ] {
+        assert!(!names_mutants_skip(text), "{text}");
+    }
 }
 
 /// Occurrences in `code` of the word `first`, whitespace, then the word `second` (no identifier
