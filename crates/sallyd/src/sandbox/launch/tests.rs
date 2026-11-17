@@ -1,3 +1,4 @@
+//! Unit tests of the launch module's pure helpers and refusal reasons (moved from `launch.rs`).
 #![allow(clippy::unwrap_used)]
 
 use super::*;

@@ -7,9 +7,9 @@ use std::sync::Arc;
 use sally_core::audit::{NewEntry, Piece};
 use serde_json::{Value, json};
 
-use super::super::action::Bound;
-use super::super::render;
 use super::Client;
+use crate::approvals::action::Bound;
+use crate::approvals::render;
 use crate::rpc::record::SHORT_STYLE;
 
 /// Characters of action text in an audit entry: escaped ASCII doubles at most in JSON, so the

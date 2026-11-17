@@ -1,6 +1,7 @@
 //! The control methods' wire helpers: refusals and their failure texts, a rejected manifest's
 //! error lines, the fitted listings, and the session, change, prompt and decision forms on the
-//! wire. The methods themselves are in `control_methods.rs`, which re-exports these.
+//! wire. The methods themselves are in `control_methods.rs`, which re-exports these; the bounds
+//! they apply (`DETAIL_CHARS`, `MAX_ERROR_LINES`) stay there beside the other reply limits.
 
 use sally_core::audit::NewEntry;
 use sally_core::text::{Quote, Style, escape_capped};

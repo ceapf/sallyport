@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use sally_core::manifest::Approvals;
 
-use super::Prompt;
+use crate::approvals::render::Prompt;
 
 /// A human's answer to one prompt (ARCHITECTURE §4.1). v1 has no "allow for this session".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,8 +101,8 @@ pub enum DecideError {
     #[error("digest-mismatch")]
     DigestMismatch,
     /// An approve of a cut prompt whose full text the client did not show, or could not be
-    /// sent ([`render::FULL_WIRE_BYTES`](super::super::render::FULL_WIRE_BYTES)). The prompt stays
-    /// pending.
+    /// sent ([`render::FULL_WIRE_BYTES`](crate::approvals::render::FULL_WIRE_BYTES)). The prompt
+    /// stays pending.
     #[error("full-text-not-shown")]
     FullTextNotShown,
 }
