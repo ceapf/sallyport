@@ -7,6 +7,12 @@
 //! bound and names what it cut; it never cuts inside an escape. [`escape_quoted_capped`] also
 //! escapes `"`, for a value written between quotes. [`StreamEscaper`] is the line-mode form
 //! (architect Q100): the same alphabet plus `\n`, for output that arrives in chunks.
+//!
+//! Every cut and escape of sandbox-chosen audit text lives here too (architect Q276, Q288), as
+//! the closed set [`Style`]: the hex formats ([`hex_capped`], [`hex_counted`]), the text format
+//! above, and the plain cut ([`plain_capped`]); plus the approval action text's
+//! [`escape_backslash_quoted`] and [`cut_escaped`]. An audit entry declares such text raw and
+//! the writer masks it whole before [`styled`] cuts and escapes it.
 
 use std::fmt::Write as _;
 
