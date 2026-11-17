@@ -1024,10 +1024,19 @@ pub async fn exec(r: &Running, script: &str) -> (i32, String) {
         .unwrap()
 }
 
-// TODO(#178): only exit 1 means absent; any other non-zero status (podman failing) should
-// panic, not read as gone.
+/// Whether `container` exists. `podman container exists` exits 0 when it does and 1 when it does
+/// not; any other status is podman failing, which panics rather than reading as gone.
 pub fn exists(container: &str) -> bool {
-    podman(&["container", "exists", container]).status.success()
+    let out = podman(&["container", "exists", container]);
+    match out.status.code() {
+        Some(0) => true,
+        Some(1) => false,
+        _ => panic!(
+            "podman container exists {container}: {} ({})",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+    }
 }
 
 pub fn rt() -> tokio::runtime::Runtime {
