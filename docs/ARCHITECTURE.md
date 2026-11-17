@@ -302,11 +302,19 @@ are released only once the container is confirmed gone.
    sweep is an oplog line, retried at the next. The listing asks podman for one label only,
    `<full ID> <name> <installation label>`, each a JSON string, never the whole label set: a
    container's labels include its image's, so a line would be as long as an image author likes
-   (architect Q307). A line is daemon-bounded (ID, name and UUID, about 180 bytes). A listing
+   (architect Q307). A line is daemon-bounded (ID, name and UUID, at most 179 bytes). A listing
    over 64 KiB is refused whole, never cut (#173): a cut on a line boundary would parse as a
-   shorter listing that misses the containers past it. That cap, not the session budget, bounds
-   the sweep at about 360 containers: past it, the startup sweep refuses the start and a
-   periodic one fails. The refusal names the recovery (Q308): `podman ps --all --filter
+   shorter listing that misses the containers past it. That cap bounds the sweep at about 360
+   containers: past it, the startup sweep refuses the start and a periodic one fails. So the
+   live sessions are bounded where they are admitted: at most 64 (`MAX_LIVE_SESSIONS`), counted
+   in the same step that reserves the overlap claims and descriptors, before either is checked.
+   The 65th is refused `session-limit` before anything is created (stop a session to launch
+   another). Counting four lines of the longest length per live session, 64 sessions list
+   about 45 KiB, which leaves 16 KiB for lines no session accounts for: inference instances,
+   which are listed but not counted (#134), and leftovers of killed predecessors or containers
+   made outside the daemon under its label. Those can still push a listing past the cap
+   (`THREAT_MODEL.md` §6). The relation is unit-tested in `sandbox::orphans`. The refusal
+   names the recovery (Q308): `podman ps --all --filter
    label=sallyport.installation=<id>` lists this installation's containers, where `<id>` is the
    `installation` file in the state directory. Containers are listed and removed by that label,
    never by an `sp-*` name, which other installations and test runs share.
@@ -1264,6 +1272,8 @@ sallyport/
   `2 * (network.max_connections + 64) + 64` (the proxy's two descriptors per connection, plus
   `agent.sock`/`llm.sock` connections and exec pipes); it is reserved with the overlap claims, in
   one step, and a session over the budget is refused `fd-budget` before anything is created.
+  The same step first checks the live-session limit (64, `session-limit`; see the orphan sweep
+  in §3), which binds long before the descriptor budget does.
   After a refusal reply (every pre-tunnel refusal, the 429 included, and the 502s written
   before a `200`) the proxy closes its sending half and discards client input until its end,
   256 KiB or 1 s in total (`DRAIN_BYTES`, `DRAIN_TIMEOUT`), then closes (#71). The bytes are
