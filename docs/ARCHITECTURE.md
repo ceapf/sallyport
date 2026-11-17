@@ -1599,8 +1599,8 @@ sallyport/
   masked text was cut; the method is masked, then cut to 256 bytes, and the entry does not say
   it was cut (Q256). Text a builder puts in plain args uncut and unescaped (an `egress.allow`
   host, lower-cased only, Q289) needs no declaration: the writer's whole-args pass masks it.
-  A panic payload is held whole up to 64 KiB or withheld whole, never cut before the logs
-  mask it (Q293). The operational log masks a value before it escapes and caps it; its
+  A panic payload, and a failed podman command's stderr, is held whole up to 64 KiB or
+  withheld whole, never cut before the logs mask it (Q293, Q295). The operational log masks a value before it escapes and caps it; its
   callers pass values raw.
   Redaction covers forms only: text that is not a form of a secret (a value the sandbox
   transformed, a CONNECT host it logs lower-cased, #160) is not redacted anywhere. A store

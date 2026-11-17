@@ -1,6 +1,8 @@
 //! Running hermetic podman commands for the launcher: bounded output, a timeout per command,
 //! container removal that confirms the container is gone, and `podman unshare rm`. Moved out of
-//! `launch.rs` unchanged in Task 6c, to keep it under the file-size ceiling.
+//! `launch.rs` unchanged in Task 6c, to keep it under the file-size ceiling. A failed command's
+//! stderr becomes its error text whole or not at all (`launch::stderr_text`, architect Q295):
+//! the logs mask that text before they cut it, so it is never cut here.
 
 use std::ffi::OsString;
 use std::time::Duration;
@@ -8,10 +10,11 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 
 use super::argv::path_arg;
-use super::launch::{LaunchError, Launcher};
+use super::launch::{LaunchError, Launcher, stderr_text};
 
-/// Bytes of podman's stdout and stderr kept per command; the rest is read and dropped.
-const OUTPUT_CAP: usize = 64 * 1024;
+/// Bytes of podman's stdout kept per command; the rest is read and dropped. A failed command's
+/// stderr is its error text whole up to this many bytes, else withheld whole (architect Q295).
+pub(crate) const OUTPUT_CAP: usize = 64 * 1024;
 /// A podman command that takes longer is killed.
 pub(crate) const PODMAN_TIMEOUT: Duration = Duration::from_secs(120);
 /// `podman rm` attempts before a removal is reported as failed, and the pause between them.
@@ -130,7 +133,11 @@ impl Launcher {
             return Err(fail("no pipes".into()));
         };
         let work = async {
-            let (out, err) = tokio::join!(read_capped(out, keep), read_capped(err, OUTPUT_CAP));
+            // One byte past the bound, so a longer stderr is withheld rather than cut (Q295).
+            let (out, err) = tokio::join!(
+                read_capped(out, keep),
+                read_capped(err, OUTPUT_CAP.saturating_add(1))
+            );
             let status = child.wait().await;
             (out, err, status)
         };
@@ -141,10 +148,7 @@ impl Launcher {
         if status.success() {
             Ok(out)
         } else {
-            Err(fail(format!(
-                "{status}: {}",
-                String::from_utf8_lossy(&err).trim()
-            )))
+            Err(fail(format!("{status}: {}", stderr_text(&err, OUTPUT_CAP))))
         }
     }
 }

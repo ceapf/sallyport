@@ -246,6 +246,18 @@ pub(super) fn running_as(state: &str, pid: u32) -> Result<(), LaunchError> {
     }
 }
 
+/// A failed podman command's stderr as its error text (architect Q295): whole, trimmed, up to
+/// `max` bytes; a longer one withheld whole, never cut. The text can name what a sandbox
+/// wrote, and the logs mask it before they cut it: a cut here, before the mask, could leave a
+/// partial form that masking the rest brings inside their cut.
+pub(crate) fn stderr_text(err: &[u8], max: usize) -> String {
+    if err.len() <= max {
+        String::from_utf8_lossy(err).trim().to_owned()
+    } else {
+        format!("stderr withheld: over {max} bytes")
+    }
+}
+
 pub(super) fn join_err(e: tokio::task::JoinError) -> LaunchError {
     LaunchError::Internal(e.to_string())
 }
@@ -263,6 +275,24 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    /// Architect Q295: a failed command's stderr is its error text whole (trimmed) up to the
+    /// bound, and withheld whole past it: no byte of it, never a cut that a mask could miss.
+    #[test]
+    fn stderr_is_whole_up_to_the_bound_and_withheld_past_it() {
+        let max = 24;
+        assert_eq!(
+            stderr_text(b"  no such container\n", max),
+            "no such container"
+        );
+        let at = "z".repeat(max);
+        assert_eq!(stderr_text(at.as_bytes(), max), at);
+        let over = "z".repeat(max + 1);
+        let withheld = stderr_text(over.as_bytes(), max);
+        assert_eq!(withheld, "stderr withheld: over 24 bytes");
+        assert!(!withheld.contains('z'));
+        assert_eq!(stderr_text(&[0xff, b'a'], max), "\u{fffd}a");
+    }
 
     fn sid() -> SessionId {
         SessionId::parse("s-1").unwrap()

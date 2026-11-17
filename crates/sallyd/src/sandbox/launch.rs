@@ -63,6 +63,7 @@ mod teardown;
 mod verify;
 
 use error::join_err;
+pub(crate) use error::stderr_text;
 pub use error::{LaunchError, RoleStopError, StopError};
 pub use harness::HarnessRequest;
 pub use inference::InferenceRequest;
@@ -78,8 +79,8 @@ const AUDIT_TEXT_CAP: usize = 4096;
 /// [`AUDIT_TEXT_CAP`] on a character boundary, unescaped, as [`capped`]. Podman's and the
 /// kernel's messages can name what the sandbox wrote, so an entry declares its detail raw and
 /// the writer masks it whole before the cut. The largest raw detail is a [`LaunchError`]'s
-/// text over podman's output, which `commands.rs` reads up to `OUTPUT_CAP` (64 KiB) a stream
-/// (architect Q294 c).
+/// text over a failed command's stderr, held whole up to `OUTPUT_CAP` (64 KiB) and withheld
+/// whole past it, never cut (architect Q294 c, Q295).
 pub(crate) const DETAIL_STYLE: Style = Style::Plain {
     max: AUDIT_TEXT_CAP,
 };
@@ -659,13 +660,37 @@ mod tests {
         for raw in ["short".to_owned(), "é".repeat(AUDIT_TEXT_CAP)] {
             assert_eq!(detail(&raw, &r), capped(&raw));
         }
-        // At the stated max: podman's two streams read in full, forms throughout.
-        let largest = value.repeat(2 * 64 * 1024 / value.len() + 1);
-        let shown = detail(&largest, &r);
-        assert!(shown.starts_with("[REDACTED:Y]"), "{}", &shown[..40]);
+        // At the stated max (architect Q294 c, Q295): a command's stderr held whole up to
+        // OUTPUT_CAP, forms throughout.
+        let cap = crate::sandbox::commands::OUTPUT_CAP;
+        assert_eq!(cap, 64 * 1024, "the size DETAIL_STYLE's doc quotes");
+        assert!(cap >= AUDIT_TEXT_CAP);
+        let largest = value.repeat(cap / value.len());
+        let text = format!(
+            "exit status: 125: {}",
+            error::stderr_text(largest.as_bytes(), cap)
+        );
+        let shown = detail(&text, &r);
+        assert!(shown.contains("[REDACTED:Y]"), "{}", &shown[..60]);
         assert!(shown.len() <= AUDIT_TEXT_CAP + "…".len());
         for w in value.as_bytes().windows(8) {
             assert!(!shown.contains(std::str::from_utf8(w).unwrap()));
+        }
+        // Past it, a long secret repeated, its last copy straddling OUTPUT_CAP: masking
+        // shrinks the text, so a cut at OUTPUT_CAP would leave a partial copy inside the
+        // audit cut. Withheld whole, nothing of it is shown. Control: the old cut.
+        let long = format!("long-secret-{}", "k0123456789".repeat(90));
+        let rl = sally_core::audit::Redactor::new([("L", long.as_str())]);
+        let over = long.repeat(cap / long.len() + 1);
+        let text = format!(
+            "exit status: 125: {}",
+            error::stderr_text(over.as_bytes(), cap)
+        );
+        let shown = detail(&text, &rl);
+        assert!(shown.starts_with("exit status: 125: "), "{shown}");
+        for w in long.as_bytes().windows(8) {
+            let w = std::str::from_utf8(w).unwrap();
+            assert!(!shown.contains(w), "{w:?} in {shown}");
         }
         let straddle = format!("{}{value}", "x".repeat(AUDIT_TEXT_CAP - 20));
         let shown = detail(&straddle, &r);
