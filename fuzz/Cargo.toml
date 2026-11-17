@@ -133,6 +133,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "gguf"
+path = "fuzz_targets/gguf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "cli_frame"
 path = "fuzz_targets/cli_frame.rs"
 test = false
