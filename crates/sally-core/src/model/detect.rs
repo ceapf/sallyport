@@ -2,8 +2,8 @@
 //!
 //! [`by_name`] reads no bytes. It accepts only the extensions on the allowlist, so a pickle-family
 //! file (`.bin`, `.pt`, `.pth`, `.pkl`, `.pickle`, `.ckpt`, `.h5`, ...) is refused before anyone
-//! opens it. Its [`Candidate`] has no public constructor: [`Candidate::check_magic`] is the only
-//! way to a [`Format`], so the magic check cannot run on a name that was never checked.
+//! opens it. Its [`Candidate`] has no public constructor, so [`Candidate::check_magic`] cannot
+//! run on a name that was never checked. A [`Format`] value alone is no proof that detect ran.
 //!
 //! The allowlist is exactly the lowercase extension `gguf` for now: `.safetensors` is refused
 //! until the safetensors check exists (M2 Task 2).
