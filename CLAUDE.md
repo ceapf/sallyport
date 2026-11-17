@@ -96,9 +96,10 @@ container-free tests run: unit tests, all of sally-core's `tests/`, `sallyd` `ar
   `oplog.rs`, `session/{lookup,types,exit,secrets}.rs`, `egress/{addr,authority,head,policy,server,
   hostaddrs,tunnel,net,ca,roots,rewrite,intercept,intercept_parts,intercept_tls,intercept_report,meter,inject,
   redact,local}.rs` (net.rs tests stay hermetic: nothing leaves the machine),
-  `rpc/{agent,control,control_methods,control_line,drive,attach,line,frame,json,listen,mcp,message,
-  rate,record}.rs`,
+  `rpc/{agent,control,control_methods,control_line,control_wire,drive,attach,line,frame,json,listen,
+  mcp,message,rate,record}.rs`,
   `llm/{body,head,io,reply,scripted,server}.rs`, `approvals/{action,glob,handler,hub,policy,queue,render}.rs`,
+  `approvals/queue/{decide,fields,types}.rs`,
   `tools/{args,path,tag,fs,shell,procs,mod,dac,ops,fetch,fetch_url,fetch_client,pipe}.rs`; sally-shim
   `args.rs`, `relay.rs`; sally-cli `clean.rs`, `client.rs`, `commands.rs`, `approve.rs`,
   `secrets.rs`, `local.rs`, `doctor.rs`, `usage.rs`, `drive.rs`, `run.rs` (clap definitions and

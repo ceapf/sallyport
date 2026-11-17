@@ -150,11 +150,11 @@ MUTANTS_WIDE_SALLYD := $(addprefix crates/sallyd/src/sandbox/,argv.rs check.rs t
                        local.rs) \
                        $(addprefix crates/sallyd/src/rpc/,agent.rs control.rs control_methods.rs frame.rs \
                        json.rs listen.rs mcp.rs message.rs rate.rs record.rs drive.rs attach.rs \
-                       line.rs control_line.rs) \
+                       line.rs control_line.rs control_wire.rs) \
                        $(addprefix crates/sallyd/src/llm/,body.rs head.rs io.rs reply.rs scripted.rs \
                        server.rs) \
                        $(addprefix crates/sallyd/src/approvals/,action.rs glob.rs handler.rs hub.rs \
-                       policy.rs queue.rs render.rs) \
+                       policy.rs queue.rs queue/decide.rs queue/fields.rs queue/types.rs render.rs) \
                        $(addprefix crates/sallyd/src/tools/,args.rs path.rs tag.rs fs.rs shell.rs procs.rs \
                        mod.rs dac.rs ops.rs fetch.rs fetch_url.rs fetch_client.rs pipe.rs)
 MUTANTS_WIDE_SHIM := $(addprefix crates/sally-shim/src/,args.rs relay.rs)
