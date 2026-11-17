@@ -4,7 +4,11 @@
 //! the values, and it is what kills the mutants of the named default consts in
 //! `manifest/types.rs`. Each expected value is written here from the spec, never read from the
 //! code. Every section is destructured without `..`, so a new field fails to compile until it
-//! is pinned here too.
+//! is pinned here too. The defaults of list items are pinned where those items are tested: a
+//! brokered mount's approve globs (`manifest_gates.rs`,
+//! `brokered_mount_without_approve_needs_approval_for_everything`), an MCP server's `approve`
+//! (`manifest_gates.rs`, `mcp_approve_defaults_to_always`) and an allow rule's ports
+//! (`manifest_validate.rs`, `network_allow_rules`).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;

@@ -44,8 +44,122 @@ async fn cgroup(x: &Lx, r: &Running) -> std::path::PathBuf {
     dir
 }
 
-fn read(dir: &std::path::Path, file: &str) -> String {
-    std::fs::read_to_string(dir.join(file)).unwrap()
+/// A file of the container's cgroup `dir`. A failed read panics at the caller's line, naming the
+/// file, whether `dir` is still there, the container's state and the audit so far (#141: a
+/// directory gone mid-test means the container ended).
+#[track_caller]
+fn read(x: &Lx, r: &Running, dir: &std::path::Path, file: &str) -> String {
+    match std::fs::read_to_string(dir.join(file)) {
+        Ok(text) => text,
+        Err(e) => {
+            let there = dir.is_dir();
+            // Printed before podman is asked; podman then gets at most STATE_LIMIT.
+            eprintln!(
+                "{file} in {}: {e}; directory still there: {there}",
+                dir.display()
+            );
+            panic!(
+                "{file} in {}: {e}; directory still there: {there}; container: {}; audit: {:?}",
+                dir.display(),
+                container_state(x, r, STATE_LIMIT),
+                x.events.list()
+            )
+        }
+    }
+}
+
+/// How long a failed [`read`] waits for podman to describe the container. Generous: the failure
+/// shows under load, and a false time-out would lose the state on the run that matters.
+const STATE_LIMIT: Duration = Duration::from_secs(30);
+
+/// The container's status, exit code and OOM-killed flag from hermetic podman, or why podman
+/// could not say within `limit`. Only a failed [`read`] asks, so it blocks the runtime's
+/// thread, for at most `limit`.
+fn container_state(x: &Lx, r: &Running, limit: Duration) -> String {
+    let fields = "{{.State.Status}} exit {{.State.ExitCode}} oom-killed {{.State.OOMKilled}}";
+    let mut c = x.podman.command();
+    let cmd = c
+        .as_std_mut()
+        .args(["inspect", "--format", fields, r.container()]);
+    bounded_output(cmd, limit, "podman inspect")
+}
+
+/// Runs `cmd` in a process group of its own and waits at most `limit` for it to exit and close
+/// its pipes (a process it started may hold one); past that the whole group is killed. Never
+/// panics: every outcome is text, so it cannot replace the panic it reports for.
+fn bounded_output(cmd: &mut std::process::Command, limit: Duration, what: &str) -> String {
+    use std::os::unix::process::CommandExt as _;
+    let spawned = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn();
+    let child = match spawned {
+        Ok(child) => child,
+        Err(e) => return format!("{what} did not run: {e}"),
+    };
+    let leader = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(limit) {
+        Ok(Ok(o)) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_owned(),
+        Ok(Ok(o)) => format!(
+            "{what} failed ({}): {}",
+            o.status,
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Ok(Err(e)) => format!("{what} did not finish: {e}"),
+        Err(_) => {
+            kill_group(leader);
+            format!("{what} timed out after {limit:?}")
+        }
+    }
+}
+
+/// Kills the process group led by `leader`.
+fn kill_group(leader: u32) {
+    let pid = i32::try_from(leader)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw);
+    if let Some(pid) = pid {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
+}
+
+/// [`bounded_output`] gives up on a query whose pipes never close, says so, and kills its group.
+/// No container: the query is a shell that exits at once, leaving a sleeper that holds its
+/// stdout and stderr and writes its pid to a file.
+#[test]
+fn a_stalled_state_query_times_out_and_its_group_is_killed() {
+    let limit = Duration::from_millis(200);
+    let file = std::env::temp_dir().join(format!("sp-bombs-sleeper-{}", std::process::id()));
+    let mut cmd = std::process::Command::new("sh");
+    cmd.args(["-c", "sleep 60 & echo $! > \"$1\"", "sh"])
+        .arg(&file);
+    let started = std::time::Instant::now();
+    let text = bounded_output(&mut cmd, limit, "the query");
+    let took = started.elapsed();
+    assert_eq!(text, format!("the query timed out after {limit:?}"));
+    assert!(took < Duration::from_secs(5), "returned after {took:?}");
+    let pid = std::fs::read_to_string(&file).unwrap();
+    std::fs::remove_file(&file).unwrap();
+    let stat = std::path::Path::new("/proc").join(pid.trim()).join("stat");
+    // Killed: gone, or a zombie (Z) or being reaped (X) by its new parent.
+    let dead = || {
+        std::fs::read_to_string(&stat).map_or(true, |s| {
+            s.rsplit_once(") ")
+                .is_some_and(|(_, rest)| rest.starts_with(['Z', 'X']))
+        })
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut killed = dead();
+    while !killed && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        killed = dead();
+    }
+    assert!(killed, "the sleeper {} outlived the time-out", pid.trim());
 }
 
 /// The `name` counter of a cgroup `*.events` file.
@@ -87,7 +201,7 @@ fn rt_ag_09_a_fork_bomb_is_held_by_the_pids_limit() {
         let started = std::time::Instant::now();
         let r = launch_small(&x, "fork").await;
         let cg = cgroup(&x, &r).await;
-        assert_eq!(read(&cg, "pids.max").trim(), PIDS.to_string());
+        assert_eq!(read(&x, &r, &cg, "pids.max").trim(), PIDS.to_string());
         let (code, out) = exec(&r, "(b() { b | b & }; b) >/dev/null 2>&1 & echo started").await;
         assert_eq!((code, out.trim()), (0, "started"));
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -97,10 +211,10 @@ fn rt_ag_09_a_fork_bomb_is_held_by_the_pids_limit() {
         } else {
             "pids.current"
         };
-        let peak: u64 = read(&cg, file).trim().parse().unwrap();
+        let peak: u64 = read(&x, &r, &cg, file).trim().parse().unwrap();
         assert!(peak <= u64::from(PIDS), "{file} {peak}");
         assert!(
-            event(&read(&cg, "pids.events"), "max ") > 0,
+            event(&read(&x, &r, &cg, "pids.events"), "max ") > 0,
             "forks were refused"
         );
         for _ in 0..20 {
@@ -135,9 +249,12 @@ fn rt_ag_09_a_memory_bomb_is_oom_killed_inside_the_container() {
         let x = Lx::new();
         let r = launch_small(&x, "oom").await;
         let cg = cgroup(&x, &r).await;
-        assert_eq!(read(&cg, "memory.max").trim(), (64u64 << 20).to_string());
+        assert_eq!(
+            read(&x, &r, &cg, "memory.max").trim(),
+            (64u64 << 20).to_string()
+        );
         // `--memory-swap` equals `--memory`: no swap, so the bomb cannot push the host to swap.
-        assert_eq!(read(&cg, "memory.swap.max").trim(), "0");
+        assert_eq!(read(&x, &r, &cg, "memory.swap.max").trim(), "0");
         let marker = std::env::current_dir().unwrap().join("oom");
         let _ = std::fs::remove_file(&marker);
         let state = x.podman.hooks_dir().parent().unwrap().join("oom");
