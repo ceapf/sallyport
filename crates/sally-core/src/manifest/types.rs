@@ -108,23 +108,23 @@ pub struct Runtime {
 }
 
 /// `runtime.memory` when omitted: 8 GiB.
-const DEFAULT_MEMORY: u64 = 8 * ByteSize::GIB;
+const DEFAULT_MEMORY_BYTES: u64 = 8 * ByteSize::GIB;
 /// `runtime.timeout` when omitted: 2 h.
 const DEFAULT_TIMEOUT_SECS: u64 = 2 * 3600;
 /// `runtime.stage_size` when omitted: 10 GiB.
-const DEFAULT_STAGE_SIZE: u64 = 10 * ByteSize::GIB;
+const DEFAULT_STAGE_SIZE_BYTES: u64 = 10 * ByteSize::GIB;
 
 impl Default for Runtime {
     fn default() -> Self {
         Self {
             image: None,
             cpus: Cpus::from_millis(4000),
-            memory: ByteSize::from_bytes(DEFAULT_MEMORY),
+            memory: ByteSize::from_bytes(DEFAULT_MEMORY_BYTES),
             pids: 512,
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             tmp_size: ByteSize::from_bytes(ByteSize::GIB),
             tmp_exec: false,
-            stage_size: ByteSize::from_bytes(DEFAULT_STAGE_SIZE),
+            stage_size: ByteSize::from_bytes(DEFAULT_STAGE_SIZE_BYTES),
         }
     }
 }
