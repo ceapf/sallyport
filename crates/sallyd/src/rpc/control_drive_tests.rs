@@ -179,6 +179,14 @@ fn held(
     (began, release, dropped)
 }
 
+/// Waits until the step [`held`] holds has begun, failing the test once [`WAIT`] passes (a
+/// drive request nothing answers never begins one).
+async fn begun(began: &tokio::sync::Notify) {
+    tokio::time::timeout(WAIT, began.notified())
+        .await
+        .expect("the step never began");
+}
+
 /// A driver that closes while its step waits (on a prompt, say) drops the step at once, and the
 /// seat is gone; it is not left held by a connection nobody reads. That a dropped driven call
 /// withdraws its prompt is `agent_tests.rs`'s
@@ -189,7 +197,7 @@ async fn rt_drv_06_a_driver_that_closes_mid_step_drops_the_step_and_leaves_the_s
     let (began, _release, dropped) = held(&f, "s-1");
     let mut seat = f.connect();
     seat.send("sessions.drive", json!({"id": "s-1"})).await;
-    began.notified().await;
+    begun(&began).await;
     drop(seat);
     for _ in 0..200 {
         if dropped.load(std::sync::atomic::Ordering::SeqCst) {
@@ -216,7 +224,7 @@ async fn rt_drv_06_a_driver_that_half_closes_mid_step_is_a_closed_driver() {
     let (began, _release, dropped) = held(&f, "s-1");
     let mut seat = f.connect();
     seat.send("sessions.drive", json!({"id": "s-1"})).await;
-    began.notified().await;
+    begun(&began).await;
     seat.w.shutdown().await.unwrap();
     for _ in 0..200 {
         if dropped.load(std::sync::atomic::Ordering::SeqCst) {
@@ -246,7 +254,7 @@ async fn a_request_pipelined_behind_a_step_does_not_drop_it() {
     let (began, release, dropped) = held(&f, "s-1");
     let mut seat = f.connect();
     seat.send("sessions.drive", json!({"id": "s-1"})).await;
-    began.notified().await;
+    begun(&began).await;
     seat.send("sessions.list", json!({})).await;
     for _ in 0..20 {
         tokio::task::yield_now().await;

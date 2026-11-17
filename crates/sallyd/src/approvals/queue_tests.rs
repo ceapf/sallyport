@@ -12,7 +12,7 @@ use super::super::policy::MountRule;
 use super::super::render;
 use super::*;
 use crate::rpc::record::escape;
-use crate::rpc::testkit::{Sink, recorder};
+use crate::rpc::testkit::{Sink, WAIT, joined, recorder};
 use sally_core::audit::{NewEntry, Piece};
 
 /// Records what an approver is told.
@@ -228,7 +228,7 @@ async fn an_approver_with_no_client_attached_denies_no_approver() {
     f.fake.detached.store(false, SeqCst);
     let (id, h) = asking(&f, shell(2, &["ls"])).await;
     decide(&f.desk, &id, Decision::Deny, ME).await.unwrap();
-    assert!(h.await.unwrap().is_err());
+    assert!(joined(h).await.is_err());
 }
 
 fn seen(digest: &str, full_shown: bool) -> Seen<'_> {
@@ -267,14 +267,14 @@ async fn an_approve_with_another_digest_is_refused_and_leaves_the_prompt() {
         .decide(&id, Decision::Approve, ME, seen(&digest, false))
         .await
         .unwrap();
-    assert_eq!(h.await.unwrap().unwrap().bound(), &b);
+    assert_eq!(joined(h).await.unwrap().bound(), &b);
     // A deny with a wrong digest still denies.
     let (id, h) = asking(&f, shell(2, &["ls"])).await;
     f.desk
         .decide(&id, Decision::Deny, ME, seen("x", false))
         .await
         .unwrap();
-    assert_eq!(h.await.unwrap(), Err(Refusal::Denied("denied")));
+    assert_eq!(joined(h).await, Err(Refusal::Denied("denied")));
 }
 
 /// A cut prompt is approved only after its full text was shown (architect Q74, RT-UI-03 for the
@@ -302,12 +302,12 @@ async fn a_cut_prompt_is_approved_only_after_its_full_text_was_shown() {
         .decide(&id, Decision::Approve, ME, seen(&digest, true))
         .await
         .unwrap();
-    assert!(h.await.unwrap().is_ok());
+    assert!(joined(h).await.is_ok());
     assert_eq!(f.sink.last("approval.decide")["full_shown"], true);
     // An approve of a whole prompt records no claim.
     let (id, h) = asking(&f, shell(2, &["ls"])).await;
     decide(&f.desk, &id, Decision::Approve, ME).await.unwrap();
-    assert!(h.await.unwrap().is_ok());
+    assert!(joined(h).await.is_ok());
     assert!(f.sink.last("approval.decide").get("full_shown").is_none());
     // A cut prompt is denied without the claim.
     let (id, h) = asking(&f, shell(3, &["echo", &long])).await;
@@ -315,7 +315,7 @@ async fn a_cut_prompt_is_approved_only_after_its_full_text_was_shown() {
         .decide(&id, Decision::Deny, ME, seen("", false))
         .await
         .unwrap();
-    assert!(h.await.unwrap().is_err());
+    assert!(joined(h).await.is_err());
 }
 
 /// A full text over the wire cap is never sent, so the prompt cannot be approved at all; it can
@@ -335,7 +335,7 @@ async fn a_prompt_whose_full_text_is_over_the_wire_cap_is_deny_only() {
     assert_eq!(r, Err(DecideError::FullTextNotShown));
     assert_eq!(f.desk.list().len(), 1);
     decide(&f.desk, &id, Decision::Deny, ME).await.unwrap();
-    assert!(h.await.unwrap().is_err());
+    assert!(joined(h).await.is_err());
 }
 
 #[tokio::test]
@@ -351,7 +351,7 @@ async fn approve_once_runs_the_askers_own_copy_and_the_id_is_single_use() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].digest, b.digest());
     decide(&f.desk, &id, Decision::Approve, ME).await.unwrap();
-    let t = h.await.unwrap().unwrap();
+    let t = joined(h).await.unwrap();
     assert_eq!(t.bound(), &b);
     assert_eq!(t.approval(), Some(id.as_str()));
     let d = f.sink.last("approval.decide");
@@ -382,7 +382,7 @@ async fn two_decisions_at_once_on_one_id_take_it_once() {
     let oks = [a, b].iter().filter(|r| r.is_ok()).count();
     assert_eq!(oks, 1);
     assert!([a, b].contains(&Err(DecideError::UnknownId)));
-    assert!(h.await.unwrap().is_ok());
+    assert!(joined(h).await.is_ok());
     let approvals = f
         .sink
         .rows()
@@ -399,11 +399,11 @@ async fn an_identical_later_call_asks_again_under_a_new_id() {
     decide(&f.desk, &first, Decision::Approve, ME)
         .await
         .unwrap();
-    h.await.unwrap().unwrap();
+    joined(h).await.unwrap();
     let (second, h) = asking(&f, shell(2, &["ls"])).await;
     assert_ne!(first, second);
     decide(&f.desk, &second, Decision::Deny, ME).await.unwrap();
-    assert_eq!(h.await.unwrap(), Err(Refusal::Denied("denied")));
+    assert_eq!(joined(h).await, Err(Refusal::Denied("denied")));
     assert_eq!(f.sink.last("approval.decide")["id"], second.as_str());
 }
 
@@ -443,7 +443,7 @@ async fn a_prompt_nobody_answers_expires_as_a_denial() {
     tokio::time::advance(Duration::from_secs(290)).await;
     assert_eq!(f.desk.list().len(), 1);
     tokio::time::advance(Duration::from_secs(10)).await;
-    assert_eq!(h.await.unwrap(), Err(Refusal::Denied("timeout")));
+    assert_eq!(joined(h).await, Err(Refusal::Denied("timeout")));
     let e = f.sink.last("approval.expire");
     assert_eq!(e["id"], id.as_str());
     assert_eq!(e["reason"], "timeout");
@@ -460,7 +460,7 @@ async fn an_expiry_that_cannot_be_written_is_unrecorded() {
     let (_, h) = asking(&f, shell(1, &["ls"])).await;
     f.sink.set_failing(true);
     tokio::time::advance(Duration::from_secs(300)).await;
-    assert_eq!(h.await.unwrap(), Err(Refusal::Unrecorded));
+    assert_eq!(joined(h).await, Err(Refusal::Unrecorded));
 }
 
 #[tokio::test]
@@ -488,7 +488,7 @@ async fn an_approval_that_cannot_be_written_is_not_given() {
     f.sink.set_failing(true);
     let r = decide(&f.desk, &id, Decision::Approve, ME).await;
     assert_eq!(r, Err(DecideError::Unrecorded));
-    assert_eq!(h.await.unwrap(), Err(Refusal::Unrecorded));
+    assert_eq!(joined(h).await, Err(Refusal::Unrecorded));
     // And an unknown id whose refusal cannot be written says so.
     assert_eq!(
         decide(&f.desk, "ap-x", Decision::Deny, ME).await,
@@ -501,15 +501,15 @@ async fn a_decision_whose_caller_is_dropped_still_completes() {
     let f = fx(5);
     let (id, h) = asking(&f, shell(1, &["ls"])).await;
     // The decision's entry cannot be written yet, so the caller is still waiting when dropped.
-    f.sink.hold(true);
+    let held = f.sink.held();
     let desk = f.desk.clone();
     let d = id.clone();
     let caller = tokio::spawn(async move { decide(&desk, &d, Decision::Deny, ME).await });
     until("prompt taken", || f.desk.list().is_empty()).await;
     caller.abort();
     assert!(caller.await.unwrap_err().is_cancelled());
-    f.sink.hold(false);
-    assert_eq!(h.await.unwrap(), Err(Refusal::Denied("denied")));
+    drop(held);
+    assert_eq!(joined(h).await, Err(Refusal::Denied("denied")));
     assert_eq!(f.sink.last("approval.decide")["id"], id.as_str());
     assert!(f.fake.closed.lock().unwrap().contains(&id));
 }
@@ -522,8 +522,8 @@ async fn deny_all_session_denies_every_pending_prompt_and_every_later_one() {
     decide(&f.desk, &a, Decision::DenyAllSession, ME)
         .await
         .unwrap();
-    assert_eq!(ha.await.unwrap(), Err(Refusal::Denied("denied")));
-    assert_eq!(hb.await.unwrap(), Err(Refusal::Denied("session-denied")));
+    assert_eq!(joined(ha).await, Err(Refusal::Denied("denied")));
+    assert_eq!(joined(hb).await, Err(Refusal::Denied("session-denied")));
     let rows: Vec<_> = f
         .sink
         .rows()
@@ -558,10 +558,10 @@ async fn deny_all_session_latches_first_and_stays_latched_when_its_entry_fails()
     f.sink.fail_next.store(1, SeqCst);
     let r = decide(&f.desk, &a, Decision::DenyAllSession, ME).await;
     assert_eq!(r, Err(DecideError::Unrecorded));
-    assert_eq!(ha.await.unwrap(), Err(Refusal::Unrecorded));
+    assert_eq!(joined(ha).await, Err(Refusal::Unrecorded));
     // Latched all the same: the other prompt is denied with its own entry, and nothing new is
     // shown.
-    assert_eq!(hb.await.unwrap(), Err(Refusal::Denied("session-denied")));
+    assert_eq!(joined(hb).await, Err(Refusal::Denied("session-denied")));
     assert_eq!(f.sink.last("approval.decide")["id"], b.as_str());
     assert_eq!(f.sink.last("approval.decide")["via"], a.as_str());
     assert!(f.desk.list().is_empty());
@@ -580,8 +580,8 @@ async fn deny_all_session_reports_an_entry_it_could_not_write_for_another_prompt
     f.sink.fail_from.store(f.sink.rows().len() + 1, SeqCst);
     let r = decide(&f.desk, &a, Decision::DenyAllSession, ME).await;
     assert_eq!(r, Err(DecideError::Unrecorded));
-    assert_eq!(ha.await.unwrap(), Err(Refusal::Denied("denied")));
-    assert_eq!(hb.await.unwrap(), Err(Refusal::Unrecorded));
+    assert_eq!(joined(ha).await, Err(Refusal::Denied("denied")));
+    assert_eq!(joined(hb).await, Err(Refusal::Unrecorded));
     // The session is latched all the same: `a`'s decision was recorded.
     f.sink.fail_from.store(0, SeqCst);
     let r = f.gate.admit(shell(3, &["c"]), None, None).await;
@@ -595,7 +595,7 @@ async fn deny_all_session_on_a_stale_id_sets_nothing() {
     assert_eq!(r, Err(DecideError::UnknownId));
     let (id, h) = asking(&f, shell(1, &["ls"])).await;
     decide(&f.desk, &id, Decision::Approve, ME).await.unwrap();
-    assert!(h.await.unwrap().is_ok());
+    assert!(joined(h).await.is_ok());
 }
 
 #[tokio::test]
@@ -603,7 +603,7 @@ async fn a_withdrawn_call_leaves_the_queue_audited_and_cannot_be_approved() {
     let f = fx(5);
     let (id, h) = asking(&f, shell(7, &["ls"])).await;
     f.gate.withdraw(7, Withdraw::Cancel).await;
-    assert_eq!(h.await.unwrap(), Err(Refusal::Denied("withdrawn")));
+    assert_eq!(joined(h).await, Err(Refusal::Denied("withdrawn")));
     let w = f.sink.last("approval.withdraw");
     assert_eq!(w["id"], id.as_str());
     assert_eq!(w["call"], 7);
@@ -615,7 +615,7 @@ async fn a_withdrawn_call_leaves_the_queue_audited_and_cannot_be_approved() {
     );
     let (_, h) = asking(&f, shell(8, &["ls"])).await;
     f.gate.withdraw(8, Withdraw::Closed).await;
-    assert_eq!(h.await.unwrap(), Err(Refusal::Denied("withdrawn")));
+    assert_eq!(joined(h).await, Err(Refusal::Denied("withdrawn")));
     assert_eq!(f.sink.last("approval.withdraw")["reason"], "closed");
     assert!(f.sink.rows().last().unwrap().debug.contains("Sallyd"));
 }
@@ -626,7 +626,7 @@ async fn a_withdraw_that_cannot_be_written_is_unrecorded() {
     let (_, h) = asking(&f, shell(7, &["ls"])).await;
     f.sink.set_failing(true);
     f.gate.withdraw(7, Withdraw::Cancel).await;
-    assert_eq!(h.await.unwrap(), Err(Refusal::Unrecorded));
+    assert_eq!(joined(h).await, Err(Refusal::Unrecorded));
 }
 
 #[tokio::test]
@@ -695,7 +695,7 @@ async fn no_decision_slips_in_while_a_deny_all_session_is_written() {
     let f = fx(5);
     let (a, ha) = asking(&f, shell(1, &["a"])).await;
     let (b, hb) = asking(&f, shell(2, &["b"])).await;
-    f.sink.hold(true);
+    let held = f.sink.held();
     let desk = f.desk.clone();
     let all = tokio::spawn(async move { decide(&desk, &a, Decision::DenyAllSession, ME).await });
     // The latch comes first: `a` is taken and `b` drained before `a`'s entry is written.
@@ -708,11 +708,11 @@ async fn no_decision_slips_in_while_a_deny_all_session_is_written() {
         !approve.is_finished(),
         "an approval ran during a deny_all_session"
     );
-    f.sink.hold(false);
-    assert_eq!(all.await.unwrap(), Ok(()));
-    assert_eq!(approve.await.unwrap(), Err(DecideError::UnknownId));
-    assert_eq!(ha.await.unwrap(), Err(Refusal::Denied("denied")));
-    assert_eq!(hb.await.unwrap(), Err(Refusal::Denied("session-denied")));
+    drop(held);
+    assert_eq!(joined(all).await, Ok(()));
+    assert_eq!(joined(approve).await, Err(DecideError::UnknownId));
+    assert_eq!(joined(ha).await, Err(Refusal::Denied("denied")));
+    assert_eq!(joined(hb).await, Err(Refusal::Denied("session-denied")));
 }
 
 /// Q59 (a) step 3: the session's stop takes every shown prompt out of the queue with
@@ -726,7 +726,7 @@ async fn the_session_stop_withdraws_every_prompt_and_queues_no_more() {
     f.desk.stop().await.unwrap();
     assert!(f.desk.list().is_empty());
     for h in [ha, hb] {
-        assert_eq!(h.await.unwrap(), Err(Refusal::Denied("withdrawn")));
+        assert_eq!(joined(h).await, Err(Refusal::Denied("withdrawn")));
     }
     assert_eq!(count(&f.sink, "approval.withdraw"), 2);
     let w = f.sink.last("approval.withdraw");
@@ -754,7 +754,7 @@ async fn the_session_stop_withdraws_every_prompt_and_queues_no_more() {
 async fn an_approve_being_written_at_the_seal_lands_before_session_stop() {
     let f = fx(5);
     let (a, ha) = asking(&f, shell(7, &["ls"])).await;
-    f.sink.hold(true);
+    let held = f.sink.held();
     let desk = f.desk.clone();
     let approve = tokio::spawn(async move { decide(&desk, &a, Decision::Approve, ME).await });
     until("the prompt is taken", || f.desk.list().is_empty()).await;
@@ -767,10 +767,10 @@ async fn an_approve_being_written_at_the_seal_lands_before_session_stop() {
     };
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(!sealing.is_finished(), "the seal waits for the decide");
-    f.sink.hold(false);
-    assert_eq!(approve.await.unwrap(), Ok(()));
-    assert!(ha.await.unwrap().is_ok());
-    assert!(sealing.await.unwrap().written);
+    drop(held);
+    assert_eq!(joined(approve).await, Ok(()));
+    assert!(joined(ha).await.is_ok());
+    assert!(joined(sealing).await.written);
     let events = f.sink.events();
     assert_eq!(events.last().map(String::as_str), Some("session.stop"));
     assert!(events.contains(&"approval.decide".to_owned()), "{events:?}");
@@ -788,9 +788,9 @@ async fn after_the_seal_a_decide_or_withdraw_writes_nothing_and_runs_nothing() {
         decide(&f.desk, &a, Decision::Approve, ME).await,
         Err(DecideError::Unrecorded)
     );
-    assert_eq!(ha.await.unwrap(), Err(Refusal::Unrecorded));
+    assert_eq!(joined(ha).await, Err(Refusal::Unrecorded));
     f.gate.withdraw(8, Withdraw::Closed).await;
-    let _ = hb.await.unwrap().unwrap_err();
+    let _ = joined(hb).await.unwrap_err();
     let events = f.sink.events();
     assert_eq!(events.last().map(String::as_str), Some("session.stop"));
     drop(b);
@@ -878,7 +878,7 @@ async fn the_oldest_prompt_leaving_keeps_the_rest_in_order() {
             "withdraw" => f.gate.withdraw(1, Withdraw::Cancel).await,
             "expire" => {
                 tokio::time::advance(Duration::from_secs(200)).await;
-                assert_eq!(ha.await.unwrap(), Err(Refusal::Denied("timeout")));
+                assert_eq!(joined(ha).await, Err(Refusal::Denied("timeout")));
             }
             _ => {
                 ha.abort();
@@ -897,7 +897,7 @@ async fn a_decision_takes_the_prompt_it_names() {
     let (a, _ha) = asking(&f, shell(1, &["ls"])).await;
     let (b, hb) = asking(&f, shell(2, &["ls"])).await;
     decide(&f.desk, &b, Decision::Deny, ME).await.unwrap();
-    assert_eq!(hb.await.unwrap(), Err(Refusal::Denied("denied")));
+    assert_eq!(joined(hb).await, Err(Refusal::Denied("denied")));
     assert_eq!(listed(&f), [a]);
 }
 
@@ -1021,7 +1021,7 @@ async fn new_prompts_come_at_most_one_per_refill_after_the_burst() {
     tokio::time::advance(REFILL / 2).await;
     let (id, h) = asking(&f, shell(11, &["y"])).await;
     decide(&f.desk, &id, Decision::Approve, ME).await.unwrap();
-    assert!(h.await.unwrap().is_ok());
+    assert!(joined(h).await.is_ok());
 }
 
 #[tokio::test]
@@ -1085,7 +1085,10 @@ async fn rt_ag_03_a_thousand_asks_leave_at_most_max_pending_and_run_nothing() {
     assert!(f.desk.list().len() <= 5);
     tokio::time::advance(Duration::from_secs(300)).await;
     let mut tally = std::collections::BTreeMap::<&str, usize>::new();
-    while let Some(r) = tasks.join_next().await {
+    while let Some(r) = tokio::time::timeout(WAIT, tasks.join_next())
+        .await
+        .expect("an asker never finished")
+    {
         match r.unwrap() {
             Ok(_) => panic!("a ticket was issued"),
             Err(Refusal::Denied(code)) => *tally.entry(code).or_default() += 1,

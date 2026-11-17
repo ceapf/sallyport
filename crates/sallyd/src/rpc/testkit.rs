@@ -14,6 +14,22 @@ use crate::sandbox::AuditSink;
 use crate::tools::ops::DISCONNECT;
 use crate::tools::shell::{AttachIo, Chunk, Ran, Status, Streamer};
 
+/// How long a real-time test waits for something that comes within milliseconds when the code
+/// is right: a spawned task's end, a reply frame, a step beginning. One that never comes (an asker
+/// left waiting out the 300 s prompt timeout, a request no arm answers) then fails the test by an
+/// assertion, well inside the mutation runs' 30 s per-test limit.
+pub const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// `h`'s output, or a failure once [`WAIT`] passes. Under paused time an idle runtime jumps to
+/// the bound at once, so a task that can never finish fails the test at once; tokio does not
+/// auto-advance while a blocking task (an append) runs, so a slow append is not cut short.
+pub async fn joined<T>(h: tokio::task::JoinHandle<T>) -> T {
+    tokio::time::timeout(WAIT, h)
+        .await
+        .expect("the spawned task never finished")
+        .unwrap()
+}
+
 /// One recorded entry.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
