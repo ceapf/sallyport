@@ -666,7 +666,8 @@ const EXEC_HOLD_US: u64 = 1_000_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Dropped {
     /// A part of either reading failed: the process was gone. A process that exits during the
-    /// reads ends here: its `exe` link fails once it is a zombie.
+    /// reads usually ends here, as its `exe` link fails once it is a zombie; one that exits
+    /// after the second `exe` read gives `Unstable` instead.
     Gone,
     /// The two readings differ, or name another executable than the one the process was picked
     /// by: it exec'd or exited between them.
@@ -679,7 +680,8 @@ enum Dropped {
 /// The reading of two back-to-back raw readings of a process picked by its executable `picked`
 /// that counts (architect Q390, Q394, #187): both whole, byte-identical, naming `picked`, with a
 /// non-empty argv. A process that exits during the reads gives none: a read opened before the
-/// exit returns 0 bytes `Ok`, but its `exe` link then fails. Nor does one caught inside `execve`
+/// exit returns 0 bytes `Ok`, but a later `exe` read fails, or the two readings differ. Nor does
+/// one caught inside `execve`
 /// before its new image has its arguments. Read in kernel source and not observed (PROBE_NOTES):
 /// later in `execve` there is a short stretch where `cmdline` holds the arguments and `environ`
 /// is still empty; two agreeing readings there keep an empty environment and fail rt_sup_04's
@@ -731,6 +733,10 @@ fn a_process_reading_counts_only_when_stable_and_past_exec() {
         exe: PathBuf::from("/usr/bin/crun"),
         ..full.clone()
     };
+    let other_exe_no_argv = Raw {
+        argv: Vec::new(),
+        ..other_exe.clone()
+    };
     let some = |r: &Raw| Some(r.clone());
     let cases = [
         (some(&full), some(&full), Ok(full.clone())),
@@ -743,8 +749,15 @@ fn a_process_reading_counts_only_when_stable_and_past_exec() {
         (some(&full), some(&other_env), Err(Dropped::Unstable)),
         (some(&full), some(&other_argv), Err(Dropped::Unstable)),
         (some(&full), some(&other_exe), Err(Dropped::Unstable)),
-        // Agreeing readings of an executable other than the one the process was picked by.
+        // Agreeing readings of an executable other than the one the process was picked by,
+        // checked before the argv.
         (some(&other_exe), some(&other_exe), Err(Dropped::Unstable)),
+        (
+            some(&other_exe_no_argv),
+            some(&other_exe_no_argv),
+            Err(Dropped::Unstable),
+        ),
+        // Differing readings are Unstable before an empty argv is looked at.
         (some(&no_argv), some(&full), Err(Dropped::Unstable)),
         (None, None, Err(Dropped::Gone)),
     ];
@@ -807,7 +820,9 @@ fn known_children(parent: i32, exes: &[&Path]) -> Vec<(i32, Result<Seen, Dropped
 /// process's event interrupts into `… <unfinished ...>` and `<pid> <... execve resumed>) = …`;
 /// such an exec counts unless it resumed with `= -1`, and one never resumed in the trace counts
 /// too (fail-closed). A resumed line counts only for a blind exec it finishes, so a split exec
-/// with readable arguments (podman's own children) never does.
+/// with readable arguments (podman's own children) never does. A split exec that resumed `= ?`
+/// (killed inside `execve`) counts, an unsplit one does not (the old filter, kept verbatim):
+/// either way its new image never ran. A pid that exec'd blind twice is listed twice.
 fn blind_execs(trace: &str) -> Vec<i32> {
     let pid = |l: &str| l.split_whitespace().next()?.parse::<i32>().ok();
     let mut pending = std::collections::BTreeSet::new();
@@ -819,6 +834,7 @@ fn blind_execs(trace: &str) -> Vec<i32> {
             pending.extend(pid(l));
         } else if l.contains("<... execve resumed>")
             && let Some(p) = pid(l)
+            // Clears the pid whatever the result, before the `= -1` check.
             && pending.remove(&p)
             && !l.contains("= -1")
         {
@@ -858,8 +874,16 @@ fn a_blind_exec_counts_whether_or_not_strace_splits_its_line() {
              \"LC_CTYPE=C.UTF-8\"] <unfinished ...>"
         )
     };
-    let cases: [(&str, Vec<String>, Vec<i32>); 8] = [
+    let readable_ok = |p: i32| {
+        format!(
+            "{p} execve(\"/bin/true\", [\"true\", \"--version\"], [\"PATH=/usr/bin\", \
+             \"LC_CTYPE=C.UTF-8\"]) = 0 (DELAYED)"
+        )
+    };
+    let cases: Vec<(&str, Vec<String>, Vec<i32>)> = vec![
         ("unsplit ok", vec![ok(11)], vec![11]),
+        // sallyd's own execve, and podman's children, have readable arguments.
+        ("readable unsplit ok", vec![readable_ok(20)], vec![]),
         ("unsplit -1", vec![fail(12)], vec![]),
         ("split ok", vec![unfinished(13), resumed_ok(13)], vec![13]),
         ("split -1", vec![unfinished(14), resumed_fail(14)], vec![]),
@@ -1003,7 +1027,7 @@ fn rt_sup_04_hostile_variables_in_sallyd_s_environment_never_reach_podman() {
          ({later} of those pids read later)"
     );
     let unfinished = std::fs::read_to_string(&trace).map_or_else(
-        |_| "unreadable".to_owned(),
+        |e| format!("unreadable: {e}"),
         |t| {
             t.lines()
                 .filter(|l| l.contains("execve(") && l.contains("<unfinished"))
@@ -1011,7 +1035,10 @@ fn rt_sup_04_hostile_variables_in_sallyd_s_environment_never_reach_podman() {
                 .to_string()
         },
     );
-    eprintln!("rt_sup_04 observer: {diag}; execve lines split <unfinished: {unfinished}");
+    eprintln!(
+        "rt_sup_04 observer: {diag}; execve lines split <unfinished (blind or readable): \
+         {unfinished}"
+    );
     // R1 (architect Q128): checked first, so a `sallyd` that consults `PATH` fails here.
     assert!(!canary.exists(), "the podman first on PATH was run");
     assert!(

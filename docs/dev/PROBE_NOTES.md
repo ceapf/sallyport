@@ -60,7 +60,8 @@ line per fact, with where it was found. Check a note again before relying on it 
   0 bytes. Opened once it is a zombie, `environ` fails `EACCES`, `cmdline` reads `Ok` with
   0 bytes, and the `exe` link fails `ENOENT`. So a reader that opens `environ` just before the
   exit records an empty environment the process never had (#187). rt_sup_04 keeps a reading
-  only when two back-to-back reads agree and the argv is not empty (Q390). Read in kernel
+  only when two back-to-back reads agree, name the executable it was picked by, and the argv is
+  not empty (Q390, Q394). Read in kernel
   source (Linux v6.18) and not observed here: `begin_new_exec` (fs/exec.c) sets the new image's
   exe file and makes its mm current before `create_elf_tables` (fs/binfmt_elf.c) fills in the
   argument and environment ranges. Until `mm->env_end` is set, `get_mm_cmdline` and
