@@ -114,7 +114,10 @@ Budget: this adds roughly half a week to M1 and is about neutral afterwards. The
 ## 10. New red-team rows (add to `REDTEAM_SUITE.md`; all CI)
 
 RT-AG-11 to RT-AG-14 and RT-INF-05 are folded into `REDTEAM_SUITE.md` (Task 7); RT-SEC-09 to
-RT-SEC-13 are folded into `REDTEAM_SUITE.md` (Task 9, old → new table there).
+RT-SEC-13 are folded into `REDTEAM_SUITE.md` (Task 9, old → new table there). Every row of the
+table below is now in `REDTEAM_SUITE.md`: RT-SUP-03 and RT-MDL-10 were added at the M1 exit with
+their attack, PASS condition and milestones, and gain a test name and a control when their tests
+land.
 
 | ID | Attack | PASS | M |
 |---|---|---|---|
