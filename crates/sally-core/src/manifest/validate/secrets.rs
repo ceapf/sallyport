@@ -74,7 +74,10 @@ pub(super) fn check_secrets(
         if let Some(env) = &s.expose_env {
             // Neither a malformed name nor a malformed variable name is echoed by the
             // duplicate check (Q376).
-            if !check_expose_env(env, &at("expose_env"), d) || !name_ok {
+            // The variable's own check runs first and always: its error is kept even when the
+            // name is malformed too.
+            let env_ok = check_expose_env(env, &at("expose_env"), d);
+            if !env_ok || !name_ok {
                 continue;
             }
             match exposed.insert(env.as_str(), s.name.as_str()) {

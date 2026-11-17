@@ -72,7 +72,8 @@ fn readable(m: &Manifest, mounts: &[ResolvedMount]) -> Vec<String> {
             unnamed.push(format!("whatever the secret at secrets[{i}] unlocks"));
         }
     }
-    // TODO(#195): the hosts are joined bare; a host label shaped like a token is not masked.
+    // TODO(#195): the hosts are joined bare, here and in destination(); a host label shaped
+    // like a token is not masked.
     out.extend(by_secret.into_iter().map(|(name, hosts)| {
         let hosts: Vec<&str> = hosts.into_iter().collect();
         format!("whatever your {name:?} unlocks on {}", hosts.join(" or "))
