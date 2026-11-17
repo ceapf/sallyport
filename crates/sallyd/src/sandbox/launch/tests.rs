@@ -119,7 +119,8 @@ fn an_fd_budget_refusal_has_its_own_reason() {
 }
 
 /// A session past the daemon's live-session limit is refused `session-limit`, the message
-/// naming both numbers and the way out.
+/// naming both numbers and the way out. TODO(#203): a container test of the audit entry and
+/// that nothing is created, for this reason and `fd-budget`.
 #[test]
 fn a_session_limit_refusal_has_its_own_reason() {
     use crate::sandbox::budget::SessionLimit;

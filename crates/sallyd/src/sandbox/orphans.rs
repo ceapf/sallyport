@@ -13,12 +13,13 @@
 //! string ([`ps_args`]; podman prints `""` for a missing label), so a label value holding a
 //! newline cannot forge a line (PROBE_NOTES). Only that one label is asked for, never the whole
 //! set: a container's labels include its image's, so a line would otherwise be as long as an
-//! image author likes (architect Q307). A line is daemon-bounded (ID, name and UUID, at most
-//! 179 bytes), so about 360 containers fit under the launcher's 64 KiB stdout cap; a longer
-//! listing is refused there (#173). The live sessions are bounded so their worst listing fits
-//! with room to spare ([`super::budget::MAX_LIVE_SESSIONS`], checked when a launch reserves its
-//! id; the relation is tested below). Inference instances and outside-made containers are not
-//! counted, which leaves a residual (TODO(#134)). A line that does not parse fails the whole sweep, never
+//! image author likes (architect Q307). A line is daemon-bounded (ID, name and UUID): at most
+//! 179 bytes for a session container, 182 for an inference instance (`sp-infer-`), so about
+//! 360 containers fit under the launcher's 64 KiB stdout cap; a longer listing is refused there
+//! (#173). The live sessions are bounded so their worst listing fits with room to spare
+//! ([`super::budget::MAX_LIVE_SESSIONS`], checked when a launch reserves its id; the relation
+//! is tested below). Inference instances and outside-made containers are not counted, which
+//! leaves a residual (TODO(#134)). A line that does not parse fails the whole sweep, never
 //! skips silently. An orphan is removed by its full ID, never its name, which a new container
 //! could have taken since the listing.
 
@@ -359,8 +360,13 @@ mod tests {
 
     /// The longest listing line a session container can have, newline included: a full ID, the
     /// longer session prefix with a 64-character id, and an installation UUID, each a JSON
-    /// string ([`ps_args`]).
+    /// string. It and [`line`] follow the `--format` of [`ps_args`], which
+    /// `the_listing_asks_podman_for_this_installations_label` pins: a change there is a change
+    /// here.
     const MAX_PS_LINE: usize = 179;
+
+    /// An inference instance's container prefix: listed by the sweep, not swept, not counted.
+    const INFERENCE_PREFIX: &str = "sp-infer-";
 
     /// Listing lines counted per live session: twice its two containers ([`SESSION_PREFIXES`]),
     /// the factor of two being margin.
@@ -371,7 +377,8 @@ mod tests {
     /// containers made outside this daemon under its label.
     const HEADROOM: usize = 16 * 1024;
 
-    /// The longest line `name` can have as podman prints it, newline included.
+    /// The listing line for `name` as podman prints it, newline included (exact: the ID is
+    /// always 64 hex digits and the label a UUID).
     fn listed(name: &str) -> String {
         format!("{}\n", line(name, Some(OWN)))
     }
@@ -387,6 +394,9 @@ mod tests {
             .max()
             .unwrap();
         assert_eq!(longest, MAX_PS_LINE);
+        // An inference instance's line, uncounted and in the headroom, is 3 bytes longer.
+        let infer = listed(&format!("{INFERENCE_PREFIX}{id}")).len();
+        assert_eq!(infer, MAX_PS_LINE + 3);
     }
 
     #[test]

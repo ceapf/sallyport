@@ -4,6 +4,9 @@
 //! pipes). A session reserves its worst case together with its overlap claim
 //! ([`super::Sessions::reserve`]) and frees it on release, so the sum over sessions can never run
 //! the daemon out of descriptors (one session's EMFILE would hit every session).
+//!
+//! The same reservation also bounds how many sessions are live at once ([`MAX_LIVE_SESSIONS`]),
+//! so the orphan sweep's container listing stays under the launcher's stdout cap.
 
 use crate::egress::server::ADMISSION_EXTRA;
 
@@ -184,6 +187,13 @@ mod tests {
             msg,
             "64 sessions are live, the daemon's limit is 64 (stop a session)"
         );
+    }
+
+    /// The number the docs and the threat model state. The upper bound is the listing relation
+    /// in `orphans`; this pins the value itself, so a lower one is a visible change too.
+    #[test]
+    fn the_daemon_keeps_at_most_64_sessions_live() {
+        assert_eq!(MAX_LIVE_SESSIONS, 64);
     }
 
     #[test]
