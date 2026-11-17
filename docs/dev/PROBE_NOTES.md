@@ -63,6 +63,13 @@ line per fact, with where it was found. Check a note again before relying on it 
   only when two back-to-back reads agree and the argv is not empty (Q390). Read in kernel
   source and not observed here: during `execve`, the `exe` link names the new image before its
   environment is set, so `environ` and `cmdline` read empty there too.
+- strace 6.8 with rt_sup_04's flags (`-f -qq -v -s 65536 -e trace=execve
+  -e inject=execve:delay_exit=1000000 -e signal=none -o <file>`), tracing a non-dumpable parent
+  that forks concurrent execs: an exec another process's event interrupts is split into
+  `<pid> execve(0x…, 0x…, 0x… <unfinished ...>` and `<pid> <... execve resumed>)           = 0 (DELAYED)`
+  (or `= -1 ENOENT (No such file or directory) (DELAYED)`); a dumpable parent's split line shows
+  the readable arguments instead. Splits seen: 0 in 6 concurrent execs (3 runs); 0 to 4 in 40
+  (15 runs). rt_sup_04 counts a split blind exec as one exec (Q393).
 - The OCI config, Podman 4.9.3 rootless crun: `capabilities: {}`; rlimits CORE, NOFILE, NPROC
   (the last two podman's own hard limits); hostname = 12-hex short id without `--hostname`;
   `/etc/passwd`, `/etc/group`, `/dev/shm` bind from `<graphroot>/…/userdata`, `/etc/hostname`

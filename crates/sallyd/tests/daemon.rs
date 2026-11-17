@@ -793,6 +793,97 @@ fn known_children(parent: i32, exes: &[&Path]) -> Vec<(i32, Result<Seen, Dropped
     out
 }
 
+/// The pids in an `strace -f` trace that exec'd with their arguments unreadable (`execve(0x…`):
+/// the children of the non-dumpable `sallyd` (architect Q393). strace splits a call that another
+/// process's event interrupts into `… <unfinished ...>` and `<pid> <... execve resumed>) = …`;
+/// such an exec counts unless it resumed with `= -1`, and one never resumed in the trace counts
+/// too (fail-closed). A resumed line counts only for a blind exec it finishes, so a split exec
+/// with readable arguments (podman's own children) never does.
+fn blind_execs(trace: &str) -> Vec<i32> {
+    let pid = |l: &str| l.split_whitespace().next()?.parse::<i32>().ok();
+    let mut pending = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for l in trace.lines() {
+        if l.contains(" execve(0x") && l.contains(") = 0") {
+            out.extend(pid(l));
+        } else if l.contains(" execve(0x") && l.contains("<unfinished") {
+            pending.extend(pid(l));
+        } else if l.contains("<... execve resumed>")
+            && let Some(p) = pid(l)
+            && pending.remove(&p)
+            && !l.contains("= -1")
+        {
+            out.push(p);
+        }
+    }
+    out.extend(pending);
+    out
+}
+
+#[test]
+fn a_blind_exec_counts_whether_or_not_strace_splits_its_line() {
+    // Copied from `strace -f -qq -v -s 65536 -e trace=execve -e inject=execve:delay_exit=…
+    // -e signal=none` (strace 6.8) of 40 concurrent execs; only the pids are changed.
+    let ok = |p: i32| {
+        format!("{p} execve(0x722fb53fda90, 0x722fb5220f10, 0x7fff91e0fd30) = 0 (DELAYED)")
+    };
+    let fail = |p: i32| {
+        format!(
+            "{p} execve(0x722fb52965d0, 0x722fb5378580, 0x7fff91e0fd30) = -1 ENOENT (No such \
+             file or directory) (DELAYED)"
+        )
+    };
+    let unfinished = |p: i32| {
+        format!("{p} execve(0x722fb53fda90, 0x722fb5220f10, 0x7fff91e0fd30 <unfinished ...>")
+    };
+    let resumed_ok = |p: i32| format!("{p} <... execve resumed>)           = 0 (DELAYED)");
+    let resumed_fail = |p: i32| {
+        format!(
+            "{p} <... execve resumed>)           = -1 ENOENT (No such file or directory) \
+             (DELAYED)"
+        )
+    };
+    let readable = |p: i32| {
+        format!(
+            "{p} execve(\"/bin/true\", [\"true\", \"--version\"], [\"PATH=/usr/bin\", \
+             \"LC_CTYPE=C.UTF-8\"] <unfinished ...>"
+        )
+    };
+    let cases: [(&str, Vec<String>, Vec<i32>); 8] = [
+        ("unsplit ok", vec![ok(11)], vec![11]),
+        ("unsplit -1", vec![fail(12)], vec![]),
+        ("split ok", vec![unfinished(13), resumed_ok(13)], vec![13]),
+        ("split -1", vec![unfinished(14), resumed_fail(14)], vec![]),
+        // Fail-closed: an exec whose result the trace never shows must have been read.
+        ("split never resumed", vec![unfinished(15)], vec![15]),
+        (
+            "interleaved",
+            vec![
+                unfinished(16),
+                unfinished(17),
+                resumed_fail(17),
+                resumed_ok(16),
+            ],
+            vec![16],
+        ),
+        // Podman's own children exec with readable arguments: not sallyd's.
+        (
+            "readable split ok",
+            vec![readable(18), resumed_ok(18)],
+            vec![],
+        ),
+        ("resumed, nothing pending", vec![resumed_ok(19)], vec![]),
+    ];
+    let wrong: Vec<String> = cases
+        .into_iter()
+        .filter_map(|(name, lines, want)| {
+            let got = blind_execs(&lines.join("\n"));
+            (got != want).then(|| format!("{name}: got {got:?}, want {want:?}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// The podman `sallyd`'s system search finds, as `/proc/<pid>/exe` shows it.
 fn trusted_podman() -> PathBuf {
     let p = sallyd::sandbox::resolve_podman(None).unwrap();
@@ -967,12 +1058,9 @@ fn rt_sup_04_hostile_variables_in_sallyd_s_environment_never_reach_podman() {
     }
     let text = std::fs::read_to_string(&trace).unwrap();
     // Every process sallyd started was read: a child of the non-dumpable sallyd execs with its
-    // arguments unreadable (`execve(0x…`), and each such successful exec is one seen above.
-    let blind: Vec<i32> = text
-        .lines()
-        .filter(|l| l.contains(" execve(0x") && l.contains(") = 0"))
-        .filter_map(|l| l.split_whitespace().next()?.parse().ok())
-        .collect();
+    // arguments unreadable (`execve(0x…`), and each such successful exec, its line split or not,
+    // is one seen above.
+    let blind = blind_execs(&text);
     assert!(
         !blind.is_empty(),
         "no exec by sallyd's children in the trace"
