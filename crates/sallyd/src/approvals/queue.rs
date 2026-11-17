@@ -402,7 +402,7 @@ impl Gate {
     }
 
     /// Refuses a call the executor could not turn into an action: `tool.deny` with the tool's
-    /// name (declared, see [`call_denied`]) and the code, before the denial is returned.
+    /// name (declared, see `call_denied`) and the code, before the denial is returned.
     pub async fn refuse_call(&self, call: u64, tool: &str, code: &'static str) -> Refusal {
         let entry = call_denied(
             self.inner.denial(Actor::Sallyd, "tool.deny"),

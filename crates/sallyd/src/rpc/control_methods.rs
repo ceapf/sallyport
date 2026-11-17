@@ -4,6 +4,8 @@
 //! Every reply that lists (`sessions.changes`, `approvals.list`, `approvals.watch`) is held to
 //! [`REPLY_BYTES`] of serialized items, so it fits the client's frame cap
 //! ([`sally_proto::MAX_FRAME`]); a cut list says so (`complete: false`, `total`).
+//!
+//! TODO(#175): the wire helpers at the end of this file move to their own file (move-only).
 
 use std::future::Future;
 use std::os::fd::AsFd;

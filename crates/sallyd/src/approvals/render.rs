@@ -18,6 +18,8 @@
 //! human approves the exact request, SI-5); an audit entry declares the same pieces, so the
 //! writer masks each raw piece whole before the text is escaped and cut (architect Q276, Q288).
 //! The escape and the cut are sally-core's (`text::escape_backslash_quoted`, `cut_escaped`).
+//! The agent's note keeps its own `"` escape and its cut at [`NOTE_CHARS`] (architect Q300): it
+//! is shown only in the prompt and never logged (the audit holds its length and digest only).
 
 use std::fmt::Write as _;
 use std::sync::Arc;

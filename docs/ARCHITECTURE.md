@@ -1600,8 +1600,12 @@ sallyport/
   it was cut (Q256). Text a builder puts in plain args uncut and unescaped (an `egress.allow`
   host, lower-cased only, Q289) needs no declaration: the writer's whole-args pass masks it.
   A panic payload, and a failed podman command's stderr, is held whole up to 64 KiB or
-  withheld whole, never cut before the logs mask it (Q293, Q295). The operational log masks a value before it escapes and caps it; its
-  callers pass values raw.
+  withheld whole, never cut before the logs mask it (Q293, Q295). A failed task join is a
+  daemon-chosen constant (`crash::join_text`, Q297): tokio's own text escapes the panic
+  message, so the payload is only in the oplog's panic line. The operational log masks a value
+  before it escapes and caps it; its callers pass values raw. The work under the writer's lock
+  for one entry is bounded by the tool-call frame cap (256 KiB raw; #174 streams the escape
+  and the digest, Q298).
   Redaction covers forms only: text that is not a form of a secret (a value the sandbox
   transformed, a CONNECT host it logs lower-cased, #160) is not redacted anywhere. A store
   value under 16 bytes is stored and reported short (`SHORT_SECRET_BYTES`: its base64 forms are

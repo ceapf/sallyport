@@ -112,6 +112,7 @@ impl Declared {
                 }
             }
             Shape::Pieces { pieces, max } => {
+                // TODO(#174): stream the escape and the digest past `max`; the mask stays whole.
                 let whole = assemble(pieces, |r| redactor.redact_str(r));
                 let (shown, _) = text::cut_escaped(&whole, *max);
                 args.insert(self.key.to_owned(), Value::from(shown));
@@ -135,7 +136,8 @@ pub fn assembled(pieces: &[Piece]) -> String {
     assemble(pieces, Cow::Borrowed)
 }
 
-/// `pieces` as one text, each raw piece through `mask` before it is escaped.
+/// `pieces` as one text, each raw piece through `mask` before it is escaped. The whole text is
+/// built under the writer's lock, bounded by the tool-call frame cap (TODO(#174)).
 fn assemble<'a>(pieces: &'a [Piece], mask: impl Fn(&'a str) -> Cow<'a, str>) -> String {
     let mut whole = String::new();
     for p in pieces {
