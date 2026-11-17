@@ -1614,7 +1614,10 @@ sallyport/
   `sallyd::session::secrets`, Q219, Q220). A session's forms enter both redactors when its
   egress has loaded them, before `net.sock` is bound or a container exists. They leave after
   the session's last entry: `sandbox.refuse` for a refused launch, `session.closed` (§5.4) for
-  a session. A value two live sessions share stays redacted until both have left. The egress
+  a session. A value two live sessions share stays redacted until both have left. A stored
+  value no live session is granted is in neither redactor (Q275): keeping every stored value
+  resident would need a second store loader. Revisit this if any new path lets a store value
+  reach a sandbox other than the user's own mount or an upstream echo. The egress
   sink of a proxy session with secret grants (interception) also redacts each of its entries
   with that session's own forms, read from its `Redaction` (the patterns `own_masked` masks
   with), masking its declared texts uncut, before the writer sees it (`SessionRedacted`, Q249, Q278). So an egress entry that
