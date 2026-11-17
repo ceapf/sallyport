@@ -75,8 +75,10 @@ line per fact, with where it was found. Check a note again before relying on it 
   that forks concurrent execs: an exec another process's event interrupts is split into
   `<pid> execve(0x…, 0x…, 0x… <unfinished ...>` and `<pid> <... execve resumed>)           = 0 (DELAYED)`
   (or `= -1 ENOENT (No such file or directory) (DELAYED)`); a dumpable parent's split line shows
-  the readable arguments instead. Splits seen: 0 in 6 concurrent execs (3 runs); 0 to 4 in 40
-  (15 runs). rt_sup_04 counts a split blind exec as one exec (Q393).
+  the readable arguments instead. Splits seen: 0 to 4 in 40 concurrent execs (15 runs; the
+  blind lines of rt_sup_04's fixture come from these captures); an earlier probe whose captures
+  were not kept saw 0 in 6 (3 runs) and 2 to 7 in 40. rt_sup_04 counts a split blind exec as
+  one exec (Q393).
 - The OCI config, Podman 4.9.3 rootless crun: `capabilities: {}`; rlimits CORE, NOFILE, NPROC
   (the last two podman's own hard limits); hostname = 12-hex short id without `--hostname`;
   `/etc/passwd`, `/etc/group`, `/dev/shm` bind from `<graphroot>/…/userdata`, `/etc/hostname`

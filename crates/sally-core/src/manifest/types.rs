@@ -107,17 +107,24 @@ pub struct Runtime {
     pub stage_size: ByteSize,
 }
 
+/// `runtime.memory` when omitted: 8 GiB.
+const DEFAULT_MEMORY_BYTES: u64 = 8 * ByteSize::GIB;
+/// `runtime.timeout` when omitted: 2 h.
+const DEFAULT_TIMEOUT_SECS: u64 = 2 * 3600;
+/// `runtime.stage_size` when omitted: 10 GiB.
+const DEFAULT_STAGE_SIZE_BYTES: u64 = 10 * ByteSize::GIB;
+
 impl Default for Runtime {
     fn default() -> Self {
         Self {
             image: None,
             cpus: Cpus::from_millis(4000),
-            memory: ByteSize::from_bytes(8 * ByteSize::GIB),
+            memory: ByteSize::from_bytes(DEFAULT_MEMORY_BYTES),
             pids: 512,
-            timeout: Duration::from_secs(2 * 3600),
+            timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             tmp_size: ByteSize::from_bytes(ByteSize::GIB),
             tmp_exec: false,
-            stage_size: ByteSize::from_bytes(10 * ByteSize::GIB),
+            stage_size: ByteSize::from_bytes(DEFAULT_STAGE_SIZE_BYTES),
         }
     }
 }
@@ -238,14 +245,19 @@ pub struct Network {
     pub max_connections: u32,
 }
 
+/// `network.max_request_bytes` when omitted: 8 MiB.
+const DEFAULT_MAX_REQUEST_BYTES: u64 = 8 * ByteSize::MIB;
+/// `network.max_response_bytes` when omitted: 64 MiB.
+const DEFAULT_MAX_RESPONSE_BYTES: u64 = 64 * ByteSize::MIB;
+
 impl Default for Network {
     fn default() -> Self {
         Self {
             mode: NetworkMode::None,
             allow: Vec::new(),
             acknowledge_unrestricted_egress: false,
-            max_request_bytes: ByteSize::from_bytes(8 * ByteSize::MIB),
-            max_response_bytes: ByteSize::from_bytes(64 * ByteSize::MIB),
+            max_request_bytes: ByteSize::from_bytes(DEFAULT_MAX_REQUEST_BYTES),
+            max_response_bytes: ByteSize::from_bytes(DEFAULT_MAX_RESPONSE_BYTES),
             max_connections: 32,
         }
     }
