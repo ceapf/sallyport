@@ -61,8 +61,14 @@ line per fact, with where it was found. Check a note again before relying on it 
   0 bytes, and the `exe` link fails `ENOENT`. So a reader that opens `environ` just before the
   exit records an empty environment the process never had (#187). rt_sup_04 keeps a reading
   only when two back-to-back reads agree and the argv is not empty (Q390). Read in kernel
-  source and not observed here: during `execve`, the `exe` link names the new image before its
-  environment is set, so `environ` and `cmdline` read empty there too.
+  source (Linux v6.18) and not observed here: `begin_new_exec` (fs/exec.c) sets the new image's
+  exe file and makes its mm current before `create_elf_tables` (fs/binfmt_elf.c) fills in the
+  argument and environment ranges. Until `mm->env_end` is set, `get_mm_cmdline` and
+  `environ_read` (fs/proc/base.c) both return 0 bytes; `create_elf_tables` sets `arg_end`, then
+  `env_start = env_end`, then the final `env_end`, so for a short stretch `cmdline` holds the
+  arguments while `environ` is empty. A reading in the first stretch is dropped (empty argv);
+  two agreeing readings inside the second keep an empty environment and fail the environment
+  equality (a false red, never a pass) (Q394).
 - strace 6.8 with rt_sup_04's flags (`-f -qq -v -s 65536 -e trace=execve
   -e inject=execve:delay_exit=1000000 -e signal=none -o <file>`), tracing a non-dumpable parent
   that forks concurrent execs: an exec another process's event interrupts is split into

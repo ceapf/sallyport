@@ -665,25 +665,32 @@ const EXEC_HOLD_US: u64 = 1_000_000;
 /// Why a process's reading was not kept.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Dropped {
-    /// A part of either reading failed: the process was gone.
+    /// A part of either reading failed: the process was gone. A process that exits during the
+    /// reads ends here: its `exe` link fails once it is a zombie.
     Gone,
-    /// The two readings differ: the process exec'd or exited between them.
+    /// The two readings differ, or name another executable than the one the process was picked
+    /// by: it exec'd or exited between them.
     Unstable,
-    /// The argv is empty: the process is a zombie or not yet past `execve`.
+    /// Two agreeing readings with an empty argv: the process is inside `execve`, before its new
+    /// image has its arguments (read in kernel source, not observed). A zombie gives `Gone`.
     NoArgv,
 }
 
-/// The reading of two back-to-back raw readings that counts (architect Q390, #187): both whole,
-/// byte-identical, with a non-empty argv. A process that exits between its reads (a zombie's
-/// `environ` and `cmdline` read back empty but `Ok`), or one caught inside `execve` before its
-/// new image has its arguments, gives no reading. The environment's content is never a
-/// criterion, so a process that really runs with an empty environment is kept and fails the
-/// equality.
-fn reading(first: Option<Raw>, second: Option<Raw>) -> Result<Raw, Dropped> {
+/// The reading of two back-to-back raw readings of a process picked by its executable `picked`
+/// that counts (architect Q390, Q394, #187): both whole, byte-identical, naming `picked`, with a
+/// non-empty argv. A process that exits during the reads gives none: a read opened before the
+/// exit returns 0 bytes `Ok`, but its `exe` link then fails. Nor does one caught inside `execve`
+/// before its new image has its arguments. Read in kernel source and not observed (PROBE_NOTES):
+/// later in `execve` there is a short stretch where `cmdline` holds the arguments and `environ`
+/// is still empty; two agreeing readings there keep an empty environment and fail rt_sup_04's
+/// environment `assert_eq` (a false red, never a pass). The environment's content is never a
+/// criterion, so a process that really runs with an empty environment is kept and fails that
+/// `assert_eq` too.
+fn reading(picked: &Path, first: Option<Raw>, second: Option<Raw>) -> Result<Raw, Dropped> {
     let (Some(first), Some(second)) = (first, second) else {
         return Err(Dropped::Gone);
     };
-    if first != second {
+    if first != second || first.exe != picked {
         return Err(Dropped::Unstable);
     }
     if first.argv.is_empty() {
@@ -736,12 +743,16 @@ fn a_process_reading_counts_only_when_stable_and_past_exec() {
         (some(&full), some(&other_env), Err(Dropped::Unstable)),
         (some(&full), some(&other_argv), Err(Dropped::Unstable)),
         (some(&full), some(&other_exe), Err(Dropped::Unstable)),
+        // Agreeing readings of an executable other than the one the process was picked by.
+        (some(&other_exe), some(&other_exe), Err(Dropped::Unstable)),
+        (some(&no_argv), some(&full), Err(Dropped::Unstable)),
+        (None, None, Err(Dropped::Gone)),
     ];
     let wrong: Vec<String> = cases
         .into_iter()
         .enumerate()
         .filter_map(|(n, (first, second, want))| {
-            let got = reading(first, second);
+            let got = reading(&full.exe, first, second);
             (got != want).then(|| format!("case {n}: got {got:?}, want {want:?}"))
         })
         .collect();
@@ -781,13 +792,11 @@ fn known_children(parent: i32, exes: &[&Path]) -> Vec<(i32, Result<Seen, Dropped
                 .map(|s| String::from_utf8_lossy(s).into_owned())
                 .collect()
         };
-        let kept = reading(raw(pid), raw(pid))
-            .and_then(|r| (r.exe == exe).then_some(r).ok_or(Dropped::Unstable))
-            .map(|r| Seen {
-                exe: r.exe,
-                env: split(&r.env),
-                argv: split(&r.argv).join(" "),
-            });
+        let kept = reading(&exe, raw(pid), raw(pid)).map(|r| Seen {
+            exe: r.exe,
+            env: split(&r.env),
+            argv: split(&r.argv).join(" "),
+        });
         out.push((pid, kept));
     }
     out
@@ -952,6 +961,7 @@ fn rt_sup_04_hostile_variables_in_sallyd_s_environment_never_reach_podman() {
     let end = Instant::now() + Duration::from_secs(120);
     let mut seen = std::collections::BTreeMap::new();
     let mut dropped = std::collections::BTreeMap::<i32, std::collections::BTreeSet<Dropped>>::new();
+    // The longest poll gap is reported, not asserted: a missed process fails as exec'd unread.
     let mut gap = Duration::ZERO;
     let mut last: Option<Instant> = None;
     let mut done: Option<Instant> = None;
@@ -971,9 +981,11 @@ fn rt_sup_04_hostile_variables_in_sallyd_s_environment_never_reach_podman() {
                     Ok(s) => {
                         seen.entry(pid).or_insert(s);
                     }
-                    Err(why) => {
+                    // A drop counts only before the pid's first kept reading.
+                    Err(why) if !seen.contains_key(&pid) => {
                         dropped.entry(pid).or_default().insert(why);
                     }
+                    Err(_) => {}
                 }
             }
         }
@@ -990,11 +1002,15 @@ fn rt_sup_04_hostile_variables_in_sallyd_s_environment_never_reach_podman() {
         "hold {EXEC_HOLD_US} us, longest poll gap {gap:?}, dropped readings {dropped:?} \
          ({later} of those pids read later)"
     );
-    let unfinished = std::fs::read_to_string(&trace)
-        .unwrap()
-        .lines()
-        .filter(|l| l.contains("execve(") && l.contains("<unfinished"))
-        .count();
+    let unfinished = std::fs::read_to_string(&trace).map_or_else(
+        |_| "unreadable".to_owned(),
+        |t| {
+            t.lines()
+                .filter(|l| l.contains("execve(") && l.contains("<unfinished"))
+                .count()
+                .to_string()
+        },
+    );
     eprintln!("rt_sup_04 observer: {diag}; execve lines split <unfinished: {unfinished}");
     // R1 (architect Q128): checked first, so a `sallyd` that consults `PATH` fails here.
     assert!(!canary.exists(), "the podman first on PATH was run");
