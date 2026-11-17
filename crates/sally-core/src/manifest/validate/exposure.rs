@@ -63,7 +63,7 @@ fn readable(m: &Manifest, mounts: &[ResolvedMount]) -> Vec<String> {
     }
     out.extend(by_secret.into_iter().map(|(name, hosts)| {
         let hosts: Vec<&str> = hosts.into_iter().collect();
-        format!("whatever your {name} unlocks on {}", hosts.join(" or "))
+        format!("whatever your {name:?} unlocks on {}", hosts.join(" or "))
     }));
     out
 }

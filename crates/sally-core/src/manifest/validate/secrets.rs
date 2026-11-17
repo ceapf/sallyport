@@ -97,7 +97,7 @@ fn check_secret_name(s: &SecretGrant, path: &str, catalog: &dyn SecretCatalog, d
             path,
             Code::SecretMissing,
             format!(
-                "{0:?} is not in the secrets store (sally secrets set {0})",
+                "{0:?} is not in the secrets store (sally secrets set {0:?})",
                 s.name
             ),
         );

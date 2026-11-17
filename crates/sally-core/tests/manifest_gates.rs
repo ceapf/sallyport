@@ -718,7 +718,7 @@ fn data_can_leave_when_private_data_meets_an_allow_rule() {
     let first = s.lines().next().unwrap();
     assert_eq!(
         first,
-        "[data-can-leave] Anything this agent reads ($ROOT/home/code/myproject and whatever your GITHUB_TOKEN unlocks on api.github.com) can be sent to pypi.org and api.github.com (acting as you)."
+        "[data-can-leave] Anything this agent reads ($ROOT/home/code/myproject and whatever your \"GITHUB_TOKEN\" unlocks on api.github.com) can be sent to pypi.org and api.github.com (acting as you)."
     );
 }
 
