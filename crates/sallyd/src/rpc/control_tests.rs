@@ -19,7 +19,7 @@ use crate::rpc::control_methods::{
 };
 use crate::rpc::drive::Driver;
 use crate::rpc::line::Line;
-use crate::rpc::testkit::{FakeExec, Row, Sink, recorder};
+use crate::rpc::testkit::{FakeExec, Row, Sink, WAIT, joined, recorder};
 use crate::sandbox::LaunchError;
 use crate::session::{SessionInfo, SessionState, StartError, StopOutcome};
 
@@ -331,7 +331,7 @@ impl Wire {
     /// The next frame, `None` at the end of the stream.
     async fn frame(&mut self) -> Option<Value> {
         let mut l = String::new();
-        let n = tokio::time::timeout(Duration::from_secs(30), self.r.read_line(&mut l))
+        let n = tokio::time::timeout(WAIT, self.r.read_line(&mut l))
             .await
             .expect("no frame")
             .unwrap();
@@ -1238,7 +1238,7 @@ async fn a_watcher_hears_a_prompt_and_approves_it() {
         closed,
         json!({"jsonrpc": "2.0", "method": "approval.closed", "params": {"id": id}})
     );
-    assert!(asked.await.unwrap().is_ok());
+    assert!(joined(asked).await.is_ok());
     let decided = desk_sink
         .rows()
         .into_iter()
@@ -1314,7 +1314,7 @@ async fn an_unwritten_decision_is_told_audit_failed_and_nothing_runs() {
     let r = w.reply("approvals.decide", params).await;
     assert_eq!(reason(&r), "audit-failed");
     assert_eq!(
-        asked.await.unwrap(),
+        joined(asked).await,
         Err(crate::approvals::Refusal::Unrecorded)
     );
     let r = w.reply("sessions.list", json!({})).await;

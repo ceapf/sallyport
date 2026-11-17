@@ -306,6 +306,9 @@ pub(crate) struct DirId {
 /// Order matters: a lexical denylist check first (so `/mnt/c` is `denylisted` even where it
 /// does not exist), then the root's own type via `lstat` (symlink / not-dir / missing), then the
 /// authoritative denylist check on the realpath.
+// TODO(#195): these errors quote the host as written, or its realpath. Past `expand` both hold
+// `/`, so a quoted one is never masked, wherever a token sits in it; in `expand`'s own errors, a
+// quote or a backslash next to a token escapes the mask.
 pub(crate) fn check_mount_host(
     raw: &str,
     home: &Path,
@@ -361,8 +364,9 @@ pub(crate) fn check_mount_host(
 }
 
 /// Guest paths: `/workspace/<seg>(/<seg>)*`, each segment `[A-Za-z0-9._-]`, not `.`/`..`.
-// TODO(#195): these errors quote the rejected guest; one holding `/`, a quote or a backslash
-// next to a token is not masked.
+// TODO(#195): these errors quote the rejected guest. Past the `/workspace/` prefix check it holds
+// `/`, so a quoted one is never masked, wherever a token sits in it; in that check's own error,
+// a quote or a backslash next to a token escapes the mask.
 pub(crate) fn check_guest(raw: &str) -> Result<(), String> {
     if raw.len() > MAX_PATH_LEN {
         return Err(format!("path is longer than {MAX_PATH_LEN} bytes"));

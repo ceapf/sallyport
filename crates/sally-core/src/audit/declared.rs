@@ -21,7 +21,9 @@ use crate::text::{self, Style};
 #[derive(Clone)]
 pub enum Piece {
     /// Text the daemon chose (fixed words, numbers it counted, digests), passed through as is.
-    /// It must already be printable ASCII.
+    /// It is meant to be printable ASCII (nothing checks it): it is never escaped. The cut keeps
+    /// a stray character outside ASCII whole ([`text::cut_escaped`]) unless a `\` in the literal
+    /// runs into it.
     Literal(String),
     /// Text the sandbox chose: masked whole, then escaped with `"` written as `\"`.
     Raw(Arc<str>),

@@ -121,7 +121,9 @@ fn escape_boundary(text: &str, max: usize) -> usize {
                 .and_then(|r| r.find('}'))
                 .map_or(1, |e| e.saturating_add(1)),
             (b'\\', Some(_)) => 2,
-            // One whole character: a literal piece may hold one outside ASCII.
+            // One whole character. A literal piece is meant to be printable ASCII but is never
+            // escaped, so a stray character outside ASCII is not split here (a `\` just before it
+            // in the literal is still read as an escape's start).
             _ => text
                 .get(i..)
                 .and_then(|r| r.chars().next())
@@ -362,8 +364,10 @@ mod tests {
         assert_eq!(cut_escaped(text, 10), (text.to_owned(), false));
     }
 
-    /// A character outside ASCII (a literal piece is daemon-chosen, never escaped) is kept or
-    /// cut whole: the shown text is never emptied by a cut inside it.
+    /// A character outside ASCII is kept or cut whole: the shown text is never emptied by a cut
+    /// inside it. Literal pieces are meant to be printable ASCII (`Piece::Literal`), but they are
+    /// never escaped, so the cut does not rely on that (a `\` in a literal is still read as an
+    /// escape).
     #[test]
     fn a_cut_never_falls_inside_a_character() {
         let (shown, cut) = cut_escaped("aé b", 2);

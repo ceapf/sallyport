@@ -387,6 +387,43 @@ fn a_command_line_that_does_not_parse_repeats_no_argument() {
     assert!(f.methods().is_empty(), "{:?}", f.methods());
 }
 
+/// `sandbox run` parse errors are the fixed texts, exit 2, and contact no daemon. There is no
+/// terminal mode yet (TODO(#138)): `--tty` is an unknown flag, refused like any other and never
+/// named back. Each line also carries a marker the output must not repeat.
+#[test]
+fn sandbox_run_parse_errors_are_fixed_texts_and_tty_is_unknown() {
+    const MARK: &str = "MARKq7zX";
+    const UNEXPECTED: &str =
+        "sally: an argument was not expected; nothing was done (run `sally --help`)\n";
+    const MISSING: &str = "sally: an argument is missing; nothing was done (run `sally --help`)\n";
+    let f = Fake::new("runp", |req| result(req, json!({})));
+    let flag = format!("--{MARK}");
+    let lines: [(&[&str], &str); 6] = [
+        (
+            &["sandbox", "run", "--tty", "--manifest", MARK, "--", MARK],
+            UNEXPECTED,
+        ),
+        (
+            &["sandbox", "run", "--manifest", MARK, "--tty", "--", MARK],
+            UNEXPECTED,
+        ),
+        (&["sandbox", "run", "--manifest", MARK, MARK], UNEXPECTED),
+        (
+            &["sandbox", "run", &flag, "--manifest", MARK, "--", MARK],
+            UNEXPECTED,
+        ),
+        (&["sandbox", "run", "--manifest", MARK], MISSING),
+        (&["sandbox", "run", "--", MARK], MISSING),
+    ];
+    for (args, text) in lines {
+        let o = f.sally(args);
+        assert_eq!(o.status.code(), Some(2), "{args:?}");
+        assert_eq!(stderr(&o), text, "{args:?}");
+        assert_eq!(stdout(&o), "", "{args:?}");
+    }
+    assert!(f.methods().is_empty(), "{:?}", f.methods());
+}
+
 #[test]
 fn help_and_version_still_print() {
     let f = Fake::new("help", |req| result(req, json!({})));
