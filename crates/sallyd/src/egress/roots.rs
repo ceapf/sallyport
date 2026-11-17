@@ -105,10 +105,16 @@ impl Default for BundleFiles {
     /// [`SYSTEM_BUNDLES`], owned by root.
     fn default() -> Self {
         Self {
-            paths: SYSTEM_BUNDLES.iter().map(PathBuf::from).collect(),
+            paths: system_paths(),
             owner: 0,
         }
     }
+}
+
+/// [`SYSTEM_BUNDLES`] as paths, in order: [`BundleFiles::default`]'s work, in a function
+/// cargo-mutants mutates (it skips `Default` impls).
+fn system_paths() -> Vec<PathBuf> {
+    SYSTEM_BUNDLES.iter().map(PathBuf::from).collect()
 }
 
 impl BundleFiles {

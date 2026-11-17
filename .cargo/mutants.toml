@@ -6,10 +6,11 @@
 # Each one matches by file, function and operator, never by line or column (the `\d+:\d+` stays
 # a wildcard), and its group carries the reason. crates/sally-core/tests/mutants_config.rs
 # enforces that form and proves the `|` -> `^` group.
-# cargo-mutants (27.1.0, src/visit.rs) never mutates a method or trait function named `new` (no
-# exclusion needed, and none covers it): mutants_config.rs
-# `no_fn_new_in_mutation_scope_holds_logic` keeps logic out of every function named `new`. Re-read
-# src/visit.rs when CARGO_MUTANTS_VERSION changes.
+# cargo-mutants (27.1.0, src/visit.rs) never mutates a method or trait function named `new`, or
+# anything in an `impl … Default for` block (no exclusion needed, and none covers them):
+# mutants_config.rs `no_fn_new_in_mutation_scope_holds_logic` keeps logic out of every function
+# named `new`, and `no_default_impl_in_mutation_scope_holds_logic` out of every `Default` impl.
+# Re-read src/visit.rs when CARGO_MUTANTS_VERSION changes.
 # Build with Cargo.toml's `mutants` profile: the test profile without debug info (#82).
 profile = "mutants"
 # Run each mutant's tests under nextest's `mutants` profile (.config/nextest.toml), whose per-test

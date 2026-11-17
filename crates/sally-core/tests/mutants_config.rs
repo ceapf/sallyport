@@ -583,9 +583,10 @@ fn matching_brace(src: &str, open: usize) -> usize {
     panic!("unbalanced braces after byte {open}");
 }
 
-/// Each `fn new` with a body in `src` (stripped): the type its `impl` block is for, and the body
-/// between its braces.
+/// Each `fn new` with a body in `src` (stripped): the type of the innermost `impl` block holding
+/// it (`(free fn)` outside every block), and the body between its braces.
 fn news(src: &str) -> Vec<(String, String)> {
+    let blocks = impl_blocks(src);
     let mut out = Vec::new();
     for (at, _) in src.match_indices("fn new") {
         let after = &src[at + "fn new".len()..];
@@ -598,9 +599,97 @@ fn news(src: &str) -> Vec<(String, String)> {
         };
         let open = at + "fn new".len() + open;
         let close = matching_brace(src, open);
-        out.push((impl_type(&src[..at]), src[open + 1..close].to_owned()));
+        let ty = blocks
+            .iter()
+            .rfind(|(_, o, c)| *o < at && at < *c)
+            .map_or_else(|| "(free fn)".to_owned(), |(h, _, _)| impl_type(h));
+        out.push((ty, src[open + 1..close].to_owned()));
     }
     out
+}
+
+/// Each `impl` block in `src` (stripped), in order: its header from `impl` to the block's `{`
+/// with whitespace collapsed to one line (rustfmt wraps long ones), and the indices of its `{`
+/// and `}`. An `impl Trait` in a parameter type has no block and is skipped.
+fn impl_blocks(src: &str) -> Vec<(String, usize, usize)> {
+    let mut out = Vec::new();
+    for (at, _) in src.match_indices("impl") {
+        let word = (at == 0 || !src[..at].ends_with(is_ident))
+            && !src[at + "impl".len()..].starts_with(is_ident);
+        if !word {
+            continue;
+        }
+        let Some(open) = block_open(&src[at..]).map(|i| at + i) else {
+            continue;
+        };
+        let header = src[at..open].split_whitespace().collect::<Vec<_>>();
+        out.push((header.join(" "), open, matching_brace(src, open)));
+    }
+    out
+}
+
+/// In `rest` (the text from an `impl` keyword): the index of its block's `{`, the first outside
+/// `<…>`, `(…)`, `[…]` and `{…}` (an `->` arrow is not a `>`; inside braces, as in `Buf<{ N }>`,
+/// only braces count). `None` when a `;` or an unmatched closer comes first: an `impl Trait` in
+/// a type, not a block.
+fn block_open(rest: &str) -> Option<usize> {
+    let (mut depth, mut braces) = (0usize, 0usize);
+    let mut prev = ' ';
+    for (i, c) in rest.char_indices() {
+        match c {
+            '{' if depth == 0 && braces == 0 => return Some(i),
+            ';' if depth == 0 && braces == 0 => return None,
+            '{' => braces += 1,
+            '}' => braces = braces.checked_sub(1)?,
+            _ if braces > 0 => {}
+            '<' | '(' | '[' => depth += 1,
+            '>' if prev == '-' => {}
+            '>' | ')' | ']' => depth = depth.checked_sub(1)?,
+            _ => {}
+        }
+        prev = c;
+    }
+    None
+}
+
+/// Each function with a body inside an `impl … Default for T` block in `src` (stripped): `T`, the
+/// function's name, and its body. cargo-mutants skips every such block (Q356), whatever its
+/// functions are named. A trait path counts when its last segment is exactly `Default`.
+fn defaults(src: &str) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for (header, open, close) in impl_blocks(src) {
+        if !default_trait(&header) {
+            continue;
+        }
+        let ty = impl_type(&header);
+        let mut from = open + 1;
+        while let Some(f) = src[from..close].find("fn ").map(|i| from + i) {
+            let name: String = src[f + "fn ".len()..]
+                .chars()
+                .take_while(|&c| is_ident(c))
+                .collect();
+            let sig = f + "fn ".len() + name.len();
+            let body = body_open(&src[sig..close]).map(|i| sig + i);
+            let Some(body) = body.filter(|_| !src[..f].ends_with(is_ident)) else {
+                from = sig;
+                continue;
+            };
+            let end = matching_brace(src, body);
+            out.push((ty.clone(), name, src[body + 1..end].to_owned()));
+            from = end;
+        }
+    }
+    out
+}
+
+/// `header` (from `impl` to the block's `{`) implements a trait whose path ends in `Default`.
+fn default_trait(header: &str) -> bool {
+    let rest = past_generics(header.trim_start_matches("impl").trim_start());
+    let Some((tr, _)) = rest.split_once(" for ") else {
+        return false;
+    };
+    let path = tr.split('<').next().unwrap_or_default().trim();
+    path.rsplit("::").next() == Some("Default")
 }
 
 /// In `sig` (the text right after a `fn` name): the index of the body's `{`, the first at depth
@@ -641,22 +730,7 @@ fn impl_type(before: &str) -> String {
         .map(str::trim_start)
         .find(|l| l.starts_with("impl"))
         .unwrap_or("impl ?");
-    let mut rest = line.trim_start_matches("impl").trim_start();
-    if rest.starts_with('<') {
-        let mut depth = 0usize;
-        let end = rest
-            .char_indices()
-            .find(|&(_, c)| {
-                depth = match c {
-                    '<' => depth + 1,
-                    '>' => depth - 1,
-                    _ => depth,
-                };
-                depth == 0
-            })
-            .map_or(rest.len(), |(i, _)| i + 1);
-        rest = rest[end..].trim_start();
-    }
+    let mut rest = past_generics(line.trim_start_matches("impl").trim_start());
     if let Some((_, ty)) = rest.split_once(" for ") {
         rest = ty;
     }
@@ -667,18 +741,44 @@ fn impl_type(before: &str) -> String {
     path.rsplit("::").next().unwrap_or_default().to_owned()
 }
 
-/// Why `body` (a stripped `fn new` body) holds decision logic, or `None` for a delegating call
-/// or a plain struct literal. Mechanical and conservative: a statement, `?`, a control-flow
-/// keyword, a closure, a `!` that is not a macro's, a binary operator (rustfmt spaces every
-/// one), or a method call other than a conversion. A false positive is fixed by delegating to
-/// a named function, never by allowlisting (architect Q12).
+/// `rest` (the text after `impl`) without a leading generic parameter list `<…>` (the `>` of an
+/// `->` arrow, as in `<F: Fn() -> u8>`, does not close it).
+fn past_generics(rest: &str) -> &str {
+    if !rest.starts_with('<') {
+        return rest;
+    }
+    let mut depth = 0usize;
+    let mut prev = ' ';
+    let end = rest
+        .char_indices()
+        .find(|&(_, c)| {
+            depth = match c {
+                '<' => depth + 1,
+                '>' if prev == '-' => depth,
+                '>' => depth - 1,
+                _ => depth,
+            };
+            prev = c;
+            depth == 0
+        })
+        .map_or(rest.len(), |(i, _)| i + 1);
+    rest[end..].trim_start()
+}
+
+/// Why `body` (a stripped body of a `fn new` or of a function in a `Default` impl) holds decision
+/// logic, or `None` for a delegating call or a plain struct literal. Mechanical and conservative:
+/// a statement, `?`, `..`, a control-flow keyword or a nested `fn`, a closure, a `!` that is not
+/// a macro's, a binary operator (rustfmt spaces every one), or a method call other than a
+/// conversion. A false positive is fixed by delegating to a named function, never by
+/// allowlisting (architect Q12).
 fn logic_in(body: &str) -> Option<String> {
     const OPERATORS: [&str; 18] = [
         " + ", " - ", " * ", " / ", " % ", " == ", " != ", " < ", " > ", " <= ", " >= ", " && ",
         " || ", " & ", " | ", " ^ ", " << ", " >> ",
     ];
-    const KEYWORDS: [&str; 8] = [
-        "if", "else", "match", "for", "while", "loop", "let", "return",
+    // `fn`: an item nested in a body cargo-mutants skips is never visited either.
+    const KEYWORDS: [&str; 9] = [
+        "if", "else", "match", "for", "while", "loop", "let", "return", "fn",
     ];
     const CONVERSIONS: [&str; 6] = [
         "into",
@@ -695,6 +795,10 @@ fn logic_in(body: &str) -> Option<String> {
     }
     if flat.contains('?') {
         return Some("`?`".into());
+    }
+    // cargo-mutants deletes a field from a struct literal that has a `..base` (Q356).
+    if flat.contains("..") {
+        return Some("`..` (a struct base or a range)".into());
     }
     if let Some(op) = OPERATORS.iter().find(|op| spaced.contains(*op)) {
         return Some(format!("the operator `{}`", op.trim()));
@@ -722,7 +826,7 @@ fn logic_in(body: &str) -> Option<String> {
         {
             return Some("a unary `-`".into());
         }
-        if c == '.' && prev.is_some_and(|p| p != '.') && chars.get(i + 1) != Some(&'.') {
+        if c == '.' {
             let (name, call) = called(&chars, i + 1);
             if call && !CONVERSIONS.contains(&name.as_str()) {
                 return Some(format!("the method call `.{name}(…)`"));
@@ -813,8 +917,9 @@ fn std_path_call(path: &str) -> bool {
 const CLEAN_NEW: (&str, &str) = ("crates/sallyd/src/rpc/rate.rs", "Rate");
 
 /// Architect Q12 (R3): decision logic never lives in a function named `new` in mutation scope.
-/// cargo-mutants skips a method or trait function named `new` (a free one too, by this rule), so
-/// logic there would go untested by the nightly. There is no allowlist (Q354).
+/// cargo-mutants skips a method or trait function named `new`, so logic there would go untested
+/// by the nightly; this rule also covers a free `fn new`, which cargo-mutants does mutate. There
+/// is no allowlist (Q354). Per file, a simple token count is the coverage proof (Q358).
 #[test]
 fn no_fn_new_in_mutation_scope_holds_logic() {
     let mut found = Vec::new();
@@ -823,7 +928,10 @@ fn no_fn_new_in_mutation_scope_holds_logic() {
         let src =
             std::fs::read_to_string(root().join(&file)).unwrap_or_else(|e| panic!("{file}: {e}"));
         let code = without_test_modules(&strip_literals(&src));
-        for (ty, body) in news(&code) {
+        let found_here = news(&code);
+        let simple = word_pairs(&code, "fn", "new");
+        assert_scanned(&file, "fn new", simple, found_here.len());
+        for (ty, body) in found_here {
             match logic_in(&body) {
                 Some(why) => found.push(format!("{file}: {ty}::new holds {why}")),
                 None => clean.push((file.clone(), ty)),
@@ -840,6 +948,112 @@ fn no_fn_new_in_mutation_scope_holds_logic() {
         clean.iter().any(|(f, t)| f == file && t == ty),
         "the guard did not judge {file}: {ty}::new clean; it read {clean:?}"
     );
+}
+
+/// An `impl Default` in mutation scope, by file and type, whose body is a plain struct literal:
+/// the guard must find it and judge it clean, so a scan that finds no block cannot pass.
+const CLEAN_DEFAULT: (&str, &str) = ("crates/sallyd/src/sandbox/scan.rs", "ScanLimits");
+
+/// Q356: cargo-mutants skips every `impl … Default for` block, so in mutation scope each of its
+/// functions is a delegating call or a plain struct literal, as for `fn new`. No allowlist. Per
+/// file, a simple token count is the coverage proof (Q358).
+#[test]
+fn no_default_impl_in_mutation_scope_holds_logic() {
+    let mut found = Vec::new();
+    let mut clean = Vec::new();
+    for file in mutation_scope() {
+        let src =
+            std::fs::read_to_string(root().join(&file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+        let code = without_test_modules(&strip_literals(&src));
+        let found_here = defaults(&code);
+        let simple = word_pairs(&code, "Default", "for");
+        assert_scanned(&file, "Default impl", simple, found_here.len());
+        for (ty, name, body) in found_here {
+            match logic_in(&body) {
+                Some(why) => found.push(format!("{file}: <{ty} as Default>::{name} holds {why}")),
+                None => clean.push((file.clone(), ty)),
+            }
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "move this logic into a named function or a literal (CLAUDE.md):\n{}",
+        found.join("\n")
+    );
+    let (file, ty) = CLEAN_DEFAULT;
+    assert!(
+        clean.iter().any(|(f, t)| f == file && t == ty),
+        "the guard did not judge {file}: <{ty} as Default> clean; it read {clean:?}"
+    );
+}
+
+#[test]
+fn the_guard_finds_each_default_impl_with_its_type() {
+    let src = strip_literals(
+        "impl Default for A {\n    fn default() -> Self {\n        Self::new()\n    }\n}\n\
+         impl<T: Clone> Default for B<T> {\n    fn default() -> Self { Self { v: Vec::new() } }\n}\n\
+         impl std::default::Default for C {\n    fn default() -> Self { Self { n: 4 << 30 } }\n}\n\
+         impl Debug for D {\n    fn fmt(&self) -> u8 { if x { 1 } else { 2 } }\n}\n\
+         impl DefaultThing for E {\n    fn default() -> Self { Self { n: 1 + 2 } }\n}\n\
+         impl F {\n    fn implement() -> Self { Self { n: 3 * 4 } }\n}\n\
+         #[cfg(test)]\nmod tests {\n    impl Default for G { fn default() -> Self { if x { a } else { b } } }\n}\n",
+    );
+    let found = defaults(&without_test_modules(&src));
+    let types: Vec<(&str, &str)> = found
+        .iter()
+        .map(|(t, n, _)| (t.as_str(), n.as_str()))
+        .collect();
+    assert_eq!(
+        types,
+        [("A", "default"), ("B", "default"), ("C", "default")]
+    );
+    let judged: Vec<bool> = found
+        .iter()
+        .map(|(_, _, b)| logic_in(b).is_some())
+        .collect();
+    assert_eq!(judged, [false, false, true], "{found:?}");
+}
+
+/// A `->` in the generics, a brace in the type or the where clause, and a wrapped header all
+/// still yield the block's functions, with the type named.
+#[test]
+fn the_guard_finds_a_default_impl_behind_arrows_braces_and_wrapping() {
+    let body = "fn default() -> Self { if x { a } else { b } }";
+    let src = strip_literals(&format!(
+        "impl<F: Fn() -> u8> Default for H<F> {{\n    {body}\n}}\n\
+         impl Default for Buf<{{ N }}> {{\n    {body}\n}}\n\
+         impl<T> Default for W<T>\nwhere\n    [(); {{ N }}]: Sized,\n{{\n    {body}\n}}\n\
+         impl<T: Clone> std::default::Default\n    for Wrapped<T>\n{{\n    {body}\n}}\n\
+         fn f(d: impl Default) -> u8 {{ 1 }}\n"
+    ));
+    let found = defaults(&src);
+    let types: Vec<&str> = found.iter().map(|(t, _, _)| t.as_str()).collect();
+    assert_eq!(types, ["H", "Buf", "W", "Wrapped"], "{found:?}");
+    assert_eq!(word_pairs(&src, "Default", "for"), found.len());
+    assert!(
+        found.iter().all(|(_, _, b)| logic_in(b).is_some()),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn a_free_fn_new_is_labelled_free_and_a_method_by_its_innermost_impl() {
+    let src = strip_literals(
+        "impl A {\n    fn a() {}\n}\n\
+         pub fn new() -> u8 { 1 }\n\
+         impl B {\n    fn f() { struct C; impl C { fn new() -> u8 { 2 } } }\n    \
+         fn new() -> Self { Self }\n}\n",
+    );
+    let types: Vec<String> = news(&src).into_iter().map(|(t, _)| t).collect();
+    assert_eq!(types, ["(free fn)", "C", "B"]);
+    assert_eq!(word_pairs(&src, "fn", "new"), types.len());
+}
+
+/// cargo-mutants never visits an item nested in a function it skips.
+#[test]
+#[should_panic(expected = "holds")]
+fn the_guard_refuses_a_nested_fn() {
+    refuse(" fn h() -> u8 { 1 } Self { n: h() } ");
 }
 
 #[test]
@@ -881,12 +1095,19 @@ fn a_delegating_call_or_a_plain_struct_literal_is_no_logic() {
     for body in [
         " Self::from_forms(secrets) ",
         " Self { a, b: Vec::new(), c: Arc::new(Mutex::new(State::default())), d: x.into() } ",
-        " Self { inner, stream: redaction.stream_of(&r), ..Self::default() } ",
+        " Self { inner, stream: redaction.stream_of(&r) } ",
         " Self { n: vec![], m: format!(\"x\") } ",
     ] {
         let body = body.replace("stream_of", "clone");
         assert_eq!(logic_in(&strip_literals(&body)), None, "{body}");
     }
+}
+
+/// cargo-mutants deletes a field of a struct literal with a base (Q356): not a plain literal.
+#[test]
+#[should_panic(expected = "holds")]
+fn the_guard_refuses_a_struct_base() {
+    refuse(" Self { inner, stream: redaction.clone(), ..Self::default() } ");
 }
 
 #[test]
@@ -1009,6 +1230,48 @@ fn the_guard_finds_the_body_after_a_braced_return_type() {
     assert_eq!(found[0].0, "Foo");
     assert!(logic_in(&found[0].1).is_some(), "{found:?}");
     assert_eq!(found[1], ("Baz".to_owned(), " [0, 1, 2, 3] ".to_owned()));
+}
+
+/// Occurrences in `code` of the word `first`, whitespace, then the word `second` (no identifier
+/// character before `first` or after `second`): a count simple enough to trust, which each
+/// guard's structural scanner must match (Q358).
+fn word_pairs(code: &str, first: &str, second: &str) -> usize {
+    // Not `is_ident`, which takes `:` for paths: `std::default::Default for` is a pair.
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    code.match_indices(first)
+        .filter(|&(at, _)| {
+            let after = &code[at + first.len()..];
+            let rest = after.trim_start();
+            !code[..at].ends_with(word)
+                && rest.len() < after.len()
+                && rest.starts_with(second)
+                && !rest[second.len()..].starts_with(word)
+        })
+        .count()
+}
+
+/// Q358, the coverage proof: in `file` the scanner found as many `what` as the simple count
+/// says are there. A false alarm is fixed by teaching the scanner the shape, never by an
+/// allowlist.
+fn assert_scanned(file: &str, what: &str, simple: usize, scanned: usize) {
+    assert_eq!(
+        simple, scanned,
+        "{file}: {simple} {what} by token count, {scanned} by the scanner; teach the scanner"
+    );
+}
+
+#[test]
+#[should_panic(expected = "by token count")]
+fn the_count_check_refuses_a_disagreement() {
+    assert_scanned("x.rs", "Default impl", 1, 0);
+}
+
+#[test]
+fn the_simple_counts_skip_identifiers_and_cross_lines() {
+    let code = "impl Default\n    for A {}\nimpl MyDefault for B {}\nimpl Default fork\n\
+                fn new() {} fn newer() {} dfn new() {} fn  new() {}";
+    assert_eq!(word_pairs(code, "Default", "for"), 1);
+    assert_eq!(word_pairs(code, "fn", "new"), 2);
 }
 
 /// Panics with "holds …" when `body` holds logic.
