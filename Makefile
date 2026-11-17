@@ -133,12 +133,11 @@ mutants:
 # MUTANTS_SHARD=k/n runs one round-robin shard; MUTANTS_OUT=<dir> moves mutants.out.
 MUTANTS_WIDE_CORE := $(addprefix crates/sally-core/src/,manifest/image.rs manifest/hostenv.rs \
                      manifest/parse.rs manifest/summary.rs manifest/units.rs manifest/diag.rs \
-                     secrets/store.rs \
-                     secrets/secret.rs secrets/names.rs audit/entry.rs audit/redact.rs audit/verify.rs \
-                     audit/writer.rs audit/declared.rs audit/layout.rs audit/tail.rs fsutil.rs fd.rs \
-                     text.rs paths.rs model/mod.rs model/detect.rs model/gguf/mod.rs \
-                     model/gguf/error.rs model/gguf/read.rs model/gguf/types.rs model/gguf/meta.rs \
-                     model/gguf/tensors.rs)
+                     secrets/store.rs secrets/secret.rs secrets/names.rs audit/entry.rs \
+                     audit/redact.rs audit/verify.rs audit/writer.rs audit/declared.rs audit/layout.rs \
+                     audit/tail.rs fsutil.rs fd.rs text.rs paths.rs model/mod.rs model/detect.rs \
+                     model/gguf/mod.rs model/gguf/error.rs model/gguf/read.rs model/gguf/types.rs \
+                     model/gguf/meta.rs model/gguf/tensors.rs)
 MUTANTS_WIDE_SALLYD := $(addprefix crates/sallyd/src/sandbox/,argv.rs check.rs types.rs profiles.rs \
                        overlap.rs scan.rs images.rs changes.rs cgroup.rs dirs.rs podman.rs binaries.rs \
                        disk.rs stage.rs \

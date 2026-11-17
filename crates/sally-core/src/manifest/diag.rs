@@ -451,14 +451,22 @@ mod tests {
     }
 
     /// Both fields are masked and within the bound, whichever entry point built them.
+    #[track_caller]
     fn assert_scrubbed(d: &Diagnostic, token: &str) {
         for (what, text) in [("path", &d.path), ("message", &d.message)] {
             assert_eq!(text.chars().count(), MAX_TEXT, "{what}: {text}");
             assert!(text.ends_with(CUT), "{what} is cut: {text}");
-            assert!(!text.contains(token.get(..10).unwrap_or(token)), "{what}: {text}");
+            assert!(
+                !text.contains(token.get(..10).unwrap_or(token)),
+                "{what}: {text}"
+            );
         }
         assert!(d.path.starts_with("k9k9....ppp"), "{}", d.path);
-        assert!(d.message.starts_with("\"k9k9...[30 chars hidden]\" m m"), "{}", d.message);
+        assert!(
+            d.message.starts_with("\"k9k9...[30 chars hidden]\" m m"),
+            "{}",
+            d.message
+        );
     }
 
     /// Architect Q351: each entry point that builds a diagnostic masks and bounds both fields.
@@ -469,7 +477,7 @@ mod tests {
         d.error(path.clone(), Code::InvalidValue, message.clone());
         d.warn(path.clone(), Code::InvalidValue, message.clone());
         let Err(rejected) = d.finish() else {
-            panic!("an error was recorded")
+            panic!("finish() returned Ok although an error was recorded")
         };
         let [error] = rejected.errors.as_slice() else {
             panic!("{rejected:?}")
