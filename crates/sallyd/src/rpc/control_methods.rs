@@ -693,15 +693,26 @@ pub(crate) fn refusal(reason: &str, detail: Option<String>, errors: Vec<String>)
 }
 
 /// How a refusal's failure text is written: [`escape_capped`]'s format at [`DETAIL_CHARS`].
+///
+/// The texts declared in it, and their largest raw length (architect Q304, Q305), all under
+/// 1276 bytes (4 × `NAME_MAX` + 256):
+/// - a stop's failure: fixed text, a `usize` count and one [`SessionId`] (at most 64 bytes);
+/// - a listing's failure ([`ChangesError`]'s text): fixed text, the host libc's errno text,
+///   numbers from the walk's bounds, a mount index, and at most one `stage/` name escaped four
+///   characters a byte (`NAME_MAX`, 255 bytes, so 1020).
+///
+/// Tested at that size in `control_tests.rs`
+/// (`a_refusal_text_at_its_bound_is_masked_before_its_cut`).
 pub const REFUSAL_STYLE: Style = Style::Text {
     max: DETAIL_CHARS,
     quote: Quote::None,
 };
 
 /// `entry` with `args` and the failure text `raw` as the arg `key`, declared (architect Q288
-/// (8)): a stop's or a listing's failure can name what a sandbox wrote, so the writer masks it
-/// whole before it escapes and cuts it in [`REFUSAL_STYLE`]. The reply carries its own escaped
-/// copy: it goes to the host client, not to a log.
+/// (8), Q305): no stop or listing failure holds a byte a sandbox chose today, but the text
+/// stays declared so that a path a listing names later (TODO(#28)) is masked whole before it
+/// is escaped and cut in [`REFUSAL_STYLE`]. The reply carries its own escaped copy: it goes to
+/// the host client, not to a log.
 pub(crate) fn refusal_entry(
     entry: NewEntry,
     args: Value,
