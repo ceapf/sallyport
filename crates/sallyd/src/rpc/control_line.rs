@@ -16,7 +16,6 @@
 //! `stop-failed` in the control log; one of a session already gone writes nothing.
 
 use sally_core::audit::Actor;
-use sally_core::text::escape_capped;
 use sally_proto::{Output, method, notification};
 use serde_json::json;
 use tokio::io::AsyncWrite;
@@ -25,7 +24,7 @@ use tokio::sync::oneshot;
 use super::agent::{line, success};
 use super::attach::{self, Ended, InputState};
 use super::control::{Conn, Control, refused, write};
-use super::control_methods::{AttachCall, DETAIL_CHARS, Done, InputCall, SessionSet, value};
+use super::control_methods::{AttachCall, Done, InputCall, SessionSet, refusal_entry, value};
 use super::line::{NotStarted, Running};
 use super::message::Id;
 use crate::sandbox::SessionId;
@@ -274,13 +273,9 @@ impl<S: SessionSet> Control<S> {
                 let Some(StopOutcome::Failed(why)) = sessions.stop_disconnected(&id).await else {
                     return;
                 };
-                let detail = escape_capped(why.as_bytes(), DETAIL_CHARS);
-                let args = json!({
-                    "id": id, "reason": "stop-failed", "detail": detail, "cause": "disconnect",
-                });
-                let entry = record
-                    .entry(Actor::Sallyd, "session.refuse", Some("refuse"))
-                    .args(args);
+                let args = json!({"id": id, "reason": "stop-failed", "cause": "disconnect"});
+                let entry = record.entry(Actor::Sallyd, "session.refuse", Some("refuse"));
+                let entry = refusal_entry(entry, args, "detail", &why);
                 let _ = record.append(entry).await;
             }));
         })))

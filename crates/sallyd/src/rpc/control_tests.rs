@@ -15,7 +15,7 @@ use crate::approvals::render::{ACTION_CHARS, FULL_WIRE_BYTES, NOTE_CHARS, Prompt
 use crate::approvals::{Approver, Desk, Gate, Limits};
 use crate::llm::scripted::Script;
 use crate::rpc::control_methods::{
-    DETAIL_CHARS, ID_CHARS, MAX_ERROR_LINES, REPLY_BYTES, error_lines, fit,
+    DETAIL_CHARS, ID_CHARS, MAX_ERROR_LINES, REPLY_BYTES, error_lines, fit, refusal_entry,
 };
 use crate::rpc::drive::Driver;
 use crate::rpc::line::Line;
@@ -1500,6 +1500,47 @@ async fn eventually(f: impl Fn() -> bool) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("never happened");
+}
+
+/// Architect Q288 (8): a stop's or a listing's failure can name what a sandbox wrote, so its
+/// `session.refuse` text is declared raw: a form of a live session's secret (with a quote, a
+/// backslash and a non-printable byte, and straddling the cut) is masked before the escape and
+/// the cut; with no form the text is `escape_capped`'s. Control: the text escaped and capped
+/// before it is declared (the old builders).
+#[test]
+fn a_refusals_failure_text_is_masked_before_its_escape_and_cut() {
+    use sally_core::audit::{NewEntry, Redactor};
+    use sally_core::text::escape_capped;
+    let value = "q\"u\\o\x01te-secret-value-0123456789";
+    let r = Redactor::new([("Y", value)]);
+    let shown = |raw: &str, r: &Redactor| {
+        let e = NewEntry::new(Actor::Sallyd, "session.refuse");
+        let v = refusal_entry(e, json!({"reason": "stop-failed"}), "detail", raw).resolved(r);
+        assert_eq!(v["reason"], json!("stop-failed"));
+        v["detail"]
+            .as_str()
+            .expect("the detail is logged")
+            .to_owned()
+    };
+    let plain = "container\x1b[2J stuck\"\\".repeat(200);
+    assert_eq!(
+        shown(&plain, &r),
+        escape_capped(plain.as_bytes(), DETAIL_CHARS)
+    );
+    let spelt = escape_capped(value.as_bytes(), usize::MAX);
+    for at in [0, DETAIL_CHARS - 20, DETAIL_CHARS - 12] {
+        let raw = format!("{}{value} tail", "x".repeat(at));
+        let got = shown(&raw, &r);
+        assert!(got.contains("[REDACTED:Y]"), "{got}");
+        for w in value
+            .as_bytes()
+            .windows(8)
+            .chain(spelt.as_bytes().windows(8))
+        {
+            let w = std::str::from_utf8(w).unwrap();
+            assert!(!got.contains(w), "{w:?} in {got:?}");
+        }
+    }
 }
 
 #[path = "control_drive_tests.rs"]

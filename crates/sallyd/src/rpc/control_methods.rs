@@ -9,10 +9,10 @@ use std::future::Future;
 use std::os::fd::AsFd;
 use std::sync::Arc;
 
-use sally_core::audit::Actor;
+use sally_core::audit::{Actor, NewEntry};
 use sally_core::manifest::{ValidatedManifest, load};
 use sally_core::secrets::StoreNames;
-use sally_core::text::escape_capped;
+use sally_core::text::{Quote, Style, escape_capped};
 use sally_proto::ModelKind;
 use sally_proto::method;
 use sally_proto::{
@@ -313,7 +313,17 @@ impl<S: SessionSet> Control<S> {
 
     /// Writes a refusal entry, then refuses; `Close` if the entry failed.
     async fn refuse(&self, actor: Actor, event: &str, args: Value, data: ErrorData) -> Done {
-        let entry = self.p.record.entry(actor, event, Some("refuse")).args(args);
+        let entry = self.refusal(actor, event).args(args);
+        self.refused(entry, data).await
+    }
+
+    /// A refusal entry named `event`, to fill.
+    fn refusal(&self, actor: Actor, event: &str) -> NewEntry {
+        self.p.record.entry(actor, event, Some("refuse"))
+    }
+
+    /// Writes the refusal `entry`; the reply once it is written, else the connection closes.
+    async fn refused(&self, entry: NewEntry, data: ErrorData) -> Done {
         if self.p.record.append(entry).await {
             Done::Refused(data)
         } else {
@@ -533,14 +543,15 @@ impl<S: SessionSet> Control<S> {
             })),
             // The session's own log is sealed by now: the control log has the entry (Q95).
             Some(StopOutcome::Failed(why)) => {
-                let detail = escape_capped(why.as_bytes(), DETAIL_CHARS);
                 let args = json!({
                     "method": method::SESSIONS_STOP, "id": id.as_str(), "reason": "stop-failed",
-                    "detail": detail, "client": who(client),
+                    "client": who(client),
                 });
+                let entry = self.refusal(Actor::Sallyd, "session.refuse");
+                let entry = refusal_entry(entry, args, "detail", &why);
+                let detail = escape_capped(why.as_bytes(), DETAIL_CHARS);
                 let data = refusal("stop-failed", Some(detail), Vec::new());
-                self.refuse(Actor::Sallyd, "session.refuse", args, data)
-                    .await
+                self.refused(entry, data).await
             }
             None => {
                 self.unknown_session(method::SESSIONS_STOP, id, client)
@@ -577,14 +588,16 @@ impl<S: SessionSet> Control<S> {
                     .await
             }
             Some(Err(e)) => {
-                let error = escape_capped(e.to_string().as_bytes(), DETAIL_CHARS);
+                let why = e.to_string();
                 let args = json!({
                     "method": method::SESSIONS_CHANGES, "id": id.as_str(),
-                    "reason": "listing-failed", "error": error, "client": who(client),
+                    "reason": "listing-failed", "client": who(client),
                 });
+                let entry = self.refusal(Actor::Sallyd, "session.refuse");
+                let entry = refusal_entry(entry, args, "error", &why);
+                let error = escape_capped(why.as_bytes(), DETAIL_CHARS);
                 let data = refusal("listing-failed", Some(error), Vec::new());
-                self.refuse(Actor::Sallyd, "session.refuse", args, data)
-                    .await
+                self.refused(entry, data).await
             }
             None => Done::Close,
         }
@@ -675,6 +688,25 @@ pub(crate) fn refusal(reason: &str, detail: Option<String>, errors: Vec<String>)
         detail,
         errors,
     }
+}
+
+/// How a refusal's failure text is written: [`escape_capped`]'s format at [`DETAIL_CHARS`].
+pub const REFUSAL_STYLE: Style = Style::Text {
+    max: DETAIL_CHARS,
+    quote: Quote::None,
+};
+
+/// `entry` with `args` and the failure text `raw` as the arg `key`, declared (architect Q288
+/// (8)): a stop's or a listing's failure can name what a sandbox wrote, so the writer masks it
+/// whole before it escapes and cuts it in [`REFUSAL_STYLE`]. The reply carries its own escaped
+/// copy: it goes to the host client, not to a log.
+pub(crate) fn refusal_entry(
+    entry: NewEntry,
+    args: Value,
+    key: &'static str,
+    raw: &str,
+) -> NewEntry {
+    entry.args(args).text(key, raw, REFUSAL_STYLE)
 }
 
 /// A rejected manifest's errors for the reply: each escaped and capped, at most
