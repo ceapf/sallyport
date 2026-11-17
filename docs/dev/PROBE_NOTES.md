@@ -419,8 +419,10 @@ reconciles the type table with the pin (#182).
 - `load_hparams` copies every non-array metadata value into the model's key/value map as text
   (`gguf_kv_to_str`: u32 42 → `"42"`, bool → `"true"`/`"false"`, f32 via `std::to_string`,
   strings unchanged) and skips arrays. `llama_model_chat_template` returns the map's text for
-  the template key, else no template. So a scalar `tokenizer.chat_template` reaches the engine
-  as template text, and an array one is dropped. Not read: how `src/llama-arch.cpp` formats
+  the template key; without one it returns no template, except the built-in name
+  `mistral-v7-tekken` for an unnamed lookup on a Tekken pre-tokenizer with 40 layers. So a
+  scalar `tokenizer.chat_template` reaches the engine as template text, and an array one is
+  dropped (the engine acts as if the key were absent). Not read: how `src/llama-arch.cpp` formats
   the template key names, the second half of `src/llama-model-loader.cpp`, and what the
   server uses when the model has no template; nothing here is claimed about them.
 - The strict parser is narrower on purpose: zero dims, zero tensors, bool bytes other than 0/1,

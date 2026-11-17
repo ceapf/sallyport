@@ -16,7 +16,9 @@
 //! - no kept key, string or tensor name holds a NUL, and `split.count`, when present, is a u16
 //!   of 0 or 1;
 //! - every chat-template key (`tokenizer.chat_template` or `tokenizer.chat_template.<name>`)
-//!   holds a string, and there are at most 16 of them;
+//!   holds a string, and there are at most 16 of them (a backstop: changing a template's type
+//!   id shifts every later field, so a one-byte edit of a seed rarely stays accepted; the unit
+//!   test `a_chat_template_must_be_a_string` is the guard of that check);
 //! - a name detect accepts holds no `/` and no NUL;
 //! - a refusal's message is printable ASCII and at most MAX_MESSAGE bytes;
 //! - a reader that yields one byte per read gives the same result as the whole slice.
