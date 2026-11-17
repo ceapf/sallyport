@@ -27,7 +27,8 @@ pub enum Format {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum DetectError {
-    /// The file name's extension is not on the allowlist.
+    /// The file name's extension is not on the allowlist, or the name is not one UTF-8 path
+    /// component without NUL.
     #[error("the file type is not an accepted model format")]
     FormatNotAllowed,
     /// The first bytes are not the magic the extension promises.

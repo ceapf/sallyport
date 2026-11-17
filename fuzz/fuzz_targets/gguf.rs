@@ -10,9 +10,9 @@
 //! - an accepted header is within every limit: at most MAX_TENSORS tensors and MAX_KV entries,
 //!   at most MAX_RETAINED_TEXT_BYTES of kept file text, every tensor's data and the data end
 //!   within `file_len`;
-//! - an accepted header's layout is llama.cpp's: the data section starts aligned at or after the
-//!   header, the first tensor at offset 0, each next at the previous end rounded up to the
-//!   alignment;
+//! - an accepted header's layout is llama.cpp's: the data section starts aligned (where the
+//!   header ends is not exposed, so that half is the unit tests'), the first tensor at offset 0,
+//!   each next at the previous end rounded up to the alignment;
 //! - no kept key, string or tensor name holds a NUL, and `split.count`, when present, is a u16
 //!   of 0 or 1;
 //! - a name detect accepts holds no `/` and no NUL;
