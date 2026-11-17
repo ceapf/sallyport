@@ -682,6 +682,10 @@ mod tests {
             Attached::Exited { exit_code: 0 }
         );
         assert!(from_value::<Attached>(json!({"killed": "timeout"})).is_err());
+        assert!(
+            from_value::<Attached>(json!({"exit_code": 0, "killed": "disconnect"})).is_err(),
+            "a result with both fields is refused, not read as either variant"
+        );
     }
 
     /// Architect Q101: one output notification names its stream.
