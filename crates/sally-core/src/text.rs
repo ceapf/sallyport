@@ -339,6 +339,31 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    /// A cut escaped text names the bytes cut and the SHA-256 of the whole text.
+    #[test]
+    fn a_cut_escaped_text_names_the_rest_and_the_whole_texts_digest() {
+        let text = "abcdefghij";
+        let mut sha = String::new();
+        for b in Sha256::digest(text.as_bytes()) {
+            let _ = write!(sha, "{b:02x}");
+        }
+        assert_eq!(
+            cut_escaped(text, 4),
+            (format!("abcd... (+6 bytes, sha256 {sha})"), true)
+        );
+        assert_eq!(cut_escaped(text, 10), (text.to_owned(), false));
+    }
+
+    /// A styled text says it was cut only past its bound, in every style that reports a cut
+    /// from the raw length.
+    #[test]
+    fn styled_says_cut_only_past_the_bound() {
+        for style in [Style::HexCounted { max: 4 }, Style::Plain { max: 4 }] {
+            assert!(!styled("abcd", style).1, "{style:?}");
+            assert!(styled("abcde", style).1, "{style:?}");
+        }
+    }
+
     fn printable(s: &str) -> bool {
         s.bytes().all(|b| (b' '..=b'~').contains(&b))
     }
