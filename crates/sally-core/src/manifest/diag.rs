@@ -168,6 +168,7 @@ const CUT: &str = "...";
 const TOKEN_MIN: usize = 20;
 
 /// Single-line, bounded, token-masked.
+/// TODO(#158): this file's credential masking is container-free but in no mutation list yet.
 pub(crate) fn scrub(s: &str) -> String {
     bounded(mask_quoted(&flattened(s)))
 }
@@ -215,7 +216,7 @@ fn mask_segments(path: &str) -> String {
 }
 
 /// Replaces the body of any `"…"` or `` `…` `` span that looks like a credential (long, no
-/// spaces or slashes, contains a digit) with its first 4 characters and a length.
+/// spaces, slashes or backslashes, contains a digit) with its first 4 characters and a length.
 fn mask_quoted(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
@@ -263,7 +264,7 @@ fn without_index(seg: &str) -> &str {
     }
 }
 
-/// Long, no spaces or slashes, and containing a digit. Field names (which can be long, e.g.
+/// Long, no spaces, slashes or backslashes, and containing a digit. Field names (which can be long, e.g.
 /// `acknowledge_unrestricted_egress`) never contain digits; 20+ character credentials do.
 fn looks_like_token(body: &str) -> bool {
     body.chars().count() >= TOKEN_MIN
