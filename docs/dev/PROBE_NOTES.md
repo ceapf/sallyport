@@ -396,8 +396,9 @@ tests in `egress/intercept_tests.rs` where the behaviour matters to the proxy.
 Read at llama.cpp commit a49db739fba21964e5a05c4d8c35e352b293242e (2026-11-17), files
 `ggml/include/ggml.h`, `ggml/src/ggml.c` (`type_traits`), `ggml/src/ggml-common.h` (block
 structs, each with a `static_assert` on its size), `ggml/include/gguf.h`, `ggml/src/gguf.cpp`
-(`gguf_init_from_reader`). No engine is pinned yet; M3 reconciles the type table with the pin
-(#182).
+(`gguf_init_from_reader`), `src/llama-model.cpp` (`load_hparams`, `llama_model_chat_template`),
+`src/llama-impl.cpp` (`gguf_data_to_str`, `gguf_kv_to_str`). No engine is pinned yet; M3
+reconciles the type table with the pin (#182).
 - ggml types: 36 live ids, 0–43 without 4, 5, 31–33, 36–38 (removed; their `type_traits`
   entries are placeholders with block size 0). `GGML_TYPE_COUNT` = 44. Ids 40–43 (NVFP4, Q1_0,
   Q2_0, F8_E4M3) are the newest.
@@ -415,6 +416,15 @@ structs, each with a `static_assert` on its size), `ggml/include/gguf.h`, `ggml/
   `std::string::c_str()`, so the engine sees only the text before a NUL.
 - `split.count` > 1 makes the model loader (`src/llama-model-loader.cpp`) derive the sibling
   shard paths (`*-0000N-of-0000M.gguf`) and open them from the same directory.
+- `load_hparams` copies every non-array metadata value into the model's key/value map as text
+  (`gguf_kv_to_str`: u32 42 → `"42"`, bool → `"true"`/`"false"`, f32 via `std::to_string`,
+  strings unchanged) and skips arrays. `llama_model_chat_template` returns the map's text for
+  the template key; without one it returns no template, except the built-in name
+  `mistral-v7-tekken` for an unnamed lookup on a Tekken pre-tokenizer with 40 layers. So a
+  scalar `tokenizer.chat_template` reaches the engine as template text, and an array one is
+  dropped (the engine acts as if the key were absent). Not read: how `src/llama-arch.cpp` formats
+  the template key names, the second half of `src/llama-model-loader.cpp`, and what the
+  server uses when the model has no template; nothing here is claimed about them.
 - The strict parser is narrower on purpose: zero dims, zero tensors, bool bytes other than 0/1,
-  alignment below 8, non-printable keys, NUL in names and templates, and `split.count` other
-  than a u16 of 0 or 1 are refused.
+  alignment below 8, non-printable keys, NUL in names and templates, a chat-template key whose
+  value is not a string, and `split.count` other than a u16 of 0 or 1 are refused.

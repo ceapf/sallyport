@@ -78,6 +78,10 @@ pub enum GgufError {
     /// `split.count` other than a `u16` of 0 or 1: one shard of a multi-file model.
     #[error("kv[{0}]: split.count says this is part of a multi-file model; those are refused")]
     SplitFile(u64),
+    /// A chat-template key whose value is not a string: the engine would turn a scalar into
+    /// template text and drop an array, so neither is the text checked here.
+    #[error("kv[{0}]: the chat template is not a string")]
+    TemplateNotString(u64),
     /// A tensor name longer than [`super::MAX_NAME_BYTES`].
     #[error("tensor[{0}]: the name is {1} bytes, over the limit")]
     TensorNameTooLong(u64, u64),
@@ -146,6 +150,7 @@ impl GgufError {
             Self::BadAlignment(_) => "bad_alignment",
             Self::TemplateHasNul(_) => "template_has_nul",
             Self::SplitFile(_) => "split_file",
+            Self::TemplateNotString(_) => "template_not_string",
             Self::TensorNameTooLong(..) => "tensor_name_too_long",
             Self::BadTensorName(_) => "bad_tensor_name",
             Self::DuplicateTensorName(..) => "duplicate_tensor_name",

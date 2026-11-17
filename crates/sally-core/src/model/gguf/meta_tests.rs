@@ -278,6 +278,105 @@ fn at_most_16_chat_templates() {
     assert_eq!(file.parse(), Err(GgufError::TemplateCountLimit(17)));
 }
 
+/// Each scalar value type id with a payload of its size (bool with byte 1).
+const SCALARS: [(u32, &[u8]); 11] = [
+    (0, &[1]),
+    (1, &[1]),
+    (2, &[1; 2]),
+    (3, &[1; 2]),
+    (4, &[1; 4]),
+    (5, &[1; 4]),
+    (6, &[1; 4]),
+    (BOOL, &[1]),
+    (10, &[1; 8]),
+    (11, &[1; 8]),
+    (12, &[1; 8]),
+];
+
+/// A chat template must be a string: the engine turns a scalar into template text ("42",
+/// "true") and drops an array, so neither is the text the parser checked (architect Q377).
+#[test]
+fn a_chat_template_must_be_a_string() {
+    for key in [
+        "tokenizer.chat_template",
+        "tokenizer.chat_template.tool_use",
+    ] {
+        let value = only_value(Gguf::valid().kv_str(key, b"{{x}}"));
+        assert_eq!(value, Value::String(FileText("{{x}}".into())), "{key}");
+        for (ty, payload) in SCALARS {
+            assert_eq!(
+                one(key.as_bytes(), ty, payload).parse(),
+                Err(GgufError::TemplateNotString(1)),
+                "{key} type {ty}"
+            );
+        }
+        for payload in [
+            array(U8, 1, &[1]),
+            array(STRING, 1, &s(b"{{x}}")),
+            array(U8, 0, &[]),
+        ] {
+            assert_eq!(
+                one(key.as_bytes(), ARRAY, &payload).parse(),
+                Err(GgufError::TemplateNotString(1)),
+                "{key} {payload:?}"
+            );
+        }
+        // Checked by type id before the value is read: these never reach their own checks.
+        for (ty, payload) in [
+            (13, Vec::new()),
+            (ARRAY, array(ARRAY, 1, &[])),
+            (BOOL, vec![2]),
+            (ARRAY, array(U8, 1 << 40, &[])),
+        ] {
+            assert_eq!(
+                one(key.as_bytes(), ty, &payload).parse(),
+                Err(GgufError::TemplateNotString(1)),
+                "{key} type {ty} {payload:?}"
+            );
+        }
+    }
+    assert_eq!(
+        one(b"tokenizer.chat_template.", U32, &[1; 4]).parse(),
+        Err(GgufError::TemplateNotString(1))
+    );
+    // Not template keys: any type is accepted.
+    let allowed = [
+        Gguf::valid(),
+        one(
+            b"tokenizer.chat_templates",
+            ARRAY,
+            &array(STRING, 1, &s(b"tool_use")),
+        ),
+        one(b"tokenizer.chat_templates", U32, &[1; 4]),
+        one(b"Tokenizer.chat_template", U32, &[1; 4]),
+        one(b"tokenizer.chat_template_x", U32, &[1; 4]),
+    ];
+    for file in allowed {
+        assert_eq!(code(file.parse()), "accepted");
+    }
+}
+
+/// The template count is checked on the key, before the value's type.
+#[test]
+fn the_template_count_is_checked_before_the_type() {
+    let mut file = Gguf::valid();
+    for n in 0..15 {
+        file = file.kv_str(&format!("tokenizer.chat_template.n{n}"), b"t");
+    }
+    assert_eq!(
+        file.clone()
+            .kv(b"tokenizer.chat_template", U32, &[1; 4])
+            .parse(),
+        Err(GgufError::TemplateNotString(16))
+    );
+    let file = file.kv_str("tokenizer.chat_template", b"t");
+    assert_eq!(
+        file.kv(b"tokenizer.chat_template.n15", U32, &[1; 4])
+            .parse(),
+        Err(GgufError::TemplateCountLimit(17))
+    );
+}
+
 #[test]
 fn alignment_is_a_u32_power_of_two_from_8_to_65536() {
     for a in [8u32, 32, 65_536] {

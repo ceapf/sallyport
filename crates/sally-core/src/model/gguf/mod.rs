@@ -10,7 +10,8 @@
 //! previous one's end rounded up to the alignment (the layout llama.cpp requires).
 //!
 //! What it keeps: every scalar; strings up to [`KEPT_STRING_BYTES`] that are UTF-8 without NUL;
-//! the chat templates whole (UTF-8, no NUL, else refused: the engine reads them as C strings);
+//! the chat templates whole (a string, UTF-8, no NUL, else refused: the engine reads them as C
+//! strings, turns a scalar into template text and drops an array);
 //! for longer strings and every array only the type and length. A `split.count` other than a
 //! `u16` of 0 or 1 is refused: it makes the engine open sibling files these checks never saw.
 //! Every string it keeps was chosen by the file's author: show it only through
@@ -63,7 +64,8 @@ pub const MAX_TEMPLATES: u64 = 16;
 /// tensor names at their limits (`MAX_KV * (MAX_KEY_BYTES + KEPT_STRING_BYTES) + MAX_TEMPLATES *
 /// MAX_STRING_BYTES + MAX_TENSORS * MAX_NAME_BYTES`).
 pub const MAX_RETAINED_TEXT_BYTES: u64 = 10_420_224;
-/// The key whose value is the chat template; `<key>.<name>` keys are named templates.
+/// The key whose value is the chat template; `<key>.<name>` keys are named templates. In an
+/// accepted header every template's value is a [`Value::String`]: whole, UTF-8, without NUL.
 pub const TEMPLATE_KEY: &str = "tokenizer.chat_template";
 /// The parser's own read buffer.
 const READ_BUFFER: usize = 65_536;
