@@ -23,6 +23,8 @@ pub(crate) fn every_variant() -> Vec<(GgufError, &'static str)> {
         (GgufError::TemplateNotUtf8(0), "template_not_utf8"),
         (GgufError::TemplateCountLimit(16), "template_count_limit"),
         (GgufError::BadAlignment(0), "bad_alignment"),
+        (GgufError::TemplateHasNul(0), "template_has_nul"),
+        (GgufError::SplitFile(0), "split_file"),
         (GgufError::TensorNameTooLong(0, 64), "tensor_name_too_long"),
         (GgufError::BadTensorName(0), "bad_tensor_name"),
         (
@@ -63,7 +65,7 @@ fn every_code_is_pinned_distinct_and_snake_case() {
             "{code}"
         );
     }
-    assert_eq!(seen.len(), 30);
+    assert_eq!(seen.len(), 32);
 }
 
 #[test]

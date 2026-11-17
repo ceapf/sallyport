@@ -9,16 +9,19 @@
 //! that the tensors are laid out back to back from the start of the data section, each at the
 //! previous one's end rounded up to the alignment (the layout llama.cpp requires).
 //!
-//! What it keeps: every scalar; strings up to [`KEPT_STRING_BYTES`] that are UTF-8; the chat
-//! templates whole; for longer strings and every array only the type and length. Every string
-//! it keeps was chosen by the file's author: show it only through [`crate::text`]'s escapes.
+//! What it keeps: every scalar; strings up to [`KEPT_STRING_BYTES`] that are UTF-8 without NUL;
+//! the chat templates whole (UTF-8, no NUL, else refused: the engine reads them as C strings);
+//! for longer strings and every array only the type and length. A `split.count` other than a
+//! `u16` of 0 or 1 is refused: it makes the engine open sibling files these checks never saw.
+//! Every string it keeps was chosen by the file's author: show it only through
+//! [`crate::text`]'s escapes.
 #![deny(clippy::indexing_slicing)]
 
-pub mod error;
+pub(crate) mod error;
 mod meta;
 mod read;
 mod tensors;
-pub mod types;
+mod types;
 
 use std::fmt;
 use std::io::{BufReader, Read};
@@ -44,6 +47,8 @@ pub const MAX_KEY_BYTES: u64 = 256;
 pub const MAX_NAME_BYTES: u64 = 63;
 /// Most dimensions of one tensor.
 pub const MAX_DIMS: u32 = 4;
+/// Largest dimension and element count of one tensor: the engine holds them in an `i64`.
+pub const MAX_ELEMENTS: u64 = 9_223_372_036_854_775_807;
 /// Smallest accepted `general.alignment`.
 pub const MIN_ALIGNMENT: u32 = 8;
 /// Largest accepted `general.alignment`.
@@ -111,8 +116,45 @@ pub enum ValueType {
     F64,
 }
 
+/// An `f32` kept as its bits, so values compare bit for bit and a header equals itself even
+/// when it holds a NaN.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct F32Bits(u32);
+
+impl F32Bits {
+    /// The float.
+    #[must_use]
+    pub const fn get(self) -> f32 {
+        f32::from_bits(self.0)
+    }
+}
+
+impl fmt::Debug for F32Bits {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self.get())
+    }
+}
+
+/// An `f64` kept as its bits; see [`F32Bits`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct F64Bits(u64);
+
+impl F64Bits {
+    /// The float.
+    #[must_use]
+    pub const fn get(self) -> f64 {
+        f64::from_bits(self.0)
+    }
+}
+
+impl fmt::Debug for F64Bits {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self.get())
+    }
+}
+
 /// A metadata value as the parser keeps it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Value {
     /// `u8`.
@@ -128,7 +170,7 @@ pub enum Value {
     /// `i32`.
     I32(i32),
     /// `f32`.
-    F32(f32),
+    F32(F32Bits),
     /// A bool (the byte was 0 or 1).
     Bool(bool),
     /// `u64`.
@@ -136,10 +178,11 @@ pub enum Value {
     /// `i64`.
     I64(i64),
     /// `f64`.
-    F64(f64),
-    /// A kept string.
+    F64(F64Bits),
+    /// A kept string: UTF-8 without NUL.
     String(FileText),
-    /// A string not kept (longer than [`KEPT_STRING_BYTES`], or not UTF-8): its length only.
+    /// A string not kept (longer than [`KEPT_STRING_BYTES`], not UTF-8, or holding a NUL): its
+    /// length only.
     StringSummary(u64),
     /// An array: its element type and length only; no element was kept or inspected beyond
     /// the length of each string.
@@ -147,7 +190,7 @@ pub enum Value {
 }
 
 /// One metadata entry.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Metadata {
     key: FileText,
     value: Value,
@@ -210,7 +253,7 @@ impl TensorInfo {
 }
 
 /// A GGUF header that passed every check.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GgufHeader {
     version: u32,
     alignment: u32,
@@ -284,15 +327,19 @@ impl GgufHeader {
 
 /// Parses the GGUF header `reader` yields, for a file `file_len` bytes long.
 ///
-/// `file_len` must be the length of the very object `reader` reads (`fstat` of the open file
-/// descriptor, never a stat of a path): every tensor's data is checked to lie within it. A parse
-/// against an advertised length (a download not yet made) is a preview, not the SI-6 check.
+/// `reader` must start at the file's first byte: every position is counted from where it
+/// starts, so a caller that read the head for [`crate::model::detect::Candidate::check_magic`]
+/// from the same file rewinds first (or reads the head with a positioned read). `file_len` must
+/// be the length of the very object `reader` reads (`fstat` of the open file descriptor, never
+/// a stat of a path): every tensor's data is checked to lie within it. A parse against an
+/// advertised length (a download not yet made) is a preview, not the SI-6 check.
 ///
 /// The reader is wrapped in a buffer of 64 KiB under a limit of [`MAX_HEADER_BYTES`]; it is never
 /// sought, and bytes the buffer read ahead past the header are never looked at.
 ///
 /// # Errors
-/// A [`GgufError`] naming the first check that failed, in file order.
+/// A [`GgufError`] naming the first check that failed, in file order, except that the layout
+/// checks the bounds of every tensor first and their contiguity second.
 pub fn parse<R: Read>(reader: R, file_len: u64) -> Result<GgufHeader, GgufError> {
     let buffered = BufReader::with_capacity(READ_BUFFER, reader.take(MAX_HEADER_BYTES));
     let mut r = Reader::new(buffered, MAX_HEADER_BYTES, file_len);

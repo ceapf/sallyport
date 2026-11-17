@@ -7,13 +7,15 @@ use std::io::Read;
 use super::error::quote;
 use super::read::Reader;
 use super::{
-    DEFAULT_ALIGNMENT, FileText, GgufError, KEPT_STRING_BYTES, MAX_ALIGNMENT, MAX_ARRAY_LEN,
-    MAX_KEY_BYTES, MAX_STRING_BYTES, MAX_TEMPLATES, MIN_ALIGNMENT, Metadata, TEMPLATE_KEY, Value,
-    ValueType,
+    DEFAULT_ALIGNMENT, F32Bits, F64Bits, FileText, GgufError, KEPT_STRING_BYTES, MAX_ALIGNMENT,
+    MAX_ARRAY_LEN, MAX_KEY_BYTES, MAX_STRING_BYTES, MAX_TEMPLATES, MIN_ALIGNMENT, Metadata,
+    TEMPLATE_KEY, Value, ValueType,
 };
 
 /// The key that sets the alignment.
 const ALIGNMENT_KEY: &str = "general.alignment";
+/// The key that says how many files a split model has.
+const SPLIT_KEY: &str = "split.count";
 
 /// The metadata and the alignment it sets.
 pub(super) struct Meta {
@@ -44,6 +46,9 @@ pub(super) fn read<R: Read>(r: &mut Reader<R>, count: u64) -> Result<Meta, GgufE
         if key == ALIGNMENT_KEY {
             alignment = check_alignment(i, &value)?;
         }
+        if key == SPLIT_KEY {
+            check_split(i, &value)?;
+        }
         entries.push(Metadata {
             key: FileText(key),
             value,
@@ -71,6 +76,9 @@ fn read_key<R: Read>(r: &mut Reader<R>, i: u64) -> Result<String, GgufError> {
     String::from_utf8(bytes).map_err(|_| GgufError::BadKey(i))
 }
 
+/// The id that marks an array.
+const ARRAY: u32 = 9;
+
 /// The value type with this id; arrays are not a [`ValueType`].
 fn value_type(i: u64, id: u32) -> Result<ValueType, GgufError> {
     Ok(match id {
@@ -86,13 +94,10 @@ fn value_type(i: u64, id: u32) -> Result<ValueType, GgufError> {
         10 => ValueType::U64,
         11 => ValueType::I64,
         12 => ValueType::F64,
-        9 => return Err(GgufError::NestedArray(i)),
+        ARRAY => return Err(GgufError::NestedArray(i)),
         other => return Err(GgufError::BadValueType(i, other)),
     })
 }
-
-/// The id that marks an array.
-const ARRAY: u32 = 9;
 
 fn read_value<R: Read>(
     r: &mut Reader<R>,
@@ -110,7 +115,7 @@ fn read_value<R: Read>(
         ValueType::I16 => Value::I16(r.i16()?),
         ValueType::U32 => Value::U32(r.u32()?),
         ValueType::I32 => Value::I32(r.i32()?),
-        ValueType::F32 => Value::F32(r.f32()?),
+        ValueType::F32 => Value::F32(F32Bits(r.u32()?)),
         ValueType::Bool => match r.u8()? {
             0 => Value::Bool(false),
             1 => Value::Bool(true),
@@ -119,7 +124,7 @@ fn read_value<R: Read>(
         ValueType::String => read_string(r, i, template)?,
         ValueType::U64 => Value::U64(r.u64()?),
         ValueType::I64 => Value::I64(r.i64()?),
-        ValueType::F64 => Value::F64(r.f64()?),
+        ValueType::F64 => Value::F64(F64Bits(r.u64()?)),
     })
 }
 
@@ -137,6 +142,9 @@ fn read_string<R: Read>(r: &mut Reader<R>, i: u64, template: bool) -> Result<Val
     if template {
         let bytes = r.bytes(len)?;
         let text = String::from_utf8(bytes).map_err(|_| GgufError::TemplateNotUtf8(i))?;
+        if text.contains('\0') {
+            return Err(GgufError::TemplateHasNul(i));
+        }
         return Ok(Value::String(FileText(text)));
     }
     if len > KEPT_STRING_BYTES {
@@ -144,8 +152,8 @@ fn read_string<R: Read>(r: &mut Reader<R>, i: u64, template: bool) -> Result<Val
         return Ok(Value::StringSummary(len));
     }
     Ok(match String::from_utf8(r.bytes(len)?) {
-        Ok(text) => Value::String(FileText(text)),
-        Err(_) => Value::StringSummary(len),
+        Ok(text) if !text.contains('\0') => Value::String(FileText(text)),
+        _ => Value::StringSummary(len),
     })
 }
 
@@ -190,6 +198,15 @@ fn check_alignment(i: u64, value: &Value) -> Result<u32, GgufError> {
             Ok(*a)
         }
         _ => Err(GgufError::BadAlignment(i)),
+    }
+}
+
+/// `split.count`: a `u16` of 0 or 1. Anything else names sibling shard files the engine would
+/// open, which never passed these checks.
+fn check_split(i: u64, value: &Value) -> Result<(), GgufError> {
+    match value {
+        Value::U16(0 | 1) => Ok(()),
+        _ => Err(GgufError::SplitFile(i)),
     }
 }
 

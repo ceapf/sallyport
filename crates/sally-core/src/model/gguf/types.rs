@@ -10,6 +10,7 @@
 
 /// Why [`GgmlType::bytes`] gave no size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SizeError {
     /// The first dimension is not a whole number of blocks.
     PartialBlock,

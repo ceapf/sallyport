@@ -10,12 +10,13 @@ use std::io;
 
 use super::read::ReadError;
 
-/// Most escaped bytes of a file-chosen key or name an error quotes.
-pub const QUOTE_BYTES: usize = 64;
+/// Most escaped bytes of a file-chosen key or name an error quotes, before the cut marker
+/// (`...(+N bytes)`) that says how much was left out.
+pub(crate) const QUOTE_BYTES: usize = 64;
 
 /// A file-chosen key or name, escaped and capped for an error message.
 #[must_use]
-pub fn quote(raw: &[u8]) -> String {
+pub(crate) fn quote(raw: &[u8]) -> String {
     crate::text::escape_quoted_capped(raw, QUOTE_BYTES)
 }
 
@@ -71,6 +72,12 @@ pub enum GgufError {
     /// `general.alignment` of a type other than u32, not a power of two, or out of range.
     #[error("kv[{0}]: general.alignment must be a u32 power of two from 8 to 65536")]
     BadAlignment(u64),
+    /// A chat template holding a NUL byte (the engine would read only the text before it).
+    #[error("kv[{0}]: the chat template holds a NUL byte")]
+    TemplateHasNul(u64),
+    /// `split.count` other than a `u16` of 0 or 1: one shard of a multi-file model.
+    #[error("kv[{0}]: split.count says this is part of a multi-file model; those are refused")]
+    SplitFile(u64),
     /// A tensor name longer than [`super::MAX_NAME_BYTES`].
     #[error("tensor[{0}]: the name is {1} bytes, over the limit")]
     TensorNameTooLong(u64, u64),
@@ -137,6 +144,8 @@ impl GgufError {
             Self::TemplateNotUtf8(_) => "template_not_utf8",
             Self::TemplateCountLimit(_) => "template_count_limit",
             Self::BadAlignment(_) => "bad_alignment",
+            Self::TemplateHasNul(_) => "template_has_nul",
+            Self::SplitFile(_) => "split_file",
             Self::TensorNameTooLong(..) => "tensor_name_too_long",
             Self::BadTensorName(_) => "bad_tensor_name",
             Self::DuplicateTensorName(..) => "duplicate_tensor_name",

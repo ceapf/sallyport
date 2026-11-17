@@ -411,5 +411,10 @@ structs, each with a `static_assert` on its size), `ggml/include/gguf.h`, `ggml/
   `ne ≥ 0` (zero allowed), element count overflow checked, `ne[0] % block_size == 0`.
 - Offsets: no per-tensor alignment check; instead each offset must equal the running total
   (first 0, each next = previous + `GGML_PAD(nbytes, alignment)`), so the data is contiguous.
+- String values (the chat template included) reach the engine's callers through
+  `std::string::c_str()`, so the engine sees only the text before a NUL.
+- `split.count` > 1 makes the model loader (`src/llama-model-loader.cpp`) derive the sibling
+  shard paths (`*-0000N-of-0000M.gguf`) and open them from the same directory.
 - The strict parser is narrower on purpose: zero dims, zero tensors, bool bytes other than 0/1,
-  alignment below 8, non-printable keys and NUL in names are refused (rulings in PR text).
+  alignment below 8, non-printable keys, NUL in names and templates, and `split.count` other
+  than a u16 of 0 or 1 are refused.

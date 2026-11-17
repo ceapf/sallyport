@@ -54,10 +54,16 @@ pub struct Candidate {
 
 /// Step 1: the format the file name's extension allows. Reads no bytes.
 ///
+/// `file_name` is one path component: the name of the file that will be opened, never a path.
+///
 /// # Errors
-/// [`DetectError::FormatNotAllowed`] unless the name is UTF-8 and its extension is exactly `gguf`.
+/// [`DetectError::FormatNotAllowed`] unless the name is UTF-8 without `/` or NUL and its
+/// extension is exactly `gguf`.
 pub fn by_name(file_name: &OsStr) -> Result<Candidate, DetectError> {
     let name = file_name.to_str().ok_or(DetectError::FormatNotAllowed)?;
+    if name.contains(['/', '\0']) {
+        return Err(DetectError::FormatNotAllowed);
+    }
     match Path::new(name).extension().and_then(OsStr::to_str) {
         Some("gguf") => Ok(Candidate {
             format: Format::Gguf,

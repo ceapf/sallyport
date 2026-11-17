@@ -115,18 +115,9 @@ impl<R: Read> Reader<R> {
         self.array::<8>().map(i64::from_le_bytes)
     }
 
-    /// A little-endian `f32`.
-    pub fn f32(&mut self) -> Result<f32, ReadError> {
-        self.array::<4>().map(f32::from_le_bytes)
-    }
-
-    /// A little-endian `f64`.
-    pub fn f64(&mut self) -> Result<f64, ReadError> {
-        self.array::<8>().map(f64::from_le_bytes)
-    }
-
-    /// The next `len` bytes. The budget is checked first; the buffer then grows only as bytes
-    /// arrive, so a length the source cannot back allocates no more than the source holds.
+    /// The next `len` bytes. The budget and the file length are checked first; the buffer then
+    /// grows as bytes arrive (by doubling, so to at most about twice what arrived), never sized
+    /// from `len` itself. Every caller has already held `len` to its own limit of 64 KiB or less.
     pub fn bytes(&mut self, len: u64) -> Result<Vec<u8>, ReadError> {
         self.claim(len)?;
         let mut out = Vec::new();

@@ -7,10 +7,7 @@ use std::io::Read;
 use super::error::quote;
 use super::read::Reader;
 use super::types::SizeError;
-use super::{FileText, GgmlType, GgufError, MAX_DIMS, MAX_NAME_BYTES, TensorInfo};
-
-/// Largest dimension and element count: the engine holds them in an `i64`.
-pub(super) const MAX_ELEMENTS: u64 = 9_223_372_036_854_775_807;
+use super::{FileText, GgmlType, GgufError, MAX_DIMS, MAX_ELEMENTS, MAX_NAME_BYTES, TensorInfo};
 
 /// Reads `count` tensor infos (already checked against the limit).
 pub(super) fn read<R: Read>(r: &mut Reader<R>, count: u64) -> Result<Vec<TensorInfo>, GgufError> {
@@ -107,9 +104,12 @@ pub(super) fn place(
         if info.offset != expected {
             return Err(GgufError::TensorNotContiguous(t, info.offset));
         }
-        // In bounds above, so offset + bytes fits; the rounding can still pass u64::MAX.
-        expected = (info.offset + info.bytes)
-            .checked_next_multiple_of(align)
+        // The bounds loop already proved data_start + offset + bytes fits with data_start >= align,
+        // so this cannot fail; it stays checked so a reorder of the two loops cannot wrap.
+        expected = info
+            .offset
+            .checked_add(info.bytes)
+            .and_then(|end| end.checked_next_multiple_of(align))
             .ok_or(GgufError::TensorOutOfBounds(t))?;
     }
     Ok((data_start, data_end))

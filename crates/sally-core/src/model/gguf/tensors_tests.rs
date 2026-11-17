@@ -1,8 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
 use super::super::build::{F32, Gguf, I8, Q4_0, Tensor, code};
-use super::super::{GgufError, MAX_DIMS};
-use super::MAX_ELEMENTS;
+use super::super::{GgufError, MAX_DIMS, MAX_ELEMENTS};
 
 fn with(t: Tensor) -> Gguf {
     Gguf::empty().tensor(t)

@@ -96,18 +96,15 @@ fn skip_consumes_without_keeping() {
 }
 
 #[test]
-fn signed_and_float_reads_use_the_same_bytes() {
-    let mut bytes = vec![0xff, 0xfe, 0xff, 0x00, 0x00, 0x80, 0x3f];
+fn signed_reads_are_little_endian_twos_complement() {
+    let mut bytes = vec![0xff, 0xfe, 0xff];
     bytes.extend_from_slice(&(-3i32).to_le_bytes());
     bytes.extend_from_slice(&(-4i64).to_le_bytes());
-    bytes.extend_from_slice(&2.5f64.to_le_bytes());
     let mut r = reader(&bytes, 64);
     assert_eq!(r.i8().unwrap(), -1);
     assert_eq!(r.i16().unwrap(), -2);
-    assert_eq!(r.f32().unwrap(), 1.0);
     assert_eq!(r.i32().unwrap(), -3);
     assert_eq!(r.i64().unwrap(), -4);
-    assert_eq!(r.f64().unwrap(), 2.5);
 }
 
 struct Failing;

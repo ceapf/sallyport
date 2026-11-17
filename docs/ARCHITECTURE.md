@@ -1205,12 +1205,13 @@ sallyport/
   overhead) / (weights / n_layer))`. RAM check: `weights + kv ≤ 0.8 * free RAM` for CPU fallback.
   Show three states: **Fits on GPU** / **Partial (N of L layers)** / **CPU only** / **Won't fit**.
   Calibrate against real llama-server VRAM readings in M3 and adjust the constant.
-- **GGUF strict parser limits** (`sally-core::model::gguf`; detect first: extension exactly
-  `gguf` from the name alone, before any open, then the magic): magic `GGUF`, version ∈ {2,3}
+- **GGUF strict parser limits** (`sally-core::model::gguf`; detect first: one path component
+  without `/` or NUL, extension exactly `gguf`, from the name alone before any open, then the
+  magic): magic `GGUF`, version ∈ {2,3}
   (one layout; a byte-swapped file is a bad version), `1 ≤ tensor_count ≤ 65 536` (no tensors is
   refused), `kv_count ≤ 4 096`, whole header (magic through the last tensor info) ≤ 64 MiB.
   Keys: 1–256 B of ASCII 0x21–0x7E, unique. String len ≤ 65 536 B, array len ≤ 4 194 304, arrays
-  of arrays refused, bool 0 or 1. `general.alignment`: u32, power of two, 8 ≤ a ≤ 65 536
+  of arrays refused, a scalar bool 0 or 1 (bool array elements are skipped uninspected). `general.alignment`: u32, power of two, 8 ≤ a ≤ 65 536
   (default 32). Tensor name 1–63 B, UTF-8, no control characters (NUL included), unique.
   `1 ≤ n_dims ≤ 4`, each dim `1 ≤ d ≤ i64::MAX`, element count ≤ `i64::MAX` via `checked_mul`,
   first dim a whole number of blocks, ggml type in the table copied from llama.cpp (removed ids
@@ -1220,9 +1221,11 @@ sallyport/
   last tensor are open (#183). Each file-stated length is checked against its own limit, then the
   header cap, then the bytes left in the file, before any read or allocation. Parse header +
   tensor infos only, forward from a reader through one 64 KiB buffer (read-ahead never
-  interpreted); never read tensor data. Kept: scalars, UTF-8 strings ≤ 1 KiB, the chat templates
-  (`tokenizer.chat_template` and `tokenizer.chat_template.<name>`, at most 16, UTF-8) whole;
-  longer strings and arrays as type and length only. `file_len` is the length of the object the
+  interpreted); never read tensor data. Kept: scalars, UTF-8 strings ≤ 1 KiB without NUL, the
+  chat templates (`tokenizer.chat_template` and `tokenizer.chat_template.<name>`, at most 16,
+  UTF-8, no NUL, else refused: the engine reads them as C strings) whole; longer strings and
+  arrays as type and length only. `split.count` must be absent or a u16 of 0 or 1: a multi-file
+  model makes the engine open sibling files that never passed SI-6, so it is refused. `file_len` is the length of the object the
   reader yields; a parse against an advertised length (the §5.1 header preview, whose 4 MiB range
   is too small for large vocabularies, #184) is a preview, not the SI-6 check.
 - **Safetensors strict check**: `header_len ≤ 100 MiB` and `8 + header_len ≤ file_len`; header is

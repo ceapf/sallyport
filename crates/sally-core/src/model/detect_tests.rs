@@ -19,7 +19,7 @@ fn a_gguf_name_with_the_magic_is_gguf() {
         "model.gguf",
         "Qwen2.5-7B-Q4_K_M.gguf",
         "a.b.gguf",
-        "dir/model.gguf",
+        "model .gguf",
     ] {
         let candidate = by_name(OsStr::new(name)).unwrap();
         assert_eq!(
@@ -55,6 +55,15 @@ fn every_other_name_is_refused_before_any_bytes() {
         "model.h5",
         "model.zip",
         "",
+        // One path component only: never a path, never a NUL.
+        "dir/model.gguf",
+        "/model.gguf",
+        "model.gguf/",
+        "./model.gguf",
+        "x.gguf/.",
+        "a.pkl/b.gguf",
+        "a\0.gguf",
+        "model.pkl\0.gguf",
     ];
     for name in refused {
         assert_eq!(

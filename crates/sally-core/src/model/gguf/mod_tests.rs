@@ -313,13 +313,21 @@ fn the_file_length_is_reported_within_the_cap() {
 
 #[test]
 fn debug_shows_lengths_never_file_text() {
-    let file = Gguf::valid().kv_str("general.name", b"secretive-model");
+    let file = Gguf::valid()
+        .kv_str("general.name", b"secretive-model")
+        .kv_str("zzkeyzz", b"x")
+        .tensor(Tensor::of("zztensorzz", F32, &[8]));
     let header = file.parse().unwrap();
     let shown = format!("{header:?}");
-    assert!(
-        !shown.contains("secretive") && !shown.contains("llama"),
-        "{shown}"
-    );
+    for text in [
+        "secretive",
+        "llama",
+        "zzkeyzz",
+        "zztensorzz",
+        "general.name",
+    ] {
+        assert!(!shown.contains(text), "{text} in {shown}");
+    }
     assert!(shown.contains("FileText(15 bytes)"), "{shown}");
 }
 
@@ -346,9 +354,11 @@ fn limits_keep_their_documented_values() {
     assert_eq!(READ_BUFFER, 64 << 10);
 }
 
-/// RT-MDL-03's corpus cases and the code each gets (C6 asserts the same on the corpus).
+/// RT-MDL-03's corpus cases and the code each gets. Not the red-team row itself (no `rt_`
+/// prefix): the row, with its corpus files and time and memory bounds, lands with M2 Task 9 and
+/// asserts these same codes.
 #[test]
-fn rt_mdl_03_cases_each_get_their_code() {
+fn mdl_03_cases_each_get_their_code() {
     let nested = (0..10).fold(Vec::new(), |inner, _| array(ARRAY, 1, &inner));
     let mut huge_string = s(b"general.name");
     huge_string.extend_from_slice(&STRING.to_le_bytes());

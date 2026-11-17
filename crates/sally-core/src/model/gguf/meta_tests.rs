@@ -1,7 +1,21 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
 use super::super::build::{ARRAY, BOOL, Gguf, STRING, U8, U32, U64, array, code, s};
-use super::super::{FileText, GgufError, GgufHeader, Value, ValueType};
+use super::super::{F32Bits, F64Bits, FileText, GgufError, GgufHeader, Value, ValueType};
+
+#[test]
+fn floats_compare_by_bits_and_read_back() {
+    let nan = Value::F32(F32Bits(f32::NAN.to_bits()));
+    assert_eq!(nan, nan.clone());
+    assert_ne!(
+        Value::F64(F64Bits(0.0f64.to_bits())),
+        Value::F64(F64Bits((-0.0f64).to_bits()))
+    );
+    assert_eq!(F32Bits(1.5f32.to_bits()).get(), 1.5);
+    assert_eq!(F64Bits(2.25f64.to_bits()).get(), 2.25);
+    assert_eq!(format!("{:?}", F32Bits(1.5f32.to_bits())), "1.5");
+    assert_eq!(format!("{:?}", F64Bits(2.25f64.to_bits())), "2.25");
+}
 
 fn only_value(file: Gguf) -> Value {
     let header: GgufHeader = file.parse().unwrap();
@@ -70,12 +84,20 @@ fn every_scalar_type_reads_its_value() {
         (3, (-2i16).to_le_bytes().to_vec(), Value::I16(-2)),
         (4, 70_000u32.to_le_bytes().to_vec(), Value::U32(70_000)),
         (5, (-3i32).to_le_bytes().to_vec(), Value::I32(-3)),
-        (6, 1.5f32.to_le_bytes().to_vec(), Value::F32(1.5)),
+        (
+            6,
+            1.5f32.to_le_bytes().to_vec(),
+            Value::F32(F32Bits(1.5f32.to_bits())),
+        ),
         (7, vec![0], Value::Bool(false)),
         (7, vec![1], Value::Bool(true)),
         (10, (1u64 << 40).to_le_bytes().to_vec(), Value::U64(1 << 40)),
         (11, (-4i64).to_le_bytes().to_vec(), Value::I64(-4)),
-        (12, 2.25f64.to_le_bytes().to_vec(), Value::F64(2.25)),
+        (
+            12,
+            2.25f64.to_le_bytes().to_vec(),
+            Value::F64(F64Bits(2.25f64.to_bits())),
+        ),
     ];
     for (ty, payload, expected) in cases {
         assert_eq!(only_value(one(b"k", ty, &payload)), expected, "type {ty}");
@@ -269,4 +291,65 @@ fn alignment_is_a_u32_power_of_two_from_8_to_65536() {
     }
     let wrong_type = Gguf::valid().kv(b"general.alignment", U64, &32u64.to_le_bytes());
     assert_eq!(wrong_type.parse(), Err(GgufError::BadAlignment(1)));
+}
+
+#[test]
+fn a_chat_template_holding_a_nul_is_refused() {
+    for key in [
+        "tokenizer.chat_template",
+        "tokenizer.chat_template.tool_use",
+    ] {
+        for value in [&b"\0{{x}}"[..], b"{{x}}\0tail", b"{{x}}\0"] {
+            assert_eq!(
+                Gguf::valid().kv_str(key, value).parse(),
+                Err(GgufError::TemplateHasNul(1)),
+                "{key} {value:?}"
+            );
+        }
+    }
+    // Both not UTF-8 and holding a NUL: UTF-8 is checked first.
+    assert_eq!(
+        Gguf::valid()
+            .kv_str("tokenizer.chat_template", b"\0\xff")
+            .parse(),
+        Err(GgufError::TemplateNotUtf8(1))
+    );
+}
+
+#[test]
+fn an_ordinary_string_holding_a_nul_is_summarized() {
+    assert_eq!(
+        only_value(one(b"k", STRING, &s(b"a\0b"))),
+        Value::StringSummary(3)
+    );
+    // Not a template key: summarized, not refused.
+    let other = Gguf::valid().kv_str("tokenizer.chat_templates", b"a\0");
+    assert_eq!(only_value(other), Value::StringSummary(2));
+}
+
+const U16: u32 = 2;
+
+#[test]
+fn split_count_may_only_say_one_file() {
+    let allowed = [
+        one(b"split.count", U16, &0u16.to_le_bytes()),
+        one(b"split.count", U16, &1u16.to_le_bytes()),
+        one(b"split.count.x", U16, &2u16.to_le_bytes()),
+        one(b"Split.count", U16, &2u16.to_le_bytes()),
+        Gguf::valid(),
+    ];
+    for file in allowed {
+        assert_eq!(code(file.parse()), "accepted");
+    }
+    let refused = [
+        one(b"split.count", U16, &2u16.to_le_bytes()),
+        one(b"split.count", U16, &u16::MAX.to_le_bytes()),
+        one(b"split.count", U32, &1u32.to_le_bytes()),
+        one(b"split.count", U32, &2u32.to_le_bytes()),
+        one(b"split.count", STRING, &s(b"1")),
+        one(b"split.count", ARRAY, &array(U16, 1, &1u16.to_le_bytes())),
+    ];
+    for file in refused {
+        assert_eq!(file.parse(), Err(GgufError::SplitFile(1)));
+    }
 }
