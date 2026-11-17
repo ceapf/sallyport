@@ -1600,7 +1600,8 @@ sallyport/
   it was cut (Q256). Text a builder puts in plain args uncut and unescaped (an `egress.allow`
   host, lower-cased only, Q289) needs no declaration: the writer's whole-args pass masks it.
   A panic payload, and a failed podman command's stderr, is held whole up to 64 KiB or
-  withheld whole, never cut before the logs mask it (Q293, Q295). A failed task join is a
+  withheld whole, never cut before the logs mask it (Q293, Q295). A path the launch scan names
+  in a refusal is shown raw, never Debug-escaped (Q303). A failed task join is a
   daemon-chosen constant (`crash::join_text`, Q297): tokio's own text escapes the panic
   message, so the payload is only in the oplog's panic line. The operational log masks a value
   before it escapes and caps it; its callers pass values raw. The work under the writer's lock
