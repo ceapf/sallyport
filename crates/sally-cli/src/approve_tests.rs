@@ -4,15 +4,16 @@ use std::collections::VecDeque;
 use std::io::{BufReader, Read};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, SyncSender};
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use super::*;
 use crate::client::{FRAME_QUEUE, Frame, spawn_reader};
 
 /// Runs before a terminal read: frames it sends reach the client's queue at once, behind
-/// whatever the reader already queued.
-type Hook = Box<dyn FnMut(&SyncSender<Frame>)>;
+/// whatever the reader already queued. `Send`, because `approve()` runs on a worker thread.
+type Hook = Box<dyn FnMut(&SyncSender<Frame>) + Send>;
 
 /// What the fake daemon answers one request with: frames to write, then whether to close (its
 /// sending side: it still reads, so whatever the client sends after is kept).
@@ -21,7 +22,12 @@ type Handler = Box<dyn FnMut(&Value) -> (Vec<Value>, bool) + Send>;
 /// How long the fake waits for the client's next request before it gives up and closes the
 /// connection. A real request comes within milliseconds; a client that never sends one then fails
 /// its test well inside cargo-mutants' 20 s minimum timeout instead of hanging it.
-const FAKE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+const FAKE_WAIT: Duration = Duration::from_secs(5);
+
+/// How long a test waits for `approve()` to return. Above [`FAKE_WAIT`], so a fake that gives up
+/// first fails the test with its own message; below cargo-mutants' 20 s minimum timeout, so a
+/// mutant that makes `approve()` hang fails its test instead of timing it out.
+const RUN_WAIT: Duration = Duration::from_secs(10);
 
 /// Whether a read ended at [`FAKE_WAIT`] (Linux reports a socket read timeout as `WouldBlock`).
 fn timed_out(e: &std::io::Error) -> bool {
@@ -102,8 +108,19 @@ impl Fake {
 }
 
 impl Drop for Fake {
+    /// A test that never joined the fake still learns how it ended: a fake that gave up on a
+    /// client which neither sent nor went fails it. A test already failing does not wait for the
+    /// fake (its client may be held by an abandoned worker).
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+        if std::thread::panicking() {
+            return;
+        }
+        if let Some(t) = self.thread.take()
+            && t.join().is_err()
+        {
+            panic!("the fake daemon failed (see its panic above)");
+        }
     }
 }
 
@@ -172,6 +189,7 @@ impl Read for Script {
 struct Run {
     code: u8,
     shown: String,
+    err: String,
     flushes: usize,
 }
 
@@ -184,30 +202,60 @@ fn client(f: &Fake) -> (Client, SyncSender<Frame>) {
 }
 
 fn run_with(f: &Fake, lines: &[&str], hook: Option<(usize, Hook)>) -> Run {
-    let (mut c, queue) = client(f);
-    let script = Script {
-        lines: lines.iter().map(|l| format!("{l}\n")).collect(),
-        reads: 0,
-        hook,
-        queue,
-    };
-    let mut input = BufReader::with_capacity(4096, script);
-    let mut shown = Vec::new();
-    let mut flushes = 0;
-    let mut flush = || flushes += 1;
-    let mut err = Vec::new();
-    let code = {
-        let mut tty = Tty {
-            input: &mut input,
-            output: &mut shown,
-            flush: &mut flush,
+    run_bounded(client(f), lines, hook)
+}
+
+/// Runs `approve()` with the client `(c, queue)` on a terminal that types `lines`, on a worker
+/// thread that owns the client, the terminal and the buffers, and waits at most [`RUN_WAIT`] for
+/// it. An `approve()` that hangs (spinning without a read, or waiting on a frame queue whose
+/// sender the test still holds) fails the test, and its worker is left behind.
+/// `std::thread::scope` cannot bound it: a scope joins its threads before it returns, even while
+/// unwinding, so it would hang with them.
+fn run_bounded(
+    (mut c, queue): (Client, SyncSender<Frame>),
+    lines: &[&str],
+    hook: Option<(usize, Hook)>,
+) -> Run {
+    let lines: VecDeque<String> = lines.iter().map(|l| format!("{l}\n")).collect();
+    let (done, result) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let script = Script {
+            lines,
+            reads: 0,
+            hook,
+            queue,
         };
-        approve(&mut c, &mut tty, &mut err)
-    };
-    Run {
-        code,
-        shown: String::from_utf8(shown).unwrap(),
-        flushes,
+        let mut input = BufReader::with_capacity(4096, script);
+        let (mut shown, mut err, mut flushes) = (Vec::new(), Vec::new(), 0);
+        let mut flush = || flushes += 1;
+        let code = {
+            let mut tty = Tty {
+                input: &mut input,
+                output: &mut shown,
+                flush: &mut flush,
+            };
+            approve(&mut c, &mut tty, &mut err)
+        };
+        let _ = done.send(Run {
+            code,
+            shown: String::from_utf8(shown).unwrap(),
+            err: String::from_utf8(err).unwrap(),
+            flushes,
+        });
+    });
+    match result.recv_timeout(RUN_WAIT) {
+        // Joined, so the client is dropped (its connection shut) before the test goes on.
+        Ok(run) => {
+            worker.join().unwrap();
+            run
+        }
+        Err(RecvTimeoutError::Timeout) => {
+            panic!("approve() neither returned nor failed within RUN_WAIT ({RUN_WAIT:?})")
+        }
+        Err(RecvTimeoutError::Disconnected) => match worker.join() {
+            Err(p) => std::panic::resume_unwind(p),
+            Ok(()) => panic!("the approve() worker ended without its result"),
+        },
     }
 }
 
@@ -297,29 +345,15 @@ fn a_line_for_a_closed_prompt_is_not_applied_to_the_next() {
 fn a_lost_connection_sends_nothing_for_the_line_typed() {
     let f = daemon("lost", vec![prompt("p1")], 9);
     let hook: Hook = Box::new(|q| q.send(Err(Error::Closed)).unwrap());
-    let (mut c, queue) = client(&f);
-    let mut input = BufReader::new(Script {
-        lines: VecDeque::from(["approve\n".to_owned()]),
-        reads: 0,
-        hook: Some((0, hook)),
-        queue,
-    });
-    let (mut shown, mut err) = (Vec::new(), Vec::new());
-    let mut flush = || {};
-    let code = approve(
-        &mut c,
-        &mut Tty {
-            input: &mut input,
-            output: &mut shown,
-            flush: &mut flush,
-        },
-        &mut err,
-    );
-    assert_eq!(code, EXIT_FAILED);
+    let r = run_with(&f, &["approve"], Some((0, hook)));
+    assert_eq!(r.code, EXIT_FAILED);
     assert!(f.decides().is_empty(), "{:?}", f.decides());
-    let err = String::from_utf8(err).unwrap();
-    assert_eq!(err.lines().count(), 1, "{err}");
-    assert!(err.contains("prompts still pending are denied"), "{err}");
+    assert_eq!(r.err.lines().count(), 1, "{}", r.err);
+    assert!(
+        r.err.contains("prompts still pending are denied"),
+        "{}",
+        r.err
+    );
 }
 
 /// Security re-review LOW1: an answer sent but never replied to may have been taken; the
@@ -379,7 +413,7 @@ fn a_cut_list_is_listed_again_only_after_progress() {
             _ => (vec![ok(req, list(&[prompt("p1")], false))], false),
         }),
     );
-    let (mut c, queue) = client(&f);
+    let (c, queue) = client(&f);
     let (requests, end) = (Arc::clone(&f.requests), queue.clone());
     let ender = std::thread::spawn(move || {
         for _ in 0..500 {
@@ -397,26 +431,16 @@ fn a_cut_list_is_listed_again_only_after_progress() {
         }
         panic!("never listed again");
     });
-    let mut input = BufReader::new(Script {
-        lines: VecDeque::from(["deny\n".to_owned()]),
-        reads: 0,
-        hook: None,
-        queue,
-    });
-    let (mut shown, mut err) = (Vec::new(), Vec::new());
-    let mut flush = || {};
-    let mut tty = Tty {
-        input: &mut input,
-        output: &mut shown,
-        flush: &mut flush,
-    };
-    let code = approve(&mut c, &mut tty, &mut err);
+    // The worker drops the client before run_bounded returns.
+    let r = run_bounded((c, queue), &["deny"], None);
     ender.join().unwrap();
-    drop(c);
     f.join();
-    assert_eq!(code, EXIT_FAILED);
-    let shown = String::from_utf8(shown).unwrap();
-    assert!(shown.contains("not taken: digest-mismatch"), "{shown}");
+    assert_eq!(r.code, EXIT_FAILED);
+    assert!(
+        r.shown.contains("not taken: digest-mismatch"),
+        "{}",
+        r.shown
+    );
     assert_eq!(
         f.methods(),
         ["approvals.watch", "approvals.decide", "approvals.list"],
