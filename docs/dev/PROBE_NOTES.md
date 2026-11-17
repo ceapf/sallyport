@@ -339,6 +339,24 @@ tests in `egress/intercept_tests.rs` where the behaviour matters to the proxy.
 - busybox `nc` does **not** exit on network EOF while its stdin is open; it runs until its input
   ends. A test that times the server's close from inside the sandbox uses `sally-shim --stdio`,
   which exits when the server closes. (RT-NET-09 slowloris, Q235)
+- The shim bounds its writes toward the client with `SO_SNDTIMEO` = the linger (#155). That
+  timeout is **per call**, not per stall. A TCP writer blocked on a full send queue is woken only
+  when about a third of the queue is free (free space at least half of what is queued). A call
+  that copied some bytes returns them when its timeout runs out; one that copied none returns
+  `EAGAIN`, even if room appeared meanwhile without waking it. Toward a client that never reads,
+  zero-window probes and receive-queue collapse let the client's kernel take a few KiB more now
+  and then, so the write fails some lingers after it first blocked, not one. Measured on WSL2
+  6.18 (`tcp_rmem` max 32 MiB, `tcp_wmem` max 4 MiB), 16 KiB writes toward a client that sent a
+  request, half-closed and never reads: at a 300 ms linger, the call that filled the queue
+  returned 12800 bytes after 0.30 s and the next got `EAGAIN` 0.32 s later; at 1 s, 3584 bytes
+  after 1.01 s, then 94.7 KiB went in at once, 12800 bytes after 1.02 s, `EAGAIN` 1.02 s later
+  (the same timing on 8 of 8 runs, 3 of them with a client that neither reads nor sends).
+  At the shipped 30 s linger (the real shim, one slot, a flooding Unix-socket server, a client
+  that never reads, in `unshare -rn`), one run: 3584 bytes after 31.4 s, 12800 after 30.7 s,
+  `EAGAIN` 30.7 s later; the server's write failed 92.9 s after the connect and the slot was
+  back at 123.3 s.
+  The shim's tests therefore time a mute client's cut from the server's failed write, which
+  happens when the shim's write fails, never in multiples of the linger.
 
 ## Test writing
 

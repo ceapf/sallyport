@@ -12,10 +12,11 @@ enum Step {
 }
 
 /// A scripted stream. Each read takes the next step; once the script is spent, reads give
-/// EOF. Writes, shutdowns and read waits are recorded.
+/// EOF. Writes (tried and done), shutdowns and read waits are recorded.
 struct Fake {
     script: Mutex<VecDeque<Step>>,
-    fail_writes: bool,
+    fail_writes: Option<ErrorKind>,
+    tries: Mutex<usize>,
     written: Mutex<Vec<u8>>,
     closes: Mutex<Vec<Shutdown>>,
     waits: Mutex<Vec<Duration>>,
@@ -25,7 +26,8 @@ impl Fake {
     fn new(script: Vec<Step>) -> Self {
         Self {
             script: Mutex::new(script.into()),
-            fail_writes: false,
+            fail_writes: None,
+            tries: Mutex::default(),
             written: Mutex::default(),
             closes: Mutex::default(),
             waits: Mutex::default(),
@@ -34,11 +36,19 @@ impl Fake {
     fn waits(&self) -> Vec<Duration> {
         self.waits.lock().unwrap().clone()
     }
+    /// Every write fails with a broken pipe (a server that stopped reading).
     fn failing_writes() -> Self {
+        Self::failing_writes_with(ErrorKind::BrokenPipe)
+    }
+    /// Every write fails with `kind`.
+    fn failing_writes_with(kind: ErrorKind) -> Self {
         Self {
-            fail_writes: true,
+            fail_writes: Some(kind),
             ..Self::new(Vec::new())
         }
+    }
+    fn tries(&self) -> usize {
+        *self.tries.lock().unwrap()
     }
     fn written(&self) -> Vec<u8> {
         self.written.lock().unwrap().clone()
@@ -70,8 +80,9 @@ impl Half for Fake {
         }
     }
     fn write_all_to(&self, buf: &[u8]) -> io::Result<()> {
-        if self.fail_writes {
-            return Err(ErrorKind::BrokenPipe.into());
+        *self.tries.lock().unwrap() += 1;
+        if let Some(kind) = self.fail_writes {
+            return Err(kind.into());
         }
         self.written.lock().unwrap().extend_from_slice(buf);
         Ok(())
@@ -81,6 +92,9 @@ impl Half for Fake {
     }
     fn read_wait(&self, wait: Duration) {
         self.waits.lock().unwrap().push(wait);
+    }
+    fn write_wait(&self, _wait: Duration) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -157,6 +171,95 @@ fn copy_half_toward_the_client_stops_at_a_failed_write_and_closes_only_its_own_d
     assert_eq!(from.unread(), 1, "read on after a failed write");
     assert_eq!(from.closes(), [Shutdown::Read]);
     assert_eq!(to.closes(), [Shutdown::Write]);
+}
+
+#[test]
+fn a_timed_out_write_toward_the_client_is_a_failed_write() {
+    // #155: the client socket's write bound ends a blocked write with `WouldBlock` or
+    // `TimedOut`. The copy stops as at any failed write toward the client: no retry, no further
+    // read, only its own direction closed.
+    for kind in [ErrorKind::WouldBlock, ErrorKind::TimedOut] {
+        let (from, to) = (
+            Fake::new(vec![Step::Data(b"a"), Step::Data(b"b")]),
+            Fake::failing_writes_with(kind),
+        );
+        copy_half(&from, &to, Direction::ToClient);
+        assert_eq!(to.tries(), 1, "retried a timed-out write ({kind:?})");
+        assert_eq!(
+            from.unread(),
+            1,
+            "read on after a timed-out write ({kind:?})"
+        );
+        assert_eq!(from.closes(), [Shutdown::Read], "{kind:?}");
+        assert_eq!(to.closes(), [Shutdown::Write], "{kind:?}");
+    }
+}
+
+/// A scratch directory, removed on drop (also when a test panics).
+struct ScratchDir(std::path::PathBuf);
+
+impl ScratchDir {
+    fn create(name: &str) -> Self {
+        // Short: a Unix socket path is limited to 107 bytes.
+        let dir = std::env::temp_dir().join(format!("shu{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn relay_connection_bounds_writes_to_the_client_by_the_limiter_s_linger() {
+    // A linger other than the default, so the value is the limiter's; whole seconds, so it
+    // reads back exactly at any kernel tick rate (a fraction is rounded up to whole ticks,
+    // which at 300 Hz is not a whole number of microseconds).
+    let linger = Duration::from_secs(2);
+    let dir = ScratchDir::create("wired");
+    let sock = dir.0.join("u.sock");
+    // The server closes at once and the client is gone, so the relay ends promptly.
+    let server = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let closing = thread::spawn(move || drop(server.accept()));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (tcp, _) = listener.accept().unwrap();
+    let seen = tcp.try_clone().unwrap();
+    drop(client);
+    let limiter = Limiter::with_linger(1, linger);
+    let slot = limiter.admit().unwrap();
+    let relayed = relay_connection(tcp, &sock, &limiter, &slot);
+    // Wakes the server's accept if the relay never connected, so the join below cannot hang;
+    // harmless if it did (refused, or queued on a listener about to close).
+    let _ = std::os::unix::net::UnixStream::connect(&sock);
+    closing.join().unwrap();
+    relayed.unwrap();
+    assert_eq!(seen.write_timeout().unwrap(), Some(linger));
+}
+
+#[test]
+fn write_wait_bounds_each_later_write_on_a_tcp_stream() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let tcp = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    // Whole seconds, so it reads back exactly at any kernel tick rate.
+    let wait = Duration::from_secs(3);
+    tcp.write_wait(wait).unwrap();
+    assert_eq!(tcp.write_timeout().unwrap(), Some(wait));
+    // std refuses a zero timeout; a zero linger still bounds the write, by the smallest one
+    // (the kernel keeps it as one clock tick).
+    tcp.write_wait(Duration::ZERO).unwrap();
+    let least = tcp
+        .write_timeout()
+        .unwrap()
+        .expect("a zero linger left writes unbounded");
+    assert!(
+        least > Duration::ZERO && least <= Duration::from_millis(10),
+        "{least:?}"
+    );
 }
 
 #[test]

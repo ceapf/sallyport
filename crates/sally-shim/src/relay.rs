@@ -24,7 +24,11 @@ pub const MAX_CONNECTIONS: usize = 32;
 /// forever. It runs from the server-to-client direction's end, or from a failed write toward a
 /// server that stopped reading (`sallyd` only does that by closing), whatever the client does
 /// after that write: a response stream still flowing is cut only in that second case, a linger
-/// after the server stopped reading.
+/// after the server stopped reading. It also bounds each write call toward the client (#155): a
+/// call no byte of which is accepted within a linger fails, so a client that stops reading is
+/// cut. A client is cut only when a whole call passes with no room freed: what counts is room in
+/// the kernel's send queue, not the client's read calls, and reads too small to reopen its
+/// receive window count only when they add up (trickle readers are out of scope).
 pub const LINGER: Duration = Duration::from_secs(30);
 /// The longest linger [`Limiter::with_linger`] keeps: one day. Longer values are clamped, so a
 /// deadline a linger from now always exists.
@@ -181,6 +185,14 @@ trait Half: Send + Sync + 'static {
     /// Bounds each later read to `wait` (not zero); a read that times out fails with
     /// `WouldBlock` or `TimedOut`.
     fn read_wait(&self, wait: Duration);
+    /// Bounds each later write call to `wait`: a call that gets no byte accepted in that time
+    /// fails with `WouldBlock` or `TimedOut`; one that got some returns them when its bound runs
+    /// out, and [`Half::write_all_to`] (std's `write_all`) goes on with the rest in a new call
+    /// with a fresh bound. A zero `wait` gives the smallest bound the platform keeps, never none.
+    ///
+    /// # Errors
+    /// The error setting the bound; the stream is then not relayed.
+    fn write_wait(&self, wait: Duration) -> io::Result<()>;
 }
 
 macro_rules! half {
@@ -197,6 +209,10 @@ macro_rules! half {
             }
             fn read_wait(&self, wait: Duration) {
                 let _ = self.set_read_timeout(Some(wait));
+            }
+            fn write_wait(&self, wait: Duration) -> io::Result<()> {
+                // std refuses a zero timeout (`None` would be no bound at all).
+                self.set_write_timeout(Some(wait.max(Duration::from_nanos(1))))
             }
         }
     };
@@ -215,16 +231,33 @@ half!(UnixStream);
 /// Those two tear the connection down at a deadline; a client's read error (it reset) ends both
 /// directions at once.
 ///
-/// TODO(#155): a client that does not read a reply larger than the buffers, and has had no send
-/// fail (for example: it sends nothing, its sends block because the server stopped reading
-/// without closing, or it half-closed after they went through), holds its slot: the
-/// server-to-client direction stays blocked writing to it.
+/// Writes to the client are bounded too ([`Half::write_wait`]), a linger per write call: a call
+/// no byte of which is accepted fails, which ends the server-to-client direction as any failed
+/// write does and starts the linger above (#155). So a client that stops reading a reply larger
+/// than the buffers gets its slot back two lingers after the first write call toward it that it
+/// accepted nothing of (one, if it had half-closed), whether it sends nothing, its sends
+/// block because the server stopped reading without closing, or it half-closed. The calls
+/// before that one add a linger each: the call that filled the queue returns its partial count
+/// only when its linger runs out, and so does each later call that found room the client's
+/// kernel made meanwhile; that count is the kernel's, finite because the client's receive
+/// buffer is. A client that keeps reading, with pauses under the linger, is not cut by this
+/// bound, as long as its reads free room in the send queue (see [`LINGER`]). A client cut this
+/// way that reads again gets what was queued for it, then an EOF (a reset instead, if it had
+/// sent bytes the relay never read): the reply cut short then ends like a complete one, and only
+/// the relayed protocol's framing tells them apart. Writes to the server are not bounded here:
+/// `sallyd` keeps its own limits.
+///
+/// # Errors
+/// Failure to bound writes to the client, to connect to `socket`, or to start the copy thread;
+/// a panicked copy thread.
 fn relay_connection(
     tcp: TcpStream,
     socket: &Path,
     limiter: &Arc<Limiter>,
     _slot: &Slot,
 ) -> io::Result<()> {
+    // Before the connect, so a connection that cannot be bounded never reaches the server.
+    tcp.write_wait(limiter.linger)?;
     let uds = UnixStream::connect(socket)?;
     let _ = tcp.set_nodelay(true);
     let (tcp, uds) = (Arc::new(tcp), Arc::new(uds));
@@ -273,7 +306,9 @@ fn relay_connection(
 enum Direction<'a> {
     /// Server to client. A failed write stops reading the server, so the server's next write
     /// fails and it learns the client is gone. No discard: the linger in [`relay_connection`]
-    /// starts only after this direction ends, so a discard here would have no bound.
+    /// starts only after this direction ends, so a discard here would have no bound. A write the
+    /// client accepted nothing of for a linger fails too (`WouldBlock` or `TimedOut`, from the
+    /// bound [`relay_connection`] sets), and is handled the same way: no retry (#155).
     ToClient,
     /// Client to server. A failed write leaves the client's bytes read and discarded, so a
     /// client still sending is not reset before it reads the reply relayed the other way (#76),
