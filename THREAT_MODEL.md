@@ -239,7 +239,10 @@ caller or the script sends.
 G6 Hide what happened
 ├─ Edit/delete audit lines from Z3                  [log dir not mounted → RT-AUD-02]
 ├─ Edit as the user later                           [hash chain detects → RT-AUD-01; RESIDUAL: user can rewrite whole chain]
-└─ Put secrets in the log to poison exports         [redaction → RT-SEC-07]
+└─ Put secrets in the log to poison exports         [the audit writer masks every live session's
+                                                     secret forms before disk → RT-SEC-15; a grant
+                                                     session's egress entries carry its own
+                                                     redaction → RT-SEC-07 (post-release clause)]
 ```
 
 ### G7. Deny service (A9)
@@ -274,7 +277,7 @@ G7 Make the machine unusable
 | Zip import hardening | `sally-core::model::import` | RT-MDL-05 |
 | Disk-space check before pull | `sally-core::hf` | RT-MDL-09 |
 | Image digest pinning; refuse unpinned | `sallyd::sandbox::images` | RT-SUP-01 |
-| Hash-chained audit, verify command, redaction | `sally-core::audit` | RT-AUD-01, 02, RT-SEC-07 |
+| Hash-chained audit, verify command, redaction | `sally-core::audit` | RT-AUD-01, 02, RT-SEC-15; RT-SEC-07 (post-release clause: `NewEntry::redacted`) |
 | Sanitized Markdown, CSP, minimal Tauri capabilities, https-only opener with confirm | `app/` | RT-UI-01..03 |
 | No telemetry; `sallyd` egress limited to HF + proxy | code review | RT-NET-11 |
 
