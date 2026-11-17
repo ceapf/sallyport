@@ -910,7 +910,9 @@ fn malformed_secret_names_are_not_echoed_by_duplicate_checks() {
     );
     let r = f.load(&body);
     assert!(
-        common::rendered(&r).iter().all(|m| !m.contains(&pasted)),
+        common::rendered_all(&r)
+            .iter()
+            .all(|m| !m.contains(&pasted)),
         "{r:#?}"
     );
 }

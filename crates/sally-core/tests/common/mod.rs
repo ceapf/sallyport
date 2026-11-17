@@ -128,3 +128,17 @@ pub fn rendered(r: &Result<Validated, Rejected>) -> Vec<String> {
         Err(e) => e.errors.iter().map(ToString::to_string).collect(),
     }
 }
+
+/// Every diagnostic rendered like the CLI prints it, errors then warnings, from success or
+/// rejection.
+pub fn rendered_all(r: &Result<Validated, Rejected>) -> Vec<String> {
+    let (errors, warnings) = match r {
+        Ok(v) => (&[][..], &v.warnings[..]),
+        Err(e) => (&e.errors[..], &e.warnings[..]),
+    };
+    errors
+        .iter()
+        .chain(warnings)
+        .map(ToString::to_string)
+        .collect()
+}

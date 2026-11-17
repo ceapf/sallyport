@@ -129,7 +129,9 @@ warning (path `network.allow`) and `summary()` opens with it, e.g.:
 Hosts with a secret grant are marked "acting as you". When `fetch` is granted the finding ends
 with "The fetch tool's GET requests are not prompted and can carry data out in the URL.": GET and
 HEAD never prompt, whatever `tools.fetch_writes` says. There is no acknowledge flag: this is the
-normal shape of a useful agent, so the point is that the user sees it every time.
+normal shape of a useful agent, so the point is that the user sees it every time. On a rejected
+manifest, a grant whose secret name or `inject.host` failed its own check appears as "whatever
+the secret at secrets[i] unlocks": neither value is echoed outside its own error.
 
 ### Ranges and formats (checked by the validator)
 | Field | Rule |
