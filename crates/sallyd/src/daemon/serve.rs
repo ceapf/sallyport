@@ -576,6 +576,9 @@ mod tests {
              them with `podman ps --all --filter label=sallyport.installation=<id>`; the id is \
              the `installation` file in sallyd's state directory)"
         );
+        // The hint spells the label as a literal: it must be the label the launcher sets.
+        let filter = format!("label={}=<id>", crate::sandbox::INSTALLATION_LABEL);
+        assert!(e.to_string().contains(&filter), "{e}");
     }
 
     fn scratch(name: &str) -> PathBuf {
