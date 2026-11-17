@@ -33,6 +33,7 @@ use std::time::Duration;
 
 use sally_core::audit::{Actor, AuditError, AuditWriter, NewEntry};
 use sally_core::manifest::{AuditLevel, MountMode, NetworkMode, ValidatedManifest};
+use sally_core::text::Style;
 use serde_json::json;
 
 use crate::egress::local::Connector;
@@ -73,6 +74,13 @@ pub use teardown::Sweep;
 
 /// Longest free-text value in an audit entry (CLAUDE.md: nothing above 4 KiB is logged).
 const AUDIT_TEXT_CAP: usize = 4096;
+/// The style of a launch or teardown `detail` in an audit entry (architect Q288 (7, 8)): cut at
+/// [`AUDIT_TEXT_CAP`] on a character boundary, unescaped, as [`capped`]. Podman's and the
+/// kernel's messages can name what the sandbox wrote, so an entry declares its detail raw and
+/// the writer masks it whole before the cut.
+pub(crate) const DETAIL_STYLE: Style = Style::Plain {
+    max: AUDIT_TEXT_CAP,
+};
 /// How long after `podman start` the container must still be running. An entry point that
 /// cannot run (a missing interpreter, a crash at startup) exits well within it; a later exit is
 /// the session's business (Task 12).
@@ -111,16 +119,10 @@ async fn blocking<T: Send + 'static>(
     tokio::task::spawn_blocking(f).await.map_err(join_err)?
 }
 
-/// Cuts free text for an audit entry at a character boundary.
+/// Cuts free text at a character boundary, as [`DETAIL_STYLE`]: for text that is not an audit
+/// entry's (a control client's error message).
 pub(super) fn capped(s: &str) -> String {
-    if s.len() <= AUDIT_TEXT_CAP {
-        return s.to_owned();
-    }
-    let mut end = AUDIT_TEXT_CAP;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", s.get(..end).unwrap_or_default())
+    sally_core::text::plain_capped(s, AUDIT_TEXT_CAP)
 }
 
 fn mode_str(m: MountMode) -> &'static str {
@@ -472,15 +474,9 @@ impl Launcher {
         cleanup: String,
     ) -> LaunchError {
         let entry = subject
-            .entry(
-                e.event(),
-                role,
-                [
-                    ("reason", e.reason().into()),
-                    ("detail", e.detail().into()),
-                    ("cleanup", capped(&cleanup).into()),
-                ],
-            )
+            .entry(e.event(), role, [("reason", e.reason().into())])
+            .text("detail", e.to_string(), DETAIL_STYLE)
+            .text("cleanup", cleanup, DETAIL_STYLE)
             .decision("deny");
         match self.audit(entry, level).await {
             Ok(()) => e,
@@ -641,6 +637,36 @@ mod tests {
         let c = capped(&long);
         assert!(c.len() <= AUDIT_TEXT_CAP + "…".len());
         assert!(c.ends_with('…'));
+    }
+
+    /// Architect Q288 (7, 8): a declared detail keeps `capped`'s format, and a form of a live
+    /// session's secret straddling the cut is masked whole before it. Control: the detail
+    /// capped before it is declared (the old builders).
+    #[test]
+    fn a_declared_detail_is_masked_before_its_cut_in_the_capped_format() {
+        let value = "q\"u\\o\x01te-secret-value-0123456789";
+        let r = sally_core::audit::Redactor::new([("Y", value)]);
+        let detail = |raw: &str, r: &sally_core::audit::Redactor| {
+            NewEntry::new(Actor::Sallyd, "sandbox.stop_failed")
+                .text("detail", raw, DETAIL_STYLE)
+                .resolved(r)["detail"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        for raw in ["short".to_owned(), "é".repeat(AUDIT_TEXT_CAP)] {
+            assert_eq!(detail(&raw, &r), capped(&raw));
+        }
+        let straddle = format!("{}{value}", "x".repeat(AUDIT_TEXT_CAP - 20));
+        let shown = detail(&straddle, &r);
+        assert!(
+            shown.ends_with("[REDACTED:Y]"),
+            "{}",
+            &shown[shown.len() - 40..]
+        );
+        for w in value.as_bytes().windows(8) {
+            assert!(!shown.contains(std::str::from_utf8(w).unwrap()));
+        }
     }
 
     /// #48 (architect Q45): a session over the descriptor budget is refused `fd-budget`, the

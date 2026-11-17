@@ -7,8 +7,8 @@ use sally_core::manifest::AuditLevel;
 use serde_json::json;
 
 use super::{
-    Confirmed, LaunchError, Launcher, Progress, RoleRunning, RoleStopError, Running, STOP_RETRY,
-    StopError, blocking, capped,
+    Confirmed, DETAIL_STYLE, LaunchError, Launcher, Progress, RoleRunning, RoleStopError, Running,
+    STOP_RETRY, StopError, blocking,
 };
 use crate::sandbox::commands::rm_args;
 use crate::sandbox::orphans::{Orphan, orphans, ps_args};
@@ -109,10 +109,8 @@ impl Launcher {
                 let entry = NewEntry::new(Actor::Sallyd, "sandbox.stop_failed")
                     .session(e.running.paths.id().as_str())
                     .decision("deny")
-                    .args(json!({
-                        "container": e.running.name,
-                        "detail": capped(&e.error.to_string()),
-                    }));
+                    .args(json!({"container": e.running.name}))
+                    .text("detail", e.error.to_string(), DETAIL_STYLE);
                 if self.audit(entry, e.running.level).await.is_err() {
                     self.unaudited("sandbox.stop_failed", e.running.paths.id().as_str());
                 }
@@ -209,11 +207,9 @@ impl Launcher {
                     .entry(
                         "sandbox.stop_failed",
                         r.role,
-                        [
-                            ("container", r.name.clone().into()),
-                            ("detail", capped(&e.error.to_string()).into()),
-                        ],
+                        [("container", r.name.clone().into())],
                     )
+                    .text("detail", e.error.to_string(), DETAIL_STYLE)
                     .decision("deny");
                 if self.audit(entry, r.level).await.is_err() {
                     self.oplog.error(
