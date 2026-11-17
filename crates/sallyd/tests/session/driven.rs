@@ -9,7 +9,7 @@ use sallyd::rpc::drive::Stepped;
 
 use super::*;
 
-fn script(text: &str) -> Script {
+pub(super) fn script(text: &str) -> Script {
     Script::parse(text).unwrap()
 }
 
@@ -33,7 +33,7 @@ fn manifest(
 
 /// The `Debug` text of every entry of session `id` written so far. TODO(#129): a typed actor
 /// accessor on the sink instead of matching the `Debug` text.
-fn entries_of(r: &Rx, id: &str) -> Vec<String> {
+pub(super) fn entries_of(r: &Rx, id: &str) -> Vec<String> {
     let needle = format!("session: Some(\"{id}\")");
     r.sink
         .debug
