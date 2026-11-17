@@ -4,11 +4,17 @@
 # race no test can force, or at an exact clock instant. The container-only group is the one
 # exception the maintainer ruled on by name.
 # Each one matches by file, function and operator, never by line or column (the `\d+:\d+` stays
-# a wildcard), and its group carries the reason. crates/sally-core/tests/mutants_config.rs
+# a wildcard), and is otherwise literal: `\d+:\d+` is its only pattern. Its group carries the
+# reason. crates/sally-core/tests/mutants_config.rs
 # enforces that form and proves the `|` -> `^` group.
-# cargo-mutants never mutates a function named `new` (no exclusion needed, and none covers it):
-# mutants_config.rs `no_fn_new_in_mutation_scope_holds_logic` keeps logic out of them.
-# TODO(#87): Task 13 empties that test's allowlist.
+# cargo-mutants (27.1.0, src/visit.rs) never mutates a method or trait function named `new`, or
+# anything in an `impl … Default for` block (no exclusion needed, and none covers them):
+# mutants_config.rs `no_fn_new_in_mutation_scope_holds_logic` keeps logic out of every function
+# named `new`, and `no_default_impl_in_mutation_scope_holds_logic` out of every `Default` impl.
+# Re-read src/visit.rs when CARGO_MUTANTS_VERSION changes: until then mutants_config.rs
+# `the_nightly_pins_the_cargo_mutants_version_the_guards_were_read_at` fails. The same file
+# refuses `mutants::skip` in every source file of a mutated crate, and any key here but
+# `profile`, `test_tool` and `exclude_re`.
 # Build with Cargo.toml's `mutants` profile: the test profile without debug info (#82).
 profile = "mutants"
 # Run each mutant's tests under nextest's `mutants` profile (.config/nextest.toml), whose per-test

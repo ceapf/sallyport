@@ -31,7 +31,7 @@ pub struct DiskFloor {
 impl Default for DiskFloor {
     fn default() -> Self {
         Self {
-            min_bytes: 4 << 30,
+            min_bytes: 4_294_967_296, // 4 GiB, a literal: cargo-mutants skips Default impls
             percent: 5,
         }
     }

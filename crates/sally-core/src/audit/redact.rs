@@ -78,7 +78,7 @@ impl fmt::Debug for Redactor {
 
 impl Default for Redactor {
     fn default() -> Self {
-        Self::new(std::iter::empty())
+        Self::new([])
     }
 }
 
