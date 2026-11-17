@@ -17,12 +17,18 @@ struct Fake {
     thread: Option<JoinHandle<Vec<Value>>>,
 }
 
+/// How long the fake waits for the client's next request before it gives up and closes the
+/// connection. A real request comes within milliseconds; a client that never sends one then fails
+/// its test well inside cargo-mutants' 20 s minimum timeout instead of hanging it.
+const FAKE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn daemon(tag: &str, replies: Vec<Result<Value, Value>>) -> Fake {
     let path = std::env::temp_dir().join(format!("sp-cli-d-{tag}-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path).unwrap();
     let thread = std::thread::spawn(move || {
         let (s, _) = listener.accept().unwrap();
+        s.set_read_timeout(Some(FAKE_WAIT)).unwrap();
         let mut w = s.try_clone().unwrap();
         let mut r = BufReader::new(s);
         let mut seen = Vec::new();
