@@ -9,11 +9,15 @@
 //!   sweep's scope;
 //! - no live session owns that id.
 //!
-//! The listing is one line per container, `<full ID> <name> <labels as JSON object or null>`,
-//! each as JSON ([`ps_args`]), so a label value holding a newline cannot forge a line
-//! (PROBE_NOTES). A line that does not parse fails the whole sweep, never skips silently. An
-//! orphan is removed by its full ID, never its name, which a new container could have taken
-//! since the listing.
+//! The listing is one line per container, `<full ID> <name> <installation label>`, each a JSON
+//! string ([`ps_args`]; podman prints `""` for a missing label), so a label value holding a
+//! newline cannot forge a line (PROBE_NOTES). Only that one label is asked for, never the whole
+//! set: a container's labels include its image's, so a line would otherwise be as long as an
+//! image author likes (architect Q307). A line is now daemon-bounded (ID, name and UUID, about
+//! 180 bytes), so about 360 containers fit under the launcher's 64 KiB stdout cap; a longer
+//! listing is refused there (#173). A line that does not parse fails the whole sweep, never
+//! skips silently. An orphan is removed by its full ID, never its name, which a new container
+//! could have taken since the listing.
 
 use std::ffi::OsString;
 
@@ -36,7 +40,9 @@ pub fn ps_args(installation: &Installation) -> Vec<OsString> {
         "--filter".to_owned(),
         format!("label={INSTALLATION_LABEL}={}", installation.as_str()),
         "--format".to_owned(),
-        "{{json .ID}} {{json .Names}} {{json .Labels}}".to_owned(),
+        format!(
+            "{{{{json .ID}}}} {{{{json .Names}}}} {{{{json (index .Labels \"{INSTALLATION_LABEL}\")}}}}"
+        ),
     ]
     .into_iter()
     .map(OsString::from)
@@ -61,8 +67,8 @@ struct Listed {
     container: String,
     /// The container name.
     name: String,
-    /// The labels (`None` for `null`).
-    labels: Option<serde_json::Map<String, Value>>,
+    /// Its [`INSTALLATION_LABEL`] value; podman prints `""` for a container without it.
+    label: String,
 }
 
 /// The orphans in `listing` (the output of [`ps_args`]).
@@ -84,14 +90,9 @@ pub fn orphans(
         let Listed {
             container,
             name,
-            labels,
+            label,
         } = parse_line(line).ok_or_else(|| format!("ps line {}: malformed", n + 1))?;
-        let ours = labels
-            .as_ref()
-            .and_then(|l| l.get(INSTALLATION_LABEL))
-            .and_then(Value::as_str)
-            .is_some_and(|v| v == installation.as_str());
-        if !ours {
+        if label != installation.as_str() {
             continue;
         }
         let Some(id) = SESSION_PREFIXES
@@ -113,7 +114,7 @@ pub fn orphans(
     Ok(out)
 }
 
-/// `<string: full ID> <string> <object|null>` and nothing else.
+/// `<string: full ID> <string: name> <string: label>` and nothing else.
 fn parse_line(line: &str) -> Option<Listed> {
     let mut values = serde_json::Deserializer::from_str(line).into_iter::<Value>();
     let mut string = || match values.next()?.ok()? {
@@ -122,15 +123,11 @@ fn parse_line(line: &str) -> Option<Listed> {
     };
     let container = string().filter(|c| full_id(c))?;
     let name = string()?;
-    let labels = match values.next()?.ok()? {
-        Value::Object(m) => Some(m),
-        Value::Null => None,
-        _ => return None,
-    };
+    let label = string()?;
     values.next().is_none().then_some(Listed {
         container,
         name,
-        labels,
+        label,
     })
 }
 
@@ -175,15 +172,13 @@ mod tests {
         h.iter().map(|b| format!("{b:02x}")).collect()
     }
 
+    /// A listing line as podman prints it: a missing label is `""` (PROBE_NOTES, Q307).
     fn line(name: &str, label: Option<&str>) -> String {
-        let labels = label.map_or(
-            Value::Null,
-            |v| serde_json::json!({ INSTALLATION_LABEL: v, "other": "x" }),
-        );
         format!(
-            "\"{}\" {} {labels}",
+            "\"{}\" {} {}",
             cid(name),
-            Value::String(name.to_owned())
+            Value::String(name.to_owned()),
+            Value::String(label.unwrap_or_default().to_owned())
         )
     }
 
@@ -210,7 +205,7 @@ mod tests {
                 "--filter",
                 &format!("label=sallyport.installation={OWN}"),
                 "--format",
-                "{{json .ID}} {{json .Names}} {{json .Labels}}",
+                "{{json .ID}} {{json .Names}} {{json (index .Labels \"sallyport.installation\")}}",
             ]
         );
     }
@@ -230,7 +225,7 @@ mod tests {
         assert_ne!(again, o);
         // Every hex digit, `a` to `f` and `0` to `9`, is one.
         for id in ["0123456789abcdef".repeat(4), "f9".repeat(32)] {
-            let l = format!("\"{id}\" \"sp-ws-a-1\" {{\"{INSTALLATION_LABEL}\": \"{OWN}\"}}");
+            let l = format!("\"{id}\" \"sp-ws-a-1\" \"{OWN}\"");
             let o = orphans(&l, &own(), "", |_| false).unwrap();
             assert_eq!(o[0].container, id);
         }
@@ -258,14 +253,24 @@ mod tests {
         assert_eq!(o[1].id, "a-2");
     }
 
+    /// Architect Q307: podman prints the label as a JSON string (`""` when missing), so any other
+    /// value is not podman's format and fails the sweep. This includes the old labels-object
+    /// form, which once carried every image label.
     #[test]
-    fn a_label_that_is_not_a_string_is_not_this_installations() {
-        let (a, b) = (cid("a"), cid("b"));
-        let listing = format!(
-            "\"{a}\" \"sp-ws-a-1\" {{\"{INSTALLATION_LABEL}\": 7}}\n\
-             \"{b}\" \"sp-ws-a-2\" {{\"other\": \"{OWN}\"}}"
-        );
-        assert!(names(&listing, "", &[]).is_empty());
+    fn a_label_that_is_not_a_string_fails_the_sweep() {
+        let a = cid("a");
+        for bad in [
+            "7".to_owned(),
+            "null".to_owned(),
+            "true".to_owned(),
+            format!("[\"{OWN}\"]"),
+            format!("{{\"{INSTALLATION_LABEL}\": \"{OWN}\"}}"),
+            "{}".to_owned(),
+        ] {
+            let listing = format!("\"{a}\" \"sp-ws-a-1\" {bad}");
+            let e = orphans(&listing, &own(), "", |_| false).unwrap_err();
+            assert_eq!(e, "ps line 1: malformed", "{bad:?}");
+        }
     }
 
     #[test]
@@ -295,26 +300,32 @@ mod tests {
         let id = "0fab".repeat(16);
         let short = &id[..12];
         let upper = id.to_uppercase();
+        // Each line below is well-formed but for one fault, so that fault alone refuses it.
+        assert_eq!(
+            names(&format!("\"{id}\" \"sp-ws-a-1\" \"{OWN}\""), "", &[]),
+            ["sp-ws-a-1"]
+        );
         for bad in [
             "sp-ws-a-1".to_owned(),
             format!("\"{id}\" \"sp-ws-a-1\""),
             format!("\"{id}\" \"sp-ws-a-1\" {{"),
             format!("\"{id}\" \"sp-ws-a-1\" [] "),
-            format!("\"{id}\" \"sp-ws-a-1\" null null"),
-            format!("\"{id}\" 7 null"),
+            format!("\"{id}\" \"sp-ws-a-1\" \"{OWN}\" \"{OWN}\""),
+            format!("\"{id}\" \"sp-ws-a-1\" \"{OWN}\" null"),
+            format!("\"{id}\" 7 \"{OWN}\""),
             // The name where the ID belongs (the old two-field form).
-            "\"sp-ws-a-1\" null".to_owned(),
+            format!("\"sp-ws-a-1\" \"{OWN}\""),
             // An ID that is not 64 lowercase hex digits: truncated, uppercase, too long, a name.
-            format!("\"{short}\" \"sp-ws-a-1\" null"),
-            format!("\"{upper}\" \"sp-ws-a-1\" null"),
-            format!("\"{id}0\" \"sp-ws-a-1\" null"),
-            format!("\"{}g\" \"sp-ws-a-1\" null", &id[..63]),
-            format!("\"{}`\" \"sp-ws-a-1\" null", &id[..63]),
-            format!("\"{}/\" \"sp-ws-a-1\" null", &id[..63]),
-            "\"sp-ws-a-1\" \"sp-ws-a-1\" null".to_owned(),
-            "7 \"sp-ws-a-1\" null".to_owned(),
-            // A listing cut at the output cap.
-            format!("\"{id}\" \"sp-ws-a-1\" {{\"sallyport.installation\":\"0123"),
+            format!("\"{short}\" \"sp-ws-a-1\" \"{OWN}\""),
+            format!("\"{upper}\" \"sp-ws-a-1\" \"{OWN}\""),
+            format!("\"{id}0\" \"sp-ws-a-1\" \"{OWN}\""),
+            format!("\"{}g\" \"sp-ws-a-1\" \"{OWN}\"", &id[..63]),
+            format!("\"{}`\" \"sp-ws-a-1\" \"{OWN}\"", &id[..63]),
+            format!("\"{}/\" \"sp-ws-a-1\" \"{OWN}\"", &id[..63]),
+            format!("\"sp-ws-a-1\" \"sp-ws-a-1\" \"{OWN}\""),
+            format!("7 \"sp-ws-a-1\" \"{OWN}\""),
+            // A line cut inside the label.
+            format!("\"{id}\" \"sp-ws-a-1\" \"0123"),
         ] {
             let listing = format!("{}\n{bad}", line("sp-ws-a-0", Some(OWN)));
             let e = orphans(&listing, &own(), "", |_| false).unwrap_err();

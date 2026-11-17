@@ -702,6 +702,7 @@ fn orphans_of_a_previous_sallyd_are_removed() {
 
 /// A podman whose `ps` prints `<at>/ps-pad` before the real listing while that file exists;
 /// otherwise the real one. `ps` is the first argument the launcher passes.
+/// TODO(#178): one shared wrapper-podman helper and `RemoveOnDrop` in `tests/common`.
 fn ps_padding_podman(at: &std::path::Path, real: &std::path::Path) -> PathBuf {
     let (at, real) = (at.display(), real.display());
     for p in [at.to_string(), real.to_string()] {
@@ -735,13 +736,14 @@ fn a_ps_listing_over_the_output_cap_is_refused_not_cut() {
     let _cleanup = RemoveOnDrop(dir.clone());
     rt().block_on(async {
         let x = Lx::with_podman(|real| ps_padding_podman(&dir, real));
-        // Well-formed lines of no installation: skipped by the parser, exactly CAP bytes.
-        let filler = format!("\"{}\" \"{}\" null\n", "0".repeat(64), "f".repeat(53));
+        // Well-formed lines of no installation (label `""`): skipped by the parser, exactly CAP
+        // bytes.
+        let filler = format!("\"{}\" \"{}\" \"\"\n", "0".repeat(64), "f".repeat(55));
         assert_eq!(filler.len(), LINE);
         let mut pad = filler.repeat(CAP / LINE);
         // Past the cap: an orphan of this installation, in scope, owned by no live session.
         pad.push_str(&format!(
-            "\"{}\" \"sp-ws-{}-lost\" {{\"sallyport.installation\":\"{}\"}}\n",
+            "\"{}\" \"sp-ws-{}-lost\" \"{}\"\n",
             "a".repeat(64),
             x.scope,
             x.installation.as_str()
