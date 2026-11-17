@@ -392,23 +392,11 @@ impl<B: Backend> Llm<B> {
         h: Option<&Head>,
         field: Option<&str>,
     ) -> bool {
-        // The harness chose the method, path and field: declared, so the writer masks them whole
-        // before it cuts and escapes them (architect Q276).
-        let mut entry = self
-            .record
-            .entry(Actor::Sallyd, "llm.deny", Some("deny"))
-            .args(json!({"reason": reason, "status": status}));
-        if let Some(h) = h {
-            entry = entry.text("method", h.method.as_str(), SHORT_STYLE).text(
-                "path",
-                h.path.as_str(),
-                SHORT_STYLE,
-            );
-        }
-        if let Some(f) = field {
-            entry = entry.text("field", f, SHORT_STYLE);
-        }
-        self.record.append(entry).await
+        let e = self.record.entry(Actor::Sallyd, "llm.deny", Some("deny"));
+        let request = h.map(|h| (h.method.as_str(), h.path.as_str()));
+        self.record
+            .append(deny_entry(e, reason, status, request, field))
+            .await
     }
 
     async fn append(&self, entry: NewEntry) -> Result<(), Closed> {
@@ -556,6 +544,28 @@ fn hex(bytes: &[u8]) -> String {
             s
         },
     )
+}
+
+/// The `llm.deny` entry. The harness chose the request's method and path and the field:
+/// declared raw, so the writer masks them whole before it cuts and escapes them (architect
+/// Q276, Q304).
+fn deny_entry(
+    e: NewEntry,
+    reason: &str,
+    status: Option<u16>,
+    request: Option<(&str, &str)>,
+    field: Option<&str>,
+) -> NewEntry {
+    let mut e = e.args(json!({"reason": reason, "status": status}));
+    if let Some((method, path)) = request {
+        e = e
+            .text("method", method, SHORT_STYLE)
+            .text("path", path, SHORT_STYLE);
+    }
+    match field {
+        Some(f) => e.text("field", f, SHORT_STYLE),
+        None => e,
+    }
 }
 
 #[cfg(test)]

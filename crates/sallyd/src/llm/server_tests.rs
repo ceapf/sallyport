@@ -883,3 +883,31 @@ async fn a_stream_one_byte_over_the_cap_in_two_chunks_is_cut_after_the_first() {
     );
     assert_eq!(out.len(), 1);
 }
+
+/// Architect Q276, Q304 (4): an `llm.deny`'s method, path and field are masked whole before
+/// their cut at 64: a form at the start and straddling the cut, with a quote, a backslash and a
+/// non-printable byte. Control: the builder escaping them itself (the old one) leaves the
+/// escaped spelling, which the writer cannot match.
+#[test]
+fn a_denied_requests_method_path_and_field_are_masked_before_their_cut() {
+    use sally_core::audit::Redactor;
+    let value = "q\"u\\o\x01te-secret-0123456789";
+    let union = Redactor::new([("Y", value)]);
+    let run = |text: &str| {
+        value
+            .as_bytes()
+            .windows(8)
+            .filter_map(|w| std::str::from_utf8(w).ok())
+            .any(|w| text.contains(w))
+    };
+    for t in [value.to_owned(), format!("{}{value}", "a".repeat(64 - 10))] {
+        let e = NewEntry::new(Actor::Sallyd, "llm.deny");
+        let v = deny_entry(e, "bad-request", Some(400), Some((&t, &t)), Some(&t)).resolved(&union);
+        for key in ["method", "path", "field"] {
+            let shown = v[key].as_str().expect("the text is logged");
+            // Straddling, the cut may fall inside the placeholder itself.
+            assert!(shown.contains("[REDACTED:"), "{key}: {shown}");
+            assert!(!run(shown), "{key}: {shown}");
+        }
+    }
+}
