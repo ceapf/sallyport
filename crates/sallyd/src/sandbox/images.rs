@@ -82,7 +82,7 @@ impl Launcher {
     /// [`LaunchError::ImageMissing`] when the image is absent, or when `podman image inspect`
     /// does not print exactly one list of references with one carrying the pinned digest;
     /// [`LaunchError::Command`] when podman fails or times out, or when its output is over the
-    /// 64 KiB cap (a `RepoDigests` list that long is refused whole, never read).
+    /// 64 KiB cap (a `RepoDigests` list that long is refused whole, never cut or parsed).
     pub(super) async fn image_present(
         &self,
         pinned: &ImageRef,
