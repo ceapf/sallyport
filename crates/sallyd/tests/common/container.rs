@@ -996,6 +996,8 @@ pub async fn exec(r: &Running, script: &str) -> (i32, String) {
         .unwrap()
 }
 
+// TODO(#178): only exit 1 means absent; any other non-zero status (podman failing) should
+// panic, not read as gone.
 pub fn exists(container: &str) -> bool {
     podman(&["container", "exists", container]).status.success()
 }
