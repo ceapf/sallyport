@@ -60,8 +60,17 @@ impl Fake {
 }
 
 impl Drop for Fake {
+    /// A test that never asked for the requests still learns how its fake ended: a fake that
+    /// panicked (a read that timed out, a request that is not JSON) fails it. A test that is
+    /// already failing does not join, since its fake may still be waiting for a connection.
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+        if !std::thread::panicking()
+            && let Some(t) = self.thread.take()
+            && t.join().is_err()
+        {
+            panic!("the fake daemon failed (see its panic above)");
+        }
     }
 }
 
