@@ -1601,7 +1601,10 @@ sallyport/
   host, lower-cased only, Q289) needs no declaration: the writer's whole-args pass masks it.
   A panic payload, and a failed podman command's stderr, is held whole up to 64 KiB or
   withheld whole, never cut before the logs mask it (Q293, Q295). A path the launch scan names
-  in a refusal is shown raw, never Debug-escaped (Q303). A failed task join is a
+  in a refusal is shown raw, never Debug-escaped (Q303); a detail in the plain style escapes
+  nothing itself, so it can hold DEL, C1 controls and bidi overrides that the audit line's
+  JSON encoding leaves as they are: a viewer of the audit escapes them for display. A failed
+  task join is a
   daemon-chosen constant (`crash::join_text`, Q297): tokio's own text escapes the panic
   message, so the payload is only in the oplog's panic line. The operational log masks a value
   before it escapes and caps it; its callers pass values raw. The work under the writer's lock
@@ -1609,7 +1612,8 @@ sallyport/
   refused key's path, under `llm::body::MAX_BODY` (4 MiB raw), masked whole and then cut at 64
   bytes; it costs one mask per refused request, at most the LLM server's rate per session
   (`llm::server::RATE`, 5 per second, burst 10, taken before any refusal), measured at 0.05 s
-  for the body check and the resolve together in a debug build. A tool call's texts are under
+  for the body check and the resolve together in a debug build. The lock is the daemon's one
+  writer, so several sessions each at that rate add up. A tool call's texts are under
   the tool-call frame cap (256 KiB raw) and are escaped and hashed whole; #174 streams the
   escape and the digest.
   Redaction covers forms only: text that is not a form of a secret (a value the sandbox
