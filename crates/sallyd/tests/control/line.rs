@@ -413,7 +413,7 @@ fn a_bound_session_stops_when_its_connection_ends() {
 }
 
 /// Q102 (b): a connection dropped mid-exec kills the command (`killed: disconnect`), and then
-/// its bound session stops; the result is written before the stop.
+/// its bound session stops; the result is written before the stop, and the container is gone.
 #[test]
 fn a_bound_session_dropped_mid_exec_kills_the_command_then_stops() {
     rt().block_on(async {
@@ -433,6 +433,7 @@ fn a_bound_session_dropped_mid_exec_kills_the_command_then_stops() {
         let result = at(&c, "sandbox.exec_result", |a| a["killed"] == "disconnect")
             .expect("the exec's result");
         assert!(result < stop, "the result follows session.stop");
+        gone(&container).await;
     });
 }
 
