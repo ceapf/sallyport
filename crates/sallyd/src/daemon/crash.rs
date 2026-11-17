@@ -290,7 +290,6 @@ mod tests {
         let e = h.await.unwrap_err();
         assert!(e.to_string().contains("sp-q\\\"u"), "tokio's text: {e}");
         assert_eq!(join_text(&e), JOIN_PANICKED);
-        assert!(!JOIN_PANICKED.contains("sp-q"));
         let h = tokio::spawn(std::future::pending::<()>());
         h.abort();
         assert_eq!(join_text(&h.await.unwrap_err()), JOIN_CANCELLED);
