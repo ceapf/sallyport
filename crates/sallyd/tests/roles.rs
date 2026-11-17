@@ -386,37 +386,8 @@ fn broker_state(x: &Lx) -> (Vec<PathBuf>, std::os::unix::net::UnixListener) {
     (paths, listener)
 }
 
-/// The relative path that climbs from host directory `from` to host path `to` (`../../x`), as a
-/// process would try it from where `from` is mounted.
-fn climb(from: &Path, to: &Path) -> String {
-    let from: Vec<_> = from.components().collect();
-    let to: Vec<_> = to.components().collect();
-    let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
-    let mut parts: Vec<String> = vec!["..".into(); from.len() - common];
-    parts.extend(
-        to[common..]
-            .iter()
-            .map(|c| c.as_os_str().to_str().unwrap().to_owned()),
-    );
-    parts.join("/")
-}
-
 /// The broker's `control.sock` as a role would find it beside its own sockets (form D).
 const CONTROL_SOCK: &str = "/run/sallyport/control.sock";
-
-/// The guest path that `rel` reaches from `/run/sallyport` inside a container (`..` stops at
-/// `/`).
-fn inside(rel: &str) -> String {
-    let mut parts = vec!["run", "sallyport"];
-    for c in rel.split('/') {
-        if c == ".." {
-            parts.pop();
-        } else {
-            parts.push(c);
-        }
-    }
-    format!("/{}", parts.join("/"))
-}
 
 /// RT-FS-10's probe strings for a role whose host socket directory is `sockets`, for each
 /// broker path in `host`: its absolute path (form A), under `/run/sallyport/../..` (B), and

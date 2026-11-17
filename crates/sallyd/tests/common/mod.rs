@@ -169,6 +169,35 @@ pub fn mounts(list: &[String]) -> String {
     format!("filesystem:\n  mounts:\n{}", list.concat())
 }
 
+/// The relative path that climbs from host directory `from` to host path `to` (`../../x`), as a
+/// process would try it from where `from` is mounted.
+pub fn climb(from: &std::path::Path, to: &std::path::Path) -> String {
+    let from: Vec<_> = from.components().collect();
+    let to: Vec<_> = to.components().collect();
+    let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+    let mut parts: Vec<String> = vec!["..".into(); from.len() - common];
+    parts.extend(
+        to[common..]
+            .iter()
+            .map(|c| c.as_os_str().to_str().unwrap().to_owned()),
+    );
+    parts.join("/")
+}
+
+/// The guest path that `rel` reaches from `/run/sallyport` inside a container (`..` stops at
+/// `/`).
+pub fn inside(rel: &str) -> String {
+    let mut parts = vec!["run", "sallyport"];
+    for c in rel.split('/') {
+        if c == ".." {
+            parts.pop();
+        } else {
+            parts.push(c);
+        }
+    }
+    format!("/{}", parts.join("/"))
+}
+
 /// Every entry under `root` (symlinks not followed), sorted: path, type, mode, size, mtime and
 /// the bytes of each file or the target of each link. Equal states mean an unchanged tree (the
 /// red-team rows' "tree hash"; fixtures are small, so the bytes are kept rather than hashed).
