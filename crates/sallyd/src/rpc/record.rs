@@ -269,6 +269,17 @@ impl Recorder {
 /// bytes, then `…(+N)` with the number left out (architect Q288's counted hex format). A builder
 /// declares such a text on its entry ([`sally_core::audit::NewEntry::text`]), so the writer masks
 /// it whole before it is cut and escaped (Q276).
+///
+/// The texts declared in it, and their largest raw length (architect Q304, Q306):
+/// - `llm.deny`'s field, under [`crate::llm::body::MAX_BODY`] (4 MiB), the largest: the path
+///   of a refused key. An unknown key sits inside its enclosing objects and arrays, whose
+///   syntax in the body is longer than the path's prefix, and a decoded key is never longer
+///   than its spelling; every other refusal's field is a name or an index the daemon chose.
+///   Tested at that size in `llm/server_tests.rs`
+///   (`a_refused_key_filling_the_largest_body_is_masked_before_its_cut`).
+/// - `llm.deny`'s method and path, under [`crate::llm::head::MAX_HEAD`].
+/// - `rpc.deny`'s method and id, a tool call's tool name and each argument key, and an
+///   approval's tool name, under [`crate::rpc::agent::MAX_FRAME`].
 pub const SHORT_STYLE: Style = Style::HexCounted { max: LOGGED_BYTES };
 
 /// `raw` in [`SHORT_STYLE`], for text the daemon chose or that is never logged.

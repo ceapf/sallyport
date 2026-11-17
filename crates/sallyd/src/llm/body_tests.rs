@@ -38,6 +38,71 @@ fn msg(m: Value) -> Value {
     json!({ "messages": [m] })
 }
 
+/// Architect Q306 (3): a refused key's path is shorter than the body that holds it, for every
+/// shape that puts a body-chosen key into the field, so a field is under [`MAX_BODY`]. A
+/// one-byte key is the tightest case: the path's prefix and the body's syntax around the key
+/// do not grow with it. An escaped key decodes shorter than its spelling.
+#[test]
+fn a_refused_keys_path_is_shorter_than_its_body() {
+    let user = r#"{"messages":[{"role":"user"}]"#;
+    let tool = r#"{"type":"function","function":{"name":"f"}}"#;
+    let ten_users = [r#"{"role":"user"}"#; 10].join(",");
+    let ten_tools = [tool; 10].join(",");
+    let cases = [
+        (r#"{"k":0}"#.to_owned(), "k"),
+        (r#"{"k":0}"#.to_owned(), "k"),
+        (r#"{"messages":[{"k":0}]}"#.to_owned(), "messages[0].k"),
+        (
+            format!(r#"{{"messages":[{ten_users},{{"k":0}}]}}"#),
+            "messages[10].k",
+        ),
+        (
+            r#"{"messages":[{"role":"user","content":[{"type":"text","k":0}]}]}"#.to_owned(),
+            "messages[0].content[0].k",
+        ),
+        (
+            r#"{"messages":[{"role":"assistant","tool_calls":[{"k":0}]}]}"#.to_owned(),
+            "messages[0].tool_calls[0].k",
+        ),
+        (
+            r#"{"messages":[{"role":"assistant","tool_calls":[{"id":"a","type":"function","function":{"k":0}}]}]}"#
+                .to_owned(),
+            "messages[0].tool_calls[0].function.k",
+        ),
+        (format!(r#"{user},"tools":[{{"k":0}}]}}"#), "tools[0].k"),
+        (
+            format!(r#"{user},"tools":[{ten_tools},{{"k":0}}]}}"#),
+            "tools[10].k",
+        ),
+        (
+            format!(r#"{user},"tools":[{{"type":"function","function":{{"k":0}}}}]}}"#),
+            "tools[0].function.k",
+        ),
+        (format!(r#"{user},"tool_choice":{{"k":0}}}}"#), "tool_choice.k"),
+        (
+            format!(r#"{user},"tool_choice":{{"type":"function","function":{{"k":0}}}}}}"#),
+            "tool_choice.function.k",
+        ),
+        (
+            format!(r#"{user},"stream_options":{{"k":0}}}}"#),
+            "stream_options.k",
+        ),
+        (
+            format!(r#"{user},"response_format":{{"k":0}}}}"#),
+            "response_format.k",
+        ),
+    ];
+    for (body, field) in cases {
+        let r = check(body.as_bytes(), CONTEXT).unwrap_err();
+        assert_eq!(
+            (r.reason, r.field.as_str()),
+            (Reason::UnknownField, field),
+            "{body}"
+        );
+        assert!(r.field.len() < body.len(), "{body}");
+    }
+}
+
 #[test]
 fn a_minimal_body_passes() {
     let c = run(&base()).unwrap();

@@ -1605,8 +1605,13 @@ sallyport/
   daemon-chosen constant (`crash::join_text`, Q297): tokio's own text escapes the panic
   message, so the payload is only in the oplog's panic line. The operational log masks a value
   before it escapes and caps it; its callers pass values raw. The work under the writer's lock
-  for one entry is bounded by the tool-call frame cap (256 KiB raw; #174 streams the escape
-  and the digest, Q298).
+  for one entry is bounded by the largest declared text (Q298, Q306): an `llm.deny` field, a
+  refused key's path, under `llm::body::MAX_BODY` (4 MiB raw), masked whole and then cut at 64
+  bytes; it costs one mask per refused request, at most the LLM server's rate per session
+  (`llm::server::RATE`, 5 per second, burst 10, taken before any refusal), measured at 0.05 s
+  for the body check and the resolve together in a debug build. A tool call's texts are under
+  the tool-call frame cap (256 KiB raw) and are escaped and hashed whole; #174 streams the
+  escape and the digest.
   Redaction covers forms only: text that is not a form of a secret (a value the sandbox
   transformed, a CONNECT host it logs lower-cased, #160) is not redacted anywhere. A store
   value under 16 bytes is stored and reported short (`SHORT_SECRET_BYTES`: its base64 forms are
