@@ -95,11 +95,13 @@ impl HostAddrs for FakeHost {
     }
 }
 
-/// Records (event, decision, arguments); `fail` refuses every append.
+/// Records (event, decision, arguments); `fail` refuses every append. Each entry is resolved
+/// with `redactor` as the writer resolves it (empty by default; architect Q301).
 #[derive(Default)]
 struct Sink {
     entries: Mutex<Vec<(String, Option<String>, Value)>>,
     fail: bool,
+    redactor: sally_core::audit::Redactor,
 }
 
 impl AuditSink for Sink {
@@ -110,7 +112,7 @@ impl AuditSink for Sink {
         let row = (
             e.event().to_owned(),
             e.decision_value().map(str::to_owned),
-            e.resolved(&sally_core::audit::Redactor::default()),
+            e.resolved(&self.redactor),
         );
         self.entries.lock().unwrap().push(row);
         Ok(())
@@ -233,6 +235,57 @@ impl Rig {
 
 fn connect(target: &str) -> Vec<u8> {
     format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").into_bytes()
+}
+
+/// RT-SEC-15, the host case (#162, architect Q289 (2), Q301 (i)): session X, without grants,
+/// CONNECTs under the `*.mock.test` rule to a host whose label is live session Y's value. The
+/// proxy's own `egress.allow` and `egress.close` builders put the host in plain args, uncut
+/// and unescaped, so the writer's pass with Y's forms masks it whole. Control: the same flow
+/// without Y's forms logs the label.
+#[tokio::test]
+async fn rt_sec_15_a_live_sessions_value_as_a_wildcard_host_is_masked_in_allow_and_close() {
+    let label = format!("ylabel{}", "q7".repeat(12));
+    let host = format!("{label}.mock.test");
+    let value = sally_core::secrets::Secret::new(label.clone());
+    let forms = sally_core::audit::SessionForms::build([("Y_LABEL", &value, vec![])]);
+    let flow = |redactor: sally_core::audit::Redactor| {
+        let host = host.clone();
+        async move {
+            let rig = Setup {
+                resolver: FakeResolver::default().with(&host, vec![vec![public(1)]]),
+                sink: Sink {
+                    redactor,
+                    ..Sink::default()
+                },
+                ..Setup::default()
+            }
+            .rig();
+            let got = rig.send(&connect(&format!("{host}:443"))).await;
+            assert!(got.starts_with("HTTP/1.1 200"), "{got}");
+            assert_eq!(rig.sink.events(), ["egress.allow", "egress.close"]);
+            ["egress.allow", "egress.close"].map(|e| rig.sink.args(e))
+        }
+    };
+    let run = |text: &str| {
+        label
+            .as_bytes()
+            .windows(8)
+            .filter_map(|w| std::str::from_utf8(w).ok())
+            .any(|w| text.contains(w))
+    };
+    let masked = flow(sally_core::audit::Redactor::from_forms([forms])).await;
+    for args in &masked {
+        assert_eq!(args["host"], "[REDACTED:Y_LABEL].mock.test", "{args}");
+        assert!(!run(&args.to_string()), "{args}");
+    }
+    let control = flow(sally_core::audit::Redactor::default()).await;
+    for args in &control {
+        assert_eq!(
+            args["host"].as_str(),
+            Some(host.as_str()),
+            "control: {args}"
+        );
+    }
 }
 
 #[tokio::test]
