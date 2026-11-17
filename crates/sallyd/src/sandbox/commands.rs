@@ -101,6 +101,7 @@ impl Launcher {
     }
 
     /// Runs one hermetic podman command; stdout on success.
+    /// TODO(#173): a stdout longer than `OUTPUT_CAP` is cut here, not refused.
     pub(super) async fn run(
         &self,
         verb: &'static str,
