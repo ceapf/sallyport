@@ -13,9 +13,12 @@
 //! string ([`ps_args`]; podman prints `""` for a missing label), so a label value holding a
 //! newline cannot forge a line (PROBE_NOTES). Only that one label is asked for, never the whole
 //! set: a container's labels include its image's, so a line would otherwise be as long as an
-//! image author likes (architect Q307). A line is daemon-bounded (ID, name and UUID, about
-//! 180 bytes), so about 360 containers fit under the launcher's 64 KiB stdout cap; a longer
-//! listing is refused there (#173). A line that does not parse fails the whole sweep, never
+//! image author likes (architect Q307). A line is daemon-bounded (ID, name and UUID, at most
+//! 179 bytes), so about 360 containers fit under the launcher's 64 KiB stdout cap; a longer
+//! listing is refused there (#173). The live sessions are bounded so their worst listing fits
+//! with room to spare ([`super::budget::MAX_LIVE_SESSIONS`], checked when a launch reserves its
+//! id; the relation is tested below). Inference instances and outside-made containers are not
+//! counted, which leaves a residual (TODO(#134)). A line that does not parse fails the whole sweep, never
 //! skips silently. An orphan is removed by its full ID, never its name, which a new container
 //! could have taken since the listing.
 
@@ -154,6 +157,10 @@ fn plain_name(s: &str) -> bool {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::sandbox::budget::MAX_LIVE_SESSIONS;
+    use crate::sandbox::commands::OUTPUT_CAP;
+    use crate::sandbox::launch::stdout_text;
+    use crate::sandbox::types::SessionId;
 
     const OWN: &str = "0123abcd-ef01-4234-8567-89abcdef0123";
     const OTHER: &str = "fedcba98-7654-4321-8fed-cba987654321";
@@ -348,5 +355,73 @@ mod tests {
         for bad in ["", "A", "a b", "a/b", "a;b", "a_b"] {
             assert!(!plain_name(bad), "{bad:?}");
         }
+    }
+
+    /// The longest listing line a session container can have, newline included: a full ID, the
+    /// longer session prefix with a 64-character id, and an installation UUID, each a JSON
+    /// string ([`ps_args`]).
+    const MAX_PS_LINE: usize = 179;
+
+    /// Listing lines counted per live session: twice its two containers ([`SESSION_PREFIXES`]),
+    /// the factor of two being margin.
+    const LINES_PER_SESSION: usize = 4;
+
+    /// Listing room no live session accounts for: inference instances, which the sweep lists but
+    /// `Sessions` does not count (TODO(#134)), and leftovers of killed predecessors or
+    /// containers made outside this daemon under its label.
+    const HEADROOM: usize = 16 * 1024;
+
+    /// The longest line `name` can have as podman prints it, newline included.
+    fn listed(name: &str) -> String {
+        format!("{}\n", line(name, Some(OWN)))
+    }
+
+    #[test]
+    fn max_ps_line_is_the_longest_line_a_session_container_has() {
+        let id = "a".repeat(64);
+        assert!(SessionId::parse(&id).is_ok(), "64 characters is an id");
+        assert!(SessionId::parse(&format!("{id}a")).is_err(), "65 is not");
+        let longest = SESSION_PREFIXES
+            .iter()
+            .map(|p| listed(&format!("{p}{id}")).len())
+            .max()
+            .unwrap();
+        assert_eq!(longest, MAX_PS_LINE);
+    }
+
+    #[test]
+    fn the_listing_of_the_most_live_sessions_leaves_the_headroom_under_the_cap() {
+        let worst = LINES_PER_SESSION * MAX_LIVE_SESSIONS * MAX_PS_LINE;
+        assert!(
+            worst + HEADROOM <= OUTPUT_CAP,
+            "{worst} + {HEADROOM} > {OUTPUT_CAP}"
+        );
+    }
+
+    /// The worst listing of [`MAX_LIVE_SESSIONS`] sessions, every line as long as a line gets,
+    /// goes through the launcher's stdout check and parses; the cap refuses the listing one
+    /// session's block past what fits, so the limit is what keeps the sweep working.
+    #[test]
+    fn the_session_limit_keeps_the_worst_listing_under_the_cap() {
+        let block = |n: usize| -> String {
+            (0..LINES_PER_SESSION)
+                .map(|k| {
+                    let l = listed(&format!("sp-ws-{:a<64}", format!("{n}-{k}")));
+                    assert_eq!(l.len(), MAX_PS_LINE, "{l}");
+                    l
+                })
+                .collect()
+        };
+        let listing = |sessions: usize| -> String { (0..sessions).map(block).collect() };
+
+        let worst = listing(MAX_LIVE_SESSIONS);
+        let text = stdout_text("ps", worst.as_bytes(), OUTPUT_CAP).unwrap();
+        let found = orphans(&text, &own(), "", |_| false).unwrap();
+        assert_eq!(found.len(), LINES_PER_SESSION * MAX_LIVE_SESSIONS);
+
+        let fits = OUTPUT_CAP / (LINES_PER_SESSION * MAX_PS_LINE);
+        assert!(MAX_LIVE_SESSIONS < fits, "{MAX_LIVE_SESSIONS} >= {fits}");
+        assert!(stdout_text("ps", listing(fits).as_bytes(), OUTPUT_CAP).is_ok());
+        assert!(stdout_text("ps", listing(fits + 1).as_bytes(), OUTPUT_CAP).is_err());
     }
 }

@@ -43,7 +43,7 @@ use crate::egress::inject::StoreFile;
 use crate::oplog::Oplog;
 use crate::rpc::control::{Control, ControlParts};
 use crate::rpc::record::Recorder;
-use crate::sandbox::budget::session_budget;
+use crate::sandbox::budget::{MAX_LIVE_SESSIONS, session_budget};
 use crate::sandbox::{
     AuditSink, CheckedRuntime, DirError, DiskFloor, Installation, LaunchError, Launcher,
     LauncherParts, PODMAN_PATH_VAR, Podman, PodmanError, PodmanHost, ProbeError, ScanLimits,
@@ -341,7 +341,7 @@ async fn serve(
         ids,
         xdg_runtime_dir: dirs.runtime.clone(),
         data_dir: dirs.state(),
-        sessions: Arc::new(Sessions::new(session_budget(nofile))),
+        sessions: Arc::new(Sessions::new(session_budget(nofile), MAX_LIVE_SESSIONS)),
         audit: Arc::clone(&audit),
         limits: ScanLimits::default(),
         disk_floor: DiskFloor::default(),

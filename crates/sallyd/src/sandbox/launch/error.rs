@@ -165,6 +165,7 @@ impl LaunchError {
             Self::Scan(ScanError::TooManyShields { .. } | ScanError::Limit { .. }) => "scan-limit",
             Self::Scan(_) | Self::Claims(_) => "mount-changed",
             Self::Overlap(ReserveError::FdBudget(_)) => "fd-budget",
+            Self::Overlap(ReserveError::SessionLimit(_)) => "session-limit",
             Self::Overlap(_) => "overlap",
             Self::Dirs(_) => "session-dir",
             Self::Argv(_) => "argv",

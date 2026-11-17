@@ -23,7 +23,7 @@ use std::sync::Mutex;
 use rustix::fs::{Mode, OFlags};
 use sally_core::manifest::{MountMode, ValidatedManifest};
 
-use super::budget::{FdRefusal, admit};
+use super::budget::{FdRefusal, SessionLimit, admit, admit_session};
 
 /// Bound on the ancestor walk (the kernel's path depth is far below it).
 const MAX_ANCESTORS: usize = 4096;
@@ -144,6 +144,9 @@ pub enum ReserveError {
     /// The session's descriptors do not fit the daemon's budget (#48).
     #[error(transparent)]
     FdBudget(#[from] FdRefusal),
+    /// The daemon already keeps its most live sessions ([`super::budget::MAX_LIVE_SESSIONS`]).
+    #[error(transparent)]
+    SessionLimit(#[from] SessionLimit),
 }
 
 /// The live sessions of this `sallyd`: their claims and the descriptors each reserved.
@@ -152,6 +155,8 @@ pub struct Sessions {
     live: Mutex<Live>,
     /// The descriptors all sessions may hold together ([`super::budget::session_budget`]).
     fd_budget: u64,
+    /// The most sessions live at once ([`super::budget::MAX_LIVE_SESSIONS`]).
+    max_sessions: usize,
 }
 
 /// Why a harness launch could not claim its session's harness (architect Q139).
@@ -176,12 +181,14 @@ struct Live {
 }
 
 impl Sessions {
-    /// No live session yet; together the sessions may hold `fd_budget` descriptors.
+    /// No live session yet; together the sessions may hold `fd_budget` descriptors, and at most
+    /// `max_sessions` of them are live at once.
     #[must_use]
-    pub fn new(fd_budget: u64) -> Self {
+    pub fn new(fd_budget: u64, max_sessions: usize) -> Self {
         Self {
             live: Mutex::new(Live::default()),
             fd_budget,
+            max_sessions,
         }
     }
 
@@ -191,16 +198,18 @@ impl Sessions {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Checks `claims` against every live session and `fds` against the descriptor budget, and
-    /// records both under `id`, atomically.
+    /// Checks the live count against the session limit, `claims` against every live session and
+    /// `fds` against the descriptor budget, and records both under `id`, atomically.
     ///
     /// # Errors
-    /// [`ReserveError`] for a live id, an overlap or a budget the session does not fit.
+    /// [`ReserveError`] for a live id, a full session limit, an overlap or a budget the session
+    /// does not fit, checked in that order.
     pub fn reserve(&self, id: &str, claims: Vec<Claim>, fds: u64) -> Result<(), ReserveError> {
         let mut live = self.lock();
         if live.held.contains_key(id) {
             return Err(ReserveError::Duplicate(id.to_owned()));
         }
+        admit_session(self.max_sessions, live.held.len())?;
         if let Some(c) = conflict(
             live.held.iter().map(|(k, v)| (k.as_str(), v.0.as_slice())),
             &claims,
@@ -266,6 +275,8 @@ mod tests {
 
     /// A budget no test reaches.
     const BIG: u64 = 1 << 40;
+    /// A session limit no test reaches unless it means to.
+    const MANY: usize = 1 << 20;
 
     const MODES: [MountMode; 4] = [
         MountMode::Ro,
@@ -356,7 +367,7 @@ mod tests {
     /// claim, and the session's release drops it.
     #[test]
     fn a_harness_claims_a_live_session_once_until_freed_or_released() {
-        let s = Sessions::new(BIG);
+        let s = Sessions::new(BIG, MANY);
         assert_eq!(
             s.claim_harness("a"),
             Err(HarnessClaimError::NotLive("a".into()))
@@ -403,7 +414,7 @@ mod tests {
 
     #[test]
     fn a_session_is_live_from_reserve_to_release() {
-        let s = Sessions::new(BIG);
+        let s = Sessions::new(BIG, MANY);
         assert!(!s.is_live("a"));
         s.reserve("a", vec![], 0).unwrap();
         assert!(s.is_live("a"));
@@ -440,7 +451,7 @@ mod tests {
 
     #[test]
     fn reservations_are_atomic_unique_and_released() {
-        let s = Sessions::new(BIG);
+        let s = Sessions::new(BIG, MANY);
         s.reserve("a", vec![c("/h/p", MountMode::Rw)], 0).unwrap();
         assert_eq!(
             s.reserve("a", vec![], 0),
@@ -457,7 +468,7 @@ mod tests {
 
     #[test]
     fn read_only_and_staged_sessions_may_share() {
-        let s = Sessions::new(BIG);
+        let s = Sessions::new(BIG, MANY);
         s.reserve("a", vec![c("/h/p", MountMode::Staged)], 0)
             .unwrap();
         s.reserve("b", vec![c("/h/p", MountMode::Ro)], 0).unwrap();
@@ -473,7 +484,7 @@ mod tests {
     /// freed with them.
     #[test]
     fn the_fd_budget_is_reserved_and_released_with_the_claims() {
-        let s = Sessions::new(1000);
+        let s = Sessions::new(1000, MANY);
         s.reserve("a", vec![c("/h/a", MountMode::Rw)], 600).unwrap();
         assert_eq!(
             s.reserve("b", vec![c("/h/b", MountMode::Rw)], 401),
@@ -495,7 +506,7 @@ mod tests {
 
     #[test]
     fn a_refused_overlap_or_duplicate_takes_no_descriptors() {
-        let s = Sessions::new(100);
+        let s = Sessions::new(100, MANY);
         s.reserve("a", vec![c("/h/p", MountMode::Rw)], 50).unwrap();
         assert!(matches!(
             s.reserve("b", vec![c("/h/p/x", MountMode::Ro)], 10),
@@ -508,9 +519,56 @@ mod tests {
         s.reserve("c", vec![], 50).unwrap();
     }
 
+    /// The live count is bounded with the claims and descriptors, in the same lock: the session
+    /// past the limit is refused before the overlap walk and the descriptor budget, holds
+    /// nothing, and a release admits the next. A live id stays a duplicate at the limit.
+    #[test]
+    fn the_session_limit_is_reserved_and_released_with_the_claims() {
+        let s = Sessions::new(100, 3);
+        s.reserve("a", vec![c("/h/a", MountMode::Rw)], 10).unwrap();
+        s.reserve("b", vec![c("/h/b", MountMode::Rw)], 10).unwrap();
+        s.reserve("c", vec![], 10).unwrap();
+        let full = Err(ReserveError::SessionLimit(SessionLimit {
+            live: 3,
+            limit: 3,
+        }));
+        assert_eq!(s.reserve("d", vec![c("/h/d", MountMode::Rw)], 10), full);
+        // Checked first: an overlap or a descriptor count that does not fit is still the limit.
+        assert_eq!(s.reserve("d", vec![c("/h/a/x", MountMode::Ro)], 10), full);
+        assert_eq!(s.reserve("d", vec![], 1000), full);
+        assert!(!s.is_live("d"), "a refused session holds nothing");
+        assert_eq!(
+            s.reserve("a", vec![], 10),
+            Err(ReserveError::Duplicate("a".into()))
+        );
+        s.release("c");
+        // The refusals took no descriptors: 30 were held, c's 10 are free again, so 80 fit.
+        s.reserve("d", vec![c("/h/d", MountMode::Rw)], 80).unwrap();
+        assert_eq!(s.reserve("e", vec![], 0), full);
+        s.release("a");
+        s.release("b");
+        s.release("d");
+        for id in ["e", "f", "g"] {
+            s.reserve(id, vec![], 0).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_session_limit_of_zero_admits_no_session() {
+        let s = Sessions::new(100, 0);
+        assert_eq!(
+            s.reserve("a", vec![], 0),
+            Err(ReserveError::SessionLimit(SessionLimit {
+                live: 0,
+                limit: 0
+            }))
+        );
+        assert!(!s.is_live("a"));
+    }
+
     #[test]
     fn a_budget_too_small_for_one_session_refuses_it() {
-        let s = Sessions::new(10);
+        let s = Sessions::new(10, MANY);
         assert!(matches!(
             s.reserve("a", vec![], 11),
             Err(ReserveError::FdBudget(_))
