@@ -96,6 +96,31 @@ fn constants(text: &str) -> Vec<(&'static str, String)> {
     out
 }
 
+/// The index just past the block comment opening at `chars[start]` (`/*`). Block comments nest
+/// in Rust: `/* /* */ */` is one comment. An unterminated one panics, as an unterminated string
+/// does: the scanners would be out of step with the compiler.
+fn block_comment_end(chars: &[char], start: usize) -> usize {
+    let mut depth = 0usize;
+    let mut j = start;
+    while let Some(&c) = chars.get(j) {
+        match (c, chars.get(j + 1)) {
+            ('/', Some('*')) => {
+                depth += 1;
+                j += 2;
+            }
+            ('*', Some('/')) => {
+                depth -= 1;
+                j += 2;
+                if depth == 0 {
+                    return j;
+                }
+            }
+            _ => j += 1,
+        }
+    }
+    panic!("unterminated block comment at char {start}");
+}
+
 /// `src` with the contents of string and char literals and of comments blanked (same length,
 /// newlines kept), so a brace, a quote or a `|` inside one is not read as code. Lifetimes (`'a`)
 /// are left alone.
@@ -113,9 +138,7 @@ fn strip_literals(src: &str) -> String {
                     .position(|&q| q == '\n')
                     .map_or(chars.len(), |n| i + n)
             } else {
-                (i + 2..chars.len().saturating_sub(1))
-                    .find(|&j| chars[j] == '*' && chars[j + 1] == '/')
-                    .map_or(chars.len(), |j| j + 2)
+                block_comment_end(&chars, i)
             };
             out.extend(
                 chars[i..end]
@@ -451,7 +474,9 @@ fn literals_do_not_end_a_function_or_add_operands() {
 
 /// The files in mutation scope: the `--file` lists of the Makefile's mutation targets
 /// (`MUTANTS_FILES` and the four `MUTANTS_WIDE_*`), with `$(addprefix …)` and `dir/*.rs`
-/// expanded, so a file added to a list is covered at once.
+/// expanded, so a file added to a list is covered at once. Read as text: nothing here proves
+/// cargo-mutants reaches each one (right `--package`, a parsed `mod` chain, every shard row).
+/// TODO(#193).
 fn mutation_scope() -> Vec<String> {
     let make = std::fs::read_to_string(root().join("Makefile")).unwrap();
     let vars = [
@@ -587,21 +612,26 @@ fn matching_brace(src: &str, open: usize) -> usize {
     panic!("unbalanced braces after byte {open}");
 }
 
+/// Each `fn new` in `src` (stripped): where `fn` starts, and the index of its body's `{`, or
+/// `None` for a declaration without a body (a trait's).
+fn new_sites(src: &str) -> impl Iterator<Item = (usize, Option<usize>)> + '_ {
+    src.match_indices("fn new").filter_map(|(at, _)| {
+        let after = &src[at + "fn new".len()..];
+        let word_start = at == 0 || !src[..at].ends_with(is_ident);
+        (word_start && matches!(after.chars().next(), Some('(' | '<')))
+            .then(|| (at, body_open(after).map(|i| at + "fn new".len() + i)))
+    })
+}
+
 /// Each `fn new` with a body in `src` (stripped): the type of the innermost `impl` block holding
 /// it (`(free fn)` outside every block), and the body between its braces.
 fn news(src: &str) -> Vec<(String, String)> {
     let blocks = impl_blocks(src);
     let mut out = Vec::new();
-    for (at, _) in src.match_indices("fn new") {
-        let after = &src[at + "fn new".len()..];
-        let word_start = at == 0 || !src[..at].ends_with(is_ident);
-        if !word_start || !matches!(after.chars().next(), Some('(' | '<')) {
-            continue;
-        }
-        let Some(open) = body_open(after) else {
-            continue; // a trait's declaration: no body
+    for (at, open) in new_sites(src) {
+        let Some(open) = open else {
+            continue; // a trait's declaration: no body, so Q358's count disagrees (Q370)
         };
-        let open = at + "fn new".len() + open;
         let close = matching_brace(src, open);
         let ty = blocks
             .iter()
@@ -614,7 +644,9 @@ fn news(src: &str) -> Vec<(String, String)> {
 
 /// Each `impl` block in `src` (stripped), in order: its header from `impl` to the block's `{`
 /// with whitespace collapsed to one line (rustfmt wraps long ones), and the indices of its `{`
-/// and `}`. An `impl Trait` in a parameter type has no block and is skipped.
+/// and `}`. An `impl Trait` in a parameter type has no block and is skipped; one in return
+/// position (`-> impl Iterator<Item = u8> {`) is read as a block, which can only mislabel a
+/// `fn new` nested in that function, never hide a `Default` impl (its header has no `for`).
 fn impl_blocks(src: &str) -> Vec<(String, usize, usize)> {
     let mut out = Vec::new();
     for (at, _) in src.match_indices("impl") {
@@ -725,23 +757,15 @@ fn body_open(sig: &str) -> Option<usize> {
     None
 }
 
-/// The type of the last `impl` block opened in `before`: the path after `for` when there is
-/// one, its last segment, without generics.
-fn impl_type(before: &str) -> String {
-    let line = before
-        .lines()
-        .rev()
-        .map(str::trim_start)
-        .find(|l| l.starts_with("impl"))
-        .unwrap_or("impl ?");
-    let mut rest = past_generics(line.trim_start_matches("impl").trim_start());
+/// The type an `impl` block is for, from its one-line `header` (as [`impl_blocks`] gives it):
+/// the path after `for` when there is one, its last segment, without generics.
+fn impl_type(header: &str) -> String {
+    let mut rest = past_generics(header.trim_start_matches("impl").trim_start());
     if let Some((_, ty)) = rest.split_once(" for ") {
         rest = ty;
     }
-    let path: String = rest
-        .chars()
-        .take_while(|&c| is_ident(c) || c == ':')
-        .collect();
+    // `is_ident` takes `:`, so the whole path is read.
+    let path: String = rest.chars().take_while(|&c| is_ident(c)).collect();
     path.rsplit("::").next().unwrap_or_default().to_owned()
 }
 
@@ -934,7 +958,8 @@ fn no_fn_new_in_mutation_scope_holds_logic() {
         let code = without_test_modules(&strip_literals(&src));
         let found_here = news(&code);
         let simple = word_pairs(&code, "fn", "new");
-        assert_scanned(&file, "fn new", simple, found_here.len());
+        let what = "fn new (a body-less `fn new(..);` is a disagreement too, Q370)";
+        assert_scanned(&file, what, simple, found_here.len());
         for (ty, body) in found_here {
             match logic_in(&body) {
                 Some(why) => found.push(format!("{file}: {ty}::new holds {why}")),
@@ -1087,9 +1112,13 @@ fn the_guard_finds_each_fn_new_with_its_impl_type() {
          Self { a: \"if\" }\n    }\n}\n\
          #[cfg(test)]\nmod tests {\n    impl T { fn new() -> u8 { if x { 1 } else { 2 } } }\n}\n",
     );
-    let found = news(&without_test_modules(&src));
+    let code = without_test_modules(&src);
+    let found = news(&code);
     let types: Vec<&str> = found.iter().map(|(t, _)| t.as_str()).collect();
     assert_eq!(types, ["Foo", "Baz"]);
+    // Q370: trait Q's body-less `fn new` is a token the scanner does not return, so the
+    // coverage check would refuse it.
+    assert_eq!(word_pairs(&code, "fn", "new"), found.len() + 1);
     assert!(
         found.iter().all(|(_, b)| logic_in(b).is_none()),
         "{found:?}"
@@ -1113,7 +1142,9 @@ fn a_delegating_call_or_a_plain_struct_literal_is_no_logic() {
 #[test]
 #[should_panic(expected = "holds")]
 fn the_guard_refuses_a_struct_base() {
-    refuse(" Self { inner, stream: redaction.clone(), ..Self::default() } ");
+    // A plain base: only the `..` rule refuses it (`..Self::default()` also trips the method
+    // call rule on its second dot).
+    refuse(" Self { inner, ..base } ");
 }
 
 #[test]
@@ -1233,6 +1264,11 @@ fn the_guard_finds_the_body_after_a_braced_return_type() {
     );
     let found = news(&src);
     assert_eq!(found.len(), 2, "{found:?}");
+    assert_eq!(
+        word_pairs(&src, "fn", "new"),
+        3,
+        "trait Q's declaration disagrees (Q370)"
+    );
     assert_eq!(found[0].0, "Foo");
     assert!(logic_in(&found[0].1).is_some(), "{found:?}");
     assert_eq!(found[1], ("Baz".to_owned(), " [0, 1, 2, 3] ".to_owned()));
@@ -1267,7 +1303,7 @@ fn the_nightly_pins_the_cargo_mutants_version_the_guards_were_read_at() {
 /// `examine_re`, `skip_calls` and `skip_calls_defaults`, which no check here reads; each would
 /// narrow the nightly unseen.
 #[test]
-fn the_mutants_config_holds_only_the_keys_the_checks_read() {
+fn the_mutants_config_holds_only_the_known_keys() {
     let v: toml::Value = toml::from_str(&config_text()).unwrap();
     let mut keys: Vec<&str> = v
         .as_table()
@@ -1287,11 +1323,22 @@ fn names_mutants_skip(text: &str) -> bool {
         || squeezed(&strip_literals(text)).contains("mutants::skip")
 }
 
-/// Every `.rs` file under `dir`, recursively.
+/// Every `.rs` file under `dir`, recursively. A symlink fails the walk by name: it could loop or
+/// lead out of the tree, and the crates hold none.
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {
-        let path = entry.unwrap().path();
-        if path.is_dir() {
+        let path = entry
+            .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+            .path();
+        let kind = std::fs::symlink_metadata(&path)
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+            .file_type();
+        assert!(
+            !kind.is_symlink(),
+            "{}: a symlink in a crate's src/",
+            path.display()
+        );
+        if kind.is_dir() {
             rust_files(&path, out);
         } else if path.extension().is_some_and(|x| x == "rs") {
             out.push(path);
@@ -1330,7 +1377,11 @@ fn no_source_of_a_mutated_crate_names_mutants_skip() {
     let named: Vec<&String> = read
         .iter()
         .zip(&files)
-        .filter(|(_, p)| names_mutants_skip(&std::fs::read_to_string(p).unwrap()))
+        .filter(|(_, p)| {
+            let text =
+                std::fs::read_to_string(p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+            names_mutants_skip(&text)
+        })
         .map(|(f, _)| f)
         .collect();
     assert!(
@@ -1347,6 +1398,7 @@ fn the_skip_scan_sees_every_spelling_and_nothing_else() {
         "#![cfg_attr(miri, mutants :: skip)]",
         "#[cfg_attr(miri, mutants\n    ::\n    skip)]",
         "#[cfg_attr(miri, mutants /* hidden */ :: skip)]",
+        "#[cfg_attr(miri, mutants /* /* nested */ */ :: skip)]",
     ] {
         assert!(names_mutants_skip(text), "{text}");
     }
@@ -1395,9 +1447,46 @@ fn the_count_check_refuses_a_disagreement() {
 #[test]
 fn the_simple_counts_skip_identifiers_and_cross_lines() {
     let code = "impl Default\n    for A {}\nimpl MyDefault for B {}\nimpl Default fork\n\
-                fn new() {} fn newer() {} dfn new() {} fn  new() {}";
+                impl Defaultfor C {}\nfn new() {} fn newer() {} dfn new() {} fn  new() {} \
+                fnnew() {}";
     assert_eq!(word_pairs(code, "Default", "for"), 1);
     assert_eq!(word_pairs(code, "fn", "new"), 2);
+}
+
+/// Q369: block comments nest, so the tail of an outer one stays blank (its `|` adds no operand,
+/// its `{` opens no body) and `/*/` does not close one.
+#[test]
+fn a_nested_block_comment_is_one_comment() {
+    let src = "a /* x /* y */ | { */ b\n/*/ c */ d";
+    let out = strip_literals(src);
+    assert_eq!(out.chars().count(), src.chars().count());
+    assert_eq!(out.lines().count(), 2);
+    assert_eq!(out.split_whitespace().collect::<Vec<_>>(), ["a", "b", "d"]);
+}
+
+#[test]
+#[should_panic(expected = "unterminated block comment")]
+fn an_unterminated_block_comment_panics() {
+    strip_literals("a /* b /* c */ d");
+}
+
+#[test]
+fn an_impl_block_opens_outside_brackets_and_an_impl_in_a_type_has_none() {
+    fn at(s: &str) -> Option<&str> {
+        block_open(s).map(|i| &s[..i])
+    }
+    let arrow = "impl<F: Fn() -> u8> Default for H<F> { x }";
+    assert_eq!(at(arrow), Some("impl<F: Fn() -> u8> Default for H<F> "));
+    let header = "impl<T> Default for W<{ N }>\nwhere\n    [(); { N }]: Sized,\n";
+    assert_eq!(at(&format!("{header}{{ x }}")), Some(header));
+    for none in [
+        "impl Default) -> u8 { 1 }",
+        "impl Default> { 1 }",
+        "impl Iterator<Item = u8>;",
+        "impl X } {",
+    ] {
+        assert_eq!(block_open(none), None, "{none}");
+    }
 }
 
 /// Panics with "holds …" when `body` holds logic.

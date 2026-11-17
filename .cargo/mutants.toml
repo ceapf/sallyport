@@ -12,7 +12,8 @@
 # named `new`, and `no_default_impl_in_mutation_scope_holds_logic` out of every `Default` impl.
 # Re-read src/visit.rs when CARGO_MUTANTS_VERSION changes: until then mutants_config.rs
 # `the_nightly_pins_the_cargo_mutants_version_the_guards_were_read_at` fails. The same file
-# refuses `mutants::skip` in every source file of a mutated crate, and any key here but these.
+# refuses `mutants::skip` in every source file of a mutated crate, and any key here but
+# `profile`, `test_tool` and `exclude_re`.
 # Build with Cargo.toml's `mutants` profile: the test profile without debug info (#82).
 profile = "mutants"
 # Run each mutant's tests under nextest's `mutants` profile (.config/nextest.toml), whose per-test
