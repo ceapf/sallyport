@@ -30,40 +30,30 @@ fn absent_image() -> ImageRef {
 /// re-check). Armed with `rm`, it fails every `rm` until disarmed instead. The verb is the
 /// first word after the global `--flag value` pairs.
 fn logging_podman(at: &Path, real: &Path) -> PathBuf {
-    let (at, real) = (at.display(), real.display());
-    let script = format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{at}/argv'\n\
-         v=; skip=\nfor a; do\n\
-         if [ -n \"$skip\" ]; then skip=; continue; fi\n\
-         case \"$a\" in --*) [ -z \"$v\" ] && skip=1 ;; *) [ -z \"$v\" ] && v=$a ;; esac\n\
-         done\n\
-         when=$(cat '{at}/when' 2>/dev/null); sock=$(cat '{at}/sock' 2>/dev/null)\n\
-         swap() {{ rm -f '{at}/when'; mv \"$sock\" \"$sock.old\" && \
-         if [ -d \"$sock.old\" ]; then mkdir -m 700 \"$sock\"; \
-         else cp -p \"$sock.old\" \"$sock\"; fi; }}\n\
-         if [ \"$v\" = init ] && [ \"$when\" = init ]; then swap; fi\n\
-         if [ \"$v\" = rm ] && [ \"$when\" = rm ]; then exit 125; fi\n\
-         '{real}' \"$@\"\nrc=$?\n\
-         if [ $rc -eq 0 ] && [ \"$v\" = create ] && [ \"$when\" = create ]; then swap; fi\n\
-         exit $rc\n"
-    );
-    let bin = PathBuf::from(at.to_string()).join("podman");
-    executable(&bin, script.as_bytes());
-    bin
+    wrap_podman(at, real, |at, real| {
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{at}/argv'\n\
+             v=; skip=\nfor a; do\n\
+             if [ -n \"$skip\" ]; then skip=; continue; fi\n\
+             case \"$a\" in --*) [ -z \"$v\" ] && skip=1 ;; *) [ -z \"$v\" ] && v=$a ;; esac\n\
+             done\n\
+             when=$(cat '{at}/when' 2>/dev/null); sock=$(cat '{at}/sock' 2>/dev/null)\n\
+             swap() {{ rm -f '{at}/when'; mv \"$sock\" \"$sock.old\" && \
+             if [ -d \"$sock.old\" ]; then mkdir -m 700 \"$sock\"; \
+             else cp -p \"$sock.old\" \"$sock\"; fi; }}\n\
+             if [ \"$v\" = init ] && [ \"$when\" = init ]; then swap; fi\n\
+             if [ \"$v\" = rm ] && [ \"$when\" = rm ]; then exit 125; fi\n\
+             '{real}' \"$@\"\nrc=$?\n\
+             if [ $rc -eq 0 ] && [ \"$v\" = create ] && [ \"$when\" = create ]; then swap; fi\n\
+             exit $rc\n"
+        )
+    })
 }
 
 /// Arms [`logging_podman`] in `dir` to swap `sock` at `when`.
 fn arm(dir: &Path, when: &str, sock: &Path) {
     std::fs::write(dir.join("sock"), sock.display().to_string()).unwrap();
     std::fs::write(dir.join("when"), when).unwrap();
-}
-
-struct RemoveOnDrop(PathBuf);
-
-impl Drop for RemoveOnDrop {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
 }
 
 fn scratch(tag: &str) -> (PathBuf, RemoveOnDrop) {

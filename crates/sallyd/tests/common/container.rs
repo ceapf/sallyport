@@ -41,6 +41,30 @@ pub fn executable(path: &Path, body: &[u8]) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// A podman wrapper at `<at>/podman`, whose script is `body(at, real)` with both paths as text.
+/// The scripts write the paths unescaped, so neither may hold a quote, a backslash or a space.
+pub fn wrap_podman(at: &Path, real: &Path, body: impl FnOnce(&str, &str) -> String) -> PathBuf {
+    let (at, real) = (at.display().to_string(), real.display().to_string());
+    for p in [&at, &real] {
+        assert!(
+            !p.contains(['\'', '"', '\\', ' ']),
+            "the test writes {p:?} into a script unescaped"
+        );
+    }
+    let bin = PathBuf::from(&at).join("podman");
+    executable(&bin, body(&at, &real).as_bytes());
+    bin
+}
+
+/// Removes a test's directory when dropped.
+pub struct RemoveOnDrop(pub PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// The probe, compiled static from the red-team tree. Test-only: it goes into the throwaway test
 /// image and nowhere else (CLAUDE.md).
 fn probe_binary(out: &Path) {

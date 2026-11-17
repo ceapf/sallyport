@@ -598,14 +598,6 @@ fn rt_fs_16_a_nested_host_mount_is_not_visible() {
     });
 }
 
-struct RemoveOnDrop(PathBuf);
-
-impl Drop for RemoveOnDrop {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 /// 6b reviews (Rust H1, security M3): relaunching a stopped session's id is refused before
 /// anything is created, and the kept staged changes survive.
 #[test]
@@ -702,23 +694,14 @@ fn orphans_of_a_previous_sallyd_are_removed() {
 
 /// A podman whose `ps` prints `<at>/ps-pad` before the real listing while that file exists;
 /// otherwise the real one. `ps` is the first argument the launcher passes.
-/// TODO(#178): one shared wrapper-podman helper and `RemoveOnDrop` in `tests/common`.
 fn ps_padding_podman(at: &std::path::Path, real: &std::path::Path) -> PathBuf {
-    let (at, real) = (at.display(), real.display());
-    for p in [at.to_string(), real.to_string()] {
-        assert!(
-            !p.contains(['\'', '"', '\\', ' ']),
-            "the test writes {p:?} into a script unescaped"
-        );
-    }
-    let script = format!(
-        "#!/bin/sh\n\
-         if [ \"$1\" = ps ] && [ -e '{at}/ps-pad' ]; then /bin/cat '{at}/ps-pad'; fi\n\
-         exec '{real}' \"$@\"\n"
-    );
-    let bin = PathBuf::from(at.to_string()).join("podman");
-    executable(&bin, script.as_bytes());
-    bin
+    wrap_podman(at, real, |at, real| {
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = ps ] && [ -e '{at}/ps-pad' ]; then /bin/cat '{at}/ps-pad'; fi\n\
+             exec '{real}' \"$@\"\n"
+        )
+    })
 }
 
 /// #173 (architect Q295 (5)): a `podman ps` listing longer than `OUTPUT_CAP` is refused, never

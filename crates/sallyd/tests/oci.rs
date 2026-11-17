@@ -19,14 +19,6 @@ mod common;
 use common::container::*;
 use common::*;
 
-struct RemoveOnDrop(PathBuf);
-
-impl Drop for RemoveOnDrop {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 /// The test paths go into shell scripts, TOML and JSON unescaped, and the argv log is split on
 /// spaces: none may hold a quote, a backslash or a space.
 fn assert_plain(p: &str) {
@@ -164,22 +156,17 @@ fn rt_sup_04_the_cpu_inference_config_passes_and_a_tampered_one_is_refused() {
 /// `$rc`, `$v` the verb and `$id` the word after it) and exits with podman's status. The verb is
 /// the first word after the global `--flag value` pairs.
 fn wrapper(at: &Path, real: &Path, after: &str) -> PathBuf {
-    let (dir, real) = (at.display(), real.display());
-    for p in [dir.to_string(), real.to_string()] {
-        assert_plain(&p);
-    }
-    let script = format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{dir}/argv'\nprintf '%s\\n' \"$HOME\" >>'{dir}/home'\n\
-         '{real}' \"$@\"\nrc=$?\n\
-         v=; id=; skip=\nfor a; do\n\
-         if [ -n \"$skip\" ]; then skip=; continue; fi\n\
-         case \"$a\" in --*) [ -z \"$v\" ] && skip=1 ;; \
-         *) if [ -z \"$v\" ]; then v=$a; elif [ -z \"$id\" ]; then id=$a; fi ;; esac\n\
-         done\n{after}\nexit $rc\n"
-    );
-    let bin = at.join("podman");
-    executable(&bin, script.as_bytes());
-    bin
+    wrap_podman(at, real, |dir, real| {
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{dir}/argv'\nprintf '%s\\n' \"$HOME\" >>'{dir}/home'\n\
+             '{real}' \"$@\"\nrc=$?\n\
+             v=; id=; skip=\nfor a; do\n\
+             if [ -n \"$skip\" ]; then skip=; continue; fi\n\
+             case \"$a\" in --*) [ -z \"$v\" ] && skip=1 ;; \
+             *) if [ -z \"$v\" ]; then v=$a; elif [ -z \"$id\" ]; then id=$a; fi ;; esac\n\
+             done\n{after}\nexit $rc\n"
+        )
+    })
 }
 
 /// The verb of one `argv` line [`wrapper`] logged.

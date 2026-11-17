@@ -256,32 +256,16 @@ fn a_refused_session_closed_still_answers_stopped_and_releases_the_forms() {
 /// A podman that fails every `rm` while `<at>/fail-rm` exists, so a container cannot be
 /// confirmed gone; otherwise the real one.
 fn rm_failing_podman(at: &Path, real: &Path) -> PathBuf {
-    let (at, real) = (at.display(), real.display());
-    for p in [at.to_string(), real.to_string()] {
-        assert!(
-            !p.contains(['\'', '"', '\\', ' ']),
-            "the test writes {p:?} into a script unescaped"
-        );
-    }
-    let script = format!(
-        "#!/bin/sh\nv=; skip=\nfor a; do\n\
-         if [ -n \"$skip\" ]; then skip=; continue; fi\n\
-         case \"$a\" in --*) [ -z \"$v\" ] && skip=1 ;; *) [ -z \"$v\" ] && v=$a ;; esac\n\
-         done\n\
-         if [ \"$v\" = rm ] && [ -e '{at}/fail-rm' ]; then exit 125; fi\n\
-         exec '{real}' \"$@\"\n"
-    );
-    let bin = PathBuf::from(at.to_string()).join("podman");
-    executable(&bin, script.as_bytes());
-    bin
-}
-
-struct RemoveOnDrop(PathBuf);
-
-impl Drop for RemoveOnDrop {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
+    wrap_podman(at, real, |at, real| {
+        format!(
+            "#!/bin/sh\nv=; skip=\nfor a; do\n\
+             if [ -n \"$skip\" ]; then skip=; continue; fi\n\
+             case \"$a\" in --*) [ -z \"$v\" ] && skip=1 ;; *) [ -z \"$v\" ] && v=$a ;; esac\n\
+             done\n\
+             if [ \"$v\" = rm ] && [ -e '{at}/fail-rm' ]; then exit 125; fi\n\
+             exec '{real}' \"$@\"\n"
+        )
+    })
 }
 
 /// Q246: a container not confirmed gone writes no `session.closed`, neither at its failed stop
