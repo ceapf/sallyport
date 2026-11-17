@@ -136,7 +136,7 @@ fn a_secret_grant_needs_the_name_in_the_store() {
     let (code, _, err) = run(|o| manifest_validate(&m, &s.store(), o));
     assert_eq!(code, EXIT_REFUSED, "{err}");
     assert!(err.contains("[secret-missing]"), "{err}");
-    assert!(err.contains("sally secrets set GH"), "{err}");
+    assert!(err.contains("sally secrets set \"GH\""), "{err}");
     store_gh(&s);
     // Architect Q226: its `[data-can-leave]` warning is plain ASCII, so the run is clean (0).
     let (code, out, err) = run(|o| manifest_validate(&m, &s.store(), o));

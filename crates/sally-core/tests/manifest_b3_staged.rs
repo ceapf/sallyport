@@ -214,7 +214,7 @@ fn each_needed_entry_is_asked_for_with_its_exact_reason() {
     );
     assert_eq!(
         ack_message(&f, &format!("{}tools:\n{}", mount("ro"), mcp_never())),
-        "MCP server docs has approve: never, so its tool calls run without approval while it \
+        "MCP server \"docs\" has approve: never, so its tool calls run without approval while it \
          can reach mounted files or secrets; add \"mcp:docs\" to tools.acknowledge_unapproved \
          to accept this"
     );

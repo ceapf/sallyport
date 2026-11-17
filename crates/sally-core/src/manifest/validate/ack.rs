@@ -75,7 +75,7 @@ fn reason(m: &Manifest, entry: &str) -> String {
                   without approval"
             .to_owned(),
         _ => format!(
-            "MCP server {} has approve: never, so its tool calls run without approval while it \
+            "MCP server {:?} has approve: never, so its tool calls run without approval while it \
              can reach mounted files or secrets",
             entry.trim_start_matches(MCP_PREFIX)
         ),

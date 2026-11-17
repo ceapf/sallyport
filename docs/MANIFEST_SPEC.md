@@ -123,7 +123,7 @@ channel** (`network.mode: proxy` with any allow rule), the validator emits a `da
 warning (path `network.allow`) and `summary()` opens with it, e.g.:
 
 ```
-[data-can-leave] Anything this agent reads (/home/u/code/p and whatever your GITHUB_TOKEN unlocks on api.github.com or github.com) can be sent to pypi.org, api.github.com (acting as you) and github.com (acting as you).
+[data-can-leave] Anything this agent reads (/home/u/code/p and whatever your "GITHUB_TOKEN" unlocks on api.github.com or github.com) can be sent to pypi.org, api.github.com (acting as you) and github.com (acting as you).
 ```
 
 Hosts with a secret grant are marked "acting as you". When `fetch` is granted the finding ends
