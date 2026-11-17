@@ -535,10 +535,10 @@ pub(crate) fn deny_entry(
     reason: &str,
 ) -> NewEntry {
     let args = json!({"reason": reason});
-    let mut entry = e.args(args.clone());
-    if let Some(i) = id {
-        entry = with_id(entry, args, i);
-    }
+    let mut entry = match id {
+        Some(i) => with_id(e, args, i),
+        None => e.args(args),
+    };
     if let Some(m) = method {
         entry = entry.text("method", m, SHORT_STYLE);
     }
