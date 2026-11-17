@@ -55,6 +55,28 @@ line per fact, with where it was found. Check a note again before relying on it 
   detaches exec'd children. `sallyd` is not dumpable, so strace cannot read the envp of the
   `execve` calls it makes; podman is dumpable after exec, so `-e inject=execve:delay_exit=<µs>`
   holds each new process long enough to read `/proc/<pid>/environ`. (Task 14, Q120)
+- `/proc` reads of a process that exits (kernel 6.18 WSL2, probed with a child of the prober):
+  opened while alive and read after the exit, `environ` and `cmdline` each read `Ok` with
+  0 bytes. Opened once it is a zombie, `environ` fails `EACCES`, `cmdline` reads `Ok` with
+  0 bytes, and the `exe` link fails `ENOENT`. So a reader that opens `environ` just before the
+  exit records an empty environment the process never had (#187). rt_sup_04 keeps a reading
+  only when two back-to-back reads agree, name the executable it was picked by, and the argv is
+  not empty (Q390, Q394). Read in kernel
+  source (Linux v6.18) and not observed here: `begin_new_exec` (fs/exec.c) sets the new image's
+  exe file and makes its mm current before `create_elf_tables` (fs/binfmt_elf.c) fills in the
+  argument and environment ranges. Until `mm->env_end` is set, `get_mm_cmdline` and
+  `environ_read` (fs/proc/base.c) both return 0 bytes; `create_elf_tables` sets `arg_end`, then
+  `env_start = env_end`, then the final `env_end`, so for a short stretch `cmdline` holds the
+  arguments while `environ` is empty. A reading in the first stretch is dropped (empty argv);
+  two agreeing readings inside the second keep an empty environment and fail the environment
+  equality (a false red, never a pass) (Q394).
+- strace 6.8 with rt_sup_04's flags (`-f -qq -v -s 65536 -e trace=execve
+  -e inject=execve:delay_exit=1000000 -e signal=none -o <file>`), tracing a non-dumpable parent
+  that forks concurrent execs: an exec another process's event interrupts is split into
+  `<pid> execve(0x…, 0x…, 0x… <unfinished ...>` and `<pid> <... execve resumed>)           = 0 (DELAYED)`
+  (or `= -1 ENOENT (No such file or directory) (DELAYED)`); a dumpable parent's split line shows
+  the readable arguments instead. Splits seen: 0 in 6 concurrent execs (3 runs); 0 to 4 in 40
+  (15 runs). rt_sup_04 counts a split blind exec as one exec (Q393).
 - The OCI config, Podman 4.9.3 rootless crun: `capabilities: {}`; rlimits CORE, NOFILE, NPROC
   (the last two podman's own hard limits); hostname = 12-hex short id without `--hostname`;
   `/etc/passwd`, `/etc/group`, `/dev/shm` bind from `<graphroot>/…/userdata`, `/etc/hostname`
