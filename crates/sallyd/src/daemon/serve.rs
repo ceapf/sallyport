@@ -368,7 +368,7 @@ async fn serve(
         .await
         .map_err(|e| DaemonError::Io {
             what: "removing stale sockets",
-            source: std::io::Error::other(e.to_string()),
+            source: std::io::Error::other(super::crash::join_text(&e)),
         })?
         .map_err(io("removing stale sockets"))?;
     let (crash, mut crashes) = CrashReporter::channel();
@@ -528,7 +528,7 @@ async fn checked_podman(
     .await
     .map_err(|e| DaemonError::Io {
         what: "podman setup",
-        source: std::io::Error::other(e.to_string()),
+        source: std::io::Error::other(super::crash::join_text(&e)),
     })?
 }
 
