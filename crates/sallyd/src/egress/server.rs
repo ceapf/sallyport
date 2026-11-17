@@ -174,6 +174,9 @@ fn permits(n: usize) -> usize {
 mod intercept;
 #[path = "intercept_tls.rs"]
 mod intercept_tls;
+/// The `egress.request` builder, for RT-SEC-15 (`session/cross_session_tests.rs`).
+#[cfg(test)]
+pub(crate) use intercept::request_entry;
 pub use intercept::{MAX_REQUEST_HEAD, MAX_RESPONSE_HEAD, Summary, upstream_builder};
 pub use intercept_tls::{Interception, trusting, upstream_client};
 

@@ -521,19 +521,28 @@ impl<T: ToolHandler> Agent<T> {
 
     /// Records `rpc.deny`; whether it was written.
     async fn deny(&self, id: Option<&Id>, method: Option<&str>, reason: &str) -> bool {
-        let args = json!({"reason": reason});
-        let mut entry = self
-            .record
-            .entry(Actor::Sallyd, "rpc.deny", Some("deny"))
-            .args(args.clone());
-        if let Some(i) = id {
-            entry = with_id(entry, args, i);
-        }
-        if let Some(m) = method {
-            entry = entry.text("method", m, SHORT_STYLE);
-        }
-        self.record.append(entry).await
+        let e = self.record.entry(Actor::Sallyd, "rpc.deny", Some("deny"));
+        self.record.append(deny_entry(e, id, method, reason)).await
     }
+}
+
+/// An `rpc.deny` entry: the reason, and the peer's id and method (an unknown or extension
+/// method is the sandbox's text) declared raw, masked whole before their cut (architect Q276).
+pub(crate) fn deny_entry(
+    e: NewEntry,
+    id: Option<&Id>,
+    method: Option<&str>,
+    reason: &str,
+) -> NewEntry {
+    let args = json!({"reason": reason});
+    let mut entry = e.args(args.clone());
+    if let Some(i) = id {
+        entry = with_id(entry, args, i);
+    }
+    if let Some(m) = method {
+        entry = entry.text("method", m, SHORT_STYLE);
+    }
+    entry
 }
 
 impl<T: ToolHandler> Server for Agent<T> {
@@ -583,7 +592,7 @@ fn lock<V>(m: &Mutex<V>) -> std::sync::MutexGuard<'_, V> {
 /// most [`LOGGED_KEYS`] keys, each escaped and cut like every peer string. The tool name, a
 /// string id and the keys (a declared list, Q291) are declared raw, so the writer masks them
 /// whole before their cut (architect Q276).
-fn call_entry(
+pub(crate) fn call_entry(
     e: NewEntry,
     id: &Id,
     era: Era,

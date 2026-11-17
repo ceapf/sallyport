@@ -412,3 +412,6 @@ impl std::io::Write for Lines {
         Ok(())
     }
 }
+
+#[path = "cross_session_tests.rs"]
+mod cross_session;

@@ -846,7 +846,7 @@ fn reply_response(reason: Reason) -> Response<Out> {
 /// declared masked with the session's own forms; the writer masks them with every live
 /// session's forms before it cuts and escapes them (architect Q253, Q276). The method is cut to
 /// 256 bytes like the target, but the entry does not say it was (Q256).
-fn request_entry(
+pub(crate) fn request_entry(
     e: NewEntry,
     a: &Authority,
     method: &Method,
