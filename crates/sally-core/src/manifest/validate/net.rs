@@ -12,6 +12,8 @@ use super::rest::in_range;
 const MAX_RULES: usize = 256;
 const MAX_CONNECTIONS: u32 = 1024;
 
+// TODO(#195): the rejected host is echoed quoted; one holding a quote, backslash, space or slash
+// next to a token is not masked.
 pub(super) fn host_error(d: &mut Diags, path: String, raw: &str, e: HostError) {
     match e {
         HostError::IpLiteral => d.error(
