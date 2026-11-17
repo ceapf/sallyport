@@ -4,7 +4,8 @@
 # race no test can force, or at an exact clock instant. The container-only group is the one
 # exception the maintainer ruled on by name.
 # Each one matches by file, function and operator, never by line or column (the `\d+:\d+` stays
-# a wildcard), and its group carries the reason. crates/sally-core/tests/mutants_config.rs
+# a wildcard), and is otherwise literal: `\d+:\d+` is its only pattern. Its group carries the
+# reason. crates/sally-core/tests/mutants_config.rs
 # enforces that form and proves the `|` -> `^` group.
 # cargo-mutants (27.1.0, src/visit.rs) never mutates a method or trait function named `new`, or
 # anything in an `impl … Default for` block (no exclusion needed, and none covers them):

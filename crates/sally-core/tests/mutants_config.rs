@@ -378,6 +378,62 @@ fn exclusions_match_by_file_function_and_operator() {
         );
         let path = root().join(file.replace(r"\.", "."));
         assert!(path.is_file(), "{e}: {} does not exist", path.display());
+        literal_entry(e).unwrap_or_else(|why| panic!("{e}: {why}"));
+    }
+}
+
+/// Q367: exclusion `e`, with its one `:\d+:\d+: ` and its final `$` cut out, is literal, so it
+/// names one mutant and never a family (`.* in .*$` would drop a whole file's).
+fn literal_entry(e: &str) -> Result<(), String> {
+    let (file, rest) = e.split_once(WILDCARD).ok_or("no wildcard")?;
+    let body = rest.strip_suffix('$').ok_or("not anchored")?;
+    literal_part(file)?;
+    literal_part(body)
+}
+
+/// Every regex metacharacter in `part` is escaped, and a backslash escapes only one of them:
+/// `\d`, `\w`, `\S`, `\b` are patterns, and a trailing `\` escaped the anchor.
+fn literal_part(part: &str) -> Result<(), String> {
+    const META: &str = r"\.+*?()[]{}|^$";
+    let mut chars = part.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(m) if META.contains(m) => {}
+                Some(m) => return Err(format!("`\\{m}` is a pattern, not a literal")),
+                None => return Err("a trailing `\\` escapes the anchor".to_owned()),
+            }
+        } else if META.contains(c) {
+            return Err(format!("unescaped `{c}`"));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn an_exclusion_is_literal_but_for_its_wildcard() {
+    let head = r"crates/sallyd/src/sandbox/scan\.rs:\d+:\d+: ";
+    for tail in [
+        r"replace \| with \^ in .*$",
+        r"replace .+ in f$",
+        r"replace \+ with - in f$|.*$",
+        r"replace \+ with - in \w+$",
+        r"replace \+ with - in [a-z_]+$",
+        r"replace \+ with - in (a|b)$",
+        r"replace \+ with - in f?$",
+        r"replace \+ with - in f\$",
+        r"replace \+ with - in f:\d+:\d+: g$",
+    ] {
+        assert!(literal_entry(&format!("{head}{tail}")).is_err(), "{tail}");
+    }
+    assert!(literal_entry(r"crates/.*\.rs:\d+:\d+: replace \+ with - in f$").is_err());
+    for tail in [
+        r"replace \| with \^ in Walk<'a>::list$",
+        r"replace \+ with \* in Head::read_owned_by$",
+        r"replace sync_dir -> Result<\(\), AuditError> with Ok\(\(\)\)$",
+        r"replace match guard e\.kind\(\) == std::io::ErrorKind::NotFound with true in f$",
+    ] {
+        assert_eq!(literal_entry(&format!("{head}{tail}")), Ok(()), "{tail}");
     }
 }
 
