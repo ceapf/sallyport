@@ -9,6 +9,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
+use common::rendered_all;
 use common::{Fixture, HEADER, assert_rejects, fake_token, rendered};
 use sally_core::manifest::{Code, MAX_MANIFEST_BYTES, parse, parse_bytes, to_yaml, validate};
 
@@ -655,6 +656,31 @@ fn rt_sec_08_secret_values_cannot_enter_through_the_manifest() {
         );
     }
     rt_sec_08_original_rows(&f);
+    rt_sec_08_malformed_names_in_warnings(&f);
+}
+
+/// A token pasted as a secret name that its check refuses, with a slash, a space or a quote in
+/// it, is not echoed by the warnings either: with an allow rule, the `[data-can-leave]` warning
+/// names grants, and only a checked name is masked whole when quoted (architect Q376). Control:
+/// the name guard in `validate/exposure.rs` (without it the warning echoes the token).
+fn rt_sec_08_malformed_names_in_warnings(f: &Fixture) {
+    let tok = fake_token(&["gh", "p_"], "0123456789abcdefghijABCDEFGHIJ");
+    for name in [
+        format!("A/{tok}"),
+        format!("Bearer {tok}"),
+        format!("X\"{tok}"),
+    ] {
+        let body = format!(
+            "network:\n  mode: proxy\n  allow:\n    - host: api.github.com\nsecrets:\n  - name: \
+             '{name}'\n    inject: {{host: api.github.com, header: H, format: \"{{value}}\"}}\n"
+        );
+        let shown = rendered_all(&f.load(&body)).join("\n");
+        assert!(shown.contains("[data-can-leave]"), "{shown}");
+        assert!(
+            !shown.contains("0123456789abcdefghij"),
+            "token echoed: {shown}"
+        );
+    }
 }
 
 fn rt_sec_08_original_rows(f: &Fixture) {

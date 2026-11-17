@@ -361,6 +361,8 @@ pub(crate) fn check_mount_host(
 }
 
 /// Guest paths: `/workspace/<seg>(/<seg>)*`, each segment `[A-Za-z0-9._-]`, not `.`/`..`.
+// TODO(#195): these errors quote the rejected guest; one holding `/`, a quote or a backslash
+// next to a token is not masked.
 pub(crate) fn check_guest(raw: &str) -> Result<(), String> {
     if raw.len() > MAX_PATH_LEN {
         return Err(format!("path is longer than {MAX_PATH_LEN} bytes"));

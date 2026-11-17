@@ -3,7 +3,9 @@
 //! [`needed`] is the single definition of "this widening is live": the validator requires an
 //! entry exactly when it returns that entry, refuses entries it does not return (so a stale
 //! acknowledgement cannot linger), and `ValidatedManifest::acknowledged_risks` reports exactly
-//! the listed, needed entries.
+//! the listed, needed entries. A missing entry for a server whose name failed its own check is
+//! not reported: the reason would echo the unchecked name, and the name error already rejects
+//! the manifest (architect Q376).
 
 use std::collections::HashSet;
 
@@ -11,6 +13,7 @@ use super::super::diag::{Code, Diags};
 use super::super::types::{
     BuiltinTool, FetchWrites, Manifest, McpApproval, NetworkMode, ShellPolicy,
 };
+use super::rest::is_slug;
 
 const FIELD: &str = "tools.acknowledge_unapproved";
 const SHELL: &str = "shell";
@@ -75,7 +78,7 @@ fn reason(m: &Manifest, entry: &str) -> String {
                   without approval"
             .to_owned(),
         _ => format!(
-            "MCP server {} has approve: never, so its tool calls run without approval while it \
+            "MCP server {:?} has approve: never, so its tool calls run without approval while it \
              can reach mounted files or secrets",
             entry.trim_start_matches(MCP_PREFIX)
         ),
@@ -114,7 +117,10 @@ pub(super) fn check(m: &Manifest, data_can_leave: bool, d: &mut Diags) {
         }
     }
     for entry in &needed {
-        if !listed.contains(entry) {
+        // A server name that failed its own check is not echoed here (Q376): its name error
+        // already rejects the manifest.
+        let named_ok = entry.strip_prefix(MCP_PREFIX).is_none_or(is_slug);
+        if named_ok && !listed.contains(entry) {
             d.error(
                 FIELD,
                 Code::UnacknowledgedRisk,

@@ -72,8 +72,12 @@ pub(super) fn check_secrets(
             );
         }
         if let Some(env) = &s.expose_env {
-            check_expose_env(env, &at("expose_env"), d);
-            if !name_ok {
+            // Neither a malformed name nor a malformed variable name is echoed by the
+            // duplicate check (Q376).
+            // The variable's own check runs first and always: its error is kept even when the
+            // name is malformed too.
+            let env_ok = check_expose_env(env, &at("expose_env"), d);
+            if !env_ok || !name_ok {
                 continue;
             }
             match exposed.insert(env.as_str(), s.name.as_str()) {
@@ -97,7 +101,7 @@ fn check_secret_name(s: &SecretGrant, path: &str, catalog: &dyn SecretCatalog, d
             path,
             Code::SecretMissing,
             format!(
-                "{0:?} is not in the secrets store (sally secrets set {0})",
+                "{0:?} is not in the secrets store (sally secrets set {0:?})",
                 s.name
             ),
         );
@@ -149,8 +153,10 @@ fn check_basic_user(u: &str) -> Result<(), &'static str> {
 /// The placeholder name must look like a token variable and must not be one Sallyport sets or
 /// one that changes how programs load code, find sockets, or verify TLS. Its value is a public
 /// constant, so the remaining risk is a program reading the placeholder as configuration.
-fn check_expose_env(name: &str, path: &str, d: &mut Diags) {
-    if !is_env_name(name) || !is_token_env_name(name) || is_reserved_env(name) {
+/// Reports a variable name that cannot be exposed; returns whether it passed.
+fn check_expose_env(name: &str, path: &str, d: &mut Diags) -> bool {
+    let ok = is_env_name(name) && is_token_env_name(name) && !is_reserved_env(name);
+    if !ok {
         d.error(
             path,
             Code::InvalidValue,
@@ -158,6 +164,7 @@ fn check_expose_env(name: &str, path: &str, d: &mut Diags) {
              proxy/CA variable)",
         );
     }
+    ok
 }
 
 fn check_inject_host(

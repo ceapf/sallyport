@@ -8,9 +8,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::super::host::HostPattern;
+use super::super::host::{HostPattern, parse_hostname};
 use super::super::types::{BuiltinTool, Manifest, NetworkMode};
 use super::{EgressRule, ResolvedMount};
+use crate::secrets::is_secret_name;
 
 /// The finding's sentence, or `None` when private data and an outward channel do not coexist.
 /// `egress` must already be empty when `network.mode` is `none`.
@@ -48,23 +49,36 @@ pub(crate) fn data_can_leave(
 const FETCH_GET: &str =
     " The fetch tool's GET requests are not prompted and can carry data out in the URL.";
 
-/// Mount realpaths, then what each secret unlocks (one entry per secret, all its hosts).
+/// Mount realpaths, then what each secret unlocks (one entry per secret, all its hosts), then
+/// one unnamed entry per grant that cannot be named, in manifest order.
+///
+/// A grant is named only when its secret name and its host both passed their own checks
+/// (architect Q376): on a rejected manifest either may hold a pasted credential with a quote,
+/// backslash, space or slash, which the diagnostic mask does not cover.
 fn readable(m: &Manifest, mounts: &[ResolvedMount]) -> Vec<String> {
     let mut out: Vec<String> = mounts
         .iter()
         .map(|mt| mt.host.display().to_string())
         .collect();
     let mut by_secret: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-    for s in &m.secrets {
-        by_secret
-            .entry(s.name.as_str())
-            .or_default()
-            .insert(s.inject.host.as_str());
+    let mut unnamed = Vec::new();
+    for (i, s) in m.secrets.iter().enumerate() {
+        if is_secret_name(&s.name) && parse_hostname(&s.inject.host).is_ok() {
+            by_secret
+                .entry(s.name.as_str())
+                .or_default()
+                .insert(s.inject.host.as_str());
+        } else {
+            unnamed.push(format!("whatever the secret at secrets[{i}] unlocks"));
+        }
     }
+    // TODO(#195): the hosts are joined bare, here and in destination(); a host label shaped
+    // like a token is not masked.
     out.extend(by_secret.into_iter().map(|(name, hosts)| {
         let hosts: Vec<&str> = hosts.into_iter().collect();
-        format!("whatever your {name} unlocks on {}", hosts.join(" or "))
+        format!("whatever your {name:?} unlocks on {}", hosts.join(" or "))
     }));
+    out.extend(unnamed);
     out
 }
 
