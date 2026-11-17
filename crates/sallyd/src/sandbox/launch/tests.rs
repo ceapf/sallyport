@@ -118,6 +118,25 @@ fn an_fd_budget_refusal_has_its_own_reason() {
     assert_eq!(dup.reason(), "overlap");
 }
 
+/// A session past the daemon's live-session limit is refused `session-limit`, the message
+/// naming both numbers and the way out. TODO(#203): a container test of the audit entry and
+/// that nothing is created, for this reason and `fd-budget`.
+#[test]
+fn a_session_limit_refusal_has_its_own_reason() {
+    use crate::sandbox::budget::SessionLimit;
+    use crate::sandbox::overlap::ReserveError;
+    let e = LaunchError::from(ReserveError::SessionLimit(SessionLimit {
+        live: 64,
+        limit: 64,
+    }));
+    assert_eq!(e.reason(), "session-limit");
+    assert_eq!(e.event(), "sandbox.refuse");
+    assert_eq!(
+        e.to_string(),
+        "64 sessions are live, the daemon's limit is 64 (stop a session)"
+    );
+}
+
 /// Architect Q58: no manifest image and no bundled default.
 #[test]
 fn a_missing_default_image_has_its_own_reason() {

@@ -4,6 +4,9 @@
 //! pipes). A session reserves its worst case together with its overlap claim
 //! ([`super::Sessions::reserve`]) and frees it on release, so the sum over sessions can never run
 //! the daemon out of descriptors (one session's EMFILE would hit every session).
+//!
+//! The same reservation also bounds how many sessions are live at once ([`MAX_LIVE_SESSIONS`]),
+//! so the orphan sweep's container listing stays under the launcher's stdout cap.
 
 use crate::egress::server::ADMISSION_EXTRA;
 
@@ -61,6 +64,35 @@ pub(crate) fn admit(limit: u64, used: u64, needed: u64) -> Result<(), FdRefusal>
             free,
             limit,
         })
+    }
+}
+
+/// The most sessions one `sallyd` keeps live at once. Every live session can leave containers
+/// in the orphan sweep's `podman ps` listing, and a listing over the launcher's stdout cap fails
+/// the whole sweep, so the count is bounded where a session is admitted, not where the listing
+/// is read (`orphans::tests::the_session_limit_keeps_the_worst_listing_under_the_cap`).
+pub const MAX_LIVE_SESSIONS: usize = 64;
+
+/// A session refused because `limit` sessions are already live
+/// (`sandbox.refuse reason "session-limit"`).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{live} sessions are live, the daemon's limit is {limit} (stop a session)")]
+pub struct SessionLimit {
+    /// The sessions live when this one asked.
+    pub live: usize,
+    /// The most sessions the daemon keeps live.
+    pub limit: usize,
+}
+
+/// Admits one more session while fewer than `limit` are `live`; a limit of 0 admits none.
+///
+/// # Errors
+/// [`SessionLimit`] naming both numbers.
+pub(crate) fn admit_session(limit: usize, live: usize) -> Result<(), SessionLimit> {
+    if live < limit {
+        Ok(())
+    } else {
+        Err(SessionLimit { live, limit })
     }
 }
 
@@ -124,6 +156,49 @@ mod tests {
         );
         // Over-committed (cannot happen, but never wraps): nothing is free.
         assert_eq!(admit(1000, 1200, 1).unwrap_err().free, 0);
+    }
+
+    #[test]
+    fn a_session_is_admitted_while_fewer_than_the_limit_are_live() {
+        assert_eq!(admit_session(64, 0), Ok(()));
+        assert_eq!(admit_session(64, 63), Ok(()));
+        assert_eq!(admit_session(1, 0), Ok(()));
+    }
+
+    #[test]
+    fn a_session_at_the_limit_is_refused_naming_both_numbers() {
+        assert_eq!(
+            admit_session(64, 64),
+            Err(SessionLimit {
+                live: 64,
+                limit: 64
+            })
+        );
+        // Over the limit (cannot happen, the count only grows through here) is the same refusal.
+        assert_eq!(
+            admit_session(64, 65),
+            Err(SessionLimit {
+                live: 65,
+                limit: 64
+            })
+        );
+        let msg = admit_session(64, 64).unwrap_err().to_string();
+        assert_eq!(
+            msg,
+            "64 sessions are live, the daemon's limit is 64 (stop a session)"
+        );
+    }
+
+    /// The number the docs and the threat model state. The upper bound is the listing relation
+    /// in `orphans`; this pins the value itself, so a lower one is a visible change too.
+    #[test]
+    fn the_daemon_keeps_at_most_64_sessions_live() {
+        assert_eq!(MAX_LIVE_SESSIONS, 64);
+    }
+
+    #[test]
+    fn a_limit_of_zero_admits_no_session() {
+        assert_eq!(admit_session(0, 0), Err(SessionLimit { live: 0, limit: 0 }));
     }
 
     #[test]

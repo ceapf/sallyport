@@ -567,8 +567,12 @@ impl Lx {
             ids: ids(),
             xdg_runtime_dir: xdg.clone(),
             data_dir: f.root.join("home/.local/share/sallyport"),
-            // Well past what the test sessions need; the budget is unit-tested in `overlap.rs`.
-            sessions: Arc::new(Sessions::new(1 << 20)),
+            // Well past what the test sessions need; the budget and the session limit are
+            // unit-tested in `overlap.rs`.
+            sessions: Arc::new(Sessions::new(
+                1 << 20,
+                sallyd::sandbox::budget::MAX_LIVE_SESSIONS,
+            )),
             audit: events.clone(),
             limits: ScanLimits::default(),
             disk_floor: floor,
