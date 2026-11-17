@@ -294,6 +294,10 @@ fn a_host_overlap_does_not_echo_the_other_mounts_guest() {
         ]
     );
     assert_not_echoed(&rendered_all(&r));
+    // Not even masked: a quoted echo keeps the token's head.
+    let shown = rendered_at(&r, "filesystem.mounts[1].host");
+    let head = fake_token(&["gh", "p_"], "");
+    assert!(!shown.contains(&head), "{shown}");
     assert_overlap_names(&r, "filesystem.mounts[1].host", 0, 2);
 }
 
