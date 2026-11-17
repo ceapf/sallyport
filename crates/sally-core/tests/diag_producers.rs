@@ -260,9 +260,25 @@ fn rendered_at(r: &Result<Validated, Rejected>, path: &str) -> String {
     found.into_iter().next().unwrap()
 }
 
+/// The host-overlap error at `path` names mount `j` of `count` by its manifest index and no
+/// other mount's. A message cut at the diagnostic bound (long fixture realpaths, as in a
+/// mutation copy) may have lost the index, so only the negative half is checked there.
+#[track_caller]
+fn assert_overlap_names(r: &Result<Validated, Rejected>, path: &str, j: usize, count: usize) {
+    let shown = rendered_at(r, path);
+    for k in (0..count).filter(|&k| k != j) {
+        let other = format!("(filesystem.mounts[{k}])");
+        assert!(!shown.contains(&other), "names {other}: {shown}");
+    }
+    if !shown.contains("... [") {
+        let want = format!("(filesystem.mounts[{j}]) [");
+        assert!(shown.contains(&want), "lacks {want}: {shown}");
+    }
+}
+
 /// fs.rs (Q395): a guest that failed its check is not echoed by another mount's host-overlap
-/// error, which names the other mount by its index (pinned on short paths in fs.rs: here the
-/// fixture's realpaths can push the index past the diagnostic cut).
+/// error, which names the other mount by its index (also pinned on short paths in fs.rs, since
+/// a mutation copy's long realpaths can push the index past the diagnostic cut).
 #[test]
 fn a_host_overlap_does_not_echo_the_other_mounts_guest() {
     let f = Fixture::new();
@@ -278,6 +294,30 @@ fn a_host_overlap_does_not_echo_the_other_mounts_guest() {
         ]
     );
     assert_not_echoed(&rendered_all(&r));
+    assert_overlap_names(&r, "filesystem.mounts[1].host", 0, 2);
+}
+
+/// fs.rs (Q395): the host-overlap error names the other mount by its manifest index, not by its
+/// place among the mounts whose host resolved, nor by the erring mount's own index or place.
+/// Here all four differ: the other mount is mounts[1] at place 0 (mounts[0] does not resolve),
+/// and the erring one is mounts[3] at place 2.
+#[test]
+fn a_host_overlap_names_the_other_mount_by_its_manifest_index() {
+    let f = Fixture::new();
+    let r = f.load(&mounts(&[
+        ("~/missing", "/workspace/m"),
+        ("~/code", "/workspace/a"),
+        ("~/Documents/research", "/workspace/r"),
+        ("~/code/myproject", "/workspace/b"),
+    ]));
+    assert_eq!(
+        mount_errors(&r),
+        vec![
+            ("filesystem.mounts[0].host".to_owned(), Code::NotFound),
+            ("filesystem.mounts[3].host".to_owned(), Code::Overlap),
+        ]
+    );
+    assert_overlap_names(&r, "filesystem.mounts[3].host", 1, 4);
 }
 
 /// fs.rs (Q395): two mounts sharing a guest that failed its check get its own error each, and
@@ -356,6 +396,7 @@ fn valid_guests_still_get_duplicate_nested_and_overlap_errors() {
         if path.ends_with(".host") {
             let shown = rendered_at(&r, path);
             assert!(!shown.contains("/workspace/a"), "{shown}");
+            assert_overlap_names(&r, path, 0, 2);
         }
     }
 }
