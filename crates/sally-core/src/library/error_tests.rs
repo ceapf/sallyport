@@ -45,8 +45,16 @@ fn every_variant_has_its_code() {
         ),
         (LibraryError::NotFound(digest()), "not_found"),
         (LibraryError::BlobMismatch(digest()), "blob_mismatch"),
+        (LibraryError::BlobChanged, "blob_changed"),
         (LibraryError::QuarantineChanged, "quarantine_changed"),
         (LibraryError::QuarantineBusy, "quarantine_busy"),
+        (LibraryError::DownloadBusy, "download_busy"),
+        (
+            LibraryError::DownloadIncomplete { have: 1, size: 2 },
+            "download_incomplete",
+        ),
+        (LibraryError::DownloadTooLong, "download_too_long"),
+        (LibraryError::DownloadNotPrivate, "download_not_private"),
         (
             LibraryError::NotPrivate {
                 path: "p".to_owned(),

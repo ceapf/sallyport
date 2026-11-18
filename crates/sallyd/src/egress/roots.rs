@@ -31,7 +31,8 @@ pub const SYSTEM_BUNDLES: [&str; 4] = [
 /// The largest bundle read (Debian's is about 220 KiB).
 pub const MAX_BUNDLE_BYTES: u64 = 4 << 20;
 
-/// Why no trust roots were loaded. Each refuses the launch of a session with secrets.
+/// Why no trust roots were loaded. Each refuses the launch of a session with secrets, and the
+/// building of a Hugging Face client.
 #[derive(Debug, thiserror::Error)]
 pub enum RootsError {
     /// None of the candidate files exists.

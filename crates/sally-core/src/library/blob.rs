@@ -7,19 +7,24 @@ use rustix::fd::OwnedFd;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 
-use super::quarantine::BLOB;
 use super::{Entry, LibraryError, RESOLVE};
 use crate::model::hash::Digest;
 
 /// Any write bit.
 const WRITE_BITS: u32 = 0o222;
 
-/// Links the copy in `qdir` into `blobs` as `<hex>`, never replacing a blob already there, and
+/// Links the verified file `name` in `dir` (a quarantine copy or a promoted download, both
+/// files the library created) into `blobs` as `<hex>`, never replacing a blob already there, and
 /// syncs the directory. Whether this call created the blob. A blob found already there is not
-/// checked here: the import checks it with [`open_checked`] before it writes a row. If the sync
+/// checked here: the caller checks it with [`open_checked`] before it writes a row. If the sync
 /// fails, a blob this call created is unlinked again.
-pub(super) fn link(qdir: &OwnedFd, blobs: &OwnedFd, digest: &Digest) -> Result<bool, LibraryError> {
-    let created = match rustix::fs::linkat(qdir, BLOB, blobs, digest.as_hex(), AtFlags::empty()) {
+pub(super) fn link(
+    dir: &OwnedFd,
+    name: &str,
+    blobs: &OwnedFd,
+    digest: &Digest,
+) -> Result<bool, LibraryError> {
+    let created = match rustix::fs::linkat(dir, name, blobs, digest.as_hex(), AtFlags::empty()) {
         Ok(()) => true,
         Err(Errno::EXIST) => false,
         Err(e) => return Err(LibraryError::io("store the blob", e)),
@@ -31,6 +36,27 @@ pub(super) fn link(qdir: &OwnedFd, blobs: &OwnedFd, digest: &Digest) -> Result<b
         return Err(LibraryError::io("sync the blobs directory", e));
     }
     Ok(created)
+}
+
+/// Whether the blob `<hex>` that [`link`] just created is `file` itself (the same device and
+/// inode, the name not followed). [`link`] links by name while every check ran on the
+/// descriptor, so a name replaced in between links another file; the caller then removes the
+/// new blob with [`unlink_new`] and refuses ([`LibraryError::BlobChanged`]). A blob gone again
+/// is not `file`.
+pub(super) fn is_file(blobs: &OwnedFd, digest: &Digest, file: &File) -> Result<bool, LibraryError> {
+    let own = rustix::fs::fstat(file).map_err(|e| LibraryError::io("stat the verified file", e))?;
+    match rustix::fs::statat(blobs, digest.as_hex(), AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(st) => Ok((st.st_dev, st.st_ino) == (own.st_dev, own.st_ino)),
+        Err(Errno::NOENT) => Ok(false),
+        Err(e) => Err(LibraryError::io("stat the blob", e)),
+    }
+}
+
+/// Removes the blob `<hex>` this store created and syncs the directory. Best effort: the
+/// refusal is the answer, and a blob left behind has no row, so nothing lists or resolves it.
+pub(super) fn unlink_new(blobs: &OwnedFd, digest: &Digest) {
+    let _ = rustix::fs::unlinkat(blobs, digest.as_hex(), AtFlags::empty());
+    let _ = rustix::fs::fsync(blobs);
 }
 
 /// Opens `entry`'s blob beneath `blobs` and checks it on the descriptor: a regular file of the

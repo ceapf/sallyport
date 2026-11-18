@@ -263,6 +263,42 @@ fn a_failed_insert_unlinks_only_its_own_blob() {
     assert!(names(&root.quarantine()).is_empty());
 }
 
+/// The tail links by name but checked the file by descriptor: when the name it linked is
+/// another file, the new blob is removed, no row is written and the name is left as found;
+/// the control, the same file under its own name, is stored.
+#[test]
+fn store_refuses_a_name_that_is_not_its_file() {
+    let root = TmpRoot::new("imp-changed");
+    let lib = Library::open(root.path(), 0).unwrap();
+    let bytes = gguf("changed");
+    let own = root.source("own.gguf", &bytes);
+    let other = root.source("other.gguf", b"other bytes");
+    let dir = crate::fd::open(
+        root.path().join("src"),
+        OFlags::RDONLY.union(OFlags::DIRECTORY),
+        Mode::empty(),
+    )
+    .unwrap();
+    let file = File::open(&own).unwrap();
+    let entry = Entry {
+        digest: sha(&bytes),
+        size: bytes.len() as u64,
+        format: Format::Gguf,
+        source_name: SourceName::checked("own.gguf").unwrap(),
+        imported_at: jiff::Timestamp::now(),
+    };
+    let err = store(&lib, &file, &dir, "other.gguf", entry.clone()).unwrap_err();
+    assert_eq!(err.code(), "blob_changed");
+    assert!(names(&root.blobs()).is_empty());
+    assert!(lib.list().unwrap().is_empty());
+    assert_eq!(std::fs::read(&other).unwrap(), b"other bytes");
+    assert_eq!(std::fs::metadata(&other).unwrap().nlink(), 1);
+
+    let stored = store(&lib, &file, &dir, "own.gguf", entry).unwrap();
+    assert_eq!(stored.digest(), &sha(&bytes));
+    assert_eq!(names(&root.blobs()), [sha(&bytes).as_hex()]);
+}
+
 /// A blob found under the digest is used only if it passes inspect's checks; otherwise the
 /// import is refused, the found file is left exactly as it was, and no row is written.
 #[test]

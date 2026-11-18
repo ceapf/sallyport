@@ -27,6 +27,8 @@ pub(super) struct Dirs {
     pub(super) blobs: OwnedFd,
     /// `library/quarantine/`.
     pub(super) quarantine: OwnedFd,
+    /// `library/downloads/`.
+    pub(super) downloads: OwnedFd,
 }
 
 /// Checks the data directory, then creates or opens the library tree beneath it. Returns the
@@ -62,11 +64,13 @@ pub(super) fn open(data_dir: &Path) -> Result<(Dirs, PathBuf), LibraryError> {
     let blobs_parent = ensure_dir(&lib, "blobs", &lib_path.join("blobs"))?;
     let blobs = ensure_dir(&blobs_parent, "sha256", &lib_path.join("blobs/sha256"))?;
     let quarantine = ensure_dir(&lib, "quarantine", &lib_path.join("quarantine"))?;
+    let downloads = ensure_dir(&lib, "downloads", &lib_path.join("downloads"))?;
     Ok((
         Dirs {
             lib,
             blobs,
             quarantine,
+            downloads,
         },
         lib_path,
     ))

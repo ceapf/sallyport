@@ -92,12 +92,14 @@ container-free tests run: unit tests, all of sally-core's `tests/`, `sallyd` `ar
   summary,types,units,diag}.rs`, `secrets/{store,secret,names}.rs`,
   `audit/{entry,redact,verify,writer,declared,layout,tail}.rs`, `fsutil.rs`, `fd.rs`, `text.rs`,
   `paths.rs`, `model/{mod,detect,hash}.rs`, `model/gguf/{mod,error,read,types,meta,tensors}.rs`,
-  `library/{mod,error,dirs,index,quarantine,import,blob,name}.rs`; sallyd
+  `library/{mod,error,dirs,index,quarantine,import,blob,name,download}.rs`,
+  `hf/{mod,error,names,list,plan,head}.rs`; sallyd
   `sandbox/{argv,check,types,profiles,overlap,scan,images,
   changes,cgroup,dirs,podman,binaries,disk,stage,budget,orphans}.rs`, `sandbox/launch/{error,parts}.rs`,
   `sandbox/oci/{mod,config,facts,intent,linux,mounts,process,seccomp}.rs`,
   `daemon/{mod,crash,startup,stale,install}.rs`,
-  `oplog.rs`, `session/{lookup,types,exit,secrets}.rs`, `egress/{addr,authority,head,policy,server,
+  `oplog.rs`, `hf/{mod,error,conn,wire}.rs` (tests hermetic: a mock Hub behind the dialer seam),
+  `session/{lookup,types,exit,secrets}.rs`, `egress/{addr,authority,head,policy,server,
   hostaddrs,tunnel,net,ca,roots,rewrite,intercept,intercept_parts,intercept_tls,intercept_report,
   meter,inject,redact,local}.rs` (net.rs tests stay hermetic: nothing leaves the machine),
   `rpc/{agent,control,control_methods,control_line,control_wire,drive,attach,line,frame,json,listen,

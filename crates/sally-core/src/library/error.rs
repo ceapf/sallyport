@@ -56,12 +56,37 @@ pub enum LibraryError {
     /// The model's blob is missing or no longer matches its row (type, owner, write bits, size).
     #[error("the blob of model {0} is missing or does not match the library index")]
     BlobMismatch(Digest),
+    /// The name the verified file was linked by named another file by then; the new blob was
+    /// removed and no row written.
+    #[error("the verified file was replaced before it was stored; nothing was stored")]
+    BlobChanged,
     /// The quarantine copy's length on disk is not the number of bytes copied into it.
     #[error("the quarantine copy changed while it was written")]
     QuarantineChanged,
     /// Every quarantine name this import tried was taken.
     #[error("no free quarantine directory name; remove stale ones under library/quarantine")]
     QuarantineBusy,
+    /// Another download of the same file holds its partial.
+    #[error("this model is already being downloaded")]
+    DownloadBusy,
+    /// The partial holds fewer bytes than the file's size; it is kept for a resume.
+    #[error("the download is incomplete ({have} of {size} bytes)")]
+    DownloadIncomplete {
+        /// Bytes on disk.
+        have: u64,
+        /// The file's listed size.
+        size: u64,
+    },
+    /// More bytes arrived than the file's listed size.
+    #[error("the download is longer than the file's listed size")]
+    DownloadTooLong,
+    /// The partial under `library/downloads` is not a regular 0600 file of the current user; it
+    /// is left as it was.
+    #[error(
+        "a partial download under library/downloads is not a regular file owned by the current \
+         user with mode 0600; remove it"
+    )]
+    DownloadNotPrivate,
     /// A library directory (or the data directory) is not private.
     #[error("{path}: {msg}")]
     NotPrivate {
@@ -113,8 +138,13 @@ impl LibraryError {
             Self::HashMismatch { .. } => "hash_mismatch",
             Self::NotFound(_) => "not_found",
             Self::BlobMismatch(_) => "blob_mismatch",
+            Self::BlobChanged => "blob_changed",
             Self::QuarantineChanged => "quarantine_changed",
             Self::QuarantineBusy => "quarantine_busy",
+            Self::DownloadBusy => "download_busy",
+            Self::DownloadIncomplete { .. } => "download_incomplete",
+            Self::DownloadTooLong => "download_too_long",
+            Self::DownloadNotPrivate => "download_not_private",
             Self::NotPrivate { .. } => "not_private",
             Self::IndexNotPrivate { .. } => "index_not_private",
             Self::UnknownIndexVersion(_) => "unknown_index_version",
