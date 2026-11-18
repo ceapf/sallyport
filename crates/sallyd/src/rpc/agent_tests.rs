@@ -1401,3 +1401,126 @@ async fn a_dropped_driven_call_that_then_panics_is_still_reported() {
     let crash = crashed(&mut crashes).await;
     assert_eq!(crash.task, "agent.call");
 }
+
+/// The real frame loop over a connection the test owns: the stream's far end and the outbox's
+/// receiver, so a test reads `conn.tasks` once the loop ends.
+fn owned_conn() -> (Conn, mpsc::Receiver<Out>, DuplexStream, DuplexStream) {
+    let (out, rx) = mpsc::channel(OUTBOX);
+    let (near, far) = tokio::io::duplex(4 * MAX_FRAME);
+    (Conn::new(out), rx, near, far)
+}
+
+/// A frame of `v` with its newline.
+fn framed(v: &Value) -> Vec<u8> {
+    let mut f = serde_json::to_vec(v).unwrap();
+    f.push(b'\n');
+    f
+}
+
+/// The next reply's JSON from the outbox, within 10 s.
+async fn next_reply(rx: &mut mpsc::Receiver<Out>) -> Value {
+    let out = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .expect("no reply within 10 s")
+        .expect("the outbox closed");
+    serde_json::from_slice(&out.line).unwrap()
+}
+
+/// Finished calls are reaped as they end: after 100 answered calls and the end of the stream,
+/// the connection holds no task.
+#[tokio::test(start_paused = true)]
+async fn answered_calls_leave_no_task_behind() {
+    let (agent, _, _) = setup();
+    let (mut conn, mut rx, near, mut far) = owned_conn();
+    let peer = async move {
+        for i in 0..100 {
+            far.write_all(&framed(&call(i, "echo"))).await.unwrap();
+            assert_eq!(next_reply(&mut rx).await["id"], json!(i));
+        }
+        drop(far);
+    };
+    tokio::join!(agent.frames(near, &mut conn), peer);
+    assert_eq!(conn.tasks.len(), 0);
+}
+
+/// Only calls still running stay: k blocked calls, then the end of the stream, leave k tasks.
+#[tokio::test]
+async fn only_running_calls_stay_in_the_task_set() {
+    let (agent, fake, _) = setup();
+    let (mut conn, _rx, near, mut far) = owned_conn();
+    let k = 3;
+    let peer = async {
+        far.write_all(&framed(&call(0, "echo"))).await.unwrap();
+        for i in 1..=k {
+            far.write_all(&framed(&call(i, "block"))).await.unwrap();
+        }
+        reach(&fake.calls, 1 + k as usize).await;
+        reach(&fake.done, 1).await;
+        drop(far);
+    };
+    tokio::join!(agent.frames(near, &mut conn), peer);
+    assert_eq!(conn.tasks.len(), k as usize);
+    for _ in 0..k {
+        fake.release.notify_one();
+    }
+}
+
+/// A reap never costs a frame: half a frame is read, a call ends and is reaped, and the rest of
+/// the frame then completes the request, which is answered.
+#[tokio::test]
+async fn a_reap_mid_frame_loses_no_byte() {
+    let (agent, fake, _) = setup();
+    let (mut conn, mut rx, near, mut far) = owned_conn();
+    let peer = async move {
+        far.write_all(&framed(&call(1, "block"))).await.unwrap();
+        reach(&fake.calls, 1).await;
+        let f = framed(&req(2, "tools/list", json!({})));
+        let (head, tail) = f.split_at(f.len() / 2);
+        far.write_all(head).await.unwrap();
+        tokio::task::yield_now().await;
+        fake.release.notify_one();
+        assert_eq!(next_reply(&mut rx).await["id"], json!(1));
+        far.write_all(tail).await.unwrap();
+        let l = next_reply(&mut rx).await;
+        assert_eq!(l["id"], json!(2));
+        assert_eq!(l["result"]["tools"][0]["name"], json!("echo"));
+        drop(far);
+    };
+    tokio::join!(agent.frames(near, &mut conn), peer);
+    assert_eq!(conn.tasks.len(), 0);
+}
+
+/// A frame already read and waiting for its rate token survives a reap and is answered once.
+#[tokio::test(start_paused = true)]
+async fn a_frame_waiting_for_its_token_survives_a_reap() {
+    let (agent, fake, _) = setup();
+    let (mut conn, mut rx, near, mut far) = owned_conn();
+    let peer = async move {
+        far.write_all(&framed(&call(0, "block"))).await.unwrap();
+        reach(&fake.calls, 1).await;
+        // Spend the rest of the burst.
+        for i in 1..i64::from(BURST) {
+            far.write_all(&framed(&req(i, "tools/list", json!({}))))
+                .await
+                .unwrap();
+            assert_eq!(next_reply(&mut rx).await["id"], json!(i));
+        }
+        far.write_all(&framed(&req(999, "tools/list", json!({}))))
+            .await
+            .unwrap();
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        fake.release.notify_one();
+        let mut ids = vec![
+            next_reply(&mut rx).await["id"].clone(),
+            next_reply(&mut rx).await["id"].clone(),
+        ];
+        ids.sort_by_key(|v| v.as_i64());
+        assert_eq!(ids, [json!(0), json!(999)]);
+        let again = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        assert!(again.is_err(), "a frame was answered twice");
+        drop(far);
+    };
+    tokio::join!(agent.frames(near, &mut conn), peer);
+}
