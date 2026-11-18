@@ -7,7 +7,9 @@ use std::time::Duration;
 use sally_core::hf::list::{FileList, parse_list};
 use sally_core::hf::names::{RepoId, RepoPath, Revision};
 
-use super::testkit::{Hub, PUBLIC, SHA, TmpLib, found, gguf, list_json, reply, sha};
+use super::testkit::{
+    Hub, PUBLIC, SHA, TmpLib, foreign_ca_pem, found, gguf, list_json, reply, sha,
+};
 use super::*;
 use crate::egress::roots::{BundleFiles, RootsError};
 
@@ -443,9 +445,9 @@ async fn a_poisoned_library_has_its_own_code() {
     assert_eq!(hub.seen().len(), 1);
 }
 
-/// The client's anchors come only from a checked bundle file: a missing bundle, or one another
-/// user could write, refuses the client; the control, the mock Hub's own bundle at 0644, gives
-/// a client that lists.
+/// The client's anchors come only from a checked bundle file: a missing bundle, or one others
+/// could write, refuses the client; the control, the mock Hub's own bundle at 0644, gives a
+/// client that lists. (The owner check needs a second uid; `egress::roots`'s tests cover it.)
 #[tokio::test]
 async fn the_client_takes_its_roots_only_from_a_checked_bundle() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -455,7 +457,7 @@ async fn the_client_takes_its_roots_only_from_a_checked_bundle() {
         HfClient::with_roots(hub.clone(), hub.clone(), hub.clone(), roots, None).map(|_| ())
     };
     let mut missing = hub.roots().clone();
-    missing.paths = vec![std::env::temp_dir().join("sp-hf-no-such-bundle.pem")];
+    missing.paths = vec![hub.bundles().absent()];
     assert_eq!(make(&missing).unwrap_err().code(), "hf_roots_failed");
     let bundle = hub.roots().paths[0].clone();
     let set = |m| std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(m)).unwrap();
@@ -467,6 +469,27 @@ async fn the_client_takes_its_roots_only_from_a_checked_bundle() {
     bounded(client.files(&repo(), &Revision::main()))
         .await
         .unwrap();
+}
+
+/// The client trusts no anchor but its bundle's: with a bundle holding only an unrelated CA
+/// the handshake to the Hub fails and no request reaches it; the control, the Hub's own bundle
+/// through the same seams, lists.
+#[tokio::test]
+async fn the_client_trusts_no_anchor_but_its_bundle() {
+    let body = list_json(&[]);
+    let hub = Hub::new(move |_, _| reply("200 OK", &[], &body));
+    let foreign = hub.bundles().write("foreign.pem", &foreign_ca_pem());
+    let client =
+        HfClient::with_roots(hub.clone(), hub.clone(), hub.clone(), &foreign, None).unwrap();
+    let err = bounded(client.files(&repo(), &Revision::main()))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "hf_tls_failed");
+    assert!(hub.seen().is_empty(), "a request reached the Hub");
+    bounded(hub.client(None).files(&repo(), &Revision::main()))
+        .await
+        .unwrap();
+    assert_eq!(hub.seen().len(), 1);
 }
 
 /// An empty answer, or one with more addresses than the bound, is a failed lookup and nothing
@@ -519,6 +542,10 @@ fn every_pull_error_has_its_code() {
         (
             PullError::Roots(RootsError::NotFound("x".to_owned())),
             "hf_roots_failed",
+        ),
+        (
+            PullError::TlsConfig(rustls::Error::General("x".to_owned())),
+            "hf_tls_config",
         ),
         (PullError::LibraryPoisoned, "hf_library_poisoned"),
     ];

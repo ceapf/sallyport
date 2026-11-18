@@ -56,7 +56,7 @@ pub enum PullError {
     Roots(#[from] RootsError),
     /// The TLS configuration could not be built from the anchors.
     #[error("the TLS configuration for the Hub could not be built")]
-    TlsConfig(#[from] rustls::Error),
+    TlsConfig(#[source] rustls::Error),
     /// An earlier library call panicked while it held the library, so its in-memory state is
     /// no longer trusted. Permanent until sallyd restarts; never recovered in place.
     #[error("the model library is unusable after an internal failure; restart sallyd")]

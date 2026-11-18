@@ -2,8 +2,9 @@
 //!
 //! Every hop is planned by the core ([`sally_core::hf::plan`]), connected by [`conn`] (resolve
 //! on this host, refuse loopback, private, link-local and own addresses, dial a pinned address,
-//! TLS verified against the anchors of a checked CA bundle, [`HfClient::with_roots`]), sent as [`wire`] builds it (the token only on a hop
-//! to `huggingface.co` itself), and its head decided by the core ([`sally_core::hf::head`]).
+//! TLS verified against the anchors of a checked CA bundle, [`HfClient::with_roots`]), sent as
+//! [`wire`] builds it (the token only on a hop to `huggingface.co` itself), and its head
+//! decided by the core ([`sally_core::hf::head`]).
 //! File bytes go only into a [`sally_core::library::Download`]; its verify checks the listed
 //! SHA-256 before anything else reads them, on a blocking thread without the library's lock,
 //! and only then does the library promote it. Every connection's task is aborted when its
@@ -75,7 +76,8 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> HfClient<R, D, H> {
     /// Blocking (it reads the bundle): call it off the runtime.
     ///
     /// # Errors
-    /// [`PullError::Roots`] when no bundle may be trusted.
+    /// [`PullError::Roots`] when no bundle may be trusted; [`PullError::TlsConfig`] if rustls
+    /// refuses the configuration (not seen with the ring provider's defaults).
     pub fn with_roots(
         resolver: R,
         dialer: D,
@@ -84,7 +86,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> HfClient<R, D, H> {
         token: Option<Secret<String>>,
     ) -> Result<Self, PullError> {
         let loaded = roots.load()?;
-        let tls = conn::client_config(loaded.store)?;
+        let tls = conn::client_config(loaded.store).map_err(PullError::TlsConfig)?;
         Ok(Self::new(resolver, dialer, own, tls, token))
     }
 

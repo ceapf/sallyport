@@ -17,6 +17,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream, duplex};
 
 use super::{HfClient, SharedLibrary};
 use crate::egress::roots::BundleFiles;
+use crate::egress::scratch::{Scratch, scratch};
 use crate::egress::server::{Dialer, HostAddrs, Resolver};
 
 /// A public address (TEST-NET would be refused as reserved).
@@ -53,7 +54,7 @@ type Handler = Arc<dyn Fn(&Seen, usize) -> Vec<u8> + Send + Sync>;
 pub(super) struct Hub {
     server: Arc<rustls::ServerConfig>,
     roots: BundleFiles,
-    _bundle: Arc<Bundle>,
+    bundles: Arc<Bundles>,
     handler: Handler,
     answer: Arc<Mutex<Vec<IpAddr>>>,
     own: Arc<Mutex<Vec<IpAddr>>>,
@@ -67,14 +68,11 @@ impl Hub {
     /// A Hub answering each request with `handler(request, index)`.
     pub(super) fn new(handler: impl Fn(&Seen, usize) -> Vec<u8> + Send + Sync + 'static) -> Self {
         let (ca_pem, server) = pki();
-        let bundle = Bundle::write(&ca_pem);
+        let bundles = Bundles::new();
         Self {
             server,
-            roots: BundleFiles {
-                paths: vec![bundle.0.clone()],
-                owner: rustix::process::getuid().as_raw(),
-            },
-            _bundle: Arc::new(bundle),
+            roots: bundles.write("roots.pem", &ca_pem),
+            bundles: Arc::new(bundles),
             handler: Arc::new(handler),
             answer: Arc::new(Mutex::new(vec![PUBLIC])),
             own: Arc::new(Mutex::new(Vec::new())),
@@ -100,6 +98,11 @@ impl Hub {
     /// The bundle file holding the mock's CA, owned by this user at 0644.
     pub(super) fn roots(&self) -> &BundleFiles {
         &self.roots
+    }
+
+    /// The scratch directory the mock's bundle lives in, for other bundles a test writes.
+    pub(super) fn bundles(&self) -> &Bundles {
+        &self.bundles
     }
 
     /// Every lookup answers `ip` from now on.
@@ -232,35 +235,60 @@ fn parse_head(head: &str) -> Seen {
     seen
 }
 
-/// A CA bundle file minted at test time, removed on drop.
-struct Bundle(PathBuf);
+/// CA bundle files minted at test time in a fresh scratch directory under `target/` (removed on
+/// drop): each created new at 0644, never through a name someone else chose.
+pub(super) struct Bundles(Scratch);
 
-impl Bundle {
-    fn write(pem: &str) -> Self {
-        use std::os::unix::fs::PermissionsExt as _;
+impl Bundles {
+    pub(super) fn new() -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("sp-hf-roots-{}-{n}.pem", std::process::id()));
-        std::fs::write(&path, pem).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        Self(path)
+        Self(scratch("hf-roots", &n.to_string()))
+    }
+
+    /// `pem` written to a new file `name`, as the roots a client loads (owned by this user).
+    pub(super) fn write(&self, name: &str, pem: &str) -> BundleFiles {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let path = self.0.join(name);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .open(&path)
+            .unwrap()
+            .write_all(pem.as_bytes())
+            .unwrap();
+        BundleFiles {
+            paths: vec![path],
+            owner: rustix::process::getuid().as_raw(),
+        }
+    }
+
+    /// A path in the scratch directory that nothing creates.
+    pub(super) fn absent(&self) -> PathBuf {
+        self.0.join("absent.pem")
     }
 }
 
-impl Drop for Bundle {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
+/// A self-signed CA's key pair, parameters and PEM.
+fn ca(name: &str) -> (KeyPair, CertificateParams, String) {
+    let key = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.distinguished_name.push(DnType::CommonName, name);
+    let pem = params.self_signed(&key).unwrap().pem();
+    (key, params, pem)
+}
+
+/// The PEM of a CA unrelated to any Hub's.
+pub(super) fn foreign_ca_pem() -> String {
+    ca("unrelated CA").2
 }
 
 /// A CA (as PEM) and one leaf for the Hub's names.
 fn pki() -> (String, Arc<rustls::ServerConfig>) {
-    let ca_key = KeyPair::generate().unwrap();
-    let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
-    ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    ca.distinguished_name
-        .push(DnType::CommonName, "mock hub CA");
-    let ca_cert = ca.self_signed(&ca_key).unwrap();
+    let (ca_key, ca, ca_pem) = ca("mock hub CA");
     let issuer = rcgen::Issuer::new(ca, ca_key);
     let leaf_key = KeyPair::generate().unwrap();
     let names: Vec<String> = NAMES.iter().map(|n| (*n).to_owned()).collect();
@@ -277,7 +305,7 @@ fn pki() -> (String, Arc<rustls::ServerConfig>) {
     .with_no_client_auth()
     .with_single_cert(vec![leaf.der().clone()], key)
     .unwrap();
-    (ca_cert.pem(), Arc::new(cfg))
+    (ca_pem, Arc::new(cfg))
 }
 
 /// A response: status line, the given header lines, a Content-Length for `body`, the body.
