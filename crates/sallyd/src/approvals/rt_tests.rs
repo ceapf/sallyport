@@ -155,7 +155,9 @@ fn fx(timeout: Duration, max_pending: usize) -> Fx {
     );
     let exec = std::sync::Arc::new(Recording::default());
     let handler = Gated::new(gate.clone(), std::sync::Arc::clone(&exec));
-    let agent = std::sync::Arc::new(Agent::new(handler, rec));
+    // A panic fails the test through its missing reply; nobody reads the reports here.
+    let crash = crate::daemon::crash::CrashReporter::channel().0;
+    let agent = std::sync::Arc::new(Agent::new(handler, rec, crash));
     Fx {
         agent,
         desk,

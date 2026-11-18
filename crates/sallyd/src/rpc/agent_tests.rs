@@ -3,11 +3,12 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::json;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use super::*;
+use crate::daemon::crash::CrashReceiver;
 use crate::rpc::mcp::{META_CAPABILITIES, META_VERSION, MODERN};
 use crate::rpc::testkit::{Sink, recorder};
 
@@ -69,14 +70,22 @@ impl ToolHandler for Arc<Fake> {
         self.numbers.lock().unwrap().push(call);
         self.seen.lock().unwrap().push((name.clone(), arguments));
         let _ended = Ended(Arc::clone(self));
-        if name == "block" {
+        // `block-panic`: held like `block`, then panics like `panic`.
+        if name.starts_with("block") {
             self.release.notified().await;
         }
+        assert!(!name.ends_with("panic"), "the tool panicked");
         self.done.fetch_add(1, Ordering::SeqCst);
         // `unrecorded`: the handler's entry failed, so it answers nothing.
-        (name != "unrecorded").then(|| ToolOutcome {
+        // `big`: an outcome of 1 MiB, the size of a large fs_read.
+        let text = if name == "big" {
+            "x".repeat(1 << 20)
+        } else {
+            format!("ran {name}")
+        };
+        (name != "unrecorded").then_some(ToolOutcome {
             is_error: false,
-            text: format!("ran {name}"),
+            text,
         })
     }
 
@@ -131,7 +140,12 @@ impl Client {
 }
 
 fn start(agent: &Arc<Agent<Arc<Fake>>>) -> Client {
-    let (client, server) = tokio::io::duplex(4 * MAX_FRAME);
+    start_with(agent, 4 * MAX_FRAME)
+}
+
+/// A client whose pipe holds at most `buffer` bytes each way.
+fn start_with(agent: &Arc<Agent<Arc<Fake>>>, buffer: usize) -> Client {
+    let (client, server) = tokio::io::duplex(buffer);
     let server = tokio::spawn(Arc::clone(agent).serve_stream(server));
     let (r, w) = tokio::io::split(client);
     Client {
@@ -142,9 +156,20 @@ fn start(agent: &Arc<Agent<Arc<Fake>>>) -> Client {
 }
 
 fn setup() -> (Arc<Agent<Arc<Fake>>>, Arc<Fake>, Arc<Sink>) {
+    let (agent, fake, sink, _) = watched();
+    (agent, fake, sink)
+}
+
+/// A server, its handler, its audit sink and its session's crash receiver.
+type Watched = (Arc<Agent<Arc<Fake>>>, Arc<Fake>, Arc<Sink>, CrashReceiver);
+
+/// [`setup`], with the receiver of the session's crash reporter.
+fn watched() -> Watched {
     let fake = Arc::new(Fake::default());
     let (sink, rec) = recorder("sess-a");
-    (Arc::new(Agent::new(Arc::clone(&fake), rec)), fake, sink)
+    let (crash, crashes) = CrashReporter::channel();
+    let agent = Arc::new(Agent::new(Arc::clone(&fake), rec, crash));
+    (agent, fake, sink, crashes)
 }
 
 fn meta() -> Value {
@@ -600,7 +625,7 @@ async fn in_flight_calls_are_capped_per_session() {
     assert_eq!(e["error"]["data"]["reason"], json!("too-many-in-flight"));
     assert_eq!(fake.calls.load(Ordering::SeqCst), MAX_IN_FLIGHT);
     assert_eq!(denies(&sink), ["too-many-in-flight"]);
-    // One returns, on whichever connection sent it; its slot is freed before its reply is
+    // One returns, on whichever connection sent it; its slot is freed once its reply is
     // queued, so one more call may run once the reply is in.
     fake.release.notify_one();
     let reply = tokio::select! {
@@ -615,6 +640,109 @@ async fn in_flight_calls_are_capped_per_session() {
     for _ in 0..MAX_IN_FLIGHT {
         fake.release.notify_one();
     }
+}
+
+/// Less than one reply fits in this pipe, so a reply the peer does not read stays with the
+/// server.
+const TIGHT: usize = 64;
+
+/// Sends `n` `tool` calls on `w`, ids `0..n`, from a task of its own (the pipe is too small
+/// to hold them); stops at the first failed write.
+fn flood(mut w: WriteHalf<DuplexStream>, tool: &'static str, n: i64) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        for i in 0..n {
+            let mut f = serde_json::to_vec(&call(i, tool)).unwrap();
+            f.push(b'\n');
+            if w.write_all(&f).await.is_err() {
+                return;
+            }
+        }
+    })
+}
+
+/// A call keeps its slot until its reply has left the broker, so a peer that reads nothing
+/// holds at most MAX_IN_FLIGHT replies there, on one connection or many: the next call, on
+/// any connection of the session, is refused (and recorded). Observed past the time the
+/// rate lets all 100 frames in and before WRITE_TIMEOUT closes the connection; past it, the
+/// slots of every queued and waiting reply are free again.
+#[tokio::test(start_paused = true)]
+async fn a_peer_that_reads_nothing_holds_at_most_max_in_flight_replies() {
+    let (agent, fake, sink) = setup();
+    let Client { mut r, w, server } = start_with(&agent, TIGHT);
+    let n = 100;
+    let sender = flood(w, "big", n);
+    let all_read = Duration::from_secs((n as u64 - u64::from(BURST)) / u64::from(RATE));
+    tokio::time::sleep(all_read + Duration::from_secs(1)).await;
+    assert!(all_read + Duration::from_secs(1) < WRITE_TIMEOUT);
+    assert_eq!(
+        fake.calls.load(Ordering::SeqCst),
+        MAX_IN_FLIGHT,
+        "calls admitted while the peer reads nothing"
+    );
+    let mut other = start(&agent);
+    let e = other.call(&call(1, "echo")).await;
+    assert_eq!(e["error"]["data"]["reason"], json!("too-many-in-flight"));
+    assert_eq!(
+        denies(&sink).last().map(String::as_str),
+        Some("too-many-in-flight")
+    );
+    // Past WRITE_TIMEOUT the writer gives up and the connection closes.
+    tokio::time::sleep(WRITE_TIMEOUT).await;
+    let mut rest = Vec::new();
+    let _ = r.read_to_end(&mut rest).await;
+    server.await.unwrap();
+    sender.abort();
+    assert_eq!(agent.in_flight.available_permits(), MAX_IN_FLIGHT);
+    let mut again = start(&agent);
+    for i in 0..MAX_IN_FLIGHT as i64 {
+        again.send(&call(i, "block")).await;
+    }
+    reach(&fake.calls, 2 * MAX_IN_FLIGHT).await;
+    for _ in 0..MAX_IN_FLIGHT {
+        fake.release.notify_one();
+    }
+    for _ in 0..MAX_IN_FLIGHT {
+        assert_eq!(
+            again.recv().await.unwrap()["result"]["content"][0]["text"],
+            json!("ran block")
+        );
+    }
+}
+
+/// The same pipe with a peer that reads one reply a second: every id gets exactly one reply,
+/// its result or a recorded too-many-in-flight refusal; the connection stays open and every
+/// slot is free at the end.
+#[tokio::test(start_paused = true)]
+async fn a_slow_reader_gets_one_reply_to_every_call() {
+    let (agent, fake, sink) = setup();
+    let Client { mut r, w, server } = start_with(&agent, TIGHT);
+    let n = 100;
+    let sender = flood(w, "echo", n);
+    let (mut ids, mut refused) = (Vec::new(), 0);
+    for _ in 0..n {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let mut line = String::new();
+        assert!(
+            r.read_line(&mut line).await.unwrap() > 0,
+            "the server closed"
+        );
+        let v: Value = serde_json::from_str(&line).unwrap();
+        if v["error"]["data"]["reason"] == json!("too-many-in-flight") {
+            refused += 1;
+        } else {
+            assert_eq!(v["result"]["content"][0]["text"], json!("ran echo"), "{v}");
+        }
+        ids.push(v["id"].as_i64().unwrap());
+    }
+    ids.sort_unstable();
+    assert_eq!(ids, (0..n).collect::<Vec<_>>());
+    assert_eq!(fake.calls.load(Ordering::SeqCst), n as usize - refused);
+    assert_eq!(denies(&sink).len(), refused);
+    // The client's end of the stream closes the connection; then every slot is free.
+    sender.await.unwrap();
+    drop(r);
+    server.await.unwrap();
+    assert_eq!(agent.in_flight.available_permits(), MAX_IN_FLIGHT);
 }
 
 #[tokio::test]
@@ -712,8 +840,9 @@ async fn rt_ag_08_a_foreign_session_id_reaches_only_its_own_session() {
         sally_core::manifest::AuditLevel::Full,
     );
     let (fa, fb) = (Arc::new(Fake::default()), Arc::new(Fake::default()));
-    let a = Arc::new(Agent::new(Arc::clone(&fa), rec_a));
-    let _b = Arc::new(Agent::new(Arc::clone(&fb), rec_b));
+    let crash = CrashReporter::channel().0;
+    let a = Arc::new(Agent::new(Arc::clone(&fa), rec_a, crash.clone()));
+    let _b = Arc::new(Agent::new(Arc::clone(&fb), rec_b, crash));
     let mut c = start(&a);
     let mut m = meta();
     m["session"] = json!("sess-b");
@@ -774,8 +903,7 @@ async fn a_peer_with_another_uid_is_refused_and_recorded() {
     let listener = tokio::net::UnixListener::bind(&path).unwrap();
     let (agent, fake, sink) = setup();
     let me = rustix::process::getuid().as_raw();
-    let (crash, _crashes) = crate::rpc::listen::CrashReporter::channel();
-    let h = Arc::clone(&agent).listen(listener, me.wrapping_add(1), crash);
+    let h = Arc::clone(&agent).listen(listener, me.wrapping_add(1));
     let mut s = UnixStream::connect(&path).await.unwrap();
     let msg = serde_json::to_vec(&call(1, "echo")).unwrap();
     let _ = s.write_all(&msg).await;
@@ -945,8 +1073,7 @@ async fn session_teardown_drops_in_flight_calls() {
         let path = dir.join(format!("agent-{orderly}.sock"));
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         let (agent, fake, _) = setup();
-        let (crash, _crashes) = crate::rpc::listen::CrashReporter::channel();
-        let h = Arc::clone(&agent).listen(listener, me, crash);
+        let h = Arc::clone(&agent).listen(listener, me);
         let mut s = UnixStream::connect(&path).await.unwrap();
         let mut msg = serde_json::to_vec(&call(1, "block")).unwrap();
         msg.push(b'\n');
@@ -1046,10 +1173,17 @@ fn logged_ids_are_escaped() {
 }
 
 fn driven_setup() -> (Arc<Agent<Arc<Fake>>>, Arc<Fake>, Arc<Sink>) {
+    let (agent, fake, sink, _) = driven_watched();
+    (agent, fake, sink)
+}
+
+/// [`driven_setup`], with the receiver of the session's crash reporter.
+fn driven_watched() -> Watched {
     let fake = Arc::new(Fake::default());
     let (sink, rec) = recorder("sess-a");
-    let agent = Agent::new(Arc::clone(&fake), rec.driven());
-    (Arc::new(agent), fake, sink)
+    let (crash, crashes) = CrashReporter::channel();
+    let agent = Agent::new(Arc::clone(&fake), rec.driven(), crash);
+    (Arc::new(agent), fake, sink, crashes)
 }
 
 fn args() -> Map<String, Value> {

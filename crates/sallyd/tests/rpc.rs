@@ -95,11 +95,8 @@ async fn harness(x: &Lx, tag: &str, script: &str) -> Harness {
     let record = Recorder::new(sink, session, AuditLevel::Full);
     // A panic would surface as a failed exchange; nobody reads the reports here.
     let (crash, _) = sallyd::daemon::crash::CrashReporter::channel();
-    let agent = Arc::new(Agent::new(Echo, record.clone())).listen(
-        bind(&sockets.join("agent.sock")).unwrap(),
-        uid,
-        crash.clone(),
-    );
+    let agent = Arc::new(Agent::new(Echo, record.clone(), crash.clone()))
+        .listen(bind(&sockets.join("agent.sock")).unwrap(), uid);
     let (llm, model) = serve_llm(&sockets, record, script, crash);
     let v = x.f.load("");
     // The net image carries the static shim; its own entry's net.sock listener finds no socket
