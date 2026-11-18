@@ -19,7 +19,7 @@ use tokio::time::Instant;
 
 use super::addr::HostNets;
 use super::ca::{self, CaError, SessionTls, Validity};
-use super::hostaddrs;
+use super::hostaddrs::{self, HostAddrsError, Table};
 use super::inject::{Credentials, CredentialsError, SecretSource, Spec};
 use super::local::{ClientTls, Connector, LOCAL_QUEUE, Local, ORIGIN, Opened, Reach, host_grants};
 use super::policy::Policy;
@@ -149,47 +149,54 @@ impl Default for ProcHostAddrs {
 }
 
 impl HostAddrs for ProcHostAddrs {
-    async fn own(&self) -> io::Result<HostNets> {
+    async fn own(&self) -> Result<HostNets, HostAddrsError> {
         let me = self.clone();
         tokio::task::spawn_blocking(move || me.read())
             .await
-            .map_err(io::Error::other)?
+            .map_err(|_| HostAddrsError::ReaderFailed)?
     }
 }
 
 impl ProcHostAddrs {
-    fn read(&self) -> io::Result<HostNets> {
-        let fib = read_bounded(&self.fib_trie)?;
-        let addrs = read_optional(&self.if_inet6)?;
-        let routes = read_optional(&self.ipv6_route)?;
+    fn read(&self) -> Result<HostNets, HostAddrsError> {
+        let fib = read_bounded(&self.fib_trie, Table::FibTrie)?;
+        let addrs = read_optional(&self.if_inet6, Table::IfInet6)?;
+        let routes = read_optional(&self.ipv6_route, Table::Ipv6Route)?;
         let v6 = hostaddrs::Ipv6Tables {
             addrs: addrs.as_deref(),
             routes: routes.as_deref(),
         };
-        hostaddrs::parse(&fib, v6).map_err(io::Error::other)
+        hostaddrs::parse(&fib, v6)
     }
 }
 
 /// [`read_bounded`], with a file that does not exist read as `None` (IPv6 is off).
-fn read_optional(path: &Path) -> io::Result<Option<String>> {
-    match read_bounded(path) {
+fn read_optional(path: &Path, table: Table) -> Result<Option<String>, HostAddrsError> {
+    match read_bounded(path, table) {
         Ok(s) => Ok(Some(s)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(HostAddrsError::Unreadable {
+            kind: io::ErrorKind::NotFound,
+            ..
+        }) => Ok(None),
         Err(e) => Err(e),
     }
 }
 
-/// Reads at most [`MAX_PROC_BYTES`]; a longer file is an error.
-fn read_bounded(path: &Path) -> io::Result<String> {
+/// Reads at most [`MAX_PROC_BYTES`]; a longer file is an error. Errors name the table and how
+/// the read failed, never the path.
+fn read_bounded(path: &Path, table: Table) -> Result<String, HostAddrsError> {
+    let unreadable = |e: io::Error| HostAddrsError::Unreadable {
+        table,
+        kind: e.kind(),
+    };
     let mut text = String::new();
-    std::fs::File::open(path)?
+    std::fs::File::open(path)
+        .map_err(unreadable)?
         .take(MAX_PROC_BYTES + 1)
-        .read_to_string(&mut text)?;
+        .read_to_string(&mut text)
+        .map_err(unreadable)?;
     if u64::try_from(text.len()).unwrap_or(u64::MAX) > MAX_PROC_BYTES {
-        return Err(io::Error::other(format!(
-            "{}: over the size bound",
-            path.display()
-        )));
+        return Err(HostAddrsError::TooLarge { table });
     }
     Ok(text)
 }

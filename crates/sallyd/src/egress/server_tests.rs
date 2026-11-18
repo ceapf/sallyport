@@ -11,6 +11,7 @@ use sally_core::manifest::parse_host_pattern;
 use tokio::io::{DuplexStream, duplex};
 
 use super::*;
+use crate::egress::hostaddrs::Table;
 use crate::egress::policy::{Grant, Rule};
 
 /// A public address (documentation-free, globally routed).
@@ -88,12 +89,12 @@ impl Dialer for FakeDialer {
 }
 
 /// The host's tables: `None` cannot be read.
-struct FakeHost(Option<HostNets>);
+struct FakeHost(Result<HostNets, HostAddrsError>);
 
 impl FakeHost {
     /// A host owning `own` and connected to no network.
     fn owning(own: Vec<IpAddr>) -> Self {
-        Self(Some(HostNets {
+        Self(Ok(HostNets {
             own,
             connected: Vec::new(),
         }))
@@ -101,8 +102,8 @@ impl FakeHost {
 }
 
 impl HostAddrs for FakeHost {
-    async fn own(&self) -> io::Result<HostNets> {
-        self.0.clone().ok_or_else(|| io::ErrorKind::NotFound.into())
+    async fn own(&self) -> Result<HostNets, HostAddrsError> {
+        self.0.clone()
     }
 }
 
@@ -589,10 +590,14 @@ async fn the_hosts_own_addresses_are_refused_and_an_unknown_list_refuses_all() {
     assert_eq!(args.get("address"), Some(&json!(public(1).to_string())));
     assert_eq!(args.get("rule"), Some(&json!("own-address")));
     let unknown = Setup {
-        host: FakeHost(None),
+        host: FakeHost(Err(HostAddrsError::Malformed {
+            table: Table::Ipv6Route,
+            line: 7,
+        })),
         ..Setup::default()
     }
     .rig();
+    // The reply is the reason only: no cause or line number (an oracle for the table's size).
     assert_eq!(
         unknown.send(&connect("a.mock.test:443")).await,
         reply(Reason::IpRangeDenied)
@@ -604,6 +609,7 @@ async fn the_hosts_own_addresses_are_refused_and_an_unknown_list_refuses_all() {
         json!({
             "reason": "ip-range-denied", "target": "a.mock.test:443", "target_bytes": 15,
             "target_cut": false, "filter": "host-addresses-unavailable",
+            "cause": "ipv6_route line 7 is malformed",
         })
     );
 }
@@ -617,7 +623,7 @@ async fn a_neighbour_on_a_connected_network_is_refused_and_named() {
     let answer = vec![public(1), neighbour];
     let connected = |nets: Vec<crate::egress::addr::Net>| Setup {
         resolver: FakeResolver::default().with("a.mock.test", vec![answer.clone()]),
-        host: FakeHost(Some(HostNets {
+        host: FakeHost(Ok(HostNets {
             own: vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 1))],
             connected: nets,
         })),

@@ -30,7 +30,7 @@ impl Rule {
 
 /// A network: an address and a prefix length of at least 1 (a prefix of length 0 is never a
 /// network here: it would be every address).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Net {
     addr: IpAddr,
     len: u32,
@@ -59,6 +59,12 @@ impl Net {
         self.addr
     }
 
+    /// The prefix length, in bits.
+    #[must_use]
+    pub fn bits(&self) -> u32 {
+        self.len
+    }
+
     /// Whether `ip` (of the same family) is inside this network.
     #[must_use]
     pub fn contains(&self, ip: IpAddr) -> bool {
@@ -71,7 +77,7 @@ impl Net {
 }
 
 /// What the host's own tables say: the addresses it owns and the networks it is directly
-/// connected to.
+/// connected to (sorted and without duplicates when the tables are parsed).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HostNets {
     /// Addresses this host owns.
@@ -310,7 +316,8 @@ mod tests {
         }
         // Every bit below the length is cleared, every bit above kept.
         let n = net(v4(0xFFFF_FFFF), 1);
-        assert_eq!((n.addr(), n.len), (v4(0x8000_0000), 1));
+        assert_eq!((n.addr(), n.bits()), (v4(0x8000_0000), 1));
+        assert_eq!(net(v6("2606:4700::"), 48).bits(), 48);
         assert_eq!(net(v4(0x5DB8_D8FF), 24).addr(), v4(0x5DB8_D800));
         assert_eq!(net(v4(0x5DB8_D8FF), 31).addr(), v4(0x5DB8_D8FE));
         let n = net(v6("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"), 1);

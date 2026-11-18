@@ -152,3 +152,10 @@ path = "fuzz_targets/hf.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "host_tables"
+path = "fuzz_targets/host_tables.rs"
+test = false
+doc = false
+bench = false

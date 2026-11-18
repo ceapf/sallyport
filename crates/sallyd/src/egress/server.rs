@@ -24,6 +24,7 @@ use tokio::sync::{Semaphore, watch};
 use super::addr::{self, HostNets, Rule};
 use super::authority::{self, Authority, AuthorityError};
 use super::head::{self, MAX_HEAD, Parsed};
+use super::hostaddrs::HostAddrsError;
 use super::policy::{Policy, Reason, Route};
 use super::tunnel::{self, End, IDLE_LIMIT, Totals};
 use crate::sandbox::AuditSink;
@@ -92,7 +93,7 @@ pub trait Dialer: Send + Sync + 'static {
 /// 5: refused like loopback).
 pub trait HostAddrs: Send + Sync + 'static {
     /// The current tables. An error refuses the connection (fail closed).
-    fn own(&self) -> impl Future<Output = io::Result<HostNets>> + Send;
+    fn own(&self) -> impl Future<Output = Result<HostNets, HostAddrsError>> + Send;
 }
 
 impl<T: Resolver> Resolver for Arc<T> {
@@ -113,7 +114,7 @@ impl<T: Dialer> Dialer for Arc<T> {
 }
 
 impl<T: HostAddrs> HostAddrs for Arc<T> {
-    fn own(&self) -> impl Future<Output = io::Result<HostNets>> + Send {
+    fn own(&self) -> impl Future<Output = Result<HostNets, HostAddrsError>> + Send {
         (**self).own()
     }
 }
@@ -253,18 +254,25 @@ enum Seen<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Refusal {
     reason: Reason,
-    /// Which part of the address filter could not be evaluated, if that was why.
-    filter: Option<&'static str>,
+    detail: Detail,
+}
+
+/// What the address filter adds to a refusal's entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Detail {
+    /// Nothing.
+    None,
+    /// The host's tables could not be read or understood, and why.
+    Unavailable(HostAddrsError),
     /// The first resolved address the filter refused, and the rule it met.
-    denied: Option<(IpAddr, Rule)>,
+    Denied(IpAddr, Rule),
 }
 
 impl From<Reason> for Refusal {
     fn from(reason: Reason) -> Self {
         Self {
             reason,
-            filter: None,
-            denied: None,
+            detail: Detail::None,
         }
     }
 }
@@ -397,10 +405,9 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
                     .ok_or(Reason::GrantHostUnavailable)?,
             ),
         };
-        let host = self.host.own().await.map_err(|_| Refusal {
+        let host = self.host.own().await.map_err(|e| Refusal {
             reason: Reason::IpRangeDenied,
-            filter: Some(HOST_ADDRS_UNAVAILABLE),
-            denied: None,
+            detail: Detail::Unavailable(e),
         })?;
         let lookup = self.resolver.resolve(&a.host, a.port);
         let found = match tokio::time::timeout(self.limits.resolve, lookup).await {
@@ -410,11 +417,10 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         let denied = found
             .iter()
             .find_map(|s| addr::denied_by(s.ip(), &host).map(|rule| (s.ip(), rule)));
-        if denied.is_some() {
+        if let Some((ip, rule)) = denied {
             return Err(Refusal {
                 reason: Reason::IpRangeDenied,
-                filter: None,
-                denied,
+                detail: Detail::Denied(ip, rule),
             });
         }
         Ok((pinned(&found, a.port), tls))
@@ -629,12 +635,16 @@ fn refusal_entry(e: NewEntry, r: Refusal, seen: Seen<'_>, forms: Option<&Redacto
             }
             Seen::Target(raw) => target = Some(raw),
         }
-        if let Some(f) = r.filter {
-            obj.insert("filter".into(), json!(f));
-        }
-        if let Some((ip, rule)) = r.denied {
-            obj.insert("address".into(), json!(ip.to_string()));
-            obj.insert("rule".into(), json!(rule.as_str()));
+        match r.detail {
+            Detail::None => {}
+            Detail::Unavailable(cause) => {
+                obj.insert("filter".into(), json!(HOST_ADDRS_UNAVAILABLE));
+                obj.insert("cause".into(), json!(cause.to_string()));
+            }
+            Detail::Denied(ip, rule) => {
+                obj.insert("address".into(), json!(ip.to_string()));
+                obj.insert("rule".into(), json!(rule.as_str()));
+            }
         }
     }
     match target {

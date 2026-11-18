@@ -26,8 +26,14 @@ async fn unreadable_or_oversized_proc_files_fail_and_a_missing_inet6_is_none() {
     };
     let missing = dir.join("missing");
     assert_eq!(p(&fib, &missing).read().unwrap().own, [IpAddr::V4(lo)]);
-    assert!(p(&missing, &missing).read().is_err());
-    assert!(p(&fib, &dir).read().is_err(), "a directory is not NotFound");
+    let unreadable = |table, kind| Err(HostAddrsError::Unreadable { table, kind });
+    assert_eq!(
+        p(&missing, &missing).read(),
+        unreadable(Table::FibTrie, io::ErrorKind::NotFound)
+    );
+    // A directory is not NotFound: it refuses, it does not turn IPv6 off.
+    let is_dir = io::ErrorKind::IsADirectory;
+    assert_eq!(p(&fib, &dir).read(), unreadable(Table::IfInet6, is_dir));
     let empty = dir.join("empty");
     std::fs::write(&empty, "").unwrap();
     let half = |a: &Path, r: &Path| ProcHostAddrs {
@@ -36,9 +42,11 @@ async fn unreadable_or_oversized_proc_files_fail_and_a_missing_inet6_is_none() {
         ipv6_route: r.to_owned(),
     };
     assert!(half(&empty, &empty).read().is_ok());
-    assert!(half(&empty, &missing).read().is_err(), "routes missing");
-    assert!(half(&missing, &empty).read().is_err(), "addresses missing");
-    assert!(half(&empty, &dir).read().is_err(), "routes unreadable");
+    let v6_half = Err(HostAddrsError::Ipv6Half);
+    assert_eq!(half(&empty, &missing).read(), v6_half, "routes missing");
+    assert_eq!(half(&missing, &empty).read(), v6_half, "addresses missing");
+    let routes_dir = half(&empty, &dir).read();
+    assert_eq!(routes_dir, unreadable(Table::Ipv6Route, is_dir));
     // A valid table of `size` bytes: the padding is the route line's indent, so only the size
     // decides between the two files.
     let sized = |size: usize| {
@@ -48,7 +56,17 @@ async fn unreadable_or_oversized_proc_files_fail_and_a_missing_inet6_is_none() {
     let max = usize::try_from(MAX_PROC_BYTES).unwrap();
     let big = dir.join("big");
     std::fs::write(&big, sized(max + 1)).unwrap();
-    assert!(p(&big, &missing).read().is_err());
+    let too_large = Err(HostAddrsError::TooLarge {
+        table: Table::FibTrie,
+    });
+    assert_eq!(p(&big, &missing).read(), too_large);
+    // Each table has its own bound.
+    assert_eq!(
+        half(&empty, &big).read(),
+        Err(HostAddrsError::TooLarge {
+            table: Table::Ipv6Route
+        })
+    );
     let exact = dir.join("exact");
     std::fs::write(&exact, sized(max)).unwrap();
     assert!(p(&exact, &missing).read().is_ok());
@@ -1151,7 +1169,7 @@ impl Dialer for Echo {
 }
 struct NoneOwned;
 impl HostAddrs for NoneOwned {
-    async fn own(&self) -> io::Result<HostNets> {
+    async fn own(&self) -> Result<HostNets, HostAddrsError> {
         Ok(HostNets::default())
     }
 }

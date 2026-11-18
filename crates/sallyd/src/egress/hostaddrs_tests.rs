@@ -40,6 +40,11 @@ fn v4_only(text: &str) -> Result<HostNets, HostAddrsError> {
     parse(text, Ipv6Tables::default())
 }
 
+/// The refusal for line `line` (from 1) of `table`.
+fn at(table: Table, line: usize) -> Result<HostNets, HostAddrsError> {
+    Err(HostAddrsError::Malformed { table, line })
+}
+
 #[test]
 fn local_host_entries_are_owned_once_and_every_other_line_is_a_network() {
     let got = v4_only(&fib(doc(7), doc(255))).unwrap();
@@ -68,11 +73,7 @@ fn only_a_slash_32_host_local_line_is_an_own_address() {
         assert_eq!(got.connected, [net(v4(leaf), len)], "{line}");
     }
     for line in ["/32 host", "/32 host LOCAL extra"] {
-        assert_eq!(
-            v4_only(&one(doc(9), line)),
-            Err(HostAddrsError::MalformedFib),
-            "{line}"
-        );
+        assert_eq!(v4_only(&one(doc(9), line)), at(Table::FibTrie, 4), "{line}");
     }
 }
 
@@ -127,11 +128,7 @@ fn a_route_line_the_parser_does_not_understand_refuses_the_list() {
         "/24 link type x",
     ] {
         let leaf = Ipv4Addr::new(93, 184, 216, 0);
-        assert_eq!(
-            v4_only(&one(leaf, line)),
-            Err(HostAddrsError::MalformedFib),
-            "{line}"
-        );
+        assert_eq!(v4_only(&one(leaf, line)), at(Table::FibTrie, 4), "{line}");
     }
 }
 
@@ -146,7 +143,7 @@ fn a_leaf_with_bits_below_its_route_length_refuses_the_list() {
     ] {
         assert_eq!(
             v4_only(&one(leaf, line)),
-            Err(HostAddrsError::MalformedFib),
+            at(Table::FibTrie, 4),
             "{leaf} {line}"
         );
     }
@@ -158,36 +155,59 @@ fn a_leaf_with_bits_below_its_route_length_refuses_the_list() {
 fn every_fib_line_has_one_of_four_shapes() {
     let lo = Ipv4Addr::LOCALHOST;
     let base = format!("|-- {lo}\n   /32 host LOCAL\n");
+    let d = doc(0);
     let ok = format!(
-        "Main:\n{base}Local:\nId 255:\n  +-- {}/24 2 0 2\n|-- {}\n   /24 link UNICAST\n   /32 link BROADCAST\n",
-        doc(0),
-        doc(0)
+        "Main:\n{base}Local:\nId 255:\nId -1:\nId 4294967295:\n  +-- {d}/24 2 0 2\n  \
+         +-- {d}/32 0 0 0\n|-- {d}\n   /24 link UNICAST\n   /32 link BROADCAST\n"
     );
     let got = v4_only(&ok).unwrap();
     assert_eq!(got.own, [v4(lo)]);
-    assert_eq!(got.connected, [net(v4(doc(0)), 24), net(v4(doc(0)), 32)]);
-    for bad in [
-        format!("{base}+-- {}/24 2 0 2\n   /24 link UNICAST\n", doc(0)),
-        format!("/24 link UNICAST\n{base}"),
-        format!("{base}Main:\n   /24 link UNICAST\n"),
-        format!("{base}|-- not-an-ip\n   /32 host LOCAL\n"),
-        format!("{base}|-- {} \n", doc(0)),
-        format!("{base}\n"),
-        format!("{base}garbage\n"),
-        format!("{base}Id x:\n"),
-        format!("{base}Id 5\n"),
-        format!("{base}Other:\n"),
-        format!("{base}+-- x/24 2 0 2\n"),
-        format!("{base}+-- {}/33 2 0 2\n", doc(0)),
-        format!("{base}+-- {}/x 2 0 2\n", doc(0)),
-        format!("{base}+-- {}/24 2 0\n", doc(0)),
-        format!("{base}+-- {}/24 2 0 2 2\n", doc(0)),
-        format!("{base}+-- {} 2 0 2\n", doc(0)),
-        format!("{base}+-- {}/24 2 0 x\n", doc(0)),
-        format!("{base}+-- {}/24 x 0 2\n", doc(0)),
+    assert_eq!(got.connected, [net(v4(d), 24), net(v4(d), 32)]);
+    // Each bad text with the line (from 1) that refuses it.
+    for (bad, line) in [
+        (format!("{base}+-- {d}/24 2 0 2\n   /24 link UNICAST\n"), 4),
+        (format!("/24 link UNICAST\n{base}"), 1),
+        (format!("{base}Main:\n   /24 link UNICAST\n"), 4),
+        (format!("{base}|-- not-an-ip\n   /32 host LOCAL\n"), 3),
+        (format!("{base}|-- {d} \n"), 3),
+        (format!("{base}\n"), 3),
+        (format!("{base}garbage\n"), 3),
+        (format!("{base}Id x:\n"), 3),
+        (format!("{base}Id 5\n"), 3),
+        (format!("{base}Id +5:\n"), 3),
+        (format!("{base}Id --5:\n"), 3),
+        (format!("{base}Id :\n"), 3),
+        (format!("{base}Other:\n"), 3),
+        (format!("{base}+-- x/24 2 0 2\n"), 3),
+        (format!("{base}+-- {d}/33 2 0 2\n"), 3),
+        (format!("{base}+-- {d}/x 2 0 2\n"), 3),
+        (format!("{base}+-- {d}/+24 2 0 2\n"), 3),
+        (format!("{base}+-- {d}/24 2 0\n"), 3),
+        (format!("{base}+-- {d}/24 2 0 2 2\n"), 3),
+        (format!("{base}+-- {d} 2 0 2\n"), 3),
+        (format!("{base}+-- {d}/24 2 0 x\n"), 3),
+        (format!("{base}+-- {d}/24 x 0 2\n"), 3),
+        (format!("{base}+-- {d}/24 2 +0 2\n"), 3),
+        (format!("|-- {d}\n   /+24 link UNICAST\n{base}"), 2),
+        (format!("|-- {d}\n   /24 link UNICAST tos=+8\n{base}"), 2),
     ] {
-        assert_eq!(v4_only(&bad), Err(HostAddrsError::MalformedFib), "{bad:?}");
+        assert_eq!(v4_only(&bad), at(Table::FibTrie, line), "{bad:?}");
     }
+}
+
+/// The kernel prints the merged table under both headers: each address and network is kept
+/// once, the lists sorted.
+#[test]
+fn a_table_printed_twice_gives_each_entry_once_in_order() {
+    let lo = Ipv4Addr::LOCALHOST;
+    let (a, b) = (doc(0), Ipv4Addr::new(93, 184, 216, 0));
+    let half = format!(
+        "|-- {b}\n   /24 link UNICAST\n   /32 host LOCAL\n|-- {lo}\n   /32 host LOCAL\n\
+         |-- {a}\n   /24 link UNICAST\n   /32 host LOCAL\n"
+    );
+    let got = v4_only(&format!("Main:\n{half}Local:\n{half}")).unwrap();
+    assert_eq!(got.own, [v4(b), v4(lo), v4(a)]);
+    assert_eq!(got.connected, [net(v4(b), 24), net(v4(a), 24)]);
 }
 
 #[test]
@@ -215,16 +235,68 @@ fn ipv6_addresses_are_owned_and_name_their_networks() {
     assert_eq!(
         got.own.get(2..).unwrap(),
         [
+            v6("::1"),
             v6("2001:db8::1"),
             v6("2001:db8::2"),
-            v6("2001:db9::1"),
-            v6("::1")
+            v6("2001:db9::1")
         ]
     );
     // One /64 for both addresses on it; a prefix of 0 names none; ::1 names only itself.
     assert_eq!(
         got.connected.get(2..).unwrap(),
-        [net(v6("2001:db8::"), 64), net(v6("::1"), 128)]
+        [net(v6("::1"), 128), net(v6("2001:db8::"), 64)]
+    );
+}
+
+#[test]
+fn a_malformed_line_is_named_by_its_table_and_number() {
+    let good6 = "20010db8000000000000000000000001 02 40 20 80 eth0\n";
+    let good_route = route6(LAN6, "40", "00000001");
+    assert_eq!(
+        with_v6(&format!("{good6}{good6}bad\n"), ""),
+        at(Table::IfInet6, 3)
+    );
+    assert_eq!(
+        with_v6("", &format!("{good_route}\n{good_route}\nbad\n")),
+        at(Table::Ipv6Route, 3)
+    );
+    let text = format!("{}garbage\n", fib(doc(7), doc(255)));
+    let lines = text.lines().count();
+    assert_eq!(v4_only(&text), at(Table::FibTrie, lines));
+    // The text is a closed set: table, fixed words, number.
+    let e = HostAddrsError::Malformed {
+        table: Table::Ipv6Route,
+        line: 12,
+    };
+    assert_eq!(e.to_string(), "ipv6_route line 12 is malformed");
+    let names = [Table::FibTrie, Table::IfInet6, Table::Ipv6Route].map(|t| t.to_string());
+    assert_eq!(names, ["fib_trie", "if_inet6", "ipv6_route"]);
+    for (e, text) in [
+        (
+            HostAddrsError::NoLoopback,
+            "fib_trie lists no host-local 127.0.0.1",
+        ),
+        (
+            HostAddrsError::Ipv6Half,
+            "only one of if_inet6 and ipv6_route exists",
+        ),
+        (
+            HostAddrsError::TooLarge {
+                table: Table::IfInet6,
+            },
+            "if_inet6 is over the size bound",
+        ),
+        (HostAddrsError::ReaderFailed, "the table reader failed"),
+    ] {
+        assert_eq!(e.to_string(), text);
+    }
+    let e = HostAddrsError::Unreadable {
+        table: Table::FibTrie,
+        kind: std::io::ErrorKind::NotFound,
+    };
+    assert!(
+        e.to_string().starts_with("fib_trie could not be read: "),
+        "{e}"
     );
 }
 
@@ -251,11 +323,7 @@ fn a_malformed_if_inet6_line_refuses_the_list() {
         "20010db8000000000000000000000001 02",
         "   ",
     ] {
-        assert_eq!(
-            with_v6(bad, ""),
-            Err(HostAddrsError::MalformedInet6),
-            "{bad}"
-        );
+        assert_eq!(with_v6(bad, ""), at(Table::IfInet6, 1), "{bad}");
     }
     let widest = "20010db8000000000000000000000001 12345678 40 20 80 eth0";
     assert!(with_v6(widest, "").is_ok());
@@ -330,11 +398,7 @@ fn a_malformed_ipv6_route_line_refuses_the_list() {
     *src_len.get_mut(3).unwrap() = "81";
     bad.push(src_len.join(" "));
     for text in &bad {
-        assert_eq!(
-            with_v6("", text),
-            Err(HostAddrsError::MalformedRoute6),
-            "{text}"
-        );
+        assert_eq!(with_v6("", text), at(Table::Ipv6Route, 1), "{text}");
     }
     assert!(with_v6("", &good).is_ok());
 }

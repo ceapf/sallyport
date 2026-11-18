@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use sallyd::egress::addr::HostNets;
+use sallyd::egress::hostaddrs::HostAddrsError;
 use sallyd::egress::net::Egress;
 use sallyd::egress::server::{Dialer, HostAddrs, Resolver};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -283,7 +284,7 @@ impl Owned {
 }
 
 impl HostAddrs for Owned {
-    async fn own(&self) -> io::Result<HostNets> {
+    async fn own(&self) -> Result<HostNets, HostAddrsError> {
         Ok(self.0.lock().unwrap().clone())
     }
 }
