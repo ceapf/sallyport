@@ -239,7 +239,9 @@ pub enum GlobError {
 fn check_overlaps(m: &Manifest, resolved: &[(usize, ResolvedMount)], d: &mut Diags) {
     let checked = |guest: &str| paths::check_guest(guest).is_ok();
     // TODO(#195): a guest that passed its check and a host realpath both hold `/`, so a quoted
-    // one is never masked.
+    // one is not masked. Only a realpath can hold a `"` or a backtick: a `"` in one (written
+    // `\"`) re-pairs `mask_quoted`'s spans, after which a backtick can open one too, so a part of
+    // either realpath can still be judged, and masked, on its own.
     let mounts = &m.filesystem.mounts;
     let mut seen_guest = HashSet::new();
     for (i, a) in mounts.iter().enumerate() {

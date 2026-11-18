@@ -52,8 +52,10 @@ pub(super) fn is_slug(s: &str) -> bool {
 }
 
 pub(super) fn check_identity(m: &Manifest, d: &mut Diags) {
-    // TODO(#195): the rejected name is echoed quoted; one holding a quote, backslash, space or
-    // slash next to a token is not masked.
+    // TODO(#195): the rejected name is echoed quoted; one holding a backslash, space, slash or any
+    // character `{:?}` escapes (such as a quote, a control or a non-printable character) is not
+    // masked; a `"` in it (written `\"`) re-pairs `mask_quoted`'s spans, after which a backtick
+    // can open one too, so a part of it can still be judged, and masked, on its own.
     if !is_slug(&m.name) {
         d.error(
             "name",
