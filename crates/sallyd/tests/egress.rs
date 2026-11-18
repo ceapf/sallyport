@@ -445,8 +445,12 @@ fn rt_net_07_names_that_resolve_to_internal_or_own_addresses_are_refused() {
         for (host, address, rule) in want {
             let i = refused.iter().position(|h| *h == host).unwrap();
             let e = &denied[i];
-            assert_eq!(e["address"], json!(address.to_string()), "{host}");
-            assert_eq!(e["rule"], json!(rule), "{host}");
+            // No value is printed: if the entries were out of order, `e` could be the `lan`
+            // entry, whose address is this host's own.
+            let named = e["address"] == json!(address.to_string());
+            assert!(named, "{host}: the entry names another address");
+            let ruled = e["rule"] == json!(rule);
+            assert!(ruled, "{host}: the entry names another rule");
         }
         // `lan` answers with this host's real addresses: checked without printing them.
         let lan = &denied[refused.iter().position(|h| *h == "lan").unwrap()];
