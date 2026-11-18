@@ -309,9 +309,10 @@ pub(crate) struct DirId {
 // TODO(#195): these errors quote the host as written, or its realpath (of `expand`'s errors, the
 // `~user` and not-absolute ones quote it as written). One holding a backslash, space, slash or
 // any character `{:?}` escapes (such as a quote, a control or a non-printable character) is not
-// masked; a `"` or `` ` `` anywhere in the message re-pairs `mask_quoted`'s spans, so a part of
-// a value can still be judged, and masked, on its own. Past `expand` both hold `/` (a bare `~`
-// as written holds none, and no token either).
+// masked; a `"` in a value (written `\"`) re-pairs `mask_quoted`'s spans across the message,
+// after which a backtick can open one too, so a part of a value can still be judged, and masked,
+// on its own. Past `expand` both hold `/` (a bare `~` as written holds none, and no token
+// either).
 pub(crate) fn check_mount_host(
     raw: &str,
     home: &Path,
@@ -367,10 +368,11 @@ pub(crate) fn check_mount_host(
 }
 
 /// Guest paths: `/workspace/<seg>(/<seg>)*`, each segment `[A-Za-z0-9._-]`, not `.`/`..`.
-// TODO(#195): these errors quote the rejected guest. One holding a backslash, space, slash or any
-// character `{:?}` escapes (such as a quote, a control or a non-printable character) is not
-// masked; a `"` or `` ` `` in it re-pairs `mask_quoted`'s spans, so a part of it can still be
-// judged, and masked, on its own. Past the `/workspace/` prefix check it holds `/`.
+// TODO(#195): these errors, all but the length one, quote the rejected guest. One holding a
+// backslash, space, slash or any character `{:?}` escapes (such as a quote, a control or a
+// non-printable character) is not masked; a `"` in it (written `\"`) re-pairs `mask_quoted`'s
+// spans, after which a backtick can open one too, so a part of it can still be judged, and
+// masked, on its own. Past the `/workspace/` prefix check it holds `/`.
 pub(crate) fn check_guest(raw: &str) -> Result<(), String> {
     if raw.len() > MAX_PATH_LEN {
         return Err(format!("path is longer than {MAX_PATH_LEN} bytes"));

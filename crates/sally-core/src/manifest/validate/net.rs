@@ -14,8 +14,8 @@ const MAX_CONNECTIONS: u32 = 1024;
 
 // TODO(#195): the rejected host is echoed quoted; one holding a backslash, space, slash or any
 // character `{:?}` escapes (such as a quote, a control or a non-printable character) is not
-// masked; a `"` or `` ` `` in it re-pairs `mask_quoted`'s spans, so a part of it can still be
-// judged, and masked, on its own.
+// masked; a `"` in it (written `\"`) re-pairs `mask_quoted`'s spans, after which a backtick can
+// open one too, so a part of it can still be judged, and masked, on its own.
 pub(super) fn host_error(d: &mut Diags, path: String, raw: &str, e: HostError) {
     match e {
         HostError::IpLiteral => d.error(
