@@ -1266,3 +1266,138 @@ async fn a_dropped_driven_call_runs_to_its_end_and_its_prompt_is_withdrawn() {
     reach(&fake.done, 1).await;
     assert_eq!(fake.ended.load(Ordering::SeqCst), 1);
 }
+
+/// The next crash report, within 5 s.
+async fn crashed(crashes: &mut CrashReceiver) -> crate::daemon::crash::Crash {
+    tokio::time::timeout(Duration::from_secs(5), crashes.recv())
+        .await
+        .expect("no crash reported within 5 s")
+        .expect("the reporter is gone")
+}
+
+/// A harness call whose task panics is reported as `agent.call` at once, with no further frame
+/// sent; its id and slot are released, and the connection stays open and answers. Closing it
+/// then withdraws nothing for the panicked call.
+#[tokio::test]
+async fn a_panicked_call_is_reported_at_once_and_releases_its_id_and_slot() {
+    let (agent, fake, _, mut crashes) = watched();
+    let mut c = start(&agent);
+    c.send(&call(1, "panic")).await;
+    let crash = crashed(&mut crashes).await;
+    assert_eq!(crash.task, "agent.call");
+    assert!(
+        crash.payload.contains("the tool panicked"),
+        "{}",
+        crash.payload
+    );
+    // The same id is accepted again (not `duplicate-id`) and answered.
+    let r = c.call(&call(1, "echo")).await;
+    assert_eq!(r["result"]["content"][0]["text"], json!("ran echo"), "{r}");
+    let l = c.call(&req(2, "tools/list", json!({}))).await;
+    assert_eq!(l["result"]["tools"][0]["name"], json!("echo"));
+    // Every slot came back: MAX_IN_FLIGHT calls run at once again.
+    for i in 0..MAX_IN_FLIGHT as i64 {
+        c.send(&call(10 + i, "block")).await;
+    }
+    reach(&fake.calls, 2 + MAX_IN_FLIGHT).await;
+    for _ in 0..MAX_IN_FLIGHT {
+        fake.release.notify_one();
+    }
+    for _ in 0..MAX_IN_FLIGHT {
+        assert_eq!(
+            c.recv().await.unwrap()["result"]["content"][0]["text"],
+            json!("ran block")
+        );
+    }
+    let Client { r, w, server } = c;
+    drop((r, w));
+    server.await.unwrap();
+    assert!(
+        fake.withdrawn.lock().unwrap().is_empty(),
+        "the panicked call was withdrawn"
+    );
+    assert!(crashes.try_recv().is_err(), "one panic, one report");
+}
+
+/// A call that panics after its connection closed is reported from the close loop, which
+/// joins the connection's calls.
+#[tokio::test]
+async fn a_call_that_panics_after_its_connection_closed_is_still_reported() {
+    let (agent, fake, _, mut crashes) = watched();
+    let mut c = start(&agent);
+    c.send(&call(1, "block-panic")).await;
+    reach(&fake.calls, 1).await;
+    let Client { r, w, server } = c;
+    drop((r, w));
+    // The close withdraws the open call's prompt, then waits for the call.
+    let end = std::time::Instant::now() + Duration::from_secs(10);
+    while fake.withdrawn.lock().unwrap().is_empty() {
+        assert!(std::time::Instant::now() < end, "never withdrawn");
+        tokio::task::yield_now().await;
+    }
+    fake.release.notify_one();
+    let crash = crashed(&mut crashes).await;
+    assert_eq!(crash.task, "agent.call");
+    server.await.unwrap();
+}
+
+/// A reply still waiting to leave does not hold its id: a call reusing the id gets its own
+/// reply, and both arrive.
+#[tokio::test(start_paused = true)]
+async fn an_id_reused_while_its_first_reply_waits_gets_its_own_reply() {
+    let (agent, fake, _) = setup();
+    let Client {
+        mut r,
+        mut w,
+        server,
+    } = start_with(&agent, TIGHT);
+    for tool in ["big", "echo"] {
+        let mut f = serde_json::to_vec(&call(1, tool)).unwrap();
+        f.push(b'\n');
+        w.write_all(&f).await.unwrap();
+        reach(&fake.done, if tool == "big" { 1 } else { 2 }).await;
+    }
+    let mut texts = Vec::new();
+    for _ in 0..2 {
+        let mut line = String::new();
+        r.read_line(&mut line).await.unwrap();
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["id"], json!(1));
+        texts.push(v["result"]["content"][0]["text"].as_str().unwrap().len());
+    }
+    assert_eq!(texts, [1 << 20, "ran echo".len()]);
+    drop((r, w));
+    server.await.unwrap();
+}
+
+/// A driven call whose handler panics is reported as `agent.call`, answers unrecorded, frees
+/// its slot and withdraws nothing.
+#[tokio::test]
+async fn a_driven_call_that_panics_is_reported_and_answers_unrecorded() {
+    let (agent, fake, _, mut crashes) = driven_watched();
+    assert_eq!(
+        agent.drive_call("panic".into(), Map::new()).await,
+        Driven::Unrecorded
+    );
+    let crash = crashed(&mut crashes).await;
+    assert_eq!(crash.task, "agent.call");
+    assert_eq!(agent.in_flight.available_permits(), MAX_IN_FLIGHT);
+    tokio::task::yield_now().await;
+    assert!(fake.withdrawn.lock().unwrap().is_empty());
+}
+
+/// A driven call its caller dropped still runs, and a panic in it is still reported.
+#[tokio::test]
+async fn a_dropped_driven_call_that_then_panics_is_still_reported() {
+    let (agent, fake, _, mut crashes) = driven_watched();
+    let step = tokio::spawn({
+        let agent = Arc::clone(&agent);
+        async move { agent.drive_call("block-panic".into(), Map::new()).await }
+    });
+    reach(&fake.calls, 1).await;
+    step.abort();
+    let _ = step.await;
+    fake.release.notify_one();
+    let crash = crashed(&mut crashes).await;
+    assert_eq!(crash.task, "agent.call");
+}
