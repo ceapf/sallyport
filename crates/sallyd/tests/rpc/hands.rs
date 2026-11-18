@@ -438,6 +438,12 @@ fn rt_ag_11_the_harness_has_no_hands() {
         assert_eq!(outside(&start), outside(&before), "seed {seed}");
         let own = format!("session: Some({:?})", h.info.id);
         let debug = x.events.debug();
+        let named = debug.iter().filter(|d| d.contains(&own)).count();
+        assert!(
+            named >= 20,
+            "control: the session form must match this session's own 20 tool.run entries, \
+             found {named}: {debug:#?}"
+        );
         assert!(
             debug
                 .iter()
