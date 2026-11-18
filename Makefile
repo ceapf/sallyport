@@ -59,6 +59,7 @@ test-scripts:
 	bash tests/scripts/test_run_test.sh
 	bash tests/scripts/disk_lock_test.sh
 	bash tests/scripts/disk_check_test.sh
+	bash tests/scripts/redteam_guard_test.sh
 
 # CI runner (AMENDMENTS-01 §15). nextest skips doctests, so they run separately.
 nextest:
@@ -228,13 +229,22 @@ doctor:
 
 # Red-team rows implemented so far: every test named `rt_<row>_…` in the workspace (Task 6c);
 # Task 13 adds the harness and the remaining M1 rows. No GPU needed. RT-AG-09 needs cgroup v2:
-# without it the run fails, never skips (CLAUDE.md). An empty selection fails too.
+# without it the run fails, never skips (CLAUDE.md). An empty selection fails too, and so does a
+# selection whose only ignored rt_ test is not the WSL one or that runs fewer than REDTEAM_FLOOR
+# rt_ tests (scripts/redteam-guard.sh): raise the floor when rows land, lower it only with the
+# removal of a test in the same PR.
 REDTEAM_FILTER := test(/(^|::)rt_/)
 REDTEAM_WSL_TEST := rt_fs_11_wsl_a_windows_executable_does_not_reach_windows
 REDTEAM_WSL_FILTER := test(=$(REDTEAM_WSL_TEST))
+REDTEAM_FLOOR := 176
+REDTEAM_LISTS := target/redteam-lists
 redteam:
 	@v=$$(podman info --format '{{.Host.CgroupsVersion}}'); \
 	  [ "$$v" = v2 ] || { echo "redteam: cgroup v2 required (RT-AG-09), podman reports '$$v'"; exit 1; }
+	@mkdir -p $(REDTEAM_LISTS)
+	$(CARGO) nextest list --workspace --message-format oneline --run-ignored only -E '$(REDTEAM_FILTER)' >$(REDTEAM_LISTS)/ignored
+	$(CARGO) nextest list --workspace --message-format oneline -E '$(REDTEAM_FILTER)' >$(REDTEAM_LISTS)/run
+	bash scripts/redteam-guard.sh $(REDTEAM_WSL_TEST) $(REDTEAM_FLOOR) $(REDTEAM_LISTS)/ignored $(REDTEAM_LISTS)/run
 	$(TEST_RUN) $(CARGO) nextest run --workspace --no-fail-fast --no-tests=fail -E '$(REDTEAM_FILTER)'
 	@# RT-FS-11's .exe part is the one approved ignored rt_ test: run on WSL, listed as skipped elsewhere.
 	@if [ -e /proc/sys/fs/binfmt_misc/WSLInterop ]; then \
