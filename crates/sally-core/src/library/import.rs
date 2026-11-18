@@ -11,7 +11,9 @@
 //!    byte refuses the import (the source grew).
 //! 4. The strict header parse of the copy from byte 0, against the copy's own length, which
 //!    must equal the bytes copied.
-//! 5. The digest compared with the expected one, when given.
+//! 5. The digest compared with the expected one, when given. A model downloaded against its
+//!    publisher's hash does not come this way: the pull's promote (`download.rs`) checks that
+//!    hash before anything else reads the file.
 //! 6. The copy made 0444 and synced, then linked into `blobs/sha256/<hex>` without replacing
 //!    a blob already there. A blob found there is used only if it passes inspect's checks
 //!    against this import's size; otherwise the import is refused and the blob left as found.
@@ -25,10 +27,11 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+use rustix::fd::OwnedFd;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 
-use super::quarantine::Quarantine;
+use super::quarantine::{BLOB, Quarantine};
 use super::{Entry, Library, LibraryError, SourceName, blob};
 use crate::model::detect::{self, Candidate, DetectError, Format};
 use crate::model::gguf;
@@ -74,10 +77,6 @@ pub(super) fn run(
             actual: digest,
         });
     }
-    rustix::fs::fchmod(&copy, Mode::from_raw_mode(BLOB_MODE))
-        .map_err(|e| LibraryError::io("make the copy read-only", e))?;
-    copy.sync_all()
-        .map_err(|e| LibraryError::io("sync the quarantine copy", e))?;
     let entry = Entry {
         digest,
         size,
@@ -85,10 +84,28 @@ pub(super) fn run(
         source_name,
         imported_at: jiff::Timestamp::now(),
     };
-    let created = blob::link(quarantine.dir(), &lib.dirs.blobs, &entry.digest)?;
+    let stored = store(lib, &copy, quarantine.dir(), BLOB, entry)?;
+    drop(quarantine);
+    Ok(stored)
+}
+
+/// The tail shared by import and promote, once every check of the chain has passed on `file`
+/// (the library's own file `name` in `dir`): read-only, synced, linked under its digest (a blob
+/// found already there is used only if it passes inspect's checks against this size, and is
+/// never changed), then the row. Returns the row as stored.
+pub(super) fn store(
+    lib: &Library,
+    file: &File,
+    dir: &OwnedFd,
+    name: &str,
+    entry: Entry,
+) -> Result<Entry, LibraryError> {
+    rustix::fs::fchmod(file, Mode::from_raw_mode(BLOB_MODE))
+        .map_err(|e| LibraryError::io("make the file read-only", e))?;
+    file.sync_all()
+        .map_err(|e| LibraryError::io("sync the verified file", e))?;
+    let created = blob::link(dir, name, &lib.dirs.blobs, &entry.digest)?;
     if !created {
-        // A blob already stored under this digest is used only if it passes inspect's checks
-        // against this import's size; it is never changed.
         drop(blob::open_checked(&lib.dirs.blobs, &entry)?);
     }
     if let Err(e) = lib.index.insert(&entry) {
@@ -97,12 +114,9 @@ pub(super) fn run(
         }
         return Err(e);
     }
-    let stored = lib
-        .index
+    lib.index
         .get(&entry.digest)?
-        .ok_or(LibraryError::IndexCorrupt)?;
-    drop(quarantine);
-    Ok(stored)
+        .ok_or(LibraryError::IndexCorrupt)
 }
 
 /// Whether a file of `size` bytes fits in `available` bytes while leaving `reserve` free. An

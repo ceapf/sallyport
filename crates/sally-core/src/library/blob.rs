@@ -7,19 +7,24 @@ use rustix::fd::OwnedFd;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 
-use super::quarantine::BLOB;
 use super::{Entry, LibraryError, RESOLVE};
 use crate::model::hash::Digest;
 
 /// Any write bit.
 const WRITE_BITS: u32 = 0o222;
 
-/// Links the copy in `qdir` into `blobs` as `<hex>`, never replacing a blob already there, and
+/// Links the verified file `name` in `dir` (a quarantine copy or a promoted download, both
+/// files the library created) into `blobs` as `<hex>`, never replacing a blob already there, and
 /// syncs the directory. Whether this call created the blob. A blob found already there is not
-/// checked here: the import checks it with [`open_checked`] before it writes a row. If the sync
+/// checked here: the caller checks it with [`open_checked`] before it writes a row. If the sync
 /// fails, a blob this call created is unlinked again.
-pub(super) fn link(qdir: &OwnedFd, blobs: &OwnedFd, digest: &Digest) -> Result<bool, LibraryError> {
-    let created = match rustix::fs::linkat(qdir, BLOB, blobs, digest.as_hex(), AtFlags::empty()) {
+pub(super) fn link(
+    dir: &OwnedFd,
+    name: &str,
+    blobs: &OwnedFd,
+    digest: &Digest,
+) -> Result<bool, LibraryError> {
+    let created = match rustix::fs::linkat(dir, name, blobs, digest.as_hex(), AtFlags::empty()) {
         Ok(()) => true,
         Err(Errno::EXIST) => false,
         Err(e) => return Err(LibraryError::io("store the blob", e)),

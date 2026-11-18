@@ -5,14 +5,22 @@
 //!   library.db                    0600  the index: one row per model, never proof of content
 //!   blobs/sha256/<hex>            0444  the model files, named by their SHA-256
 //!   quarantine/<pid>-<n>/blob     0600  an import in progress
+//!   downloads/<hex>.part          0600  a download in progress, named by its publisher's hash
 //! ```
 //!
-//! [`Library::import_file`] is the one way bytes enter `blobs/`. It runs the whole SI-6 chain
-//! itself on a private copy: the name's allowlist before any open, the magic on the first bytes
-//! copied, the strict header parse of the copy, and the SHA-256 of the very bytes copied. Only
-//! then is the copy made read-only and linked under its digest; the row is written last. A
-//! refusal leaves no blob, no row and no quarantine directory. The source is only ever read,
-//! never linked or renamed.
+//! Bytes enter `blobs/` two ways, and both end in the same tail: the file made read-only and
+//! linked under its digest, the row written last. Only a file the library created itself is
+//! ever linked; no entry point takes an arbitrary path and links it.
+//!
+//! - [`Library::import_file`] runs the whole SI-6 chain itself on a private copy: the name's
+//!   allowlist before any open, the magic on the first bytes copied, the strict header parse of
+//!   the copy, and the SHA-256 of the very bytes copied. A refusal leaves no blob, no row and no
+//!   quarantine directory. The source is only ever read, never linked or renamed.
+//! - [`Library::begin_download`] creates the partial beneath the library's own directory and
+//!   hands out a [`Download`], which has no constructor from a path; the caller only appends
+//!   bytes to it. [`Library::promote`] then checks the publisher's SHA-256 over every byte on
+//!   disk before anything else reads them, and only on a match the magic and the strict parse.
+//!   A refusal from the hash on deletes the partial and leaves no blob and no row.
 //!
 //! The blob directory decides what a model's bytes are; the index only lists them. Add writes
 //! the blob first, then the row; remove deletes the row first, then the blob. A crash leaves at
@@ -35,6 +43,7 @@
 
 mod blob;
 mod dirs;
+mod download;
 mod error;
 mod import;
 mod index;
@@ -45,6 +54,7 @@ use std::path::Path;
 
 use rustix::fs::{AtFlags, ResolveFlags};
 
+pub use download::Download;
 pub use error::LibraryError;
 pub use name::SourceName;
 
@@ -182,6 +192,41 @@ impl Library {
         expected: Option<&Digest>,
     ) -> Result<Entry, LibraryError> {
         import::run(self, source, expected)
+    }
+
+    /// Begins (or resumes) the download of a file the publisher lists as `file_name`, `size`
+    /// bytes with SHA-256 `expected`. The name goes through the same allowlist and name check
+    /// as an import before anything is created; the partial `downloads/<hex>.part` is created
+    /// at 0600 or, if one is there, checked and resumed from its length (emptied when longer
+    /// than `size`), and locked for the life of the returned [`Download`].
+    ///
+    /// # Errors
+    /// [`LibraryError::Detect`] or [`LibraryError::SourceNameNotAllowed`] for the name,
+    /// [`LibraryError::InsufficientDisk`] when the rest of the file plus a twentieth of its size
+    /// would leave less than the reserve free, [`LibraryError::DownloadNotPrivate`] for a
+    /// partial that is not a regular 0600 file of the current user (left as found),
+    /// [`LibraryError::DownloadBusy`] when another download holds it, or an I/O error.
+    pub fn begin_download(
+        &mut self,
+        file_name: &str,
+        expected: &Digest,
+        size: u64,
+    ) -> Result<Download, LibraryError> {
+        download::begin(self, file_name, expected, size)
+    }
+
+    /// Promotes a finished download: its length, then the SHA-256 of every byte on disk
+    /// against the publisher's, then the magic and the strict parse, then the tail shared with
+    /// import. Bytes already in the library return their existing row.
+    ///
+    /// # Errors
+    /// [`LibraryError::DownloadIncomplete`] for a short partial (kept for a resume); otherwise
+    /// the partial is deleted and the error is [`LibraryError::DownloadTooLong`],
+    /// [`LibraryError::HashMismatch`], [`LibraryError::Detect`], [`LibraryError::Gguf`],
+    /// [`LibraryError::BlobMismatch`], or an I/O or index error. No refusal leaves a blob or a
+    /// row.
+    pub fn promote(&mut self, download: Download) -> Result<Entry, LibraryError> {
+        download::promote(self, download)
     }
 
     /// Every model, in digest order.

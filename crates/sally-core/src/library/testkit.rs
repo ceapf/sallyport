@@ -40,6 +40,11 @@ impl TmpRoot {
         self.lib().join("quarantine")
     }
 
+    /// `<root>/library/downloads`.
+    pub(crate) fn downloads(&self) -> PathBuf {
+        self.lib().join("downloads")
+    }
+
     /// `<root>/library/library.db`.
     pub(crate) fn index(&self) -> PathBuf {
         self.lib().join("library.db")
@@ -111,9 +116,10 @@ pub(crate) fn chmod(path: &Path, mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
-/// Nothing in `blobs/sha256`, nothing in `quarantine`, and no row.
+/// Nothing in `blobs/sha256`, nothing in `quarantine`, nothing in `downloads`, and no row.
 pub(crate) fn assert_nothing_stored(root: &TmpRoot, lib: &super::Library) {
     assert!(names(&root.blobs()).is_empty(), "a blob was left");
     assert!(names(&root.quarantine()).is_empty(), "quarantine not empty");
+    assert!(names(&root.downloads()).is_empty(), "downloads not empty");
     assert!(lib.list().unwrap().is_empty(), "a row was left");
 }

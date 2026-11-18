@@ -11,7 +11,8 @@ const DIR: u32 = 0o040_000;
 const FILE: u32 = 0o100_000;
 const ME: u32 = 1000;
 
-/// Open lays out library/, blobs/sha256/ and quarantine/ at exactly 0700, and opens again.
+/// Open lays out library/, blobs/sha256/, quarantine/ and downloads/ at exactly 0700, and opens
+/// again.
 #[test]
 fn open_creates_the_tree_private_and_reopens() {
     let root = TmpRoot::new("dirs-fresh");
@@ -21,10 +22,14 @@ fn open_creates_the_tree_private_and_reopens() {
         root.lib().join("blobs"),
         root.blobs(),
         root.quarantine(),
+        root.downloads(),
     ] {
         assert_eq!(mode(&d), 0o700, "{}", d.display());
     }
-    assert_eq!(names(&root.lib()), ["blobs", "library.db", "quarantine"]);
+    assert_eq!(
+        names(&root.lib()),
+        ["blobs", "downloads", "library.db", "quarantine"]
+    );
     drop(Library::open(root.path(), 0).unwrap());
 }
 
@@ -37,6 +42,7 @@ fn a_dir_with_another_mode_is_refused_unchanged() {
         ("library/blobs/sha256", 0o701),
         ("library/quarantine", 0o755),
         ("library/quarantine", 0o500),
+        ("library/downloads", 0o750),
     ] {
         let root = TmpRoot::new("dirs-mode");
         drop(Library::open(root.path(), 0).unwrap());
