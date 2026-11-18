@@ -4,7 +4,10 @@
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use super::LibraryError;
+use crate::model::detect::DetectError;
 use crate::model::gguf::build::Gguf;
+use crate::model::gguf::error::tests::every_variant;
 use crate::model::hash::{Digest, Hasher};
 
 /// A private (0700) data directory under the temp dir, removed on drop. Every file under it is
@@ -114,6 +117,89 @@ pub(crate) fn mode(path: &Path) -> u32 {
 /// Sets the permission bits of `path`.
 pub(crate) fn chmod(path: &Path, mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// One of each [`LibraryError`] variant with the code it must keep: the library's own, both
+/// detect errors and every GGUF error, wrapped. Together these are every code
+/// [`LibraryError::code`] can return. The list is written by hand;
+/// `error_tests::every_code_has_a_row` fails when a code table gains a code with no row here.
+pub(crate) fn every_library_error() -> Vec<(LibraryError, &'static str)> {
+    let digest = || sha(b"row");
+    let mut rows = vec![
+        (
+            LibraryError::Detect(DetectError::FormatNotAllowed),
+            "format_not_allowed",
+        ),
+        (
+            LibraryError::Detect(DetectError::MagicMismatch),
+            "magic_mismatch",
+        ),
+        (LibraryError::SymlinkInImport, "symlink_in_import"),
+        (LibraryError::NotRegularFile, "not_regular_file"),
+        (
+            LibraryError::SourceNameNotAllowed,
+            "source_name_not_allowed",
+        ),
+        (
+            LibraryError::InsufficientDisk { size: 7 },
+            "insufficient_disk",
+        ),
+        (LibraryError::SourceChanged, "source_changed"),
+        (
+            LibraryError::HashMismatch {
+                expected: digest(),
+                actual: digest(),
+            },
+            "hash_mismatch",
+        ),
+        (LibraryError::NotFound(digest()), "not_found"),
+        (LibraryError::BlobMismatch(digest()), "blob_mismatch"),
+        (LibraryError::BlobChanged, "blob_changed"),
+        (LibraryError::QuarantineChanged, "quarantine_changed"),
+        (LibraryError::QuarantineBusy, "quarantine_busy"),
+        (LibraryError::DownloadBusy, "download_busy"),
+        (
+            LibraryError::DownloadIncomplete { have: 1, size: 2 },
+            "download_incomplete",
+        ),
+        (LibraryError::DownloadTooLong, "download_too_long"),
+        (LibraryError::DownloadNotPrivate, "download_not_private"),
+        (
+            LibraryError::NotPrivate {
+                path: "p".to_owned(),
+                msg: "m".to_owned(),
+            },
+            "not_private",
+        ),
+        (
+            LibraryError::IndexNotPrivate {
+                path: "p".to_owned(),
+            },
+            "index_not_private",
+        ),
+        (
+            LibraryError::UnknownIndexVersion(2),
+            "unknown_index_version",
+        ),
+        (LibraryError::IndexCorrupt, "index_corrupt"),
+        (
+            LibraryError::Index(rusqlite::Error::InvalidQuery),
+            "index_error",
+        ),
+        (
+            LibraryError::Io {
+                op: "read",
+                source: std::io::Error::other("x"),
+            },
+            "io_error",
+        ),
+    ];
+    rows.extend(
+        every_variant()
+            .into_iter()
+            .map(|(e, code)| (LibraryError::Gguf(e), code)),
+    );
+    rows
 }
 
 /// Nothing in `blobs/sha256`, nothing in `quarantine`, nothing in `downloads`, and no row.

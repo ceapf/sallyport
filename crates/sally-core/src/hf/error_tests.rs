@@ -1,9 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
 use super::*;
-use crate::library::LibraryError;
-use crate::model::detect::DetectError;
-use crate::model::gguf::GgufError;
+use crate::library::testkit::every_library_error;
 
 fn all() -> Vec<(HfError, &'static str)> {
     vec![
@@ -50,20 +48,14 @@ fn every_variant_has_its_code() {
     assert_eq!(codes.len(), cases.len(), "two variants share a code");
 }
 
-/// No hf code is a detect, GGUF or library code.
+/// No hf code is a detect, GGUF or library code: every code a library error can return (detect
+/// and GGUF errors wrapped) is outside the hf_ prefix and none of the hf codes.
 #[test]
 fn no_code_collides_with_the_model_codes() {
-    let others = [
-        DetectError::FormatNotAllowed.code(),
-        DetectError::MagicMismatch.code(),
-        GgufError::Truncated.code(),
-        LibraryError::NotRegularFile.code(),
-        LibraryError::DownloadBusy.code(),
-        LibraryError::InsufficientDisk { size: 1 }.code(),
-    ];
-    for (err, _) in all() {
-        assert!(!others.contains(&err.code()), "{}", err.code());
-        assert!(!others.iter().any(|o| o.starts_with("hf_")), "{others:?}");
+    let hf: Vec<&str> = all().iter().map(|(err, _)| err.code()).collect();
+    for (err, code) in every_library_error() {
+        assert!(!code.starts_with("hf_"), "{code}");
+        assert!(!hf.contains(&err.code()), "{code}");
     }
 }
 

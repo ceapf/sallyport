@@ -1,10 +1,10 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
+use std::collections::BTreeSet;
 use std::io;
 
 use super::*;
-use crate::model::detect::DetectError;
-use crate::model::gguf::GgufError;
+use crate::library::testkit::every_library_error;
 use crate::model::hash::Digest;
 
 fn digest() -> Digest {
@@ -14,80 +14,41 @@ fn digest() -> Digest {
 /// Every variant has its own stable code; wrapped errors keep theirs.
 #[test]
 fn every_variant_has_its_code() {
-    let cases = [
-        (
-            LibraryError::Detect(DetectError::FormatNotAllowed),
-            "format_not_allowed",
-        ),
-        (
-            LibraryError::Detect(DetectError::MagicMismatch),
-            "magic_mismatch",
-        ),
-        (LibraryError::Gguf(GgufError::Truncated), "truncated"),
-        (LibraryError::Gguf(GgufError::BadVersion(9)), "bad_version"),
-        (LibraryError::SymlinkInImport, "symlink_in_import"),
-        (LibraryError::NotRegularFile, "not_regular_file"),
-        (
-            LibraryError::SourceNameNotAllowed,
-            "source_name_not_allowed",
-        ),
-        (
-            LibraryError::InsufficientDisk { size: 7 },
-            "insufficient_disk",
-        ),
-        (LibraryError::SourceChanged, "source_changed"),
-        (
-            LibraryError::HashMismatch {
-                expected: digest(),
-                actual: digest(),
-            },
-            "hash_mismatch",
-        ),
-        (LibraryError::NotFound(digest()), "not_found"),
-        (LibraryError::BlobMismatch(digest()), "blob_mismatch"),
-        (LibraryError::BlobChanged, "blob_changed"),
-        (LibraryError::QuarantineChanged, "quarantine_changed"),
-        (LibraryError::QuarantineBusy, "quarantine_busy"),
-        (LibraryError::DownloadBusy, "download_busy"),
-        (
-            LibraryError::DownloadIncomplete { have: 1, size: 2 },
-            "download_incomplete",
-        ),
-        (LibraryError::DownloadTooLong, "download_too_long"),
-        (LibraryError::DownloadNotPrivate, "download_not_private"),
-        (
-            LibraryError::NotPrivate {
-                path: "p".to_owned(),
-                msg: "m".to_owned(),
-            },
-            "not_private",
-        ),
-        (
-            LibraryError::IndexNotPrivate {
-                path: "p".to_owned(),
-            },
-            "index_not_private",
-        ),
-        (
-            LibraryError::UnknownIndexVersion(2),
-            "unknown_index_version",
-        ),
-        (LibraryError::IndexCorrupt, "index_corrupt"),
-        (
-            LibraryError::Index(rusqlite::Error::InvalidQuery),
-            "index_error",
-        ),
-        (
-            LibraryError::Io {
-                op: "read",
-                source: io::Error::other("x"),
-            },
-            "io_error",
-        ),
-    ];
-    for (err, code) in cases {
+    for (err, code) in every_library_error() {
         assert_eq!(err.code(), code, "{err}");
     }
+}
+
+/// The `=> "..."` literals of the `const fn code(` in `source`, up to its closing brace.
+fn code_literals(source: &str) -> BTreeSet<&str> {
+    source
+        .lines()
+        .skip_while(|line| !line.contains("const fn code("))
+        .take_while(|line| *line != "    }")
+        .filter_map(|line| line.split_once("=> \""))
+        .filter_map(|(_, rest)| rest.split_once('"'))
+        .map(|(code, _)| code)
+        .collect()
+}
+
+/// Every code the library, detect and GGUF code tables can return has a row in
+/// `every_library_error`, and every row's code is in a table: the two sets are equal, so a
+/// scan that read nothing fails too.
+#[test]
+fn every_code_has_a_row() {
+    let tables: BTreeSet<&str> = [
+        include_str!("error.rs"),
+        include_str!("../model/detect.rs"),
+        include_str!("../model/gguf/error.rs"),
+    ]
+    .into_iter()
+    .flat_map(code_literals)
+    .collect();
+    let rows: BTreeSet<&str> = every_library_error()
+        .iter()
+        .map(|(_, code)| *code)
+        .collect();
+    assert_eq!(tables, rows);
 }
 
 /// Messages name the operation or the library path, never file-chosen text.
