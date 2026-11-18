@@ -1283,8 +1283,10 @@ sallyport/
   is malformed (the manifest validator refuses one too). The head is re-parsed only after the
   first read, a read that brought a line end, or a full buffer, at most 128 times (more is
   `head-too-large`), so a client sending a byte at a time costs no more than one sending a line
-  at a time. Then policy, the host's own addresses (a `/proc` file over 1 MiB, or unreadable,
-  refuses every connection as `ip-range-denied`), one lookup (5 s) of the absolute name
+  at a time. Then policy, the host's own addresses and connected networks (`/proc/net/fib_trie`,
+  `if_inet6` and `ipv6_route`, read together; a file over 1 MiB, unreadable or not understood,
+  or only one of the two IPv6 files present, refuses every connection as `ip-range-denied`), one
+  lookup (5 s) of the absolute name
   `host.` (no search list), the address filter over every address (any denied address refuses
   the name; an answer of more than 64 addresses is `resolve-failed`, before duplicates are
   dropped), at most 3 pinned addresses tried (10 s each), `200`, and a tunnel with one 16 KiB
@@ -1355,7 +1357,9 @@ sallyport/
     target_cut}` (the request-target masked with the session's own forms first, then cut at 256
     bytes and escaped, never a header; §7 Redaction), or `{reason, head_bytes}` when no target
     was parsed; `filter: "host-addresses-unavailable"` when the host's own addresses could not
-    be read.
+    be read; when the address filter refused, `address` (the first refused address of the
+    answer, as resolved) and `rule` (`reserved-range`, `own-address` or `connected-network`).
+    The reply to the sandbox carries the reason only.
   - `egress.limit` (decision `deny`): as `egress.deny`, for `too-many-connections` (decided at
     accept: `{reason}` only), `head-too-large`, `head-timeout`, `request-too-large` and
     `response-too-large`.

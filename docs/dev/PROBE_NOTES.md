@@ -254,6 +254,17 @@ line per fact, with where it was found. Check a note again before relying on it 
   are `/32 link BROADCAST`. The table appears twice (`Main:` and `Local:`). About 1.3 KiB on WSL2.
 - `/proc/net/if_inet6`: one line per IPv6 address, 32 hex digits then index, prefix length,
   scope, flags and the interface name. Absent when IPv6 is disabled. (Task 8, `egress/hostaddrs.rs`)
+- Seen on WSL2 (kernel 6.18): `fib_trie` holds only table headers, `+-- <ip>/<len> <n> <n> <n>`
+  nodes, `|-- <ip>` leaves and route lines; several route lines can follow one leaf (`/32 host
+  LOCAL` then `/32 link BROADCAST`); the connected network is `/<len> link UNICAST` and the
+  default route `/0 universe UNICAST`. `ipv6_route` lines have ten fields (destination, length,
+  source, length, next hop: hex; metric, reference count, use count, flags: 8 hex digits each;
+  interface); the unreachable default on `lo` has flags `00200200` (`RTF_REJECT` 0x200 set),
+  a local `/128` `80200001`. Not seen here and taken from the kernel's printing code, unverified:
+  a `tos=<n>` field after the type, an unknown scope as `scope=<n>`, an unknown type as `type
+  <n>` (two tokens: the parser refuses the list), an interface index of three or more hex digits
+  in `if_inet6` (printed `%02x`), an `ipv6_route` line with no interface name. (Connected-network
+  filter, `egress/hostaddrs.rs`)
 - A Unix socket path over 107 bytes fails `bind` with `InvalidInput` ("path must be shorter than
   SUN_LEN"); the test fixture's `CARGO_TARGET_TMPDIR` paths exceed it. Binding through
   `/proc/self/fd/<dir fd>/<name>` of an `O_PATH` directory works and keeps the name short.
