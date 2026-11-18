@@ -15,14 +15,21 @@ use crate::model::hash::Digest;
 const WRITE_BITS: u32 = 0o222;
 
 /// Links the copy in `qdir` into `blobs` as `<hex>`, never replacing a blob already there, and
-/// syncs the directory. Whether this call created the blob (an existing one is success).
+/// syncs the directory. Whether this call created the blob. A blob found already there is not
+/// checked here: the import checks it with [`open_checked`] before it writes a row. If the sync
+/// fails, a blob this call created is unlinked again.
 pub(super) fn link(qdir: &OwnedFd, blobs: &OwnedFd, digest: &Digest) -> Result<bool, LibraryError> {
     let created = match rustix::fs::linkat(qdir, BLOB, blobs, digest.as_hex(), AtFlags::empty()) {
         Ok(()) => true,
         Err(Errno::EXIST) => false,
         Err(e) => return Err(LibraryError::io("store the blob", e)),
     };
-    rustix::fs::fsync(blobs).map_err(|e| LibraryError::io("sync the blobs directory", e))?;
+    if let Err(e) = rustix::fs::fsync(blobs) {
+        if created {
+            let _ = rustix::fs::unlinkat(blobs, digest.as_hex(), AtFlags::empty());
+        }
+        return Err(LibraryError::io("sync the blobs directory", e));
+    }
     Ok(created)
 }
 
@@ -47,6 +54,11 @@ pub(super) fn open_checked(blobs: &OwnedFd, entry: &Entry) -> Result<File, Libra
 }
 
 /// A regular file of `euid` with no write bit, `size` bytes long where `want` were stored.
+///
+/// The link count is not checked: a second hard link lets the owner do nothing it cannot do
+/// through `blobs/` itself, and another import of the same bytes holds a second link until its
+/// quarantine is removed. Nothing here rehashes the blob.
+// TODO(#210): the caller that hands a blob to an engine checks its SHA-256 then (SI-6).
 pub(super) fn blob_ok(st_mode: u32, uid: u32, euid: u32, size: u64, want: u64) -> bool {
     FileType::from_raw_mode(st_mode) == FileType::RegularFile
         && uid == euid

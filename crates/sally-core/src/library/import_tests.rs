@@ -7,14 +7,14 @@ use rusqlite::Connection;
 use super::*;
 use crate::library::Library;
 use crate::library::testkit::{TmpRoot, assert_nothing_stored, chmod, gguf, mode, names, sha};
-use crate::model::gguf::build::Gguf;
+use crate::model::gguf::build::{F32, Gguf, Tensor};
 
 /// A valid file is copied into blobs/sha256/<hex> at exactly 0444 (RT-MDL-07), named by its
 /// SHA-256, listed once, the quarantine empty, and the source left alone (copied, never linked).
 #[test]
 fn a_valid_file_is_stored_by_digest_0444() {
     let root = TmpRoot::new("imp-ok");
-    let mut lib = Library::open(root.path()).unwrap();
+    let mut lib = Library::open(root.path(), 0).unwrap();
     let bytes = gguf("ok");
     let source = root.source("model.gguf", &bytes);
     let entry = lib.import_file(&source, None).unwrap();
@@ -22,7 +22,7 @@ fn a_valid_file_is_stored_by_digest_0444() {
     assert_eq!(entry.digest(), &digest);
     assert_eq!(entry.size(), bytes.len() as u64);
     assert_eq!(entry.format(), Format::Gguf);
-    assert_eq!(entry.source_name(), "model.gguf");
+    assert_eq!(entry.source_name().as_raw_str(), "model.gguf");
     let blob = root.blobs().join(digest.as_hex());
     assert_eq!(std::fs::read(&blob).unwrap(), bytes);
     assert_eq!(mode(&blob), 0o444);
@@ -38,7 +38,7 @@ fn a_valid_file_is_stored_by_digest_0444() {
 #[test]
 fn a_file_over_one_buffer_is_copied_whole() {
     let root = TmpRoot::new("imp-big");
-    let mut lib = Library::open(root.path()).unwrap();
+    let mut lib = Library::open(root.path(), 0).unwrap();
     let mut g = Gguf::valid();
     g.trailing = 200_000;
     let bytes = g.bytes();
@@ -54,7 +54,7 @@ fn a_file_over_one_buffer_is_copied_whole() {
 #[test]
 fn the_expected_digest_is_enforced() {
     let root = TmpRoot::new("imp-hash");
-    let mut lib = Library::open(root.path()).unwrap();
+    let mut lib = Library::open(root.path(), 0).unwrap();
     let bytes = gguf("hash");
     let source = root.source("m.gguf", &bytes);
     let err = lib.import_file(&source, Some(&sha(b"other"))).unwrap_err();
@@ -70,7 +70,7 @@ fn the_expected_digest_is_enforced() {
 #[test]
 fn a_name_off_the_allowlist_is_refused_unopened() {
     let root = TmpRoot::new("imp-name");
-    let mut lib = Library::open(root.path()).unwrap();
+    let mut lib = Library::open(root.path(), 0).unwrap();
     for name in [
         "m.bin",
         "m.pt",
@@ -96,7 +96,7 @@ fn a_name_off_the_allowlist_is_refused_unopened() {
 #[test]
 fn a_wrong_magic_is_refused() {
     let root = TmpRoot::new("imp-magic");
-    let mut lib = Library::open(root.path()).unwrap();
+    let mut lib = Library::open(root.path(), 0).unwrap();
     for bytes in [&b"PK\x03\x04rest"[..], b"", b"GGU", b"\x80\x02}q"] {
         let source = root.source("m.gguf", bytes);
         let err = lib.import_file(&source, None).unwrap_err();
@@ -109,7 +109,7 @@ fn a_wrong_magic_is_refused() {
 #[test]
 fn a_refused_header_stores_nothing() {
     let root = TmpRoot::new("imp-parse");
-    let mut lib = Library::open(root.path()).unwrap();
+    let mut lib = Library::open(root.path(), 0).unwrap();
     let mut truncated = gguf("t");
     truncated.truncate(30);
     let mut bad_version = Gguf::valid();
@@ -130,7 +130,7 @@ fn a_refused_header_stores_nothing() {
 #[test]
 fn a_symlink_source_is_refused() {
     let root = TmpRoot::new("imp-link");
-    let mut lib = Library::open(root.path()).unwrap();
+    let mut lib = Library::open(root.path(), 0).unwrap();
     let target = root.source("real.gguf", &gguf("link"));
     let link = root.path().join("src").join("link.gguf");
     symlink(&target, &link).unwrap();
@@ -144,7 +144,7 @@ fn a_symlink_source_is_refused() {
 #[test]
 fn a_non_regular_source_is_refused() {
     let root = TmpRoot::new("imp-kind");
-    let mut lib = Library::open(root.path()).unwrap();
+    let mut lib = Library::open(root.path(), 0).unwrap();
     let dir = root.path().join("d.gguf");
     std::fs::create_dir(&dir).unwrap();
     assert_eq!(
@@ -171,7 +171,7 @@ fn a_non_regular_source_is_refused() {
 #[test]
 fn an_unreadable_source_is_an_io_error() {
     let root = TmpRoot::new("imp-missing");
-    let mut lib = Library::open(root.path()).unwrap();
+    let mut lib = Library::open(root.path(), 0).unwrap();
     let missing = root.path().join("missing.gguf");
     assert_eq!(
         lib.import_file(&missing, None).unwrap_err().code(),
@@ -184,7 +184,7 @@ fn an_unreadable_source_is_an_io_error() {
 #[test]
 fn a_source_changed_after_import_leaves_the_blob() {
     let root = TmpRoot::new("imp-after");
-    let mut lib = Library::open(root.path()).unwrap();
+    let mut lib = Library::open(root.path(), 0).unwrap();
     let bytes = gguf("after");
     let source = root.source("m.gguf", &bytes);
     let entry = lib.import_file(&source, None).unwrap();
@@ -198,7 +198,7 @@ fn a_source_changed_after_import_leaves_the_blob() {
 #[test]
 fn a_second_import_of_the_same_bytes_keeps_the_first_row() {
     let root = TmpRoot::new("imp-again");
-    let mut lib = Library::open(root.path()).unwrap();
+    let mut lib = Library::open(root.path(), 0).unwrap();
     let bytes = gguf("again");
     let first = lib
         .import_file(&root.source("one.gguf", &bytes), None)
@@ -216,7 +216,7 @@ fn a_second_import_of_the_same_bytes_keeps_the_first_row() {
 #[test]
 fn an_orphan_blob_gains_its_row() {
     let root = TmpRoot::new("imp-orphan");
-    let mut lib = Library::open(root.path()).unwrap();
+    let mut lib = Library::open(root.path(), 0).unwrap();
     let bytes = gguf("orphan");
     let source = root.source("m.gguf", &bytes);
     let entry = lib.import_file(&source, None).unwrap();
@@ -236,7 +236,7 @@ fn an_orphan_blob_gains_its_row() {
 #[test]
 fn a_failed_insert_unlinks_only_its_own_blob() {
     let root = TmpRoot::new("imp-insert");
-    let mut lib = Library::open(root.path()).unwrap();
+    let mut lib = Library::open(root.path(), 0).unwrap();
     let refuse =
         "CREATE TRIGGER refuse BEFORE INSERT ON models BEGIN SELECT RAISE(ABORT, 'no'); END";
     Connection::open(root.index())
@@ -260,23 +260,145 @@ fn a_failed_insert_unlinks_only_its_own_blob() {
         "index_error"
     );
     assert_eq!(names(&root.blobs()), [entry.digest().as_hex()]);
+    assert!(names(&root.quarantine()).is_empty());
 }
 
-/// No refusal's message carries the source's path or name.
+/// A blob found under the digest is used only if it passes inspect's checks; otherwise the
+/// import is refused, the found file is left exactly as it was, and no row is written.
+#[test]
+fn a_found_blob_that_fails_its_checks_is_refused() {
+    let bytes = gguf("found");
+    let digest = sha(&bytes);
+    let mut longer = bytes.clone();
+    longer.push(0);
+    type Place<'a> = &'a dyn Fn(&std::path::Path);
+    let cases: [(&str, Place); 3] = [
+        ("writable", &|p| {
+            std::fs::write(p, &bytes).unwrap();
+            chmod(p, 0o644);
+        }),
+        ("wrong size", &|p| {
+            std::fs::write(p, &longer).unwrap();
+            chmod(p, 0o444);
+        }),
+        ("directory", &|p| {
+            std::fs::create_dir(p).unwrap();
+            chmod(p, 0o700);
+        }),
+    ];
+    for (what, place) in cases {
+        let root = TmpRoot::new("imp-found");
+        let mut lib = Library::open(root.path(), 0).unwrap();
+        let blob = root.blobs().join(digest.as_hex());
+        place(&blob);
+        let before = std::fs::symlink_metadata(&blob).unwrap();
+        let source = root.source("m.gguf", &bytes);
+        let err = lib.import_file(&source, None).unwrap_err();
+        assert_eq!(err.code(), "blob_mismatch", "{what}");
+        let after = std::fs::symlink_metadata(&blob).unwrap();
+        assert_eq!(
+            (after.ino(), after.mode(), after.len()),
+            (before.ino(), before.mode(), before.len()),
+            "{what}"
+        );
+        assert!(lib.list().unwrap().is_empty(), "{what}");
+        assert!(names(&root.quarantine()).is_empty(), "{what}");
+    }
+}
+
+/// The import time is the time of the import, to the second, and survives a reopen.
+#[test]
+fn imported_at_is_the_import_time() {
+    let root = TmpRoot::new("imp-time");
+    let mut lib = Library::open(root.path(), 0).unwrap();
+    let before = jiff::Timestamp::now().as_second();
+    let entry = lib
+        .import_file(&root.source("m.gguf", &gguf("time")), None)
+        .unwrap();
+    let after = jiff::Timestamp::now().as_second();
+    let at = entry.imported_at().as_second();
+    assert!(before <= at && at <= after, "{before} {at} {after}");
+    drop(lib);
+    let lib = Library::open(root.path(), 0).unwrap();
+    assert_eq!(lib.list().unwrap()[0].imported_at().as_second(), at);
+}
+
+/// A name with an allowed extension but a control character is refused before the file is
+/// opened (a mode-000 file still answers this, not an I/O error); a non-ASCII name is kept.
+#[test]
+fn a_name_with_a_control_character_is_refused_unopened() {
+    let root = TmpRoot::new("imp-ctrl");
+    let mut lib = Library::open(root.path(), 0).unwrap();
+    for name in ["a\x1b[31m.gguf", "a\nb.gguf", "a\x7f.gguf", "a\u{85}.gguf"] {
+        let source = root.source(name, &gguf("ctrl"));
+        chmod(&source, 0o000);
+        let err = lib.import_file(&source, None).unwrap_err();
+        assert_eq!(err.code(), "source_name_not_allowed", "{name:?}");
+        assert_nothing_stored(&root, &lib);
+    }
+    let entry = lib
+        .import_file(&root.source("modèle\u{202e}.gguf", &gguf("ok")), None)
+        .unwrap();
+    assert_eq!(entry.source_name().as_raw_str(), "modèle\u{202e}.gguf");
+    assert!(entry.source_name().to_string().is_ascii());
+}
+
+/// A file larger than the free space less the reserve is refused before anything is created.
+#[test]
+fn a_file_that_does_not_fit_is_refused() {
+    let root = TmpRoot::new("imp-disk");
+    let mut lib = Library::open(root.path(), u64::MAX).unwrap();
+    let source = root.source("m.gguf", &gguf("disk"));
+    let err = lib.import_file(&source, None).unwrap_err();
+    assert_eq!(err.code(), "insufficient_disk");
+    assert!(
+        err.to_string().contains(&gguf("disk").len().to_string()),
+        "{err}"
+    );
+    assert_nothing_stored(&root, &lib);
+    assert_eq!(lib.next_quarantine, 0, "a quarantine name was tried");
+}
+
+/// Admission: the file must fit in what is available after the reserve.
+#[test]
+fn admits_leaves_the_reserve() {
+    assert!(admits(10, 30, 20));
+    assert!(!admits(11, 30, 20));
+    assert!(admits(0, 20, 20));
+    assert!(!admits(1, 20, 20));
+    assert!(!admits(0, 19, 20), "less available than the reserve");
+    assert!(admits(u64::MAX, u64::MAX, 0));
+}
+
+/// The copy stops one byte past the source's size; that byte means the source grew.
+#[test]
+fn not_grown_refuses_a_byte_past_the_size() {
+    assert!(not_grown(10, 10).is_ok());
+    assert!(not_grown(9, 10).is_ok());
+    assert_eq!(not_grown(11, 10).unwrap_err().code(), "source_changed");
+}
+
+/// No refusal's message carries the source's path or name, and file-chosen text from the
+/// header reaches the message only escaped.
 #[test]
 fn refusals_do_not_echo_the_source() {
     let root = TmpRoot::new("imp-echo");
-    let mut lib = Library::open(root.path()).unwrap();
+    let mut lib = Library::open(root.path(), 0).unwrap();
+    let dup = Gguf::valid()
+        .tensor(Tensor::of("w\u{202e}", F32, &[8]))
+        .tensor(Tensor::of("w\u{202e}", F32, &[8]))
+        .bytes();
     for (name, bytes) in [
-        ("secret\x1b[31m.bin", gguf("e")),
-        ("secret\x1b[31m.gguf", b"nope".to_vec()),
-        ("secret\x1b[31m.gguf", gguf("e")),
+        ("secret\u{202e}.bin", gguf("e")),
+        ("secret\u{202e}.gguf", b"nope".to_vec()),
+        ("secret\u{202e}.gguf", gguf("e")),
+        ("secret\u{202e}.gguf", dup),
     ] {
         let source = root.source(name, &bytes);
         let got = lib.import_file(&source, Some(&sha(b"x")));
         let text = format!("{}", got.unwrap_err());
         assert!(!text.contains("secret"), "{text}");
-        assert!(!text.contains('\x1b'), "{text}");
+        assert!(text.is_ascii(), "{text}");
     }
 }
 

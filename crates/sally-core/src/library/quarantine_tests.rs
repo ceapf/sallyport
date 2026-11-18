@@ -15,7 +15,7 @@ fn the_name_is_pid_dash_counter() {
 #[test]
 fn an_existing_name_is_skipped_and_kept() {
     let root = TmpRoot::new("q-skip");
-    let mut lib = Library::open(root.path()).unwrap();
+    let mut lib = Library::open(root.path(), 0).unwrap();
     let taken = root.quarantine().join(name(std::process::id(), 0));
     std::fs::create_dir(&taken).unwrap();
     std::fs::write(taken.join("blob"), b"theirs").unwrap();
@@ -31,7 +31,7 @@ fn an_existing_name_is_skipped_and_kept() {
 fn the_tries_are_bounded_at_64() {
     for (taken, ok) in [(63, true), (64, false)] {
         let root = TmpRoot::new("q-busy");
-        let mut lib = Library::open(root.path()).unwrap();
+        let mut lib = Library::open(root.path(), 0).unwrap();
         for n in 0..taken {
             std::fs::create_dir(root.quarantine().join(name(std::process::id(), n))).unwrap();
         }
@@ -51,7 +51,7 @@ fn the_tries_are_bounded_at_64() {
 #[test]
 fn the_counter_moves_on_and_quarantine_empties() {
     let root = TmpRoot::new("q-next");
-    let mut lib = Library::open(root.path()).unwrap();
+    let mut lib = Library::open(root.path(), 0).unwrap();
     for tag in ["a", "b", "c"] {
         let source = root.source(&format!("{tag}.gguf"), &gguf(tag));
         lib.import_file(&source, None).unwrap();
@@ -64,7 +64,7 @@ fn the_counter_moves_on_and_quarantine_empties() {
 #[test]
 fn a_quarantine_dir_is_private() {
     let root = TmpRoot::new("q-mode");
-    let mut lib = Library::open(root.path()).unwrap();
+    let mut lib = Library::open(root.path(), 0).unwrap();
     let q = Quarantine::create(&lib.dirs.quarantine, &mut lib.next_quarantine).unwrap();
     let path = root.quarantine().join(name(std::process::id(), 0));
     assert_eq!(crate::library::testkit::mode(&path), 0o700);

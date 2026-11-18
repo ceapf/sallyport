@@ -6,7 +6,7 @@ use super::*;
 use crate::library::testkit::{TmpRoot, chmod, gguf, names, sha};
 
 fn with(root: &TmpRoot, tags: &[&str]) -> (Library, Vec<Entry>) {
-    let mut lib = Library::open(root.path()).unwrap();
+    let mut lib = Library::open(root.path(), 0).unwrap();
     let entries = tags
         .iter()
         .map(|t| {
@@ -152,18 +152,20 @@ fn a_reopened_library_lists_the_same_rows() {
     let root = TmpRoot::new("lib-reopen");
     let (lib, entries) = with(&root, &["a"]);
     drop(lib);
-    let lib = Library::open(root.path()).unwrap();
+    let lib = Library::open(root.path(), 0).unwrap();
     assert_eq!(lib.list().unwrap(), entries);
     lib.inspect(entries[0].digest()).unwrap();
 }
 
-/// An entry's Debug shows the source name's length only.
+/// An entry's Debug shows the source name escaped to printable ASCII.
 #[test]
-fn entry_debug_hides_the_source_name() {
+fn entry_debug_escapes_the_source_name() {
     let root = TmpRoot::new("lib-debug");
-    let (_, entries) = with(&root, &["hidden"]);
-    let text = format!("{:?}", entries[0]);
-    assert!(!text.contains("hidden"), "{text}");
-    assert!(text.contains("11 bytes"), "{text}");
-    assert!(text.contains(entries[0].digest().as_hex()), "{text}");
+    let mut lib = Library::open(root.path(), 0).unwrap();
+    let source = root.source("a\u{202e}b.gguf", &gguf("debug"));
+    let entry = lib.import_file(&source, None).unwrap();
+    let text = format!("{entry:?}");
+    assert!(text.is_ascii(), "{text}");
+    assert!(text.contains("a\\u{202e}b.gguf"), "{text}");
+    assert!(text.contains(entry.digest().as_hex()), "{text}");
 }

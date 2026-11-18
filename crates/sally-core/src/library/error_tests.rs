@@ -28,6 +28,15 @@ fn every_variant_has_its_code() {
         (LibraryError::SymlinkInImport, "symlink_in_import"),
         (LibraryError::NotRegularFile, "not_regular_file"),
         (
+            LibraryError::SourceNameNotAllowed,
+            "source_name_not_allowed",
+        ),
+        (
+            LibraryError::InsufficientDisk { size: 7 },
+            "insufficient_disk",
+        ),
+        (LibraryError::SourceChanged, "source_changed"),
+        (
             LibraryError::HashMismatch {
                 expected: digest(),
                 actual: digest(),

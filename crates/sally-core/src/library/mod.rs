@@ -18,6 +18,11 @@
 //! the blob first, then the row; remove deletes the row first, then the blob. A crash leaves at
 //! most a blob without a row, which nothing lists or resolves.
 //!
+//! Neither inspect nor an import that finds its blob already stored hashes the blob again: a
+//! blob rewritten in place at the same size by the owner's own uid is not detected here. The
+//! content control is the SHA-256 checked again by whatever hands a blob to an engine (SI-6;
+//! that caller does not exist yet, see `blob_ok`).
+//!
 //! Every open beneath the library goes through [`crate::fd::openat2`] from a pinned directory
 //! descriptor with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`; the index is
 //! the one path-based open, inside the checked 0700 directory.
@@ -33,14 +38,15 @@ mod dirs;
 mod error;
 mod import;
 mod index;
+mod name;
 mod quarantine;
 
-use std::fmt;
 use std::path::Path;
 
 use rustix::fs::{AtFlags, ResolveFlags};
 
 pub use error::LibraryError;
+pub use name::SourceName;
 
 use crate::model::detect::Format;
 use crate::model::gguf::{self, GgufHeader};
@@ -51,13 +57,13 @@ const RESOLVE: ResolveFlags = ResolveFlags::BENEATH
     .union(ResolveFlags::NO_SYMLINKS)
     .union(ResolveFlags::NO_MAGICLINKS);
 
-/// One model in the library: one row of the index.
-#[derive(Clone, PartialEq, Eq)]
+/// One model in the library: one row of the index. Its `Debug` shows the source name escaped.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     digest: Digest,
     size: u64,
     format: Format,
-    source_name: String,
+    source_name: SourceName,
     imported_at: jiff::Timestamp,
 }
 
@@ -80,10 +86,10 @@ impl Entry {
         self.format
     }
 
-    /// The name of the file it was imported from: an allowed model file name of at most 255
-    /// bytes, chosen by whoever named the file. Escape it before showing it anywhere.
+    /// The name of the file it was imported from, chosen by whoever named the file; its
+    /// `Display` escapes it.
     #[must_use]
-    pub fn source_name(&self) -> &str {
+    pub const fn source_name(&self) -> &SourceName {
         &self.source_name
     }
 
@@ -91,21 +97,6 @@ impl Entry {
     #[must_use]
     pub const fn imported_at(&self) -> jiff::Timestamp {
         self.imported_at
-    }
-}
-
-impl fmt::Debug for Entry {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Entry")
-            .field("digest", &self.digest.as_hex())
-            .field("size", &self.size)
-            .field("format", &self.format)
-            .field(
-                "source_name",
-                &format_args!("{} bytes", self.source_name.len()),
-            )
-            .field("imported_at", &self.imported_at)
-            .finish()
     }
 }
 
@@ -131,29 +122,45 @@ impl Inspected {
 }
 
 /// The model library under one data directory.
+///
+/// One process opens a library at a time: `sallyd` is one per user and holds its runtime lock
+/// for life. Two processes importing and removing the same bytes at once could leave a row
+/// whose blob the other removed; every later inspect of it answers
+/// [`LibraryError::BlobMismatch`], so it fails closed.
 pub struct Library {
     dirs: dirs::Dirs,
     index: index::Index,
     /// The next quarantine counter to try (`<pid>-<n>`).
     next_quarantine: u32,
+    /// Bytes an import must leave free on the library's filesystem.
+    reserve: u64,
 }
 
 impl Library {
-    /// Opens the library under `data_dir` (which must exist and be private), creating
-    /// `library/`, `blobs/sha256/`, `quarantine/` at 0700 and the index at 0600 when missing.
+    /// Opens the library under `data_dir` (an absolute path to a directory that must exist and
+    /// be private), creating `library/`, `blobs/sha256/`, `quarantine/` at 0700 and the index at
+    /// 0600 when missing. An import is refused when the file would leave less than `reserve`
+    /// bytes free on the library's filesystem.
+    ///
+    /// A umask that clears owner bits makes a fresh directory or index fail its own mode check;
+    /// `sallyd` runs with umask 077.
     ///
     /// # Errors
-    /// [`LibraryError::NotPrivate`] for a directory that is not the current user's at exactly
-    /// 0700 (never repaired), [`LibraryError::IndexNotPrivate`] for an index that is not a
-    /// regular 0600 file of the current user, [`LibraryError::UnknownIndexVersion`] for an index
-    /// of another schema, [`LibraryError::Io`] and [`LibraryError::Index`] otherwise.
-    pub fn open(data_dir: &Path) -> Result<Self, LibraryError> {
+    /// [`LibraryError::NotPrivate`] for a relative `data_dir` or a directory that is not the
+    /// current user's at exactly 0700 (never repaired), [`LibraryError::IndexNotPrivate`] for
+    /// an index that is not a regular 0600 file of the current user,
+    /// [`LibraryError::UnknownIndexVersion`] for an index of another schema,
+    /// [`LibraryError::IndexCorrupt`] for an index holding anything but this library's table,
+    /// [`LibraryError::Io`] and [`LibraryError::Index`] otherwise.
+    // TODO(#209): sallyd passes the state filesystem's free-space floor as `reserve`.
+    pub fn open(data_dir: &Path, reserve: u64) -> Result<Self, LibraryError> {
         let (dirs, lib_path) = dirs::open(data_dir)?;
         let index = index::Index::open(&dirs.lib, &lib_path)?;
         Ok(Self {
             dirs,
             index,
             next_quarantine: 0,
+            reserve,
         })
     }
 
@@ -163,10 +170,12 @@ impl Library {
     ///
     /// # Errors
     /// The first check that failed: [`LibraryError::Detect`] (name or magic),
-    /// [`LibraryError::SymlinkInImport`], [`LibraryError::NotRegularFile`],
-    /// [`LibraryError::Gguf`], [`LibraryError::HashMismatch`] when `expected` is given and
-    /// differs, [`LibraryError::QuarantineBusy`], or an I/O or index error. A refusal leaves no
-    /// blob, no row and no quarantine directory.
+    /// [`LibraryError::SourceNameNotAllowed`], [`LibraryError::SymlinkInImport`],
+    /// [`LibraryError::NotRegularFile`], [`LibraryError::InsufficientDisk`],
+    /// [`LibraryError::SourceChanged`], [`LibraryError::Gguf`], [`LibraryError::HashMismatch`]
+    /// when `expected` is given and differs, [`LibraryError::BlobMismatch`] when a blob already
+    /// stored under the digest fails its checks, [`LibraryError::QuarantineBusy`], or an I/O or
+    /// index error. A refusal leaves no blob, no row and no quarantine directory.
     pub fn import_file(
         &mut self,
         source: &Path,

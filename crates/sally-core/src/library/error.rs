@@ -1,9 +1,11 @@
 //! Why a library operation failed. Each variant has a stable [`LibraryError::code`] for the
 //! `model.refuse` reason; the message text may change, the codes may not.
 //!
-//! No variant holds text the imported file or its name chose: digests are code-made hex, and
-//! paths are the library's own directories. The source path an import was given is never
-//! echoed.
+//! No variant holds raw text the imported file or its name chose: digests are code-made hex,
+//! paths are the library's own directories, and the source path an import was given is never
+//! echoed. The one exception is [`GgufError`], whose duplicate-key and duplicate-tensor-name
+//! refusals quote the file's key or name, escaped to printable ASCII and capped at 64 bytes by
+//! [`crate::text::escape_quoted_capped`].
 
 use std::io;
 
@@ -27,6 +29,19 @@ pub enum LibraryError {
     /// The source is not a regular file (a directory, a FIFO, a device).
     #[error("the file to import is not a regular file")]
     NotRegularFile,
+    /// The file name has an allowed extension but holds a control character or is longer than
+    /// 255 bytes, so the library will not keep it.
+    #[error("the file name holds a control character or is over 255 bytes; rename the file")]
+    SourceNameNotAllowed,
+    /// The file is larger than the space the library may use on its filesystem.
+    #[error("not enough free disk space for this model ({size} bytes)")]
+    InsufficientDisk {
+        /// The file's size.
+        size: u64,
+    },
+    /// The file grew while it was copied.
+    #[error("the file to import grew while it was copied")]
+    SourceChanged,
     /// The file's SHA-256 is not the one expected.
     #[error("the file's SHA-256 is {actual}, not the expected {expected}")]
     HashMismatch {
@@ -92,6 +107,9 @@ impl LibraryError {
             Self::Gguf(e) => e.code(),
             Self::SymlinkInImport => "symlink_in_import",
             Self::NotRegularFile => "not_regular_file",
+            Self::SourceNameNotAllowed => "source_name_not_allowed",
+            Self::InsufficientDisk { .. } => "insufficient_disk",
+            Self::SourceChanged => "source_changed",
             Self::HashMismatch { .. } => "hash_mismatch",
             Self::NotFound(_) => "not_found",
             Self::BlobMismatch(_) => "blob_mismatch",
