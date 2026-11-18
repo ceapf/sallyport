@@ -10,6 +10,7 @@
 //! `common::container`; these tests never skip.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -99,6 +100,29 @@ async fn harness(x: &Lx, tag: &str, script: &str) -> Harness {
         uid,
         crash.clone(),
     );
+    let (llm, model) = serve_llm(&sockets, record, script, crash);
+    let v = x.f.load("");
+    // The net image carries the static shim; its own entry's net.sock listener finds no socket
+    // in a harness and stays idle. The harness's llm.sock listener starts here.
+    let argv = harness_argv(&x.common_args(&dirs), &paths, &v, &net_image()).unwrap();
+    let container = x.create_and_start(argv).await;
+    start_llm_shim(&container).await;
+    Harness {
+        container,
+        agent,
+        llm,
+        model,
+    }
+}
+
+/// Binds `llm.sock` in the harness socket directory `sockets` and serves it with the scripted
+/// model `script`, under the production peer-UID check.
+fn serve_llm(
+    sockets: &Path,
+    record: Recorder,
+    script: &str,
+    crash: sallyd::daemon::crash::CrashReporter,
+) -> (Handle, Arc<Scripted>) {
     let model = load_script(script);
     let settings = Settings {
         model: "local-model".into(),
@@ -106,31 +130,27 @@ async fn harness(x: &Lx, tag: &str, script: &str) -> Harness {
     };
     let llm = Arc::new(Llm::new(Arc::clone(&model), record, settings)).listen(
         bind(&sockets.join("llm.sock")).unwrap(),
-        uid,
+        ids().uid,
         crash,
     );
-    let v = x.f.load("");
-    // The net image carries the static shim; its own entry's net.sock listener finds no socket
-    // in a harness and stays idle. The harness's llm.sock listener starts here.
-    let argv = harness_argv(&x.common_args(&dirs), &paths, &v, &net_image()).unwrap();
-    let container = x.create_and_start(argv).await;
+    (llm, model)
+}
+
+/// Starts the harness's `llm.sock` shim on `127.0.0.1:8080` in `container` and waits for its
+/// readiness line; panics after 10 s.
+async fn start_llm_shim(container: &str) {
     let start =
         format!("{SHIM} --listen 127.0.0.1:{LLM_PORT}=/run/sallyport/llm.sock 2>{LLM_SHIM_LOG}");
-    let out = podman(&["exec", "-d", &container, "sh", "-c", &start]);
+    let out = podman(&["exec", "-d", container, "sh", "-c", &start]);
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
     for _ in 0..100 {
-        let (_, log) = sh(&container, &format!("cat {LLM_SHIM_LOG} 2>/dev/null")).await;
+        let (_, log) = sh(container, &format!("cat {LLM_SHIM_LOG} 2>/dev/null")).await;
         if log.contains(&format!("sally-shim: listening on 127.0.0.1:{LLM_PORT}")) {
-            return Harness {
-                container,
-                agent,
-                llm,
-                model,
-            };
+            return;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -360,3 +380,6 @@ fn mock_model_scripts_parse_strictly() {
         assert!(Turn::parse(bad).is_err(), "{bad}");
     }
 }
+
+#[path = "rpc/hands.rs"]
+mod hands;

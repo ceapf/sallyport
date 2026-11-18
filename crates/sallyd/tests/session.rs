@@ -1149,3 +1149,6 @@ fn rt_ag_15_an_operation_past_the_drain_and_a_panic_during_the_stop_end_before_s
 
 #[path = "session/driven.rs"]
 mod driven;
+
+#[path = "session/agent_rows.rs"]
+mod agent_rows;
