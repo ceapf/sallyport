@@ -442,6 +442,32 @@ async fn a_poisoned_library_has_its_own_code() {
     assert_eq!(hub.seen().len(), 1);
 }
 
+/// An empty answer, or one with more addresses than the bound, is a failed lookup and nothing
+/// is dialled; the control, exactly the bound of public answers, is dialled once.
+#[tokio::test]
+async fn an_answer_outside_its_bounds_is_a_failed_lookup() {
+    use crate::egress::server::MAX_ANSWER;
+    let body = list_json(&[]);
+    let hub = Hub::new(move |_, _| reply("200 OK", &[], &body));
+    let client = hub.client(None);
+    let at_bound = vec![PUBLIC; MAX_ANSWER];
+    let mut over = at_bound.clone();
+    over.push(PUBLIC);
+    for (answer, what) in [(Vec::new(), "empty"), (over, "over the bound")] {
+        hub.answer_all(&answer);
+        let err = bounded(client.files(&repo(), &Revision::main()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "hf_resolve_failed", "{what}");
+        assert_eq!(hub.dials(), 0, "{what}");
+    }
+    hub.answer_all(&at_bound);
+    bounded(client.files(&repo(), &Revision::main()))
+        .await
+        .unwrap();
+    assert_eq!(hub.dials(), 1);
+}
+
 /// Every transport variant has its own stable code; wrapped core and library errors keep
 /// theirs.
 #[test]
