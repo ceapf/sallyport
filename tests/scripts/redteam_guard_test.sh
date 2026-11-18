@@ -2,7 +2,7 @@
 # tests/scripts/redteam_guard_test.sh — scripts/redteam-guard.sh passes when the only ignored rt_
 # test is the approved WSL one and the run lists at least the floor; it fails on a second ignored
 # rt_ test, on the WSL test missing from the ignored list, on a run below the floor, on an empty
-# list, and on a line that is not "<binary> <test>". Runs via `make test-scripts`.
+# list, and on a line that is not "<binary> <test>" in either list. Runs via `make test-scripts`.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -45,6 +45,8 @@ expect 1 "the WSL test not ignored" "" 5 5 "ignored rt_ tests must be exactly $w
 expect 1 "another test ignored instead" "sallyd::launch rt_fs_13_x
 " 5 5 "rt_fs_13_x"
 expect 1 "an empty run list" "$only" 0 5 "0 rt_ tests run"
+expect 1 "a malformed ignored line" "${only}garbage
+" 5 5 "unexpected line in $tmp/ignored"
 # A line that is not "<binary> <test>" in the run list.
 printf '%s' "$only" >"$tmp/ignored"
 lines "$tmp/run" 5

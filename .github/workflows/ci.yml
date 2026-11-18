@@ -168,8 +168,10 @@ jobs:
       - run: make test-scripts
       - name: every script test runs under make test-scripts
         run: |
+          # The target's own recipe, so a test listed under another target does not count.
+          listed="$(make -n test-scripts)"
           for t in tests/scripts/*_test.sh; do
-            grep -qxE "[[:space:]]+bash ${t//./\\.}" Makefile || { echo "$t is not in make test-scripts"; exit 1; }
+            grep -qxF "bash $t" <<<"$listed" || { echo "$t is not in make test-scripts"; exit 1; }
           done
       # Commits carry Signed-off-by only: no co-author or tool lines (CLAUDE.md, Conventions).
       - name: no co-author or tool lines in the pull request's commits
