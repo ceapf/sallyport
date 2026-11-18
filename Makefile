@@ -136,8 +136,11 @@ MUTANTS_WIDE_CORE := $(addprefix crates/sally-core/src/,manifest/image.rs manife
                      manifest/diag.rs secrets/store.rs secrets/secret.rs secrets/names.rs audit/entry.rs \
                      audit/redact.rs audit/verify.rs audit/writer.rs audit/declared.rs audit/layout.rs \
                      audit/tail.rs fsutil.rs fd.rs text.rs paths.rs model/mod.rs model/detect.rs \
+                     model/hash.rs \
                      model/gguf/mod.rs model/gguf/error.rs model/gguf/read.rs model/gguf/types.rs \
-                     model/gguf/meta.rs model/gguf/tensors.rs)
+                     model/gguf/meta.rs model/gguf/tensors.rs \
+                     library/mod.rs library/error.rs library/dirs.rs library/index.rs \
+                     library/quarantine.rs library/import.rs library/blob.rs)
 MUTANTS_WIDE_SALLYD := $(addprefix crates/sallyd/src/sandbox/,argv.rs check.rs types.rs profiles.rs \
                        overlap.rs scan.rs images.rs changes.rs cgroup.rs dirs.rs podman.rs binaries.rs \
                        disk.rs stage.rs \
