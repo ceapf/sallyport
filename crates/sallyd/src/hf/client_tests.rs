@@ -9,6 +9,7 @@ use sally_core::hf::names::{RepoId, RepoPath, Revision};
 
 use super::testkit::{Hub, PUBLIC, SHA, TmpLib, found, gguf, list_json, reply, sha};
 use super::*;
+use crate::egress::roots::{BundleFiles, RootsError};
 
 /// A token assembled at run time, so no credential-shaped literal is in the source.
 fn token() -> String {
@@ -442,6 +443,32 @@ async fn a_poisoned_library_has_its_own_code() {
     assert_eq!(hub.seen().len(), 1);
 }
 
+/// The client's anchors come only from a checked bundle file: a missing bundle, or one another
+/// user could write, refuses the client; the control, the mock Hub's own bundle at 0644, gives
+/// a client that lists.
+#[tokio::test]
+async fn the_client_takes_its_roots_only_from_a_checked_bundle() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let body = list_json(&[]);
+    let hub = Hub::new(move |_, _| reply("200 OK", &[], &body));
+    let make = |roots: &BundleFiles| {
+        HfClient::with_roots(hub.clone(), hub.clone(), hub.clone(), roots, None).map(|_| ())
+    };
+    let mut missing = hub.roots().clone();
+    missing.paths = vec![std::env::temp_dir().join("sp-hf-no-such-bundle.pem")];
+    assert_eq!(make(&missing).unwrap_err().code(), "hf_roots_failed");
+    let bundle = hub.roots().paths[0].clone();
+    let set = |m| std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(m)).unwrap();
+    set(0o666);
+    assert_eq!(make(hub.roots()).unwrap_err().code(), "hf_roots_failed");
+    set(0o644);
+    let client =
+        HfClient::with_roots(hub.clone(), hub.clone(), hub.clone(), hub.roots(), None).unwrap();
+    bounded(client.files(&repo(), &Revision::main()))
+        .await
+        .unwrap();
+}
+
 /// An empty answer, or one with more addresses than the bound, is a failed lookup and nothing
 /// is dialled; the control, exactly the bound of public answers, is dialled once.
 #[tokio::test]
@@ -489,6 +516,10 @@ fn every_pull_error_has_its_code() {
         (PullError::BodyFailed, "hf_body_failed"),
         (PullError::TokenUnusable, "hf_token_unusable"),
         (PullError::Task, "hf_task_failed"),
+        (
+            PullError::Roots(RootsError::NotFound("x".to_owned())),
+            "hf_roots_failed",
+        ),
         (PullError::LibraryPoisoned, "hf_library_poisoned"),
     ];
     for (err, code) in cases {

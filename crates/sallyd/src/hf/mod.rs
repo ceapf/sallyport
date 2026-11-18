@@ -2,7 +2,7 @@
 //!
 //! Every hop is planned by the core ([`sally_core::hf::plan`]), connected by [`conn`] (resolve
 //! on this host, refuse loopback, private, link-local and own addresses, dial a pinned address,
-//! TLS verified against the system roots), sent as [`wire`] builds it (the token only on a hop
+//! TLS verified against the anchors of a checked CA bundle, [`HfClient::with_roots`]), sent as [`wire`] builds it (the token only on a hop
 //! to `huggingface.co` itself), and its head decided by the core ([`sally_core::hf::head`]).
 //! File bytes go only into a [`sally_core::library::Download`]; its verify checks the listed
 //! SHA-256 before anything else reads them, on a blocking thread without the library's lock,
@@ -39,6 +39,7 @@ use sally_core::secrets::Secret;
 pub use error::PullError;
 use wire::HeadValues;
 
+use crate::egress::roots::BundleFiles;
 use crate::egress::server::{Dialer, HostAddrs, Resolver, upstream_builder};
 
 /// Longest wait for a response head after the request is sent.
@@ -57,7 +58,7 @@ const WRITE_BATCH: usize = 1 << 20;
 pub type SharedLibrary = Arc<Mutex<Library>>;
 
 /// The client: its resolver, dialer and own-address source (wired once, by the caller), the
-/// TLS configuration, and the token, if any.
+/// TLS configuration built from a checked CA bundle, and the token, if any.
 pub struct HfClient<R, D, H> {
     resolver: R,
     dialer: D,
@@ -67,9 +68,28 @@ pub struct HfClient<R, D, H> {
 }
 
 impl<R: Resolver, D: Dialer, H: HostAddrs> HfClient<R, D, H> {
-    /// A client over these seams. `tls` comes from [`conn::client_config`].
-    #[must_use]
-    pub const fn new(
+    /// A client over these seams whose TLS anchors are loaded from `roots` with the egress
+    /// proxy's checks (the first bundle that exists, owned by the expected user, not group- or
+    /// other-writable). Production passes [`BundleFiles::default`], the system bundle owned by
+    /// root; the environment never chooses the anchors of this credential-carrying connection.
+    /// Blocking (it reads the bundle): call it off the runtime.
+    ///
+    /// # Errors
+    /// [`PullError::Roots`] when no bundle may be trusted.
+    pub fn with_roots(
+        resolver: R,
+        dialer: D,
+        own: H,
+        roots: &BundleFiles,
+        token: Option<Secret<String>>,
+    ) -> Result<Self, PullError> {
+        let loaded = roots.load()?;
+        let tls = conn::client_config(loaded.store)?;
+        Ok(Self::new(resolver, dialer, own, tls, token))
+    }
+
+    /// The fields as given; only [`HfClient::with_roots`] builds `tls`.
+    const fn new(
         resolver: R,
         dialer: D,
         own: H,

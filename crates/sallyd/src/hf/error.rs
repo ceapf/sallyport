@@ -1,10 +1,13 @@
 //! Why a Hub list or pull failed. Each variant has a stable [`PullError::code`]: the core's and
 //! the library's codes pass through, and the transport's own start `hf_`. The only text a
 //! variant holds is a host name the plan already validated (LDH, at most 253 bytes, a Hub
-//! domain; a redirect can choose which one); none holds a header, a body or the token.
+//! domain; a redirect can choose which one), or the host path of a CA bundle file this host
+//! chose; none holds a header, a body or the token.
 
 use sally_core::hf::HfError;
 use sally_core::library::LibraryError;
+
+use crate::egress::roots::RootsError;
 
 /// Why a Hub list or pull failed.
 #[derive(Debug, thiserror::Error)]
@@ -47,6 +50,13 @@ pub enum PullError {
     /// A blocking library task failed.
     #[error("a library task failed")]
     Task,
+    /// No CA bundle may be trusted for the Hub connection (missing, wrong owner, writable by
+    /// others, malformed, or empty); nothing is connected.
+    #[error(transparent)]
+    Roots(#[from] RootsError),
+    /// The TLS configuration could not be built from the anchors.
+    #[error("the TLS configuration for the Hub could not be built")]
+    TlsConfig(#[from] rustls::Error),
     /// An earlier library call panicked while it held the library, so its in-memory state is
     /// no longer trusted. Permanent until sallyd restarts; never recovered in place.
     #[error("the model library is unusable after an internal failure; restart sallyd")]
@@ -71,6 +81,8 @@ impl PullError {
             Self::TokenUnusable => "hf_token_unusable",
             Self::Task => "hf_task_failed",
             Self::LibraryPoisoned => "hf_library_poisoned",
+            Self::Roots(_) => "hf_roots_failed",
+            Self::TlsConfig(_) => "hf_tls_config",
         }
     }
 }

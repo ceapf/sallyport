@@ -6,6 +6,7 @@
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
@@ -14,7 +15,8 @@ use sally_core::library::Library;
 use sally_core::model::hash::{Digest, Hasher};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream, duplex};
 
-use super::{HfClient, SharedLibrary, conn};
+use super::{HfClient, SharedLibrary};
+use crate::egress::roots::BundleFiles;
 use crate::egress::server::{Dialer, HostAddrs, Resolver};
 
 /// A public address (TEST-NET would be refused as reserved).
@@ -50,7 +52,8 @@ type Handler = Arc<dyn Fn(&Seen, usize) -> Vec<u8> + Send + Sync>;
 #[derive(Clone)]
 pub(super) struct Hub {
     server: Arc<rustls::ServerConfig>,
-    client: Arc<rustls::ClientConfig>,
+    roots: BundleFiles,
+    _bundle: Arc<Bundle>,
     handler: Handler,
     answer: Arc<Mutex<Vec<IpAddr>>>,
     own: Arc<Mutex<Vec<IpAddr>>>,
@@ -63,12 +66,15 @@ pub(super) struct Hub {
 impl Hub {
     /// A Hub answering each request with `handler(request, index)`.
     pub(super) fn new(handler: impl Fn(&Seen, usize) -> Vec<u8> + Send + Sync + 'static) -> Self {
-        let (ca, server) = pki();
-        let mut store = rustls::RootCertStore::empty();
-        store.add(ca).unwrap();
+        let (ca_pem, server) = pki();
+        let bundle = Bundle::write(&ca_pem);
         Self {
             server,
-            client: conn::client_config(Arc::new(store)).unwrap(),
+            roots: BundleFiles {
+                paths: vec![bundle.0.clone()],
+                owner: rustix::process::getuid().as_raw(),
+            },
+            _bundle: Arc::new(bundle),
             handler: Arc::new(handler),
             answer: Arc::new(Mutex::new(vec![PUBLIC])),
             own: Arc::new(Mutex::new(Vec::new())),
@@ -81,13 +87,19 @@ impl Hub {
 
     /// A client over this Hub, with `token`.
     pub(super) fn client(&self, token: Option<&str>) -> HfClient<Self, Self, Self> {
-        HfClient::new(
+        HfClient::with_roots(
             self.clone(),
             self.clone(),
             self.clone(),
-            Arc::clone(&self.client),
+            &self.roots,
             token.map(|t| sally_core::secrets::Secret::new(t.to_owned())),
         )
+        .unwrap()
+    }
+
+    /// The bundle file holding the mock's CA, owned by this user at 0644.
+    pub(super) fn roots(&self) -> &BundleFiles {
+        &self.roots
     }
 
     /// Every lookup answers `ip` from now on.
@@ -220,11 +232,29 @@ fn parse_head(head: &str) -> Seen {
     seen
 }
 
-/// A CA and one leaf for the Hub's names.
-fn pki() -> (
-    rustls::pki_types::CertificateDer<'static>,
-    Arc<rustls::ServerConfig>,
-) {
+/// A CA bundle file minted at test time, removed on drop.
+struct Bundle(PathBuf);
+
+impl Bundle {
+    fn write(pem: &str) -> Self {
+        use std::os::unix::fs::PermissionsExt as _;
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("sp-hf-roots-{}-{n}.pem", std::process::id()));
+        std::fs::write(&path, pem).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for Bundle {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// A CA (as PEM) and one leaf for the Hub's names.
+fn pki() -> (String, Arc<rustls::ServerConfig>) {
     let ca_key = KeyPair::generate().unwrap();
     let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
     ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -247,7 +277,7 @@ fn pki() -> (
     .with_no_client_auth()
     .with_single_cert(vec![leaf.der().clone()], key)
     .unwrap();
-    (ca_cert.der().clone(), Arc::new(cfg))
+    (ca_cert.pem(), Arc::new(cfg))
 }
 
 /// A response: status line, the given header lines, a Content-Length for `body`, the body.

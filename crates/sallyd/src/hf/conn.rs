@@ -1,5 +1,7 @@
 //! One connection to one Hub host: resolved on this host, every address checked, a pinned
-//! address dialled, then TLS verified against the system roots for that host name.
+//! address dialled, then TLS verified for that host name against the anchors of a checked CA
+//! bundle file (production: the system bundle owned by root, through
+//! [`crate::egress::roots::BundleFiles`]).
 //!
 //! The rule is the egress proxy's (SI-9's reason applies to `sallyd`'s own credential-carrying
 //! connection): one lookup, at most [`MAX_ANSWER`] answers; if any answer is loopback, private,
@@ -84,13 +86,12 @@ pub(super) async fn tls<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
-/// The client TLS configuration: the given anchors (production: the system bundle through
-/// [`crate::egress::roots::BundleFiles`]), the ring provider's safe defaults, HTTP/1.1 only, no
-/// client certificate.
+/// The client TLS configuration: the anchors [`super::HfClient::with_roots`] loaded, the ring
+/// provider's safe defaults, HTTP/1.1 only, no client certificate.
 ///
 /// # Errors
 /// rustls's, if it refuses the provider's protocol versions.
-pub fn client_config(
+pub(super) fn client_config(
     roots: Arc<rustls::RootCertStore>,
 ) -> Result<Arc<rustls::ClientConfig>, rustls::Error> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
