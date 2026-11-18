@@ -52,9 +52,10 @@ pub const MAX_ADDRS: usize = 16;
 /// up to this many is filtered; only the first [`MAX_ADDRS`] distinct ones are kept.
 pub const MAX_ANSWER: usize = 64;
 /// Connections accepted past `max_connections` at one time, each only to be answered 429 (architect
-/// Q20). Beyond the sum, the accept loop stops accepting until one ends.
-// TODO(#48): raise RLIMIT_NOFILE and cap connections across sessions; one session at 1024 needs
-// about 1088 + 1024 descriptors.
+/// Q20). Beyond the sum, the accept loop stops accepting until one ends. Descriptors across
+/// sessions are bounded at the daemon: `daemon::process::raise_nofile` raises `RLIMIT_NOFILE`
+/// (`daemon::startup::nofile_target`) at start, and a launch is admitted only while the live
+/// sessions' `sandbox::budget::session_cost` fits half of it (`sandbox::budget::admit`).
 pub const ADMISSION_EXTRA: usize = 64;
 /// Connections a session's `net.sock` admits per second on average (`net.rs`); the ones over the
 /// rate are closed unread and counted in `egress.shed`. The same figures as `agent.sock`'s request

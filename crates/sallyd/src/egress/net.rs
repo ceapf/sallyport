@@ -40,8 +40,9 @@ pub const SHED_INTERVAL: Duration = Duration::from_secs(1);
 /// How long a stopping listener waits for its connections to write `egress.close`.
 pub const STOP_GRACE: Duration = Duration::from_secs(5);
 
-/// `getaddrinfo` calls in flight at once, across every session (architect Q19).
-// TODO(#47): a per-session share, so one session cannot hold every slot for a resolver timeout.
+/// `getaddrinfo` calls in flight at once, across every session (architect Q19). One session may
+/// hold at most a quarter of them (`session::lookup::SESSION_LOOKUPS`, through
+/// `session_resolver` and `globally_bounded`), so it cannot take every slot for a resolver timeout.
 pub const MAX_LOOKUPS: usize = 64;
 
 /// A blocking name lookup of an absolute name and a port.
@@ -51,11 +52,11 @@ pub type Lookup = Arc<dyn Fn(&str, u16) -> io::Result<Vec<SocketAddr>> + Send + 
 /// free slot fails at once and never queues; a slot stays taken until its blocking call returns,
 /// even after the caller gave up. Lookups and audit appends share tokio's blocking pool: stuck
 /// lookups take at most `slots` of its threads, so lookups alone never hold the audit log up
-/// while the pool is larger than that (tokio's default is 512). Appends wait on the one audit
-/// writer whatever the pool; what bounds how many a sandbox causes is each socket's rate (on
-/// `net.sock`, the admission rate of [`serve_with`]).
-// TODO(#47): the daemon's runtime builder must keep `max_blocking_threads` well above
-// MAX_LOOKUPS, and its test must use that builder.
+/// while the pool is larger than that. The daemon's runtime builder (`daemon::runtime`) sets
+/// the pool to `MAX_BLOCKING_THREADS`, which its test
+/// `the_blocking_pool_stays_well_above_the_lookup_cap` keeps well above [`MAX_LOOKUPS`]. Appends
+/// wait on the one audit writer whatever the pool; what bounds how many a sandbox causes is each
+/// socket's rate (on `net.sock`, the admission rate of [`serve_with`]).
 #[derive(Clone)]
 pub struct SystemResolver {
     slots: Arc<Semaphore>,
