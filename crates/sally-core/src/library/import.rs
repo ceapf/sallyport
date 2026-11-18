@@ -66,7 +66,6 @@ pub(super) fn run(
     let quarantine = Quarantine::create(&lib.dirs.quarantine, &mut lib.next_quarantine)?;
     let mut copy = quarantine.create_file()?;
     let (format, hasher) = copy_checked(src, source_size, &mut copy, candidate)?;
-    not_grown(hasher.bytes(), source_size)?;
     let size = check_copy(&mut copy, format, hasher.bytes())?;
     let digest = hasher.finish();
     if let Some(want) = expected
@@ -166,7 +165,9 @@ fn open_source(path: &Path) -> Result<(File, u64), LibraryError> {
 }
 
 /// Copies at most `source_size + 1` bytes of `src` into `dst` in one pass, hashing every byte
-/// written; the magic check runs on the first bytes before anything else is read.
+/// written; the magic check runs on the first bytes before anything else is read. A copy that
+/// reached the byte past `source_size` is refused with [`LibraryError::SourceChanged`] (the
+/// source grew).
 fn copy_checked(
     src: File,
     source_size: u64,
@@ -194,6 +195,7 @@ fn copy_checked(
         let used = chunk.len();
         reader.consume(used);
     }
+    not_grown(hasher.bytes(), source_size)?;
     Ok((format, hasher))
 }
 

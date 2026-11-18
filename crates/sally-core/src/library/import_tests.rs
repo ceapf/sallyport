@@ -419,6 +419,81 @@ fn not_grown_refuses_a_byte_past_the_size() {
     assert_eq!(not_grown(11, 10).unwrap_err().code(), "source_changed");
 }
 
+/// The copy holds its own bound. A source longer than the size it was opened at is copied to
+/// one byte past that size, no further, and refused source_changed. At or above the source's
+/// length, the whole source is copied and hashed. The source spans more than two copy buffers.
+#[test]
+fn copy_checked_stops_one_byte_past_the_size() {
+    let root = TmpRoot::new("imp-bound");
+    let mut g = Gguf::valid();
+    g.trailing = 200_000;
+    let bytes = g.bytes();
+    let len = u64::try_from(bytes.len()).unwrap();
+    assert!(len > 2 * u64::try_from(COPY_BUFFER).unwrap());
+    let source = root.source("m.gguf", &bytes);
+    let run = |size: u64| {
+        let dst_path = root.path().join(format!("dst-{size}"));
+        let mut dst = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&dst_path)
+            .unwrap();
+        let candidate = detect::by_name(std::ffi::OsStr::new("m.gguf")).unwrap();
+        let got = copy_checked(File::open(&source).unwrap(), size, &mut dst, candidate);
+        (got, std::fs::metadata(&dst_path).unwrap().len())
+    };
+    for (size, copied) in [(100, 101), (len - 1, len)] {
+        let (got, on_disk) = run(size);
+        assert_eq!(got.unwrap_err().code(), "source_changed", "size {size}");
+        assert_eq!(on_disk, copied, "size {size}");
+    }
+    for size in [len, len + 1, u64::MAX] {
+        let (got, on_disk) = run(size);
+        let (format, hasher) = got.unwrap();
+        assert_eq!(format, Format::Gguf);
+        assert_eq!(hasher.bytes(), len, "size {size}");
+        assert_eq!(hasher.finish(), sha(&bytes), "size {size}");
+        assert_eq!(on_disk, len, "size {size}");
+    }
+}
+
+/// Before the magic verdict, the copy reads at most one copy buffer of the source, however long
+/// the source is. The probe shares the source's file offset; a valid source moves it to the end,
+/// so the probe measures.
+#[test]
+fn the_magic_check_reads_at_most_one_buffer() {
+    let root = TmpRoot::new("imp-head");
+    let mut g = Gguf::valid();
+    g.trailing = 200_000;
+    let good = g.bytes();
+    let mut bad = good.clone();
+    bad[0] = b'X';
+    let len = u64::try_from(good.len()).unwrap();
+    assert!(len > 2 * u64::try_from(COPY_BUFFER).unwrap());
+    let run = |name: &str, bytes: &[u8]| {
+        let mut probe = File::open(root.source(name, bytes)).unwrap();
+        let dst_path = root.path().join(format!("dst-{name}"));
+        let mut dst = File::options()
+            .write(true)
+            .create_new(true)
+            .open(dst_path)
+            .unwrap();
+        let candidate = detect::by_name(std::ffi::OsStr::new("m.gguf")).unwrap();
+        let got = copy_checked(probe.try_clone().unwrap(), len, &mut dst, candidate);
+        (got, probe.stream_position().unwrap())
+    };
+    let (got, read) = run("bad.gguf", &bad);
+    assert_eq!(got.unwrap_err().code(), "magic_mismatch");
+    assert!(
+        read <= u64::try_from(COPY_BUFFER).unwrap(),
+        "read {read} bytes before the magic verdict"
+    );
+    let (got, read) = run("good.gguf", &good);
+    got.unwrap();
+    assert_eq!(read, len);
+}
+
 /// No refusal's message carries the source's path or name, and file-chosen text from the
 /// header reaches the message only escaped.
 #[test]
