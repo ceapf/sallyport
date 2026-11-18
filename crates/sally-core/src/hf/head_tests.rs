@@ -306,6 +306,20 @@ fn a_list_answer_is_bounded() {
     );
 }
 
+/// The shape checked before a number is parsed: 1 to 20 digits (20 is accepted, 21 refused,
+/// even with a value that would overflow anyway), no leading zero but `0`.
+#[test]
+fn canonical_digits_bounds_the_shape_first() {
+    assert!(canonical_digits("0"));
+    assert!(canonical_digits("7"));
+    assert!(canonical_digits(&"9".repeat(20)));
+    assert!(!canonical_digits(&"1".repeat(21)));
+    assert!(!canonical_digits(""));
+    assert!(!canonical_digits("01"));
+    assert!(!canonical_digits("1a"));
+    assert!(!canonical_digits("a1"));
+}
+
 /// The strict number and range parsers.
 #[test]
 fn numbers_and_ranges_parse_strictly() {

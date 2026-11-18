@@ -177,14 +177,15 @@ pub fn retry_wait(value: Option<&str>) -> u64 {
 /// leading zero (except `0` itself).
 #[must_use]
 pub fn parse_u64(s: &str) -> Option<u64> {
-    if s.is_empty()
-        || s.len() > MAX_NUMBER_DIGITS
-        || !s.bytes().all(|b| b.is_ascii_digit())
-        || (s.len() > 1 && s.starts_with('0'))
-    {
-        return None;
-    }
-    s.parse().ok()
+    canonical_digits(s).then(|| s.parse().ok()).flatten()
+}
+
+/// The shape [`parse_u64`] checks before it parses: 1 to 20 ASCII digits, no leading zero
+/// (except `0` itself). Bounds first: no longer string reaches the parser.
+pub(super) fn canonical_digits(s: &str) -> bool {
+    (1..=MAX_NUMBER_DIGITS).contains(&s.len())
+        && s.bytes().all(|b| b.is_ascii_digit())
+        && !(s.len() > 1 && s.starts_with('0'))
 }
 
 /// `bytes first-last/total` with `first <= last < total`, exactly; nothing else.
