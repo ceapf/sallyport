@@ -12,6 +12,7 @@ fn repo_ids_are_two_strict_parts() {
         &format!("a/{}", "b".repeat(96)),
     ] {
         assert_eq!(RepoId::parse(ok).unwrap().as_str(), ok, "{ok}");
+        assert_eq!(RepoId::parse(ok).unwrap().to_string(), ok, "{ok}");
     }
     for bad in [
         "",
@@ -98,6 +99,13 @@ fn paths_are_strict_and_end_in_an_allowed_model_name() {
         assert_eq!(p.as_str(), ok);
     }
     assert_eq!(RepoPath::parse("a/b/m.gguf").unwrap().file_name(), "m.gguf");
+    // The whole path: 1024 bytes is accepted, 1025 refused.
+    let dirs = vec!["d".repeat(200); 4].join("/");
+    let at_limit = format!("{dirs}/{}.gguf", "a".repeat(215));
+    assert_eq!(at_limit.len(), 1024);
+    assert!(RepoPath::parse(&at_limit).is_ok());
+    let over = format!("{dirs}/{}.gguf", "a".repeat(216));
+    assert_eq!(RepoPath::parse(&over), Err(HfError::PathInvalid));
     let long_dirs = format!("{}/m.gguf", vec!["d".repeat(200); 6].join("/"));
     assert!(long_dirs.len() > 1024);
     for bad in [

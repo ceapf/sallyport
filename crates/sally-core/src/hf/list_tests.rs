@@ -163,6 +163,17 @@ fn the_sibling_count_is_bounded() {
     assert_eq!(err.code(), "hf_list_malformed");
 }
 
+/// serde's own error for siblings that are not an array says what was expected; parse_list
+/// keeps only its position (see `malformed_lists_are_refused`).
+#[test]
+fn the_siblings_visitor_names_what_it_expects() {
+    let bad = format!(r#"{{"sha":"{SHA}","siblings":{{}}}}"#);
+    let err = serde_json::from_slice::<RawList>(bad.as_bytes())
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("an array of files"), "{err}");
+}
+
 /// A key the parser reads given twice is refused at any level, as is a missing or invalid
 /// commit, a wrong type,
 /// or anything but an object; the error names a position, never a value.
