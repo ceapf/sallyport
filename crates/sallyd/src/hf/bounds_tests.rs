@@ -43,6 +43,64 @@ fn partial(lib: &TmpLib, g: &[u8]) -> Vec<u8> {
     std::fs::read(lib.path(&format!("downloads/{}.part", sha(g).as_hex()))).unwrap()
 }
 
+/// Lets every spawned task run until all are idle (the clock is paused, so this costs nothing).
+async fn settle() {
+    tokio::time::sleep(Duration::from_secs(1)).await;
+}
+
+/// The guard on an exchange's connection task aborts it when dropped: a task that would never
+/// end on its own, holding its stream, ends with the guard and the peer sees the stream close;
+/// while the guard is held the stream stays open (the control).
+#[tokio::test(start_paused = true)]
+async fn a_dropped_conn_task_is_aborted() {
+    use tokio::io::AsyncReadExt as _;
+    let (near, mut far) = tokio::io::duplex(64);
+    let task = ConnTask::spawn(async move {
+        let _held = near;
+        std::future::pending::<()>().await;
+    });
+    settle().await;
+    let mut buf = [0_u8; 1];
+    let open = tokio::time::timeout(Duration::from_secs(1), far.read(&mut buf)).await;
+    assert!(open.is_err(), "the stream ended while the guard was held");
+    drop(task);
+    assert_eq!(bounded(far.read(&mut buf)).await.unwrap(), 0);
+}
+
+/// No connection outlives its exchange: while a response whose body stalls is held, its
+/// connection stays open (the control); once it is dropped, the peer sees the connection end.
+/// (The HTTP layer ends it too; the guard's own test above is the one that fails without it.)
+#[tokio::test(start_paused = true)]
+async fn a_dropped_exchange_closes_its_connection() {
+    let hub = Hub::new(|_, _| {
+        let mut r = reply("200 OK", &[], b"0123456789");
+        r.truncate(r.len() - 5);
+        r.extend_from_slice(STALL);
+        r
+    });
+    let client = hub.client(None);
+    let req = list_request(&repo(), &Revision::main());
+    let held = bounded(client.exchange(&req)).await.unwrap();
+    settle().await;
+    assert_eq!(hub.closed(), 0, "closed while still held");
+    drop(held);
+    settle().await;
+    assert_eq!(hub.closed(), 1, "the connection outlived its exchange");
+}
+
+/// A head that never comes: the exchange gives up after the head bound, and the peer sees the
+/// connection end.
+#[tokio::test(start_paused = true)]
+async fn a_timed_out_head_closes_its_connection() {
+    let hub = Hub::new(|_, _| STALL.to_vec());
+    let client = hub.client(None);
+    let req = list_request(&repo(), &Revision::main());
+    let err = bounded(client.exchange(&req)).await.err().unwrap();
+    assert_eq!(err.code(), "hf_timeout");
+    settle().await;
+    assert_eq!(hub.closed(), 1, "the connection outlived its exchange");
+}
+
 /// The transport's bounds are the values chosen for it; changing one is a reviewed decision.
 #[test]
 fn the_transport_bounds_are_pinned() {

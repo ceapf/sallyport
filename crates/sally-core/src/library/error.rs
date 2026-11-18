@@ -56,6 +56,10 @@ pub enum LibraryError {
     /// The model's blob is missing or no longer matches its row (type, owner, write bits, size).
     #[error("the blob of model {0} is missing or does not match the library index")]
     BlobMismatch(Digest),
+    /// The name the verified file was linked by named another file by then; the new blob was
+    /// removed and no row written.
+    #[error("the verified file was replaced before it was stored; nothing was stored")]
+    BlobChanged,
     /// The quarantine copy's length on disk is not the number of bytes copied into it.
     #[error("the quarantine copy changed while it was written")]
     QuarantineChanged,
@@ -134,6 +138,7 @@ impl LibraryError {
             Self::HashMismatch { .. } => "hash_mismatch",
             Self::NotFound(_) => "not_found",
             Self::BlobMismatch(_) => "blob_mismatch",
+            Self::BlobChanged => "blob_changed",
             Self::QuarantineChanged => "quarantine_changed",
             Self::QuarantineBusy => "quarantine_busy",
             Self::DownloadBusy => "download_busy",

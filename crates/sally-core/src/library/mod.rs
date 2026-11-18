@@ -18,9 +18,14 @@
 //!   quarantine directory. The source is only ever read, never linked or renamed.
 //! - [`Library::begin_download`] creates the partial beneath the library's own directory and
 //!   hands out a [`Download`], which has no constructor from a path; the caller only appends
-//!   bytes to it. [`Library::promote`] then checks the publisher's SHA-256 over every byte on
-//!   disk before anything else reads them, and only on a match the magic and the strict parse.
-//!   A refusal from the hash on deletes the partial and leaves no blob and no row.
+//!   bytes to it. [`Download::verify`] then checks the publisher's SHA-256 over every byte on
+//!   disk before anything else reads them, and only on a match the magic and the strict parse;
+//!   it needs no library, so it runs without the library's lock. Only it makes a [`Verified`],
+//!   which [`Library::promote`] takes for the tail. A refusal from the hash on deletes the
+//!   partial and leaves no blob and no row.
+//!
+//! The tail links by name while the checks ran on the descriptor: a blob it created that is
+//! not the checked file itself is removed again and refused ([`LibraryError::BlobChanged`]).
 //!
 //! The blob directory decides what a model's bytes are; the index only lists them. Add writes
 //! the blob first, then the row; remove deletes the row first, then the blob. A crash leaves at
@@ -54,7 +59,7 @@ use std::path::Path;
 
 use rustix::fs::{AtFlags, ResolveFlags};
 
-pub use download::Download;
+pub use download::{Download, Verified};
 pub use error::LibraryError;
 pub use name::SourceName;
 
@@ -215,18 +220,32 @@ impl Library {
         download::begin(self, file_name, expected, size)
     }
 
-    /// Promotes a finished download: its length, then the SHA-256 of every byte on disk
-    /// against the publisher's, then the magic and the strict parse, then the tail shared with
-    /// import. Bytes already in the library return their existing row.
+    /// Promotes a verified download (see [`Download::verify`]) through the tail shared with
+    /// import: read-only, synced, linked under its digest, the row; then the partial's name is
+    /// removed. Bytes already in the library return their existing row.
     ///
     /// # Errors
-    /// [`LibraryError::DownloadIncomplete`] for a short partial (kept for a resume); otherwise
-    /// the partial is deleted and the error is [`LibraryError::DownloadTooLong`],
-    /// [`LibraryError::HashMismatch`], [`LibraryError::Detect`], [`LibraryError::Gguf`],
-    /// [`LibraryError::BlobMismatch`], or an I/O or index error. No refusal leaves a blob or a
-    /// row.
-    pub fn promote(&mut self, download: Download) -> Result<Entry, LibraryError> {
-        download::promote(self, download)
+    /// [`LibraryError::BlobChanged`] when the partial's name no longer names the verified file
+    /// (the name is left as found); otherwise the partial is deleted and the error is
+    /// [`LibraryError::BlobMismatch`] for a blob already stored under the digest that fails its
+    /// checks, or an I/O or index error. No refusal leaves a blob or a row.
+    pub fn promote(&mut self, verified: Verified) -> Result<Entry, LibraryError> {
+        download::promote(self, verified)
+    }
+
+    /// The row stored under `digest`, if any, with its blob checked as inspect checks it (a
+    /// regular file of the current user, no write bit, the row's size). It neither parses nor
+    /// hashes the blob. A pull asks this before it downloads anything.
+    ///
+    /// # Errors
+    /// [`LibraryError::BlobMismatch`] for a row whose blob is missing or fails the checks
+    /// (refused, never repaired), or an I/O or index error.
+    pub fn stored(&self, digest: &Digest) -> Result<Option<Entry>, LibraryError> {
+        let Some(entry) = self.index.get(digest)? else {
+            return Ok(None);
+        };
+        drop(blob::open_checked(&self.dirs.blobs, &entry)?);
+        Ok(Some(entry))
     }
 
     /// Every model, in digest order.

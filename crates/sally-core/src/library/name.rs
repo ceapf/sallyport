@@ -20,7 +20,7 @@ impl SourceName {
     /// `name`, if the library keeps it: at most 255 bytes, no control character, and a name
     /// the model allowlist accepts.
     #[must_use]
-    pub fn checked(name: &str) -> Option<Self> {
+    pub(crate) fn checked(name: &str) -> Option<Self> {
         ok(name).then(|| Self(name.to_owned()))
     }
 

@@ -93,6 +93,10 @@ pub(super) fn run(
 /// (the library's own file `name` in `dir`): read-only, synced, linked under its digest (a blob
 /// found already there is used only if it passes inspect's checks against this size, and is
 /// never changed), then the row. Returns the row as stored.
+///
+/// The link is made by `name`, the checks ran on `file`: a blob this call created that is not
+/// `file` itself (the name was replaced in between) is removed again, no row is written, and
+/// the refusal is [`LibraryError::BlobChanged`]; `name` is left as found.
 pub(super) fn store(
     lib: &Library,
     file: &File,
@@ -105,7 +109,13 @@ pub(super) fn store(
     file.sync_all()
         .map_err(|e| LibraryError::io("sync the verified file", e))?;
     let created = blob::link(dir, name, &lib.dirs.blobs, &entry.digest)?;
-    if !created {
+    if created {
+        let same = blob::is_file(&lib.dirs.blobs, &entry.digest, file);
+        if !matches!(same, Ok(true)) {
+            blob::unlink_new(&lib.dirs.blobs, &entry.digest);
+            return Err(same.err().unwrap_or(LibraryError::BlobChanged));
+        }
+    } else {
         drop(blob::open_checked(&lib.dirs.blobs, &entry)?);
     }
     if let Err(e) = lib.index.insert(&entry) {

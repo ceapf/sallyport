@@ -80,7 +80,7 @@ flowchart LR
 | `sally-core::audit` | Hash-chained NDJSON writer, verifier, redaction of secret values and oversize args | yes |
 | `sally-core::secrets` | Load/store 0600 TOML; `Secret` newtype with redacted `Debug`, `zeroize` on drop; name-only references everywhere else | **yes** |
 | `sally-core::hf` | The HF Hub client's decisions, with no socket: names validated and encoded, the bounded parse of a repository's file list (path, size, LFS sha256 at one commit), each hop's request (host, path, range, whether it carries the token), the decision on each response head (redirect, bounded wait, body, refusal) and the resume rules. Search and the Range fetch of a GGUF header come later (#214) | no (but handles untrusted bytes → bounded, fuzzed) |
-| `sally-core::library` | SQLite index of blobs; content-addressed store; immutability (`chmod 0444`). The SQLite is the bundled one this crate pins; the database is only an index, and the blob directory decides what a model's bytes are. Bytes enter `blobs/` two ways, both ending in one tail (read-only, linked, then the row), and only a file the library created is ever linked: import runs the whole SI-6 chain on its own copy; a download is a partial the library creates and locks, which promote checks against the publisher's SHA-256 before anything else reads it, then magic and parse | yes |
+| `sally-core::library` | SQLite index of blobs; content-addressed store; immutability (`chmod 0444`). The SQLite is the bundled one this crate pins; the database is only an index, and the blob directory decides what a model's bytes are. Bytes enter `blobs/` two ways, both ending in one tail (read-only, linked, then the row), and only a file the library created is ever linked: import runs the whole SI-6 chain on its own copy; a download is a partial the library creates and locks, which verify checks against the publisher's SHA-256 before anything else reads it, then magic and parse, without the library's lock; promote takes only a verified download | yes |
 | `sallyd::hf` | The HF client's transport: one lookup on the host, loopback/private/link-local/own answers refused, a pinned address dialled on 443, TLS verified against the system roots; requests exactly as `sally-core::hf` plans them, the token only on a hop to `huggingface.co` itself; file bytes only into the library's download. No production caller yet (#209) | yes |
 | `sallyd::sandbox` | Build `podman run` argv from manifest + profile; mount prep (realpath re-check, socket dirs); launch/exec/kill/wait; image digest check | **yes** |
 | `sallyd::rpc` | `control.sock` (trusted methods, §4.1) and per-session `agent.sock` (the MCP subset, §4.2); bounded NDJSON framing, duplicate-key-refusing JSON, per-session rate and connection caps, `SO_PEERCRED` UID check before a byte is read, an audit entry before every reply | **yes** |
@@ -958,22 +958,29 @@ sequenceDiagram
     D->>HF: GET resolve/{commit}/{file} Range: 0-4194303 (GGUF header only, #214)
     D-->>UI: quants with sizes, metadata, fit badge (VRAM/RAM estimate)
     UI->>D: hf.pull(repo, file)
+    D->>LIB: lfs.sha256 already stored (row + blob passing its checks)? answer it, no request
     D->>LIB: ext allowlist and name check; free disk ≥ rest + ceil(size/20) + reserve
-    LIB-->>D: downloads/<sha256>.part (created or resumed, flock-ed)
+    LIB-->>D: downloads/<sha256>.part (created or resumed; flock-ed, the lock bound to the name)
     D->>HF: GET resolve/{commit}/{file} (Range: bytes=n- when resuming; redirects to *.hf.co carry no token)
-    D->>LIB: append the body (never past size)
-    D->>LIB: promote: length == size → sha256 of every byte == lfs.sha256 → magic → strict header parse
+    D->>LIB: append the body (never past size; room checked again before each write)
+    D->>D: verify, without the library lock: length == size → sha256 of every byte == lfs.sha256 → magic → strict header parse → sync
+    D->>LIB: promote the verified file (the tail only)
     alt any check fails
         LIB->>LIB: delete the partial (a short one is kept to resume)
         D-->>UI: error with reason; audit model.refuse(reason) (#209)
     else ok
-        LIB->>LIB: chmod 0444, link → blobs/sha256/<hex>, insert row, unlink the partial
+        LIB->>LIB: chmod 0444, link → blobs/sha256/<hex> (the linked inode must be the verified one), insert row, unlink the partial
         D-->>UI: job.done; audit model.import (#209)
     end
 ```
 
 On the pull path the publisher's SHA-256 is checked before anything else reads the bytes; magic
-and the strict parse follow on the matched file. An import of a local file keeps its order
+and the strict parse follow on the matched file. Verification runs on the partial's own
+descriptor without the library's lock; only a `Verified` download (made by verify alone) reaches
+promote, which runs the tail shared with import under the lock. The tail links by name: a blob
+it created that is not the verified inode is removed and refused (`blob_changed`), and the name
+is left as found. Disk admission is a check, not a reservation: concurrent pulls can overshoot
+it by the batches in flight. An import of a local file keeps its order
 (magic during the copy, parse, then the digest). Bounds (constants in `sally-core::hf` and
 `sallyd::hf`): file list 8 MiB and 10 000 files; path 1024 bytes, segments 255; file size 1 byte
 to 1 TiB; 3 redirects, 3 rate-limit retries waiting at most 60 s each (5 s without a

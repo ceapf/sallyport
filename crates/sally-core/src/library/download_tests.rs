@@ -11,8 +11,16 @@ fn part(bytes: &[u8]) -> String {
     format!("{}.part", sha(bytes).as_hex())
 }
 
-/// A whole download, written in one chunk, is promoted: the blob is stored at 0444 under its
-/// digest, the row written, and downloads/ left empty.
+/// Writes `bytes` at 0600 under a temporary name in `dir`, then renames it over `name`.
+fn replace(dir: &std::path::Path, name: &str, bytes: &[u8]) {
+    let tmp = dir.join("replacement.tmp");
+    std::fs::write(&tmp, bytes).unwrap();
+    chmod(&tmp, 0o600);
+    std::fs::rename(&tmp, dir.join(name)).unwrap();
+}
+
+/// A whole download, written in one chunk, is verified and promoted: the blob is stored at 0444
+/// under its digest, the row written, and downloads/ left empty.
 #[test]
 fn a_whole_download_is_promoted() {
     let root = TmpRoot::new("dl-ok");
@@ -25,7 +33,9 @@ fn a_whole_download_is_promoted() {
     assert_eq!(mode(&root.downloads().join(part(&bytes))), 0o600);
     d.append(&bytes).unwrap();
     assert_eq!(d.written(), size);
-    let entry = lib.promote(d).unwrap();
+    let v = d.verify().unwrap();
+    assert_eq!(v.digest(), &sha(&bytes));
+    let entry = lib.promote(v).unwrap();
     assert_eq!(entry.digest(), &sha(&bytes));
     assert_eq!(entry.size(), size);
     assert_eq!(entry.source_name().as_raw_str(), "m.gguf");
@@ -39,7 +49,7 @@ fn a_whole_download_is_promoted() {
 }
 
 /// A download stopped half way keeps its bytes; the next begin resumes at that offset and the
-/// promote covers every byte, whichever run wrote it.
+/// verify covers every byte, whichever run wrote it.
 #[test]
 fn a_stopped_download_resumes_where_it_stopped() {
     let root = TmpRoot::new("dl-resume");
@@ -53,9 +63,29 @@ fn a_stopped_download_resumes_where_it_stopped() {
     let mut d = lib.begin_download("m.gguf", &sha(&bytes), size).unwrap();
     assert_eq!(d.written(), half as u64);
     d.append(&bytes[half..]).unwrap();
-    let entry = lib.promote(d).unwrap();
+    let entry = lib.promote(d.verify().unwrap()).unwrap();
     assert_eq!(entry.digest(), &sha(&bytes));
     assert!(names(&root.downloads()).is_empty());
+}
+
+/// A verified download that is dropped before its promote leaves a 0600 partial, never a
+/// read-only one; the next begin resumes it at its full length and verifies it again.
+#[test]
+fn a_dropped_verified_download_is_verified_again() {
+    let root = TmpRoot::new("dl-dropv");
+    let mut lib = Library::open(root.path(), 0).unwrap();
+    let bytes = gguf("dl-dropv");
+    let size = bytes.len() as u64;
+    let mut d = lib.begin_download("m.gguf", &sha(&bytes), size).unwrap();
+    d.append(&bytes).unwrap();
+    drop(d.verify().unwrap());
+    let path = root.downloads().join(part(&bytes));
+    assert_eq!(mode(&path), 0o600);
+    assert!(names(&root.blobs()).is_empty());
+    let d = lib.begin_download("m.gguf", &sha(&bytes), size).unwrap();
+    assert_eq!(d.written(), size);
+    lib.promote(d.verify().unwrap()).unwrap();
+    assert_eq!(names(&root.blobs()), [sha(&bytes).as_hex()]);
 }
 
 /// Bytes that do not hash to the expected digest are deleted with nothing stored; the control,
@@ -71,13 +101,13 @@ fn a_hash_mismatch_deletes_the_partial_and_stores_nothing() {
 
     let mut d = lib.begin_download("m.gguf", &sha(&good), size).unwrap();
     d.append(&bad).unwrap();
-    let err = lib.promote(d).unwrap_err();
+    let err = d.verify().unwrap_err();
     assert_eq!(err.code(), "hash_mismatch");
     assert_nothing_stored(&root, &lib);
 
     let mut d = lib.begin_download("m.gguf", &sha(&good), size).unwrap();
     d.append(&good).unwrap();
-    lib.promote(d).unwrap();
+    lib.promote(d.verify().unwrap()).unwrap();
     assert_eq!(names(&root.blobs()), [sha(&good).as_hex()]);
 }
 
@@ -93,12 +123,12 @@ fn the_hash_is_checked_before_the_magic() {
 
     let mut d = lib.begin_download("m.gguf", &sha(b"other"), size).unwrap();
     d.append(&junk).unwrap();
-    assert_eq!(lib.promote(d).unwrap_err().code(), "hash_mismatch");
+    assert_eq!(d.verify().unwrap_err().code(), "hash_mismatch");
     assert_nothing_stored(&root, &lib);
 
     let mut d = lib.begin_download("m.gguf", &sha(&junk), size).unwrap();
     d.append(&junk).unwrap();
-    assert_eq!(lib.promote(d).unwrap_err().code(), "magic_mismatch");
+    assert_eq!(d.verify().unwrap_err().code(), "magic_mismatch");
     assert_nothing_stored(&root, &lib);
 }
 
@@ -112,12 +142,12 @@ fn a_matching_file_the_parser_refuses_is_deleted() {
     let size = bytes.len() as u64;
     let mut d = lib.begin_download("m.gguf", &sha(&bytes), size).unwrap();
     d.append(&bytes).unwrap();
-    let err = lib.promote(d).unwrap_err();
+    let err = d.verify().unwrap_err();
     assert!(matches!(err, LibraryError::Gguf(_)), "{err:?}");
     assert_nothing_stored(&root, &lib);
 }
 
-/// A short download is not promoted: it is incomplete and its bytes are kept for a resume.
+/// A short download is not verified: it is incomplete and its bytes are kept for a resume.
 #[test]
 fn a_short_download_is_kept_for_a_resume() {
     let root = TmpRoot::new("dl-short");
@@ -126,7 +156,7 @@ fn a_short_download_is_kept_for_a_resume() {
     let size = bytes.len() as u64;
     let mut d = lib.begin_download("m.gguf", &sha(&bytes), size).unwrap();
     d.append(&bytes[..10]).unwrap();
-    let err = lib.promote(d).unwrap_err();
+    let err = d.verify().unwrap_err();
     assert_eq!(err.code(), "download_incomplete");
     assert!(err.to_string().contains(&format!("10 of {size}")), "{err}");
     let kept = root.downloads().join(part(&bytes));
@@ -152,13 +182,57 @@ fn append_stops_at_the_listed_size() {
     assert_eq!(d.append(b"z").unwrap_err().code(), "download_too_long");
     let on_disk = std::fs::metadata(root.downloads().join(part(&bytes))).unwrap();
     assert_eq!(on_disk.len(), size);
-    lib.promote(d).unwrap();
+    lib.promote(d.verify().unwrap()).unwrap();
 }
 
-/// A partial longer than the listed size is promoted as too long and deleted; the control, a
-/// partial of exactly its size written the same way, is promoted.
+/// Append writes at the download's own offset, wherever the descriptor's cursor is.
 #[test]
-fn a_partial_longer_than_its_size_is_refused_at_promote() {
+fn append_writes_at_the_written_offset() {
+    let root = TmpRoot::new("dl-at");
+    let mut lib = Library::open(root.path(), 0).unwrap();
+    let bytes = gguf("dl-at");
+    let size = bytes.len() as u64;
+    let mut d = lib.begin_download("m.gguf", &sha(&bytes), size).unwrap();
+    d.append(&bytes[..5]).unwrap();
+    (&d.file).seek(SeekFrom::Start(0)).unwrap();
+    d.append(&bytes[5..]).unwrap();
+    let path = root.downloads().join(part(&bytes));
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    lib.promote(d.verify().unwrap()).unwrap();
+}
+
+/// Every append checks the room again before writing: with no space left it is refused, the
+/// chunk unwritten and the partial kept; the reserve the download began with counts; the
+/// control, the same chunk with room, is written.
+#[test]
+fn append_checks_the_room_before_writing() {
+    let root = TmpRoot::new("dl-room");
+    let reserve = 10;
+    let mut lib = Library::open(root.path(), reserve).unwrap();
+    let bytes = gguf("dl-room");
+    let size = bytes.len() as u64;
+    let need = size + size.div_ceil(20);
+    let mut d = lib.begin_download("m.gguf", &sha(&bytes), size).unwrap();
+    let path = root.downloads().join(part(&bytes));
+    for available in [0, need, need + reserve - 1] {
+        let err = d.append_with(&bytes[..5], available).unwrap_err();
+        assert_eq!(err.code(), "insufficient_disk", "{available}");
+        assert_eq!(d.written(), 0);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    }
+    d.append_with(&bytes[..5], need + reserve).unwrap();
+    assert_eq!(d.written(), 5);
+    assert_eq!(std::fs::read(&path).unwrap(), &bytes[..5]);
+    d.append_with(&bytes[5..], u64::MAX).unwrap();
+    // Complete: an empty chunk needs no room.
+    d.append_with(&[], 0).unwrap();
+    lib.promote(d.verify().unwrap()).unwrap();
+}
+
+/// A partial longer than the listed size is refused as too long at verify and deleted; the
+/// control, a partial of exactly its size written the same way, is promoted.
+#[test]
+fn a_partial_longer_than_its_size_is_refused_at_verify() {
     let root = TmpRoot::new("dl-grown");
     let mut lib = Library::open(root.path(), 0).unwrap();
     let exact = gguf("dl-exact");
@@ -166,7 +240,7 @@ fn a_partial_longer_than_its_size_is_refused_at_promote() {
         .begin_download("m.gguf", &sha(&exact), exact.len() as u64)
         .unwrap();
     std::fs::write(root.downloads().join(part(&exact)), &exact).unwrap();
-    lib.promote(d).unwrap();
+    lib.promote(d.verify().unwrap()).unwrap();
     lib.remove(&sha(&exact)).unwrap();
 
     let bytes = gguf("dl-grown");
@@ -176,7 +250,7 @@ fn a_partial_longer_than_its_size_is_refused_at_promote() {
     let mut grown = bytes.clone();
     grown.push(0);
     std::fs::write(&path, &grown).unwrap();
-    assert_eq!(lib.promote(d).unwrap_err().code(), "download_too_long");
+    assert_eq!(d.verify().unwrap_err().code(), "download_too_long");
     assert_nothing_stored(&root, &lib);
 }
 
@@ -209,7 +283,7 @@ fn restart_empties_the_partial() {
     d.restart().unwrap();
     assert_eq!(d.written(), 0);
     d.append(&bytes).unwrap();
-    lib.promote(d).unwrap();
+    lib.promote(d.verify().unwrap()).unwrap();
 }
 
 /// Discard removes the partial.
@@ -244,6 +318,35 @@ fn a_held_download_is_busy() {
     drop(first);
     let again = lib.begin_download("m.gguf", &sha(&bytes), size).unwrap();
     assert_eq!(again.written(), 3);
+}
+
+/// The lock is bound to the name: a partial whose name was replaced or removed between the
+/// open and the lock is refused busy and the replacement left as found; the control, the same
+/// two steps with the name untouched, binds.
+#[test]
+fn the_lock_is_bound_to_the_name() {
+    let root = TmpRoot::new("dl-bind");
+    let lib = Library::open(root.path(), 0).unwrap();
+    let dir = &lib.dirs.downloads;
+    let name = part(b"bind");
+
+    let fd = open_unlocked(&lib, &name, 100).unwrap();
+    replace(&root.downloads(), &name, b"replacement");
+    let err = lock_and_bind(fd, dir, &name).err().unwrap();
+    assert_eq!(err.code(), "download_busy");
+    let path = root.downloads().join(&name);
+    assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+    assert_eq!(mode(&path), 0o600);
+    std::fs::remove_file(&path).unwrap();
+
+    let fd = open_unlocked(&lib, &name, 100).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    let err = lock_and_bind(fd, dir, &name).err().unwrap();
+    assert_eq!(err.code(), "download_busy");
+    assert!(names(&root.downloads()).is_empty());
+
+    let fd = open_unlocked(&lib, &name, 100).unwrap();
+    drop(lock_and_bind(fd, dir, &name).unwrap());
 }
 
 /// A partial that is not a private regular file of the current user is refused and left as it
@@ -284,6 +387,33 @@ fn a_partial_that_is_not_private_is_refused_unchanged() {
     assert_eq!(err.code(), "download_not_private");
     assert_eq!(std::fs::read(&target).unwrap(), b"target");
     assert!(std::fs::symlink_metadata(&path).unwrap().is_symlink());
+}
+
+/// A partial with a second hard link is refused and the other file left as it was: a 0600
+/// canary linked in as the partial keeps its bytes (longer than the size, so a begin that took
+/// it would have emptied it) and its mode.
+#[test]
+fn a_partial_with_a_second_link_is_refused_unchanged() {
+    let root = TmpRoot::new("dl-nlink");
+    let mut lib = Library::open(root.path(), 0).unwrap();
+    let bytes = gguf("dl-nlink");
+    let size = bytes.len() as u64;
+    let canary_bytes = vec![b'c'; bytes.len() + 10];
+    let canary = root.source("canary.gguf", &canary_bytes);
+    chmod(&canary, 0o600);
+    let path = root.downloads().join(part(&bytes));
+    std::fs::hard_link(&canary, &path).unwrap();
+    let err = lib
+        .begin_download("m.gguf", &sha(&bytes), size)
+        .err()
+        .unwrap();
+    assert_eq!(err.code(), "download_not_private");
+    assert_eq!(std::fs::read(&canary).unwrap(), canary_bytes);
+    assert_eq!(mode(&canary), 0o600);
+    // Control: once the second link is gone the same file is a partial again.
+    std::fs::remove_file(&canary).unwrap();
+    let d = lib.begin_download("m.gguf", &sha(&bytes), size).unwrap();
+    assert_eq!(d.written(), 0);
 }
 
 /// A name off the allowlist, or one the library will not keep, is refused before any file is
@@ -341,9 +471,37 @@ fn a_download_of_stored_bytes_returns_the_row() {
         .begin_download("b.gguf", &sha(&bytes), bytes.len() as u64)
         .unwrap();
     d.append(&bytes).unwrap();
-    assert_eq!(lib.promote(d).unwrap(), first);
+    assert_eq!(lib.promote(d.verify().unwrap()).unwrap(), first);
     assert_eq!(lib.list().unwrap(), [first]);
     assert!(names(&root.downloads()).is_empty());
+}
+
+/// A partial whose name was replaced after it was verified is refused at promote as changed:
+/// no blob, no row, and the name left as found; the control, the same steps with the name
+/// untouched, is promoted.
+#[test]
+fn a_partial_replaced_after_verify_is_not_promoted() {
+    let root = TmpRoot::new("dl-swap");
+    let mut lib = Library::open(root.path(), 0).unwrap();
+    let bytes = gguf("dl-swap");
+    let size = bytes.len() as u64;
+    let mut d = lib.begin_download("m.gguf", &sha(&bytes), size).unwrap();
+    d.append(&bytes).unwrap();
+    let v = d.verify().unwrap();
+    replace(&root.downloads(), &part(&bytes), b"replacement");
+    let err = lib.promote(v).unwrap_err();
+    assert_eq!(err.code(), "blob_changed");
+    assert!(names(&root.blobs()).is_empty());
+    assert!(lib.list().unwrap().is_empty());
+    let path = root.downloads().join(part(&bytes));
+    assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+    assert_eq!(mode(&path), 0o600);
+    std::fs::remove_file(&path).unwrap();
+
+    let mut d = lib.begin_download("m.gguf", &sha(&bytes), size).unwrap();
+    d.append(&bytes).unwrap();
+    lib.promote(d.verify().unwrap()).unwrap();
+    assert_eq!(names(&root.blobs()), [sha(&bytes).as_hex()]);
 }
 
 /// Admission counts what is left to fetch plus a twentieth of the size (rounded up) against
@@ -373,6 +531,17 @@ fn admission_counts_the_rest_and_a_twentieth() {
     ));
 }
 
+/// A complete partial needs no room: one byte short needs that byte plus the slack, all of
+/// it needs nothing, even with no space and a reserve.
+#[test]
+fn admission_admits_a_complete_partial() {
+    assert!(admits_download(100, 99, 6, 0));
+    assert!(!admits_download(100, 99, 5, 0));
+    assert!(admits_download(100, 100, 0, 0));
+    assert!(admits_download(100, 100, 0, 10));
+    assert!(admits_download(100, 101, 0, 10));
+}
+
 /// The offset a download starts at: what is on disk, or 0 when that is more than the size.
 #[test]
 fn the_start_offset_is_what_is_on_disk_up_to_the_size() {
@@ -382,13 +551,15 @@ fn the_start_offset_is_what_is_on_disk_up_to_the_size() {
     assert_eq!(start_offset(11, 10), 0);
 }
 
-/// The partial's mode rule: a regular file of the current user, exactly 0600.
+/// The partial's rule: a regular file of the current user, exactly 0600, one link.
 #[test]
 fn part_ok_wants_a_private_regular_file() {
     const FILE: u32 = 0o100_000;
-    assert!(part_ok(FILE | 0o600, 7, 7));
-    assert!(!part_ok(FILE | 0o600, 8, 7));
-    assert!(!part_ok(FILE | 0o640, 7, 7));
-    assert!(!part_ok(FILE | 0o4600, 7, 7));
-    assert!(!part_ok(0o040_000 | 0o600, 7, 7));
+    assert!(part_ok(FILE | 0o600, 1, 7, 7));
+    assert!(!part_ok(FILE | 0o600, 2, 7, 7));
+    assert!(!part_ok(FILE | 0o600, 0, 7, 7));
+    assert!(!part_ok(FILE | 0o600, 1, 8, 7));
+    assert!(!part_ok(FILE | 0o640, 1, 7, 7));
+    assert!(!part_ok(FILE | 0o4600, 1, 7, 7));
+    assert!(!part_ok(0o040_000 | 0o600, 1, 7, 7));
 }

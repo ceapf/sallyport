@@ -4,8 +4,10 @@
 //! on this host, refuse loopback, private, link-local and own addresses, dial a pinned address,
 //! TLS verified against the system roots), sent as [`wire`] builds it (the token only on a hop
 //! to `huggingface.co` itself), and its head decided by the core ([`sally_core::hf::head`]).
-//! File bytes go only into a [`sally_core::library::Download`]; the library's promote checks the
-//! listed SHA-256 before anything else reads them.
+//! File bytes go only into a [`sally_core::library::Download`]; its verify checks the listed
+//! SHA-256 before anything else reads them, on a blocking thread without the library's lock,
+//! and only then does the library promote it. Every connection's task is aborted when its
+//! response is dropped.
 //!
 //! Bounds: the lookup, each connect and the TLS handshake as in [`conn`]; each response head
 //! [`HEAD_TIMEOUT`]; each list exchange [`LIST_TIMEOUT`] in all; a file body may take as long as
@@ -48,7 +50,10 @@ pub const BODY_IDLE: Duration = Duration::from_secs(60);
 /// File bytes gathered before one blocking write to the partial.
 const WRITE_BATCH: usize = 1 << 20;
 
-/// The library a pull writes into: one owner at a time, used from blocking tasks only.
+/// The library a pull writes into: one owner at a time, used from blocking tasks only. A
+/// mutex poisoned by a panic is refused ([`PullError::LibraryPoisoned`]) until sallyd
+/// restarts, never recovered in place: the files survive a crash, the in-memory index
+/// connection and counters may not.
 pub type SharedLibrary = Arc<Mutex<Library>>;
 
 /// The client: its resolver, dialer and own-address source (wired once, by the caller), the
@@ -89,10 +94,10 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> HfClient<R, D, H> {
         let mut tries = Tries::default();
         loop {
             let exchange = async {
-                let resp = self.exchange(&req).await?;
-                let head = HeadValues::of(resp.status().as_u16(), resp.headers())?;
+                let answer = self.exchange(&req).await?;
+                let head = answer.head()?;
                 match decide_list(&head.head(), &req, &mut tries)? {
-                    Step::Body(_) => read_list(resp.into_body()).await.map(Ok),
+                    Step::Body(_) => read_list(answer.into_body()).await.map(Ok),
                     other => Ok(Err(other)),
                 }
             };
@@ -108,8 +113,11 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> HfClient<R, D, H> {
         }
     }
 
-    /// Pulls the file at `path` of `list` into `lib`: the download begins (or resumes), the
-    /// rest of the file is fetched at the list's commit, and the library promotes it.
+    /// Pulls the file at `path` of `list` into `lib`. A digest already stored (its blob
+    /// passing the library's checks) is answered from the library with no request. Otherwise
+    /// the download begins (or resumes), the rest of the file is fetched at the list's commit,
+    /// the download is verified on a blocking thread without the library's lock, and the
+    /// library promotes it.
     ///
     /// # Errors
     /// The first refusal or failure. A refusal whose bytes cannot be trusted deletes the
@@ -121,17 +129,24 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> HfClient<R, D, H> {
         list: &FileList,
         path: &RepoPath,
     ) -> Result<Entry, PullError> {
-        let wanted = list.wanted(path)?.clone();
+        let wanted = list.wanted(path)?;
+        let digest = wanted.sha256().clone();
+        if let Some(entry) = with_library(lib, move |l| l.stored(&digest)).await? {
+            return Ok(entry);
+        }
         let w = wanted.clone();
         let d = with_library(lib, move |l| {
             l.begin_download(w.path().file_name(), w.sha256(), w.size())
         })
         .await?;
         let d = match next_fetch(d.written(), d.size()) {
-            Some(from) => self.fetch(d, repo, list.commit(), &wanted, from).await?,
+            Some(from) => self.fetch(d, repo, list.commit(), wanted, from).await?,
             None => d,
         };
-        with_library(lib, move |l| l.promote(d)).await
+        let verified = tokio::task::spawn_blocking(move || d.verify())
+            .await
+            .map_err(|_| PullError::Task)??;
+        with_library(lib, move |l| l.promote(verified)).await
     }
 
     /// Fetches the rest of the file into `d`, following redirects and waits.
@@ -146,19 +161,21 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> HfClient<R, D, H> {
         let mut req = file_request(repo, commit, wanted.path(), from);
         let mut tries = Tries::default();
         loop {
-            let resp = self.exchange(&req).await?;
-            let head = HeadValues::of(resp.status().as_u16(), resp.headers())?;
+            let answer = self.exchange(&req).await?;
+            let head = answer.head()?;
             match decide_file(&head.head(), &req, &mut tries, d.written(), d.size()) {
                 Ok(Step::Redirect(next)) => req = next,
                 Ok(Step::Wait(secs)) => tokio::time::sleep(Duration::from_secs(secs)).await,
-                Ok(Step::Body(how)) => return stream(d, how, resp.into_body()).await,
+                Ok(Step::Body(how)) => return stream(d, how, answer.into_body()).await,
                 Err(e) => return Err(refuse(d, e).await),
             }
         }
     }
 
-    /// One request on a fresh connection, and its response head.
-    async fn exchange(&self, req: &Request) -> Result<hyper::Response<Incoming>, PullError> {
+    /// One request on a fresh connection, and its response head. The task driving the
+    /// connection travels with the response and its body, and is aborted when they are
+    /// dropped.
+    async fn exchange(&self, req: &Request) -> Result<Answer, PullError> {
         let host = req.host();
         let addrs = conn::pinned(&self.resolver, &self.own, host).await?;
         let tcp = conn::dial(&self.dialer, &addrs, host).await?;
@@ -168,19 +185,66 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> HfClient<R, D, H> {
             .handshake(TokioIo::new(tls))
             .await
             .map_err(|_| PullError::Protocol)?;
-        tokio::spawn(async move {
+        let conn = ConnTask::spawn(async move {
             let _ = connection.await;
         });
         match tokio::time::timeout(HEAD_TIMEOUT, sender.send_request(request)).await {
-            Ok(Ok(resp)) => Ok(resp),
+            Ok(Ok(resp)) => Ok(Answer { resp, conn }),
             Ok(Err(_)) => Err(PullError::Protocol),
             Err(_) => Err(PullError::Timeout("response head")),
         }
     }
 }
 
+/// The task driving one exchange's connection. Dropping it aborts the task, so no connection
+/// outlives the exchange that opened it (SI-12), whatever the HTTP layer does with a dropped
+/// response.
+struct ConnTask(tokio::task::JoinHandle<()>);
+
+impl ConnTask {
+    /// Runs `conn` on its own task, aborted when the returned guard is dropped.
+    fn spawn(conn: impl Future<Output = ()> + Send + 'static) -> Self {
+        Self(tokio::spawn(conn))
+    }
+}
+
+impl Drop for ConnTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// A response and the guard on its connection.
+struct Answer {
+    resp: hyper::Response<Incoming>,
+    conn: ConnTask,
+}
+
+impl Answer {
+    /// The response head's values for the decision layer.
+    fn head(&self) -> Result<HeadValues, PullError> {
+        HeadValues::of(self.resp.status().as_u16(), self.resp.headers())
+    }
+
+    /// The body, still holding the connection's guard.
+    fn into_body(self) -> AnswerBody {
+        AnswerBody {
+            body: self.resp.into_body(),
+            _conn: self.conn,
+        }
+    }
+}
+
+/// A response body and the guard on its connection: the connection lives while the body is
+/// read, and no longer.
+struct AnswerBody {
+    body: Incoming,
+    _conn: ConnTask,
+}
+
 /// The list body, at most [`MAX_LIST_BYTES`]; one byte more is the refusal.
-async fn read_list(mut body: Incoming) -> Result<Vec<u8>, PullError> {
+async fn read_list(mut answer: AnswerBody) -> Result<Vec<u8>, PullError> {
+    let body = &mut answer.body;
     let mut out = Vec::new();
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|_| PullError::Protocol)?;
@@ -196,7 +260,8 @@ async fn read_list(mut body: Incoming) -> Result<Vec<u8>, PullError> {
 
 /// Writes the body into `d`: emptied first for [`Body::FromStart`], then appended in batches.
 /// A body that stops or stalls keeps what arrived.
-async fn stream(mut d: Download, how: Body, mut body: Incoming) -> Result<Download, PullError> {
+async fn stream(mut d: Download, how: Body, mut answer: AnswerBody) -> Result<Download, PullError> {
+    let body = &mut answer.body;
     if how == Body::FromStart {
         d = blocking(d, |d| d.restart()).await?;
     }
@@ -268,7 +333,7 @@ async fn with_library<T: Send + 'static>(
 ) -> Result<T, PullError> {
     let lib = Arc::clone(lib);
     tokio::task::spawn_blocking(move || {
-        let mut guard = lib.lock().map_err(|_| PullError::Task)?;
+        let mut guard = lib.lock().map_err(|_| PullError::LibraryPoisoned)?;
         f(&mut guard).map_err(PullError::from)
     })
     .await

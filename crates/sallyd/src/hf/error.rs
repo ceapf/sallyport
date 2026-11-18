@@ -47,6 +47,10 @@ pub enum PullError {
     /// A blocking library task failed.
     #[error("a library task failed")]
     Task,
+    /// An earlier library call panicked while it held the library, so its in-memory state is
+    /// no longer trusted. Permanent until sallyd restarts; never recovered in place.
+    #[error("the model library is unusable after an internal failure; restart sallyd")]
+    LibraryPoisoned,
 }
 
 impl PullError {
@@ -66,6 +70,7 @@ impl PullError {
             Self::BodyFailed => "hf_body_failed",
             Self::TokenUnusable => "hf_token_unusable",
             Self::Task => "hf_task_failed",
+            Self::LibraryPoisoned => "hf_library_poisoned",
         }
     }
 }

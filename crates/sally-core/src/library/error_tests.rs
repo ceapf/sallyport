@@ -45,6 +45,7 @@ fn every_variant_has_its_code() {
         ),
         (LibraryError::NotFound(digest()), "not_found"),
         (LibraryError::BlobMismatch(digest()), "blob_mismatch"),
+        (LibraryError::BlobChanged, "blob_changed"),
         (LibraryError::QuarantineChanged, "quarantine_changed"),
         (LibraryError::QuarantineBusy, "quarantine_busy"),
         (LibraryError::DownloadBusy, "download_busy"),

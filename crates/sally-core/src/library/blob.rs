@@ -38,6 +38,27 @@ pub(super) fn link(
     Ok(created)
 }
 
+/// Whether the blob `<hex>` that [`link`] just created is `file` itself (the same device and
+/// inode, the name not followed). [`link`] links by name while every check ran on the
+/// descriptor, so a name replaced in between links another file; the caller then removes the
+/// new blob with [`unlink_new`] and refuses ([`LibraryError::BlobChanged`]). A blob gone again
+/// is not `file`.
+pub(super) fn is_file(blobs: &OwnedFd, digest: &Digest, file: &File) -> Result<bool, LibraryError> {
+    let own = rustix::fs::fstat(file).map_err(|e| LibraryError::io("stat the verified file", e))?;
+    match rustix::fs::statat(blobs, digest.as_hex(), AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(st) => Ok((st.st_dev, st.st_ino) == (own.st_dev, own.st_ino)),
+        Err(Errno::NOENT) => Ok(false),
+        Err(e) => Err(LibraryError::io("stat the blob", e)),
+    }
+}
+
+/// Removes the blob `<hex>` this store created and syncs the directory. Best effort: the
+/// refusal is the answer, and a blob left behind has no row, so nothing lists or resolves it.
+pub(super) fn unlink_new(blobs: &OwnedFd, digest: &Digest) {
+    let _ = rustix::fs::unlinkat(blobs, digest.as_hex(), AtFlags::empty());
+    let _ = rustix::fs::fsync(blobs);
+}
+
 /// Opens `entry`'s blob beneath `blobs` and checks it on the descriptor: a regular file of the
 /// current user, no write bit, the row's size.
 pub(super) fn open_checked(blobs: &OwnedFd, entry: &Entry) -> Result<File, LibraryError> {

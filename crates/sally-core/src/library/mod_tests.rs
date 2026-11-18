@@ -95,6 +95,28 @@ fn a_changed_blob_is_blob_mismatch() {
     }
 }
 
+/// stored answers from the row and its checked blob: nothing for an unknown digest, the row
+/// when the blob passes, blob_mismatch when it is writable or gone.
+#[test]
+fn stored_answers_only_from_a_checked_blob() {
+    let root = TmpRoot::new("lib-stored");
+    let (lib, entries) = with(&root, &["a"]);
+    let digest = entries[0].digest();
+    assert_eq!(lib.stored(&sha(b"none")).unwrap(), None);
+    assert_eq!(lib.stored(digest).unwrap().as_ref(), Some(&entries[0]));
+    let blob = root.blobs().join(digest.as_hex());
+    let bytes = std::fs::read(&blob).unwrap();
+    chmod(&blob, 0o644);
+    assert_eq!(lib.stored(digest).unwrap_err().code(), "blob_mismatch");
+    chmod(&blob, 0o444);
+    assert!(lib.stored(digest).unwrap().is_some());
+    std::fs::remove_file(&blob).unwrap();
+    assert_eq!(lib.stored(digest).unwrap_err().code(), "blob_mismatch");
+    std::fs::write(&blob, &bytes).unwrap();
+    chmod(&blob, 0o444);
+    assert!(lib.stored(digest).unwrap().is_some());
+}
+
 /// inspect parses again: a blob whose bytes were changed in place (same size, read-only) is
 /// refused by the parser, not trusted because of its row.
 #[test]

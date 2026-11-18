@@ -366,6 +366,82 @@ async fn a_cut_body_is_kept_and_resumed() {
     assert!(lib.root().exists());
 }
 
+/// A digest already stored is answered from the library with no request; a row whose blob is
+/// writable or missing is refused blob_mismatch, also with no request and no partial. The
+/// control, the first pull of the digest, sends one.
+#[tokio::test]
+async fn a_stored_digest_sends_no_request() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let g = gguf("stored");
+    let served = g.clone();
+    let hub = Hub::new(move |_, _| reply("200 OK", &[], &served));
+    let lib = TmpLib::open("stored", 0);
+    let l = list(&[("m.gguf", &g)]);
+    let client = hub.client(None);
+    let first = bounded(client.pull(&lib.lib, &repo(), &l, &path("m.gguf")))
+        .await
+        .unwrap();
+    assert_eq!(hub.seen().len(), 1);
+
+    let again = bounded(client.pull(&lib.lib, &repo(), &l, &path("m.gguf")))
+        .await
+        .unwrap();
+    assert_eq!(again, first);
+    assert_eq!((hub.seen().len(), hub.dials()), (1, 1));
+
+    let blob = lib.path(&format!("blobs/sha256/{}", sha(&g).as_hex()));
+    let chmod = |m| std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(m)).unwrap();
+    chmod(0o644);
+    let err = bounded(client.pull(&lib.lib, &repo(), &l, &path("m.gguf")))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "blob_mismatch");
+    chmod(0o444);
+    std::fs::remove_file(&blob).unwrap();
+    let err = bounded(client.pull(&lib.lib, &repo(), &l, &path("m.gguf")))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "blob_mismatch");
+    assert_eq!((hub.seen().len(), hub.dials()), (1, 1));
+    assert!(lib.names("downloads").is_empty());
+    assert!(lib.names("blobs/sha256").is_empty());
+}
+
+/// A library poisoned by a panic is refused with its own code, not the blocking-task one, and
+/// nothing is requested; the control, the same pull before the poison, is stored.
+#[tokio::test]
+async fn a_poisoned_library_has_its_own_code() {
+    let g = gguf("poison");
+    let served = g.clone();
+    let hub = Hub::new(move |_, _| reply("200 OK", &[], &served));
+    let lib = TmpLib::open("poison", 0);
+    let client = hub.client(None);
+    bounded(client.pull(&lib.lib, &repo(), &list(&[("m.gguf", &g)]), &path("m.gguf")))
+        .await
+        .unwrap();
+    assert_eq!(hub.seen().len(), 1);
+
+    let held = Arc::clone(&lib.lib);
+    let panicked = std::thread::spawn(move || {
+        let _guard = held.lock().unwrap();
+        panic!("poison the library on purpose");
+    })
+    .join();
+    assert!(panicked.is_err());
+    let other = gguf("poison-2");
+    let err = bounded(client.pull(
+        &lib.lib,
+        &repo(),
+        &list(&[("n.gguf", &other)]),
+        &path("n.gguf"),
+    ))
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), "hf_library_poisoned");
+    assert!(err.to_string().contains("restart sallyd"), "{err}");
+    assert_eq!(hub.seen().len(), 1);
+}
+
 /// The rig's GGUF bytes pass the strict parser, so a refusal in these tests is never the
 /// fixture's.
 #[test]

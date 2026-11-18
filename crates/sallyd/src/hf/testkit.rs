@@ -25,7 +25,8 @@ pub(super) const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 const NAMES: [&str; 2] = ["huggingface.co", "cdn-lfs.hf.co"];
 /// Longest request head the mock reads.
 const MAX_HEAD: usize = 65_536;
-/// In a reply, where the mock stops writing and never writes or closes again.
+/// In a reply, where the mock stops writing and never writes or closes again; it only waits for
+/// the client to close the connection, and counts that ([`Hub::closed`]).
 pub(super) const STALL: &[u8] = b"\0stall\0";
 
 /// One request the mock received.
@@ -55,6 +56,7 @@ pub(super) struct Hub {
     own: Arc<Mutex<Vec<IpAddr>>>,
     lookups: Arc<Mutex<Vec<String>>>,
     dials: Arc<Mutex<usize>>,
+    closed: Arc<Mutex<usize>>,
     seen: Arc<Mutex<Vec<Seen>>>,
 }
 
@@ -72,6 +74,7 @@ impl Hub {
             own: Arc::new(Mutex::new(Vec::new())),
             lookups: Arc::new(Mutex::new(Vec::new())),
             dials: Arc::new(Mutex::new(0)),
+            closed: Arc::new(Mutex::new(0)),
             seen: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -114,6 +117,11 @@ impl Hub {
         self.seen.lock().unwrap().clone()
     }
 
+    /// Stalled connections the client has closed.
+    pub(super) fn closed(&self) -> usize {
+        *self.closed.lock().unwrap()
+    }
+
     async fn serve(&self, far: DuplexStream) {
         let Ok(mut tls) = tokio_rustls::TlsAcceptor::from(Arc::clone(&self.server))
             .accept(far)
@@ -146,7 +154,10 @@ impl Hub {
         let _ = tls.write_all(&resp[..stall.unwrap_or(resp.len())]).await;
         let _ = tls.flush().await;
         if stall.is_some() {
-            std::future::pending::<()>().await;
+            let mut sink = [0_u8; 256];
+            while matches!(tls.read(&mut sink).await, Ok(n) if n > 0) {}
+            *self.closed.lock().unwrap() += 1;
+            return;
         }
         let _ = tls.shutdown().await;
     }

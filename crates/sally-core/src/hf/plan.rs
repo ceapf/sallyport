@@ -88,7 +88,7 @@ pub fn file_request(repo: &RepoId, commit: &Commit, path: &RepoPath, from: u64) 
     }
 }
 
-/// Where a download goes on from, or `None` when every byte is on disk (go to promote).
+/// Where a download goes on from, or `None` when every byte is on disk (go to verify).
 #[must_use]
 pub const fn next_fetch(written: u64, size: u64) -> Option<u64> {
     if written >= size { None } else { Some(written) }
