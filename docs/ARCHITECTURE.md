@@ -80,7 +80,7 @@ flowchart LR
 | `sally-core::audit` | Hash-chained NDJSON writer, verifier, redaction of secret values and oversize args | yes |
 | `sally-core::secrets` | Load/store 0600 TOML; `Secret` newtype with redacted `Debug`, `zeroize` on drop; name-only references everywhere else | **yes** |
 | `sally-core::hf` | HF Hub API client (search, repo files with LFS sha256, Range fetch of GGUF header), resumable downloader to quarantine | no (but handles untrusted bytes → bounded) |
-| `sally-core::library` | SQLite index of blobs; content-addressed store; immutability (`chmod 0444`) | yes |
+| `sally-core::library` | SQLite index of blobs; content-addressed store; immutability (`chmod 0444`). The SQLite is the bundled one this crate pins; the database is only an index, and the blob directory decides what a model's bytes are. Import is the one way bytes enter `blobs/`, and it runs the whole SI-6 chain on its own copy | yes |
 | `sallyd::sandbox` | Build `podman run` argv from manifest + profile; mount prep (realpath re-check, socket dirs); launch/exec/kill/wait; image digest check | **yes** |
 | `sallyd::rpc` | `control.sock` (trusted methods, §4.1) and per-session `agent.sock` (the MCP subset, §4.2); bounded NDJSON framing, duplicate-key-refusing JSON, per-session rate and connection caps, `SO_PEERCRED` UID check before a byte is read, an audit entry before every reply | **yes** |
 | `sallyd::llm` | Per-session `llm.sock` (§4.4): HTTP/1.1 through hyper; the broker reads and decides on the head itself and gates hyper's writes; strict body allowlist; the model backend is a constructor argument (M3 wires the engine) | **yes** |
@@ -104,9 +104,11 @@ flowchart LR
   secrets.toml                # 0600; name = "value"
   manifests/*.yaml            # user manifests
 ~/.local/share/sallyport/
-  library/library.db          # sqlite
+  library/                    # 0700, as are blobs/, blobs/sha256/ and quarantine/
+  library/library.db          # sqlite, 0600: the index
   library/blobs/sha256/<hex>  # immutable 0444 model files
-  library/quarantine/<uuid>/  # downloads before verification
+  library/quarantine/<pid>-<n>/  # an import's copy before verification (mkdirat makes the
+                                 # name unique); removed when the import ends
   audit/audit-YYYYMM.jsonl    # hash-chained; audit.head = newest {seq, hash}; audit.lock
   sessions/                   # 0700
   sessions/<id>/              # 0700, created fresh per session (#10)

@@ -13,6 +13,14 @@ workspace = true
 
 [dependencies]
 jiff = { version = "0.2.42", default-features = false, features = ["std"] }
+# The model library's index (ARCHITECTURE §2.1). `bundled` compiles the SQLite this crate pins,
+# so its version and build options are reviewed here, not the host's (the build environment is
+# trusted like the rest of the toolchain). No other feature: no user functions, no hooks, and no
+# `load_extension`. The bundled build compiles URI filenames and extension loading in; neither is
+# reachable: the library opens an absolute path without the URI flag, and without rusqlite's
+# feature nothing can turn extension loading on. The blob directory, not the index, decides what
+# a model's bytes are.
+rusqlite = { version = "=0.43.0", default-features = false, features = ["bundled"] }
 rustix = { version = "1.1.6", default-features = false, features = ["fs", "process", "std"] }
 schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }

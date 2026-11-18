@@ -9,6 +9,7 @@ pub mod audit;
 pub mod config;
 pub mod fd;
 mod fsutil;
+pub mod library;
 pub mod manifest;
 pub mod model;
 pub mod paths;
