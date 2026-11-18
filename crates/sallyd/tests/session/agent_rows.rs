@@ -414,11 +414,22 @@ fn rt_ag_10_driven_an_injected_readmes_instructions_are_each_denied() {
             up.seen()[0].contains(&token),
             "control: the grant was injected"
         );
-        let own = r.sink.debug.lock().unwrap().clone();
+        // Every entry's event and args as text (the `Debug` forms omit the args).
+        let entries: Vec<String> =
+            r.x.events
+                .all()
+                .iter()
+                .map(|(e, a)| format!("{e} {a}"))
+                .collect();
+        assert!(
+            entries
+                .iter()
+                .any(|t| t.starts_with("egress.deny ") && t.contains("attacker.test")),
+            "control: the search reads the args"
+        );
         for c in [&secret, &token] {
             assert!(results.iter().all(|t| !t.contains(c)), "{results:#?}");
-            assert!(r.x.events.debug().iter().all(|d| !d.contains(c)));
-            assert!(own.iter().all(|d| !d.contains(c)));
+            assert!(entries.iter().all(|t| !t.contains(c)), "{entries:#?}");
         }
         assert!(up.seen().iter().all(|q| !q.contains(&secret)));
         assert!(!canary_exec.exists(), "CANARY_EXEC was created on the host");

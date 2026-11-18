@@ -229,7 +229,10 @@ fn operation(
     let at = |name: &str| (format!("/workspace/p/{name}"), format!("code/hands/{name}"));
     let body = format!("op{i}");
     let b64 = base64::engine::general_purpose::STANDARD.encode(&body);
-    let kind = match rng.below(5) {
+    // The first five operations are each kind once (so every kind runs on every seed), the
+    // rest are drawn.
+    let drawn = if i < 5 { i } else { rng.below(5) };
+    let kind = match drawn {
         1 | 2 if files.is_empty() => 0,
         k => k,
     };
@@ -292,15 +295,15 @@ fn tool_runs(x: &Lx) -> Vec<(String, String)> {
 ///    succeeds; the mount set is the defence);
 /// 3. no route: only `lo`, and the probe's public connect fails `ENETUNREACH` (the probe prints
 ///    the errno, which tells unreachable from refused and from a time-out);
-/// 4. host-side changes equal audit entries: 20 mutating operations, chosen from a per-run seed
-///    printed in every message, go through the shim in stdio mode on `agent.sock`, one exchange
+/// 4. host-side changes equal audit entries: 20 mutating operations (each kind once, then drawn
+///    from a per-run seed printed up front and in every message) go through the shim in stdio mode on `agent.sock`, one exchange
 ///    each. After each, the fixture home (names and content, except Sallyport's own state
 ///    directory: see [`snapshot`]) differs by exactly the predicted change, and exactly one new
 ///    `tool.run` names that tool and target. At the end there are 20 `tool.run`, nothing
 ///    outside the mount changed, and no entry names another session.
 ///
 /// Each control is asserted first: (1) the product harness argv with the mount bound back in
-/// reads the canary; (2) with the workspace socket directory as the source of `/run/sallyport`
+/// at its guest and its host path: the same probe finds all four paths, and the canary reads; (2) with the workspace socket directory as the source of `/run/sallyport`
 /// it lists `net.sock`, and on the net image the same proxy request gets an HTTP answer;
 /// (3) (analogue) the same probe connect reaches a listener on the harness's own loopback (a
 /// defence-off control would need a `--network` other than `none`); (4) two out-of-band host
@@ -315,19 +318,25 @@ fn rt_ag_11_the_harness_has_no_hands() {
         let home = x.f.root.join("home");
 
         // (1)
-        let bound = LeaveOut::Bind {
-            host: &h.host,
-            guest: "/workspace/p",
-        };
-        let ctl = harness_control(&x, &h.v, "ag11m", bound).await;
-        let (_, got) = sh(&ctl, "cat /workspace/p/canary.txt").await;
-        assert_eq!(got, h.canary, "control: the mount bound back in");
+        let host = h.host.display().to_string();
         let tried: Vec<String> = vec![
             "/workspace".into(),
             "/workspace/p".into(),
             "/workspace/p/canary.txt".into(),
-            h.host.display().to_string(),
+            host.clone(),
         ];
+        // The mount bound back in, at its guest path and at its host path: the same probe finds
+        // all four paths, and the canary reads.
+        let binds = [
+            (h.host.as_path(), "/workspace/p"),
+            (h.host.as_path(), host.as_str()),
+        ];
+        let ctl = harness_control(&x, &h.v, "ag11m", LeaveOut::Binds(&binds)).await;
+        for (p, line) in tried.iter().zip(ls_each(&ctl, &tried).await) {
+            assert_eq!(line, "found", "control: {p}");
+        }
+        let (_, got) = sh(&ctl, "cat /workspace/p/canary.txt").await;
+        assert_eq!(got, h.canary, "control: the mount bound back in");
         for (p, line) in tried.iter().zip(ls_each(&c, &tried).await) {
             assert!(line.ends_with("No such file or directory"), "{p}: {line}");
         }
@@ -387,6 +396,8 @@ fn rt_ag_11_the_harness_has_no_hands() {
                 "seed {seed}"
             );
         }
+        // Printed once up front too, so a panic inside a helper still leaves the seed.
+        eprintln!("rt_ag_11 seed {seed}");
         let mut rng = Seeded(seed);
         let mut files = vec!["canary.txt".to_owned()];
         let mut before = start.clone();
