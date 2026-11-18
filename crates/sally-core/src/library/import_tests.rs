@@ -357,12 +357,17 @@ fn a_file_that_does_not_fit_is_refused() {
     );
     assert_nothing_stored(&root, &lib);
     assert_eq!(lib.next_quarantine, 0, "a quarantine name was tried");
+    // A real, small reserve still admits a small file.
+    let mut lib = Library::open(root.path(), 1 << 20).unwrap();
+    lib.import_file(&source, None).unwrap();
+    assert_eq!(lib.list().unwrap().len(), 1);
 }
 
 /// Admission: the file must fit in what is available after the reserve.
 #[test]
 fn admits_leaves_the_reserve() {
     assert!(admits(10, 30, 20));
+    assert!(admits(5, 30, 20));
     assert!(!admits(11, 30, 20));
     assert!(admits(0, 20, 20));
     assert!(!admits(1, 20, 20));

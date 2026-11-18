@@ -97,6 +97,9 @@ impl Index {
         let mut conn = Connection::open_with_flags(&path, flags)?;
         conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
         path_is_fd(&path, &file)?;
+        // Closing any descriptor of the file drops every POSIX lock this process holds on it,
+        // SQLite's included: close ours before SQLite takes one.
+        drop(file);
         conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.execute_batch(SETTINGS)?;
         init_schema(&mut conn)?;
