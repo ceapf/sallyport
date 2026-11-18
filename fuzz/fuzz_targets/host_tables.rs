@@ -7,8 +7,9 @@
 //! the three texts separated by `#` (no table holds one). Non-UTF-8 input returns (production
 //! reads with `read_to_string`, which refuses it).
 //!
-//! Invariants: never panics; an accepted table owns 127.0.0.1, holds only networks equal to
-//! `Net::prefix` of their own address and length, and keeps both lists sorted and unique; an
+//! Invariants: never panics; an accepted table owns 127.0.0.1, holds only networks of length 1
+//! up to the family's width (a default route is never a connected network), and keeps both
+//! lists sorted and unique; an
 //! accepted `fib_trie` with a line that is no shape appended is refused at that table; a
 //! malformed-line error names a line inside its table's text.
 #![no_main]
@@ -17,7 +18,6 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use libfuzzer_sys::fuzz_target;
-use sallyd::egress::addr::Net;
 use sallyd::egress::hostaddrs::{HostAddrsError, Ipv6Tables, Table, parse};
 
 fuzz_target!(|data: &[u8]| {
@@ -39,7 +39,8 @@ fuzz_target!(|data: &[u8]| {
         Ok(host) => {
             assert!(host.own.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)), "no loopback");
             for n in &host.connected {
-                assert_eq!(Net::prefix(n.addr(), n.bits()), Some(*n), "not a network");
+                let width = if n.addr().is_ipv4() { 32 } else { 128 };
+                assert!((1..=width).contains(&n.bits()), "length {} kept", n.bits());
             }
             let own_ok = host.own.windows(2).all(|w| matches!(w, [a, b] if a < b));
             assert!(own_ok, "own not sorted unique");

@@ -157,7 +157,8 @@ fn every_fib_line_has_one_of_four_shapes() {
     let base = format!("|-- {lo}\n   /32 host LOCAL\n");
     let d = doc(0);
     let ok = format!(
-        "Main:\n{base}Local:\nId 255:\nId -1:\nId 4294967295:\n  +-- {d}/24 2 0 2\n  \
+        "Main:\n{base}Local:\nId 255:\nId -1:\nId 2147483647:\nId -2147483648:\n  \
+         +-- {d}/24 2 0 2\n  \
          +-- {d}/32 0 0 0\n|-- {d}\n   /24 link UNICAST\n   /32 link BROADCAST\n"
     );
     let got = v4_only(&ok).unwrap();
@@ -176,6 +177,11 @@ fn every_fib_line_has_one_of_four_shapes() {
         (format!("{base}Id 5\n"), 3),
         (format!("{base}Id +5:\n"), 3),
         (format!("{base}Id --5:\n"), 3),
+        // `%d` prints neither `-0` nor anything outside `i32`.
+        (format!("{base}Id -0:\n"), 3),
+        (format!("{base}Id 2147483648:\n"), 3),
+        (format!("{base}Id 4294967295:\n"), 3),
+        (format!("{base}Id -2147483649:\n"), 3),
         (format!("{base}Id :\n"), 3),
         (format!("{base}Other:\n"), 3),
         (format!("{base}+-- x/24 2 0 2\n"), 3),
@@ -294,10 +300,17 @@ fn a_malformed_line_is_named_by_its_table_and_number() {
         table: Table::FibTrie,
         kind: std::io::ErrorKind::NotFound,
     };
-    assert!(
-        e.to_string().starts_with("fib_trie could not be read: "),
-        "{e}"
-    );
+    // The kind's text is the standard library's fixed description, never an OS message or a
+    // path; pinned whole so a change in it shows here, not first in an audit reader.
+    let kind = std::io::ErrorKind::NotFound;
+    assert_eq!(e.to_string(), format!("fib_trie could not be read: {kind}"));
+    assert_eq!(kind.to_string(), "entity not found");
+}
+
+/// The bound on a negative table id is `i32::MIN`'s magnitude.
+#[test]
+fn the_negative_id_bound_is_i32_min() {
+    assert_eq!(I32_MAGNITUDE, i32::MIN.unsigned_abs());
 }
 
 #[test]

@@ -1357,8 +1357,10 @@ sallyport/
     target_cut}` (the request-target masked with the session's own forms first, then cut at 256
     bytes and escaped, never a header; §7 Redaction), or `{reason, head_bytes}` when no target
     was parsed; `filter: "host-addresses-unavailable"` when the host's own addresses could not
-    be read, with `cause`: which table, and whether it could not be read (and how), was over
-    the bound, or has a malformed line (its number); never a line's content or a path; when
+    be read, with `cause` from a closed set: a table could not be read (which, and the I/O
+    error kind), was over the bound, or has a malformed line (which, and its number); the
+    `fib_trie` has no loopback address; only one of the two IPv6 tables exists; or the reader
+    task failed. Never a line's content or a path. When
     the address filter refused, `address` (the first refused address of the
     answer, as resolved) and `rule` (`reserved-range`, `own-address` or `connected-network`).
     The reply to the sandbox carries the reason only.

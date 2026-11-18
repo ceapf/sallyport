@@ -260,8 +260,8 @@ struct Refusal {
 /// What the address filter adds to a refusal's entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Detail {
-    /// Nothing.
-    None,
+    /// Nothing beyond the reason.
+    Plain,
     /// The host's tables could not be read or understood, and why.
     Unavailable(HostAddrsError),
     /// The first resolved address the filter refused, and the rule it met.
@@ -272,7 +272,7 @@ impl From<Reason> for Refusal {
     fn from(reason: Reason) -> Self {
         Self {
             reason,
-            detail: Detail::None,
+            detail: Detail::Plain,
         }
     }
 }
@@ -636,7 +636,7 @@ fn refusal_entry(e: NewEntry, r: Refusal, seen: Seen<'_>, forms: Option<&Redacto
             Seen::Target(raw) => target = Some(raw),
         }
         match r.detail {
-            Detail::None => {}
+            Detail::Plain => {}
             Detail::Unavailable(cause) => {
                 obj.insert("filter".into(), json!(HOST_ADDRS_UNAVAILABLE));
                 obj.insert("cause".into(), json!(cause.to_string()));

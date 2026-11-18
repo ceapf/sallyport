@@ -88,7 +88,7 @@ impl Dialer for FakeDialer {
     }
 }
 
-/// The host's tables: `None` cannot be read.
+/// The host's tables, or (`Err`) why they cannot be used.
 struct FakeHost(Result<HostNets, HostAddrsError>);
 
 impl FakeHost {

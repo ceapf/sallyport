@@ -34,6 +34,8 @@ const DROP_V4: [&str; 3] = ["BLACKHOLE", "UNREACHABLE", "PROHIBIT"];
 const RTF_GATEWAY: u128 = 0x2;
 /// `RTF_REJECT` in `ipv6_route`'s flags: blackhole, unreachable, prohibit and throw routes.
 const RTF_REJECT: u128 = 0x200;
+/// The magnitude of `i32::MIN`, the most negative table id `%d` prints.
+const I32_MAGNITUDE: u32 = 2_147_483_648;
 
 /// One of the three tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,9 +197,12 @@ fn fib_lines(text: &str) -> Result<Vec<Fib>, HostAddrsError> {
 }
 
 /// `Main:`, `Local:` or `Id <n>:` (the kernel prints a table id with `%d`, so one past
-/// `i32::MAX` is negative).
+/// `i32::MAX` is negative): `n` is an `i32` as `%d` writes it, never `-0`.
 fn is_header(t: &str) -> bool {
-    let id = |n: &str| decimal::<u32>(n.strip_prefix('-').unwrap_or(n)).is_some();
+    let id = |n: &str| match n.strip_prefix('-') {
+        Some(m) => decimal::<u32>(m).is_some_and(|v| (1..=I32_MAGNITUDE).contains(&v)),
+        None => decimal::<i32>(n).is_some(),
+    };
     t == "Main:"
         || t == "Local:"
         || t.strip_prefix("Id ")
