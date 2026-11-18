@@ -270,9 +270,17 @@ review). Every remaining non-errno rule is a plain `SCMP_ACT_ALLOW`, and:
 The profiles are `profiles/seccomp-{workspace,harness,inference}.json`, derived by
 `scripts/gen_seccomp.py` from containers-common's profile and committed. They are embedded in
 `sallyd` and written into the session's 0700 `profiles/` directory at launch (#10), so no file
-outside Sallyport's control decides what a sandbox may call. Unit tests check the removals and
-the inference socket filter independently of the generator; RT-FS-07 and RT-FS-09 test them in
-a container.
+outside Sallyport's control decides what a sandbox may call. Unit tests check the profile JSON
+independently of the generator (`sandbox::profiles`:
+`no_rule_of_any_role_allows_a_removed_syscall_under_any_condition`,
+`sockets_are_an_allowlist_of_address_families`, `clone_is_allowed_only_without_namespace_flags`,
+`only_native_architectures_are_listed`). The OCI config verifier compares each container's
+`linux.seccomp` with the embedded profile by content before `start` (`sandbox::oci`
+`the_cgroup_path_seccomp_and_masked_paths_are_checked`; RT-SUP-04). In a container, three probes
+meet the filter: RT-FS-07 (`mknod`, `ENOSYS`), RT-FS-17 (`unshare`, `clone` with namespace flags,
+`clone3`) and RT-NET-12 (socket families outside the role's list). The other removals are checked
+in the JSON only, by no system call in a container. RT-FS-09 tests the masked and read-only
+`/proc` and `/sys` paths, not the profile.
 
 ### 3.5 Launch (normative, Task 6b)
 `sallyd::sandbox::Launcher::launch_workspace`, in this order. The launch runs in its own task:

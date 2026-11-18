@@ -133,6 +133,12 @@ line per fact, with where it was found. Check a note again before relying on it 
   `/proc/sys/fs/lease-break-time` (45 s by default) passes. Either way the holder gets `SIGIO`,
   whose default action ends it. `fs.leases-enable` is 1 by default. Rust has no lease call
   without `unsafe` or a new crate: the Q40 test uses a `python3 -I -c` holder. (Task 11, Q40)
+- A FIFO in a read-only bind is still a channel to the host: with a host process reading a FIFO
+  in a folder bound `:ro` (`--read-only --cap-drop=all --userns=keep-id
+  --security-opt=no-new-privileges --network=none`, the base Alpine image), `echo … > /m/f`
+  inside exited 0 and the host reader got the bytes; the container's mount table showed `/m`
+  `ro`. Opening a FIFO writes no file, so `ro` does not refuse it, as for `connect` on a socket.
+  (Podman 4.9.3, kernel 6.18 WSL2, ext4; scratch probe for the threat model's FIFO row)
 - `podman build` keeps intermediate layer images (`<none>` in `images -a`) unless
   `--layers=false`. `ps --filter name=` is an unanchored regex: match names with `grep -E '^…'`.
   (8-prC)

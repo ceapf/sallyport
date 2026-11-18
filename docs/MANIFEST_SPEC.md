@@ -176,7 +176,8 @@ Task 11 decision 1; ARCHITECTURE §4.3). Every such action is audited (SI-4).
 - `staged` (AMENDMENTS-02 B2(b)): an overlay whose lower layer is the host directory; every write
   lands in a kept upper directory under `~/.local/share/sallyport/sessions/<id>/stage/<n>/`, and
   the host directory is untouched. `sally session changes <id>` lists changed and deleted paths;
-  M1 is discard-only, applying arrives in M4.5. Podman accepts no other option next to `O`
+  M1 only lists (nothing is applied, nothing is deleted: the kept upper directories stay), and
+  applying and discarding arrive in M4.5. Podman accepts no other option next to `O`
   (probed on 4.9.3), so an overlay is not `nosuid,nodev`; `no-new-privileges`, `--cap-drop=ALL`
   and the seccomp profile (no `mknod`) keep set-id files and device nodes inert there. Editing the
   host folder while a staged session runs gives undefined results inside the sandbox; conflicts
