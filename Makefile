@@ -140,7 +140,9 @@ MUTANTS_WIDE_CORE := $(addprefix crates/sally-core/src/,manifest/image.rs manife
                      model/gguf/mod.rs model/gguf/error.rs model/gguf/read.rs model/gguf/types.rs \
                      model/gguf/meta.rs model/gguf/tensors.rs \
                      library/mod.rs library/error.rs library/dirs.rs library/index.rs \
-                     library/quarantine.rs library/import.rs library/blob.rs library/name.rs)
+                     library/quarantine.rs library/import.rs library/blob.rs library/name.rs \
+                     library/download.rs \
+                     hf/mod.rs hf/error.rs hf/names.rs hf/list.rs hf/plan.rs hf/head.rs)
 MUTANTS_WIDE_SALLYD := $(addprefix crates/sallyd/src/sandbox/,argv.rs check.rs types.rs profiles.rs \
                        overlap.rs scan.rs images.rs changes.rs cgroup.rs dirs.rs podman.rs binaries.rs \
                        disk.rs stage.rs \
@@ -148,6 +150,7 @@ MUTANTS_WIDE_SALLYD := $(addprefix crates/sallyd/src/sandbox/,argv.rs check.rs t
                        oci/intent.rs oci/linux.rs oci/mounts.rs oci/process.rs oci/seccomp.rs) \
                        $(addprefix crates/sallyd/src/daemon/,mod.rs crash.rs startup.rs stale.rs install.rs) \
                        crates/sallyd/src/oplog.rs \
+                       $(addprefix crates/sallyd/src/hf/,mod.rs error.rs conn.rs wire.rs) \
                        $(addprefix crates/sallyd/src/session/,lookup.rs types.rs exit.rs secrets.rs) \
                        $(addprefix crates/sallyd/src/egress/,addr.rs authority.rs head.rs policy.rs server.rs \
                        hostaddrs.rs tunnel.rs net.rs ca.rs roots.rs rewrite.rs intercept.rs \

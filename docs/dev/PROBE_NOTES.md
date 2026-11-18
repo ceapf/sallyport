@@ -460,3 +460,26 @@ reconciles the type table with the pin (#182).
 - The strict parser is narrower on purpose: zero dims, zero tensors, bool bytes other than 0/1,
   alignment below 8, non-printable keys, NUL in names and templates, a chat-template key whose
   value is not a string, and `split.count` other than a u16 of 0 or 1 are refused.
+
+## Hugging Face Hub API shapes (for the HF client)
+
+Read 2026-11-18 from the `huggingface_hub` Python client's source (client code only; nothing
+was requested from the Hub, and its server behaviour is inferred from what the client handles).
+- `model_info` calls `/api/models/{repo_id}/revision/{revision}` with the revision URL-quoted with
+  no safe characters, and adds `blobs=true` for file metadata. The answer's `sha` is the commit;
+  the client types it as an optional string and states no format (Sallyport requires 40 lowercase
+  hex and refuses anything else). Each `siblings[]` entry has `rfilename`, `size`, `blobId`, and
+  `lfs` (`size`, `sha256`, `pointerSize`) only for LFS files; absent or null otherwise.
+- `resolve/` answers a redirect for an LFS file. The client handles any 3xx with a `Location`
+  and follows a relative one on the same host. It hardcodes no CDN host name, so the redirect
+  hosts were not confirmed from this source. The rule ships with the two domains `huggingface.co`
+  and `hf.co` and their subdomains (the LFS CDN and the Xet bridge are known to sit under
+  `hf.co`). The first live pull should record the hosts it saw here; a host outside both domains
+  is refused and means a design question, not a wider rule.
+- On a redirect to another host the client drops `Authorization`. Resume is `Range: bytes=N-`; a
+  416 is an error. The client sends `Accept-Encoding: identity` on its metadata HEAD only.
+- Nothing in the client handles 429 or `Retry-After`; its backoff retries 503 only. Sallyport
+  waits on 429, or 503 with a delta-seconds `Retry-After`, as its own bounded choice.
+- The client's repo-id check allows an optional namespace and a name of 1 to 96 `[\w.-]`
+  (Unicode word characters too) with `--` and `..` refused. Sallyport is stricter: exactly
+  `namespace/name`, ASCII only, each part starting with a letter or digit.
