@@ -145,3 +145,10 @@ path = "fuzz_targets/cli_frame.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "hf"
+path = "fuzz_targets/hf.rs"
+test = false
+doc = false
+bench = false
