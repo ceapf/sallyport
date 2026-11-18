@@ -1,15 +1,15 @@
 //! Tests of the session listener, the resolver, the dialer and the host's own addresses.
 use super::*;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
 async fn the_hosts_own_addresses_include_loopback() {
-    let own = ProcHostAddrs::default().own().await.unwrap();
+    let host = ProcHostAddrs::default().own().await.unwrap();
     assert!(
-        own.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        host.own.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)),
         "{} addresses",
-        own.len()
+        host.own.len()
     );
 }
 
@@ -22,23 +22,97 @@ async fn unreadable_or_oversized_proc_files_fail_and_a_missing_inet6_is_none() {
     let p = |f: &Path, v6: &Path| ProcHostAddrs {
         fib_trie: f.to_owned(),
         if_inet6: v6.to_owned(),
+        ipv6_route: v6.to_owned(),
     };
     let missing = dir.join("missing");
-    assert_eq!(p(&fib, &missing).read().unwrap(), vec![IpAddr::V4(lo)]);
+    assert_eq!(p(&fib, &missing).read().unwrap().own, [IpAddr::V4(lo)]);
     assert!(p(&missing, &missing).read().is_err());
     assert!(p(&fib, &dir).read().is_err(), "a directory is not NotFound");
+    let empty = dir.join("empty");
+    std::fs::write(&empty, "").unwrap();
+    let half = |a: &Path, r: &Path| ProcHostAddrs {
+        fib_trie: fib.clone(),
+        if_inet6: a.to_owned(),
+        ipv6_route: r.to_owned(),
+    };
+    assert!(half(&empty, &empty).read().is_ok());
+    assert!(half(&empty, &missing).read().is_err(), "routes missing");
+    assert!(half(&missing, &empty).read().is_err(), "addresses missing");
+    assert!(half(&empty, &dir).read().is_err(), "routes unreadable");
+    // A valid table of `size` bytes: the padding is the route line's indent, so only the size
+    // decides between the two files.
+    let sized = |size: usize| {
+        let (head, tail) = (format!("|-- {lo}\n"), "/32 host LOCAL\n");
+        format!("{head}{}{tail}", " ".repeat(size - head.len() - tail.len()))
+    };
+    let max = usize::try_from(MAX_PROC_BYTES).unwrap();
     let big = dir.join("big");
-    let mut body = format!("|-- {lo}\n   /32 host LOCAL\n");
-    body.push_str(&" ".repeat(usize::try_from(MAX_PROC_BYTES).unwrap()));
-    std::fs::write(&big, body).unwrap();
+    std::fs::write(&big, sized(max + 1)).unwrap();
     assert!(p(&big, &missing).read().is_err());
     let exact = dir.join("exact");
-    let mut body = format!("|-- {lo}\n   /32 host LOCAL\n");
-    let pad = usize::try_from(MAX_PROC_BYTES).unwrap() - body.len();
-    body.push_str(&" ".repeat(pad));
-    std::fs::write(&exact, body).unwrap();
+    std::fs::write(&exact, sized(max)).unwrap();
     assert!(p(&exact, &missing).read().is_ok());
     assert_eq!(MAX_PROC_BYTES, 1 << 20, "the documented 1 MiB");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A host on a public IPv4 /24 and a public IPv6 /64 (route lines with no gateway): a neighbour
+/// inside either network is refused, in every spelling that carries it; an address just outside
+/// passes. Addresses assembled at runtime (the guard hooks refuse dotted IPv4 literals).
+#[tokio::test]
+async fn a_neighbour_on_a_connected_network_is_denied() {
+    let dir = scratch("connected");
+    let (any, lo) = (Ipv4Addr::UNSPECIFIED, Ipv4Addr::LOCALHOST);
+    let net = Ipv4Addr::new(93, 184, 216, 0);
+    let (me, peer) = (
+        Ipv4Addr::new(93, 184, 216, 1),
+        Ipv4Addr::new(93, 184, 216, 7),
+    );
+    let fib = dir.join("fib");
+    std::fs::write(
+        &fib,
+        format!(
+            "Main:\n  +-- {any}/0 3 0 5\n     |-- {any}\n        /0 universe UNICAST\n     \
+             |-- {lo}\n        /32 host LOCAL\n     +-- {net}/24 2 0 2\n        |-- {net}\n           \
+             /24 link UNICAST\n        |-- {me}\n           /32 host LOCAL\n"
+        ),
+    )
+    .unwrap();
+    let inet6 = dir.join("inet6");
+    std::fs::write(
+        &inet6,
+        "26064700001000000000000000000001 02 40 00 80     eth0\n\
+         00000000000000000000000000000001 01 80 10 80       lo\n",
+    )
+    .unwrap();
+    let route6 = dir.join("route6");
+    std::fs::write(
+        &route6,
+        "26064700001000000000000000000000 40 00000000000000000000000000000000 00 \
+         00000000000000000000000000000000 00000100 00000001 00000000 00000001     eth0\n",
+    )
+    .unwrap();
+    let host = ProcHostAddrs {
+        fib_trie: fib,
+        if_inet6: inet6,
+        ipv6_route: route6,
+    };
+    let own = host.read().unwrap();
+    let denied = |ip: IpAddr| crate::egress::addr::denied_by(ip, &own).is_some();
+    for ip in [
+        IpAddr::V4(peer),
+        IpAddr::V6(peer.to_ipv6_mapped()),
+        "2606:4700:10::7".parse().unwrap(),
+        "2606:4700:10::ffff:ffff".parse().unwrap(),
+    ] {
+        assert!(denied(ip), "{ip} is on a connected network");
+    }
+    for ip in [
+        IpAddr::V4(Ipv4Addr::new(93, 184, 217, 7)),
+        "2606:4700:11::7".parse().unwrap(),
+    ] {
+        assert!(!denied(ip), "{ip} is outside every connected network");
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -1077,8 +1151,8 @@ impl Dialer for Echo {
 }
 struct NoneOwned;
 impl HostAddrs for NoneOwned {
-    async fn own(&self) -> io::Result<Vec<IpAddr>> {
-        Ok(vec![])
+    async fn own(&self) -> io::Result<HostNets> {
+        Ok(HostNets::default())
     }
 }
 /// Records "event end-or-reason" per entry; with a gate, each append waits there first. The

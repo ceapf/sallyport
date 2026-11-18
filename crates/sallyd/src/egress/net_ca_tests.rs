@@ -30,8 +30,8 @@ impl Dialer for Nothing {
 }
 
 impl HostAddrs for Nothing {
-    async fn own(&self) -> io::Result<Vec<IpAddr>> {
-        Ok(Vec::new())
+    async fn own(&self) -> io::Result<crate::egress::addr::HostNets> {
+        Ok(crate::egress::addr::HostNets::default())
     }
 }
 

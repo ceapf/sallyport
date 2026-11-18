@@ -264,8 +264,8 @@ impl Resolver for Public {
 pub(super) struct NoOwn;
 
 impl HostAddrs for NoOwn {
-    async fn own(&self) -> io::Result<Vec<IpAddr>> {
-        Ok(vec![])
+    async fn own(&self) -> io::Result<crate::egress::addr::HostNets> {
+        Ok(crate::egress::addr::HostNets::default())
     }
 }
 

@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use common::container::{Lx, SHIM_LOG, exec, net_image, rt};
 use common::egress::public;
+use sallyd::egress::addr::Net;
 use sallyd::egress::server::ESTABLISHED;
 use sallyd::sandbox::{Running, WorkspaceRequest};
 use serde_json::json;
@@ -363,29 +364,99 @@ fn rt_net_07_names_that_resolve_to_internal_or_own_addresses_are_refused() {
             "mix.mock.test",
             vec![vec![public(1), IpAddr::V4(Ipv4Addr::LOCALHOST)]],
         );
-        // The host's real non-loopback addresses (whatever they are; never printed), and a
-        // public one the fake host-address source claims as the host's own.
+        // This host's real tables (whatever they are; never printed): its non-loopback addresses
+        // answer `lan`. The fake host-address source then serves those tables plus a public
+        // address it claims as the host's own and two public networks it claims the host is
+        // directly connected to (an IPv4 /24 and an IPv6 /64).
         let real = sallyd::egress::net::ProcHostAddrs::default();
-        let own_real: Vec<IpAddr> = sallyd::egress::server::HostAddrs::own(&real)
-            .await
-            .unwrap()
-            .into_iter()
+        let mut tables = sallyd::egress::server::HostAddrs::own(&real).await.unwrap();
+        let own_real: Vec<IpAddr> = tables
+            .own
+            .iter()
+            .copied()
             .filter(|ip| !ip.is_loopback())
             .collect();
         assert!(!own_real.is_empty(), "the host has no non-loopback address");
-        names.set("lan.mock.test", vec![own_real.clone()]);
-        lx.egress.host.set([own_real, vec![public(9)]].concat());
+        names.set("lan.mock.test", vec![own_real]);
+        let (near, far) = (
+            Ipv4Addr::new(93, 184, 216, 7),
+            Ipv4Addr::new(93, 184, 217, 7),
+        );
+        let near6: Ipv6Addr = "2606:4700:10::7".parse().unwrap();
+        let far6: Ipv6Addr = "2606:4700:11::7".parse().unwrap();
+        tables.own.push(public(9));
+        tables.connected.extend([
+            Net::prefix(IpAddr::V4(near), 24).unwrap(),
+            Net::prefix(IpAddr::V6(near6), 64).unwrap(),
+        ]);
+        lx.egress.host.set(tables);
         names.set("own.mock.test", vec![vec![public(9)]]);
-        for host in ["lo", "ten", "meta", "v6", "mix", "lan", "own"] {
+        names.set("near.mock.test", vec![vec![IpAddr::V4(near)]]);
+        names.set("near6.mock.test", vec![vec![IpAddr::V6(near6)]]);
+        let carried = IpAddr::V6(near.to_ipv6_mapped());
+        names.set("nearmapped.mock.test", vec![vec![public(1), carried]]);
+        let refused = [
+            "lo",
+            "ten",
+            "meta",
+            "v6",
+            "mix",
+            "lan",
+            "own",
+            "near",
+            "near6",
+            "nearmapped",
+        ];
+        for host in refused {
             let got = via_shim(&r, &connect(&format!("{host}.mock.test:443"))).await;
             assert_eq!(status(&got), "403", "{host}");
             assert!(got.ends_with("ip-range-denied\n"), "{host}");
-        }
-        // Each name was looked up once (the refusal comes after resolution) and none dialled.
-        let looked: Vec<String> = ["lo", "ten", "meta", "v6", "mix", "lan", "own"]
+            // The reply names neither the rule nor an address: only the audit entry does.
+            let leaked = [
+                "reserved",
+                "own-address",
+                "connected",
+                "93.184.",
+                "2606:",
+                "::ffff",
+            ]
             .iter()
-            .map(|h| format!("{h}.mock.test"))
-            .collect();
+            .any(|w| got.contains(w));
+            assert!(!leaked, "{host}: the reply names more than the reason");
+        }
+        // Each refusal's entry names the first refused address of the answer and its rule.
+        let denied = refusals(&lx, "egress.deny");
+        assert_eq!(denied.len(), refused.len());
+        let want = [
+            ("lo", IpAddr::V4(Ipv4Addr::LOCALHOST), "reserved-range"),
+            (
+                "ten",
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+                "reserved-range",
+            ),
+            ("meta", metadata, "reserved-range"),
+            ("v6", IpAddr::V6(Ipv6Addr::LOCALHOST), "reserved-range"),
+            ("mix", IpAddr::V4(Ipv4Addr::LOCALHOST), "reserved-range"),
+            ("own", public(9), "own-address"),
+            ("near", IpAddr::V4(near), "connected-network"),
+            ("near6", IpAddr::V6(near6), "connected-network"),
+            ("nearmapped", carried, "connected-network"),
+        ];
+        for (host, address, rule) in want {
+            let i = refused.iter().position(|h| *h == host).unwrap();
+            let e = &denied[i];
+            assert_eq!(e["address"], json!(address.to_string()), "{host}");
+            assert_eq!(e["rule"], json!(rule), "{host}");
+        }
+        // `lan` answers with this host's real addresses: checked without printing them.
+        let lan = &denied[refused.iter().position(|h| *h == "lan").unwrap()];
+        let lan_rule = lan["rule"].as_str().unwrap_or_default();
+        assert!(
+            ["reserved-range", "own-address"].contains(&lan_rule),
+            "lan: the rule is not one an own address meets"
+        );
+        // Each name was looked up once (the refusal comes after resolution) and none dialled.
+        let looked: Vec<String> = refused.iter().map(|h| format!("{h}.mock.test")).collect();
         assert_eq!(names.lookups(), [seen.0.clone(), looked].concat());
         assert_eq!(lx.egress.dialer.dials(), seen.1);
         // Rebinding: public on the first lookup, loopback on the second.
@@ -398,7 +469,38 @@ fn rt_net_07_names_that_resolve_to_internal_or_own_addresses_are_refused() {
         let second = via_shim(&r, &connect("rebind.mock.test:443")).await;
         assert_eq!(status(&second), "403", "{second}");
         let rebound = vec![SocketAddr::new(public(2), 443)];
-        assert_eq!(lx.egress.dialer.dials(), [seen.1, rebound].concat());
+        assert_eq!(
+            lx.egress.dialer.dials(),
+            [seen.1.clone(), rebound.clone()].concat()
+        );
+        // Controls: the allowed twin of each claimed-network leg, one address outside the
+        // network in the same spelling, is looked up, dialled and tunnelled. And with this
+        // host's real tables still the source, the seams' allowed name still connects.
+        let farmapped = IpAddr::V6(far.to_ipv6_mapped());
+        names.set("far.mock.test", vec![vec![IpAddr::V4(far)]]);
+        names.set("far6.mock.test", vec![vec![IpAddr::V6(far6)]]);
+        names.set("farmapped.mock.test", vec![vec![farmapped]]);
+        let mut twins = Vec::new();
+        for (host, ip) in [
+            ("far", IpAddr::V4(far)),
+            ("far6", IpAddr::V6(far6)),
+            ("farmapped", farmapped),
+            ("ok", public(1)),
+        ] {
+            let got = tunnel(
+                &r,
+                &format!("{}ping", connect(&format!("{host}.mock.test:443"))),
+            )
+            .await;
+            assert_eq!(status(&got), "200", "control {host}: {got}");
+            assert!(got.ends_with("\r\n\r\nping"), "control {host}: {got:?}");
+            twins.push(SocketAddr::new(ip, 443));
+        }
+        assert_eq!(
+            lx.egress.dialer.dials(),
+            [seen.1, rebound, twins].concat(),
+            "the controls were dialled at their own addresses"
+        );
         lx.stop(r).await;
     });
 }

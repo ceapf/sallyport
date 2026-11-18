@@ -1,13 +1,36 @@
-//! The addresses this host owns, parsed from `/proc/net/fib_trie` and `/proc/net/if_inet6`
-//! (decision 5, architect Q8): no dependency, no packet sent. Pure over the file text; `net.rs`
-//! reads the files.
+//! The addresses this host owns and the networks it is directly connected to, parsed from
+//! `/proc/net/fib_trie`, `/proc/net/if_inet6` and `/proc/net/ipv6_route` (decision 5, architect
+//! Q8): no dependency, no packet sent. Pure over the file text; `net.rs` reads the files.
 //!
-//! `fib_trie` lists each address as a `|-- <ipv4>` leaf followed by indented `/<len> <scope>
-//! <type>` lines; an address the host owns has a `/32 host LOCAL` line (broadcast entries are
-//! `BROADCAST` and are not taken). `if_inet6` has one line per IPv6 address: 32 hex digits, then
-//! index, prefix length, scope, flags and the interface name.
+//! Every `fib_trie` line has one of four shapes: a table header (`Main:`, `Local:`, `Id <n>:`),
+//! a node (`+-- <ipv4>/<len> <n> <n> <n>`), a leaf (`|-- <ipv4>`), or a route line under a leaf
+//! (`/<len> <scope> <type>`, then an optional `tos=<n>`; the kernel prints an unknown scope as
+//! `scope=<n>` and an unknown type as `type <n>`, which has one token too many and refuses). A
+//! `/32 host LOCAL` line is an address the host owns. Any other route line is a network the host
+//! reaches with no gateway, except one of length 0, a route that only drops traffic
+//! (`BLACKHOLE`, `UNREACHABLE`, `PROHIBIT`), and a `universe` route: the scope the kernel gives a
+//! route through a gateway (a device route given that scope by hand is therefore not counted).
+//!
+//! `if_inet6` has one line per IPv6 address: 32 hex digits, the interface index (2 to 8 hex
+//! digits), prefix length, scope and flags (2 each), the interface name. The address is owned,
+//! and its prefix names a network. `ipv6_route` has one line per route: destination, its length,
+//! source, its length, next hop, metric, reference count, use count, flags, and the interface
+//! (absent for some routes). A route counts unless it has length 0, the gateway flag, or the
+//! reject flag (set on every route that only drops traffic).
+//!
+//! A line the parser does not understand, a prefix longer than the address, or a network written
+//! with bits set below its length refuses the whole list (fail closed).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+use super::addr::{HostNets, Net};
+
+/// IPv4 route types that only drop traffic.
+const DROP_V4: [&str; 3] = ["BLACKHOLE", "UNREACHABLE", "PROHIBIT"];
+/// `RTF_GATEWAY` in `ipv6_route`'s flags.
+const RTF_GATEWAY: u32 = 0x2;
+/// `RTF_REJECT` in `ipv6_route`'s flags: blackhole, unreachable, prohibit and throw routes.
+const RTF_REJECT: u32 = 0x200;
 
 /// Why the list cannot be trusted. Every case refuses the connection (fail closed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -15,157 +38,239 @@ pub enum HostAddrsError {
     /// `fib_trie` yielded no IPv4 loopback: the format is not what the parser expects.
     #[error("fib_trie lists no host-local 127.0.0.1")]
     NoLoopback,
-    /// An `if_inet6` line does not start with 32 hex digits.
+    /// A `fib_trie` line is not one of its four shapes.
+    #[error("fib_trie has a malformed line")]
+    MalformedFib,
+    /// An `if_inet6` line is not in the expected form.
     #[error("if_inet6 has a malformed line")]
     MalformedInet6,
+    /// An `ipv6_route` line is not in the expected form.
+    #[error("ipv6_route has a malformed line")]
+    MalformedRoute6,
+    /// One of `if_inet6` and `ipv6_route` exists and the other does not.
+    #[error("only one of if_inet6 and ipv6_route exists")]
+    Ipv6Half,
 }
 
-/// The host's own addresses: every `/32 host LOCAL` IPv4 leaf of `fib_trie`, then every address
-/// of `if_inet6` (`None`: the file does not exist, IPv6 is off). Duplicates are dropped.
+/// The text of `if_inet6` and `ipv6_route` (`None`: the file does not exist).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Ipv6Tables<'a> {
+    /// `/proc/net/if_inet6`.
+    pub addrs: Option<&'a str>,
+    /// `/proc/net/ipv6_route`.
+    pub routes: Option<&'a str>,
+}
+
+/// The host's own addresses and connected networks. Both IPv6 files missing means IPv6 is off.
+/// Duplicates are dropped.
 ///
 /// # Errors
 /// [`HostAddrsError`]; the caller refuses the connection.
-pub(crate) fn parse(fib_trie: &str, if_inet6: Option<&str>) -> Result<Vec<IpAddr>, HostAddrsError> {
-    let mut out: Vec<IpAddr> = Vec::new();
-    for ip in local_v4(fib_trie) {
-        push(&mut out, IpAddr::V4(ip));
+pub(crate) fn parse(fib_trie: &str, v6: Ipv6Tables<'_>) -> Result<HostNets, HostAddrsError> {
+    let mut host = HostNets::default();
+    for line in fib_lines(fib_trie)? {
+        match line {
+            Fib::Own(ip) => push(&mut host.own, IpAddr::V4(ip)),
+            Fib::Connected(net) => push(&mut host.connected, net),
+        }
     }
-    if !out.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)) {
+    if !host.own.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)) {
         return Err(HostAddrsError::NoLoopback);
     }
-    for line in if_inet6.unwrap_or_default().lines() {
-        let ip = inet6_line(line).ok_or(HostAddrsError::MalformedInet6)?;
-        push(&mut out, IpAddr::V6(ip));
+    let (addrs, routes) = match (v6.addrs, v6.routes) {
+        (None, None) => return Ok(host),
+        (Some(a), Some(r)) => (a, r),
+        _ => return Err(HostAddrsError::Ipv6Half),
+    };
+    for line in addrs.lines() {
+        let (ip, len) = inet6_line(line).ok_or(HostAddrsError::MalformedInet6)?;
+        push(&mut host.own, IpAddr::V6(ip));
+        // Length 0 is no network (`Net::prefix` refuses it); 128 is the address itself.
+        if let Some(n) = Net::prefix(IpAddr::V6(ip), len) {
+            push(&mut host.connected, n);
+        }
     }
-    Ok(out)
+    for line in routes.lines() {
+        if let Some(net) = route6_line(line).ok_or(HostAddrsError::MalformedRoute6)? {
+            push(&mut host.connected, net);
+        }
+    }
+    Ok(host)
 }
 
-fn push(out: &mut Vec<IpAddr>, ip: IpAddr) {
-    if !out.contains(&ip) {
-        out.push(ip);
+fn push<T: PartialEq>(out: &mut Vec<T>, x: T) {
+    if !out.contains(&x) {
+        out.push(x);
     }
 }
 
-/// The IPv4 leaves that carry a `/32 host LOCAL` line.
-fn local_v4(text: &str) -> Vec<Ipv4Addr> {
+/// What one `fib_trie` route line says about its leaf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fib {
+    Own(Ipv4Addr),
+    Connected(Net),
+}
+
+/// Every route line of `fib_trie` that names an own address or a connected network, in order.
+fn fib_lines(text: &str) -> Result<Vec<Fib>, HostAddrsError> {
     let mut out = Vec::new();
     let mut leaf: Option<Ipv4Addr> = None;
     for line in text.lines() {
         let t = line.trim_start();
         if let Some(rest) = t.strip_prefix("|-- ") {
-            leaf = rest.trim().parse().ok();
+            leaf = Some(rest.parse().map_err(|_| HostAddrsError::MalformedFib)?);
         } else if t.starts_with('/') {
+            let ip = leaf.ok_or(HostAddrsError::MalformedFib)?;
             let fields: Vec<&str> = t.split_whitespace().collect();
-            if let (Some(ip), ["/32", "host", "LOCAL"]) = (leaf, fields.as_slice()) {
-                out.push(ip);
-            }
-        } else {
+            let route = route_v4(&fields).ok_or(HostAddrsError::MalformedFib)?;
+            out.extend(route.judge(ip)?);
+        } else if is_header(t) || is_node(t) {
             leaf = None;
+        } else {
+            return Err(HostAddrsError::MalformedFib);
         }
     }
-    out
+    Ok(out)
 }
 
-/// The address at the start of one `if_inet6` line.
-fn inet6_line(line: &str) -> Option<Ipv6Addr> {
-    let hex = line.split_whitespace().next()?;
-    if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+/// `Main:`, `Local:` or `Id <n>:`.
+fn is_header(t: &str) -> bool {
+    t == "Main:"
+        || t == "Local:"
+        || t.strip_prefix("Id ")
+            .and_then(|r| r.strip_suffix(':'))
+            .is_some_and(|n| n.parse::<u32>().is_ok())
+}
+
+/// `+-- <ipv4>/<len> <n> <n> <n>`.
+fn is_node(t: &str) -> bool {
+    let Some(rest) = t.strip_prefix("+-- ") else {
+        return false;
+    };
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let [key, a, b, c] = fields.as_slice() else {
+        return false;
+    };
+    let key_ok = key.split_once('/').is_some_and(|(ip, len)| {
+        ip.parse::<Ipv4Addr>().is_ok() && len.parse::<u32>().is_ok_and(|l| l <= 32)
+    });
+    key_ok && [a, b, c].iter().all(|n| n.parse::<u32>().is_ok())
+}
+
+/// One `fib_trie` route line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RouteV4<'a> {
+    len: u32,
+    scope: &'a str,
+    kind: &'a str,
+}
+
+impl RouteV4<'_> {
+    /// What the line says about `ip`, its leaf: nothing for a route of length 0, one that only
+    /// drops, or one through a gateway (`universe`). A leaf with bits set below the line's
+    /// length is not a network the kernel writes: it refuses the list.
+    fn judge(&self, ip: Ipv4Addr) -> Result<Option<Fib>, HostAddrsError> {
+        if self.len == 0 {
+            return if ip.is_unspecified() {
+                Ok(None)
+            } else {
+                Err(HostAddrsError::MalformedFib)
+            };
+        }
+        let net = Net::prefix(IpAddr::V4(ip), self.len)
+            .filter(|n| n.addr() == IpAddr::V4(ip))
+            .ok_or(HostAddrsError::MalformedFib)?;
+        if (self.len, self.scope, self.kind) == (32, "host", "LOCAL") {
+            return Ok(Some(Fib::Own(ip)));
+        }
+        if DROP_V4.contains(&self.kind) || self.scope == "universe" {
+            return Ok(None);
+        }
+        Ok(Some(Fib::Connected(net)))
+    }
+}
+
+/// `/<len> <scope> <type>`, then an optional `tos=<n>`.
+fn route_v4<'a>(fields: &[&'a str]) -> Option<RouteV4<'a>> {
+    let (len, scope, kind, rest) = match fields {
+        [len, scope, kind, rest @ ..] => (len, scope, kind, rest),
+        _ => return None,
+    };
+    let len: u32 = len.strip_prefix('/')?.parse().ok().filter(|l| *l <= 32)?;
+    let tos_ok = match rest {
+        [] => true,
+        [tos] => tos
+            .strip_prefix("tos=")
+            .is_some_and(|n| n.parse::<u8>().is_ok()),
+        _ => false,
+    };
+    tos_ok.then_some(RouteV4 { len, scope, kind })
+}
+
+/// Hex digits only, `min..=max` of them, as a number.
+fn hex(field: &str, min: usize, max: usize) -> Option<u128> {
+    if !(min..=max).contains(&field.len()) || !field.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    u128::from_str_radix(hex, 16).ok().map(Ipv6Addr::from)
+    u128::from_str_radix(field, 16).ok()
+}
+
+/// Exactly `n` hex digits, as a number.
+fn hex_exact(field: &str, n: usize) -> Option<u128> {
+    hex(field, n, n)
+}
+
+/// A prefix length: two hex digits, at most 128.
+fn prefix_len(field: &str) -> Option<u32> {
+    hex_exact(field, 2)
+        .and_then(|l| u32::try_from(l).ok())
+        .filter(|l| *l <= 128)
+}
+
+/// The address and prefix length of one `if_inet6` line.
+fn inet6_line(line: &str) -> Option<(Ipv6Addr, u32)> {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    let [addr, index, len, scope, flags, _name] = fields.as_slice() else {
+        return None;
+    };
+    let ip = Ipv6Addr::from(hex_exact(addr, 32)?);
+    hex(index, 2, 8)?;
+    hex_exact(scope, 2)?;
+    hex_exact(flags, 2)?;
+    Some((ip, prefix_len(len)?))
+}
+
+/// The network of one `ipv6_route` line: `Some(None)` when the route does not count (length 0,
+/// a gateway, or a reject route), `None` when the line is malformed.
+#[allow(clippy::option_option)]
+fn route6_line(line: &str) -> Option<Option<Net>> {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    let (dest, len, src, src_len, next, metric, refs, uses, flags) = match fields.as_slice() {
+        [d, l, s, sl, n, m, r, u, f] | [d, l, s, sl, n, m, r, u, f, _] => {
+            (*d, *l, *s, *sl, *n, *m, *r, *u, *f)
+        }
+        _ => return None,
+    };
+    let dest = IpAddr::V6(Ipv6Addr::from(hex_exact(dest, 32)?));
+    let len = prefix_len(len)?;
+    // The other fields are checked for form only.
+    prefix_len(src_len)?;
+    for (f, n) in [(src, 32), (next, 32), (metric, 8), (refs, 8), (uses, 8)] {
+        hex_exact(f, n)?;
+    }
+    let flags = u32::try_from(hex_exact(flags, 8)?).ok()?;
+    let net = match Net::prefix(dest, len) {
+        Some(n) if n.addr() == dest => Some(n),
+        None if dest.is_unspecified() => None,
+        _ => return None,
+    };
+    if flags & (RTF_GATEWAY | RTF_REJECT) != 0 {
+        return Some(None);
+    }
+    Some(net)
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
-mod tests {
-    use super::*;
-
-    /// A synthetic table (shape of a real one, addresses from documentation and test ranges,
-    /// assembled at runtime: the guard hooks refuse dotted IPv4 literals).
-    fn fib(own: Ipv4Addr, bcast: Ipv4Addr) -> String {
-        let lo = Ipv4Addr::LOCALHOST;
-        let net = Ipv4Addr::new(127, 0, 0, 0);
-        format!(
-            "Main:\n  +-- {net}/0 3 0 5\n     |-- {net}\n        /8 host LOCAL\n     \
-             |-- {lo}\n        /32 host LOCAL\n     +-- {own}/24 2 0 2\n        |-- {own}\n           \
-             /32 host LOCAL\n        |-- {bcast}\n           /32 link BROADCAST\n\
-             Local:\n  |-- {own}\n     /32 host LOCAL\n"
-        )
-    }
-
-    fn doc(n: u8) -> Ipv4Addr {
-        Ipv4Addr::new(198, 51, 100, n)
-    }
-
-    #[test]
-    fn local_host_entries_are_taken_once_and_broadcast_never() {
-        let got = parse(&fib(doc(7), doc(255)), None).unwrap();
-        assert_eq!(
-            got,
-            vec![IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V4(doc(7))]
-        );
-    }
-
-    #[test]
-    fn only_the_exact_host_local_slash_32_line_counts() {
-        let lo = Ipv4Addr::LOCALHOST;
-        for attr in [
-            "/32 link LOCAL",
-            "/32 host UNICAST",
-            "/24 host LOCAL",
-            "/32 host",
-            "/32 host LOCAL extra",
-        ] {
-            let text = format!("|-- {lo}\n   /32 host LOCAL\n|-- {}\n   {attr}\n", doc(9));
-            let got = parse(&text, None).unwrap();
-            assert_eq!(got, vec![IpAddr::V4(lo)], "{attr}");
-        }
-    }
-
-    #[test]
-    fn an_attribute_line_belongs_to_the_leaf_above_it_only() {
-        let lo = Ipv4Addr::LOCALHOST;
-        let text = format!(
-            "|-- {lo}\n   /32 host LOCAL\n+-- {}/24 2 0 2\n   /32 host LOCAL\n",
-            doc(3)
-        );
-        assert_eq!(parse(&text, None).unwrap(), vec![IpAddr::V4(lo)]);
-        let bad_leaf = format!("|-- {lo}\n   /32 host LOCAL\n|-- not-an-ip\n   /32 host LOCAL\n");
-        assert_eq!(parse(&bad_leaf, None).unwrap(), vec![IpAddr::V4(lo)]);
-    }
-
-    #[test]
-    fn a_table_without_loopback_is_refused() {
-        let text = format!("|-- {}\n   /32 host LOCAL\n", doc(1));
-        assert_eq!(parse(&text, None), Err(HostAddrsError::NoLoopback));
-        assert_eq!(parse("", None), Err(HostAddrsError::NoLoopback));
-    }
-
-    #[test]
-    fn ipv6_addresses_are_read_and_bad_lines_refuse_the_list() {
-        let base = fib(doc(7), doc(255));
-        let lines = "20010db8000000000000000000000001 02 40 20 80     eth0\n\
-                     00000000000000000000000000000001 01 80 10 80       lo\n";
-        let got = parse(&base, Some(lines)).unwrap();
-        let doc6: Ipv6Addr = "2001:db8::1".parse().unwrap();
-        assert_eq!(
-            got.get(2..).unwrap(),
-            [IpAddr::V6(doc6), IpAddr::V6(Ipv6Addr::LOCALHOST)]
-        );
-        for bad in [
-            "2001:db8::1 02 40 20 80 eth0",
-            "20010db800000000000000000000001 02 40 20 80 eth0",
-            "20010db80000000000000000000000011 02",
-            "20010db8000000000000000000000g01 02 40 20 80 eth0",
-            "+0010db8000000000000000000000001 02",
-            "   ",
-        ] {
-            assert_eq!(
-                parse(&base, Some(bad)),
-                Err(HostAddrsError::MalformedInet6),
-                "{bad}"
-            );
-        }
-        assert_eq!(parse(&base, Some("")).unwrap().len(), 2);
-    }
-}
+#[path = "hostaddrs_tests.rs"]
+mod tests;

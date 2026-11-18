@@ -4,10 +4,10 @@
 //!
 //! Order (decision 3, architect Q1/Q8): admission (the in-flight slot and the admission rate, in
 //! `net.rs`; a connection over the rate is closed unread and only counted), head, CONNECT only,
-//! authority, policy (host, port, grant), the host's own addresses, one lookup, the address
-//! filter over every address, `egress.allow`, connect to the pinned addresses in order, `200`,
-//! tunnel, `egress.close`. Every refusal is audited before its reply; a failed audit append
-//! closes without a reply or a dial.
+//! authority, policy (host, port, grant), the host's own addresses and connected networks, one
+//! lookup, the address filter over every address, `egress.allow`, connect to the pinned
+//! addresses in order, `200`, tunnel, `egress.close`. Every refusal is audited before its reply;
+//! a failed audit append closes without a reply or a dial.
 
 use std::future::Future;
 use std::io;
@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Semaphore, watch};
 
-use super::addr;
+use super::addr::{self, HostNets, Rule};
 use super::authority::{self, Authority, AuthorityError};
 use super::head::{self, MAX_HEAD, Parsed};
 use super::policy::{Policy, Reason, Route};
@@ -66,7 +66,8 @@ pub const ADMISSION_RATE: u32 = 20;
 pub const ADMISSION_BURST: u32 = 40;
 /// The reply that opens a tunnel.
 pub const ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
-/// `filter` value of a refusal made because the host's own addresses could not be read.
+/// `filter` value of a refusal made because the host's own addresses and connected networks
+/// could not be read.
 pub const HOST_ADDRS_UNAVAILABLE: &str = "host-addresses-unavailable";
 
 /// Looks a name up once. Only the addresses are used; their ports are ignored.
@@ -87,10 +88,11 @@ pub trait Dialer: Send + Sync + 'static {
     fn dial(&self, addr: SocketAddr) -> impl Future<Output = io::Result<Self::Stream>> + Send;
 }
 
-/// The addresses this host itself owns (decision 5: refused like loopback).
+/// The addresses this host itself owns and the networks it is directly connected to (decision
+/// 5: refused like loopback).
 pub trait HostAddrs: Send + Sync + 'static {
-    /// The current list. An error refuses the connection (fail closed).
-    fn own(&self) -> impl Future<Output = io::Result<Vec<IpAddr>>> + Send;
+    /// The current tables. An error refuses the connection (fail closed).
+    fn own(&self) -> impl Future<Output = io::Result<HostNets>> + Send;
 }
 
 impl<T: Resolver> Resolver for Arc<T> {
@@ -111,7 +113,7 @@ impl<T: Dialer> Dialer for Arc<T> {
 }
 
 impl<T: HostAddrs> HostAddrs for Arc<T> {
-    fn own(&self) -> impl Future<Output = io::Result<Vec<IpAddr>>> + Send {
+    fn own(&self) -> impl Future<Output = io::Result<HostNets>> + Send {
         (**self).own()
     }
 }
@@ -253,6 +255,8 @@ struct Refusal {
     reason: Reason,
     /// Which part of the address filter could not be evaluated, if that was why.
     filter: Option<&'static str>,
+    /// The first resolved address the filter refused, and the rule it met.
+    denied: Option<(IpAddr, Rule)>,
 }
 
 impl From<Reason> for Refusal {
@@ -260,6 +264,7 @@ impl From<Reason> for Refusal {
         Self {
             reason,
             filter: None,
+            denied: None,
         }
     }
 }
@@ -392,17 +397,25 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
                     .ok_or(Reason::GrantHostUnavailable)?,
             ),
         };
-        let own = self.host.own().await.map_err(|_| Refusal {
+        let host = self.host.own().await.map_err(|_| Refusal {
             reason: Reason::IpRangeDenied,
             filter: Some(HOST_ADDRS_UNAVAILABLE),
+            denied: None,
         })?;
         let lookup = self.resolver.resolve(&a.host, a.port);
         let found = match tokio::time::timeout(self.limits.resolve, lookup).await {
             Ok(Ok(found)) if !found.is_empty() && found.len() <= MAX_ANSWER => found,
             _ => return Err(Reason::ResolveFailed.into()),
         };
-        if found.iter().any(|s| addr::is_denied(s.ip(), &own)) {
-            return Err(Reason::IpRangeDenied.into());
+        let denied = found
+            .iter()
+            .find_map(|s| addr::denied_by(s.ip(), &host).map(|rule| (s.ip(), rule)));
+        if denied.is_some() {
+            return Err(Refusal {
+                reason: Reason::IpRangeDenied,
+                filter: None,
+                denied,
+            });
         }
         Ok((pinned(&found, a.port), tls))
     }
@@ -618,6 +631,10 @@ fn refusal_entry(e: NewEntry, r: Refusal, seen: Seen<'_>, forms: Option<&Redacto
         }
         if let Some(f) = r.filter {
             obj.insert("filter".into(), json!(f));
+        }
+        if let Some((ip, rule)) = r.denied {
+            obj.insert("address".into(), json!(ip.to_string()));
+            obj.insert("rule".into(), json!(rule.as_str()));
         }
     }
     match target {
