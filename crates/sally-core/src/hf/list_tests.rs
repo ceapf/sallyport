@@ -163,7 +163,8 @@ fn the_sibling_count_is_bounded() {
     assert_eq!(err.code(), "hf_list_malformed");
 }
 
-/// A duplicate key at any level is refused, as is a missing or invalid commit, a wrong type,
+/// A key the parser reads given twice is refused at any level, as is a missing or invalid
+/// commit, a wrong type,
 /// or anything but an object; the error names a position, never a value.
 #[test]
 fn malformed_lists_are_refused() {

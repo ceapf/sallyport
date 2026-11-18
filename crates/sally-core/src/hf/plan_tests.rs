@@ -102,6 +102,12 @@ fn absolute_redirects_to_hub_hosts_are_followed() {
     assert!(!upper.carries_auth());
     let bare = redirect(&file(0), "https://hf.co").unwrap();
     assert_eq!(bare.path(), "/");
+    assert!(!bare.carries_auth(), "the token went to hf.co");
+    let sub = redirect(&file(0), "https://cdn-lfs.huggingface.co/a").unwrap();
+    assert!(
+        !sub.carries_auth(),
+        "the token went to a subdomain of the API host"
+    );
 }
 
 /// A relative redirect stays on the current host with its token rule.

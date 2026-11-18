@@ -45,6 +45,14 @@ fn the_api_hop_carries_the_token_and_the_range() {
 #[test]
 fn other_hops_carry_no_token() {
     let t = token();
+    // Control: the same token on the API host's hop is sent.
+    let api = build(&file(0), Some(&t)).unwrap();
+    assert!(api.headers().get(AUTHORIZATION).is_some());
+    for other in ["https://hf.co/x", "https://cdn-lfs.huggingface.co/x"] {
+        let hop = redirect(&file(0), other).unwrap();
+        let r = build(&hop, Some(&t)).unwrap();
+        assert!(r.headers().get(AUTHORIZATION).is_none(), "{other}");
+    }
     let cdn = redirect(&file(0), "https://cdn-lfs.hf.co/x?y=1").unwrap();
     let r = build(&cdn, Some(&t)).unwrap();
     assert_eq!(r.uri(), "/x?y=1");

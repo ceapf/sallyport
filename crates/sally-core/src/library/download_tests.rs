@@ -155,11 +155,20 @@ fn append_stops_at_the_listed_size() {
     lib.promote(d).unwrap();
 }
 
-/// A partial longer than the listed size is promoted as too long and deleted.
+/// A partial longer than the listed size is promoted as too long and deleted; the control, a
+/// partial of exactly its size written the same way, is promoted.
 #[test]
 fn a_partial_longer_than_its_size_is_refused_at_promote() {
     let root = TmpRoot::new("dl-grown");
     let mut lib = Library::open(root.path(), 0).unwrap();
+    let exact = gguf("dl-exact");
+    let d = lib
+        .begin_download("m.gguf", &sha(&exact), exact.len() as u64)
+        .unwrap();
+    std::fs::write(root.downloads().join(part(&exact)), &exact).unwrap();
+    lib.promote(d).unwrap();
+    lib.remove(&sha(&exact)).unwrap();
+
     let bytes = gguf("dl-grown");
     let size = bytes.len() as u64;
     let d = lib.begin_download("m.gguf", &sha(&bytes), size).unwrap();
@@ -246,6 +255,13 @@ fn a_partial_that_is_not_private_is_refused_unchanged() {
     let bytes = gguf("dl-mode");
     let size = bytes.len() as u64;
     let path = root.downloads().join(part(&bytes));
+    // Control: the same partial at 0600 is resumed from its length.
+    std::fs::write(&path, b"abc").unwrap();
+    chmod(&path, 0o600);
+    let ok = lib.begin_download("m.gguf", &sha(&bytes), size).unwrap();
+    assert_eq!(ok.written(), 3);
+    drop(ok);
+    std::fs::remove_file(&path).unwrap();
     for bad in [0o644, 0o400, 0o700] {
         std::fs::write(&path, b"abc").unwrap();
         chmod(&path, bad);
@@ -287,6 +303,9 @@ fn a_name_is_checked_before_any_file_exists() {
         assert_eq!(err.code(), code, "{name:?}");
     }
     assert!(names(&root.downloads()).is_empty());
+    // Control: an allowed name begins and creates its partial.
+    drop(lib.begin_download("m.gguf", &d, 10).unwrap());
+    assert_eq!(names(&root.downloads()), [format!("{}.part", d.as_hex())]);
 }
 
 /// A download that does not fit is refused before its file is created; the control, the same

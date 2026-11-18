@@ -212,18 +212,21 @@ async fn stream(mut d: Download, how: Body, mut body: Incoming) -> Result<Downlo
             }
         };
         batch.extend_from_slice(&data);
-        if batch.len() >= WRITE_BATCH {
-            d = flush(d, std::mem::take(&mut batch)).await?;
+        if batch_full(batch.len()) {
+            let full = std::mem::replace(&mut batch, Vec::with_capacity(WRITE_BATCH));
+            d = flush(d, full).await?;
         }
     }
     flush(d, batch).await
 }
 
+/// Whether a batch of `len` bytes is written now.
+const fn batch_full(len: usize) -> bool {
+    len >= WRITE_BATCH
+}
+
 /// Appends `batch` to the partial on a blocking thread.
 async fn flush(d: Download, batch: Vec<u8>) -> Result<Download, PullError> {
-    if batch.is_empty() {
-        return Ok(d);
-    }
     blocking(d, move |d| d.append(&batch)).await
 }
 
@@ -279,3 +282,7 @@ mod testkit;
 #[cfg(test)]
 #[path = "client_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "bounds_tests.rs"]
+mod bounds_tests;

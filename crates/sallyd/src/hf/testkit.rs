@@ -25,6 +25,8 @@ pub(super) const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 const NAMES: [&str; 2] = ["huggingface.co", "cdn-lfs.hf.co"];
 /// Longest request head the mock reads.
 const MAX_HEAD: usize = 65_536;
+/// In a reply, where the mock stops writing and never writes or closes again.
+pub(super) const STALL: &[u8] = b"\0stall\0";
 
 /// One request the mock received.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,7 +89,12 @@ impl Hub {
 
     /// Every lookup answers `ip` from now on.
     pub(super) fn answer(&self, ip: IpAddr) {
-        *self.answer.lock().unwrap() = vec![ip];
+        self.answer_all(&[ip]);
+    }
+
+    /// Every lookup answers `ips`, in order, from now on.
+    pub(super) fn answer_all(&self, ips: &[IpAddr]) {
+        *self.answer.lock().unwrap() = ips.to_vec();
     }
 
     /// This host owns `ip` from now on.
@@ -135,8 +142,12 @@ impl Hub {
             all.len() - 1
         };
         let resp = (self.handler)(&seen, index);
-        let _ = tls.write_all(&resp).await;
+        let stall = resp.windows(STALL.len()).position(|w| w == STALL);
+        let _ = tls.write_all(&resp[..stall.unwrap_or(resp.len())]).await;
         let _ = tls.flush().await;
+        if stall.is_some() {
+            std::future::pending::<()>().await;
+        }
         let _ = tls.shutdown().await;
     }
 }
@@ -238,6 +249,21 @@ pub(super) fn reply(status: &str, headers: &[&str], body: &[u8]) -> Vec<u8> {
     out.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
     let mut out = out.into_bytes();
     out.extend_from_slice(body);
+    out
+}
+
+/// A response with the body sent as one chunk (no Content-Length).
+pub(super) fn chunked(status: &str, headers: &[&str], body: &[u8]) -> Vec<u8> {
+    let mut out =
+        format!("HTTP/1.1 {status}\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n");
+    for h in headers {
+        out.push_str(h);
+        out.push_str("\r\n");
+    }
+    out.push_str(&format!("\r\n{:x}\r\n", body.len()));
+    let mut out = out.into_bytes();
+    out.extend_from_slice(body);
+    out.extend_from_slice(b"\r\n0\r\n\r\n");
     out
 }
 

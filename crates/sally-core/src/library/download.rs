@@ -234,7 +234,9 @@ fn verified_tail(lib: &mut Library, d: &Download) -> Result<Entry, LibraryError>
 
 /// Deletes the partial and returns `err`.
 fn refuse(d: Download, err: LibraryError) -> Result<Entry, LibraryError> {
-    d.discard()?;
+    // The refusal is the answer; a partial that could not be removed is refused at the next
+    // begin's checks or by its hash, never promoted.
+    let _ = d.discard();
     Err(err)
 }
 

@@ -225,6 +225,19 @@ async fn denied_addresses_are_never_dialled() {
         .unwrap_err();
     assert_eq!(err.code(), "hf_address_denied");
     assert_eq!(hub.dials(), 1, "an own address was dialled");
+
+    // One denied answer among public ones refuses the host: nothing is dialled, not even the
+    // public answer listed first.
+    let mapped = IpAddr::V6(Ipv4Addr::new(10, 0, 0, 1).to_ipv6_mapped());
+    for mixed in [[PUBLIC, IpAddr::V4(Ipv4Addr::LOCALHOST)], [PUBLIC, mapped]] {
+        let hub = Hub::new(|_, _| reply("200 OK", &[], b""));
+        hub.answer_all(&mixed);
+        let err = bounded(hub.client(None).files(&repo(), &Revision::main()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "hf_address_denied", "{mixed:?}");
+        assert_eq!(hub.dials(), 0, "{mixed:?} was dialled");
+    }
 }
 
 /// A redirect to a host outside the Hub's domains is refused without a lookup or a dial of it.

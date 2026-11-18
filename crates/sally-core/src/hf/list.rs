@@ -2,8 +2,9 @@
 //!
 //! Bounds first: a body over [`MAX_LIST_BYTES`] is refused before it is parsed, and the
 //! `siblings` array is counted as it is read and refused at the first entry past
-//! [`MAX_SIBLINGS`], so the vector never grows past the bound. A duplicate key at any level is
-//! refused (serde's duplicate-field error); unknown keys are ignored. A refusal names the JSON
+//! [`MAX_SIBLINGS`], so the vector never grows past the bound. A key this parser reads (`sha`,
+//! `siblings`, `rfilename`, `size`, `lfs`, `sha256`) given twice in one object is refused (serde's
+//! duplicate-field error); unknown keys are ignored, repeated ones too. A refusal names the JSON
 //! position only, never a value.
 //!
 //! Each sibling is checked on its own. One Sallyport cannot pull (a path it does not download,

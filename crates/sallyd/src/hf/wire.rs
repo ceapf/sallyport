@@ -4,6 +4,8 @@
 //! `Range: bytes=n-` when the plan asks for one, and `Authorization: Bearer …` only when the
 //! plan says the hop carries the token. The header value is marked sensitive (kept out of
 //! hyper's debug output and header compression); the text it is built in is wiped as it drops.
+//! The header value's own bytes and hyper's write buffer are freed, not wiped (as for the token
+//! proxy's injected headers; THREAT_MODEL section 6).
 //! No cookie is ever sent or kept.
 
 use http_body_util::Empty;

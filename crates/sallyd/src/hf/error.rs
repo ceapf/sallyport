@@ -1,6 +1,7 @@
 //! Why a Hub list or pull failed. Each variant has a stable [`PullError::code`]: the core's and
-//! the library's codes pass through, and the transport's own start `hf_`. No variant holds text
-//! the Hub or the network chose, and none can hold the token.
+//! the library's codes pass through, and the transport's own start `hf_`. The only text a
+//! variant holds is a host name the plan already validated (LDH, at most 253 bytes, a Hub
+//! domain; a redirect can choose which one); none holds a header, a body or the token.
 
 use sally_core::hf::HfError;
 use sally_core::library::LibraryError;

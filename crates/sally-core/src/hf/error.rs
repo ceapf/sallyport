@@ -3,7 +3,8 @@
 //!
 //! No variant holds text the Hub chose: a status is a number, a size is a number, a header or a
 //! JSON value is never echoed (serde's messages can quote a value, so only its position is
-//! kept). The one name shown is the file the caller asked for, escaped and capped.
+//! kept). The one name shown is the file path the caller asked for, already validated: at most
+//! 1024 bytes of `[A-Za-z0-9._+~-]` and `/`.
 
 /// Why a Hub request was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -23,7 +24,8 @@ pub enum HfError {
     /// The file list is larger than its bound.
     #[error("the Hub's file list is too large")]
     ListTooLarge,
-    /// The file list is not the JSON expected (a duplicate key, a wrong type, too many files).
+    /// The file list is not the JSON expected (a key it reads given twice, a wrong type, too
+    /// many files).
     #[error("the Hub's file list is malformed (line {line}, column {column})")]
     ListMalformed {
         /// Line of the first error.
