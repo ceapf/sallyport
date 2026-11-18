@@ -711,13 +711,12 @@ impl Lx {
     }
 
     /// Whether `podman ps --all` lists a container of this fixture: its scope is part of every
-    /// session id, so of every container name. The probe of the "nothing was created" checks.
+    /// session id, so of every container name. The probe of the "nothing was created" checks; a
+    /// failed `ps` panics at the check itself, so it never reads as "nothing was created".
     #[allow(dead_code)] // Only the launch-refusal tests probe for created containers.
     pub fn listed(&self) -> bool {
         let out = podman(&["ps", "--all", "--format", "{{.Names}}"]);
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .any(|n| self.owns(n))
+        listed_names(&out).iter().any(|n| self.owns(n))
     }
 
     /// Whether a container name is one of this fixture's: a known prefix, then the scope and a
@@ -968,14 +967,22 @@ fn only_timeout(argv: &[String]) -> usize {
 #[allow(dead_code)] // Only the launch tests probe one name.
 pub fn listed_name(name: &str) -> bool {
     let out = podman(&["ps", "--all", "--format", "{{.Names}}"]);
+    listed_names(&out).iter().any(|n| n == name)
+}
+
+/// The names a `podman ps --all --format {{.Names}}` run printed. Its status is checked at the
+/// moment of the probe: a failed `ps` panics, so it never reads as "nothing listed".
+fn listed_names(out: &std::process::Output) -> Vec<String> {
     assert!(
         out.status.success(),
-        "podman ps: {}",
-        String::from_utf8_lossy(&out.stderr)
+        "podman ps: {} ({})",
+        out.status,
+        String::from_utf8_lossy(&out.stderr).trim()
     );
     String::from_utf8_lossy(&out.stdout)
         .lines()
-        .any(|n| n == name)
+        .map(str::to_owned)
+        .collect()
 }
 
 pub fn ids() -> UserIds {
