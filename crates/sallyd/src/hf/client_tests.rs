@@ -442,6 +442,34 @@ async fn a_poisoned_library_has_its_own_code() {
     assert_eq!(hub.seen().len(), 1);
 }
 
+/// Every transport variant has its own stable code; wrapped core and library errors keep
+/// theirs.
+#[test]
+fn every_pull_error_has_its_code() {
+    let host = || "huggingface.co".to_owned();
+    let cases = [
+        (PullError::Hf(HfError::ListTooLarge), "hf_list_too_large"),
+        (
+            PullError::Library(LibraryError::DownloadBusy),
+            "download_busy",
+        ),
+        (PullError::ResolveFailed(host()), "hf_resolve_failed"),
+        (PullError::AddressDenied(host()), "hf_address_denied"),
+        (PullError::ConnectFailed(host()), "hf_connect_failed"),
+        (PullError::TlsFailed(host()), "hf_tls_failed"),
+        (PullError::Timeout("response head"), "hf_timeout"),
+        (PullError::Protocol, "hf_protocol"),
+        (PullError::HeaderInvalid("Location"), "hf_header_invalid"),
+        (PullError::BodyFailed, "hf_body_failed"),
+        (PullError::TokenUnusable, "hf_token_unusable"),
+        (PullError::Task, "hf_task_failed"),
+        (PullError::LibraryPoisoned, "hf_library_poisoned"),
+    ];
+    for (err, code) in cases {
+        assert_eq!(err.code(), code, "{err}");
+    }
+}
+
 /// The rig's GGUF bytes pass the strict parser, so a refusal in these tests is never the
 /// fixture's.
 #[test]

@@ -68,8 +68,9 @@ async fn a_dropped_conn_task_is_aborted() {
 }
 
 /// No connection outlives its exchange: while a response whose body stalls is held, its
-/// connection stays open (the control); once it is dropped, the peer sees the connection end.
-/// (The HTTP layer ends it too; the guard's own test above is the one that fails without it.)
+/// connection stays open (the control: it fails if the guard were dropped inside the exchange);
+/// once it is dropped, the peer sees the connection end. (The HTTP layer ends it too; the
+/// guard's own test above is the one that fails without the abort.)
 #[tokio::test(start_paused = true)]
 async fn a_dropped_exchange_closes_its_connection() {
     let hub = Hub::new(|_, _| {
@@ -89,7 +90,8 @@ async fn a_dropped_exchange_closes_its_connection() {
 }
 
 /// A head that never comes: the exchange gives up after the head bound, and the peer sees the
-/// connection end.
+/// connection end. (The HTTP layer ends this one too when the response future is dropped; it
+/// pins the behaviour, and the guard's own test is the one that fails without the abort.)
 #[tokio::test(start_paused = true)]
 async fn a_timed_out_head_closes_its_connection() {
     let hub = Hub::new(|_, _| STALL.to_vec());
@@ -99,6 +101,38 @@ async fn a_timed_out_head_closes_its_connection() {
     assert_eq!(err.code(), "hf_timeout");
     settle().await;
     assert_eq!(hub.closed(), 1, "the connection outlived its exchange");
+}
+
+/// A rate-limited answer's connection ends before the wait, not after it: the 429's body is
+/// left unread mid-way, and the peer sees the connection close while the pull still waits;
+/// the retry then stores the file.
+#[tokio::test(start_paused = true)]
+async fn a_rate_limited_connection_ends_before_the_wait() {
+    let g = gguf("wait-close");
+    let whole = g.clone();
+    let hub = Hub::new(move |_, i| {
+        if i == 0 {
+            let mut r = reply("429 Too Many Requests", &["Retry-After: 60"], b"0123456789");
+            r.truncate(r.len() - 5);
+            r.extend_from_slice(STALL);
+            r
+        } else {
+            reply("200 OK", &[], &whole)
+        }
+    });
+    let lib = TmpLib::open("wait-close", 0);
+    let client = hub.client(None);
+    let (l, r, p) = (list(&g), repo(), path());
+    let pull = client.pull(&lib.lib, &r, &l, &p);
+    tokio::pin!(pull);
+    let waited = tokio::select! {
+        r = &mut pull => panic!("the pull did not wait: {:?}", r.map(|_| ())),
+        () = settle() => hub.closed(),
+    };
+    assert_eq!(waited, 1, "the connection lived through the wait");
+    assert_eq!(hub.seen().len(), 1);
+    bounded(pull).await.unwrap();
+    assert_eq!(hub.seen().len(), 2);
 }
 
 /// The transport's bounds are the values chosen for it; changing one is a reviewed decision.

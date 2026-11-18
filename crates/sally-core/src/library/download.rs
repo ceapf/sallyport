@@ -35,7 +35,8 @@
 //!    disk; then the file is synced.
 //!
 //! A refusal from step 2 on deletes the partial: a file that failed its hash is never resumed.
-//! A [`Verified`] dropped before its promote leaves a 0600 partial, which the next begin
+//! An I/O error while hashing is not a refusal and keeps the partial; whoever resumes it hashes
+//! it again from byte 0. A [`Verified`] dropped before its promote leaves a 0600 partial, which the next begin
 //! resumes at its full length and verifies again from byte 0.
 //!
 //! [`Library::promote`] is then only the tail shared with import: read-only, synced, linked
@@ -55,7 +56,7 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
 
 use rustix::fd::OwnedFd;
-use rustix::fs::{AtFlags, FileType, FlockOperation, Mode, OFlags, Stat};
+use rustix::fs::{AtFlags, FileType, FlockOperation, Mode, OFlags};
 use rustix::io::Errno;
 
 use super::import::store;
@@ -310,11 +311,11 @@ fn lock_and_bind(fd: OwnedFd, dir: &OwnedFd, name: &str) -> Result<OwnedFd, Libr
 }
 
 /// Stats the partial on its descriptor and refuses it unless [`part_ok`].
-fn check_private(fd: &OwnedFd) -> Result<Stat, LibraryError> {
+fn check_private(fd: &OwnedFd) -> Result<(), LibraryError> {
     let st = rustix::fs::fstat(fd).map_err(|e| LibraryError::io("stat the download", e))?;
     let euid = rustix::process::geteuid().as_raw();
     if part_ok(st.st_mode, st.st_nlink, st.st_uid, euid) {
-        Ok(st)
+        Ok(())
     } else {
         Err(LibraryError::DownloadNotPrivate)
     }
@@ -339,7 +340,10 @@ pub(super) fn promote(lib: &mut Library, v: Verified) -> Result<Entry, LibraryEr
             let _ = rustix::fs::unlinkat(&d.dir, d.name.as_str(), AtFlags::empty());
             Ok(entry)
         }
-        // The name is another file now: it is left as found.
+        // The name is another file now: it is left as found. (If the new blob vanished instead,
+        // the name can still be this file, made 0444 by the tail: a later begin refuses it as
+        // not private until it is removed.)
+        // TODO(#211): the sweep also handles a 0444 partial whose digest has no row.
         Err(LibraryError::BlobChanged) => Err(LibraryError::BlobChanged),
         Err(e) => Err(v.download.refuse(e)),
     }

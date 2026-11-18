@@ -69,19 +69,35 @@ fn a_stopped_download_resumes_where_it_stopped() {
 }
 
 /// A verified download that is dropped before its promote leaves a 0600 partial, never a
-/// read-only one; the next begin resumes it at its full length and verifies it again.
+/// read-only one; the next begin resumes it at its full length and verifies it again from
+/// byte 0: one byte changed meanwhile at the same length is a hash mismatch, nothing stored.
+/// The control, the same steps with the bytes untouched, is promoted.
 #[test]
 fn a_dropped_verified_download_is_verified_again() {
     let root = TmpRoot::new("dl-dropv");
     let mut lib = Library::open(root.path(), 0).unwrap();
     let bytes = gguf("dl-dropv");
     let size = bytes.len() as u64;
-    let mut d = lib.begin_download("m.gguf", &sha(&bytes), size).unwrap();
-    d.append(&bytes).unwrap();
-    drop(d.verify().unwrap());
     let path = root.downloads().join(part(&bytes));
-    assert_eq!(mode(&path), 0o600);
-    assert!(names(&root.blobs()).is_empty());
+    let verified_then_dropped = |lib: &mut Library| {
+        let mut d = lib.begin_download("m.gguf", &sha(&bytes), size).unwrap();
+        d.append(&bytes).unwrap();
+        drop(d.verify().unwrap());
+        assert_eq!(mode(&path), 0o600);
+        assert!(names(&root.blobs()).is_empty());
+    };
+
+    verified_then_dropped(&mut lib);
+    let mut changed = bytes.clone();
+    let last = changed.len() - 1;
+    changed[last] ^= 1;
+    std::fs::write(&path, &changed).unwrap();
+    let d = lib.begin_download("m.gguf", &sha(&bytes), size).unwrap();
+    assert_eq!(d.written(), size);
+    assert_eq!(d.verify().unwrap_err().code(), "hash_mismatch");
+    assert_nothing_stored(&root, &lib);
+
+    verified_then_dropped(&mut lib);
     let d = lib.begin_download("m.gguf", &sha(&bytes), size).unwrap();
     assert_eq!(d.written(), size);
     lib.promote(d.verify().unwrap()).unwrap();
@@ -344,6 +360,49 @@ fn the_lock_is_bound_to_the_name() {
     let err = lock_and_bind(fd, dir, &name).err().unwrap();
     assert_eq!(err.code(), "download_busy");
     assert!(names(&root.downloads()).is_empty());
+
+    // Moved away (still one link, still 0600) and a new partial made under the name: only the
+    // binding tells the two apart.
+    let moved = root.downloads().join("moved");
+    let fd = open_unlocked(&lib, &name, 100).unwrap();
+    std::fs::rename(&path, &moved).unwrap();
+    drop(open_unlocked(&lib, &name, 100).unwrap());
+    let err = lock_and_bind(fd, dir, &name).err().unwrap();
+    assert_eq!(err.code(), "download_busy");
+    assert_eq!(mode(&moved), 0o600);
+    assert_eq!(mode(&path), 0o600);
+    std::fs::remove_file(&moved).unwrap();
+    std::fs::remove_file(&path).unwrap();
+
+    let fd = open_unlocked(&lib, &name, 100).unwrap();
+    drop(lock_and_bind(fd, dir, &name).unwrap());
+}
+
+/// The partial is checked again on the locked descriptor: one whose mode changed, or that
+/// gained a second link, between the open and the lock is refused and left as found; the
+/// control, the same two steps with the file untouched, binds.
+#[test]
+fn the_partial_is_checked_again_after_the_lock() {
+    let root = TmpRoot::new("dl-recheck");
+    let lib = Library::open(root.path(), 0).unwrap();
+    let dir = &lib.dirs.downloads;
+    let name = part(b"recheck");
+    let path = root.downloads().join(&name);
+
+    let fd = open_unlocked(&lib, &name, 100).unwrap();
+    chmod(&path, 0o644);
+    let err = lock_and_bind(fd, dir, &name).err().unwrap();
+    assert_eq!(err.code(), "download_not_private");
+    assert_eq!(mode(&path), 0o644);
+    chmod(&path, 0o600);
+
+    let second = root.downloads().join("second");
+    let fd = open_unlocked(&lib, &name, 100).unwrap();
+    std::fs::hard_link(&path, &second).unwrap();
+    let err = lock_and_bind(fd, dir, &name).err().unwrap();
+    assert_eq!(err.code(), "download_not_private");
+    assert_eq!(std::fs::metadata(&path).unwrap().nlink(), 2);
+    std::fs::remove_file(&second).unwrap();
 
     let fd = open_unlocked(&lib, &name, 100).unwrap();
     drop(lock_and_bind(fd, dir, &name).unwrap());

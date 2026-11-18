@@ -14,7 +14,8 @@
 //!
 //! The bytes themselves go to a [`crate::library::Download`], and
 //! [`crate::library::Download::verify`] checks the listed SHA-256 before anything else reads
-//! them; [`crate::library::Library::promote`] takes only what it verified. The token's value never reaches this module.
+//! them; [`crate::library::Library::promote`] takes only what it verified. The token's value
+//! never reaches this module.
 //!
 //! The bounds below are constants with their values pinned by tests.
 

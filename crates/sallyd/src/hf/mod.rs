@@ -130,15 +130,19 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> HfClient<R, D, H> {
         path: &RepoPath,
     ) -> Result<Entry, PullError> {
         let wanted = list.wanted(path)?;
-        let digest = wanted.sha256().clone();
-        if let Some(entry) = with_library(lib, move |l| l.stored(&digest)).await? {
-            return Ok(entry);
-        }
         let w = wanted.clone();
-        let d = with_library(lib, move |l| {
-            l.begin_download(w.path().file_name(), w.sha256(), w.size())
+        // One hold of the library: no pull can finish between the check and the begin.
+        let start = with_library(lib, move |l| match l.stored(w.sha256())? {
+            Some(entry) => Ok(Start::Stored(entry)),
+            None => l
+                .begin_download(w.path().file_name(), w.sha256(), w.size())
+                .map(Start::Begun),
         })
         .await?;
+        let d = match start {
+            Start::Stored(entry) => return Ok(entry),
+            Start::Begun(d) => d,
+        };
         let d = match next_fetch(d.written(), d.size()) {
             Some(from) => self.fetch(d, repo, list.commit(), wanted, from).await?,
             None => d,
@@ -165,7 +169,11 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> HfClient<R, D, H> {
             let head = answer.head()?;
             match decide_file(&head.head(), &req, &mut tries, d.written(), d.size()) {
                 Ok(Step::Redirect(next)) => req = next,
-                Ok(Step::Wait(secs)) => tokio::time::sleep(Duration::from_secs(secs)).await,
+                Ok(Step::Wait(secs)) => {
+                    // The answer is done with: its connection ends before the wait.
+                    drop(answer);
+                    tokio::time::sleep(Duration::from_secs(secs)).await;
+                }
                 Ok(Step::Body(how)) => return stream(d, how, answer.into_body()).await,
                 Err(e) => return Err(refuse(d, e).await),
             }
@@ -194,6 +202,12 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> HfClient<R, D, H> {
             Err(_) => Err(PullError::Timeout("response head")),
         }
     }
+}
+
+/// How a pull starts: from a stored row, or with a download begun.
+enum Start {
+    Stored(Entry),
+    Begun(Download),
 }
 
 /// The task driving one exchange's connection. Dropping it aborts the task, so no connection

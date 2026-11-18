@@ -228,7 +228,9 @@ impl Library {
     /// [`LibraryError::BlobChanged`] when the partial's name no longer names the verified file
     /// (the name is left as found); otherwise the partial is deleted and the error is
     /// [`LibraryError::BlobMismatch`] for a blob already stored under the digest that fails its
-    /// checks, or an I/O or index error. No refusal leaves a blob or a row.
+    /// checks, or an I/O or index error. No refusal writes a row, and a blob the tail created
+    /// is removed again; that removal is best effort, and a blob it leaves has no row, so
+    /// nothing lists or resolves it.
     pub fn promote(&mut self, verified: Verified) -> Result<Entry, LibraryError> {
         download::promote(self, verified)
     }
