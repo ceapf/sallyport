@@ -51,6 +51,24 @@ fn revisions_are_strict_and_one_segment() {
     }
 }
 
+/// Each `/`-separated revision component is non-empty and never starts with `.`, so `.` and
+/// `..` are out too; a dot later in a component stays allowed.
+#[test]
+fn revision_components_are_never_empty_or_dot_led() {
+    for ok in ["v1.0", "refs/pr/1", "a.b/c", "a/b.", "a-/_b"] {
+        assert_eq!(Revision::parse(ok).unwrap().as_str(), ok, "{ok}");
+    }
+    for bad in [
+        ".", "..", "/", "/a", "a/", "a//b", ".a", "a/.b", "a/./b", "a/../b", "a/..",
+    ] {
+        assert_eq!(
+            Revision::parse(bad),
+            Err(HfError::RevisionInvalid),
+            "{bad:?}"
+        );
+    }
+}
+
 /// A commit is exactly 40 lowercase hex digits.
 #[test]
 fn commits_are_forty_lowercase_hex() {

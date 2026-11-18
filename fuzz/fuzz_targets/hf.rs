@@ -14,7 +14,8 @@
 //!   huggingface.co, and it keeps the range;
 //! - Retry-After never waits past MAX_RETRY_WAIT_SECS;
 //! - an accepted path has no empty, `.` or `..` segment, and its encoding holds only unreserved
-//!   bytes, `%` and `/`.
+//!   bytes, `%` and `/`;
+//! - an accepted revision has no empty component and none starting with `.`.
 #![no_main]
 #![forbid(unsafe_code)]
 
@@ -87,6 +88,11 @@ fn check_text(s: &str) {
     }
     if let Ok(r) = Revision::parse(s) {
         assert!(!r.encoded().contains('/'));
+        assert!(
+            r.as_str()
+                .split('/')
+                .all(|c| !c.is_empty() && !c.starts_with('.'))
+        );
     }
 }
 

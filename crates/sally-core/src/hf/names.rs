@@ -70,8 +70,9 @@ pub(super) fn repo_part_ok(part: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
 }
 
-/// A revision: a branch, tag or commit name of `[A-Za-z0-9._/-]`, 1 to 128 bytes. In a URL it
-/// is one encoded segment (`/` becomes `%2F`).
+/// A revision: a branch, tag or commit name of `[A-Za-z0-9._/-]`, 1 to 128 bytes, whose
+/// `/`-separated components are never empty and never start with `.`. In a URL it is one
+/// encoded segment (`/` becomes `%2F`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Revision(String);
 
@@ -107,12 +108,16 @@ impl Revision {
     }
 }
 
-/// The revision rule.
+/// The revision rule: the bytes, the length, and every `/`-separated component non-empty and
+/// not starting with `.` (so never `.` or `..`).
 pub(super) fn revision_ok(rev: &str) -> bool {
     (1..=MAX_REVISION_BYTES).contains(&rev.len())
         && rev
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'/' | b'-'))
+        && rev
+            .split('/')
+            .all(|c| c.bytes().next().is_some_and(|first| first != b'.'))
 }
 
 /// A commit hash: 40 lowercase hex digits. Files are downloaded at the commit the list names,
