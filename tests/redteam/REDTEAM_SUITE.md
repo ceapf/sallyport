@@ -1,6 +1,6 @@
 # Red-team suite
 
-**Rule:** a test *passes* when the attack *fails*. CI (`redteam.yml`) runs every test marked
+**Rule:** a test *passes* when the attack *fails*. CI (the `redteam` job in `ci.yml`) runs every test marked
 `CI` on a rootless-Podman GitHub runner with the mock inference backend; tests marked `GPU` run
 locally via `make redteam-gpu`. Any attack success fails the job. No test may be skipped without
 a tracked issue number and an expiry date in the skip reason; CI fails on expired skips.
@@ -27,8 +27,9 @@ a tracked issue number and an expiry date in the skip reason; CI fails on expire
   production code (architect Q46, Q119 on R3): one strict parser, enabled only by the explicit
   `model` param of `sessions.create`, which declares the session driven; there it is a turn
   source for `sessions.drive`, never a model a harness talks to (RT-DRV).
-- Output: `target/redteam/results.md` table (ID, name, PASS/FAIL, evidence snippet) uploaded as a
-  CI artifact and pasted into `docs/reports/M<n>.md`.
+- Output (planned, #213): a `target/redteam/results.md` table (ID, name, PASS/FAIL, evidence
+  snippet) uploaded as a CI artifact and pasted into `docs/reports/M<n>.md`. Until it exists, a
+  report's table is read from the `redteam` job log of one named CI run.
 
 Fixture manifests: `fx-coding` (= `coding-agent.yaml` with mock hosts), `fx-brokered` (one
 `brokered` mount), `fx-chat` (= `chat-only.yaml`), `fx-wild` (= `web-research.yaml` with `*`).
