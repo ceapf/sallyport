@@ -288,6 +288,7 @@ fn every_role_starts_with_the_checked_runtime_and_has_the_section_6_1_flags() {
             "--userns=keep-id",
             "--init",
             "--env-host=false",
+            "--image-volume=ignore",
         ] {
             assert_eq!(
                 a.iter().filter(|x| *x == flag).count(),
@@ -301,6 +302,30 @@ fn every_role_starts_with_the_checked_runtime_and_has_the_section_6_1_flags() {
         // The launcher, not the image, chooses the working directory.
         assert_eq!(pair("--workdir", "/"), 1, "{a:?}");
     }
+}
+
+/// The checker requires image-declared volumes to be ignored, as one token: a missing flag,
+/// another mode, the two-token spelling and a second copy are refused.
+#[test]
+fn checker_requires_image_volumes_ignored() {
+    let f = Fx::new();
+    let (a, allowed) = base(&f);
+    check_argv(&a, &allowed).unwrap();
+    let flag = "--image-volume=ignore";
+    for new in [
+        &["--image-volume=bind"][..],
+        &["--image-volume=tmpfs"],
+        &["--image-volume=anonymous"],
+        &["--image-volume", "ignore"],
+        &[flag, flag],
+    ] {
+        assert_forbidden(&replacing(&a, flag, new), &allowed, &format!("{new:?}"));
+    }
+    assert_forbidden(
+        &replacing(&a, flag, &[]),
+        &allowed,
+        "without --image-volume",
+    );
 }
 
 /// The checker holds the working directory to "/", as two tokens: any other value, the `=`

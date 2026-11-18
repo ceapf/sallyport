@@ -220,31 +220,31 @@ fn rt_fs_02_the_image_working_directory_creates_nothing_in_a_mount() {
     });
 }
 
-/// RT-FS-02, mount placement (security review): an image whose root filesystem holds a link at
-/// a mount destination (`/workspace/q`) that points into an earlier `ro` mount (`/workspace/p`)
-/// creates nothing in either host folder, whether the launch starts or is refused.
+/// RT-FS-02, image volumes (security review): an image that declares a volume below an `ro` or
+/// a `brokered` mount's guest path creates nothing in the host folder. Image-declared volumes
+/// are disabled, so the launch starts with no extra mount.
 #[test]
-fn rt_fs_02_an_image_link_at_a_mount_creates_nothing_in_an_earlier_one() {
+fn rt_fs_02_an_image_volume_creates_nothing_in_a_mount() {
     rt().block_on(async {
         let x = Lx::new();
+        let dir = home(&x).join("code/myproject");
         host_file(&x, "code/myproject/README", "keep\n");
-        host_file(&x, "code/other/README", "keep\n");
-        let dirs = [home(&x).join("code/myproject"), home(&x).join("code/other")];
-        let image =
-            image_with("RUN mkdir -p /workspace && ln -s /workspace/p/made-by-link /workspace/q\n");
-        let v = x.f.load(&mounts(&[
-            mount("~/code/myproject", "/workspace/p", "ro"),
-            mount("~/code/other", "/workspace/q", "ro"),
-        ]));
-        let before: Vec<_> = dirs.iter().map(|d| tree(d)).collect();
-        let got = launch_image(&x, &v, image, "link").await;
-        let after: Vec<_> = dirs.iter().map(|d| tree(d)).collect();
-        let started = got.as_ref().map(|_| ()).map_err(String::clone);
-        if let Ok(r) = got {
-            x.stop(r).await;
+        let image = image_with("VOLUME /workspace/p/vol\n");
+        for mode in ["ro", "brokered"] {
+            let before = tree(&dir);
+            assert!(before.contains(&"README".to_owned()), "control: {before:?}");
+            let got = launch_image(&x, &manifest(&x, mode), image.clone(), mode).await;
+            let after = tree(&dir);
+            let started = got.as_ref().map(|_| ()).map_err(String::clone);
+            if let Ok(r) = got {
+                x.stop(r).await;
+            }
+            assert_eq!(
+                after, before,
+                "{mode}: the host folder changed ({started:?})"
+            );
+            assert!(started.is_ok(), "{mode}: {started:?}");
         }
-        eprintln!("mount-link launch: {started:?}");
-        assert_eq!(after, before, "a host folder changed ({started:?})");
     });
 }
 

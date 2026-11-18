@@ -140,9 +140,9 @@ impl ContainerPaths {
 }
 
 /// The fields of an image's `Config` that reach the OCI config (architect Q101). Not
-/// `deny_unknown_fields`: every effect of any other image field (a `Volumes` entry, say) shows in
-/// `config.json`, where unknown keys and extra mounts are refused. A field used here with the
-/// wrong type refuses.
+/// `deny_unknown_fields`: every effect of any other image field shows in `config.json`, where
+/// unknown keys and extra mounts are refused (image-declared volumes are disabled by the argv's
+/// `--image-volume=ignore`). A field used here with the wrong type refuses.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct ImageConfig {
     /// `NAME=value` pairs.

@@ -39,7 +39,8 @@ const SPACE_FLAGS: [&str; 16] = [
     "--device",
 ];
 /// Options written `--flag=value`, as one token; the two-token form is refused.
-const EQ_FLAGS: [&str; 8] = [
+const EQ_FLAGS: [&str; 9] = [
+    "--image-volume",
     "--pull",
     "--http-proxy",
     "--log-driver",
@@ -55,9 +56,10 @@ const BARE_FLAGS: [&str; 4] = ["--rm", "--no-hosts", "--read-only", "--init"];
 const REPEATABLE: [&str; 3] = ["-v", "--env", "--security-opt"];
 /// Options every role must carry exactly once (`--security-opt` is counted per kind in
 /// [`require`]).
-const REQUIRED: [&str; 20] = [
+const REQUIRED: [&str; 21] = [
     "--rm",
     "--workdir",
+    "--image-volume",
     "--name",
     "--label",
     "--pull",
@@ -323,6 +325,7 @@ fn check_option(
         ("--hostname", _) if a.role != Role::Inference => fixed("sandbox"),
         ("--user", _) => fixed(&format!("{}:{}", a.ids.uid, a.ids.gid)),
         ("--workdir", _) => fixed(WORKDIR),
+        ("--image-volume", _) => fixed("ignore"),
         ("--device", _) if a.role == Role::Inference => fixed(GPU_DEVICE),
         ("--security-opt", Some(v)) => security_opt(v, a),
         ("--name", Some(v)) => ok(name_ok(v, a.role)),

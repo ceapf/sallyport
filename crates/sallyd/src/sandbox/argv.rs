@@ -187,7 +187,8 @@ impl Argv {
             "--user",
             &format!("{}:{}", c.ids.uid, c.ids.gid),
         ]);
-        a.push(["--workdir", WORKDIR]);
+        // Image-declared volumes are disabled: the image does not add mounts.
+        a.push(["--workdir", WORKDIR, "--image-volume=ignore"]);
         Ok(a)
     }
 
