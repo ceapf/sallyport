@@ -24,9 +24,10 @@ reason; review enforces this (no CI step reads skip reasons yet).
   `sallyd`), the intercepted-TLS rig (`intercept.rs`), the redaction-form helpers (`forms.rs`),
   audit-log search (`search.rs`) and run-scoped locks (`locks.rs`). sally-core's are in
   `crates/sally-core/tests/common/`.
-- **Canaries** are fixed, greppable text assembled at runtime (`canary` in
-  `crates/sallyd/tests/common/egress.rs`: `SALLY_CANARY_<name>_…`) and held by the fixture secret
-  store, so no credential-shaped literal is in the tree; they are the same in every run. Where a
+- **Canaries** are fixed text assembled at runtime, one per fixture secret name, and held by the
+  fixture secret store, so no credential-shaped literal is in the tree; they are the same in every
+  run. `canary` in `crates/sallyd/tests/common/egress.rs` holds the exact shapes: most start
+  `SALLY_CANARY_`; one is a lower-case DNS label, so it can stand in a `CONNECT` host. Where a
   row names `CANARY_SECRET`, `CANARY_FILE`, `CANARY_EXEC` or a fixture (`fx-coding`,
   `fx-brokered`, `fx-chat`, `fx-wild`), it names a role: its test builds the equivalent in code.
 - `tests/redteam/` also holds the syscall probe `probe/probe.c` (built into the test image at
