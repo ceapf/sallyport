@@ -366,6 +366,14 @@ fn rt_man_02_privilege_escalation_attempts_rejected_with_documented_codes() {
     };
     let proxy = "network:\n  mode: proxy\n  allow:\n    - host: api.github.com\n";
     let digest = "0".repeat(64);
+    let wildcard = |host: &str, ack: bool| {
+        let ack = if ack {
+            "  acknowledge_unrestricted_egress: true\n"
+        } else {
+            ""
+        };
+        format!("network:\n  mode: proxy\n  allow:\n    - host: \"{host}\"\n{ack}")
+    };
     let secret = |host: &str| {
         format!(
             "{proxy}secrets:\n  - {{name: GITHUB_TOKEN, inject: {{host: \"{host}\", header: Authorization, format: \"{{value}}\"}}}}\n"
@@ -431,6 +439,23 @@ fn rt_man_02_privilege_escalation_attempts_rejected_with_documented_codes() {
             "network.allow[0].host",
             Code::UnacknowledgedWildcard,
             r#"error: network.allow[0].host: "*" requires network.acknowledge_unrestricted_egress: true [unacknowledged-wildcard]"#,
+        ),
+        // A wildcard under a shared tree (a regional endpoint) and one over a parent of a shared
+        // suffix reach hosts anyone can register, as `*` does.
+        (
+            wildcard("*.s3.us-east-1.amazonaws.com", false),
+            wildcard("*.s3.us-east-1.amazonaws.com", true),
+            "network.allow[0].host",
+            Code::UnacknowledgedWildcard,
+            // Long and holding a digit, the host is masked like any token-shaped value.
+            r#"error: network.allow[0].host: "*.s3...[28 chars hidden]" covers hosts anyone can register, so it requires network.acknowledge_unrestricted_egress: true [unacknowledged-wildcard]"#,
+        ),
+        (
+            wildcard("*.windows.net", false),
+            wildcard("*.windows.net", true),
+            "network.allow[0].host",
+            Code::UnacknowledgedWildcard,
+            r#"error: network.allow[0].host: "*.windows.net" covers hosts anyone can register, so it requires network.acknowledge_unrestricted_egress: true [unacknowledged-wildcard]"#,
         ),
         (
             secret("*"),
