@@ -409,3 +409,43 @@ fn recheck_distinguishes_a_replaced_directory_from_a_moved_path() {
     assert!(e.errors[0].message.contains("now resolves to"), "{e:#?}");
     assert_eq!(e.errors[0].code, Code::MountChanged);
 }
+
+// ---- the denylist's link scan budget (MANIFEST_SPEC §2) -----------------------------------------
+
+/// Entries the scan reads per validation (the `links::BUDGET` pin is in `paths.rs`).
+const SCAN_BUDGET: usize = 65_536;
+
+/// A scanned folder past the real budget (a cache subfolder holding as many files as the
+/// budget, read at depth 2 of `~/.cache`): a manifest with a mount is refused
+/// `denylist-incomplete` at `filesystem`, naming the folder, as its only error, at validation
+/// and at the library's re-check; a manifest with no mounts reads no folder and is accepted.
+#[test]
+fn a_scan_past_the_budget_refuses_only_manifests_with_mounts() {
+    let f = Fixture::new();
+    let body = mounts(&mount("~/code/myproject", "/workspace/p", "rw"));
+    let v = f.load(&body).unwrap().manifest;
+    let many = f.home().join(".cache/many");
+    std::fs::create_dir_all(&many).unwrap();
+    // `many` alone holds the budget's worth; with `.cache`'s own entry and the fixture's other
+    // folders the scan passes the budget inside `many`.
+    for n in 0..SCAN_BUDGET {
+        std::fs::File::create(many.join(n.to_string())).unwrap();
+    }
+    let r = f.load(&body);
+    assert_rejects(&r, "filesystem", Code::DenylistIncomplete);
+    let msg = rendered(&r).join("\n");
+    assert!(
+        msg.contains(&format!("budget of {SCAN_BUDGET} entries"))
+            && msg.contains(&many.display().to_string())
+            && msg.ends_with(" [denylist-incomplete]"),
+        "{msg}"
+    );
+    let e = v.recheck_mounts(&f.env).unwrap_err();
+    let found: Vec<(String, Code)> = e.errors.iter().map(|d| (d.path.clone(), d.code)).collect();
+    assert_eq!(found, [("filesystem".to_owned(), Code::DenylistIncomplete)]);
+    assert_ok(&f.load(""));
+    // Control: without the cache the same manifest is accepted (the exact boundary is pinned
+    // in `paths.rs`, where every entry read is known).
+    std::fs::remove_dir_all(&many).unwrap();
+    assert_ok(&f.load(&body));
+}

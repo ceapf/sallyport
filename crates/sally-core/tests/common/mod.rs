@@ -58,6 +58,7 @@ impl Fixture {
                 home.join(".local/share/containers/storage"),
                 PathBuf::from("/var/lib/containers/storage"),
             ],
+            env_dirs: Vec::new(),
             nproc: 8,
             mem_bytes: 16 << 30,
         };

@@ -83,6 +83,7 @@ impl Fx {
             xdg_data_home: None,
             xdg_runtime_dir: Some(root.join("run")),
             podman_storage: vec![home.join(".local/share/containers/storage")],
+            env_dirs: Vec::new(),
             nproc: 8,
             mem_bytes: 16 << 30,
         };

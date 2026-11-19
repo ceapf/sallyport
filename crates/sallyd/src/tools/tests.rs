@@ -1186,6 +1186,7 @@ fn the_session_mounts_take_their_roots_by_mode() {
         xdg_data_home: None,
         xdg_runtime_dir: None,
         podman_storage: Vec::new(),
+        env_dirs: Vec::new(),
         nproc: 8,
         mem_bytes: 16 << 30,
     };

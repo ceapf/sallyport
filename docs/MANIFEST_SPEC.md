@@ -323,12 +323,23 @@ environment (passwd entry only if `$HOME` is unset or relative).
 - **Root only** — the path itself is refused, descendants are fine: `/`, `$HOME`.
 - **Subtree** — the path, anything inside it, **and any ancestor of it** are refused:
   - under each home: credentials (`.ssh`, `.gnupg`, `.aws`, `.kube`, `.docker`, `.netrc.d`,
-    `.password-store`, `.pki`, `.local/share/keyrings`, `.mozilla`, `.claude`, `.ollama`, `.m2`),
-    config and Sallyport state (`.config`, `.local/share/sallyport`, `.var/app`, `snap`), caches
-    (`.cache`, `.npm`), and anything the host executes or auto-loads (`.local/bin`, `bin`,
-    `.local/share/applications`, `.local/lib`, `.cargo`, `.rustup`, `.vscode-server`, `.gradle`,
-    `.nvm`, `.pyenv`) — a writable mount there is host code execution (THREAT_MODEL G4);
+    `.password-store`, `.pki`, `.local/share/keyrings`, `.mozilla`, `.claude`, `.ollama`, `.m2`,
+    `.azure`, `.terraform.d`, `.oci`, `.minikube`), config and Sallyport state (`.config`,
+    `.local/share/sallyport`, `.var/app`, `snap`), caches (`.cache`, `.npm`), and anything the
+    host executes or auto-loads (`.local/bin`, `bin`, `.local/share/applications`, `.local/lib`,
+    `.cargo`, `.rustup`, `.vscode-server`, `.gradle`, `.nvm`, `.pyenv`, `.vscode`, `.vim`,
+    `.emacs.d`, `.ipython`, `.oh-my-zsh`, `.bun`, `.deno`, `.volta`, `go/bin`, `go/pkg`,
+    `.local/share/{pipx,uv,nvim,mise,pnpm}`) — a writable mount there is host code execution
+    (THREAT_MODEL G4);
   - `$XDG_CONFIG_HOME`, `$XDG_DATA_HOME`, `$XDG_RUNTIME_DIR` (each when set, plus `sallyport/`);
+  - the folders the environment names, each when absolute: `$CARGO_HOME`, `$RUSTUP_HOME`,
+    `$GNUPGHOME`, `$NVM_DIR`, `$PYENV_ROOT`, `$XDG_CACHE_HOME`, `$GOBIN`, `$DOCKER_CONFIG`,
+    `$ZDOTDIR`, `$PNPM_HOME`, `$VOLTA_HOME`, `$BUN_INSTALL`, `$PYTHONUSERBASE`, `$PIPX_HOME`,
+    `$PIPX_BIN_DIR`, `$UV_TOOL_DIR`, `$GRADLE_USER_HOME`, `$PASSWORD_STORE_DIR`, `bin` and
+    `pkg` under each `$GOPATH` element (at most 32 folders), and every `$PATH` entry (at most
+    256); past either bound the list is incomplete (below). Messages name the variable ("is inside /opt/go/bin (from $GOBIN)"). A
+    folder named this way that is `/`, a home, or an ancestor of one is kept as a rule, so it
+    refuses every mount under it (§6);
   - `/etc`, `/proc`, `/sys`, `/dev`, `/run`, `/var/run`, `/boot`, `/root`, `/mnt`,
     `/usr/lib/wsl`, `/tmp`, `/var/tmp` (`/tmp` holds other programs' Unix sockets — ssh-agent,
     X11 — and a read-only bind does not stop `connect()`, so it would be a path around SI-1);
@@ -338,6 +349,29 @@ environment (passwd entry only if `$HOME` is unset or relative).
   The ancestor rule is why `~/.local`, `/var`, `/usr`, and `/home` are refused: they really
   contain protected data. "Each home" is `$HOME` **and** the passwd home when they differ, so a
   wrapper that sets `HOME=/tmp/x` does not unprotect the real one.
+
+**Links out of protected folders.** A symlink inside a protected folder makes its target part of
+what the host runs or loads (`~/.local/bin/t -> ~/tools/t/bin/t`, a stow `~/.config/gh ->
+~/dotfiles/gh`), so its target becomes a subtree rule too: "contains /home/u/tools/t/bin/t, which
+/home/u/.local/bin/t points to", with the reason of the folder that holds the link. When a
+manifest has mounts, validation reads, to depth 2 (a folder's entries and its subfolders'
+entries, never entering a linked folder): every home folder of the list above, `$XDG_CONFIG_HOME`
+and `$XDG_DATA_HOME`, every folder the environment names except a `$PATH` entry outside the
+homes, and each home's own entries, of which only dot names (`.bashrc`, …) are followed. A folder
+reached first as a subfolder is read again to depth 2 when it is on that list itself. The rule is
+made from the link's text, joined (when relative) to the real path of the folder holding the link,
+as the kernel resolves it, and also matches where that resolves: through a stow-folded
+`~/.local/bin -> ~/dotfiles/bin` holding `t -> ../tools/t` the rule is `~/dotfiles/tools/t`, both
+hops of `~/.bashrc -> ~/df/bashrc -> /data/x/bashrc` are protected, and a dangling link protects
+its target before it exists. A link whose target is already inside a built-in, environment or
+`filesystem.deny` rule adds nothing.
+Reading is bounded: at most 65 536 entries per validation, counted across all folders. Past that,
+with more than 256 `$PATH` or 32 `$GOPATH` folders, or when a folder cannot be read (one that is
+gone, not a folder, or that the user can neither list nor enter is skipped; one the user can
+enter but not list refuses, as its files still run by name), validation fails with one
+`denylist-incomplete` error at `filesystem` naming the folder, the bound or the variable; the
+mounts are still checked against every other rule. A manifest with no mounts reads nothing, so it
+never gets this error.
 
 `denylisted` messages name the rule in words ("is inside /home/u/.ssh — credential folders are
 never mountable"). There is no `cfg(test)` or feature-gated bypass of the denylist: tests move
@@ -355,9 +389,13 @@ and, for a subtree rule, of every existing ancestor. A mount root with one of th
 detected: the same path-versus-filesystem ancestry gap as the overlap rule's re-review M-2
 (open, optional: #17, #28).
 
-At launch the driver re-checks every mount root (`ValidatedManifest::recheck_mounts`): it must
-pass the same checks, have the same realpath, and be the same directory (`st_dev`/`st_ino`) as at
-validation — otherwise `mount-changed`/`is-symlink` (RT-FS-06).
+`sallyd` validates when the session is created (`sessions.create`), so the denylist, link rules
+included, is as of that moment. At launch the driver's scan re-opens every mount root without
+following symlinks and refuses one that is no longer the same directory (`st_dev`/`st_ino`,
+RT-FS-06). The library's own re-check, `ValidatedManifest::recheck_mounts`, rebuilds the
+denylist (link rules included) and requires the same checks, realpath and directory as at
+validation — otherwise `mount-changed`/`is-symlink`/`denylisted`; the launcher does not call it
+yet (TODO(#231)).
 
 ## 3. Enforcement points (field → who enforces → when)
 
@@ -429,6 +467,7 @@ never on message text); the field path uses `a.b[0].c` form.
 | `invalid-value` | malformed string (name, path, glob, env name, model ref, …) |
 | `out-of-range` | number/size/duration/list length outside its range |
 | `denylisted` / `is-symlink` / `not-directory` / `not-found` / `path-chars` | mount host checks (§2) |
+| `denylist-incomplete` | the built-in denylist could not be completed on this host: the link scan passed its 65 536-entry budget, `$PATH` names more than 256 folders or `$GOPATH` more than 32, or a folder could not be read or can be entered but not listed (§2); at `filesystem`, only when the manifest has mounts |
 | `guest-path` | guest not a clean path under `/workspace/` |
 | `duplicate` / `overlap` | repeated entry / overlapping mounts |
 | `not-pinned` | `runtime.image` / `harness.image` without a digest |
@@ -471,3 +510,30 @@ See `manifests/examples/`:
   cannot be read, is treated as open to its owner only. The ACL's named entries are not
   honoured. In practice, brokered writes to group-shared folders are narrower than the user's own
   access. Mount a folder the user owns, or one whose mode bits grant the access directly.
+- **Links out of protected folders are read when the session is validated, to depth 2 (§2).** A
+  link made later, one deeper than depth 2, one inside a linked folder, a non-dot entry of a home,
+  a link in a `$PATH` folder outside the homes (`/usr/local/bin/x -> ~/code/x`), the middle
+  hops of a chain longer than two, and a not-yet-existing target spelled with `..` after a
+  linked component (only its textual form is protected) are not followed (THREAT_MODEL §6).
+- **A large protected folder can refuse every manifest with mounts.** A listed folder, or one of
+  its subfolders, holding tens of thousands of entries (a cache subfolder with a file per item)
+  can take the scan past the 65 536 entries it reads; validation then fails `denylist-incomplete`
+  naming the folder. Clear or shrink that folder, or move it out of the listed folders; manifests
+  without mounts are not affected.
+- **An environment variable or link that names `/`, a home, or an ancestor of one refuses every
+  mount under it** until it is changed (`CARGO_HOME=$HOME`, a `$PATH` entry equal to a home, an
+  exported `ZDOTDIR=$HOME`, `PYTHONUSERBASE=$HOME/.local`, which refuses everything under
+  `~/.local`). The message names the variable or the link; for the last two, unset the variable
+  (the default is the same place). Such a variable's folder is also read whole, every entry and
+  not only dot names, so a large home can use up the budget and refuse mounts outside it too
+  (`denylist-incomplete`).
+- **A folder the user can enter but not list (mode `--x`) inside a listed folder refuses every
+  manifest with mounts** (`denylist-incomplete`, naming it), since its files still run by name
+  and its links cannot be read. Make it listable, or remove it.
+- **A tool folder moved by a variable that is not on the §2 list is not a rule** (#232). List it
+  in `filesystem.deny`. Nor is a listed variable's value that is not absolute, even where the
+  tool expands it itself (a literal `~/…` or a relative `$PIPX_HOME`, which pipx expands).
+- **The environment that counts is `sallyd`'s own, read once when it starts.** A variable set
+  only in the user's shell is not seen, so a daemon started with a minimal environment has fewer
+  environment rules than the shell. `sally manifest validate` uses the CLI's environment and is
+  advisory.

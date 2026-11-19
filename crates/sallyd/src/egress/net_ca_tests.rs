@@ -59,6 +59,7 @@ fn session_settings_carry_the_ca_condition_and_the_timeout() {
         xdg_data_home: None,
         xdg_runtime_dir: None,
         podman_storage: Vec::new(),
+        env_dirs: Vec::new(),
         nproc: 8,
         mem_bytes: 16 << 30,
     };
