@@ -172,6 +172,13 @@ line per fact, with where it was found. Check a note again before relying on it 
 - Podman 4.9.3 rootless (cgroup v2, crun 1.14.1) accepts `--cpus` above the host's CPU count:
   `--cpus 34` on a 32-CPU host creates, starts and exits 0. Only the manifest validator bounds
   `runtime.cpus` by the host (`HostEnv.nproc`). (#99, the line 1 test)
+- Podman 4.9.3 rootless (cgroup v2), on an idle host: `podman rm --force --time 0 <id>` of a
+  container frozen with `podman pause` removes it, exit 0, with no `unpause` first. The removal
+  that fails on a frozen container is a loaded host's ("given PID did not die within
+  timeout": a process outlives podman's wait), which is why `remove_container` thaws and
+  retries. The orphan sweep's paused-orphan test therefore injects the failure: its podman
+  wrapper refuses `rm` while the real podman reports the container `paused`
+  (`tests/cleanup.rs`).
 
 ## Kernel and namespaces
 

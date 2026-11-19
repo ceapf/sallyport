@@ -93,8 +93,10 @@ included), egress connection (`egress.allow` with host:port and the pinned addre
 `egress.deny`/`egress.limit` with the reason, `egress.shed` for over-rate connections closed
 unread, `egress.close` with the address used and the byte counts, and per intercepted request
 `egress.request` (method + path, never bodies) and response `egress.response` with the secrets
-redacted and the bytes, names only; ARCHITECTURE §7 "Egress audit events"), approval, launch,
-and model import. The audit writer refuses the detail mark on any other event.
+redacted and the bytes, names only; ARCHITECTURE §7 "Egress audit events"), approval, launch
+and teardown (`sandbox.cleaned` when a failed launch's cleanup ends after a retry,
+`sandbox.orphan_remove_failed` after an orphan removal that failed; ARCHITECTURE §3.5), and
+model import. The audit writer refuses the detail mark on any other event.
 
 ### 1.1 Approval gates, acknowledgements, and `[data-can-leave]` (SI-5)
 

@@ -281,6 +281,21 @@ and removes only the directories this launch created: an id whose directories ex
 before anything is created, so a stopped session's kept `stage/` is never touched. The claims
 are released only once the container is confirmed gone.
 
+When that cleanup itself fails (`sandbox.refuse` names it `incomplete, kept: …`), the rest of
+it runs in its own task on the daemon's crash reporter; a panic in that task stops the daemon.
+While the mount-link probe or the container may exist it retries every 2 s without bound,
+holding the session's claim and auditing nothing. Once both are confirmed gone, the directories
+get at most three more tries (`STOP_RETRIES_AFTER_REMOVAL`, the bound a stop nobody received
+uses); a first try that removed both and failed only on the directories starts there. Then, in
+this order: `sandbox.cleaned` (`role`, the `container` and `probe` names or null, `attempts`
+counting every try, `directories: removed|kept`; no decision and no podman text; directories
+given up also get one oplog error line with the last error), the claim freed, and a workspace's
+secret forms released. A failed append is an oplog line, and the claim is freed and the forms
+released anyway. So a failed launch holds its claim until its containers are confirmed gone and
+its directories removed or given up. Open risk: until it is removed, such a container has no
+disk watchdog, and no egress (its listener was dropped with the launch); if `sallyd` exits
+first, the next start's sweep removes it, and conmon's backstop bounds it meanwhile.
+
 0. **Image** (architect Q58). The workspace image is resolved first: the manifest's
    `runtime.image`, else the bundled default. While no bundled image is installed (#88) the
    default is absent, and a manifest without `runtime.image` is refused `no-default-image`
@@ -305,8 +320,18 @@ are released only once the container is confirmed gone.
    removed. The label is compared in `sandbox::orphans`, after podman's own label filter. A
    launch reserves its id before it creates anything, so no sweep takes a launch in progress; a
    container a stop removes during the sweep drops out of its second listing; a failed periodic
-   sweep is an oplog line, retried at the next. The listing asks podman for one label only,
-   `<full ID> <name> <installation label>`, each a JSON string, never the whole label set: a
+   sweep is an oplog line, retried at the next. Each orphan is removed by its full ID through
+   the removal a stop uses (`rm`, then `container exists`; a container still there is thawed
+   with `unpause` and the `rm` retried), so an orphan a killed `sallyd` left paused in a stage
+   walk is removed too. `sandbox.orphan_removed` is written before each attempt, and a failed
+   append ends the sweep at once. A removal that fails (a failed existence check included) gets
+   one oplog error line and then `sandbox.orphan_remove_failed` (`deny`, the name, the ID and
+   the sweep, the error as `detail`), and the sweep goes on to the next orphan. It then fails
+   with `<k> of <n> orphaned containers not removed; first: <name>`, no podman text: the startup
+   sweep refuses the start, a periodic one logs it and tries again at the next, so an orphan
+   that stays stuck gets one pair of entries per periodic sweep. The listing asks podman for
+   one label only, `<full ID> <name> <installation label>`, each a JSON string, never the
+   whole label set: a
    container's labels include its image's, so a line would be as long as an image author likes
    (architect Q307). A line is daemon-bounded (ID, name and UUID): at most 179 bytes for a
    session container, 182 for an inference instance. A listing over 64 KiB is refused whole,
@@ -1043,8 +1068,8 @@ The session registry (`sallyd::session`, Task 12, architect Q57) owns every live
 **Start**, in this order:
 1. `launch_workspace` (§3.5): the image, the overlap claims and fd budget reserved,
    `sandbox.launch` audited, the workspace container started. A failed launch is the
-   launcher's `sandbox.refuse` only, with no `session.start`, `session.stop` or
-   `session.closed`.
+   launcher's `sandbox.refuse` only (and `sandbox.cleaned` when its cleanup was retried,
+   §3.5), with no `session.start`, `session.stop` or `session.closed`.
 2. The container's init is watched for exit.
 3. Approvals, tools and the agent server are built in memory.
 4. Audit `session.start` (`model: {kind: "none"}` until a session can have a model).
@@ -1704,11 +1729,12 @@ sallyport/
   The audit log and the operational log redact every live session's forms (#85,
   `sallyd::session::secrets`, Q219, Q220). A session's forms enter both redactors when its
   egress has loaded them, before `net.sock` is bound or a container exists. They leave after
-  the session's last entry: `sandbox.refuse` for a refused launch, `session.closed` (§5.4) for
-  a session. A value two live sessions share stays redacted until both have left. A stored
-  value no live session is granted is in neither redactor (Q275): keeping every stored value
-  resident would need a second store loader. Revisit this if any new path lets a store value
-  reach a sandbox other than the user's own mount or an upstream echo. The egress
+  the session's last entry: `sandbox.refuse` for a refused launch (`sandbox.cleaned` when its
+  cleanup was retried, §3.5), `session.closed` (§5.4) for a session. A value two live sessions
+  share stays redacted until both have left. A stored value no live session is granted is in
+  neither redactor (Q275): keeping every stored value resident would need a second store
+  loader. Revisit this if any new path lets a store value reach a sandbox other than the
+  user's own mount or an upstream echo. The egress
   sink of a proxy session with secret grants (interception) also redacts each of its entries
   with that session's own forms, read from its `Redaction` (the patterns `own_masked` masks
   with), masking its declared texts uncut, before the writer sees it (`SessionRedacted`, Q249, Q278). So an egress entry that

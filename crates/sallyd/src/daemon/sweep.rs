@@ -5,9 +5,12 @@
 //! the overlap rule does not know. Every [`ORPHAN_SWEEP`] the daemon removes this installation's
 //! session containers that no live session owns (`Launcher::remove_orphans`, matched on the
 //! installation label, never by name alone: architect Q64; each removal audited
-//! `sandbox.orphan_removed` with `sweep: periodic` before it). A container without the label is
-//! never removed. A failed sweep is an oplog line and is tried again at the next tick; only the
-//! startup sweep refuses to start. The task's first act is the oplog line `orphan sweep started`,
+//! `sandbox.orphan_removed` with `sweep: periodic` before each attempt). A container without the
+//! label is never removed. A removal that fails, after the thaw and retries every removal makes,
+//! is audited `sandbox.orphan_remove_failed` and the sweep goes on to the others; the sweep then
+//! fails. A failed sweep is an oplog line and is tried again at the next tick, so an orphan that
+//! stays stuck gets one attempt and one failure entry per tick; only the startup sweep refuses
+//! to start. The task's first act is the oplog line `orphan sweep started`,
 //! which `tests/daemon.rs` reads to prove `serve` starts it.
 
 use std::sync::Arc;
