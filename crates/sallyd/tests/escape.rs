@@ -190,9 +190,39 @@ async fn launch_image(
         .map_err(|e| format!("{e:?}"))
 }
 
+/// Control (#122) for the two image tests below: the product workspace argv for `mode` from
+/// `image`, with `leave_out` taken out, started by hermetic podman; the host folder `dir` must
+/// then gain `entry`. The container is removed and the entry deleted, so the host folder is as
+/// it was for the product leg.
+async fn image_control(
+    x: &Lx,
+    dir: &Path,
+    image: &sallyd::sandbox::ImageRef,
+    mode: &str,
+    leave_out: LeaveOut<'_>,
+    entry: &str,
+) {
+    let before = tree(dir);
+    let tag = format!("c{mode}");
+    let id = x
+        .control_workspace_image(&manifest(x, mode), &tag, image, leave_out)
+        .await;
+    let after = tree(dir);
+    x.hermetic(&["rm".to_owned(), "-f".to_owned(), "-v".to_owned(), id])
+        .await;
+    assert!(
+        after.contains(&entry.to_owned()),
+        "control: {mode}: the host folder gained no {entry}: {after:?}"
+    );
+    std::fs::remove_dir(dir.join(entry)).unwrap();
+    assert_eq!(tree(dir), before, "control: {mode}: cleaned up");
+}
+
 /// RT-FS-02, the working directory (security review): an image whose config names a missing
 /// working directory below an `ro` or a `brokered` mount's guest path creates nothing in the
 /// host folder. The launcher sets the working directory to "/", so the launch starts there.
+/// Control (#122), asserted first in each mode: the same image and product argv with
+/// `--workdir /` taken out creates `made-at-init` in the host folder.
 #[test]
 fn rt_fs_02_the_image_working_directory_creates_nothing_in_a_mount() {
     rt().block_on(async {
@@ -201,6 +231,8 @@ fn rt_fs_02_the_image_working_directory_creates_nothing_in_a_mount() {
         host_file(&x, "code/myproject/README", "keep\n");
         let image = image_with("WORKDIR /workspace/p/made-at-init\n");
         for mode in ["ro", "brokered"] {
+            let entry = "made-at-init";
+            image_control(&x, &dir, &image, mode, LeaveOut::Workdir, entry).await;
             let before = tree(&dir);
             assert!(before.contains(&"README".to_owned()), "control: {before:?}");
             let got = launch_image(&x, &manifest(&x, mode), image.clone(), mode).await;
@@ -223,6 +255,8 @@ fn rt_fs_02_the_image_working_directory_creates_nothing_in_a_mount() {
 /// RT-FS-02, image volumes (security review): an image that declares a volume below an `ro` or
 /// a `brokered` mount's guest path creates nothing in the host folder. Image-declared volumes
 /// are disabled, so the launch starts with no extra mount.
+/// Control (#122), asserted first in each mode: the same image and product argv with
+/// `--image-volume=ignore` taken out creates `vol` in the host folder.
 #[test]
 fn rt_fs_02_an_image_volume_creates_nothing_in_a_mount() {
     rt().block_on(async {
@@ -231,6 +265,7 @@ fn rt_fs_02_an_image_volume_creates_nothing_in_a_mount() {
         host_file(&x, "code/myproject/README", "keep\n");
         let image = image_with("VOLUME /workspace/p/vol\n");
         for mode in ["ro", "brokered"] {
+            image_control(&x, &dir, &image, mode, LeaveOut::ImageVolume, "vol").await;
             let before = tree(&dir);
             assert!(before.contains(&"README".to_owned()), "control: {before:?}");
             let got = launch_image(&x, &manifest(&x, mode), image.clone(), mode).await;

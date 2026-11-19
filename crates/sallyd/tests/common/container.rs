@@ -855,23 +855,38 @@ impl Lx {
         tag: &str,
         leave_out: LeaveOut<'_>,
     ) -> String {
-        let argv = self.product_workspace_argv(v, tag);
+        let argv = self.product_workspace_argv(v, tag, &test_image());
         self.control(argv, leave_out).await
     }
 
-    /// The product-built workspace argv for `v` and session `tag`, its directories made.
-    fn product_workspace_argv(&self, v: &ValidatedManifest, tag: &str) -> Vec<String> {
+    /// [`Lx::control_workspace`] from `image` (an [`image_with`] image) instead of the test
+    /// image. The [`LeaveOut`] variants that add binds need the test image, so they are not
+    /// used here.
+    #[allow(dead_code)] // Only the escape tests run image controls.
+    pub async fn control_workspace_image(
+        &self,
+        v: &ValidatedManifest,
+        tag: &str,
+        image: &ImageRef,
+        leave_out: LeaveOut<'_>,
+    ) -> String {
+        let argv = self.product_workspace_argv(v, tag, image);
+        self.control(argv, leave_out).await
+    }
+
+    /// The product-built workspace argv for `v`, session `tag` and `image`, its directories
+    /// made.
+    fn product_workspace_argv(
+        &self,
+        v: &ValidatedManifest,
+        tag: &str,
+        image: &ImageRef,
+    ) -> Vec<String> {
         let paths = self.paths(tag);
         let dirs = SessionDirs::create(&paths, &self.xdg, &[], 0).unwrap();
         let scan = sallyd::sandbox::scan_mounts(v, &ScanLimits::default()).unwrap();
-        sallyd::sandbox::workspace_argv(
-            &self.common_args(&dirs),
-            &paths,
-            v,
-            &scan,
-            Some(&test_image()),
-        )
-        .unwrap()
+        sallyd::sandbox::workspace_argv(&self.common_args(&dirs), &paths, v, &scan, Some(image))
+            .unwrap()
     }
 
     /// RT-AG-16 (#92, architect Q196): the product-built workspace argv for `v` and session
@@ -880,7 +895,7 @@ impl Lx {
     /// no `sallyd` at all; the container id.
     #[allow(dead_code)] // Only the launch tests run the backstop.
     pub async fn backstop_workspace(&self, v: &ValidatedManifest, tag: &str, secs: u64) -> String {
-        let mut argv = self.product_workspace_argv(v, tag);
+        let mut argv = self.product_workspace_argv(v, tag, &test_image());
         let at = only_timeout(&argv);
         let want = v.manifest().runtime.timeout.as_secs() + 300;
         assert_eq!(argv[at + 1], want.to_string(), "the product backstop");
@@ -917,6 +932,15 @@ impl Lx {
             LeaveOut::Timeout => {
                 let at = only_timeout(&argv);
                 argv.drain(at..at + 2);
+            }
+            LeaveOut::Workdir => {
+                let at = only(&argv, "--workdir");
+                assert_eq!(argv[at + 1], "/", "the product working directory");
+                argv.drain(at..at + 2);
+            }
+            LeaveOut::ImageVolume => {
+                let at = only(&argv, "--image-volume=ignore");
+                argv.remove(at);
             }
         }
         self.create_and_start(argv).await
@@ -964,6 +988,26 @@ pub enum LeaveOut<'a> {
     NonRecursive { guest: &'a str },
     /// The conmon backstop (#92): `--timeout` and its value are removed.
     Timeout,
+    /// The fixed working directory: `--workdir` and its value are removed, so the image's own
+    /// working directory applies.
+    Workdir,
+    /// Disabled image volumes: `--image-volume=ignore` is removed, so the image's volumes are
+    /// created.
+    ImageVolume,
+}
+
+/// The index of the argv's one argument starting with `flag`; panics unless there is exactly
+/// one and it is `flag` itself.
+fn only(argv: &[String], flag: &str) -> usize {
+    let at: Vec<usize> = argv
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.starts_with(flag))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(at.len(), 1, "exactly one {flag} in {argv:?}");
+    assert_eq!(argv[at[0]], flag, "{flag} as one token");
+    at[0]
 }
 
 /// The index of the argv's one `--timeout` (its value follows); panics unless there is exactly
