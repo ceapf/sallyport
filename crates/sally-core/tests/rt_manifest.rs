@@ -785,21 +785,33 @@ fn mount(host: &str, mode: &str) -> String {
     )
 }
 
-/// Makes `~/<link> -> ~/<target>` in the fixture home, creating the link's folder.
+/// Makes `~/<link> -> ~/<target>` in the fixture home, creating the link's folder. Returns
+/// how a refusal names it: "<target>, which <link>".
 fn link(f: &Fixture, link: &str, target: &str) -> String {
     let l = f.home().join(link);
+    let t = f.home().join(target);
     std::fs::create_dir_all(l.parent().unwrap()).unwrap();
-    std::os::unix::fs::symlink(f.home().join(target), &l).unwrap();
-    l.display().to_string()
+    std::os::unix::fs::symlink(&t, &l).unwrap();
+    format!("{}, which {}", t.display(), l.display())
 }
 
-/// Refused `denylisted` at the mount, with a message naming `link`.
+/// A mount of `host` is refused `denylisted`, and the message says it contains the link's
+/// target, naming the link: "<host> contains <target>, which <link> points to: …". A message
+/// past the diagnostic cap (300 characters, MANIFEST_SPEC §4; a long fixture root) is checked
+/// up to its cut.
 #[track_caller]
-fn refused_naming(f: &Fixture, body: &str, link: &str) {
-    let r = f.load(body);
+fn refused_naming(f: &Fixture, host: &str, mode: &str, named: &str) {
+    let r = f.load(&mount(host, mode));
     assert_rejects(&r, "filesystem.mounts[0].host", Code::Denylisted);
-    let msg = rendered(&r).join("\n");
-    assert!(msg.contains(link), "{msg}");
+    let msg = &r.as_ref().unwrap_err().errors[0].message;
+    let want = format!("{host:?} contains {named} points to: ");
+    let shown = msg
+        .strip_suffix("...")
+        .filter(|_| msg.chars().count() == 300);
+    match shown {
+        Some(head) => assert!(want.starts_with(head) || head.starts_with(&want), "{msg}"),
+        None => assert!(msg.starts_with(&want), "{msg}"),
+    }
 }
 
 /// A symlink inside a protected folder makes its target part of what the host runs or loads:
@@ -820,20 +832,20 @@ fn rt_fs_19_a_link_out_of_a_protected_folder_protects_its_target() {
 
     // `~/.local/bin/t -> ~/tools/t/bin/t` (pipx / uv tool layout).
     let t = link(&f, ".local/bin/t", "tools/t/bin/t");
-    refused_naming(&f, &body, &t);
-    refused_naming(&f, &mount("~/tools", "ro"), &t);
+    refused_naming(&f, "~/tools/t", "rw", &t);
+    refused_naming(&f, "~/tools", "ro", &t);
     // A manifest validated before the link is refused by the library's re-check after it.
     let e = before.recheck_mounts(&f.env).unwrap_err();
     assert_eq!(e.errors[0].code, Code::Denylisted, "{e:#?}");
     // A config folder linked out (stow), even read-only.
     let gh = link(&f, ".config/gh", "dotfiles/gh");
-    refused_naming(&f, &mount("~/dotfiles", "ro"), &gh);
+    refused_naming(&f, "~/dotfiles", "ro", &gh);
     // A home dotfile.
     let rc = link(&f, ".bashrc", "rc/bashrc");
-    refused_naming(&f, &mount("~/rc", "rw"), &rc);
+    refused_naming(&f, "~/rc", "rw", &rc);
     // A dangling link protects its lexical target before it exists.
     let gone = link(&f, ".local/bin/gone", "later/gone");
-    refused_naming(&f, &mount("~/later", "rw"), &gone);
+    refused_naming(&f, "~/later", "rw", &gone);
 
     // Allow twin, with every link above in place: an ordinary folder, a sibling of a link's
     // target, and a link whose target is already inside a rule changes nothing.
