@@ -844,9 +844,9 @@ A request with one 2026 key but not the other, or with neither on a connection t
 **Bounds** (each a named constant with a boundary test): frames 256 KiB (an oversize frame is
 recorded, then the connection closes); nesting depth 64; ids ≤ 128 bytes; method names ≤ 64
 bytes; tool names 1–128 bytes; duplicate JSON keys refused. Per session: 8 connections (the
-listener stops accepting at the cap), 16 `tools/call` in flight, replies not yet written included (the
-17th is `-32000` `too-many-in-flight`, recorded first), a reused in-flight id `-32600`, and 20 requests read per
-second with a burst of 40. Over the rate the broker stops reading (backpressure): requests are
+listener stops accepting at the cap), 16 `tools/call` in flight, replies not yet written
+included (the 17th is `-32000` `too-many-in-flight`, recorded first), a reused in-flight id
+`-32600`, and 20 requests read per second with a burst of 40. Over the rate the broker stops reading (backpressure): requests are
 slowed, never dropped unrecorded. A reply the peer does not take within 10 s closes the
 connection. Prompts: at most `approvals.max_pending` wait at once, and new ones come at most one
 per 2 s with a burst of `max_pending` (`approvals::queue::REFILL`, tunable); a call over either

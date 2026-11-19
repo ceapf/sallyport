@@ -354,9 +354,9 @@ environment (passwd entry only if `$HOME` is unset or relative).
     `$ZDOTDIR`, `$PNPM_HOME`, `$VOLTA_HOME`, `$BUN_INSTALL`, `$PYTHONUSERBASE`, `$PIPX_HOME`,
     `$PIPX_BIN_DIR`, `$UV_TOOL_DIR`, `$GRADLE_USER_HOME`, `$PASSWORD_STORE_DIR`, `bin` and
     `pkg` under each `$GOPATH` element (at most 32 folders), and every `$PATH` entry (at most
-    256); past either bound the list is incomplete (below). Messages name the variable ("is inside /opt/go/bin (from $GOBIN)"). A
-    folder named this way that is `/`, a home, or an ancestor of one is kept as a rule, so it
-    refuses every mount under it (§6);
+    256); past either bound the list is incomplete (below). Messages name the variable ("is
+    inside /opt/go/bin (from $GOBIN)"). A folder named this way that is `/`, a home, or an
+    ancestor of one is kept as a rule, so it refuses every mount under it (§6);
   - `/etc`, `/proc`, `/sys`, `/dev`, `/run`, `/var/run`, `/boot`, `/root`, `/mnt`,
     `/usr/lib/wsl`, `/tmp`, `/var/tmp` (`/tmp` holds other programs' Unix sockets — ssh-agent,
     X11 — and a read-only bind does not stop `connect()`, so it would be a path around SI-1);
