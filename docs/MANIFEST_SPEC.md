@@ -87,13 +87,14 @@ policy:                           # reserved for v2 signed org policies; parsed 
 - `runtime.cpus` is a number with at most three decimals; NaN/infinity are parse errors.
 - Sizes are `<n>B|KiB|MiB|GiB|TiB` (decimal `GB` is an error); durations are `<n>s|m|h`.
 
-`audit.level: actions` keeps every decision record: one per tool call, egress connection
-(`egress.allow` with host:port and the pinned addresses, `egress.deny`/`egress.limit` with the
-reason, `egress.close` with the address used and the byte counts, and per intercepted response
-`egress.response` with the secrets redacted and the bytes, names only; ARCHITECTURE §7 "Egress
-audit events"), approval, launch, and model import. `full` adds
-per-request lines for intercepted HTTP (method + path, never bodies), `fs_read` events, and
-inference metadata.
+`audit.level: actions` drops one kind of entry, inference response metadata (`llm.response`),
+which `full` adds. Every other entry is kept at both levels: one per tool call (`fs_read`
+included), egress connection (`egress.allow` with host:port and the pinned addresses,
+`egress.deny`/`egress.limit` with the reason, `egress.shed` for over-rate connections closed
+unread, `egress.close` with the address used and the byte counts, and per intercepted request
+`egress.request` (method + path, never bodies) and response `egress.response` with the secrets
+redacted and the bytes, names only; ARCHITECTURE §7 "Egress audit events"), approval, launch,
+and model import. The audit writer refuses the detail mark on any other event.
 
 ### 1.1 Approval gates, acknowledgements, and `[data-can-leave]` (SI-5)
 
@@ -242,14 +243,21 @@ an object carrying a POSIX ACL is open to its owner only (architect ruling Q39; 
 Hosts are written canonically (lowercase ASCII/punycode, no trailing dot) or rejected. An exact
 host (here and in `secrets[].inject.host`) has at least two labels: `localhost` or `intranet`
 is rejected, since the proxy refuses such names and looks every name up absolute. A
-wildcard over a suffix where anyone can register hosts (`*.github.io`, `*.s3.amazonaws.com`,
-`*.workers.dev`, `*.r2.dev`, `*.ngrok-free.app`, … — one maintained constant,
-`host::SHARED_SUFFIXES`; TODO(v2) derive it from the Public Suffix List) counts as unrestricted and needs
-`acknowledge_unrestricted_egress: true` like `"*"`. Matching: lowercase, trailing dot stripped; `*.example.com` matches `a.example.com` and
-`a.b.example.com` but **not** `example.com` and **not** `example.com.evil.net`. IP literals in
-any form are always denied. `"*"` matches any hostname but still goes through the IP-range
-filter (no loopback/private/link-local/host-own) and requires
-`acknowledge_unrestricted_egress: true`.
+wildcard that reaches hosts anyone can register counts as unrestricted and needs
+`acknowledge_unrestricted_egress: true` like `"*"`: its base is a listed shared-hosting suffix
+(`*.github.io`, `*.workers.dev`, `*.r2.dev`, `*.ngrok-free.app`, …), a parent of a listed entry
+(`*.googleapis.com`), or a shared tree or anywhere under one, a provider whose registrable hosts
+sit at any depth (`*.amazonaws.com`, `*.windows.net`, `*.s3.us-east-1.amazonaws.com`,
+`*.web.core.windows.net`, `*.a.run.app`). The lists are two maintained constants,
+`host::SHARED_SUFFIXES` and `host::SHARED_TREES` (read from the Public Suffix List's private
+section; `host::SHARED_TREES` states when an entry is a tree, and its two exceptions); the
+summary marks such a rule "anyone can register these". The lists are
+curated, so a wildcard over a shared-hosting suffix they do not name is an ordinary rule
+(TODO(#235): derive them from the Public Suffix List). Matching: lowercase, trailing dot
+stripped; `*.example.com` matches `a.example.com` and `a.b.example.com` but **not**
+`example.com` and **not** `example.com.evil.net`. IP literals in any form are always denied.
+`"*"` matches any hostname but still goes through the IP-range filter (no
+loopback/private/link-local/host-own) and requires `acknowledge_unrestricted_egress: true`.
 
 ### SecretGrant
 ```yaml
