@@ -114,7 +114,7 @@ pub enum FsError {
     ContainerGone,
     /// Out of space or quota.
     NoSpace,
-    /// A write the filesystem's free space is below the session's free-space floor for.
+    /// The filesystem written to has less free space than the session's free-space floor.
     DiskFloor,
     /// The sandbox's identity may not do this (or the file system refused it).
     Permission,

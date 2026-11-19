@@ -136,14 +136,15 @@ pub(super) fn watch_plan(
     let stage = StageWatch::of(v, paths, scan);
     // `rw` roots are written by the sandbox, `brokered` ones by the broker's file tools: both
     // grow the host folder's filesystem.
-    let rw: Vec<(usize, &std::path::Path)> = v
+    let written: Vec<(usize, &std::path::Path)> = v
         .mounts()
         .iter()
         .enumerate()
         .filter(|(_, m)| matches!(m.mode, MountMode::Rw | MountMode::Brokered))
         .map(|(i, m)| (i, m.host.as_path()))
         .collect();
-    let watched = watch(paths.data_root(), stage.is_some(), &rw).map_err(LaunchError::DiskSpace)?;
+    let watched =
+        watch(paths.data_root(), stage.is_some(), &written).map_err(LaunchError::DiskSpace)?;
     if watched.is_empty() {
         return Ok(None);
     }
@@ -820,6 +821,23 @@ mod tests {
         assert!(got.stage.is_none());
         let ro = manifest("    - {host: \"~/a\", guest: /workspace/a, mode: ro}\n");
         assert!(plan(&ro).is_none(), "a ro mount is not writable");
+        // Deny: under a floor no filesystem has free, the brokered mount's refuses the launch,
+        // and a ro-only session still has nothing to watch.
+        let full = DiskFloor {
+            min_bytes: u64::MAX,
+            percent: 0,
+        };
+        let refused = |v: &ValidatedManifest| {
+            let scan = super::super::scan::scan_mounts(v, &Default::default()).unwrap();
+            watch_plan(v, &paths, &scan, &full)
+        };
+        match refused(&brokered) {
+            Err(LaunchError::DiskSpace(msg)) => {
+                assert!(msg.starts_with("filesystem.mounts[1]: "), "{msg}");
+            }
+            other => panic!("{:?}", other.map(|p| p.is_some())),
+        }
+        assert!(refused(&ro).unwrap().is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

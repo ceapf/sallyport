@@ -1,9 +1,10 @@
 //! The free-space floor (#14, maintainer design after the 6c-1 reviews): the hard, race-free
 //! guarantee that no sandbox fills a host disk.
 //!
-//! A session's watched filesystems are the ones its sandbox can write to: the filesystem of
-//! Sallyport's state directory when the session has staged mounts or `.git` overlays, and the
-//! filesystem of every `rw` mount root. Each is held open (an `O_PATH` fd) for the session's
+//! A session's watched filesystems are the ones written on its behalf: the filesystem of
+//! Sallyport's state directory when the session has staged mounts or `.git` overlays, the
+//! filesystem of every `rw` mount root (written by the sandbox), and that of every `brokered`
+//! mount root (written by the broker's file tools). Each is held open (an `O_PATH` fd) for the session's
 //! lifetime and polled with `fstatfs`. When the space available to unprivileged users falls below
 //! the floor, `max(min_bytes, percent % of the filesystem)`, the session is killed. A launch is
 //! refused unless every watched filesystem has the floor free, plus `runtime.stage_size` on the
@@ -104,14 +105,15 @@ fn open_dir(path: &Path) -> Result<(OwnedFd, u64), String> {
 }
 
 /// Opens the watched filesystems of a session, one per device: `state` (the nearest existing
-/// ancestor of `state_dir`) when `writes_state`, and each `rw` mount root. Blocking.
+/// ancestor of `state_dir`) when `writes_state`, and each written mount root (`rw` and
+/// `brokered`). Blocking.
 ///
 /// # Errors
 /// A path that cannot be opened.
 pub(super) fn watch(
     state_dir: &Path,
     writes_state: bool,
-    rw_roots: &[(usize, &Path)],
+    written_roots: &[(usize, &Path)],
 ) -> Result<Vec<Watched>, String> {
     let mut out: Vec<(u64, Watched)> = Vec::new();
     if writes_state {
@@ -128,7 +130,7 @@ pub(super) fn watch(
             },
         ));
     }
-    for (i, root) in rw_roots {
+    for (i, root) in written_roots {
         let (fd, dev) = open_dir(root)?;
         if out.iter().all(|(d, _)| *d != dev) {
             out.push((
