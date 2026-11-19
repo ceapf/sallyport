@@ -66,6 +66,20 @@ fn absent(kind: ErrorKind) -> bool {
     )
 }
 
+/// One read's result while reading `dir`: the value, `None` when the error is [`absent`] (skip
+/// it), or [`Incomplete::Unreadable`] naming `dir` for any other error. Every read of the scan
+/// goes through here, so the classification is decided, and tested, in one place.
+fn settle<T>(read: std::io::Result<T>, dir: &Path) -> Result<Option<T>, Incomplete> {
+    match read {
+        Ok(v) => Ok(Some(v)),
+        Err(e) if absent(e.kind()) => Ok(None),
+        Err(e) => Err(Incomplete::Unreadable {
+            folder: dir.to_owned(),
+            error: e.to_string(),
+        }),
+    }
+}
+
 impl Scan {
     /// A scan with `budget` entries to read.
     pub(crate) fn with_budget(budget: usize) -> Self {
@@ -121,38 +135,26 @@ impl Scan {
         if !self.seen.insert(key) {
             return Ok(());
         }
-        let unreadable = |e: std::io::Error| Incomplete::Unreadable {
-            folder: dir.to_owned(),
-            error: e.to_string(),
-        };
-        let entries = match std::fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(e) if absent(e.kind()) => return Ok(()),
-            Err(e) => return Err(unreadable(e)),
+        let Some(entries) = settle(std::fs::read_dir(dir), dir)? else {
+            return Ok(());
         };
         for entry in entries {
             self.left = self.left.checked_sub(1).ok_or_else(|| Incomplete::Budget {
                 folder: dir.to_owned(),
             })?;
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(e) if absent(e.kind()) => continue,
-                Err(e) => return Err(unreadable(e)),
+            let Some(entry) = settle(entry, dir)? else {
+                continue;
             };
-            let kind = match entry.file_type() {
-                Ok(kind) => kind,
-                Err(e) if absent(e.kind()) => continue,
-                Err(e) => return Err(unreadable(e)),
+            let Some(kind) = settle(entry.file_type(), dir)? else {
+                continue;
             };
             let path = entry.path();
             if kind.is_symlink() {
                 if !keep(&entry.file_name()) {
                     continue;
                 }
-                let text = match std::fs::read_link(&path) {
-                    Ok(text) => text,
-                    Err(e) if absent(e.kind()) => continue,
-                    Err(e) => return Err(unreadable(e)),
+                let Some(text) = settle(std::fs::read_link(&path), dir)? else {
+                    continue;
                 };
                 self.links.push(Link {
                     link: path,
@@ -313,6 +315,25 @@ mod tests {
         let file = t.file("f");
         assert_eq!(links(&t.0.join("absent"), DEPTH, 0), Ok(Vec::new()));
         assert_eq!(links(&file, DEPTH, 0), Ok(Vec::new()));
+    }
+
+    /// A read's value passes; an absent one is skipped; any other error stops the scan, naming
+    /// the folder and the error.
+    #[test]
+    fn settle_skips_absence_and_stops_on_other_errors() {
+        let dir = Path::new("/d");
+        assert_eq!(settle(Ok(7), dir), Ok(Some(7)));
+        for k in [ErrorKind::NotFound, ErrorKind::PermissionDenied] {
+            assert_eq!(settle::<u8>(Err(k.into()), dir), Ok(None), "{k:?}");
+        }
+        let e = std::io::Error::other("boom");
+        assert_eq!(
+            settle::<u8>(Err(e), dir),
+            Err(Incomplete::Unreadable {
+                folder: dir.to_owned(),
+                error: "boom".to_owned(),
+            })
+        );
     }
 
     #[test]
