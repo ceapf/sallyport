@@ -1212,8 +1212,10 @@ sallyport/
 │   ├── 00_DECISIONS.md  01_SCOPE.md  ARCHITECTURE.md  MANIFEST_SPEC.md  MILESTONES.md
 │   └── reports/M*.md                # written by Claude Code at each milestone end
 └── .github/workflows/
-    ├── ci.yml                       # fmt, clippy -D warnings, test, cargo-deny, python lint/tests, ts lint/tests
-    └── redteam.yml                  # rootless podman on ubuntu-24.04; make redteam; fails on any attack success
+    ├── ci.yml                       # jobs: rust (fmt, clippy -D warnings, test), redteam (rootless podman on
+    │                                #   ubuntu-24.04; make redteam; fails on any attack success), coverage,
+    │                                #   zizmor, deny, fuzz, doctor-syntax
+    └── nightly.yml                  # mutation testing (make mutants, sharded mutants-wide-*)
 ```
 
 ## 7. Key implementation notes
