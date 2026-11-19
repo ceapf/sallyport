@@ -77,7 +77,7 @@ impl Launcher {
                 .await?;
             // By ID: a name re-used since the listing is another container (PS-L5). Through the
             // removal that thaws and retries: a `sallyd` killed in a stage walk leaves its
-            // container paused (architect Q563).
+            // container paused.
             match self.remove_container(&o.container).await {
                 Ok(()) => removed.push(o.name.clone()),
                 Err(e) => {
@@ -95,8 +95,8 @@ impl Launcher {
         }
     }
 
-    /// After a failed orphan removal: one oplog error line, then `sandbox.orphan_remove_failed`
-    /// (architect Q563). A failed append is one more oplog line; the sweep goes on either way.
+    /// After a failed orphan removal: one oplog error line, then `sandbox.orphan_remove_failed`.
+    /// A failed append is one more oplog line; the sweep goes on either way.
     async fn orphan_not_removed(&self, o: &Orphan, sweep: Sweep, e: &LaunchError) {
         let error = e.to_string();
         self.oplog.error(
@@ -188,7 +188,7 @@ impl Launcher {
 
     /// The rest of a failed launch's cleanup, whose first try (in the launch) failed with
     /// `first`; `tries` holds that try. Runs in its own task on the daemon's crash reporter
-    /// (architect Q559, Q562). While the probe or the container may exist it retries every
+    /// (ARCHITECTURE §3.5). While the probe or the container may exist it retries every
     /// [`STOP_RETRY`] without bound, holding the claim and auditing nothing; once both are
     /// confirmed gone the directories get at most [`STOP_RETRIES_AFTER_REMOVAL`] more tries.
     /// Then, in this order: `sandbox.cleaned` (with an oplog error line first when the

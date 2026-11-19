@@ -280,8 +280,8 @@ pub struct LauncherParts {
     /// creates, and the only one its orphan sweeps remove (Q64).
     pub installation: Installation,
     /// The daemon's crash reporter: a failed launch whose cleanup is retried in its own task
-    /// (architect Q559) reports a panic there, which stops the daemon. Not a session's: a
-    /// refused session has no reporter left.
+    /// reports a panic there, which stops the daemon. Not a session's: a refused session has no
+    /// reporter left.
     pub crash: CrashReporter,
 }
 

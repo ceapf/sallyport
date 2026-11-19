@@ -328,8 +328,8 @@ impl Launcher {
     /// when the caller stopped a handle first). When the cleanup removed everything the claim
     /// is freed before the entry and the forms released after it. Otherwise the rest of the
     /// cleanup goes on in its own task on the daemon's crash reporter, which writes
-    /// `sandbox.cleaned` and only then frees the claim and releases the forms (architect Q559,
-    /// Q562): the session stays live while a container may exist.
+    /// `sandbox.cleaned` and only then frees the claim and releases the forms: the session stays
+    /// live while a container may exist (ARCHITECTURE §3.5).
     async fn failed(
         self: &Arc<Self>,
         req: &Request,
@@ -370,7 +370,7 @@ impl Launcher {
     }
 
     /// After a refused workspace's last entry (`sandbox.refuse`, or `sandbox.cleaned` after a
-    /// retried cleanup), its secrets leave the logs' redactors (architect Q219, Q559). A harness
+    /// retried cleanup), its secrets leave the logs' redactors (architect Q219). A harness
     /// shares its session's id, so only a workspace releases them.
     pub(super) async fn forget(&self, held: &Held) {
         if held.role == Role::Workspace {
