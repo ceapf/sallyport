@@ -144,14 +144,22 @@ pub use super::locks::*;
 /// name). Each run owns its tags: `scripts/test-run.sh` untags only its own afterwards, and
 /// `--layers=false` leaves no untagged intermediate images (architect Q25).
 fn build(name: &str, entry: &str, shim: Option<&[u8]>) -> (String, String) {
+    build_with(name, entry, shim, "")
+}
+
+/// As [`build`], with `extra` appended to the Containerfile (it is part of the input key).
+fn build_with(name: &str, entry: &str, shim: Option<&[u8]>, extra: &str) -> (String, String) {
     use std::hash::{Hash, Hasher};
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/redteam/probe/probe.c");
     let mut h = std::hash::DefaultHasher::new();
     (BASE, entry, STAND_IN, std::fs::read(&src).unwrap(), shim).hash(&mut h);
+    if !extra.is_empty() {
+        extra.hash(&mut h);
+    }
     let tag = format!("localhost/{name}:{}-{:016x}", image_run(), h.finish());
     let _held = lock("test-image", true);
     if !podman(&["image", "exists", &tag]).status.success() {
-        build_image(&tag, entry, shim);
+        build_image(&tag, entry, shim, extra);
     }
     let out = podman(&["image", "inspect", "--format", "{{.Digest}}", &tag]);
     assert!(
@@ -169,7 +177,7 @@ fn build(name: &str, entry: &str, shim: Option<&[u8]>) -> (String, String) {
 /// The `llama-server` stand-in: it idles.
 const STAND_IN: &str = "#!/bin/sh\nexec sleep 2147483647\n";
 
-fn build_image(tag: &str, entry: &str, shim: Option<&[u8]>) {
+fn build_image(tag: &str, entry: &str, shim: Option<&[u8]>, extra: &str) {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("test-image-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -182,6 +190,7 @@ fn build_image(tag: &str, entry: &str, shim: Option<&[u8]>) {
         executable(&dir.join("sally-shim"), bytes);
         file.push_str(&format!("COPY sally-shim {SHIM}\n"));
     }
+    file.push_str(extra);
     std::fs::write(dir.join("Containerfile"), file).unwrap();
     executable(&dir.join("entry"), entry.as_bytes());
     executable(&dir.join("llama-server"), STAND_IN.as_bytes());
@@ -286,6 +295,15 @@ pub fn exiting_image() -> ImageRef {
     let r =
         IMAGE.get_or_init(|| build("sallyport-test-exit", "#!/nonexistent/sh\nexit 3\n", None).1);
     ImageRef::parse(r).unwrap()
+}
+
+/// As [`test_image`], with Containerfile lines `extra` (an image config or root filesystem an
+/// attacker chose). Same name, its own tag (the input key differs), so `scripts/test-run.sh`
+/// untags it with the run's other test images.
+pub fn image_with(extra: &str) -> ImageRef {
+    // The entry idles, as the stand-in does.
+    let (_, pinned) = build_with("sallyport-test", STAND_IN, None, extra);
+    ImageRef::parse(&pinned).unwrap()
 }
 
 /// Records every audit entry's event name and arguments; appends of the events named by

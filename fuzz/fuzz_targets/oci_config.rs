@@ -58,7 +58,6 @@ fn fixture() -> (Intent, Facts) {
         image: ImageConfig {
             env: Some(vec!["PATH=/usr/bin:/bin".into()]),
             entrypoint: None,
-            working_dir: Some("/".into()),
             stop_signal: None,
         },
         init: "/usr/bin/catatonit".into(),

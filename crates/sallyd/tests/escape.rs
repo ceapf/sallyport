@@ -156,6 +156,98 @@ fn rt_fs_02_an_ro_mount_is_read_only() {
     });
 }
 
+/// Every path below `dir`, relative and sorted; links are listed, never followed. Names only,
+/// not contents or modes: enough to show that nothing was created.
+fn tree(dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let e = e.unwrap();
+            let p = e.path();
+            out.push(p.strip_prefix(dir).unwrap().display().to_string());
+            if e.file_type().unwrap().is_dir() {
+                todo.push(p);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Launches the workspace manifest `v` from `image` instead of the test image.
+async fn launch_image(
+    x: &Lx,
+    v: &sally_core::manifest::ValidatedManifest,
+    image: sallyd::sandbox::ImageRef,
+    tag: &str,
+) -> Result<Running, String> {
+    let mut req = x.request(v, tag);
+    req.default_image = Some(image);
+    x.launcher
+        .launch_workspace(req)
+        .await
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// RT-FS-02, the working directory (security review): an image whose config names a missing
+/// working directory below an `ro` or a `brokered` mount's guest path creates nothing in the
+/// host folder. The launcher sets the working directory to "/", so the launch starts there.
+#[test]
+fn rt_fs_02_the_image_working_directory_creates_nothing_in_a_mount() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let dir = home(&x).join("code/myproject");
+        host_file(&x, "code/myproject/README", "keep\n");
+        let image = image_with("WORKDIR /workspace/p/made-at-init\n");
+        for mode in ["ro", "brokered"] {
+            let before = tree(&dir);
+            assert!(before.contains(&"README".to_owned()), "control: {before:?}");
+            let got = launch_image(&x, &manifest(&x, mode), image.clone(), mode).await;
+            let after = tree(&dir);
+            let started = got.as_ref().map(|_| ()).map_err(String::clone);
+            if let Ok(r) = got {
+                let (code, pwd) = exec(&r, "pwd").await;
+                x.stop(r).await;
+                assert_eq!((code, pwd.trim()), (0, "/"), "{mode}");
+            }
+            assert_eq!(
+                after, before,
+                "{mode}: the host folder changed ({started:?})"
+            );
+            assert!(started.is_ok(), "{mode}: {started:?}");
+        }
+    });
+}
+
+/// RT-FS-02, mount placement (security review): an image whose root filesystem holds a link at
+/// a mount destination (`/workspace/q`) that points into an earlier `ro` mount (`/workspace/p`)
+/// creates nothing in either host folder, whether the launch starts or is refused.
+#[test]
+fn rt_fs_02_an_image_link_at_a_mount_creates_nothing_in_an_earlier_one() {
+    rt().block_on(async {
+        let x = Lx::new();
+        host_file(&x, "code/myproject/README", "keep\n");
+        host_file(&x, "code/other/README", "keep\n");
+        let dirs = [home(&x).join("code/myproject"), home(&x).join("code/other")];
+        let image =
+            image_with("RUN mkdir -p /workspace && ln -s /workspace/p/made-by-link /workspace/q\n");
+        let v = x.f.load(&mounts(&[
+            mount("~/code/myproject", "/workspace/p", "ro"),
+            mount("~/code/other", "/workspace/q", "ro"),
+        ]));
+        let before: Vec<_> = dirs.iter().map(|d| tree(d)).collect();
+        let got = launch_image(&x, &v, image, "link").await;
+        let after: Vec<_> = dirs.iter().map(|d| tree(d)).collect();
+        let started = got.as_ref().map(|_| ()).map_err(String::clone);
+        if let Ok(r) = got {
+            x.stop(r).await;
+        }
+        eprintln!("mount-link launch: {started:?}");
+        assert_eq!(after, before, "a host folder changed ({started:?})");
+    });
+}
+
 /// RT-FS-03's reads through the host-made `evil -> ~/.ssh` and the sandbox-made `s2` (a link to
 /// the canary's absolute host path).
 const FS03_READS: [&str; 3] = [

@@ -78,6 +78,11 @@ impl SessionId {
 /// The container label naming the installation that created a container (architect Q64).
 pub const INSTALLATION_LABEL: &str = "sallyport.installation";
 
+/// Every container's working directory, chosen by the launcher (`--workdir`), never by the
+/// image: a runtime creates a missing working directory while it places the mounts, so an
+/// image-chosen one below a mount's guest path would land in the host folder.
+pub const WORKDIR: &str = "/";
+
 /// The id of one Sallyport installation (one state directory): a random UUID v4 in its
 /// lowercase hyphenated form. Every container the launcher creates carries it as
 /// [`INSTALLATION_LABEL`], and the orphan sweeps remove only containers that carry this

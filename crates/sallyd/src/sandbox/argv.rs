@@ -20,7 +20,7 @@ use super::oci::intent::{Built, Intent, Wanted};
 use super::scan::{GitScan, LaunchScan};
 use super::types::{
     ArgvError, CommonArgs, INSTALLATION_LABEL, ImageRef, InferenceSpec, OverlayDirs, Role,
-    SessionPaths, input,
+    SessionPaths, WORKDIR, input,
 };
 
 /// The entry point baked into the workspace and harness images.
@@ -187,6 +187,7 @@ impl Argv {
             "--user",
             &format!("{}:{}", c.ids.uid, c.ids.gid),
         ]);
+        a.push(["--workdir", WORKDIR]);
         Ok(a)
     }
 

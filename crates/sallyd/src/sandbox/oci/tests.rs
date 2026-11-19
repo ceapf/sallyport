@@ -40,7 +40,6 @@ fn facts() -> Facts {
         image: ImageConfig {
             env: Some(vec!["PATH=/usr/bin:/bin".into()]),
             entrypoint: None,
-            working_dir: Some("/".into()),
             stop_signal: None,
         },
         init: "/usr/bin/catatonit".into(),
@@ -542,18 +541,23 @@ fn the_environment_is_exactly_image_podman_and_argv_with_values_never_shown() {
     refused_with("image.Env", &intent(), &f, |_| {});
 }
 
+/// The working directory is the launcher's "/", whatever the image names: an image working
+/// directory below a mount destination (`/workspace/p`) does not move the expectation, so a
+/// config that follows it is refused and one at "/" is accepted.
 #[test]
-fn the_working_directory_is_the_image_s() {
-    refused("process.cwd", |v| v["process"]["cwd"] = json!("/tmp"));
+fn the_working_directory_is_the_launcher_s() {
+    let below = "/workspace/p/made-at-init";
     let mut f = facts();
-    f.image.working_dir = Some("/w".into());
-    refused_with("process.cwd", &intent(), &f, |_| {});
-    let mut v = good(&intent(), &f);
-    v["process"]["cwd"] = json!("/w");
-    check(&v, &intent(), &f).unwrap();
-    for wd in [None, Some(String::new())] {
-        f.image.working_dir = wd;
-        check(&good(&intent(), &f), &intent(), &f).unwrap();
+    f.image = ImageConfig::parse(
+        format!(r#"{{"Env":["PATH=/usr/bin:/bin"],"WorkingDir":"{below}"}}"#).as_bytes(),
+    )
+    .unwrap();
+    refused_with("process.cwd", &intent(), &f, |v| {
+        v["process"]["cwd"] = json!(below);
+    });
+    check(&good(&intent(), &f), &intent(), &f).unwrap();
+    for other in ["/tmp", "/workspace/p", "", "/w"] {
+        refused("process.cwd", |v| v["process"]["cwd"] = json!(other));
     }
 }
 

@@ -33,6 +33,8 @@ label=disable
 --userns=keep-id
 --user
 1000:1000
+--workdir
+/
 --tmpfs
 /tmp:rw,noexec,nosuid,nodev,size=1073741824
 --pids-limit

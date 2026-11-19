@@ -7,6 +7,7 @@ use super::config::{Capabilities, Process, Rlimit, User};
 use super::facts::Facts;
 use super::intent::Intent;
 use super::{Mismatch, ensure};
+use crate::sandbox::types::WORKDIR;
 
 /// `--init`: podman runs the checked catatonit at this path, then the command.
 pub const INIT_GUEST: &str = "/run/podman-init";
@@ -21,16 +22,10 @@ pub fn check(p: &Process, i: &Intent, f: &Facts, hostname: &str) -> Result<(), M
     check_user(&p.user, i)?;
     check_args(&p.args, i, f)?;
     check_env(&p.env, i, f, hostname)?;
-    let cwd = f
-        .image
-        .working_dir
-        .as_deref()
-        .filter(|d| !d.is_empty())
-        .unwrap_or("/");
     ensure(
-        p.cwd == cwd,
+        p.cwd == WORKDIR,
         "process.cwd",
-        "not the image's working directory",
+        "not the launcher's working directory",
     )?;
     check_caps(&p.capabilities)?;
     check_rlimits(&p.rlimits, f)?;

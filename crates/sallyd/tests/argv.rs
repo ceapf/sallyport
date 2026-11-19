@@ -298,7 +298,37 @@ fn every_role_starts_with_the_checked_runtime_and_has_the_section_6_1_flags() {
         let pair = |x: &str, y: &str| a.windows(2).filter(|w| w[0] == x && w[1] == y).count();
         assert_eq!(pair("--ulimit", "core=0"), 1, "{a:?}");
         assert_eq!(pair("--security-opt", "no-new-privileges"), 1, "{a:?}");
+        // The launcher, not the image, chooses the working directory.
+        assert_eq!(pair("--workdir", "/"), 1, "{a:?}");
     }
+}
+
+/// The checker holds the working directory to "/", as two tokens: any other value, the `=`
+/// spelling and the short flag are refused, and so is an argv without it. (Every role's builder
+/// passing it is held by `every_role_starts_with_the_checked_runtime_…`.)
+#[test]
+fn checker_holds_the_working_directory_to_root() {
+    let f = Fx::new();
+    let (a, allowed) = base(&f);
+    check_argv(&a, &allowed).unwrap();
+    for new in [
+        &["--workdir", "/workspace/p"][..],
+        &["--workdir", "/workspace/p/made-at-init"],
+        &["--workdir", "/tmp"],
+        &["--workdir", ""],
+        &["--workdir=/"],
+        &["-w", "/"],
+    ] {
+        assert_forbidden(
+            &replacing(&a, "--workdir", new),
+            &allowed,
+            &format!("{new:?}"),
+        );
+    }
+    let i = a.iter().position(|x| x == "--workdir").unwrap();
+    let mut without = a[..i].to_vec();
+    without.extend_from_slice(&a[i + 2..]);
+    assert_forbidden(&without, &allowed, "without --workdir");
 }
 
 #[test]
