@@ -491,6 +491,38 @@ pub(crate) struct DirId {
     pub(crate) ino: u64,
 }
 
+/// The most directories an identity chain walks before it gives up: deeper than any real path.
+const MAX_ANCESTORS: usize = 4096;
+
+/// The identities of `dir` and of each of its ancestors up to `/`, walking `..` from a directory
+/// handle, never the path string. `..` climbs the path the walk came in by, so the chain of a bind
+/// alias starts with the aliased folder's identity: two mounts of one folder, or of a folder and
+/// one inside it, share an element whatever their paths. The root is opened without following a
+/// symlink, and with `O_PATH`, so a search-only folder can be walked.
+///
+/// TODO(#17): a bind of a *subdirectory* hides its real parents from this chain; comparing
+/// `(st_dev, path inside the filesystem)` from mountinfo closes that. `sallyd`'s session
+/// reservation keeps its own copy of this walk (`sandbox::overlap`); that fix makes them one.
+pub(crate) fn identity_chain(dir: &Path) -> std::io::Result<Vec<DirId>> {
+    use rustix::fs::{Mode, OFlags};
+    let flags = OFlags::PATH | OFlags::DIRECTORY;
+    let mut fd = crate::fd::open(dir, flags | OFlags::NOFOLLOW, Mode::empty())?;
+    let mut chain = Vec::new();
+    for _ in 0..MAX_ANCESTORS {
+        let st = rustix::fs::fstat(&fd)?;
+        let id = DirId {
+            dev: st.st_dev,
+            ino: st.st_ino,
+        };
+        if chain.last() == Some(&id) {
+            return Ok(chain);
+        }
+        chain.push(id);
+        fd = crate::fd::openat(&fd, "..", flags, Mode::empty())?;
+    }
+    Err(std::io::Error::other("ancestor walk did not reach /"))
+}
+
 /// Checks a mount host path and returns its realpath and directory identity.
 ///
 /// Order matters: a lexical denylist check first (so `/mnt/c` is `denylisted` even where it
@@ -1254,5 +1286,55 @@ mod tests {
         assert!(overlaps(Path::new("/a/b"), Path::new("/a")));
         assert!(overlaps(Path::new("/a"), Path::new("/a")));
         assert!(!overlaps(Path::new("/a/bc"), Path::new("/a/b")));
+    }
+
+    fn id_of(p: &Path) -> DirId {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(p).unwrap();
+        DirId {
+            dev: m.dev(),
+            ino: m.ino(),
+        }
+    }
+
+    /// The chain starts at the folder itself, goes on with its parent, and ends at `/`.
+    #[test]
+    fn an_identity_chain_climbs_from_the_folder_to_the_root() {
+        let base = std::env::temp_dir().join(format!("sp-core-chain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("a/b");
+        std::fs::create_dir_all(&dir).unwrap();
+        let chain = identity_chain(&dir);
+        let want = [id_of(&dir), id_of(&base.join("a")), id_of(&base)];
+        std::fs::remove_dir_all(&base).unwrap();
+        let chain = chain.unwrap();
+        assert_eq!(chain.get(..3), Some(&want[..]), "{chain:?}");
+        assert_eq!(chain.last(), Some(&id_of(Path::new("/"))));
+        assert_eq!(
+            chain
+                .iter()
+                .filter(|i| **i == id_of(Path::new("/")))
+                .count(),
+            1,
+            "the root once: {chain:?}"
+        );
+    }
+
+    /// The walk opens with `O_PATH` (no read permission needed) and never through a symlink.
+    #[test]
+    fn an_identity_chain_needs_no_read_permission_and_refuses_a_symlinked_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("sp-core-chain-perm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("d");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(&dir, base.join("link")).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o100)).unwrap();
+        let chain = identity_chain(&dir);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = identity_chain(&base.join("link"));
+        std::fs::remove_dir_all(&base).unwrap();
+        assert!(chain.is_ok(), "search-only dir: {chain:?}");
+        assert!(link.is_err(), "symlinked root: {link:?}");
     }
 }
