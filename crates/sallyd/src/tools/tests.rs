@@ -191,7 +191,15 @@ pub(crate) struct Opts {
     out: Output,
     pub(crate) fetch: Option<FetchParts>,
     pub(crate) approval_timeout: Duration,
+    floor: DiskFloor,
 }
+
+/// An explicit zero floor: the fixture's writes are never held to free space unless a test sets
+/// one.
+const NO_FLOOR: DiskFloor = DiskFloor {
+    min_bytes: 0,
+    percent: 0,
+};
 
 /// The fixture's defaults: every tool, `shell: allow`, no mount, no way out for `fetch`.
 pub(crate) fn opts_without_mounts() -> Opts {
@@ -207,6 +215,7 @@ fn opts(mounts: Vec<Spec>) -> Opts {
         out: ok_output(),
         fetch: None,
         approval_timeout: Duration::from_secs(30),
+        floor: NO_FLOOR,
     }
 }
 
@@ -266,6 +275,7 @@ pub(crate) fn fx(name: &str, o: Opts) -> Fx {
             host: host.clone(),
             mode: s.mode,
             root,
+            floor: o.floor,
         });
         rules.push(MountRule {
             guest: s.guest.to_owned(),
@@ -904,6 +914,50 @@ async fn a_listing_shows_entries_and_audits_their_count_and_hash() {
     assert_eq!(e["mode"], "rw");
 }
 
+/// The broker's own write is held to the session's free-space floor: it fails after its
+/// `tool.run`, with its `tool.result` and reply naming `disk-floor`, and creates nothing. A
+/// delete is never held to the floor.
+#[tokio::test]
+async fn a_write_below_the_floor_fails_with_its_entries_and_a_delete_still_runs() {
+    let mut o = opts(all_modes());
+    o.floor = DiskFloor {
+        min_bytes: u64::MAX,
+        percent: 0,
+    };
+    let f = fx("floor", o);
+    let rw = f.dir("/workspace/rw").to_owned();
+    std::fs::write(rw.join("old"), b"keep").unwrap();
+    let out = f
+        .call(
+            "fs_write",
+            json!({"path": "/workspace/rw/new", "content_b64": "eA=="}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (out.is_error, out.text.as_str()),
+        (true, "failed: disk-floor")
+    );
+    let events = f.sink.events();
+    assert!(
+        events.ends_with(&["tool.run".to_owned(), "tool.result".to_owned()]),
+        "{events:?}"
+    );
+    let r = f.sink.last("tool.result");
+    assert_eq!(
+        (r["outcome"].as_str(), r["code"].as_str()),
+        (Some("failed"), Some("disk-floor"))
+    );
+    assert!(!rw.join("new").exists());
+    assert_eq!(std::fs::read(rw.join("old")).unwrap(), b"keep");
+    let out = f
+        .call("fs_delete", json!({"path": "/workspace/rw/old"}))
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.text);
+    assert!(!rw.join("old").exists());
+}
+
 #[tokio::test]
 async fn a_failure_at_run_time_is_reported_and_audited() {
     let f = fx("run-fail", opts(all_modes()));
@@ -1215,7 +1269,12 @@ fn the_session_mounts_take_their_roots_by_mode() {
         )
         .unwrap(),
     );
-    let ms = mounts(&v, &dir);
+    let floor = DiskFloor {
+        min_bytes: 7,
+        percent: 3,
+    };
+    let ms = mounts(&v, &dir, floor);
+    assert!(ms.iter().all(|m| m.floor == floor), "{ms:?}");
     let pin = |m: &str| {
         let md = std::fs::metadata(base.join(m)).unwrap();
         (md.dev(), md.ino())

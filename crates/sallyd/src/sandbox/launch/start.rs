@@ -41,6 +41,7 @@ use super::{
 };
 use crate::egress::net::EgressHandle;
 use crate::sandbox::commands::container_id;
+use crate::sandbox::disk::DiskFloor;
 use crate::sandbox::images::PresentImage;
 use crate::sandbox::inside::{Expect, check_in_container};
 use crate::sandbox::mount_probe::{
@@ -370,7 +371,9 @@ impl Launcher {
             prepared.name.clone(),
         );
         match self.start_prepared(prepared, progress).await {
-            Ok(started) => finish(extra, started, name, subject, level, role).await,
+            Ok(started) => {
+                finish(extra, started, name, subject, level, role, self.disk_floor).await
+            }
             Err(e) => {
                 extra.shut_down().await;
                 Err(e)
@@ -600,6 +603,7 @@ impl Extra {
 }
 
 /// The handle of a started container. An `Err` here comes back through the one cleanup path.
+/// A workspace's `Running` carries the launcher's free-space floor (`floor`) for the file tools.
 async fn finish(
     extra: Extra,
     started: Started,
@@ -607,6 +611,7 @@ async fn finish(
     subject: Subject,
     level: AuditLevel,
     role: Role,
+    floor: DiskFloor,
 ) -> Result<Launched, LaunchError> {
     let Started {
         container,
@@ -633,6 +638,7 @@ async fn finish(
                 exec_gate: Arc::new(tokio::sync::Mutex::new(())),
                 init_pid,
                 init_dir: Arc::new(init_dir),
+                disk_floor: floor,
             },
             Watch { plan, observed },
         )))),

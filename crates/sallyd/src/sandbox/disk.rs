@@ -1,18 +1,24 @@
 //! The free-space floor (#14, maintainer design after the 6c-1 reviews): the hard, race-free
 //! guarantee that no sandbox fills a host disk.
 //!
-//! A session's watched filesystems are the ones its sandbox can write to: the filesystem of
-//! Sallyport's state directory when the session has staged mounts or `.git` overlays, and the
-//! filesystem of every `rw` mount root. Each is held open (an `O_PATH` fd) for the session's
-//! lifetime and polled with `fstatfs`. When the space available to unprivileged users falls below
+//! A session's watched filesystems are the ones written on its behalf: the filesystem of
+//! Sallyport's state directory when the session has staged mounts or `.git` overlays, the
+//! filesystem of every `rw` mount root (written by the sandbox), and that of every `brokered`
+//! mount root (written by the broker's file tools). Each is held open (an `O_PATH` fd) for the
+//! session's lifetime and polled with `fstatfs`. When the space available to unprivileged users falls below
 //! the floor, `max(min_bytes, percent % of the filesystem)`, the session is killed. A launch is
 //! refused unless every watched filesystem has the floor free, plus `runtime.stage_size` on the
 //! state filesystem.
 //!
 //! Unlike the `stage_size` walk, the floor cannot be raced: it reads the filesystem's own
 //! accounting, so renames, open unlinked files and `O_TMPFILE`s all count.
+//!
+//! The kill only reaches writers inside the container. The broker's own file-tool writes are
+//! held to the same floor by the same reading and predicate ([`space`], [`below`]) before each
+//! write begins (`tools::fs::write`): a check, not a reservation, so the write that crosses the
+//! floor is admitted and the ones after it are refused.
 
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
@@ -48,7 +54,7 @@ impl DiskFloor {
 
 /// One `fstatfs` reading, in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Space {
+pub(crate) struct Space {
     /// Available to unprivileged users (`f_bavail`).
     pub free: u64,
     /// The filesystem's size (`f_blocks`).
@@ -70,14 +76,23 @@ pub(super) struct Watched {
 impl Watched {
     /// Reads the filesystem's space. Blocking.
     pub(super) fn space(&self) -> std::io::Result<Space> {
-        let s = rustix::fs::fstatvfs(&self.fd)?;
-        let unit = s.f_frsize;
-        Ok(Space {
-            free: s.f_bavail.saturating_mul(unit),
-            total: s.f_blocks.saturating_mul(unit),
-            used: s.f_blocks.saturating_sub(s.f_bfree).saturating_mul(unit),
-        })
+        Ok(space(&self.fd)?)
     }
+}
+
+/// Reads the space of the filesystem `fd` is on (an `O_PATH` fd will do). Blocking. The one
+/// reading both the watchdog and the file tools' own writes (`tools::fs::write`) judge.
+///
+/// # Errors
+/// The `fstatvfs` errno.
+pub(crate) fn space(fd: impl AsFd) -> rustix::io::Result<Space> {
+    let s = rustix::fs::fstatvfs(fd)?;
+    let unit = s.f_frsize;
+    Ok(Space {
+        free: s.f_bavail.saturating_mul(unit),
+        total: s.f_blocks.saturating_mul(unit),
+        used: s.f_blocks.saturating_sub(s.f_bfree).saturating_mul(unit),
+    })
 }
 
 fn open_dir(path: &Path) -> Result<(OwnedFd, u64), String> {
@@ -90,14 +105,15 @@ fn open_dir(path: &Path) -> Result<(OwnedFd, u64), String> {
 }
 
 /// Opens the watched filesystems of a session, one per device: `state` (the nearest existing
-/// ancestor of `state_dir`) when `writes_state`, and each `rw` mount root. Blocking.
+/// ancestor of `state_dir`) when `writes_state`, and each written mount root (`rw` and
+/// `brokered`). Blocking.
 ///
 /// # Errors
 /// A path that cannot be opened.
 pub(super) fn watch(
     state_dir: &Path,
     writes_state: bool,
-    rw_roots: &[(usize, &Path)],
+    written_roots: &[(usize, &Path)],
 ) -> Result<Vec<Watched>, String> {
     let mut out: Vec<(u64, Watched)> = Vec::new();
     if writes_state {
@@ -114,7 +130,7 @@ pub(super) fn watch(
             },
         ));
     }
-    for (i, root) in rw_roots {
+    for (i, root) in written_roots {
         let (fd, dev) = open_dir(root)?;
         if out.iter().all(|(d, _)| *d != dev) {
             out.push((
@@ -136,8 +152,9 @@ pub(super) fn admits(space: Space, floor: &DiskFloor, extra: u64) -> bool {
     space.free >= floor.bytes(space.total).saturating_add(extra)
 }
 
-/// Whether `space` is below the floor.
-pub(super) fn below(space: Space, floor: &DiskFloor) -> bool {
+/// Whether `space` is below the floor: the watchdog's kill, and the file tools' refusal of a
+/// write.
+pub(crate) fn below(space: Space, floor: &DiskFloor) -> bool {
     space.free < floor.bytes(space.total)
 }
 

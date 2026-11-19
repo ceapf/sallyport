@@ -4,117 +4,23 @@
 //! read-only bind. The fixture is `common::container`; these tests never skip.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use sally_core::manifest::{AuditLevel, ValidatedManifest};
-use sallyd::approvals::Gated;
-use sallyd::approvals::policy::Policy;
-use sallyd::approvals::queue::{self, Approver, Client, Decision, Desk, Limits, Seen};
-use sallyd::approvals::render::Prompt;
-use sallyd::daemon::crash::CrashReporter;
-use sallyd::rpc::agent::ToolHandler;
-use sallyd::rpc::mcp::ToolOutcome;
-use sallyd::rpc::record::Recorder;
-use sallyd::sandbox::{DiskFloor, Running};
+use sally_core::manifest::ValidatedManifest;
+use sallyd::approvals::queue::{Client, Decision};
+use sallyd::sandbox::DiskFloor;
 use sallyd::tools::exec::PodmanExec;
 use sallyd::tools::ops::Ops;
 use sallyd::tools::shell::{Runner, Status};
-use sallyd::tools::{Parts, Tools, mounts as tool_mounts};
 use serde_json::{Value, json};
 
 mod common;
 use common::container::*;
+use common::tools::{seen, session};
 use common::*;
 
 const ME: Client = Client { uid: 1000, pid: 7 };
-
-#[derive(Default)]
-struct Shown(Mutex<Vec<Prompt>>);
-
-impl Approver for Shown {
-    fn attached(&self) -> bool {
-        true
-    }
-    fn requested(&self, p: &Prompt) {
-        self.0.lock().unwrap().push(p.clone());
-    }
-    fn flood(&self, _: &str) {}
-    fn closed(&self, _: &str) {}
-}
-
-/// What a client shown `p` sends with its answer (these prompts are never cut).
-fn seen(p: &Prompt) -> Seen<'_> {
-    Seen {
-        digest: &p.digest,
-        full_shown: false,
-    }
-}
-
-struct Session {
-    gated: Gated<Tools<PodmanExec>>,
-    desk: Desk,
-    shown: Arc<Shown>,
-}
-
-impl Session {
-    async fn call(&self, name: &str, args: Value) -> ToolOutcome {
-        let n = self.gated.begin();
-        self.gated
-            .call(n, name.to_owned(), args.as_object().unwrap().clone())
-            .await
-            .expect("every entry was written")
-    }
-
-    async fn shown(&self, n: usize) -> Prompt {
-        for _ in 0..5000 {
-            if let Some(p) = self.shown.0.lock().unwrap().get(n - 1) {
-                return p.clone();
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-        panic!("no prompt");
-    }
-}
-
-/// The session's tools behind the real gate, as Task 12 will wire them.
-fn session(x: &Lx, v: &ValidatedManifest, r: &Running, timeout: Duration) -> Session {
-    let rec = Recorder::new(
-        x.events.clone(),
-        r.paths().id().as_str().to_owned(),
-        AuditLevel::Full,
-    );
-    let shown = Arc::new(Shown::default());
-    let (gate, desk) = queue::new(
-        r.paths().id().as_str().to_owned(),
-        Policy::from_manifest(v),
-        Limits {
-            timeout,
-            max_pending: 4,
-        },
-        rec.clone(),
-        Some(Arc::clone(&shown) as Arc<dyn Approver>),
-    );
-    let ops = Ops::new();
-    let tools = Tools::new(Parts {
-        builtin: v.manifest().tools.builtin.clone(),
-        mounts: tool_mounts(v, &r.init_dir()),
-        record: rec,
-        exec_gate: r.exec_gate(),
-        ops: ops.clone(),
-        crash: CrashReporter::channel().0,
-        // The launcher's ids: the workspace's `--user`.
-        ids: ids(),
-        shell: PodmanExec::new(x.podman.clone(), r, ops),
-        // The container tests do not reach the network; fetch has its own tests (#75).
-        fetch: None,
-    });
-    Session {
-        gated: Gated::new(gate, tools),
-        desk,
-        shown,
-    }
-}
 
 const TOOLS: &str = "tools:\n  builtin: [fs_list, fs_read, fs_write, fs_delete, shell]\n";
 
@@ -401,6 +307,127 @@ fn rt_ag_09_stage_size_is_enforced_during_one_long_exec() {
         .await;
         let a = x.events.args("session.resource_limit").expect("audited");
         assert_eq!(a["resource"], "stage_size", "{a}");
+        x.stop(r).await;
+    });
+}
+
+/// The size of each large lower file in the copy-up clause: well above its `stage_size`.
+const LOWER: u64 = 1 << 30;
+/// The most this process may write while the broker writes one byte to a lower file of [`LOWER`]
+/// bytes: an eighth of it.
+const COPY_BOUND: u64 = LOWER / 8;
+const MIB_BYTES: usize = 1 << 20;
+
+/// One MiB of the lower files' repeating pattern.
+fn pattern() -> Vec<u8> {
+    (0..MIB_BYTES).map(|i| (i % 251) as u8).collect()
+}
+
+/// A lower file of [`LOWER`] bytes of data (not a hole, which a copy-up would skip).
+fn lower_file(path: &std::path::Path) {
+    use std::io::Write as _;
+    let block = pattern();
+    let mut f = std::fs::File::create(path).unwrap();
+    for _ in 0..LOWER / MIB_BYTES as u64 {
+        f.write_all(&block).unwrap();
+    }
+}
+
+/// Whether the file at `path` is still exactly [`lower_file`]'s content.
+fn lower_intact(path: &std::path::Path) -> bool {
+    use std::io::Read as _;
+    let (block, mut buf) = (pattern(), vec![0_u8; MIB_BYTES]);
+    let mut f = std::fs::File::open(path).unwrap();
+    let blocks = LOWER / MIB_BYTES as u64;
+    (0..blocks).all(|_| f.read_exact(&mut buf).is_ok() && buf == block)
+        && f.read(&mut buf).unwrap() == 0
+}
+
+/// This process's written-bytes counter (`write_bytes` in `/proc/self/io`): what it caused to be
+/// written to storage, counted when page-cache pages are dirtied, over all its threads and the
+/// children it reaped. Without task I/O accounting there is no counter and this panics, so the
+/// control fails rather than skips.
+fn written() -> u64 {
+    let io = std::fs::read_to_string("/proc/self/io").expect("task I/O accounting");
+    io.lines()
+        .find_map(|l| l.strip_prefix("write_bytes:"))
+        .expect("a write_bytes line")
+        .trim()
+        .parse()
+        .expect("a byte count")
+}
+
+/// Runs `work`; returns its output and what this process wrote meanwhile ([`written`]).
+async fn written_by<T>(work: impl std::future::Future<Output = T>) -> (T, u64) {
+    let before = written();
+    let out = work.await;
+    (out, written().saturating_sub(before))
+}
+
+/// RT-AG-09: the broker's write to an existing file in a `staged` mount copies nothing up. One
+/// `fs_write` of one byte to a lower file far above `stage_size` makes this process write at
+/// most [`COPY_BOUND`]: the reopen truncates, so overlayfs copies the file up empty. The tool runs
+/// in this process (the blocking pool), so a copy-up's writes count here; the counter is
+/// cumulative, not sampled, so nothing can slip between two readings. Control (analogue), first,
+/// through the same probe and mount: the unfixed sequence (a write open without `O_TRUNC`, then
+/// `ftruncate(0)`, holding the exec gate as the tool does) on a sibling lower file of the same
+/// size writes at least half the file. The counter covers every thread and every reaped child.
+/// It is near quiet here, not silent: no command runs in the container, the I/O lock keeps
+/// other fixtures out, and under nextest each test has its own process; but a stage walk woken
+/// by the control's copy can pause and walk the container during the write, and its podman
+/// children count when reaped (as can another test in the same process under `cargo test`).
+/// Each is a few hundred KiB against a 128 MiB bound, and extra writes can only fail the test.
+/// Known limit: where the state directory is on tmpfs or a reflink filesystem (btrfs, XFS with
+/// reflink) a copy-up writes no counted pages, and the control fails there.
+#[test]
+fn rt_ag_09_a_write_to_a_large_lower_file_copies_nothing_up() {
+    let _serial = io_lock(true);
+    rt().block_on(async {
+        let x = Lx::with_floor(DiskFloor::default());
+        let st = x.f.root.join("home/code/other");
+        std::fs::create_dir_all(&st).unwrap();
+        lower_file(&st.join("big"));
+        lower_file(&st.join("sibling"));
+        let v = x.f.load(&format!(
+            "{}runtime:\n  stage_size: 64MiB\n{TOOLS}  shell: deny\n",
+            mounts(&[mount("~/code/other", "/workspace/o", "staged")])
+        ));
+        let r = x.launch(&v, "copyup").await.unwrap();
+        let s = session(&x, &v, &r, Duration::from_secs(30));
+        let in_view = format!("/proc/{}/root/workspace/o/sibling", r.init_pid());
+        let gate = r.exec_gate();
+        let held = gate.lock().await;
+        let ((), control) = written_by(async move {
+            tokio::task::spawn_blocking(move || {
+                let f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&in_view)
+                    .unwrap();
+                f.set_len(0).unwrap();
+            })
+            .await
+            .unwrap();
+        })
+        .await;
+        drop(held);
+        assert!(
+            control >= LOWER / 2,
+            "control: the probe sees a copy-up ({control} bytes written; a state directory on \
+             tmpfs or a reflink filesystem copies up without counted writes)"
+        );
+        let (out, wrote) = written_by(s.call(
+            "fs_write",
+            json!({"path": "/workspace/o/big", "content_b64": "eA=="}),
+        ))
+        .await;
+        assert!(!out.is_error, "{}", out.text);
+        eprintln!("bytes written: {control} (control), {wrote} (the write)");
+        assert!(wrote <= COPY_BOUND, "the write copied {wrote} bytes up");
+        let (_, seen) = exec_in(r.container(), &["cat", "/workspace/o/big"]);
+        assert_eq!(seen, "x");
+        assert!(lower_intact(&st.join("big")), "the host's lower file");
+        assert!(lower_intact(&st.join("sibling")));
+        assert!(exists(r.container()));
         x.stop(r).await;
     });
 }

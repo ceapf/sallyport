@@ -134,14 +134,17 @@ pub(super) fn watch_plan(
     floor: &DiskFloor,
 ) -> Result<Option<WatchPlan>, LaunchError> {
     let stage = StageWatch::of(v, paths, scan);
-    let rw: Vec<(usize, &std::path::Path)> = v
+    // `rw` roots are written by the sandbox, `brokered` ones by the broker's file tools: both
+    // grow the host folder's filesystem.
+    let written: Vec<(usize, &std::path::Path)> = v
         .mounts()
         .iter()
         .enumerate()
-        .filter(|(_, m)| m.mode == MountMode::Rw)
+        .filter(|(_, m)| matches!(m.mode, MountMode::Rw | MountMode::Brokered))
         .map(|(i, m)| (i, m.host.as_path()))
         .collect();
-    let watched = watch(paths.data_root(), stage.is_some(), &rw).map_err(LaunchError::DiskSpace)?;
+    let watched =
+        watch(paths.data_root(), stage.is_some(), &written).map_err(LaunchError::DiskSpace)?;
     if watched.is_empty() {
         return Ok(None);
     }
@@ -756,6 +759,85 @@ mod tests {
         let plain = manifest("    - {host: \"~/d\", guest: /workspace/d, mode: rw}\n");
         let scan = super::super::scan::scan_mounts(&plain, &Default::default()).unwrap();
         assert!(StageWatch::of(&plain, &paths, &scan).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// RT-AG-09 (security review): the broker writes straight into a `brokered` mount's host
+    /// folder, so that folder's filesystem is watched by the floor; a `ro` mount is not.
+    #[test]
+    fn brokered_mount_roots_are_watched_and_ro_ones_are_not() {
+        use sally_core::manifest::{HostEnv, load};
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("../../target/watchdog-unit-brokered")
+            .join(std::process::id().to_string());
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        for d in ["a", "b"] {
+            std::fs::create_dir_all(home.join(d)).unwrap();
+        }
+        let home = std::fs::canonicalize(&home).unwrap();
+        let env = HostEnv {
+            home: home.clone(),
+            other_homes: Vec::new(),
+            xdg_config_home: None,
+            xdg_data_home: None,
+            xdg_runtime_dir: None,
+            podman_storage: Vec::new(),
+            nproc: 8,
+            mem_bytes: 16 << 30,
+            env_dirs: Vec::new(),
+        };
+        let manifest = |mounts: &str| {
+            let body = format!(
+                "apiVersion: sallyport/v1\nkind: Manifest\nname: t\nmodel:\n  ref: any\n\
+                 filesystem:\n  mounts:\n{mounts}"
+            );
+            load(&body, &env, &std::collections::BTreeSet::new())
+                .unwrap()
+                .manifest
+        };
+        let paths = SessionPaths::new(
+            super::super::types::SessionId::parse("s").unwrap(),
+            &dir.join("run"),
+            &dir.join("data"),
+        )
+        .unwrap();
+        let none = DiskFloor {
+            min_bytes: 0,
+            percent: 0,
+        };
+        let plan = |v: &ValidatedManifest| {
+            let scan = super::super::scan::scan_mounts(v, &Default::default()).unwrap();
+            watch_plan(v, &paths, &scan, &none).unwrap()
+        };
+        let brokered = manifest(
+            "    - {host: \"~/a\", guest: /workspace/a, mode: ro}\n\
+             \x20   - {host: \"~/b\", guest: /workspace/b, mode: brokered}\n",
+        );
+        let got = plan(&brokered).expect("a brokered mount is watched");
+        let labels: Vec<&str> = got.watched.iter().map(|w| w.label.as_str()).collect();
+        assert_eq!(labels, ["filesystem.mounts[1]"]);
+        assert!(got.stage.is_none());
+        let ro = manifest("    - {host: \"~/a\", guest: /workspace/a, mode: ro}\n");
+        assert!(plan(&ro).is_none(), "a ro mount is not writable");
+        // Deny: under a floor no filesystem has free, the brokered mount's refuses the launch,
+        // and a ro-only session still has nothing to watch.
+        let full = DiskFloor {
+            min_bytes: u64::MAX,
+            percent: 0,
+        };
+        let refused = |v: &ValidatedManifest| {
+            let scan = super::super::scan::scan_mounts(v, &Default::default()).unwrap();
+            watch_plan(v, &paths, &scan, &full)
+        };
+        match refused(&brokered) {
+            Err(LaunchError::DiskSpace(msg)) => {
+                assert!(msg.starts_with("filesystem.mounts[1]: "), "{msg}");
+            }
+            other => panic!("{:?}", other.map(|p| p.is_some())),
+        }
+        assert!(refused(&ro).unwrap().is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

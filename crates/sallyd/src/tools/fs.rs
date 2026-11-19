@@ -24,13 +24,15 @@
 //! component is first reached `O_PATH`, checked regular and judged on that fd; only then is the
 //! same inode opened for I/O through `/proc/self/fd`, so a FIFO or device is never opened, read
 //! from or written to. That open is `O_NONBLOCK`, so a file another process holds a lease on
-//! fails at once instead of stalling the call (ruling Q40). An existing file is opened without
-//! `O_TRUNC` and
-//! truncated only after the checks; a new one is created `O_EXCL`, so the case judged is the
-//! case that happened. On
+//! fails at once instead of stalling the call (ruling Q40). An existing file is truncated by that
+//! open (`O_TRUNC`), after the checks, so a `staged` mount's lower file is never copied up with
+//! its data; a new one is created `O_EXCL`, so the case judged is the case that happened. On
 //! `brokered` mounts a regular file with more than one link is refused (`hard-link`): the broker
 //! would write through to a file outside the mount. Every check is repeated at run time from the
 //! pinned root (the window between prepare and run can last `approvals.timeout`).
+//!
+//! A write is held to the session's free-space floor (`sandbox::disk`) on the filesystem its
+//! parent directory is on, before it has any effect ([`write`]); a delete frees space and never is.
 
 use std::ffi::CStr;
 use std::path::{Path, PathBuf};
@@ -42,7 +44,7 @@ use rustix::io::Errno;
 use sally_core::fd;
 
 use super::dac::{self, Object, R, W, WX, X};
-use crate::sandbox::UserIds;
+use crate::sandbox::{DiskFloor, UserIds, disk};
 
 /// `OVERLAYFS_SUPER_MAGIC` (`linux/magic.h`).
 const OVERLAYFS_MAGIC: i64 = 0x794c_7630;
@@ -112,6 +114,8 @@ pub enum FsError {
     ContainerGone,
     /// Out of space or quota.
     NoSpace,
+    /// The filesystem written to has less free space than the session's free-space floor.
+    DiskFloor,
     /// The sandbox's identity may not do this (or the file system refused it).
     Permission,
     /// Any other error.
@@ -133,6 +137,7 @@ impl FsError {
             Self::MountChanged => "mount-changed",
             Self::ContainerGone => "container-gone",
             Self::NoSpace => "no-space",
+            Self::DiskFloor => "disk-floor",
             Self::Permission => "permission",
             Self::Io(_) => "io-error",
         }
@@ -187,8 +192,10 @@ fn read_file() -> OFlags {
     OFlags::RDONLY | OFlags::NONBLOCK
 }
 
+// `O_TRUNC` truncates at the open, after the checks on the `O_PATH` handle: on a `staged`
+// mount overlayfs then copies the lower file up empty instead of copying its data.
 fn write_existing() -> OFlags {
-    OFlags::WRONLY | OFlags::NONBLOCK
+    OFlags::WRONLY | OFlags::NONBLOCK | OFlags::TRUNC
 }
 
 // `O_CREAT | O_EXCL` never follows a symlink and only ever makes a new regular file, so no
@@ -535,20 +542,29 @@ pub fn check_write(root: &Root, rel: &str, brokered: bool) -> Result<(), FsError
 }
 
 /// Writes `bytes` to `rel`, replacing an existing file's content or creating it (mode
-/// [`NEW_FILE_MODE`], `O_EXCL`).
+/// [`NEW_FILE_MODE`], `O_EXCL`). First, before either case has any effect, the filesystem the
+/// parent directory is on must not be below `floor` ([`FsError::DiskFloor`]): the broker is a
+/// writer outside the container, which the watchdog's kill does not reach. The check is the
+/// watchdog's own predicate, not a reservation: the write that crosses the floor is admitted, and
+/// the overshoot is at most the writes already past the check (one agent frame each).
 ///
 /// # Errors
 /// [`FsError`]; nothing was truncated unless the target was a regular file that passed.
-pub fn write(root: &Root, rel: &str, bytes: &[u8], brokered: bool) -> Result<(), FsError> {
+pub fn write(
+    root: &Root,
+    rel: &str,
+    bytes: &[u8],
+    brokered: bool,
+    floor: &DiskFloor,
+) -> Result<(), FsError> {
     let (parent, name) = root.parent(rel)?;
+    above_floor(&parent, floor)?;
     let f = match root.step(&parent, name, OFlags::PATH, Mode::empty()) {
         Ok(p) => {
             let st = rustix::fs::fstat(&p).map_err(FsError::from_errno)?;
             kind_ok(&st, brokered)?;
             root.judge(&p, W)?;
-            let f = reopen(&p, write_existing())?;
-            rustix::fs::ftruncate(&f, 0).map_err(FsError::from_errno)?;
-            f
+            reopen(&p, write_existing())?
         }
         Err(FsError::NotFound) => {
             root.judge(&parent, WX)?;
@@ -567,6 +583,16 @@ pub fn write(root: &Root, rel: &str, bytes: &[u8], brokered: bool) -> Result<(),
             Err(Errno::INTR) => {}
             Err(e) => return Err(FsError::from_errno(e)),
         }
+    }
+    Ok(())
+}
+
+/// Refuses when the filesystem `dir` is on is below `floor` ([`disk::below`] on [`disk::space`]).
+/// A filesystem whose space cannot be read refuses too.
+fn above_floor(dir: &OwnedFd, floor: &DiskFloor) -> Result<(), FsError> {
+    let space = disk::space(dir).map_err(FsError::from_errno)?;
+    if disk::below(space, floor) {
+        return Err(FsError::DiskFloor);
     }
     Ok(())
 }
