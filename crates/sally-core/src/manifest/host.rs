@@ -39,6 +39,8 @@ impl HostPattern {
 /// exfiltrating agent would reach for; anything else still needs an explicit rule. With
 /// [`SHARED_TREES`] this is the one maintained list for shared hosting (AMENDMENTS-01). No entry
 /// of either list lies under another (a test holds it), so every entry is one testable case.
+/// Some entries (`gradio.live`, `glitch.me`, `loca.lt`, `serveo.net`) are not in the Public
+/// Suffix List; a list derived from it must keep them.
 /// TODO(#235): derive from the Public Suffix List's private section.
 const SHARED_SUFFIXES: &[&str] = &[
     "cloudfront.net",
@@ -54,7 +56,6 @@ const SHARED_SUFFIXES: &[&str] = &[
     "workers.dev",
     "r2.dev",
     "trycloudflare.com",
-    "herokuapp.com",
     "vercel.app",
     "netlify.app",
     "fly.dev",
@@ -64,9 +65,11 @@ const SHARED_SUFFIXES: &[&str] = &[
     "ngrok-free.app",
     "ngrok.dev",
     "ngrok-free.dev",
+    "ngrok.pizza",
+    "ngrok.pro",
     "loca.lt",
     "serveo.net",
-    "repl.co",
+    "repl.run",
     "deno.dev",
     "surge.sh",
     "co.uk",
@@ -80,9 +83,11 @@ const SHARED_SUFFIXES: &[&str] = &[
 /// under one counts too. An entry is a tree when the Public Suffix List's private section lists
 /// `*.<entry>`, or `<x>.<entry>` beside the entry, or only names two or more labels below it
 /// (read at publicsuffix/list commit f7796455091118a5617cc7588523b083a8223301).
-/// `storage.googleapis.com` is the exception: the list does not name it; it is a tree because a
-/// verified domain owner may name a bucket with dots (`example.com.storage.googleapis.com`), from
-/// a security review and not yet confirmed from the provider's naming documentation (#235).
+/// Two exceptions. `windows.net` is unlisted but is the parent of the listed Azure service
+/// suffixes (`servicebus.windows.net`, `blob.core.windows.net`, …), chosen to cover them all.
+/// `storage.googleapis.com` is not in the list; it is a tree because a verified domain owner
+/// may name a bucket with dots (`example.com.storage.googleapis.com`), from a security review
+/// and not yet confirmed from the provider's naming documentation (#235).
 const SHARED_TREES: &[&str] = &[
     "amazonaws.com",
     "on.aws",
@@ -93,9 +98,12 @@ const SHARED_TREES: &[&str] = &[
     "storage.googleapis.com",
     "run.app",
     "appspot.com",
+    "herokuapp.com",
     "hf.space",
     "ngrok.io",
     "replit.dev",
+    "replit.app",
+    "repl.co",
 ];
 
 impl HostPattern {
@@ -367,6 +375,9 @@ mod tests {
             "*.cloudfunctions.net",
             "*.ngrok.dev",
             "*.ngrok-free.dev",
+            "*.ngrok.pizza",
+            "*.ngrok.pro",
+            "*.repl.run",
             // A parent of an entry: its wildcard matches the entry's hosts too.
             "*.googleapis.com",
             // A tree itself, and anywhere under one: regional and service endpoints.
@@ -394,6 +405,12 @@ mod tests {
             "*.eu.ngrok.io",
             "*.replit.dev",
             "*.picard.replit.dev",
+            "*.replit.app",
+            "*.id.replit.app",
+            "*.repl.co",
+            "*.id.repl.co",
+            "*.herokuapp.com",
+            "*.compute.herokuapp.com",
             "*.on.aws",
             "*.lambda-url.us-east-1.on.aws",
             "*.elasticbeanstalk.com",

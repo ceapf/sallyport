@@ -249,9 +249,9 @@ wildcard that reaches hosts anyone can register counts as unrestricted and needs
 (`*.googleapis.com`), or a shared tree or anywhere under one, a provider whose registrable hosts
 sit at any depth (`*.amazonaws.com`, `*.windows.net`, `*.s3.us-east-1.amazonaws.com`,
 `*.web.core.windows.net`, `*.a.run.app`). The lists are two maintained constants,
-`host::SHARED_SUFFIXES` and `host::SHARED_TREES` (an entry is a tree when the Public Suffix
-List's private section names hosts more than one label below it); the summary marks such a
-rule "anyone can register these". The lists are
+`host::SHARED_SUFFIXES` and `host::SHARED_TREES` (read from the Public Suffix List's private
+section; `host::SHARED_TREES` states when an entry is a tree, and its two exceptions); the
+summary marks such a rule "anyone can register these". The lists are
 curated, so a wildcard over a shared-hosting suffix they do not name is an ordinary rule
 (TODO(#235): derive them from the Public Suffix List). Matching: lowercase, trailing dot
 stripped; `*.example.com` matches `a.example.com` and `a.b.example.com` but **not**
