@@ -56,6 +56,7 @@ pub enum Detail {
     #[default]
     Decision,
     /// Inference response metadata (`llm.response`, the only such entry): dropped at `actions`.
+    /// The writer refuses the mark on any other event ([`AuditError::InvalidEntry`]).
     Full,
 }
 
@@ -248,9 +249,16 @@ impl NewEntry {
         if declared::collides(&self.args, &self.texts) {
             return bad("a declared text's key is used twice, or the args are not an object");
         }
+        // The level sets detail, never coverage (SI-4): only the listed events may be dropped.
+        if self.detail == Detail::Full && !DETAIL_EVENTS.contains(&self.event.as_str()) {
+            return bad("only inference response metadata may be marked detail");
+        }
         Ok(())
     }
 }
+
+/// The only events that may be marked [`Detail::Full`] and so dropped at `audit.level: actions`.
+const DETAIL_EVENTS: &[&str] = &["llm.response"];
 
 /// What [`AuditWriter::append`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

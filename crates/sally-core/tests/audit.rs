@@ -334,7 +334,16 @@ fn level_actions_drops_detail_but_never_a_decision() {
     let s = Scratch::new("levels");
     let clock = TestClock::at(JAN);
     let mut w = open(&s, &clock);
-    let detail = note("egress.request").detail(Detail::Full);
+    // Only inference response metadata may be detail (SI-4: the level sets detail, never
+    // coverage): any other event marked detail is refused at both levels and not written.
+    for level in [AuditLevel::Actions, AuditLevel::Full] {
+        let marked = note("egress.request").detail(Detail::Full);
+        assert!(
+            matches!(w.append(marked, level), Err(AuditError::InvalidEntry(_))),
+            "{level:?}"
+        );
+    }
+    let detail = note("llm.response").detail(Detail::Full);
     assert_eq!(
         w.append(detail.clone(), AuditLevel::Actions).unwrap(),
         Appended::Filtered
