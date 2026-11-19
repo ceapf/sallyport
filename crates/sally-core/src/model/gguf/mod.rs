@@ -316,14 +316,15 @@ impl GgufHeader {
     pub fn retained_text_bytes(&self) -> u64 {
         let text = |t: &FileText| t.as_str().len() as u64;
         let meta = self.metadata.iter().map(|m| {
-            text(&m.key)
-                + match &m.value {
-                    Value::String(s) => text(s),
-                    _ => 0,
-                }
+            let value = match &m.value {
+                Value::String(s) => text(s),
+                _ => 0,
+            };
+            text(&m.key).saturating_add(value)
         });
         let names = self.tensors.iter().map(|t| text(&t.name));
-        meta.chain(names).sum()
+        // The parse bounds the sum; saturating keeps this parser module free of unchecked `+`.
+        meta.chain(names).fold(0, u64::saturating_add)
     }
 }
 
