@@ -156,9 +156,18 @@ pub struct Running {
     /// the pid is reused (architect ruling Q29).
     init_pid: u32,
     init_dir: Arc<rustix::fd::OwnedFd>,
+    /// The launcher's free-space floor, which the file tools' own writes are held to.
+    disk_floor: DiskFloor,
 }
 
 impl Running {
+    /// The launcher's free-space floor: the one the watchdog kills at, and the one the file
+    /// tools' own writes are held to (`tools::mounts`).
+    #[must_use]
+    pub fn disk_floor(&self) -> DiskFloor {
+        self.disk_floor
+    }
+
     /// The container init's host pid.
     #[must_use]
     pub fn init_pid(&self) -> u32 {

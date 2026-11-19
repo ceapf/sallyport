@@ -327,7 +327,11 @@ impl Registry {
             record: record.clone(),
             ops: ops.clone(),
             crash: crash.clone(),
-            cwd: tools::default_cwd(&tools::mounts(&manifest, &running.init_dir())),
+            cwd: tools::default_cwd(&tools::mounts(
+                &manifest,
+                &running.init_dir(),
+                running.disk_floor(),
+            )),
         });
         let model = model_of(script.as_ref());
         let start = NewEntry::new(Actor::Sallyd, "session.start")
@@ -436,7 +440,7 @@ impl Registry {
         );
         let tools = Tools::new(Parts {
             builtin: v.tools.builtin.clone(),
-            mounts: tools::mounts(manifest, &running.init_dir()),
+            mounts: tools::mounts(manifest, &running.init_dir(), running.disk_floor()),
             record: rec.clone(),
             exec_gate: running.exec_gate(),
             ops: ops.clone(),

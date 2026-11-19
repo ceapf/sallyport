@@ -46,7 +46,7 @@ use crate::daemon::crash::CrashReporter;
 use crate::egress::local::Connector;
 use crate::rpc::mcp::{Tool, ToolOutcome};
 use crate::rpc::record::{Recorder, escape};
-use crate::sandbox::UserIds;
+use crate::sandbox::{DiskFloor, UserIds};
 use args::Args;
 use fs::{FsError, RootSource};
 use ops::Ops;
@@ -76,6 +76,8 @@ pub struct Mount {
     pub mode: MountMode,
     /// Where its files are reached.
     pub root: RootSource,
+    /// The session's free-space floor (the launcher's), which a write here is held to.
+    pub floor: DiskFloor,
 }
 
 /// Where a command runs when its call names no directory: the first mount's guest path, else
@@ -88,9 +90,10 @@ pub fn default_cwd(mounts: &[Mount]) -> String {
 }
 
 /// The session's mounts as the tools reach them: `brokered` and `ro` on the host pin, `rw` and
-/// `staged` in the workspace through `init_dir` (the container init's `/proc/<pid>`).
+/// `staged` in the workspace through `init_dir` (the container init's `/proc/<pid>`). Every write
+/// is held to `floor`, the launch's free-space floor (`Running::disk_floor`).
 #[must_use]
-pub fn mounts(v: &ValidatedManifest, init_dir: &Arc<OwnedFd>) -> Vec<Mount> {
+pub fn mounts(v: &ValidatedManifest, init_dir: &Arc<OwnedFd>, floor: DiskFloor) -> Vec<Mount> {
     v.mounts()
         .iter()
         .map(|m| {
@@ -117,6 +120,7 @@ pub fn mounts(v: &ValidatedManifest, init_dir: &Arc<OwnedFd>) -> Vec<Mount> {
                 host: m.host.clone(),
                 mode: m.mode,
                 root,
+                floor,
             }
         })
         .collect()
@@ -422,10 +426,10 @@ impl<R: Runner> Core<R> {
         let rel = t.rel.clone();
         let res = match content {
             Some(c) => {
-                let bytes = c.bytes().to_vec();
+                let (bytes, floor) = (c.bytes().to_vec(), m.floor);
                 on_root(&m.root, self.ids, move |r| {
                     let _held = held;
-                    fs::write(r, &rel, &bytes, brokered)
+                    fs::write(r, &rel, &bytes, brokered, &floor)
                 })
                 .await
             }

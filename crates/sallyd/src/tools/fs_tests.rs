@@ -10,6 +10,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
 
+/// An explicit zero floor: the writes of the tests that are not about the floor are never held
+/// to free space.
+const NO_FLOOR: DiskFloor = DiskFloor {
+    min_bytes: 0,
+    percent: 0,
+};
+
+/// [`super::write`] under [`NO_FLOOR`].
+fn write(root: &Root, rel: &str, bytes: &[u8], brokered: bool) -> Result<(), FsError> {
+    super::write(root, rel, bytes, brokered, &NO_FLOOR)
+}
+
 /// A fresh directory under `target/` (removed first if a previous run left it).
 fn scratch(name: &str) -> PathBuf {
     static N: AtomicUsize = AtomicUsize::new(0);
@@ -406,6 +418,34 @@ fn a_listing_reads_at_most_max_scanned_entries() {
     );
 }
 
+/// The broker is a writer outside the container, so its own write is held to the free-space
+/// floor of the filesystem it writes to: below it, nothing is created and nothing truncated. A
+/// delete frees space and is never held to it.
+#[test]
+fn a_write_below_the_free_space_floor_is_refused_before_any_effect() {
+    let (m, _) = mount("floor");
+    std::fs::write(m.join("old"), b"keep me").unwrap();
+    let root = host(&m).open(me()).unwrap();
+    let full = DiskFloor {
+        min_bytes: u64::MAX,
+        percent: 0,
+    };
+    assert_eq!(
+        super::write(&root, "new", b"x", true, &full),
+        Err(FsError::DiskFloor)
+    );
+    assert!(!m.join("new").exists());
+    assert_eq!(
+        super::write(&root, "old", b"y", false, &full),
+        Err(FsError::DiskFloor)
+    );
+    assert_eq!(std::fs::read(m.join("old")).unwrap(), b"keep me");
+    delete(&root, "old").unwrap();
+    assert!(!m.join("old").exists());
+    super::write(&root, "new", b"x", true, &NO_FLOOR).unwrap();
+    assert_eq!(std::fs::read(m.join("new")).unwrap(), b"x");
+}
+
 #[test]
 fn a_write_creates_or_replaces_a_regular_file_only() {
     let (m, _) = mount("write");
@@ -568,6 +608,7 @@ fn errnos_map_to_their_codes() {
         (FsError::HardLink, "hard-link"),
         (FsError::MountChanged, "mount-changed"),
         (FsError::ContainerGone, "container-gone"),
+        (FsError::DiskFloor, "disk-floor"),
     ] {
         assert_eq!(e.code(), code);
         assert_eq!(e.to_string(), code);

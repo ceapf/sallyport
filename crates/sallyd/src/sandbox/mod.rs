@@ -14,7 +14,7 @@ mod changes;
 mod check;
 mod commands;
 mod dirs;
-mod disk;
+pub(crate) mod disk;
 mod images;
 mod inside;
 mod launch;

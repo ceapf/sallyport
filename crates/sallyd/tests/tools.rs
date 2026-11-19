@@ -98,7 +98,7 @@ fn session(x: &Lx, v: &ValidatedManifest, r: &Running, timeout: Duration) -> Ses
     let ops = Ops::new();
     let tools = Tools::new(Parts {
         builtin: v.manifest().tools.builtin.clone(),
-        mounts: tool_mounts(v, &r.init_dir()),
+        mounts: tool_mounts(v, &r.init_dir(), r.disk_floor()),
         record: rec,
         exec_gate: r.exec_gate(),
         ops: ops.clone(),
