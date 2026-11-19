@@ -355,10 +355,13 @@ what the host runs or loads (`~/.local/bin/t -> ~/tools/t/bin/t`, a stow `~/.con
 manifest has mounts, validation reads, to depth 2 (a folder's entries and its subfolders'
 entries, never entering a linked folder): every home folder of the list above, `$XDG_CONFIG_HOME`
 and `$XDG_DATA_HOME`, every folder the environment names except a `$PATH` entry outside the
-homes, and each home's own entries, of which only dot names (`.bashrc`, …) are followed. The rule
-is made from the link's text, made absolute and normalized, and also matches where that resolves,
-so both hops of `~/.bashrc -> ~/df/bashrc -> /data/x/bashrc` are protected and a dangling link
-protects its target before it exists. A link whose target is already inside a rule adds nothing.
+homes, and each home's own entries, of which only dot names (`.bashrc`, …) are followed. A folder
+reached first as a subfolder is read again to depth 2 when it is on that list itself. The rule is
+made from the link's text, joined (when relative) to the real path of the folder holding the link,
+as the kernel resolves it, and also matches where that resolves: through a stow-folded
+`~/.local/bin -> ~/dotfiles/bin` holding `t -> ../tools/t` the rule is `~/dotfiles/tools/t`, both
+hops of `~/.bashrc -> ~/df/bashrc -> /data/x/bashrc` are protected, and a dangling link protects
+its target before it exists. A link whose target is already inside a rule adds nothing.
 Reading is bounded: at most 65 536 entries per validation, counted across all folders. Past that,
 with more than 256 `$PATH` entries, or when a folder cannot be read (a folder that is gone, not a
 folder, or not readable by the user is skipped), validation fails with one `denylist-incomplete`
@@ -506,13 +509,16 @@ See `manifests/examples/`:
   link made later, one deeper than depth 2, one inside a linked folder, a non-dot entry of a home,
   a link in a `$PATH` folder outside the homes (`/usr/local/bin/x -> ~/code/x`), and the middle
   hops of a chain longer than two are not followed (THREAT_MODEL §6).
-- **A large protected folder can refuse every manifest with mounts.** A desktop thumbnail cache
-  (`~/.cache/thumbnails`) can hold more than the 65 536 entries the link scan reads; validation
-  then fails `denylist-incomplete` naming the folder. Clear or shrink that folder, or move it out
-  of the listed folders; manifests without mounts are not affected.
+- **A large protected folder can refuse every manifest with mounts.** A listed folder, or one of
+  its subfolders, holding tens of thousands of entries (a cache subfolder with a file per item)
+  can take the scan past the 65 536 entries it reads; validation then fails `denylist-incomplete`
+  naming the folder. Clear or shrink that folder, or move it out of the listed folders; manifests
+  without mounts are not affected.
 - **An environment variable or link that names `/`, a home, or an ancestor of one refuses every
   mount under it** until it is changed (`CARGO_HOME=$HOME`, a `$PATH` entry equal to a home). The
-  message names the variable or the link.
+  message names the variable or the link. Such a variable's folder is also read whole, every
+  entry and not only dot names, so a large home can use up the budget and refuse mounts outside
+  it too (`denylist-incomplete`).
 - **The environment that counts is `sallyd`'s own, read once when it starts.** A variable set
   only in the user's shell is not seen, so a daemon started with a minimal environment has fewer
   environment rules than the shell. `sally manifest validate` uses the CLI's environment and is
