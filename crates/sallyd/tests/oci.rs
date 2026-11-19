@@ -8,11 +8,13 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use sally_core::manifest::Cpus;
+use sallyd::sandbox::oci::intent::Built;
 use sallyd::sandbox::{
-    InferenceSpec, LaunchError, SessionDirs, SessionId, VerifiedModel, harness_build,
-    inference_build,
+    ImageRef, InferenceSpec, LaunchError, ScanLimits, SessionDirs, SessionId, VerifiedModel,
+    harness_build, inference_build, scan_mounts, workspace_build,
 };
 
 mod common;
@@ -333,6 +335,250 @@ fn rt_sup_04_the_cpu_inference_launch_runs_the_one_start_path() {
     });
 }
 
+/// Where the image-metadata image's health check leaves its marker.
+const MARKER: &str = "/tmp/sp-health-marker";
+
+/// The test image, in Docker format, declaring a health check that makes [`MARKER`] every second
+/// and one volume at a path no mount uses.
+fn metadata_image() -> ImageRef {
+    docker_image_with(&format!(
+        "HEALTHCHECK --interval=1s --timeout=5s CMD touch {MARKER}\nVOLUME /sp-image-volume\n"
+    ))
+}
+
+/// `podman inspect` of `id` with the Go template `format`, trimmed.
+fn inspect(id: &str, format: &str) -> String {
+    let out = podman(&["inspect", "--format", format, id]);
+    assert!(
+        out.status.success(),
+        "inspect: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// The health check podman recorded for container `id`, as JSON.
+fn health_of(id: &str) -> String {
+    inspect(id, "{{json .Config.Healthcheck}}")
+}
+
+/// The names of the volumes mounted in container `id`.
+fn volumes_of(id: &str) -> Vec<String> {
+    let t = "{{range .Mounts}}{{if eq .Type \"volume\"}}{{.Name}} {{end}}{{end}}";
+    inspect(id, t)
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn volume_exists(name: &str) -> bool {
+    podman(&["volume", "exists", name]).status.success()
+}
+
+/// Whether a unit of the user's service manager is named after container `id` (`<id>.<kind>`;
+/// the container's own `libpod-<id>.scope` units do not count). A failed listing panics, so it
+/// never reads as "none".
+fn unit_names(id: &str) -> bool {
+    let out = std::process::Command::new("systemctl")
+        .args(["--user", "list-units", "--all", "--no-legend", "--plain"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "systemctl --user: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let named = format!("{id}.");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .any(|l| l.starts_with(&named))
+}
+
+/// How long it took [`MARKER`] to appear in container `id`, polled until `limit`; `None` if it
+/// did not.
+async fn marker_within(id: &str, limit: Duration) -> Option<Duration> {
+    let begun = Instant::now();
+    while begun.elapsed() < limit {
+        if exec_in(id, &["test", "-e", MARKER]).0 == 0 {
+            return Some(begun.elapsed());
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    None
+}
+
+/// Whether hermetic `podman healthcheck run` on `id` succeeded.
+async fn health_run(x: &Lx, id: &str) -> bool {
+    let out = x
+        .podman
+        .command()
+        .args(["healthcheck", "run", id])
+        .output()
+        .await
+        .unwrap();
+    out.status.success()
+}
+
+/// The longest the controls wait for the image's health check to act on its own.
+const CONTROL_LIMIT: Duration = Duration::from_secs(30);
+
+/// The controls of the image-metadata rows, from the product-built `built` of one role from
+/// [`metadata_image`]; how long the image's health check took to act on its own.
+///
+/// Health checks: the argv without `--no-healthcheck` gives a container that carries the image's
+/// health check, which the verifier refuses on `healthcheck`; started, the check makes the
+/// marker by itself and a unit of the user's service manager names the container. Volumes: the
+/// argv without `--image-volume=ignore` gives a container with the image's volume. Each control
+/// is removed with its volumes and its unit.
+async fn metadata_controls(x: &Lx, built: &Built) -> Duration {
+    let declared = podman(&[
+        "image",
+        "inspect",
+        "--format",
+        "{{json .Config.Healthcheck}}",
+        metadata_image().as_str(),
+    ]);
+    assert!(
+        String::from_utf8_lossy(&declared.stdout).contains(MARKER),
+        "the fixture image carries its health check (built in Docker format)"
+    );
+    let argv = x.left_out(built.argv.clone(), LeaveOut::Healthcheck);
+    let id = create_and_init(x, argv).await;
+    assert!(
+        health_of(&id).contains(MARKER),
+        "control: {}",
+        health_of(&id)
+    );
+    assert_eq!(
+        mismatch_field(x.launcher.verify_config(&id, &built.intent).await),
+        "healthcheck"
+    );
+    x.hermetic(&["start".to_owned(), id.clone()]).await;
+    let took = marker_within(&id, CONTROL_LIMIT)
+        .await
+        .expect("control: the image's health check made its marker by itself");
+    assert!(unit_names(&id), "control: a unit names the container");
+    assert!(health_run(x, &id).await, "control: the health check runs");
+    assert!(
+        podman(&["rm", "--force", "--volumes", "--time", "0", &id])
+            .status
+            .success()
+    );
+    let begun = Instant::now();
+    while unit_names(&id) && begun.elapsed() < CONTROL_LIMIT {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(!unit_names(&id), "control: its unit went with it");
+
+    let argv = x.left_out(built.argv.clone(), LeaveOut::ImageVolume);
+    let id = x.hermetic(&argv).await.lines().last().unwrap().to_owned();
+    let made = volumes_of(&id);
+    assert_eq!(made.len(), 1, "control: the image's volume is made");
+    assert!(volume_exists(&made[0]));
+    assert!(
+        podman(&["rm", "--force", "--volumes", "--time", "0", &id])
+            .status
+            .success()
+    );
+    assert!(
+        !volume_exists(&made[0]),
+        "control: removed with its container"
+    );
+    took
+}
+
+/// Container `id`, launched from [`metadata_image`], carries no health check and no image
+/// volume: podman records the disabled form, the marker never appears in twice the time the
+/// control's check took (and a second more), no unit names the container, and a health check
+/// run fails.
+async fn assert_metadata_off(x: &Lx, id: &str, took: Duration) {
+    assert_eq!(health_of(id), r#"{"Test":["NONE"]}"#);
+    assert!(volumes_of(id).is_empty(), "{:?}", volumes_of(id));
+    let wait = took * 2 + Duration::from_secs(1);
+    assert_eq!(marker_within(id, wait).await, None, "the marker appeared");
+    assert!(!unit_names(id), "a unit names the container");
+    assert!(!health_run(x, id).await, "a health check ran");
+    assert_eq!(
+        exec_in(id, &["test", "-e", MARKER]).0,
+        1,
+        "the marker appeared"
+    );
+}
+
+/// Security review: a workspace launched from an image that declares a health check and a
+/// volume carries neither. Controls first ([`metadata_controls`]).
+#[test]
+fn rt_sup_05_the_workspace_image_health_check_and_volume_are_off() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let v = x.f.load("");
+        let image = metadata_image();
+        let paths = x.paths("md-ws-c");
+        let dirs = SessionDirs::create(&paths, &x.xdg, &[], 0).unwrap();
+        let scan = scan_mounts(&v, &ScanLimits::default()).unwrap();
+        let built = workspace_build(&x.common_args(&dirs), &paths, &v, &scan, Some(&image));
+        let took = metadata_controls(&x, &built.unwrap()).await;
+        let mut req = x.request(&v, "md-ws");
+        req.default_image = Some(image);
+        let r = x.launcher.launch_workspace(req).await.unwrap();
+        assert_metadata_off(&x, r.container(), took).await;
+        x.stop(r).await;
+    });
+}
+
+/// Security review: as the workspace row, for the harness.
+#[test]
+fn rt_sup_05_the_harness_image_health_check_and_volume_are_off() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let v = x.f.load("");
+        let image = metadata_image();
+        let paths = x.paths("md-h-c");
+        let dirs = SessionDirs::create(&paths, &x.xdg, &[], 0).unwrap();
+        let built = harness_build(&x.common_args(&dirs), &paths, &v, &image).unwrap();
+        let took = metadata_controls(&x, &built).await;
+        let ws = x.launch(&v, "md-h").await.unwrap();
+        let mut req = x.harness(&v, "md-h");
+        req.default_image = Some(image);
+        let h = x.launcher.launch_harness(req).await.unwrap();
+        assert_metadata_off(&x, h.container(), took).await;
+        x.launcher.stop_role(h).await.unwrap();
+        x.stop(ws).await;
+    });
+}
+
+/// Security review: as the workspace row, for CPU inference.
+#[test]
+fn rt_sup_05_the_inference_image_health_check_and_volume_are_off() {
+    let (dir, _cleanup) = scratch("md-infer");
+    rt().block_on(async {
+        let x = Lx::new();
+        let image = metadata_image();
+        let paths = x.paths("md-i-c");
+        let dirs = SessionDirs::create(&paths, &x.xdg, &[], 0).unwrap();
+        let socket_dir = dir.join("sock");
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        let spec = InferenceSpec {
+            instance: SessionId::parse(&format!("{}-md-i-c", x.scope)).unwrap(),
+            socket_dir,
+            model: x.model(),
+            image: image.clone(),
+            gpu: false,
+            gpu_layers: 0,
+            context: 512,
+            cpus: Cpus::from_millis(1000),
+            memory: None,
+        };
+        let built = inference_build(&x.common_args(&dirs), &spec).unwrap();
+        let took = metadata_controls(&x, &built).await;
+        let mut req = x.inference(x.model(), "md-i");
+        req.image = image;
+        let i = x.launcher.launch_inference(req).await.unwrap();
+        assert_metadata_off(&x, i.container(), took).await;
+        x.launcher.stop_role(i).await.unwrap();
+    });
+}
+
 /// RT-SUP-04, #123, Q132 phase 2: a harness whose config is altered between `init` and
 /// `start` is refused `config-mismatch` and never started; the workspace beside it was not
 /// altered and still runs.
@@ -434,6 +680,74 @@ fn rt_sup_04_a_config_altered_between_create_and_start_is_refused() {
             "{argv}"
         );
         assert!(!argv.lines().any(|l| verb_of(l) == "start"), "{argv}");
+    });
+}
+
+/// A podman wrapper that drops `--image-volume=ignore` from every call (so the image's volumes
+/// are made) and, when `keep_volumes`, `--volumes` too (so `rm` leaves them). Before each `rm`
+/// it appends the names of the removed container's volumes to `<at>/volumes`.
+fn volume_podman(at: &Path, real: &Path, keep_volumes: bool) -> PathBuf {
+    let drop = if keep_volumes { "--volumes) ;;" } else { "" };
+    wrap_podman(at, real, |dir, real| {
+        "#!/bin/sh\nn=$#\nv=; skip=; last=\nfor a; do\n\
+         if [ -z \"$v\" ]; then\n\
+         if [ -n \"$skip\" ]; then skip=; else case \"$a\" in --*) skip=1 ;; *) v=$a ;; esac; fi\n\
+         fi\nlast=$a\n\
+         case \"$a\" in --image-volume=ignore) ;; DROP *) set -- \"$@\" \"$a\" ;; esac\n\
+         done\nshift $n\n\
+         if [ \"$v\" = rm ]; then\n\
+         'REAL' inspect --format '{{range .Mounts}}{{if eq .Type \"volume\"}}{{.Name}} \
+         {{end}}{{end}}' \"$last\" >>'DIR/volumes' 2>/dev/null\nfi\n\
+         exec 'REAL' \"$@\"\n"
+            .replace("DROP", drop)
+            .replace("REAL", real)
+            .replace("DIR", dir)
+    })
+}
+
+/// The volume names [`volume_podman`] in `dir` recorded.
+fn recorded_volumes(dir: &Path) -> Vec<String> {
+    std::fs::read_to_string(dir.join("volumes"))
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// One workspace launch of an image declaring a volume, through [`volume_podman`] in `dir`:
+/// the launch is refused; the volumes of the containers it removed.
+async fn refused_with_image_volume(dir: &Path, keep_volumes: bool) -> Vec<String> {
+    let x = Lx::with_podman(|real| volume_podman(dir, real, keep_volumes));
+    let v = x.f.load("");
+    let mut req = x.request(&v, "vol");
+    req.default_image = Some(image_with("VOLUME /sp-image-volume\n"));
+    let e = x.launcher.launch_workspace(req).await.unwrap_err();
+    assert!(matches!(&e, LaunchError::ConfigMismatch(_)), "{e:?}");
+    let made = recorded_volumes(dir);
+    assert!(!made.is_empty(), "the image's volume was made");
+    made
+}
+
+/// Security review: removing a container also removes its anonymous volumes. A workspace
+/// launch whose podman calls make the image's volume (the argv's `--image-volume=ignore`
+/// dropped) is refused, and the containers it removed leave no volume behind. Control, first:
+/// with `--volumes` also dropped from `rm`, the volumes stay.
+#[test]
+fn rt_sup_05_a_removed_container_leaves_no_image_volume() {
+    let (control, _c) = scratch("vol-control");
+    let (dir, _d) = scratch("vol");
+    rt().block_on(async {
+        let kept = refused_with_image_volume(&control, true).await;
+        for name in &kept {
+            assert!(volume_exists(name), "control: {name} stays");
+            assert!(podman(&["volume", "rm", name]).status.success());
+        }
+        let made = refused_with_image_volume(&dir, false).await;
+        let stayed: Vec<&String> = made.iter().filter(|n| volume_exists(n)).collect();
+        for name in &stayed {
+            let _ = podman(&["volume", "rm", name]);
+        }
+        assert!(stayed.is_empty(), "stayed behind: {stayed:?}");
     });
 }
 
