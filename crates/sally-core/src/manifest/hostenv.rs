@@ -220,8 +220,6 @@ mod tests {
             .collect()
     }
 
-    /// DS2: the env-moved folders, `$GOPATH`'s `bin` and `pkg`, and `$PATH`'s entries; relative
-    /// values and repeats are dropped, and every listed variable is read.
     /// The list of single-folder variables, pinned by name (the test below builds its
     /// expectation from the list, so it could not notice a dropped name).
     #[test]
@@ -249,6 +247,8 @@ mod tests {
         );
     }
 
+    /// DS2: the env-moved folders, `$GOPATH`'s `bin` and `pkg`, and `$PATH`'s entries; relative
+    /// values and repeats are dropped, and every listed variable is read.
     #[test]
     fn env_dirs_reads_each_variable() {
         let mut vars: Vec<(&str, String)> = SINGLE_DIR_VARS

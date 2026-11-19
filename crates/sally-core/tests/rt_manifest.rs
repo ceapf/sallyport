@@ -833,12 +833,14 @@ fn rt_fs_19_a_link_out_of_a_protected_folder_protects_its_target() {
         "plugs",
         "crates",
         "cargohome/bin",
+        "stow/cargo",
+        "stow/ktools",
     ] {
         std::fs::create_dir_all(home.join(dir)).unwrap();
     }
     let body = mount("~/tools/t", "rw");
     twin_ok(&f, &body);
-    for host in ["~/plugs", "~/crates", "~/cargohome"] {
+    for host in ["~/plugs", "~/crates", "~/cargohome", "~/stow/ktools"] {
         twin_ok(&f, &mount(host, "rw"));
     }
     let before = f.load(&body).unwrap().manifest;
@@ -862,6 +864,17 @@ fn rt_fs_19_a_link_out_of_a_protected_folder_protects_its_target() {
     // A link at depth 2 (a subfolder of a protected folder).
     let plug = link(&f, ".config/app/plug", "plugs/p");
     refused_naming(&f, "~/plugs", "rw", &plug);
+    // A stow-folded protected folder (`~/.cargo -> ~/stow/cargo`) holding a relative link:
+    // `../ktools/k` resolves against the real folder, to `~/stow/ktools/k`.
+    std::os::unix::fs::symlink(home.join("stow/cargo"), home.join(".cargo")).unwrap();
+    std::os::unix::fs::symlink("../ktools/k", home.join("stow/cargo/k")).unwrap();
+    let real_home = std::fs::canonicalize(&home).unwrap();
+    let k = format!(
+        "{}, which {}",
+        real_home.join("stow/ktools/k").display(),
+        home.join(".cargo/k").display()
+    );
+    refused_naming(&f, "~/stow/ktools", "rw", &k);
     // A folder the environment names is a rule naming its variable, and its links are read.
     f.env.env_dirs = vec![EnvDir {
         path: home.join("cargohome"),

@@ -126,12 +126,13 @@ impl Scan {
         depth: usize,
         reason: &'static str,
     ) -> Result<(), Incomplete> {
-        self.walk(dir, depth, reason, |_| true)
+        self.walk(dir, depth, reason, false)
     }
 
     /// Reads only `home`'s own entries and records the symlinks whose names start with `.`
-    /// (dotfiles, which shells and tools load). Every entry read counts. Called after every
-    /// [`Scan::read`]: a home already read whole is not read again for its dotfiles.
+    /// (dotfiles, which shells and tools load). Every entry read counts. A home already read
+    /// whole is not read again for its dotfiles, and a dotfile read does not count as reading
+    /// the home whole: a later [`Scan::read`] of it still reads every entry.
     ///
     /// # Errors
     /// As [`Scan::read`].
@@ -140,9 +141,7 @@ impl Scan {
         home: &Path,
         reason: &'static str,
     ) -> Result<(), Incomplete> {
-        self.walk(home, 1, reason, |name| {
-            name.as_encoded_bytes().starts_with(b".")
-        })
+        self.walk(home, 1, reason, true)
     }
 
     fn walk(
@@ -150,18 +149,20 @@ impl Scan {
         dir: &Path,
         depth: usize,
         reason: &'static str,
-        keep: fn(&std::ffi::OsStr) -> bool,
+        dotfiles_only: bool,
     ) -> Result<(), Incomplete> {
         if depth == 0 {
             return Ok(());
         }
         // The real folder: relative link text resolves against it, as the kernel resolves it,
-        // and a folder is read again only to a greater depth than before.
+        // and a folder is read again only to a greater depth than a whole read before.
         let real = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_owned());
         if self.seen.get(&real).is_some_and(|read| *read >= depth) {
             return Ok(());
         }
-        self.seen.insert(real.clone(), depth);
+        if !dotfiles_only {
+            self.seen.insert(real.clone(), depth);
+        }
         let listed = std::fs::read_dir(dir);
         if let Err(e) = &listed
             && e.kind() == ErrorKind::PermissionDenied
@@ -183,7 +184,7 @@ impl Scan {
             };
             let path = entry.path();
             if kind.is_symlink() {
-                if !keep(&entry.file_name()) {
+                if dotfiles_only && !entry.file_name().as_encoded_bytes().starts_with(b".") {
                     continue;
                 }
                 let Some(text) = settle(std::fs::read_link(&path), dir)? else {
@@ -195,7 +196,8 @@ impl Scan {
                     reason,
                 });
             } else if kind.is_dir() {
-                self.walk(&real.join(entry.file_name()), depth - 1, reason, keep)?;
+                // Entered by the spelling it was found under (its real path is taken again).
+                self.walk(&path, depth - 1, reason, dotfiles_only)?;
             }
         }
         Ok(())
@@ -365,16 +367,26 @@ mod tests {
         let t = Tree::new("realdir");
         let real = t.dir("dotfiles/bin");
         symlink("../tools/t", real.join("t")).unwrap();
+        // At depth 2 too: the link is named by its spelling, the target by the real folder.
+        let sub = t.dir("dotfiles/bin/sub");
+        symlink("../../tools/u", sub.join("u")).unwrap();
         t.dir("local");
         symlink(&real, t.0.join("local/bin")).unwrap();
         let found = links(&t.0.join("local/bin"), DEPTH, BUDGET).unwrap();
         assert_eq!(
             found,
-            [Link {
-                link: t.0.join("local/bin/t"),
-                target: real.join("../tools/t"),
-                reason: WHY,
-            }]
+            [
+                Link {
+                    link: t.0.join("local/bin/sub/u"),
+                    target: sub.join("../../tools/u"),
+                    reason: WHY,
+                },
+                Link {
+                    link: t.0.join("local/bin/t"),
+                    target: real.join("../tools/t"),
+                    reason: WHY,
+                }
+            ]
         );
     }
 
@@ -398,6 +410,8 @@ mod tests {
 
     impl Mode {
         fn set(dir: &Path, mode: u32) -> Self {
+            // The guard first, so a failed check below still restores the mode.
+            let guard = Self(dir.to_owned());
             set_mode(dir, mode);
             // Control: the fixture is really unlistable here (a root runner would list it and
             // the test would pass without the rule; fail instead).
@@ -407,13 +421,15 @@ mod tests {
                 Err(ErrorKind::PermissionDenied),
                 "the fixture folder must be unlistable for this user"
             );
-            Self(dir.to_owned())
+            guard
         }
     }
 
     impl Drop for Mode {
         fn drop(&mut self) {
-            set_mode(&self.0, 0o755);
+            use std::os::unix::fs::PermissionsExt;
+            let open = std::fs::Permissions::from_mode(0o755);
+            let _ = std::fs::set_permissions(&self.0, open);
         }
     }
 
@@ -510,6 +526,25 @@ mod tests {
         s.read_dotfiles(&home, WHY).unwrap();
         let found: Vec<PathBuf> = s.into_links().into_iter().map(|l| l.link).collect();
         assert_eq!(found, [home.join(".bashrc")]);
+        // A dotfile read does not count as a whole read: a later one still finds `work`.
+        let mut s = Scan::with_budget(BUDGET);
+        s.read_dotfiles(&home, WHY).unwrap();
+        s.read(&home, 1, WHY).unwrap();
+        let mut found: Vec<PathBuf> = s.into_links().into_iter().map(|l| l.link).collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                home.join(".bashrc"),
+                home.join(".bashrc"),
+                home.join("work")
+            ]
+        );
+        // A whole read first: the dotfile read adds nothing more.
+        let mut s = Scan::with_budget(BUDGET);
+        s.read(&home, 1, WHY).unwrap();
+        s.read_dotfiles(&home, WHY).unwrap();
+        assert_eq!(s.into_links().len(), 2);
         let mut s = Scan::with_budget(2);
         assert_eq!(
             s.read_dotfiles(&home, WHY),

@@ -42,8 +42,8 @@ pub(crate) const MAX_PATH_DIRS: usize = 256;
 pub(crate) const MAX_GOPATH_DIRS: usize = 32;
 
 /// The variables that name a list of folders, each with the most of its folders that become
-/// rules. With the single-folder variables (`hostenv.rs`) the environment adds at most
-/// 16 + 32 + 256 = 304 rules and scan roots.
+/// rules. With one folder for each single-folder variable (`hostenv.rs`), the environment adds
+/// at most that many plus 32 + 256 rules and scan roots.
 const LIST_BOUNDS: [(&str, usize); 2] = [("PATH", MAX_PATH_DIRS), ("GOPATH", MAX_GOPATH_DIRS)];
 
 /// Under each home directory. Credentials, Sallyport's own state, and anything the host
@@ -241,10 +241,12 @@ impl Denylist {
         let fixed = self.rules.len();
         let mut targets = std::collections::HashSet::new();
         for l in links {
-            let shown = normalize(&l.target);
-            if !targets.insert(shown.clone()) {
+            // Keyed by the target as the kernel reads it, not its normalized form: `s/../x`
+            // through a linked `s` and a plain `x` normalize alike but resolve apart.
+            if !targets.insert(l.target.clone()) {
                 continue;
             }
+            let shown = normalize(&l.target);
             let label = format!("{}, which {} points to", shown.display(), l.link.display());
             let r = rule(&l.target, Scope::Subtree, Some(&label), Some(l.reason));
             if !r.forms.iter().all(|f| self.covers(f, fixed)) {
@@ -932,6 +934,39 @@ mod tests {
         assert!(w.contains(".local/bin/t points to"), "{w}");
     }
 
+    /// Two links whose targets normalize alike but resolve apart (`s/../x` through a linked `s`,
+    /// and a plain `x`) each make a rule, in either order.
+    #[test]
+    fn targets_that_resolve_apart_are_not_merged() {
+        let t = TmpHome::new("apart");
+        let home = t.home();
+        let r = home.join(".local/bin");
+        std::fs::create_dir_all(&r).unwrap();
+        std::fs::create_dir_all(home.join("data/q")).unwrap();
+        std::fs::write(home.join("data/x"), "").unwrap();
+        std::os::unix::fs::symlink(home.join("data/q"), r.join("s")).unwrap();
+        let via = Link {
+            link: r.join("a"),
+            target: r.join("s/../x"),
+            reason: EXECUTED,
+        };
+        let plain = Link {
+            link: r.join("b"),
+            target: r.join("x"),
+            reason: EXECUTED,
+        };
+        for order in [[via.clone(), plain.clone()], [plain, via]] {
+            let mut d = Denylist::without_links(&env(home.to_str().unwrap()), &[]);
+            d.add_links(order.to_vec());
+            // `s/../x` resolves to `~/data/x`: its folder `~/data` contains it.
+            let w = why(&d, &home, "data");
+            assert!(
+                w.contains("contains") && w.contains(".local/bin/a points to"),
+                "{w}"
+            );
+        }
+    }
+
     /// Two links to one target make one rule.
     #[test]
     fn a_target_named_by_two_links_is_one_rule() {
@@ -1075,7 +1110,8 @@ mod tests {
     /// over their bounds one sentence names both.
     #[test]
     fn gopath_folders_past_the_bound_leave_the_list_incomplete() {
-        let entry = |n: usize| PathBuf::from(format!("/opt/g{n}"));
+        // Under a root that does not exist: `$GOPATH` folders are read wherever they lie.
+        let entry = |n: usize| PathBuf::from(format!("/sp-absent-root/g{n}"));
         let mut e = env("/sp-absent-root/home/u");
         e.env_dirs = (1..=MAX_GOPATH_DIRS)
             .map(|n| env_dir(&entry(n), "GOPATH"))
