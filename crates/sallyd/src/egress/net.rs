@@ -247,9 +247,9 @@ impl Drop for EgressHandle {
 /// nothing more is accepted until a connection ends. An accepted connection over the session's
 /// admission rate ([`Limits::admission_rate`], [`Limits::admission_burst`]) is closed at once,
 /// unread and without an entry of its own; one `egress.shed` per [`SHED_INTERVAL`] says how many
-/// were, and a stop writes the count of an unfinished interval (an abort, after
-/// [`STOP_GRACE`] or on drop, loses it, as it does an `egress.close`). No broker-originated
-/// connections.
+/// were, and a stop writes the count of an unfinished interval (an abort before that entry is
+/// written, past [`STOP_GRACE`] or on drop, loses it, as it does an `egress.close`). No
+/// broker-originated connections.
 pub fn serve<R, D, H>(listener: UnixListener, proxy: Arc<Proxy<R, D, H>>) -> EgressHandle
 where
     R: Resolver,
@@ -406,7 +406,8 @@ impl Shedding {
     }
 
     /// The entry was not written: the count and its window stay, and the next try is one
-    /// interval after `now`. Only at the stop, with no next try, is a count lost.
+    /// interval after `now`. Only at the stop, with no next try, does a failed entry lose its
+    /// count.
     fn failed(&mut self, now: Instant) {
         if self.first.is_some() {
             self.due = Some(now + SHED_INTERVAL);

@@ -390,7 +390,7 @@ async fn a_stop_writes_the_count_of_an_unfinished_interval() {
 }
 
 /// A count whose entry could not be written is kept, window and all, and goes into the next
-/// entry one interval later: no count is dropped unwritten.
+/// entry one interval later.
 #[tokio::test(start_paused = true)]
 async fn a_failed_count_entry_carries_its_count_into_the_next() {
     use super::super::server::{ADMISSION_BURST, ADMISSION_RATE};
@@ -527,7 +527,9 @@ async fn past_the_cap_the_rate_closes_before_the_429() {
     let audit = Arc::new(Ends::default());
     let frozen = freeze();
     let handle = start(Arc::new(OnePublic), Arc::clone(&audit), 1, &sock);
-    // Takes the one live slot (and one connection of the burst), and sends nothing.
+    // Takes the one live slot (and one connection of the burst), and sends nothing. Accepted
+    // first and its task spawned first, so on this current-thread runtime it holds the slot
+    // before any flood connection asks (if not, the flood's 403 fails the test loudly).
     let held = UnixStream::connect(&sock).await.unwrap();
     let (mut answered, mut closed) = (0usize, 0usize);
     for _ in 0..100 {

@@ -1299,9 +1299,9 @@ sallyport/
   unread and has no effect; it is counted, not entered one by one: one `egress.shed` per second
   (`SHED_INTERVAL`) while any were closed, and one at the stop for an unfinished second. A count
   whose entry fails to append is kept and goes into the next one; at the stop there is no next
-  one, so a failed final entry loses its count, and an abort of the accept task (past the stop
-  grace, or a dropped handle) loses it unwritten, as either loses a connection's `egress.close`
-  (RT-AUD-03's residual). Broker-originated connections
+  one, so a failed final entry loses its count, and an abort of the accept task before that
+  entry is written (past the stop grace, or a dropped handle) loses it unwritten, as either
+  loses a connection's `egress.close` (RT-AUD-03's residual). Broker-originated connections
   (the fetch connector) never cross `net.sock` and draw nothing from the rate. Descriptors are
   bounded across sessions (#48, architect Q45): `sallyd` raises its soft `NOFILE` to the hard
   limit (at most 2^20), and sessions together may reserve half of it. A session costs
