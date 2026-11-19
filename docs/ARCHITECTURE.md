@@ -846,10 +846,11 @@ recorded, then the connection closes); nesting depth 64; ids ≤ 128 bytes; meth
 bytes; tool names 1–128 bytes; duplicate JSON keys refused. Per session: 8 connections (the
 listener stops accepting at the cap), 16 `tools/call` in flight, replies not yet written
 included (the 17th is `-32000` `too-many-in-flight`, recorded first), a reused in-flight id
-`-32600`, and 20 requests read per second with a burst of 40. Over the rate the broker stops reading (backpressure): requests are
-slowed, never dropped unrecorded. A reply the peer does not take within 10 s closes the
-connection. Prompts: at most `approvals.max_pending` wait at once, and new ones come at most one
-per 2 s with a burst of `max_pending` (`approvals::queue::REFILL`, tunable); a call over either
+`-32600`, and 20 requests read per second with a burst of 40. Over the rate the broker stops
+reading (backpressure): requests are slowed, never dropped unrecorded. A reply the peer does
+not take within 10 s closes the connection. Prompts: at most `approvals.max_pending` wait at
+once, and new ones come at most one per 2 s with a burst of `max_pending`
+(`approvals::queue::REFILL`, tunable); a call over either
 bound is denied `approval-flood` with its own `approval.deny` entry, and each flood episode (until
 the queue is empty and the rate full again) writes one `approval.flood`. With 16 calls in flight
 at most, a `max_pending` above 16 is never reached.

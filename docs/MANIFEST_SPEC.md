@@ -213,8 +213,8 @@ an object carrying a POSIX ACL is open to its owner only (architect ruling Q39; 
   `.husky/`) are ordinary files in the writable folder and are not protected, nor is a `.git`
   created after the launch scan; `summary()` says so. The same holds for what a link inside
   `.git` points to in the working tree (a `.git/hooks` linked to a tracked folder): the link
-  stays byte-identical, its target is writable, and the host runs what the sandbox wrote there. Commits
-  made in a session are discarded and file changes arrive as uncommitted modifications;
+  stays byte-identical, its target is writable, and the host runs what the sandbox wrote there.
+  Commits made in a session are discarded and file changes arrive as uncommitted modifications;
   `summary()` says so. Every directory between the mount root and a nested `.git` entry is bound
   onto itself, so it cannot be renamed away from under its shield (`EBUSY`); the launch scan
   covers every `rw` mount (an `rw` mount without a scan is refused). More than 32 shielded

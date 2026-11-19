@@ -269,5 +269,6 @@ dialer, a mock upstream's log, the audit sink, a backend) records the allowed ca
 test first. 6. Raise `REDTEAM_COUNT` in the `Makefile` by the number of `rt_` tests the PR adds:
 `make redteam` fails unless exactly that many run (`scripts/redteam-guard.sh`), so a lost test file
 fails the run. Every test in a module whose name starts `rt_` (`approvals::rt_tests`) counts
-too, since the filter selects it. The count goes down only in a PR that removes a test, and its description names
-every test that left; removing, renaming or ignoring an `rt_` test is the maintainer's decision.
+too, since the filter selects it. The count goes down only in a PR that removes a test, and its
+description names every test that left; removing, renaming or ignoring an `rt_` test is the
+maintainer's decision.
