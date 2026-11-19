@@ -36,18 +36,20 @@ impl HostPattern {
 /// Suffixes under which anyone can register a subdomain (hosting, tunnels, object storage).
 /// `*.<one of these>` reaches attacker-controlled hosts, so it counts as unrestricted egress.
 /// Deliberately a short curated list, not the full Public Suffix List: it covers the services an
-/// exfiltrating agent would reach for; anything else still needs an explicit rule. This is the
-/// one maintained constant for shared hosting (AMENDMENTS-01).
-/// TODO(v2): derive from the Public Suffix List's private section.
+/// exfiltrating agent would reach for; anything else still needs an explicit rule. With
+/// [`SHARED_TREES`] this is the one maintained list for shared hosting (AMENDMENTS-01). No entry
+/// of either list lies under another (a test holds it), so every entry is one testable case.
+/// TODO(#235): derive from the Public Suffix List's private section.
 const SHARED_SUFFIXES: &[&str] = &[
-    "amazonaws.com",
-    "s3.amazonaws.com",
     "cloudfront.net",
     "appspot.com",
     "web.app",
     "firebaseapp.com",
     "azurewebsites.net",
-    "blob.core.windows.net",
+    "storage.googleapis.com",
+    "hf.space",
+    "gradio.live",
+    "run.app",
     "github.io",
     "githubusercontent.com",
     "gitlab.io",
@@ -75,16 +77,41 @@ const SHARED_SUFFIXES: &[&str] = &[
     "co.jp",
 ];
 
+/// Shared trees: providers whose registrable hosts sit at any depth below the entry (regional
+/// and per-service endpoints such as `<bucket>.s3.<region>.amazonaws.com` or
+/// `<account>.z13.web.core.windows.net`), so a wildcard over any base under one counts too.
+const SHARED_TREES: &[&str] = &["amazonaws.com", "core.windows.net"];
+
 impl HostPattern {
-    /// `*`, or a wildcard over a suffix where anyone can register hosts (see `SHARED_SUFFIXES`).
+    /// `*`, or a wildcard that reaches hosts anyone can register: its base is an entry of
+    /// [`SHARED_SUFFIXES`] or [`SHARED_TREES`], or a parent of one (`*.windows.net` covers
+    /// `*.core.windows.net`), or lies under a shared tree (`*.s3.us-east-1.amazonaws.com`).
     #[must_use]
     pub fn is_effectively_unrestricted(&self) -> bool {
         match self {
             Self::Any => true,
-            Self::Suffix(base) => SHARED_SUFFIXES.contains(&base.as_str()),
+            Self::Suffix(base) => covers_shared_hosting(base),
             Self::Exact(_) => false,
         }
     }
+}
+
+/// Whether `*.<base>` matches hosts under a shared-hosting entry (see
+/// [`HostPattern::is_effectively_unrestricted`]).
+fn covers_shared_hosting(base: &str) -> bool {
+    let under_tree = SHARED_TREES.iter().any(|tree| is_below(base, tree));
+    under_tree
+        || SHARED_SUFFIXES
+            .iter()
+            .chain(SHARED_TREES)
+            .any(|entry| *entry == base || is_below(entry, base))
+}
+
+/// Whether `host` lies strictly below `parent` at a label boundary (`a.b.c` below `b.c`; not
+/// `ab.c`). Both are validated hostnames, so no label is empty.
+fn is_below(host: &str, parent: &str) -> bool {
+    host.strip_suffix(parent)
+        .is_some_and(|rest| rest.ends_with('.'))
 }
 
 impl fmt::Display for HostPattern {
@@ -317,6 +344,21 @@ mod tests {
             "*.s3.amazonaws.com",
             "*.workers.dev",
             "*.co.uk",
+            // Hosting a stranger can register under, by an exact entry.
+            "*.storage.googleapis.com",
+            "*.hf.space",
+            "*.gradio.live",
+            "*.run.app",
+            // A parent of an entry: its wildcard matches the entry's hosts too.
+            "*.googleapis.com",
+            "*.windows.net",
+            // A tree itself, and anywhere under one: regional and service endpoints.
+            "*.amazonaws.com",
+            "*.core.windows.net",
+            "*.s3.us-east-1.amazonaws.com",
+            "*.execute-api.eu-west-1.amazonaws.com",
+            "*.web.core.windows.net",
+            "*.z13.web.core.windows.net",
         ] {
             assert!(
                 parse_host_pattern(p).is_ok_and(|h| h.is_effectively_unrestricted()),
@@ -328,12 +370,51 @@ mod tests {
             "*.myorg.github.io",
             "api.github.io",
             "github.io",
+            // Label boundaries: a shared name inside a label is not that name.
+            "*.xamazonaws.com",
+            "*.ows.net",
+            "*.notcore.windows.net",
+            // Under a flat entry: one account's own subdomains.
+            "*.myorg.hf.space",
+            // Exact hosts are never unrestricted, even under a tree.
+            "x.s3.us-east-1.amazonaws.com",
         ] {
             assert!(
                 parse_host_pattern(p).is_ok_and(|h| !h.is_effectively_unrestricted()),
                 "{p}"
             );
         }
+    }
+
+    /// Every entry is a wildcard base a manifest can write, appears once, and lies under no
+    /// other entry: a redundant entry would be a case no test can tell apart.
+    #[test]
+    fn shared_hosting_lists_are_distinct_valid_bases() {
+        let all: Vec<&str> = SHARED_SUFFIXES
+            .iter()
+            .chain(SHARED_TREES)
+            .copied()
+            .collect();
+        for (i, e) in all.iter().enumerate() {
+            assert_eq!(
+                parse_host_pattern(&format!("*.{e}")),
+                Ok(HostPattern::Suffix((*e).to_owned())),
+                "{e}"
+            );
+            for (j, other) in all.iter().enumerate() {
+                if i != j {
+                    assert_ne!(e, other, "duplicate {e}");
+                    assert!(!is_below(e, other), "{e} lies under {other}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn is_below_needs_a_label_boundary() {
+        assert!(is_below("a.b.c", "b.c"));
+        assert!(!is_below("ab.c", "b.c"));
+        assert!(!is_below("b.c", "b.c"));
     }
 
     #[test]
