@@ -107,6 +107,7 @@ fn inner() {
         xdg_data_home: None,
         xdg_runtime_dir: None,
         podman_storage: Vec::new(),
+        env_dirs: Vec::new(),
         nproc: 8,
         mem_bytes: 16 << 30,
     };

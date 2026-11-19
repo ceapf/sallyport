@@ -2,6 +2,7 @@
 //! CPU count, and RAM. Gathered once by the caller and passed in, so validation is a function of
 //! its inputs and tests can point it at a temporary home.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// Host facts used by the validator.
@@ -20,10 +21,66 @@ pub struct HostEnv {
     pub xdg_runtime_dir: Option<PathBuf>,
     /// Podman storage roots (graphroot). Mounting these or any ancestor is refused.
     pub podman_storage: Vec<PathBuf>,
+    /// Folders the environment moves or names for code the host runs or loads (`$CARGO_HOME`,
+    /// `$GNUPGHOME`, every absolute `$PATH` entry, …). Each is denylisted like
+    /// a home folder of the built-in list (MANIFEST_SPEC §2).
+    pub env_dirs: Vec<EnvDir>,
     /// Logical CPUs available to the user.
     pub nproc: u32,
     /// Total host RAM in bytes.
     pub mem_bytes: u64,
+}
+
+/// A folder named by an environment variable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvDir {
+    /// The folder (absolute, as the variable gives it, `bin`/`pkg` appended for `$GOPATH`).
+    pub path: PathBuf,
+    /// The variable's name, without `$` (`PATH`, `CARGO_HOME`, …).
+    pub var: &'static str,
+}
+
+/// Variables whose value is one folder the host runs or loads code from, or keeps credentials
+/// in (the env-moved forms of the built-in home folders).
+const SINGLE_DIR_VARS: &[&str] = &[
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "GNUPGHOME",
+    "NVM_DIR",
+    "PYENV_ROOT",
+    "XDG_CACHE_HOME",
+    "GOBIN",
+    "DOCKER_CONFIG",
+];
+
+/// The folders the environment names, from `lookup` (a variable's value, if set): each
+/// [`SINGLE_DIR_VARS`] value, `bin` and `pkg` under each `$GOPATH` element, and each `$PATH`
+/// entry. Only absolute values count (a relative one names no fixed folder); the first of
+/// repeated paths is kept.
+pub(crate) fn env_dirs(lookup: impl Fn(&str) -> Option<OsString>) -> Vec<EnvDir> {
+    let mut out: Vec<EnvDir> = Vec::new();
+    let mut add = |path: PathBuf, var: &'static str| {
+        if path.is_absolute() && !out.iter().any(|d| d.path == path) {
+            out.push(EnvDir { path, var });
+        }
+    };
+    for var in SINGLE_DIR_VARS {
+        if let Some(v) = lookup(var) {
+            add(PathBuf::from(v), var);
+        }
+    }
+    if let Some(v) = lookup("GOPATH") {
+        for p in std::env::split_paths(&v).filter(|p| p.is_absolute()) {
+            add(p.join("bin"), "GOPATH");
+            add(p.join("pkg"), "GOPATH");
+        }
+    }
+    if let Some(v) = lookup("PATH") {
+        for p in std::env::split_paths(&v) {
+            add(p, "PATH");
+        }
+    }
+    out
 }
 
 /// Why host facts could not be gathered.
@@ -78,6 +135,7 @@ impl HostEnv {
             xdg_config_home,
             xdg_data_home,
             podman_storage,
+            env_dirs: env_dirs(|name| std::env::var_os(name)),
             nproc,
             mem_bytes: mem_total()?,
         })
@@ -138,6 +196,52 @@ mod tests {
         assert_eq!(parse_meminfo("MemTotal: 99999999999999999999 kB\n"), None);
     }
 
+    fn dirs(vars: &[(&str, &str)]) -> Vec<(String, &'static str)> {
+        let lookup = |name: &str| {
+            vars.iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| OsString::from(v))
+        };
+        env_dirs(lookup)
+            .into_iter()
+            .map(|d| (d.path.display().to_string(), d.var))
+            .collect()
+    }
+
+    /// DS2: the env-moved folders, `$GOPATH`'s `bin` and `pkg`, and `$PATH`'s entries; relative
+    /// values and repeats are dropped, and every listed variable is read.
+    #[test]
+    fn env_dirs_reads_each_variable() {
+        let mut vars: Vec<(&str, String)> = SINGLE_DIR_VARS
+            .iter()
+            .map(|v| (*v, format!("/e/{v}")))
+            .collect();
+        vars.push(("GOPATH", "/g1:rel:/g2".into()));
+        vars.push((
+            "PATH",
+            "/usr/bin:bin::/e/CARGO_HOME:/usr/bin:/h/.venv/bin".into(),
+        ));
+        vars.push(("UNLISTED", "/nope".into()));
+        let pairs: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let mut want: Vec<(String, &'static str)> = SINGLE_DIR_VARS
+            .iter()
+            .map(|v| (format!("/e/{v}"), *v))
+            .collect();
+        for (p, v) in [
+            ("/g1/bin", "GOPATH"),
+            ("/g1/pkg", "GOPATH"),
+            ("/g2/bin", "GOPATH"),
+            ("/g2/pkg", "GOPATH"),
+            ("/usr/bin", "PATH"),
+            ("/h/.venv/bin", "PATH"),
+        ] {
+            want.push((p.into(), v));
+        }
+        assert_eq!(dirs(&pairs), want);
+        assert_eq!(dirs(&[("CARGO_HOME", "rel/cargo")]), Vec::new());
+        assert_eq!(dirs(&[]), Vec::new());
+    }
+
     #[test]
     fn from_process_works_on_this_host() {
         let env = HostEnv::from_process();
@@ -147,6 +251,11 @@ mod tests {
         assert!(env.nproc >= 1 && env.mem_bytes > 0);
         let info = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
         assert_eq!(Some(env.mem_bytes), parse_meminfo(&info));
+        assert_eq!(env.env_dirs, env_dirs(|n| std::env::var_os(n)));
+        assert!(
+            env.env_dirs.iter().any(|d| d.var == "PATH"),
+            "this host has a PATH"
+        );
     }
 
     /// The passwd home of the current uid, from `getent` (independent of the code under test).

@@ -86,6 +86,7 @@ coverage:
 # (architect ruling Q6, Task 8), and so do approvals (maintainer's Task 10 decision 8, architect
 # ruling Q26) and tools (Task 11 decision 8, ruling Q38; tools/exec.rs stays with the rt_ tests).
 MUTANTS_FILES := crates/sally-core/src/manifest/validate/*.rs crates/sally-core/src/manifest/paths.rs \
+                 crates/sally-core/src/manifest/links.rs \
                  crates/sally-core/src/manifest/host.rs crates/sally-core/src/config.rs
 # cargo-mutants copies the tree to $$TMPDIR; /tmp is denylisted for mounts, so the copy (and the
 # test fixtures under its target dir) must live elsewhere. Move the fixtures, not the wall.

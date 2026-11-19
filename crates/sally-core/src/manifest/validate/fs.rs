@@ -13,7 +13,10 @@ const MAX_MOUNTS: usize = 64;
 const MAX_GLOBS: usize = 256;
 const MAX_GLOB_LEN: usize = 256;
 
-/// Builds the denylist from built-ins plus `filesystem.deny`, reporting malformed entries.
+/// Builds the denylist from built-ins plus `filesystem.deny`, reporting malformed entries. With
+/// mounts it also reads the protected folders for links (MANIFEST_SPEC §2) and reports a list it
+/// could not complete as `denylist-incomplete` at `filesystem`; with none, nothing is checked
+/// against it, so no folder is read.
 pub(super) fn denylist(m: &Manifest, env: &HostEnv, d: &mut Diags) -> Denylist {
     let extra: Vec<PathBuf> = m
         .filesystem
@@ -28,7 +31,14 @@ pub(super) fn denylist(m: &Manifest, env: &HostEnv, d: &mut Diags) -> Denylist {
             }
         })
         .collect();
-    Denylist::for_env(env, &extra)
+    if m.filesystem.mounts.is_empty() {
+        return Denylist::without_links(env, &extra);
+    }
+    let (list, incomplete) = Denylist::for_env(env, &extra);
+    if let Some(why) = incomplete {
+        d.error("filesystem", Code::DenylistIncomplete, why);
+    }
+    list
 }
 
 pub(super) fn check_filesystem(m: &Manifest, env: &HostEnv, d: &mut Diags) -> Vec<ResolvedMount> {

@@ -1,7 +1,7 @@
 //! Red-team tests for the manifest layer (tests/redteam/REDTEAM_SUITE.md).
 //!
 //! Covered here: RT-MAN-01, RT-MAN-02, RT-MAN-03 (validate half), RT-FS-05 (validate half),
-//! RT-FS-06 (validate + re-check half), RT-SEC-08, RT-MAN-04. The launch halves ("no container launched",
+//! RT-FS-06 (validate + re-check half), RT-SEC-08, RT-MAN-04, RT-FS-19. The launch halves ("no container launched",
 //! "launch uses the stored struct") are asserted again by the sandbox/session tests (tasks 6, 12).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -774,5 +774,71 @@ fn rt_man_04_data_can_leave_flags_coding_agent_and_web_research_but_not_chat_onl
                 "{name}:\n{s}"
             );
         }
+    }
+}
+
+// ---- RT-FS-19: a link out of a protected folder ------------------------------------------------
+
+fn mount(host: &str, mode: &str) -> String {
+    format!(
+        "filesystem:\n  mounts:\n    - {{host: \"{host}\", guest: /workspace/x, mode: {mode}}}\n"
+    )
+}
+
+/// Makes `~/<link> -> ~/<target>` in the fixture home, creating the link's folder.
+fn link(f: &Fixture, link: &str, target: &str) -> String {
+    let l = f.home().join(link);
+    std::fs::create_dir_all(l.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(f.home().join(target), &l).unwrap();
+    l.display().to_string()
+}
+
+/// Refused `denylisted` at the mount, with a message naming `link`.
+#[track_caller]
+fn refused_naming(f: &Fixture, body: &str, link: &str) {
+    let r = f.load(body);
+    assert_rejects(&r, "filesystem.mounts[0].host", Code::Denylisted);
+    let msg = rendered(&r).join("\n");
+    assert!(msg.contains(link), "{msg}");
+}
+
+/// A symlink inside a protected folder makes its target part of what the host runs or loads:
+/// mounting the target's folder is refused, naming the link (MANIFEST_SPEC §2). Control: the
+/// same mount is accepted before the link exists, by the same validator.
+#[test]
+fn rt_fs_19_a_link_out_of_a_protected_folder_protects_its_target() {
+    let f = Fixture::new();
+    let home = f.home().to_owned();
+    std::fs::create_dir_all(home.join("tools/t/bin")).unwrap();
+    std::fs::write(home.join("tools/t/bin/t"), "").unwrap();
+    for dir in ["dotfiles/gh", "rc", "later", "tools/u"] {
+        std::fs::create_dir_all(home.join(dir)).unwrap();
+    }
+    let body = mount("~/tools/t", "rw");
+    twin_ok(&f, &body);
+    let before = f.load(&body).unwrap().manifest;
+
+    // `~/.local/bin/t -> ~/tools/t/bin/t` (pipx / uv tool layout).
+    let t = link(&f, ".local/bin/t", "tools/t/bin/t");
+    refused_naming(&f, &body, &t);
+    refused_naming(&f, &mount("~/tools", "ro"), &t);
+    // A manifest validated before the link is refused by the library's re-check after it.
+    let e = before.recheck_mounts(&f.env).unwrap_err();
+    assert_eq!(e.errors[0].code, Code::Denylisted, "{e:#?}");
+    // A config folder linked out (stow), even read-only.
+    let gh = link(&f, ".config/gh", "dotfiles/gh");
+    refused_naming(&f, &mount("~/dotfiles", "ro"), &gh);
+    // A home dotfile.
+    let rc = link(&f, ".bashrc", "rc/bashrc");
+    refused_naming(&f, &mount("~/rc", "rw"), &rc);
+    // A dangling link protects its lexical target before it exists.
+    let gone = link(&f, ".local/bin/gone", "later/gone");
+    refused_naming(&f, &mount("~/later", "rw"), &gone);
+
+    // Allow twin, with every link above in place: an ordinary folder, a sibling of a link's
+    // target, and a link whose target is already inside a rule changes nothing.
+    link(&f, ".local/bin/k", ".ssh/key");
+    for host in ["~/code/myproject", "~/tools/u"] {
+        twin_ok(&f, &mount(host, "rw"));
     }
 }

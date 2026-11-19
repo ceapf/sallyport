@@ -117,10 +117,14 @@ impl ValidatedManifest {
     }
 
     /// Launch-time TOCTOU re-check (RT-FS-06): every mount root must still pass the host checks
-    /// *and* still resolve to the realpath recorded at validation.
+    /// *and* still resolve to the realpath recorded at validation. The denylist is rebuilt, link
+    /// rules included (MANIFEST_SPEC §2), so a list that cannot be completed now is refused
+    /// `denylist-incomplete` here too.
     ///
     /// This narrows but does not close the race with the container runtime; the sandbox driver
     /// must additionally pin the directory (task 6). Performs blocking filesystem I/O.
+    // TODO(#231): no production code calls this yet; `sallyd`'s launch scan compares each
+    // mount root's identity only, so the denylist is as of the session's validation.
     ///
     /// # Errors
     /// [`Rejected`] listing every mount that changed or now fails a check.

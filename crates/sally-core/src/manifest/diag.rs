@@ -20,6 +20,10 @@ pub enum Code {
     OutOfRange,
     /// A mount host path is, is inside, or contains a denylisted path.
     Denylisted,
+    /// The built-in denylist could not be completed on this host: the folders read for links out
+    /// of protected folders passed the entry budget, `$PATH` names too many folders, or a folder
+    /// could not be read (MANIFEST_SPEC §2). Reported once, at `filesystem`.
+    DenylistIncomplete,
     /// A mount host path is itself a symlink.
     IsSymlink,
     /// A mount host path is not a directory.
@@ -86,6 +90,7 @@ impl Code {
             Self::InvalidValue => "invalid-value",
             Self::OutOfRange => "out-of-range",
             Self::Denylisted => "denylisted",
+            Self::DenylistIncomplete => "denylist-incomplete",
             Self::IsSymlink => "is-symlink",
             Self::NotDirectory => "not-directory",
             Self::NotFound => "not-found",

@@ -409,3 +409,41 @@ fn recheck_distinguishes_a_replaced_directory_from_a_moved_path() {
     assert!(e.errors[0].message.contains("now resolves to"), "{e:#?}");
     assert_eq!(e.errors[0].code, Code::MountChanged);
 }
+
+// ---- the denylist's link scan budget (MANIFEST_SPEC §2) -----------------------------------------
+
+/// Entries the scan reads per validation (the `links::BUDGET` pin is in `paths.rs`).
+const SCAN_BUDGET: usize = 65_536;
+
+/// One entry past the real budget in a scanned folder (a thumbnail cache): a manifest with a
+/// mount is refused `denylist-incomplete` at `filesystem`, naming the folder, as its only error,
+/// at validation and at the library's re-check; a manifest with no mounts reads no folder and
+/// is accepted.
+#[test]
+fn a_scan_past_the_budget_refuses_only_manifests_with_mounts() {
+    let f = Fixture::new();
+    let body = mounts(&mount("~/code/myproject", "/workspace/p", "rw"));
+    let v = f.load(&body).unwrap().manifest;
+    let thumbs = f.home().join(".cache/thumbnails");
+    std::fs::create_dir_all(&thumbs).unwrap();
+    // `.cache` holds `thumbnails`, which holds the rest: SCAN_BUDGET + 1 entries in all.
+    for n in 0..SCAN_BUDGET {
+        std::fs::File::create(thumbs.join(n.to_string())).unwrap();
+    }
+    let r = f.load(&body);
+    assert_rejects(&r, "filesystem", Code::DenylistIncomplete);
+    let msg = rendered(&r).join("\n");
+    assert!(
+        msg.contains(&format!("budget of {SCAN_BUDGET} entries"))
+            && msg.contains(&thumbs.display().to_string()),
+        "{msg}"
+    );
+    let e = v.recheck_mounts(&f.env).unwrap_err();
+    let found: Vec<(String, Code)> = e.errors.iter().map(|d| (d.path.clone(), d.code)).collect();
+    assert_eq!(found, [("filesystem".to_owned(), Code::DenylistIncomplete)]);
+    assert_ok(&f.load(""));
+    // Control: without the cache the same manifest is accepted (the exact boundary is pinned
+    // in `paths.rs`, where every entry read is known).
+    std::fs::remove_dir_all(&thumbs).unwrap();
+    assert_ok(&f.load(&body));
+}
