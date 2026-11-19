@@ -62,6 +62,7 @@ pub(super) struct Hub {
     answer: Arc<Mutex<Vec<IpAddr>>>,
     own: Arc<Mutex<Vec<IpAddr>>>,
     connected: Arc<Mutex<Vec<Net>>>,
+    tables_unreadable: Arc<Mutex<bool>>,
     lookups: Arc<Mutex<Vec<String>>>,
     dials: Arc<Mutex<usize>>,
     closed: Arc<Mutex<usize>>,
@@ -81,6 +82,7 @@ impl Hub {
             answer: Arc::new(Mutex::new(vec![PUBLIC])),
             own: Arc::new(Mutex::new(Vec::new())),
             connected: Arc::new(Mutex::new(Vec::new())),
+            tables_unreadable: Arc::new(Mutex::new(false)),
             lookups: Arc::new(Mutex::new(Vec::new())),
             dials: Arc::new(Mutex::new(0)),
             closed: Arc::new(Mutex::new(0)),
@@ -128,6 +130,11 @@ impl Hub {
     /// This host is directly connected to `net` from now on.
     pub(super) fn connected(&self, net: Net) {
         self.connected.lock().unwrap().push(net);
+    }
+
+    /// This host's address tables cannot be read from now on.
+    pub(super) fn tables_unreadable(&self) {
+        *self.tables_unreadable.lock().unwrap() = true;
     }
 
     pub(super) fn lookups(&self) -> Vec<String> {
@@ -212,6 +219,9 @@ impl Dialer for Hub {
 
 impl HostAddrs for Hub {
     async fn own(&self) -> Result<HostNets, HostAddrsError> {
+        if *self.tables_unreadable.lock().unwrap() {
+            return Err(HostAddrsError::ReaderFailed);
+        }
         Ok(HostNets {
             own: self.own.lock().unwrap().clone(),
             connected: self.connected.lock().unwrap().clone(),

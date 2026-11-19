@@ -38,7 +38,9 @@ pub(super) async fn pinned<R: Resolver, H: HostAddrs>(
     own: &H,
     host: &str,
 ) -> Result<Vec<SocketAddr>, PullError> {
-    let own = own
+    // TODO(#209): carry the tables' refusal cause (`HostAddrsError`) into the pull's error and its
+    // audit once a production caller exists.
+    let tables = own
         .own()
         .await
         .map_err(|_| PullError::AddressDenied(host.to_owned()))?;
@@ -49,7 +51,7 @@ pub(super) async fn pinned<R: Resolver, H: HostAddrs>(
     };
     if found
         .iter()
-        .any(|s| addr::denied_by(s.ip(), &own).is_some())
+        .any(|s| addr::denied_by(s.ip(), &tables).is_some())
     {
         return Err(PullError::AddressDenied(host.to_owned()));
     }
