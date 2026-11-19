@@ -976,7 +976,7 @@ fn summary_of_chat_only() {
          - sees no host files.\n\
          - has no network access.\n\
          - cannot run shell commands.\n\
-         - is audited at reduced detail (every action and connection is still recorded; per-request HTTP lines, file reads, and inference metadata are not).\n\
+         - is audited at reduced detail (every action, connection, HTTP request line and file read is still recorded; inference response metadata is not).\n\
          - is limited to 2 CPUs, 2GiB memory, 64 processes, and 8h of wall time.\n"
     );
 }

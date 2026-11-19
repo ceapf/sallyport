@@ -470,12 +470,12 @@ pub struct Audit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum AuditLevel {
-    /// Decision records plus per-request lines for intercepted HTTP (method + path, never
-    /// bodies), `fs_read` events, and inference metadata.
+    /// Every entry: the decision records plus inference response metadata (`llm.response`).
     #[default]
     Full,
-    /// Decision records only: one per tool call, egress connection (allow and deny, with
-    /// host:port and byte counts), approval, launch, and model import.
+    /// Every entry except inference response metadata (`llm.response`): each tool call
+    /// (file reads included), egress connection and intercepted request or response line,
+    /// approval, launch, and model import is still recorded.
     Actions,
 }
 

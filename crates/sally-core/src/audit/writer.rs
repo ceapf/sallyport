@@ -55,7 +55,7 @@ pub enum Detail {
     /// A decision, launch, approval, import: written at every level.
     #[default]
     Decision,
-    /// Per-request lines, `fs_read`, inference metadata: dropped at `actions`.
+    /// Inference response metadata (`llm.response`, the only such entry): dropped at `actions`.
     Full,
 }
 

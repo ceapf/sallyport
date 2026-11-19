@@ -22,8 +22,9 @@ pub const MAX_STORE_BYTES: usize = 1024 * 1024;
 pub const MAX_SECRETS: usize = 256;
 /// Longest secret value, in bytes.
 pub const MAX_VALUE_BYTES: usize = 8 * 1024;
-/// Values shorter than this are stored but flagged: redaction skips collision-prone short
-/// patterns (ARCHITECTURE §7, Redaction); `sally secrets set` warns when it reports one.
+/// Values shorter than this are stored but flagged: the raw value is always redacted, but its
+/// base64 forms may be too short to use as patterns (`audit::redact::MIN_BASE64_PATTERN`;
+/// ARCHITECTURE §7, Redaction); `sally secrets set` warns when it reports one.
 pub const SHORT_SECRET_BYTES: usize = 16;
 
 /// How long [`SecretStore::lock`] waits for another writer before giving up.

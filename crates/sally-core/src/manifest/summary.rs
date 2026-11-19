@@ -289,8 +289,8 @@ fn runtime_lines(m: &Manifest) -> Vec<String> {
     }
     if m.audit.level == AuditLevel::Actions {
         lines.push(
-            "is audited at reduced detail (every action and connection is still recorded; \
-             per-request HTTP lines, file reads, and inference metadata are not)."
+            "is audited at reduced detail (every action, connection, HTTP request line and \
+             file read is still recorded; inference response metadata is not)."
                 .into(),
         );
     }
