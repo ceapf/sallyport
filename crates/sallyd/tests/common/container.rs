@@ -171,9 +171,8 @@ fn build_with(
     if !extra.is_empty() {
         extra.hash(&mut h);
     }
-    if let Some(f) = format {
-        f.hash(&mut h);
-    }
+    // After `extra`, and tagged by `Option`, so no `extra` reads as a format.
+    format.hash(&mut h);
     let tag = format!("localhost/{name}:{}-{:016x}", image_run(), h.finish());
     let _held = lock("test-image", true);
     if !podman(&["image", "exists", &tag]).status.success() {
@@ -326,8 +325,7 @@ pub fn image_with(extra: &str) -> ImageRef {
     ImageRef::parse(&pinned).unwrap()
 }
 
-/// As [`image_with`], built in Docker format: the format that can carry image metadata the OCI
-/// format drops (a health check).
+/// As [`image_with`], built in Docker format.
 #[allow(dead_code)] // Only the image-metadata tests build one.
 pub fn docker_image_with(extra: &str) -> ImageRef {
     let (_, pinned) = build_with("sallyport-test", STAND_IN, None, extra, Some("docker"));

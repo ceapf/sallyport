@@ -57,8 +57,8 @@ pub struct ContainerPaths {
     pub health: serde_json::Value,
 }
 
-/// Whether `health` is the record of a disabled health check: exactly what podman records for
-/// `--no-healthcheck`, `{"Test":["NONE"]}`, and nothing more.
+/// Whether `health` is the record of a disabled health check: exactly `{"Test":["NONE"]}`, the
+/// form the argv's `--no-healthcheck` gives, and nothing more.
 #[must_use]
 pub fn health_disabled(health: &serde_json::Value) -> bool {
     *health == serde_json::json!({ "Test": ["NONE"] })
@@ -253,7 +253,7 @@ mod tests {
         assert_eq!(with_health(None).unwrap_err().field, "inspect");
     }
 
-    /// Security review: only the form podman records for `--no-healthcheck` is the disabled
+    /// Security review: only the form the argv's `--no-healthcheck` gives is the disabled
     /// health check; anything else, including that form with more in it, is not.
     #[test]
     fn only_the_recorded_disabled_form_is_a_disabled_health_check() {

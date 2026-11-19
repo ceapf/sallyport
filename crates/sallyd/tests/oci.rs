@@ -375,10 +375,9 @@ fn volume_exists(name: &str) -> bool {
     podman(&["volume", "exists", name]).status.success()
 }
 
-/// Whether a unit of the user's service manager is named after container `id` (`<id>.<kind>`;
-/// the container's own `libpod-<id>.scope` units do not count). A failed listing panics, so it
-/// never reads as "none".
-fn unit_names(id: &str) -> bool {
+/// Whether a unit of the user's service manager has a name that starts with container `id`. A
+/// failed listing panics, so it never reads as "none".
+fn a_unit_is_named_after(id: &str) -> bool {
     let out = std::process::Command::new("systemctl")
         .args(["--user", "list-units", "--all", "--no-legend", "--plain"])
         .output()
@@ -388,10 +387,9 @@ fn unit_names(id: &str) -> bool {
         "systemctl --user: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let named = format!("{id}.");
     String::from_utf8_lossy(&out.stdout)
         .lines()
-        .any(|l| l.starts_with(&named))
+        .any(|l| l.starts_with(id))
 }
 
 /// How long it took [`MARKER`] to appear in container `id`, polled until `limit`; `None` if it
@@ -426,10 +424,10 @@ const CONTROL_LIMIT: Duration = Duration::from_secs(30);
 /// [`metadata_image`]; how long the image's health check took to act on its own.
 ///
 /// Health checks: the argv without `--no-healthcheck` gives a container that carries the image's
-/// health check, which the verifier refuses on `healthcheck`; started, the check makes the
-/// marker by itself and a unit of the user's service manager names the container. Volumes: the
-/// argv without `--image-volume=ignore` gives a container with the image's volume. Each control
-/// is removed with its volumes and its unit.
+/// health check, which the verifier refuses on `healthcheck`; started, the check runs by itself
+/// (the marker appears, and a unit is named after the container). Volumes: the argv without
+/// `--image-volume=ignore` gives a container with the image's volume. Nothing of either control
+/// is left behind.
 async fn metadata_controls(x: &Lx, built: &Built) -> Duration {
     let declared = podman(&[
         "image",
@@ -440,7 +438,7 @@ async fn metadata_controls(x: &Lx, built: &Built) -> Duration {
     ]);
     assert!(
         String::from_utf8_lossy(&declared.stdout).contains(MARKER),
-        "the fixture image carries its health check (built in Docker format)"
+        "the fixture image declares its health check"
     );
     let argv = x.left_out(built.argv.clone(), LeaveOut::Healthcheck);
     let id = create_and_init(x, argv).await;
@@ -457,7 +455,10 @@ async fn metadata_controls(x: &Lx, built: &Built) -> Duration {
     let took = marker_within(&id, CONTROL_LIMIT)
         .await
         .expect("control: the image's health check made its marker by itself");
-    assert!(unit_names(&id), "control: a unit names the container");
+    assert!(
+        a_unit_is_named_after(&id),
+        "control: a unit is named after the container"
+    );
     assert!(health_run(x, &id).await, "control: the health check runs");
     assert!(
         podman(&["rm", "--force", "--volumes", "--time", "0", &id])
@@ -465,10 +466,13 @@ async fn metadata_controls(x: &Lx, built: &Built) -> Duration {
             .success()
     );
     let begun = Instant::now();
-    while unit_names(&id) && begun.elapsed() < CONTROL_LIMIT {
+    while a_unit_is_named_after(&id) && begun.elapsed() < CONTROL_LIMIT {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    assert!(!unit_names(&id), "control: its unit went with it");
+    assert!(
+        !a_unit_is_named_after(&id),
+        "control: removed, no unit is named after it"
+    );
 
     let argv = x.left_out(built.argv.clone(), LeaveOut::ImageVolume);
     let id = x.hermetic(&argv).await.lines().last().unwrap().to_owned();
@@ -489,14 +493,17 @@ async fn metadata_controls(x: &Lx, built: &Built) -> Duration {
 
 /// Container `id`, launched from [`metadata_image`], carries no health check and no image
 /// volume: podman records the disabled form, the marker never appears in twice the time the
-/// control's check took (and a second more), no unit names the container, and a health check
-/// run fails.
+/// control's check took (and a second more), no unit is named after the container, and a health
+/// check run fails.
 async fn assert_metadata_off(x: &Lx, id: &str, took: Duration) {
     assert_eq!(health_of(id), r#"{"Test":["NONE"]}"#);
     assert!(volumes_of(id).is_empty(), "{:?}", volumes_of(id));
     let wait = took * 2 + Duration::from_secs(1);
     assert_eq!(marker_within(id, wait).await, None, "the marker appeared");
-    assert!(!unit_names(id), "a unit names the container");
+    assert!(
+        !a_unit_is_named_after(id),
+        "a unit is named after the container"
+    );
     assert!(!health_run(x, id).await, "a health check ran");
     assert_eq!(
         exec_in(id, &["test", "-e", MARKER]).0,
