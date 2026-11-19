@@ -251,6 +251,9 @@ mod tests {
                 "PASSWORD_STORE_DIR",
             ]
         );
+        // The most folders the environment adds, as `paths.rs`'s `LIST_BOUNDS` doc states it.
+        let bounds = super::super::paths::MAX_GOPATH_DIRS + super::super::paths::MAX_PATH_DIRS;
+        assert_eq!(SINGLE_DIR_VARS.len() + bounds, 306);
     }
 
     /// The env-moved folders, `$GOPATH`'s `bin` and `pkg`, and `$PATH`'s entries; relative
