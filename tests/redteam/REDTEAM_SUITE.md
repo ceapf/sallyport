@@ -240,4 +240,7 @@ assertion, through the same probe string or scan function, and its messages star
 forbid leaving the defence out, as "Control (analogue): …", naming what succeeds instead and
 the flag a defence-off control would need. A recorder that saw nothing (a fake resolver or
 dialer, a mock upstream's log, the audit sink, a backend) records the allowed case in the same
-test first.
+test first. 6. Raise `REDTEAM_COUNT` in the `Makefile` by the number of `rt_` tests the PR adds:
+`make redteam` fails unless exactly that many run (`scripts/redteam-guard.sh`), so a lost test file
+fails the run. The count goes down only in a PR that removes a test, and its description names
+every test that left; removing, renaming or ignoring an `rt_` test is the maintainer's decision.
