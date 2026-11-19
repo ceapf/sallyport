@@ -156,7 +156,7 @@ G1 Obtain GITHUB_TOKEN value from inside Z3
 │  │                                                 spellings OPEN, fix planned, #249; §6]
 │  ├─ Time the redaction scan                       [RESIDUAL: not constant-time, not measured; §6]
 │  ├─ Fetch it in pieces with Range                 [Range and If-Range dropped (decision 4)]
-│  └─ Compressed body hides it from the scanner    [Accept-Encoding stripped; any Content-Encoding refused → RT-SEC-06b]
+│  └─ Compressed body hides it from the scanner    [Accept-Encoding stripped; a Content-Encoding other than one `identity` refused → RT-SEC-06b]
 ├─ Read it from the audit log                       [values never logged; log unreachable → RT-SEC-07, RT-AUD-02]
 └─ Define my own secret in the manifest             [manifests reference names only → RT-SEC-08]
 ```
@@ -369,7 +369,7 @@ G7 Make the machine unusable
 | Shim → Unix socket → policy proxy; CONNECT by hostname; port allowlist | `sally-shim`, `sallyd::egress` | RT-NET-03..07, 10 |
 | Resolve-then-filter-then-pin connect; deny loopback/private/link-local/own/connected networks | `sallyd::egress::server` (`check`), `egress::addr`, `egress::hostaddrs` | RT-NET-07 |
 | Label-boundary wildcard matching | sally-core `manifest::host` (`HostPattern::matches`), called from `sallyd::egress::policy` (`decide`) | RT-NET-06 |
-| Per-host header injection inside TLS the proxy terminates (grant hosts only; others spliced); no request carrying a grant header is sent unless its `egress.request` entry was written (an entry that cannot be written sends nothing); strip `Accept-Encoding`, `Range`, `If-Range`; refuse any `Content-Encoding`; redact every response header and body with every form of every session secret, at the same length; no redirects | `sallyd::egress::server::intercept`, `sallyd::egress::rewrite` (9a-2); `sallyd::egress::inject`, `sallyd::egress::redact` (9a-3, `{basic}` 9b) | RT-SEC-03..07, 09..13 |
+| Per-host header injection inside TLS the proxy terminates (grant hosts only; others spliced); no request carrying a grant header is sent unless its `egress.request` entry was written (an entry that cannot be written sends nothing); strip `Accept-Encoding`, `Range`, `If-Range`; refuse a `Content-Encoding` other than one `identity`; redact every response header and body with every form of every session secret, at the same length; no redirects | `sallyd::egress::server::intercept`, `sallyd::egress::rewrite` (9a-2); `sallyd::egress::inject`, `sallyd::egress::redact` (9a-3, `{basic}` 9b) | RT-SEC-03..07, 09..13 |
 | Secrets module: values never serialized; `Debug` redacted; zeroize | `sally-core::secrets`; values only in `sallyd` (`egress::inject`), the placeholder the only `--env` value | RT-SEC-01, 02, 07 |
 | Manifest strict schema + denylist + realpath checks | `sally-core::manifest` | RT-MAN-01..03, RT-FS-05, 06, 19 |
 | `--cap-drop=ALL --security-opt=no-new-privileges --read-only --userns=keep-id`, `nosuid,nodev` mounts, custom seccomp | `sallyd::sandbox::argv` (seccomp profiles from `sandbox::profiles`), checked by `sandbox::check` | RT-FS-07, 08, 09, 17, RT-NET-12 |
