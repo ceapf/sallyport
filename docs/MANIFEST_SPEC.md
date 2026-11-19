@@ -333,11 +333,13 @@ environment (passwd entry only if `$HOME` is unset or relative).
     (THREAT_MODEL G4);
   - `$XDG_CONFIG_HOME`, `$XDG_DATA_HOME`, `$XDG_RUNTIME_DIR` (each when set, plus `sallyport/`);
   - the folders the environment names, each when absolute: `$CARGO_HOME`, `$RUSTUP_HOME`,
-    `$GNUPGHOME`, `$NVM_DIR`, `$PYENV_ROOT`, `$XDG_CACHE_HOME`, `$GOBIN`, `$DOCKER_CONFIG`, `bin`
-    and `pkg` under each `$GOPATH` element, and every `$PATH` entry (at most 256: past that the
-    list is incomplete, below). Messages name the variable ("is inside /opt/go/bin (from
-    $GOBIN)"). A folder named this way that is `/`, a home, or an ancestor of one is kept as a
-    rule, so it refuses every mount under it (§6);
+    `$GNUPGHOME`, `$NVM_DIR`, `$PYENV_ROOT`, `$XDG_CACHE_HOME`, `$GOBIN`, `$DOCKER_CONFIG`,
+    `$ZDOTDIR`, `$PNPM_HOME`, `$VOLTA_HOME`, `$BUN_INSTALL`, `$PYTHONUSERBASE`, `$UV_TOOL_DIR`,
+    `$GRADLE_USER_HOME`, `$PASSWORD_STORE_DIR`, `bin` and `pkg` under each `$GOPATH` element (at
+    most 32 folders), and every `$PATH` entry (at most 256); past either bound the list is
+    incomplete (below). Messages name the variable ("is inside /opt/go/bin (from $GOBIN)"). A
+    folder named this way that is `/`, a home, or an ancestor of one is kept as a rule, so it
+    refuses every mount under it (§6);
   - `/etc`, `/proc`, `/sys`, `/dev`, `/run`, `/var/run`, `/boot`, `/root`, `/mnt`,
     `/usr/lib/wsl`, `/tmp`, `/var/tmp` (`/tmp` holds other programs' Unix sockets — ssh-agent,
     X11 — and a read-only bind does not stop `connect()`, so it would be a path around SI-1);
@@ -363,10 +365,12 @@ as the kernel resolves it, and also matches where that resolves: through a stow-
 hops of `~/.bashrc -> ~/df/bashrc -> /data/x/bashrc` are protected, and a dangling link protects
 its target before it exists. A link whose target is already inside a rule adds nothing.
 Reading is bounded: at most 65 536 entries per validation, counted across all folders. Past that,
-with more than 256 `$PATH` entries, or when a folder cannot be read (a folder that is gone, not a
-folder, or not readable by the user is skipped), validation fails with one `denylist-incomplete`
-error at `filesystem` naming the folder, the bound or the variable; the mounts are still checked
-against every other rule. A manifest with no mounts reads nothing, so it never gets this error.
+with more than 256 `$PATH` or 32 `$GOPATH` folders, or when a folder cannot be read (one that is
+gone, not a folder, or that the user can neither list nor enter is skipped; one the user can
+enter but not list refuses, as its files still run by name), validation fails with one
+`denylist-incomplete` error at `filesystem` naming the folder, the bound or the variable; the
+mounts are still checked against every other rule. A manifest with no mounts reads nothing, so it
+never gets this error.
 
 `denylisted` messages name the rule in words ("is inside /home/u/.ssh — credential folders are
 never mountable"). There is no `cfg(test)` or feature-gated bypass of the denylist: tests move
@@ -462,7 +466,7 @@ never on message text); the field path uses `a.b[0].c` form.
 | `invalid-value` | malformed string (name, path, glob, env name, model ref, …) |
 | `out-of-range` | number/size/duration/list length outside its range |
 | `denylisted` / `is-symlink` / `not-directory` / `not-found` / `path-chars` | mount host checks (§2) |
-| `denylist-incomplete` | the built-in denylist could not be completed on this host: the link scan passed its 65 536-entry budget, `$PATH` names more than 256 folders, or a folder could not be read (§2); at `filesystem`, only when the manifest has mounts |
+| `denylist-incomplete` | the built-in denylist could not be completed on this host: the link scan passed its 65 536-entry budget, `$PATH` names more than 256 folders or `$GOPATH` more than 32, or a folder could not be read or can be entered but not listed (§2); at `filesystem`, only when the manifest has mounts |
 | `guest-path` | guest not a clean path under `/workspace/` |
 | `duplicate` / `overlap` | repeated entry / overlapping mounts |
 | `not-pinned` | `runtime.image` / `harness.image` without a digest |
@@ -515,10 +519,17 @@ See `manifests/examples/`:
   naming the folder. Clear or shrink that folder, or move it out of the listed folders; manifests
   without mounts are not affected.
 - **An environment variable or link that names `/`, a home, or an ancestor of one refuses every
-  mount under it** until it is changed (`CARGO_HOME=$HOME`, a `$PATH` entry equal to a home). The
-  message names the variable or the link. Such a variable's folder is also read whole, every
-  entry and not only dot names, so a large home can use up the budget and refuse mounts outside
-  it too (`denylist-incomplete`).
+  mount under it** until it is changed (`CARGO_HOME=$HOME`, a `$PATH` entry equal to a home, an
+  exported `ZDOTDIR=$HOME`, `PYTHONUSERBASE=$HOME/.local`, which refuses everything under
+  `~/.local`). The message names the variable or the link; for the last two, unset the variable
+  (the default is the same place). Such a variable's folder is also read whole, every entry and
+  not only dot names, so a large home can use up the budget and refuse mounts outside it too
+  (`denylist-incomplete`).
+- **A folder the user can enter but not list (mode `--x`) inside a listed folder refuses every
+  manifest with mounts** (`denylist-incomplete`, naming it), since its files still run by name
+  and its links cannot be read. Make it listable, or remove it.
+- **A tool folder moved by a variable that is not on the §2 list is not a rule** (#232). List it
+  in `filesystem.deny`.
 - **The environment that counts is `sallyd`'s own, read once when it starts.** A variable set
   only in the user's shell is not seen, so a daemon started with a minimal environment has fewer
   environment rules than the shell. `sally manifest validate` uses the CLI's environment and is
