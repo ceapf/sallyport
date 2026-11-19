@@ -189,6 +189,13 @@ fn walk_in_opens_the_root_beneath_the_proc_dir_and_stops_at_the_first_refusal() 
         walk_in(&elsewhere, &fine),
         Err(WalkError::Root(Errno::NOENT))
     );
+    // A `root` that is not a directory is not a root.
+    let file_root = base.join("root/workspace/a");
+    std::fs::write(file_root.join("root"), b"x").unwrap();
+    assert_eq!(
+        walk_in(dir(&file_root), &fine),
+        Err(WalkError::Root(Errno::NOTDIR))
+    );
     assert_eq!(
         WalkError::Root(Errno::NOENT).to_string(),
         format!("cannot open the probe's root: {}", Errno::NOENT)

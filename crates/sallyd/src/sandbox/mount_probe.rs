@@ -99,7 +99,7 @@ pub fn walk_in(proc_dir: impl AsFd, dests: &[String]) -> Result<(), WalkError> {
     let root = sally_core::fd::openat(
         proc_dir,
         "root",
-        OFlags::PATH | OFlags::DIRECTORY,
+        OFlags::PATH.union(OFlags::DIRECTORY),
         Mode::empty(),
     )
     .map_err(WalkError::Root)?;
