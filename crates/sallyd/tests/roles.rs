@@ -192,6 +192,20 @@ fn rt_net_12_socket_families_outside_the_role_list_fail() {
                 ],
             };
             check(b, &ip);
+            // Security review: `socketpair` follows the list too, AF_UNIX only in every role.
+            // Control: AF_UNIX pairs are made. Every other family is the profile's ENOSYS, never
+            // the kernel's own answer.
+            check(b, &[("socketpair 1 1 0", "ok"), ("socketpair 1 2 0", "ok")]);
+            let calls: Vec<String> = denied_everywhere
+                .iter()
+                .map(|(call, _)| call.replacen("socket ", "socketpair ", 1))
+                .chain(
+                    ["socketpair 2 1 0", "socketpair 10 1 0", "socketpair 16 3 0"]
+                        .map(String::from),
+                )
+                .collect();
+            let refused: Vec<(&str, &str)> = calls.iter().map(|c| (c.as_str(), SECCOMP)).collect();
+            check(b, &refused);
         }
         finish(&x, boxes).await;
     });

@@ -187,6 +187,36 @@ mod tests {
         assert_eq!(socket_families(Role::Inference), [(1, 0)], "AF_UNIX only");
     }
 
+    /// Security review: `socketpair` follows the family allowlist too. In every role, exactly
+    /// one rule allows it; that rule names only `socketpair` and carries an index-0 equality on
+    /// AF_UNIX, so every other family gets the profile's default error.
+    #[test]
+    fn socketpair_is_allowed_for_af_unix_only() {
+        for role in ROLES {
+            let pairs: Vec<Value> = rules(role)
+                .into_iter()
+                .filter(|r| allows(r, "socketpair"))
+                .collect();
+            assert_eq!(pairs.len(), 1, "{role:?}: {pairs:?}");
+            let r = &pairs[0];
+            assert_eq!(
+                r["names"],
+                serde_json::json!(["socketpair"]),
+                "{role:?}: {r}"
+            );
+            assert_eq!(r["action"], "SCMP_ACT_ALLOW", "{role:?}: {r}");
+            assert_eq!(
+                r["args"],
+                serde_json::json!([{"index": 0, "value": 1, "valueTwo": 0, "op": "SCMP_CMP_EQ"}]),
+                "{role:?}: AF_UNIX only"
+            );
+            assert!(
+                r.get("includes")
+                    .is_none_or(|i| i == &serde_json::json!({}))
+            );
+        }
+    }
+
     /// 6b security review H1: `clone` may not create namespaces (no nested user or network
     /// namespace, so no CAP_NET_ADMIN over nf_tables); exactly Docker's mask.
     #[test]

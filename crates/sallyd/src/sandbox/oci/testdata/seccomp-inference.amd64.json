@@ -338,7 +338,6 @@
         "sigprocmask",
         "sigreturn",
         "sigsuspend",
-        "socketpair",
         "splice",
         "stat",
         "stat64",
@@ -496,6 +495,19 @@
     {
       "names": [
         "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 1,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socketpair"
       ],
       "action": "SCMP_ACT_ALLOW",
       "args": [

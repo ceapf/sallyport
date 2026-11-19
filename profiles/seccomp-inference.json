@@ -356,7 +356,6 @@
     "sigprocmask",
     "sigreturn",
     "sigsuspend",
-    "socketpair",
     "splice",
     "stat",
     "stat64",
@@ -736,6 +735,21 @@
    "comment": "Address family 1 (ARCHITECTURE section 3.4).",
    "names": [
     "socket"
+   ]
+  },
+  {
+   "action": "SCMP_ACT_ALLOW",
+   "args": [
+    {
+     "index": 0,
+     "op": "SCMP_CMP_EQ",
+     "value": 1,
+     "valueTwo": 0
+    }
+   ],
+   "comment": "socketpair: address family 1 only (ARCHITECTURE section 3.4).",
+   "names": [
+    "socketpair"
    ]
   }
  ]
