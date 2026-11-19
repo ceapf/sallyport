@@ -158,10 +158,12 @@ impl Launcher {
     }
 }
 
-pub(super) fn rm_args(container: &str) -> [OsString; 5] {
+/// `podman rm` of `container`, with its anonymous volumes, stopping it at once.
+pub(super) fn rm_args(container: &str) -> [OsString; 6] {
     [
         "rm".into(),
         "--force".into(),
+        "--volumes".into(),
         "--time".into(),
         "0".into(),
         container.into(),
@@ -207,6 +209,20 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    /// Security review: a removal takes the container's anonymous volumes with it, and stops it
+    /// at once.
+    #[test]
+    fn a_removal_takes_the_volumes_and_waits_for_nothing() {
+        let got: Vec<String> = rm_args("sp-ws-x")
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            got,
+            ["rm", "--force", "--volumes", "--time", "0", "sp-ws-x"]
+        );
+    }
 
     #[test]
     fn container_ids_are_exactly_64_lowercase_hex() {

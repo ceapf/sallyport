@@ -52,15 +52,22 @@ const EQ_FLAGS: [&str; 9] = [
     "--env-host",
 ];
 /// Options that take no value.
-const BARE_FLAGS: [&str; 4] = ["--rm", "--no-hosts", "--read-only", "--init"];
+const BARE_FLAGS: [&str; 5] = [
+    "--rm",
+    "--no-hosts",
+    "--read-only",
+    "--init",
+    "--no-healthcheck",
+];
 /// Options that may appear more than once (with distinct values).
 const REPEATABLE: [&str; 3] = ["-v", "--env", "--security-opt"];
 /// Options every role must carry exactly once (`--security-opt` is counted per kind in
 /// [`require`]).
-const REQUIRED: [&str; 21] = [
+const REQUIRED: [&str; 22] = [
     "--rm",
     "--workdir",
     "--image-volume",
+    "--no-healthcheck",
     "--name",
     "--label",
     "--pull",
@@ -336,7 +343,7 @@ fn check_option(
         }
     };
     match (flag, value) {
-        ("--rm" | "--no-hosts" | "--read-only" | "--init", None) => Ok(()),
+        ("--rm" | "--no-hosts" | "--read-only" | "--init" | "--no-healthcheck", None) => Ok(()),
         ("--pull", _) => fixed("never"),
         ("--http-proxy" | "--read-only-tmpfs" | "--env-host", _) => fixed("false"),
         ("--log-driver" | "--network", _) => fixed("none"),

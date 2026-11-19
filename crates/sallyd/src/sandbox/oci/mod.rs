@@ -83,6 +83,12 @@ pub fn verify(bytes: &[u8], intent: &Intent, facts: &Facts) -> Result<(), Mismat
         "timeout",
         "podman's .Config.Timeout is not the argv's --timeout",
     )?;
+    // Security review: the argv's --no-healthcheck is what podman recorded.
+    ensure(
+        facts::health_disabled(&facts.paths.health),
+        "healthcheck",
+        "podman's .Config.Healthcheck is not the disabled form",
+    )?;
     let c = config::parse(bytes)?;
     ensure(c.oci_version == "1.1.0", "ociVersion", "not 1.1.0")?;
     linux::check_hostname(&c.hostname, intent, facts)?;

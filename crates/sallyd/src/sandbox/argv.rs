@@ -191,8 +191,14 @@ impl Argv {
             "--user",
             &format!("{}:{}", c.ids.uid, c.ids.gid),
         ]);
-        // Image-declared volumes are disabled: the image does not add mounts (RT-FS-02).
-        a.push(["--workdir", WORKDIR, "--image-volume=ignore"]);
+        // Image-declared volumes are disabled: the image does not add mounts (RT-FS-02). Image
+        // health checks are disabled too (security review).
+        a.push([
+            "--workdir",
+            WORKDIR,
+            "--image-volume=ignore",
+            "--no-healthcheck",
+        ]);
         Ok(a)
     }
 
