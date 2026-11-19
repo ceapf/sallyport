@@ -440,14 +440,15 @@ fn rt_man_02_privilege_escalation_attempts_rejected_with_documented_codes() {
             Code::UnacknowledgedWildcard,
             r#"error: network.allow[0].host: "*" requires network.acknowledge_unrestricted_egress: true [unacknowledged-wildcard]"#,
         ),
-        // A wildcard under a shared tree (a regional endpoint) and one over a parent of a shared
-        // suffix reach hosts anyone can register, as `*` does.
+        // A wildcard under a shared tree (a regional endpoint), one over a shared tree itself and
+        // one over a parent of a listed entry each reach hosts anyone can register, as `*` does.
         (
             wildcard("*.s3.us-east-1.amazonaws.com", false),
             wildcard("*.s3.us-east-1.amazonaws.com", true),
             "network.allow[0].host",
             Code::UnacknowledgedWildcard,
-            // Long and holding a digit, the host is masked like any token-shaped value.
+            // Long and holding a digit, the host is masked like any token-shaped value
+            // (TODO(#236): whether a parsed host pattern is exempt is the maintainer's choice).
             r#"error: network.allow[0].host: "*.s3...[28 chars hidden]" covers hosts anyone can register, so it requires network.acknowledge_unrestricted_egress: true [unacknowledged-wildcard]"#,
         ),
         (
@@ -456,6 +457,13 @@ fn rt_man_02_privilege_escalation_attempts_rejected_with_documented_codes() {
             "network.allow[0].host",
             Code::UnacknowledgedWildcard,
             r#"error: network.allow[0].host: "*.windows.net" covers hosts anyone can register, so it requires network.acknowledge_unrestricted_egress: true [unacknowledged-wildcard]"#,
+        ),
+        (
+            wildcard("*.googleapis.com", false),
+            wildcard("*.googleapis.com", true),
+            "network.allow[0].host",
+            Code::UnacknowledgedWildcard,
+            r#"error: network.allow[0].host: "*.googleapis.com" covers hosts anyone can register, so it requires network.acknowledge_unrestricted_egress: true [unacknowledged-wildcard]"#,
         ),
         (
             secret("*"),
