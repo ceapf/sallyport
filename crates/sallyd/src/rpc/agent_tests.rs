@@ -3,11 +3,12 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::json;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use super::*;
+use crate::daemon::crash::CrashReceiver;
 use crate::rpc::mcp::{META_CAPABILITIES, META_VERSION, MODERN};
 use crate::rpc::testkit::{Sink, recorder};
 
@@ -69,14 +70,22 @@ impl ToolHandler for Arc<Fake> {
         self.numbers.lock().unwrap().push(call);
         self.seen.lock().unwrap().push((name.clone(), arguments));
         let _ended = Ended(Arc::clone(self));
-        if name == "block" {
+        // `block-panic`: held like `block`, then panics like `panic`.
+        if name.starts_with("block") {
             self.release.notified().await;
         }
+        assert!(!name.ends_with("panic"), "the tool panicked");
         self.done.fetch_add(1, Ordering::SeqCst);
         // `unrecorded`: the handler's entry failed, so it answers nothing.
-        (name != "unrecorded").then(|| ToolOutcome {
+        // `big`: an outcome of 1 MiB, the size of a large fs_read.
+        let text = if name == "big" {
+            "x".repeat(1 << 20)
+        } else {
+            format!("ran {name}")
+        };
+        (name != "unrecorded").then_some(ToolOutcome {
             is_error: false,
-            text: format!("ran {name}"),
+            text,
         })
     }
 
@@ -131,7 +140,12 @@ impl Client {
 }
 
 fn start(agent: &Arc<Agent<Arc<Fake>>>) -> Client {
-    let (client, server) = tokio::io::duplex(4 * MAX_FRAME);
+    start_with(agent, 4 * MAX_FRAME)
+}
+
+/// A client whose pipe holds at most `buffer` bytes each way.
+fn start_with(agent: &Arc<Agent<Arc<Fake>>>, buffer: usize) -> Client {
+    let (client, server) = tokio::io::duplex(buffer);
     let server = tokio::spawn(Arc::clone(agent).serve_stream(server));
     let (r, w) = tokio::io::split(client);
     Client {
@@ -142,9 +156,20 @@ fn start(agent: &Arc<Agent<Arc<Fake>>>) -> Client {
 }
 
 fn setup() -> (Arc<Agent<Arc<Fake>>>, Arc<Fake>, Arc<Sink>) {
+    let (agent, fake, sink, _) = watched();
+    (agent, fake, sink)
+}
+
+/// A server, its handler, its audit sink and its session's crash receiver.
+type Watched = (Arc<Agent<Arc<Fake>>>, Arc<Fake>, Arc<Sink>, CrashReceiver);
+
+/// [`setup`], with the receiver of the session's crash reporter.
+fn watched() -> Watched {
     let fake = Arc::new(Fake::default());
     let (sink, rec) = recorder("sess-a");
-    (Arc::new(Agent::new(Arc::clone(&fake), rec)), fake, sink)
+    let (crash, crashes) = CrashReporter::channel();
+    let agent = Arc::new(Agent::new(Arc::clone(&fake), rec, crash));
+    (agent, fake, sink, crashes)
 }
 
 fn meta() -> Value {
@@ -507,6 +532,26 @@ async fn a_closed_connection_still_lets_its_calls_finish() {
     assert_eq!(fake.done.load(Ordering::SeqCst), 1);
 }
 
+/// A normal close still writes what is queued: a peer that stops sending while a call runs
+/// gets that call's reply, and then the end of the stream (only teardown cuts the writer).
+#[tokio::test]
+async fn a_peer_that_stops_sending_still_gets_the_reply_of_a_running_call() {
+    let (agent, fake, _) = setup();
+    let mut c = start(&agent);
+    c.send(&call(1, "block")).await;
+    reach(&fake.calls, 1).await;
+    c.w.shutdown().await.unwrap();
+    fake.release.notify_one();
+    let reply = c.recv().await.expect("closed before the reply");
+    assert_eq!(reply["id"], json!(1));
+    assert_eq!(reply["result"]["content"][0]["text"], json!("ran block"));
+    assert_eq!(c.recv().await, None, "more than one reply");
+    tokio::time::timeout(Duration::from_secs(5), c.server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 #[tokio::test]
 async fn a_closed_connection_withdraws_only_its_unfinished_calls() {
     let (agent, fake, _) = setup();
@@ -600,7 +645,7 @@ async fn in_flight_calls_are_capped_per_session() {
     assert_eq!(e["error"]["data"]["reason"], json!("too-many-in-flight"));
     assert_eq!(fake.calls.load(Ordering::SeqCst), MAX_IN_FLIGHT);
     assert_eq!(denies(&sink), ["too-many-in-flight"]);
-    // One returns, on whichever connection sent it; its slot is freed before its reply is
+    // One returns, on whichever connection sent it; its slot is freed once its reply is
     // queued, so one more call may run once the reply is in.
     fake.release.notify_one();
     let reply = tokio::select! {
@@ -615,6 +660,124 @@ async fn in_flight_calls_are_capped_per_session() {
     for _ in 0..MAX_IN_FLIGHT {
         fake.release.notify_one();
     }
+}
+
+/// Less than one reply fits in this pipe, so a reply the peer does not read stays with the
+/// server.
+const TIGHT: usize = 64;
+
+/// Sends `n` `tool` calls on `w`, ids `0..n`, from a task of its own (the pipe is too small
+/// to hold them); stops at the first failed write.
+fn flood(mut w: WriteHalf<DuplexStream>, tool: &'static str, n: i64) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        for i in 0..n {
+            let mut f = serde_json::to_vec(&call(i, tool)).unwrap();
+            f.push(b'\n');
+            if w.write_all(&f).await.is_err() {
+                return;
+            }
+        }
+    })
+}
+
+/// A call keeps its slot until its reply has left the broker, so a peer that reads nothing
+/// holds at most MAX_IN_FLIGHT replies there, on one connection or many: the next call, on
+/// any connection of the session, is refused (and recorded). Observed past the time the
+/// rate would let all 100 frames in (the reader stops sooner: once the outbox is full, it
+/// waits to queue a refusal) and before WRITE_TIMEOUT closes the connection; past it, the
+/// slots of every queued and waiting reply are free again.
+#[tokio::test(start_paused = true)]
+async fn a_peer_that_reads_nothing_holds_at_most_max_in_flight_replies() {
+    let (agent, fake, sink) = setup();
+    let Client { mut r, w, server } = start_with(&agent, TIGHT);
+    let n = 100;
+    let sender = flood(w, "big", n);
+    let all_read = Duration::from_secs((n as u64 - u64::from(BURST)) / u64::from(RATE));
+    tokio::time::sleep(all_read + Duration::from_secs(1)).await;
+    assert!(all_read + Duration::from_secs(1) < WRITE_TIMEOUT);
+    assert_eq!(
+        fake.calls.load(Ordering::SeqCst),
+        MAX_IN_FLIGHT,
+        "calls admitted while the peer reads nothing"
+    );
+    let mut other = start(&agent);
+    let e = other.call(&call(1, "echo")).await;
+    assert_eq!(e["error"]["data"]["reason"], json!("too-many-in-flight"));
+    assert_eq!(
+        denies(&sink).last().map(String::as_str),
+        Some("too-many-in-flight")
+    );
+    // Past WRITE_TIMEOUT the writer gives up and the connection closes.
+    tokio::time::sleep(WRITE_TIMEOUT).await;
+    let mut rest = Vec::new();
+    // Bounded: a writer that never gave up would hang the test here instead of failing it.
+    let read = tokio::time::timeout(WRITE_TIMEOUT, r.read_to_end(&mut rest)).await;
+    assert!(read.is_ok(), "the connection never closed");
+    server.await.unwrap();
+    sender.abort();
+    assert_eq!(agent.in_flight.available_permits(), MAX_IN_FLIGHT);
+    let mut again = start(&agent);
+    for i in 0..MAX_IN_FLIGHT as i64 {
+        again.send(&call(i, "block")).await;
+    }
+    reach(&fake.calls, 2 * MAX_IN_FLIGHT).await;
+    for _ in 0..MAX_IN_FLIGHT {
+        fake.release.notify_one();
+    }
+    for _ in 0..MAX_IN_FLIGHT {
+        assert_eq!(
+            again.recv().await.unwrap()["result"]["content"][0]["text"],
+            json!("ran block")
+        );
+    }
+}
+
+/// The same pipe with a peer that reads one reply a second: every id gets exactly one reply,
+/// its result or a recorded too-many-in-flight refusal; the connection stays open and every
+/// slot is free at the end.
+#[tokio::test(start_paused = true)]
+async fn a_slow_reader_gets_one_reply_to_every_call() {
+    let (agent, fake, sink) = setup();
+    let Client { mut r, w, server } = start_with(&agent, TIGHT);
+    let n = 100;
+    let sender = flood(w, "echo", n);
+    let (mut ids, mut refused) = (Vec::new(), 0);
+    let (mut first_refused, mut last_ran) = (None, None);
+    for _ in 0..n {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let mut line = String::new();
+        // Bounded: on the paused clock a missing reply would otherwise hang, not fail.
+        let n = tokio::time::timeout(Duration::from_secs(60), r.read_line(&mut line))
+            .await
+            .expect("no reply")
+            .unwrap();
+        assert!(n > 0, "the server closed");
+        let v: Value = serde_json::from_str(&line).unwrap();
+        let id = v["id"].as_i64().unwrap();
+        if v["error"]["data"]["reason"] == json!("too-many-in-flight") {
+            refused += 1;
+            first_refused = Some(first_refused.map_or(id, |f: i64| f.min(id)));
+        } else {
+            assert_eq!(v["result"]["content"][0]["text"], json!("ran echo"), "{v}");
+            last_ran = last_ran.max(Some(id));
+        }
+        ids.push(id);
+    }
+    // Slots come back as replies are read: a call sent after the first refusal still ran.
+    let (first_refused, last_ran) = (first_refused.unwrap(), last_ran.unwrap());
+    assert!(
+        last_ran > first_refused,
+        "no slot came back: last call run {last_ran}, first refused {first_refused}"
+    );
+    ids.sort_unstable();
+    assert_eq!(ids, (0..n).collect::<Vec<_>>());
+    assert_eq!(fake.calls.load(Ordering::SeqCst), n as usize - refused);
+    assert_eq!(denies(&sink).len(), refused);
+    // The client's end of the stream closes the connection; then every slot is free.
+    sender.await.unwrap();
+    drop(r);
+    server.await.unwrap();
+    assert_eq!(agent.in_flight.available_permits(), MAX_IN_FLIGHT);
 }
 
 #[tokio::test]
@@ -712,8 +875,9 @@ async fn rt_ag_08_a_foreign_session_id_reaches_only_its_own_session() {
         sally_core::manifest::AuditLevel::Full,
     );
     let (fa, fb) = (Arc::new(Fake::default()), Arc::new(Fake::default()));
-    let a = Arc::new(Agent::new(Arc::clone(&fa), rec_a));
-    let _b = Arc::new(Agent::new(Arc::clone(&fb), rec_b));
+    let crash = CrashReporter::channel().0;
+    let a = Arc::new(Agent::new(Arc::clone(&fa), rec_a, crash.clone()));
+    let _b = Arc::new(Agent::new(Arc::clone(&fb), rec_b, crash));
     let mut c = start(&a);
     let mut m = meta();
     m["session"] = json!("sess-b");
@@ -774,8 +938,7 @@ async fn a_peer_with_another_uid_is_refused_and_recorded() {
     let listener = tokio::net::UnixListener::bind(&path).unwrap();
     let (agent, fake, sink) = setup();
     let me = rustix::process::getuid().as_raw();
-    let (crash, _crashes) = crate::rpc::listen::CrashReporter::channel();
-    let h = Arc::clone(&agent).listen(listener, me.wrapping_add(1), crash);
+    let h = Arc::clone(&agent).listen(listener, me.wrapping_add(1));
     let mut s = UnixStream::connect(&path).await.unwrap();
     let msg = serde_json::to_vec(&call(1, "echo")).unwrap();
     let _ = s.write_all(&msg).await;
@@ -945,8 +1108,7 @@ async fn session_teardown_drops_in_flight_calls() {
         let path = dir.join(format!("agent-{orderly}.sock"));
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         let (agent, fake, _) = setup();
-        let (crash, _crashes) = crate::rpc::listen::CrashReporter::channel();
-        let h = Arc::clone(&agent).listen(listener, me, crash);
+        let h = Arc::clone(&agent).listen(listener, me);
         let mut s = UnixStream::connect(&path).await.unwrap();
         let mut msg = serde_json::to_vec(&call(1, "block")).unwrap();
         msg.push(b'\n');
@@ -973,6 +1135,68 @@ async fn session_teardown_drops_in_flight_calls() {
         assert_eq!(fake.ended.load(Ordering::SeqCst), 1, "orderly: {orderly}");
         assert_eq!(fake.done.load(Ordering::SeqCst), 0, "orderly: {orderly}");
         assert_eq!(agent.in_flight.available_permits(), MAX_IN_FLIGHT);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Session teardown ends a connection's writer as well as its calls: with two answered calls
+/// whose 1 MiB replies a peer has not read (one stalled in its write, one queued), a dropped
+/// handle, or an orderly shutdown past STOP_GRACE, frees both slots at once, well before
+/// WRITE_TIMEOUT, and the peer then reads to the end of the stream without a complete
+/// second reply: nothing more was written after teardown.
+#[tokio::test(start_paused = true)]
+async fn session_teardown_ends_the_writer_and_drops_queued_replies() {
+    let dir = std::env::temp_dir().join(format!("sp-agent-writer-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir).unwrap();
+    let me = rustix::process::getuid().as_raw();
+    for orderly in [false, true] {
+        let path = dir.join(format!("agent-{orderly}.sock"));
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let (agent, fake, _) = setup();
+        let h = Arc::clone(&agent).listen(listener, me);
+        let mut s = UnixStream::connect(&path).await.unwrap();
+        for i in 1..=2 {
+            let mut msg = serde_json::to_vec(&call(i, "big")).unwrap();
+            msg.push(b'\n');
+            s.write_all(&msg).await.unwrap();
+        }
+        reach(&fake.done, 2).await;
+        let stalled = tokio::time::Instant::now();
+        // A reply larger than the socket's buffer: the first write stalls, the second waits.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            agent.in_flight.available_permits(),
+            MAX_IN_FLIGHT - 2,
+            "orderly: {orderly}: both replies hold their slots before teardown"
+        );
+        if orderly {
+            h.shutdown().await;
+        } else {
+            drop(h);
+        }
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(stalled.elapsed() < WRITE_TIMEOUT, "orderly: {orderly}");
+        assert_eq!(
+            agent.in_flight.available_permits(),
+            MAX_IN_FLIGHT,
+            "orderly: {orderly}: teardown left a writer holding slots"
+        );
+        let mut got = Vec::new();
+        tokio::time::timeout(WRITE_TIMEOUT, s.read_to_end(&mut got))
+            .await
+            .expect("orderly: no end of stream after teardown")
+            .unwrap();
+        assert!(stalled.elapsed() < WRITE_TIMEOUT, "orderly: {orderly}");
+        let lines = got.iter().filter(|&&b| b == b'\n').count();
+        assert!(
+            lines < 2,
+            "orderly: {orderly}: {lines} replies written after teardown"
+        );
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1046,10 +1270,17 @@ fn logged_ids_are_escaped() {
 }
 
 fn driven_setup() -> (Arc<Agent<Arc<Fake>>>, Arc<Fake>, Arc<Sink>) {
+    let (agent, fake, sink, _) = driven_watched();
+    (agent, fake, sink)
+}
+
+/// [`driven_setup`], with the receiver of the session's crash reporter.
+fn driven_watched() -> Watched {
     let fake = Arc::new(Fake::default());
     let (sink, rec) = recorder("sess-a");
-    let agent = Agent::new(Arc::clone(&fake), rec.driven());
-    (Arc::new(agent), fake, sink)
+    let (crash, crashes) = CrashReporter::channel();
+    let agent = Agent::new(Arc::clone(&fake), rec.driven(), crash);
+    (Arc::new(agent), fake, sink, crashes)
 }
 
 fn args() -> Map<String, Value> {
@@ -1131,4 +1362,285 @@ async fn a_dropped_driven_call_runs_to_its_end_and_its_prompt_is_withdrawn() {
     fake.release.notify_one();
     reach(&fake.done, 1).await;
     assert_eq!(fake.ended.load(Ordering::SeqCst), 1);
+}
+
+/// The next crash report, within 5 s.
+async fn crashed(crashes: &mut CrashReceiver) -> crate::daemon::crash::Crash {
+    tokio::time::timeout(Duration::from_secs(5), crashes.recv())
+        .await
+        .expect("no crash reported within 5 s")
+        .expect("the reporter is gone")
+}
+
+/// A harness call whose task panics is reported as `agent.call` at once, with no further frame
+/// sent; its id and slot are released, and the connection stays open and answers. Closing it
+/// then withdraws nothing for the panicked call.
+#[tokio::test]
+async fn a_panicked_call_is_reported_at_once_and_releases_its_id_and_slot() {
+    let (agent, fake, _, mut crashes) = watched();
+    let mut c = start(&agent);
+    c.send(&call(1, "panic")).await;
+    let crash = crashed(&mut crashes).await;
+    assert_eq!(crash.task, "agent.call");
+    assert!(
+        crash.payload.contains("the tool panicked"),
+        "{}",
+        crash.payload
+    );
+    // The same id is accepted again (not `duplicate-id`) and answered.
+    let r = c.call(&call(1, "echo")).await;
+    assert_eq!(r["result"]["content"][0]["text"], json!("ran echo"), "{r}");
+    let l = c.call(&req(2, "tools/list", json!({}))).await;
+    assert_eq!(l["result"]["tools"][0]["name"], json!("echo"));
+    // Every slot came back: MAX_IN_FLIGHT calls run at once again.
+    for i in 0..MAX_IN_FLIGHT as i64 {
+        c.send(&call(10 + i, "block")).await;
+    }
+    reach(&fake.calls, 2 + MAX_IN_FLIGHT).await;
+    for _ in 0..MAX_IN_FLIGHT {
+        fake.release.notify_one();
+    }
+    for _ in 0..MAX_IN_FLIGHT {
+        assert_eq!(
+            c.recv().await.unwrap()["result"]["content"][0]["text"],
+            json!("ran block")
+        );
+    }
+    let Client { r, w, server } = c;
+    drop((r, w));
+    server.await.unwrap();
+    assert!(
+        fake.withdrawn.lock().unwrap().is_empty(),
+        "the panicked call was withdrawn"
+    );
+    assert!(crashes.try_recv().is_err(), "one panic, one report");
+}
+
+/// A call that panics after its connection closed is reported from the close loop, which
+/// joins the connection's calls.
+#[tokio::test]
+async fn a_call_that_panics_after_its_connection_closed_is_still_reported() {
+    let (agent, fake, _, mut crashes) = watched();
+    let mut c = start(&agent);
+    c.send(&call(1, "block-panic")).await;
+    reach(&fake.calls, 1).await;
+    let Client { r, w, server } = c;
+    drop((r, w));
+    // The close withdraws the open call's prompt, then waits for the call.
+    let end = std::time::Instant::now() + Duration::from_secs(10);
+    while fake.withdrawn.lock().unwrap().is_empty() {
+        assert!(std::time::Instant::now() < end, "never withdrawn");
+        tokio::task::yield_now().await;
+    }
+    fake.release.notify_one();
+    let crash = crashed(&mut crashes).await;
+    assert_eq!(crash.task, "agent.call");
+    server.await.unwrap();
+}
+
+/// A call's id is released when it returns, before its reply is written: while the first
+/// reply's write is stalled on a peer that has not read it, a call reusing the id is admitted
+/// and gets its own reply, and both arrive. (The first reply is in the writer here, not
+/// queued behind others: the claim is about the id's release, not the outbox.)
+#[tokio::test(start_paused = true)]
+async fn an_id_reused_while_its_first_reply_waits_gets_its_own_reply() {
+    let (agent, fake, _) = setup();
+    let Client {
+        mut r,
+        mut w,
+        server,
+    } = start_with(&agent, TIGHT);
+    for tool in ["big", "echo"] {
+        let mut f = serde_json::to_vec(&call(1, tool)).unwrap();
+        f.push(b'\n');
+        w.write_all(&f).await.unwrap();
+        reach(&fake.done, if tool == "big" { 1 } else { 2 }).await;
+    }
+    let mut texts = Vec::new();
+    for _ in 0..2 {
+        let mut line = String::new();
+        // Bounded: on the paused clock a missing reply would otherwise hang, not fail.
+        tokio::time::timeout(Duration::from_secs(60), r.read_line(&mut line))
+            .await
+            .expect("no reply")
+            .unwrap();
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["id"], json!(1));
+        texts.push(v["result"]["content"][0]["text"].as_str().unwrap().len());
+    }
+    assert_eq!(texts, [1 << 20, "ran echo".len()]);
+    drop((r, w));
+    server.await.unwrap();
+}
+
+/// A driven call whose handler panics is reported as `agent.call`, answers unrecorded, frees
+/// its slot and withdraws nothing.
+#[tokio::test]
+async fn a_driven_call_that_panics_is_reported_and_answers_unrecorded() {
+    let (agent, fake, _, mut crashes) = driven_watched();
+    assert_eq!(
+        agent.drive_call("panic".into(), Map::new()).await,
+        Driven::Unrecorded
+    );
+    let crash = crashed(&mut crashes).await;
+    assert_eq!(crash.task, "agent.call");
+    // The slot moves into the call's task, so its unwinding frees it today; this pins that
+    // against a later change that holds the slot outside the task.
+    assert_eq!(agent.in_flight.available_permits(), MAX_IN_FLIGHT);
+    // A caller that got its answer withdraws nothing: without the disarm after the answer,
+    // the guard's drop would withdraw the call's prompt here (shown failing that way).
+    tokio::task::yield_now().await;
+    assert!(fake.withdrawn.lock().unwrap().is_empty());
+}
+
+/// A driven call its caller dropped still runs, and a panic in it is still reported.
+#[tokio::test]
+async fn a_dropped_driven_call_that_then_panics_is_still_reported() {
+    let (agent, fake, _, mut crashes) = driven_watched();
+    let step = tokio::spawn({
+        let agent = Arc::clone(&agent);
+        async move { agent.drive_call("block-panic".into(), Map::new()).await }
+    });
+    reach(&fake.calls, 1).await;
+    step.abort();
+    let _ = step.await;
+    fake.release.notify_one();
+    let crash = crashed(&mut crashes).await;
+    assert_eq!(crash.task, "agent.call");
+}
+
+/// The real frame loop over a connection the test owns: the stream's far end and the outbox's
+/// receiver, so a test reads `conn.tasks` once the loop ends.
+fn owned_conn() -> (Conn, mpsc::Receiver<Out>, DuplexStream, DuplexStream) {
+    let (out, rx) = mpsc::channel(OUTBOX);
+    let (near, far) = tokio::io::duplex(4 * MAX_FRAME);
+    (Conn::new(out), rx, near, far)
+}
+
+/// A frame of `v` with its newline.
+fn framed(v: &Value) -> Vec<u8> {
+    let mut f = serde_json::to_vec(v).unwrap();
+    f.push(b'\n');
+    f
+}
+
+/// The next reply's JSON from the outbox, within 10 s.
+async fn next_reply(rx: &mut mpsc::Receiver<Out>) -> Value {
+    let out = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .expect("no reply within 10 s")
+        .expect("the outbox closed");
+    serde_json::from_slice(&out.line).unwrap()
+}
+
+/// Finished calls are reaped as they end: after 100 answered calls and the end of the stream,
+/// the connection holds no task.
+#[tokio::test(start_paused = true)]
+async fn answered_calls_leave_no_task_behind() {
+    let (agent, _, _) = setup();
+    let (mut conn, mut rx, near, mut far) = owned_conn();
+    let peer = async move {
+        for i in 0..100 {
+            far.write_all(&framed(&call(i, "echo"))).await.unwrap();
+            assert_eq!(next_reply(&mut rx).await["id"], json!(i));
+        }
+        drop(far);
+    };
+    tokio::join!(agent.frames(near, &mut conn), peer);
+    assert_eq!(conn.tasks.len(), 0);
+}
+
+/// Only calls still running stay: k blocked calls, then the end of the stream, leave k tasks.
+#[tokio::test]
+async fn only_running_calls_stay_in_the_task_set() {
+    let (agent, fake, _) = setup();
+    let (mut conn, _rx, near, mut far) = owned_conn();
+    let k = 3;
+    let peer = async {
+        far.write_all(&framed(&call(0, "echo"))).await.unwrap();
+        for i in 1..=k {
+            far.write_all(&framed(&call(i, "block"))).await.unwrap();
+        }
+        reach(&fake.calls, 1 + k as usize).await;
+        reach(&fake.done, 1).await;
+        drop(far);
+    };
+    tokio::join!(agent.frames(near, &mut conn), peer);
+    assert_eq!(conn.tasks.len(), k as usize);
+    for _ in 0..k {
+        fake.release.notify_one();
+    }
+}
+
+/// A reap never costs a frame: half a frame is read, a call ends and is reaped, and the rest of
+/// the frame then completes the request, which is answered.
+#[tokio::test]
+async fn a_reap_mid_frame_loses_no_byte() {
+    let (agent, fake, _) = setup();
+    let (mut conn, mut rx, near, mut far) = owned_conn();
+    let peer = async move {
+        far.write_all(&framed(&call(1, "block"))).await.unwrap();
+        reach(&fake.calls, 1).await;
+        let f = framed(&req(2, "tools/list", json!({})));
+        let (head, tail) = f.split_at(f.len() / 2);
+        far.write_all(head).await.unwrap();
+        tokio::task::yield_now().await;
+        fake.release.notify_one();
+        assert_eq!(next_reply(&mut rx).await["id"], json!(1));
+        // Give the loop turns to reap the ended call while the frame is still half read.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(rx.try_recv().is_err(), "the half frame was answered");
+        far.write_all(tail).await.unwrap();
+        let l = next_reply(&mut rx).await;
+        assert_eq!(l["id"], json!(2));
+        assert_eq!(l["result"]["tools"][0]["name"], json!("echo"));
+        drop(far);
+    };
+    tokio::join!(agent.frames(near, &mut conn), peer);
+    assert_eq!(conn.tasks.len(), 0);
+}
+
+/// A frame already read and waiting for its rate token survives a reap and is answered once.
+#[tokio::test(start_paused = true)]
+async fn a_frame_waiting_for_its_token_survives_a_reap() {
+    let (agent, fake, _) = setup();
+    let (mut conn, mut rx, near, mut far) = owned_conn();
+    let rate = &agent.rate;
+    let peer = async move {
+        far.write_all(&framed(&call(0, "block"))).await.unwrap();
+        reach(&fake.calls, 1).await;
+        // Spend the rest of the burst.
+        for i in 1..i64::from(BURST) {
+            far.write_all(&framed(&req(i, "tools/list", json!({}))))
+                .await
+                .unwrap();
+            assert_eq!(next_reply(&mut rx).await["id"], json!(i));
+        }
+        far.write_all(&framed(&req(999, "tools/list", json!({}))))
+            .await
+            .unwrap();
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        // At the reap, frame 999 is unanswered and no token is free (an empty bucket's take
+        // takes nothing): it is waiting for its token.
+        assert!(rx.try_recv().is_err(), "999 was answered before the reap");
+        assert!(
+            lock(rate).take().is_err(),
+            "a token was free: 999 was not waiting"
+        );
+        fake.release.notify_one();
+        let mut ids = vec![
+            next_reply(&mut rx).await["id"].clone(),
+            next_reply(&mut rx).await["id"].clone(),
+        ];
+        ids.sort_by_key(|v| v.as_i64());
+        assert_eq!(ids, [json!(0), json!(999)]);
+        let again = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        assert!(again.is_err(), "a frame was answered twice");
+        drop(far);
+    };
+    tokio::join!(agent.frames(near, &mut conn), peer);
 }

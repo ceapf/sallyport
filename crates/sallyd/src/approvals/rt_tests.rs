@@ -155,7 +155,9 @@ fn fx(timeout: Duration, max_pending: usize) -> Fx {
     );
     let exec = std::sync::Arc::new(Recording::default());
     let handler = Gated::new(gate.clone(), std::sync::Arc::clone(&exec));
-    let agent = std::sync::Arc::new(Agent::new(handler, rec));
+    // A panic fails the test through its missing reply; nobody reads the reports here.
+    let crash = crate::daemon::crash::CrashReporter::channel().0;
+    let agent = std::sync::Arc::new(Agent::new(handler, rec, crash));
     Fx {
         agent,
         desk,
@@ -165,6 +167,13 @@ fn fx(timeout: Duration, max_pending: usize) -> Fx {
         sink,
     }
 }
+
+/// How long [`Conn::recv`] waits for a reply. Short of the test runner's per-test limit, so
+/// a missing reply is a failure with a message, not a hang.
+const REPLY_WAIT: Duration = Duration::from_secs(10);
+
+/// A wait past every approval timeout these tests set (paused clock only).
+const PAST_EXPIRY: Duration = Duration::from_secs(3600);
 
 struct Conn {
     r: BufReader<ReadHalf<DuplexStream>>,
@@ -180,9 +189,16 @@ impl Conn {
         self.w.write_all(b"\n").await.unwrap();
     }
 
+    /// The next reply, within [`REPLY_WAIT`]: a missing reply fails the test in seconds.
     async fn recv(&mut self) -> Value {
+        self.recv_within(REPLY_WAIT).await
+    }
+
+    /// The next reply, within `limit`. A paused-clock test that waits out an approval timeout
+    /// passes a limit past it, so the timeout's own timer fires first.
+    async fn recv_within(&mut self, limit: Duration) -> Value {
         let mut line = String::new();
-        let n = tokio::time::timeout(Duration::from_secs(3600), self.r.read_line(&mut line))
+        let n = tokio::time::timeout(limit, self.r.read_line(&mut line))
             .await
             .expect("no reply")
             .unwrap();
@@ -349,7 +365,7 @@ async fn rt_ag_02_a_a_call_nobody_answers_times_out_and_never_runs() {
     approved_control(&f, &mut c).await;
     c.send(&touch(1)).await;
     let p = shown(&f, 2).await;
-    let r = c.recv().await;
+    let r = c.recv_within(PAST_EXPIRY).await;
     assert_eq!(text(&r), "denied: timeout");
     assert_eq!(r["result"]["isError"], true);
     assert_eq!(ran(&f).len(), 1);
@@ -528,7 +544,7 @@ async fn rt_ag_03_a_call_flood_through_agent_sock_runs_nothing() {
         w.write_all(&frame).await.unwrap();
         w.write_all(b"\n").await.unwrap();
     }
-    let (replies, r) = tokio::time::timeout(Duration::from_secs(3600), reader)
+    let (replies, r) = tokio::time::timeout(PAST_EXPIRY, reader)
         .await
         .unwrap()
         .unwrap();
@@ -600,7 +616,7 @@ async fn rt_ag_14_a_fetch_write_waits_for_approval_and_is_denied_on_timeout() {
     assert_eq!(text(&c.recv().await), "ran");
     c.send(&post(2)).await;
     shown(&f, 2).await;
-    assert_eq!(text(&c.recv().await), "denied: timeout");
+    assert_eq!(text(&c.recv_within(PAST_EXPIRY).await), "denied: timeout");
     assert_eq!(ran(&f).len(), 1);
     // A read needs no approval.
     let get = call(3, "fetch", json!({"url": "https://api.mock.test/gists"}));

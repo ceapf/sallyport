@@ -18,10 +18,17 @@
 //!   approvals bind it, never the harness's id (architect ruling Q19).
 //! - A cancel or a closed connection never drops a call: it runs to its end (so its own audit
 //!   entries are written) and only its reply is suppressed; a prompt it waits on is withdrawn
-//!   through the handler (#54; ruling Q27). Its in-flight slot is held until it returns. A call
+//!   through the handler (#54; ruling Q27). Its in-flight slot is held until its reply has been
+//!   written or dropped, so the replies the broker holds for a session are at most
+//!   [`MAX_IN_FLIGHT`], however many connections it has and whether or not they read. A call
 //!   whose handler could not write an entry gets no reply. Session teardown does drop calls:
 //!   after [`listen::STOP_GRACE`] (`Handle::shutdown`) or at once (the `Handle` dropped)
-//!   (architect ruling Q17).
+//!   (architect ruling Q17). Teardown ends each connection's writer too: nothing more is written
+//!   to the peer (a line in mid-write is cut short, then the stream ends), and every queued
+//!   reply and its slot are dropped.
+//! - Finished calls are reaped as they end. A call whose task panics is reported to the
+//!   session's crash reporter as `agent.call` at once (the session then stops); its id and slot
+//!   are released and its connection stays open until the session's stop.
 //! - The broker never sends a request; replies are the only messages it writes.
 
 use std::collections::HashMap;
@@ -33,11 +40,11 @@ use sally_core::audit::{Actor, NewEntry};
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
-use tokio::task::JoinSet;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
+use tokio::task::{JoinHandle, JoinSet};
 
 use super::frame::{self, Frame};
-use super::listen::{self, Peer, Server, until_true};
+use super::listen::{self, CrashReporter, Peer, Server, until_true};
 use super::mcp::{self, Call, Era, Note, SERVER_LIMIT, Tool, ToolOutcome};
 use super::message::{
     self, INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, Id, METHOD_NOT_FOUND, Message,
@@ -64,7 +71,9 @@ pub enum Driven {
     Done(ToolOutcome),
     /// Refused before the handler, with the `rpc.deny` reason.
     Denied(&'static str),
-    /// An entry could not be written: nothing ran, or no answer exists.
+    /// No answer exists: an entry could not be written (before the effect, nothing ran; when
+    /// the call's result entry failed, the effect happened and its answer is withheld), or the
+    /// call's task panicked (reported as `agent.call`).
     Unrecorded,
 }
 
@@ -97,7 +106,8 @@ impl<T: ToolHandler> Drop for WithdrawOnDrop<T> {
 
 /// Largest frame accepted (ARCHITECTURE §4: 256 KiB on the session socket).
 pub const MAX_FRAME: usize = 256 * 1024;
-/// `tools/call` requests running at once per session (architect Q8).
+/// `tools/call` requests running at once per session (architect Q8), counting each until its
+/// reply has been written or dropped: also the most replies the broker holds for a session.
 pub const MAX_IN_FLIGHT: usize = 16;
 /// Frames read per second per session, on average (architect Q8).
 pub const RATE: u32 = 20;
@@ -107,8 +117,12 @@ pub const BURST: u32 = 40;
 pub const MAX_CONNECTIONS: usize = 8;
 /// Time a reply may take to write; a peer that does not read is closed.
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Replies queued per connection before the reader waits for the writer.
+/// Replies queued per connection before the reader waits for the writer. A queued `tools/call`
+/// reply still holds its call's slot, so this bounds the other replies (refusals, lists).
 const OUTBOX: usize = 32;
+/// The crash reporter's name for a `tools/call` task, harness or driven (`agent.sock` names
+/// the connection task, `listen.rs`).
+const CALL_TASK: &str = "agent.call";
 /// Argument keys a `tools/call` entry names, at most (architect ruling Q16).
 pub const LOGGED_KEYS: usize = 8;
 
@@ -125,7 +139,8 @@ pub trait ToolHandler: Send + Sync + 'static {
     /// Runs one call. `call` is the number [`begin`](Self::begin) gave it. It must write
     /// its own effect entry (each tool's fields, ARCHITECTURE §4.3) before the effect or the
     /// denial reply, at every `audit.level`: the `rpc.request` entry carries no argument values.
-    /// `None` means an entry could not be written: nothing ran, and no reply is sent.
+    /// `None` means an entry could not be written, and no reply is sent: before the effect,
+    /// nothing ran; when the result entry fails, the effect happened and its reply is withheld.
     ///
     /// A cancel or a closed connection never drops a call; it is told through
     /// [`withdraw`](Self::withdraw). Session teardown does drop calls: after
@@ -154,6 +169,57 @@ pub struct Agent<T> {
     rate: Mutex<Rate>,
     in_flight: Arc<Semaphore>,
     stop: watch::Sender<bool>,
+    /// The session's reporter: connection tasks (through [`listen`]) and call tasks.
+    crash: CrashReporter,
+}
+
+/// One line for the writer, with the in-flight slot of the `tools/call` it answers (`None`
+/// for every other reply): the writer releases it once the line is written, or failed, or
+/// timed out; a writer that gives up drops every queued line and its slot with it.
+struct Out {
+    line: Vec<u8>,
+    slot: Option<OwnedSemaphorePermit>,
+}
+
+/// A dispatched call's id in its connection's `pending` map while the handler runs. The task
+/// consumes it with [`take`](Self::take) as the handler returns; only a task that unwinds
+/// removes the id by dropping it, so a panicked call's id can be sent again.
+struct Pending {
+    map: Arc<Mutex<HashMap<Id, InFlight>>>,
+    /// `Some` until taken: a drop removes the id only then.
+    id: Option<Id>,
+}
+
+impl Pending {
+    /// Enters `id` as in flight with the broker's `call` number.
+    fn insert(map: &Arc<Mutex<HashMap<Id, InFlight>>>, id: Id, call: u64) -> Self {
+        let flight = InFlight {
+            call,
+            cancelled: false,
+        };
+        lock(map).insert(id.clone(), flight);
+        Self {
+            map: Arc::clone(map),
+            id: Some(id),
+        }
+    }
+
+    /// Removes the id as the call returns, before its reply is queued (a later call may reuse
+    /// the id only then); whether its reply is suppressed because a cancel named it. Only
+    /// `take` and the drop remove an entry, so it is always there here: the "gone" case
+    /// (suppressed too) is defensive only.
+    fn take(mut self) -> bool {
+        let flight = self.id.take().and_then(|id| lock(&self.map).remove(&id));
+        flight.is_none_or(|f| f.cancelled)
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            lock(&self.map).remove(&id);
+        }
+    }
 }
 
 /// A `tools/call` in flight on one connection.
@@ -171,88 +237,122 @@ struct Conn {
     legacy: bool,
     /// `tools/call` ids in flight.
     pending: Arc<Mutex<HashMap<Id, InFlight>>>,
-    out: mpsc::Sender<Vec<u8>>,
+    out: mpsc::Sender<Out>,
     tasks: JoinSet<()>,
 }
 
+impl Conn {
+    /// A fresh connection whose replies go to `out`.
+    fn new(out: mpsc::Sender<Out>) -> Self {
+        Self {
+            legacy: false,
+            pending: Arc::default(),
+            out,
+            tasks: JoinSet::new(),
+        }
+    }
+}
+
 impl<T: ToolHandler> Agent<T> {
-    /// A server for one session.
+    /// A server for one session; a panicking connection or call is reported to `crash`, the
+    /// session's reporter.
     #[must_use]
-    pub fn new(handler: T, record: Recorder) -> Self {
+    pub fn new(handler: T, record: Recorder, crash: CrashReporter) -> Self {
         Self {
             handler: Arc::new(handler),
             record,
             rate: Mutex::new(Rate::new(RATE, BURST)),
             in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
             stop: watch::Sender::new(false),
+            crash,
         }
     }
 
     /// Serves `listener` (the session's `agent.sock`) for peers with `uid`; a panicking
-    /// connection is reported to the session's `crash` reporter.
-    pub fn listen(
-        self: Arc<Self>,
-        listener: tokio::net::UnixListener,
-        uid: u32,
-        crash: listen::CrashReporter,
-    ) -> listen::Handle {
+    /// connection is reported to the session's reporter as `agent.sock`.
+    pub fn listen(self: Arc<Self>, listener: tokio::net::UnixListener, uid: u32) -> listen::Handle {
+        let crash = self.crash.clone();
         listen::spawn(listener, self, MAX_CONNECTIONS, uid, "agent.sock", crash)
     }
 
-    /// Serves one stream to its end.
+    /// Serves one stream to its end. Dropping the future (session teardown) ends its writer
+    /// and its calls with it.
     pub async fn serve_stream<S>(self: Arc<Self>, stream: S)
     where
         S: AsyncRead + AsyncWrite + Send + 'static,
     {
         let (r, w) = tokio::io::split(stream);
         let (out, rx) = mpsc::channel(OUTBOX);
-        let writer = tokio::spawn(write_loop(w, rx));
-        let mut conn = Conn {
-            legacy: false,
-            pending: Arc::default(),
-            out,
-            tasks: JoinSet::new(),
-        };
-        let mut reader = BufReader::new(r);
+        let writer = Writer(tokio::spawn(write_loop(w, rx)));
+        let mut conn = Conn::new(out);
+        self.frames(r, &mut conn).await;
+        self.close(conn, writer).await;
+    }
+
+    /// Reads and handles frames until the peer closes, a frame ends the connection or the
+    /// server stops; reaps each call task as it ends.
+    async fn frames<R: AsyncRead + Unpin>(&self, reader: R, conn: &mut Conn) {
         let stopped = until_true(self.stop.subscribe());
         tokio::pin!(stopped);
+        // One frame, then a token before it is handled: a connection idle on its read holds no
+        // token, and nothing past this one frame is read until the rate allows it. The future
+        // owns the reader and is replaced only once it has completed, never dropped for a reap:
+        // a frame half read, or read and waiting for its token, would be lost.
+        let next = move |mut reader: BufReader<R>| async move {
+            let f = frame::read(&mut reader, MAX_FRAME).await;
+            self.throttle().await;
+            (f, reader)
+        };
+        let mut frame = std::pin::pin!(next(BufReader::new(reader)));
         loop {
-            // One frame, then a token before it is handled: a connection idle on its read holds
-            // no token, and nothing past this one frame is read until the rate allows it.
-            let next = async {
-                let f = frame::read(&mut reader, MAX_FRAME).await;
-                self.throttle().await;
-                f
-            };
-            let frame = tokio::select! {
+            let (got, reader) = tokio::select! {
                 biased;
-                () = &mut stopped => break,
-                f = next => f,
+                () = &mut stopped => return,
+                Some(r) = conn.tasks.join_next(), if !conn.tasks.is_empty() => {
+                    self.reaped(r);
+                    continue;
+                }
+                got = &mut frame => got,
             };
-            let keep = match frame {
-                Ok(Frame::Line(line)) => self.handle(&line, &mut conn).await,
+            let keep = match got {
+                Ok(Frame::Line(line)) => self.handle(&line, conn).await,
                 Ok(Frame::TooLarge) => {
-                    self.refuse(&conn, None, None, "frame-too-large", INVALID_REQUEST)
+                    self.refuse(conn, None, None, "frame-too-large", INVALID_REQUEST)
                         .await;
                     false
                 }
                 Ok(Frame::Eof) | Err(_) => false,
             };
             if !keep {
-                break;
+                return;
             }
+            frame.set(next(reader));
         }
+    }
+
+    /// Ends a connection whose frames are done.
+    async fn close(&self, conn: Conn, mut writer: Writer) {
         // Dispatched calls run to their end, though the peer is gone (rulings Q7, Q17; only
         // session teardown aborts them), but a prompt one waits on is withdrawn: nobody is
-        // left to receive its result (architect ruling Q27). Then the writer drains and closes.
+        // left to receive its result (architect ruling Q27). Then the writer drains and closes,
+        // awaited through its guard, so a teardown during the drain still aborts it.
         let open: Vec<u64> = lock(&conn.pending).values().map(|f| f.call).collect();
         for call in open {
             self.handler.withdraw(call, Withdraw::Closed).await;
         }
         let Conn { out, mut tasks, .. } = conn;
         drop(out);
-        while tasks.join_next().await.is_some() {}
-        let _ = writer.await;
+        while let Some(r) = tasks.join_next().await {
+            self.reaped(r);
+        }
+        let _ = (&mut writer.0).await;
+    }
+
+    /// A call task's end: a panic goes to the session's reporter.
+    fn reaped(&self, ended: Result<(), tokio::task::JoinError>) {
+        if let Err(e) = ended {
+            self.crash.joined(CALL_TASK, e);
+        }
     }
 
     /// One tool call of a driven session (architect ruling Q117): the transport-free front half
@@ -264,7 +364,9 @@ impl<T: ToolHandler> Agent<T> {
     ///
     /// The call runs in a task of its own; dropping this future (the driver went away) does not
     /// drop the call: it runs to its end with its entries, and a prompt it waits on is withdrawn
-    /// ([`Withdraw::Closed`]), as for a closed `agent.sock` connection.
+    /// ([`Withdraw::Closed`]), as for a closed `agent.sock` connection. A call that panics is
+    /// reported to the session's reporter as `agent.call` (the session then stops with reason
+    /// crash) and answers [`Driven::Unrecorded`].
     pub async fn drive_call(&self, name: String, arguments: Map<String, Value>) -> Driven {
         let mut params = Map::new();
         params.insert("name".into(), Value::from(name));
@@ -282,12 +384,16 @@ impl<T: ToolHandler> Agent<T> {
             Err(Unadmitted::Unrecorded) => return Driven::Unrecorded,
         };
         let handler = Arc::clone(&self.handler);
-        let task = tokio::spawn({
+        let (tx, rx) = oneshot::channel();
+        // Through the reporter, so a panic is reported even after the caller went away. Its
+        // abort handle is not kept: a call its caller dropped still runs to its end (only its
+        // prompt is withdrawn), like a call on a closed connection.
+        self.crash.spawn(CALL_TASK, {
             let handler = Arc::clone(&handler);
             async move {
                 let outcome = handler.call(call, name, arguments).await;
                 drop(slot);
-                outcome
+                let _ = tx.send(outcome);
             }
         });
         let mut away = WithdrawOnDrop {
@@ -295,7 +401,8 @@ impl<T: ToolHandler> Agent<T> {
             call,
             armed: true,
         };
-        let outcome = task.await;
+        // A panicked call drops `tx`: reported, and answered as unrecorded.
+        let outcome = rx.await;
         away.armed = false;
         match outcome {
             Ok(Some(o)) => Driven::Done(o),
@@ -440,25 +547,19 @@ impl<T: ToolHandler> Agent<T> {
             }
             Err(Unadmitted::Unrecorded) => return false,
         };
-        let flight = InFlight {
-            call,
-            cancelled: false,
-        };
-        lock(&conn.pending).insert(id.clone(), flight);
-        let (handler, pending, out) = (
-            Arc::clone(&self.handler),
-            Arc::clone(&conn.pending),
-            conn.out.clone(),
-        );
+        let pending = Pending::insert(&conn.pending, id.clone(), call);
+        let (handler, out) = (Arc::clone(&self.handler), conn.out.clone());
         conn.tasks.spawn(async move {
             let outcome = handler.call(call, name, arguments).await;
-            let cancelled = lock(&pending).remove(&id).is_none_or(|f| f.cancelled);
-            drop(slot);
-            // `None`: an entry could not be written, so nothing ran and nothing is answered.
+            let cancelled = pending.take();
+            // `None`: an entry could not be written, so nothing is answered (nothing ran, or
+            // the effect happened and its result entry failed).
+            // The slot leaves with the reply and is released once it is written; with no
+            // reply, or a writer gone, it is released here.
             if let (false, Some(outcome)) = (cancelled, outcome) {
-                let _ = out
-                    .send(success(&id, mcp::tools_call_result(era, &outcome)))
-                    .await;
+                let line = success(&id, mcp::tools_call_result(era, &outcome));
+                let slot = Some(slot);
+                let _ = out.send(Out { line, slot }).await;
             }
         });
         true
@@ -564,22 +665,34 @@ impl<T: ToolHandler> Server for Agent<T> {
     }
 }
 
+/// A connection's writer task, aborted when the guard drops: a torn-down connection writes
+/// nothing more, and its queued replies and their slots go with the task. Aborting a writer
+/// that has already ended does nothing.
+struct Writer(JoinHandle<()>);
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Writes queued replies; stops at the first write that fails or stalls past [`WRITE_TIMEOUT`].
-async fn write_loop<W: AsyncWrite + Unpin>(mut w: W, mut rx: mpsc::Receiver<Vec<u8>>) {
-    while let Some(line) = rx.recv().await {
-        if !matches!(
-            tokio::time::timeout(WRITE_TIMEOUT, w.write_all(&line)).await,
-            Ok(Ok(()))
-        ) {
+/// Each line's slot is released once its write has ended, whichever way; stopping drops the
+/// receiver, which releases every queued slot and fails every waiting send.
+async fn write_loop<W: AsyncWrite + Unpin>(mut w: W, mut rx: mpsc::Receiver<Out>) {
+    while let Some(Out { line, slot }) = rx.recv().await {
+        let written = tokio::time::timeout(WRITE_TIMEOUT, w.write_all(&line)).await;
+        drop(slot);
+        if !matches!(written, Ok(Ok(()))) {
             return;
         }
     }
     let _ = tokio::time::timeout(WRITE_TIMEOUT, w.shutdown()).await;
 }
 
-/// Queues a reply; whether the writer is still there.
+/// Queues a reply that holds no slot; whether the writer is still there.
 async fn send(conn: &Conn, line: Vec<u8>) -> bool {
-    conn.out.send(line).await.is_ok()
+    conn.out.send(Out { line, slot: None }).await.is_ok()
 }
 
 fn lock<V>(m: &Mutex<V>) -> std::sync::MutexGuard<'_, V> {

@@ -358,11 +358,7 @@ impl Registry {
             (None, None, None)
         } else {
             match bind(&sock) {
-                Ok(l) => (
-                    Some(agent.listen(l, self.p.ids.uid, crash.clone())),
-                    None,
-                    None,
-                ),
+                Ok(l) => (Some(agent.listen(l, self.p.ids.uid)), None, None),
                 Err(e) => (None, Some(StopReason::StartFailed), Some(e)),
             }
         };
@@ -456,7 +452,11 @@ impl Registry {
             }),
         });
         (
-            Arc::new(Agent::new(Gated::new(gate, tools), rec.clone())),
+            Arc::new(Agent::new(
+                Gated::new(gate, tools),
+                rec.clone(),
+                crash.clone(),
+            )),
             desk,
         )
     }
