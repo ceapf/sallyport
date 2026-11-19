@@ -162,9 +162,9 @@ pub struct Running {
 
 impl Running {
     /// The launcher's free-space floor: the one the watchdog kills at, and the one the file
-    /// tools' own writes are held to (`tools::mounts`).
+    /// tools' own writes are held to (`tools::exec::session_mounts`).
     #[must_use]
-    pub fn disk_floor(&self) -> DiskFloor {
+    pub(crate) fn disk_floor(&self) -> DiskFloor {
         self.disk_floor
     }
 

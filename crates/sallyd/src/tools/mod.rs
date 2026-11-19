@@ -91,9 +91,10 @@ pub fn default_cwd(mounts: &[Mount]) -> String {
 
 /// The session's mounts as the tools reach them: `brokered` and `ro` on the host pin, `rw` and
 /// `staged` in the workspace through `init_dir` (the container init's `/proc/<pid>`). Every write
-/// is held to `floor`, the launch's free-space floor (`Running::disk_floor`).
+/// is held to `floor`, the launch's free-space floor. Outside this module the mounts come only
+/// from a launch ([`exec::session_mounts`]), so no caller can pass another floor.
 #[must_use]
-pub fn mounts(v: &ValidatedManifest, init_dir: &Arc<OwnedFd>, floor: DiskFloor) -> Vec<Mount> {
+fn mounts(v: &ValidatedManifest, init_dir: &Arc<OwnedFd>, floor: DiskFloor) -> Vec<Mount> {
     v.mounts()
         .iter()
         .map(|m| {

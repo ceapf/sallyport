@@ -35,6 +35,9 @@
 //! `docs/dev/PROBE_NOTES.md`), hence the pidfds. A process is named by its pid and start time,
 //! both read through one `/proc/<pid>` directory fd, and a signal goes only through a pidfd
 //! opened for a process seen in the container's pid namespace and re-checked after the open.
+//!
+//! The session's tool mounts are taken from the launch here too ([`session_mounts`]): a
+//! [`Running`] only comes from a launch, so this one expression is container-only as well.
 
 use std::os::unix::process::ExitStatusExt as _;
 use std::process::Stdio;
@@ -45,10 +48,12 @@ use std::time::Duration;
 use rustix::fd::OwnedFd;
 use rustix::fs::{Mode, OFlags};
 use rustix::process::{Pid, PidfdFlags, Signal};
+use sally_core::manifest::ValidatedManifest;
 use sally_proto::Stream;
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 use tokio::sync::watch;
 
+use super::Mount;
 use super::ops::{Ops, SESSION_STOP};
 use super::pipe::{Counts, DRAIN_LIMIT, ended, stream, within, write_input};
 use super::procs::{self, Call, Snapshot, Stat};
@@ -57,6 +62,15 @@ use super::shell::{
     exec_argv,
 };
 use crate::sandbox::{Podman, Running};
+
+/// The session's mounts as the tools reach them, from its launch: the container init's view and
+/// the launcher's free-space floor ([`super::mounts`]). The session registry and the container
+/// tests' fixture both build the tools' mounts with this, so the floor the tools hold writes to
+/// is the launch's.
+#[must_use]
+pub fn session_mounts(v: &ValidatedManifest, running: &Running) -> Vec<Mount> {
+    super::mounts(v, &running.init_dir(), running.disk_floor())
+}
 
 /// Pause between snapshots while looking for the started process.
 const POLL: Duration = Duration::from_millis(10);

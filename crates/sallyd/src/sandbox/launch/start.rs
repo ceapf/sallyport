@@ -372,8 +372,7 @@ impl Launcher {
         );
         match self.start_prepared(prepared, progress).await {
             Ok(started) => {
-                let floor = self.disk_floor;
-                finish(extra, started, name, subject, level, role, floor).await
+                finish(extra, started, name, subject, level, role, self.disk_floor).await
             }
             Err(e) => {
                 extra.shut_down().await;

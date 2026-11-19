@@ -14,9 +14,9 @@ use sallyd::rpc::agent::ToolHandler;
 use sallyd::rpc::mcp::ToolOutcome;
 use sallyd::rpc::record::Recorder;
 use sallyd::sandbox::Running;
-use sallyd::tools::exec::PodmanExec;
+use sallyd::tools::exec::{PodmanExec, session_mounts};
 use sallyd::tools::ops::Ops;
-use sallyd::tools::{Parts, Tools, mounts as tool_mounts};
+use sallyd::tools::{Parts, Tools};
 use serde_json::Value;
 
 use super::container::{Lx, ids};
@@ -70,7 +70,8 @@ impl Session {
 }
 
 /// The session's tools behind the real gate, as the session registry wires them: the mounts and
-/// their free-space floor come from the launch, through the registry's own expression.
+/// their free-space floor come from the launch, through the registry's own function
+/// (`session_mounts`).
 pub fn session(x: &Lx, v: &ValidatedManifest, r: &Running, timeout: Duration) -> Session {
     let rec = Recorder::new(
         x.events.clone(),
@@ -91,7 +92,7 @@ pub fn session(x: &Lx, v: &ValidatedManifest, r: &Running, timeout: Duration) ->
     let ops = Ops::new();
     let tools = Tools::new(Parts {
         builtin: v.manifest().tools.builtin.clone(),
-        mounts: tool_mounts(v, &r.init_dir(), r.disk_floor()),
+        mounts: session_mounts(v, r),
         record: rec,
         exec_gate: r.exec_gate(),
         ops: ops.clone(),
