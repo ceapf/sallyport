@@ -202,9 +202,11 @@ fn altering_podman(at: &Path, real: &Path, prefix: &str) -> PathBuf {
 }
 
 /// Q132, one helper for every role: the podman calls logged from line `from` on (one launch of
-/// `container`) all ran with the private `HOME`; there was exactly one `create`, one `init` and
-/// one `start`; `init` and `start` carried exactly the empty mounts file; and the verifier read
-/// the config between them.
+/// `container`) all ran with the private `HOME`; the mount-link probe was created and inited
+/// once (its `init` with exactly the empty mounts file), never started, and removed before the
+/// real `create`; the container had exactly one `create`, one `init` and one `start`; its `init`
+/// and `start` carried exactly the empty mounts file; and the verifier read the config between
+/// them.
 fn assert_one_start_path(x: &Lx, dir: &Path, from: usize, container: &str) {
     let argv = std::fs::read_to_string(dir.join("argv")).unwrap();
     let homes = std::fs::read_to_string(dir.join("home")).unwrap();
@@ -216,11 +218,39 @@ fn assert_one_start_path(x: &Lx, dir: &Path, from: usize, container: &str) {
     for (line, h) in lines.iter().zip(&homes) {
         assert_eq!(Path::new(h), home, "{line}");
     }
+    let file = x.podman.mounts_file();
+    // The mount-link probe ran first: one `create` and one `init` with the empty mounts file,
+    // never started, and removed before the real `create`.
+    let probe: Vec<&str> = lines.iter().copied().filter(|l| is_probe(l)).collect();
+    let name = probe
+        .iter()
+        .find(|l| verb_of(l) == "init")
+        .and_then(|l| l.rsplit(' ').next())
+        .unwrap_or_else(|| panic!("no probe init: {argv}"));
+    assert!(name.starts_with("sp-probe-"), "{argv}");
+    for (verb, n) in [("create", 1), ("init", 1), ("start", 0)] {
+        let got = probe.iter().filter(|l| verb_of(l) == verb).count();
+        assert_eq!(got, n, "probe {verb}: {argv}");
+    }
+    assert!(
+        probe.contains(&format!("--default-mounts-file {} init {name}", file.display()).as_str()),
+        "{argv}"
+    );
+    let removed = lines
+        .iter()
+        .rposition(|l| verb_of(l) == "rm" && is_probe(l))
+        .unwrap_or_else(|| panic!("the probe was not removed: {argv}"));
+    let lines: Vec<&str> = lines.iter().copied().filter(|l| !is_probe(l)).collect();
+    let real_create = argv
+        .lines()
+        .skip(from)
+        .position(|l| verb_of(l) == "create" && !is_probe(l))
+        .unwrap();
+    assert!(removed < real_create, "{argv}");
     for verb in ["create", "init", "start"] {
         let n = lines.iter().filter(|l| verb_of(l) == verb).count();
         assert_eq!(n, 1, "{verb}: {argv}");
     }
-    let file = x.podman.mounts_file();
     for verb in ["init", "start"] {
         let line = lines.iter().find(|l| verb_of(l) == verb).unwrap();
         assert_eq!(
@@ -238,6 +268,11 @@ fn assert_one_start_path(x: &Lx, dir: &Path, from: usize, container: &str) {
         .position(|l| l.starts_with("unshare cat -- ") && l.ends_with("/config.json"))
         .unwrap_or_else(|| panic!("no config read: {argv}"));
     assert!(at("init") < read && read < at("start"), "{argv}");
+}
+
+/// A logged call of the mount-link probe (it names `sp-probe-…`).
+fn is_probe(line: &str) -> bool {
+    line.contains(" sp-probe-")
 }
 
 /// How many podman calls the wrapper in `dir` logged so far.
@@ -329,7 +364,10 @@ fn rt_sup_04_a_harness_config_altered_between_create_and_start_is_refused() {
         assert!(!exists(&format!("sp-h-{sid}")));
         let argv = std::fs::read_to_string(dir.join("argv")).unwrap();
         let after: Vec<&str> = argv.lines().skip(from).collect();
-        assert!(after.iter().any(|l| verb_of(l) == "init"), "{argv}");
+        assert!(
+            after.iter().any(|l| verb_of(l) == "init" && !is_probe(l)),
+            "{argv}"
+        );
         assert!(!after.iter().any(|l| verb_of(l) == "start"), "{argv}");
         let (_, caps) = exec(&ws, "grep CapEff /proc/self/status").await;
         assert!(caps.contains("CapEff:\t0000000000000000"), "{caps}");
@@ -357,7 +395,10 @@ fn rt_sup_04_an_inference_config_altered_between_create_and_start_is_refused() {
         );
         assert!(!exists(&name));
         let argv = std::fs::read_to_string(dir.join("argv")).unwrap();
-        assert!(argv.lines().any(|l| verb_of(l) == "init"), "{argv}");
+        assert!(
+            argv.lines().any(|l| verb_of(l) == "init" && !is_probe(l)),
+            "{argv}"
+        );
         assert!(!argv.lines().any(|l| verb_of(l) == "start"), "{argv}");
         let p = x.instance_paths("i-altered");
         assert!(!p.socket_dir().exists() && !p.data_dir().exists());
@@ -388,7 +429,10 @@ fn rt_sup_04_a_config_altered_between_create_and_start_is_refused() {
         );
         assert!(!exists(&format!("sp-ws-{}", paths.id().as_str())));
         let argv = std::fs::read_to_string(dir.join("argv")).unwrap();
-        assert!(argv.lines().any(|l| verb_of(l) == "init"), "{argv}");
+        assert!(
+            argv.lines().any(|l| verb_of(l) == "init" && !is_probe(l)),
+            "{argv}"
+        );
         assert!(!argv.lines().any(|l| verb_of(l) == "start"), "{argv}");
     });
 }
@@ -511,8 +555,14 @@ fn rt_sup_04_hostile_podman_configuration_never_reaches_a_container() {
             Some("lo"),
             "own network namespace: {out}"
         );
-        // The two calls that build the spec carry Sallyport's empty mounts file, exactly.
-        let argv = std::fs::read_to_string(dir.join("argv")).unwrap();
+        // The two calls that build the container's spec carry Sallyport's empty mounts file,
+        // exactly (the mount-link probe's are held by `assert_one_start_path`'s tests).
+        let all = std::fs::read_to_string(dir.join("argv")).unwrap();
+        let argv: String = all
+            .lines()
+            .filter(|l| !is_probe(l))
+            .map(|l| format!("{l}\n"))
+            .collect();
         let file = x.podman.mounts_file();
         for verb in ["init", "start"] {
             let lines: Vec<&str> = argv.lines().filter(|l| verb_of(l) == verb).collect();

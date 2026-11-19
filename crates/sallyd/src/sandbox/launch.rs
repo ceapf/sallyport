@@ -308,6 +308,9 @@ struct Progress {
     owned: Vec<PathBuf>,
     /// Directories this launch created (and only those).
     dirs: Vec<PathBuf>,
+    /// The mount-link probe's name, recorded before its `create` and cleared once it is
+    /// confirmed gone, so a failed launch removes it too.
+    probe: Option<String>,
     container: Option<String>,
 }
 

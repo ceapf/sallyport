@@ -24,8 +24,16 @@ use super::Fx;
 
 /// The base image CI pulls by digest; everything else is built from it without a network.
 pub const BASE: &str = "docker.io/library/alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc";
-/// Container name prefixes of every role (`sp-ws-`, `sp-h-`, `sp-infer-` + session id).
-const PREFIXES: [&str; 3] = ["sp-ws-", "sp-h-", "sp-infer-"];
+/// Container name prefixes of every role and of its mount-link probe (`sp-ws-`, `sp-h-`,
+/// `sp-infer-`, each also after `sp-probe-`; then the session or instance id).
+const PREFIXES: [&str; 6] = [
+    "sp-ws-",
+    "sp-h-",
+    "sp-infer-",
+    "sp-probe-ws-",
+    "sp-probe-h-",
+    "sp-probe-infer-",
+];
 /// The red-team syscall probe inside the test image (`tests/redteam/probe/probe.c`).
 pub const PROBE: &str = "/usr/local/bin/sp-probe";
 
@@ -948,6 +956,7 @@ impl Lx {
                 let at = only_flag(&argv, "--image-volume", "--image-volume=ignore");
                 argv.remove(at);
             }
+            LeaveOut::Probe => {}
         }
         self.create_and_start(argv).await
     }
@@ -980,7 +989,8 @@ impl Lx {
     }
 }
 
-/// The one defence a [`Lx::control`] container leaves out of the product argv.
+/// The one defence a [`Lx::control`] container leaves out: an edit of the product argv, or (for
+/// [`LeaveOut::Probe`]) a launcher-side check, with the argv unedited.
 #[allow(dead_code)] // Only the escape, launch, roles and session tests run controls.
 pub enum LeaveOut<'a> {
     /// The mount set: one more `ro` bind of `host` (below the fixture root) at `guest`.
@@ -1000,6 +1010,10 @@ pub enum LeaveOut<'a> {
     /// Disabled image volumes: `--image-volume=ignore` is removed, so the image's volumes are
     /// created.
     ImageVolume,
+    /// The mount-link probe (security review): the argv is unedited. Running it outside the
+    /// launcher leaves out every launcher-side check, and of those only the probe runs before
+    /// `init`, so it is the one defence left out of what the runtime does at `init`.
+    Probe,
 }
 
 /// The index of the argv's one argument starting with `flag`; panics unless there is exactly

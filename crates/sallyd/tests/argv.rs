@@ -246,6 +246,142 @@ fn snapshot_inference_gpu_and_cpu() {
     assert!(!a.iter().any(|x| x.starts_with("--device")), "{a:?}");
 }
 
+// ---- the mount-link probe's argv (security review) ------------------------------------------
+
+/// `real` with every `-v` and `--device` pair left out and `--name`'s value replaced by `probe`.
+fn without_binds(real: &[String], probe: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut it = real.iter();
+    while let Some(t) = it.next() {
+        match t.as_str() {
+            "-v" | "--device" => {
+                it.next();
+            }
+            "--name" => {
+                it.next();
+                out.extend(["--name".to_owned(), probe.to_owned()]);
+            }
+            _ => out.push(t.clone()),
+        }
+    }
+    out
+}
+
+#[test]
+fn snapshot_probe_workspace_has_no_bind_or_overlay() {
+    let f = Fx::new();
+    f.tree("code/myproject", &[".git"], &["sub/.git"]);
+    let v = f.load(&mounts(&[
+        mount("~/code/myproject", "/workspace/p", "rw"),
+        mount("~/code/other", "/workspace/o", "staged"),
+    ]));
+    std::fs::create_dir_all(f.root.join("home/code/other")).unwrap();
+    let b = workspace_build(&f.common, &f.paths, &v, &f.scan(&v), Some(&ws_image())).unwrap();
+    assert_eq!(
+        b.probe.name,
+        format!("sp-probe-ws-{}", f.paths.id().as_str())
+    );
+    assert_eq!(b.probe.argv, without_binds(&b.argv, &b.probe.name));
+    assert!(
+        !b.probe.argv.iter().any(|x| x == "-v"),
+        "{:?}",
+        b.probe.argv
+    );
+    insta::assert_snapshot!("probe-workspace", f.redact(&b.probe.argv));
+}
+
+#[test]
+fn snapshot_probe_harness_has_no_bind() {
+    let f = Fx::new();
+    let v = f.load("");
+    let b = harness_build(&f.common, &f.paths, &v, &image("harness", D0)).unwrap();
+    assert_eq!(
+        b.probe.name,
+        format!("sp-probe-h-{}", f.paths.id().as_str())
+    );
+    assert_eq!(b.probe.argv, without_binds(&b.argv, &b.probe.name));
+    insta::assert_snapshot!("probe-harness", f.redact(&b.probe.argv));
+}
+
+#[test]
+fn snapshot_probe_inference_has_no_bind_and_no_gpu_device() {
+    let f = Fx::new();
+    let spec = inference(&f, true, Some(ByteSize::from_bytes(8 << 30)));
+    let b = inference_build(&f.common, &spec).unwrap();
+    assert_eq!(b.probe.name, "sp-probe-infer-i-0001");
+    assert_eq!(b.probe.argv, without_binds(&b.argv, &b.probe.name));
+    assert!(b.argv.iter().any(|x| x == "--device"), "{:?}", b.argv);
+    assert!(
+        !b.probe.argv.iter().any(|x| x == "--device"),
+        "{:?}",
+        b.probe.argv
+    );
+    insta::assert_snapshot!("probe-inference-gpu", f.redact(&b.probe.argv));
+}
+
+/// The probe argv passes the check only under its own policy, and that policy refuses a bind,
+/// an overlay source, a GPU device or the real container's name.
+#[test]
+fn the_probe_policy_takes_the_probe_argv_and_nothing_with_a_mount() {
+    let f = Fx::new();
+    let v = f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "ro")]));
+    let b = workspace_build(&f.common, &f.paths, &v, &f.scan(&v), Some(&ws_image())).unwrap();
+    let real = allowed(&f, Role::Workspace, Grant::Ro);
+    let probe = real.probe();
+    assert!(probe.probe && probe.sources.is_empty() && probe.scratch.is_none());
+    // Allow: each argv under its own policy.
+    check_argv(&b.argv, &real).unwrap();
+    check_argv(&b.probe.argv, &probe).unwrap();
+    // Deny: crossed over, the name is the other's (and the real argv's bind has no source).
+    assert_forbidden(&b.probe.argv, &real, "probe argv under the real policy");
+    assert_forbidden(&b.argv, &probe, "real argv under the probe policy");
+    let renamed = replacing(&b.argv, "--name", &["--name", &b.probe.name]);
+    assert_forbidden(&renamed, &probe, "a bind under the probe policy");
+    // Deny: a probe policy that names a source or a scratch directory.
+    let src = Allowed {
+        sources: real.sources.clone(),
+        ..probe.clone()
+    };
+    let e = check_argv(&b.probe.argv, &src).unwrap_err();
+    assert!(
+        e.to_string().contains("probe policy must name no source"),
+        "{e}"
+    );
+    let scratch = Allowed {
+        scratch: real.scratch.clone(),
+        ..probe.clone()
+    };
+    assert_forbidden(&b.probe.argv, &scratch, "probe policy with scratch");
+    // Deny: another role's probe name.
+    let other = replacing(
+        &b.probe.argv,
+        "--name",
+        &["--name", &format!("sp-probe-h-{}", f.paths.id().as_str())],
+    );
+    assert_forbidden(&other, &probe, "a harness probe name for a workspace");
+}
+
+#[test]
+fn an_inference_probe_policy_refuses_the_gpu_device() {
+    let f = Fx::new();
+    let spec = inference(&f, true, None);
+    let b = inference_build(&f.common, &spec).unwrap();
+    let ia = Allowed {
+        role: Role::Inference,
+        sources: Vec::new(),
+        scratch: None,
+        timeout: None,
+        ..allowed(&f, Role::Inference, Grant::Ro)
+    }
+    .probe();
+    check_argv(&b.probe.argv, &ia).unwrap();
+    let with_device = with(&b.probe.argv, &["--device", "nvidia.com/gpu=all"]);
+    assert_forbidden(&with_device, &ia, "a GPU device in an inference probe");
+    let not_probe = Allowed { probe: false, ..ia };
+    check_argv(&with_device, &not_probe)
+        .expect_err("the name is the probe's, so the real policy refuses it");
+}
+
 // ---- invariants of every argv ---------------------------------------------------------------
 
 fn every_argv(f: &Fx) -> Vec<Vec<String>> {
@@ -585,6 +721,7 @@ fn allowed(f: &Fx, role: Role, project: Grant) -> Allowed {
         installation: f.common.installation.clone(),
         // The default runtime.timeout (2 h) plus the backstop grace (#92).
         timeout: Some(BACKSTOP),
+        probe: false,
     }
 }
 

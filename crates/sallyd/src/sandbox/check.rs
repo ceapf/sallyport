@@ -16,6 +16,7 @@ use super::argv::{
     BACKSTOP_GRACE, CA_BUNDLE, CA_BUNDLE_VARS, ENTRY, HARNESS_API_KEY, INFER_SOCKET, MODEL_GUEST,
     OPENAI_BASE_URL, PLACEHOLDER, PROXY_URL, PROXY_VARS, SESSION_CA,
 };
+use super::mount_probe::probe_prefix;
 use super::types::{ArgvError, INSTALLATION_LABEL, ImageRef, Installation, Role, UserIds, WORKDIR};
 
 /// Options written `--flag value`, as two tokens; `--flag=value` is refused, so the argv has one
@@ -133,6 +134,23 @@ pub struct Allowed {
     /// than [`BACKSTOP_GRACE`] (podman reads 0 as no timeout); `None` for inference, which may
     /// carry none.
     pub timeout: Option<u64>,
+    /// The argv is a mount-link probe's (security review): its name has the role's probe prefix,
+    /// and it may carry no `-v` source, no overlay scratch and no GPU device.
+    pub probe: bool,
+}
+
+impl Allowed {
+    /// The policy of this argv's mount-link probe: the same, with no source, no scratch and the
+    /// probe's name rule.
+    #[must_use]
+    pub fn probe(&self) -> Self {
+        Self {
+            sources: Vec::new(),
+            scratch: None,
+            probe: true,
+            ..self.clone()
+        }
+    }
 }
 
 fn forbid<T>(msg: impl Into<String>) -> Result<T, ArgvError> {
@@ -201,6 +219,9 @@ fn check_allowed(a: &Allowed) -> Result<(), ArgvError> {
             ));
         }
         (Role::Workspace | Role::Harness, Some(_)) => {}
+    }
+    if a.probe && (!a.sources.is_empty() || a.scratch.is_some()) {
+        return forbid("a probe policy must name no source and no scratch");
     }
     let paths = a.sources.iter().map(|s| s.path.as_path());
     let guests = a.sources.iter().map(|s| Path::new(&s.guest));
@@ -326,9 +347,10 @@ fn check_option(
         ("--user", _) => fixed(&format!("{}:{}", a.ids.uid, a.ids.gid)),
         ("--workdir", _) => fixed(WORKDIR),
         ("--image-volume", _) => fixed("ignore"),
-        ("--device", _) if a.role == Role::Inference => fixed(GPU_DEVICE),
+        // A mount-link probe carries no GPU device: it is never started.
+        ("--device", _) if a.role == Role::Inference && !a.probe => fixed(GPU_DEVICE),
         ("--security-opt", Some(v)) => security_opt(v, a),
-        ("--name", Some(v)) => ok(name_ok(v, a.role)),
+        ("--name", Some(v)) => ok(name_ok(v, a.role, a.probe)),
         ("--label", _) => fixed(&format!("{INSTALLATION_LABEL}={}", a.installation.as_str())),
         // RT-AG-16: exactly the policy's value, in canonical digits; none without one.
         ("--timeout", _) => match a.timeout {
@@ -352,11 +374,23 @@ fn check_option(
     }
 }
 
-fn name_ok(v: &str, role: Role) -> bool {
-    let prefix = match role {
+/// The container name prefix of a role (`sp-ws-`, `sp-h-`, `sp-infer-`); the id follows.
+#[must_use]
+pub(crate) const fn container_prefix(role: Role) -> &'static str {
+    match role {
         Role::Workspace => "sp-ws-",
         Role::Harness => "sp-h-",
         Role::Inference => "sp-infer-",
+    }
+}
+
+/// `v` is the role's container name, or its mount-link probe's when `probe` is set: the prefix,
+/// then a plain id.
+fn name_ok(v: &str, role: Role, probe: bool) -> bool {
+    let prefix = if probe {
+        probe_prefix(role)
+    } else {
+        container_prefix(role)
     };
     v.strip_prefix(prefix).is_some_and(|id| {
         id.bytes().next().is_some_and(|b| b != b'-')

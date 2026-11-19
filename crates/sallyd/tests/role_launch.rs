@@ -27,8 +27,9 @@ fn absent_image() -> ImageRef {
 /// Armed (`<at>/when` holds `create` or `init`, `<at>/sock` a path), it swaps that path once:
 /// a directory for a new empty one, a file for a copy of itself (same bytes, another inode).
 /// The swap happens after a successful `create`, or before `init` runs (after the host
-/// re-check). Armed with `rm`, it fails every `rm` until disarmed instead. The verb is the
-/// first word after the global `--flag value` pairs.
+/// re-check), of the real container: the mount-link probe's calls (`sp-probe-` in the argv),
+/// which run first, never swap. Armed with `rm`, it fails every `rm` until disarmed instead.
+/// The verb is the first word after the global `--flag value` pairs.
 fn logging_podman(at: &Path, real: &Path) -> PathBuf {
     wrap_podman(at, real, |at, real| {
         format!(
@@ -38,6 +39,7 @@ fn logging_podman(at: &Path, real: &Path) -> PathBuf {
              case \"$a\" in --*) [ -z \"$v\" ] && skip=1 ;; *) [ -z \"$v\" ] && v=$a ;; esac\n\
              done\n\
              when=$(cat '{at}/when' 2>/dev/null); sock=$(cat '{at}/sock' 2>/dev/null)\n\
+             case \"$*\" in *sp-probe-*) when= ;; esac\n\
              swap() {{ rm -f '{at}/when'; mv \"$sock\" \"$sock.old\" && \
              if [ -d \"$sock.old\" ]; then mkdir -m 700 \"$sock\"; \
              else cp -p \"$sock.old\" \"$sock\"; fi; }}\n\

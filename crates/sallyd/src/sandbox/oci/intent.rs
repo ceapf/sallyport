@@ -96,4 +96,16 @@ pub struct Built {
     pub argv: Vec<String>,
     /// What the argv asked for.
     pub intent: Intent,
+    /// Its mount-link probe (security review).
+    pub probe: Probe,
+}
+
+/// The mount-link probe of a container (security review): created and inited before the real
+/// container, never started, removed before the real `create`.
+#[derive(Debug, Clone)]
+pub struct Probe {
+    /// The probe's container name (`sp-probe-<role>-<id>`).
+    pub name: String,
+    /// Its checked `podman create` argv: the real one with no bind, overlay or GPU device.
+    pub argv: Vec<String>,
 }

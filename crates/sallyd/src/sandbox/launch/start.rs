@@ -3,20 +3,26 @@
 //! container:
 //!
 //! 1. audit `sandbox.launch` (SI-4: before anything is visible);
-//! 2. `podman create` (the container name is recorded first, so a failed launch removes it even
-//!    when `create` printed no id);
-//! 3. re-check every pin on the host;
-//! 4. `podman init` with Sallyport's empty mounts file ([`Podman::spec_args`]): the runtime builds
+//! 2. the mount-link probe (security review, `sandbox/mount_probe.rs`): a container of the same
+//!    image from the checked probe argv (no bind, overlay or GPU device; its name recorded
+//!    first), `create` and `init`, its pid and image id read, every mount destination of the
+//!    launch walked inside its root filesystem with no link allowed, then removed and confirmed
+//!    gone whatever the walk found. Any failure refuses the launch;
+//! 3. `podman create` (the container name is recorded first, so a failed launch removes it even
+//!    when `create` printed no id), and its image id compared with the probe's;
+//! 4. re-check every pin on the host;
+//! 5. `podman init` with Sallyport's empty mounts file ([`Podman::spec_args`]): the runtime builds
 //!    the mounts but runs nothing;
-//! 5. compare every bind pin inside the container's mount namespace (B4);
-//! 6. the OCI config verifier (Task 14, RT-SUP-04), last before start, so the config read is the
+//! 6. compare every bind pin inside the container's mount namespace (B4);
+//! 7. the OCI config verifier (Task 14, RT-SUP-04), last before start, so the config read is the
 //!    one started;
-//! 7. `podman start` with the empty mounts file, then confirm after a short grace that the
+//! 8. `podman start` with the empty mounts file, then confirm after a short grace that the
 //!    container runs as the pid that was checked.
 //!
 //! `create`, `init`, `start`, [`Podman::spec_args`] and [`Launcher::verify_config`] are called
 //! from here only, and every podman command runs through hermetic podman (its private `HOME`),
-//! so no role can launch without the private `HOME`, the empty mounts file or the verifier.
+//! so no role can launch without the private `HOME`, the empty mounts file, the probe or the
+//! verifier.
 //!
 //! [`Podman::spec_args`]: crate::sandbox::Podman::spec_args
 
@@ -37,7 +43,11 @@ use crate::egress::net::EgressHandle;
 use crate::sandbox::commands::container_id;
 use crate::sandbox::images::PresentImage;
 use crate::sandbox::inside::{Expect, check_in_container};
+use crate::sandbox::mount_probe::{
+    IMAGE_FORMAT, PID_IMAGE_FORMAT, WalkError, parse_image, parse_pid_image, walk_in,
+};
 use crate::sandbox::oci::intent::Built;
+use crate::sandbox::oci::mounts::destinations;
 use crate::sandbox::scan::LaunchScan;
 use crate::sandbox::types::{
     CheckedRuntime, CommonArgs, ImageRef, InstancePaths, Role, SessionPaths,
@@ -393,7 +403,9 @@ impl Launcher {
         .await
     }
 
-    /// Steps 1 to 7 (module docs). Records the container name in `progress` before `create`.
+    /// Steps 1 to 8 (module docs). Records the probe's name in `progress` before its `create`,
+    /// clears it once the probe is confirmed gone, and records the container name before
+    /// `create`.
     pub(super) async fn start_prepared(
         &self,
         p: Prepared,
@@ -418,11 +430,15 @@ impl Launcher {
             level,
         )
         .await?;
+        progress.probe = Some(built.probe.name.clone());
+        let probe_image = self.probe(&built).await?;
+        progress.probe = None;
         progress.container = Some(name);
         let out = self
             .run("create", built.argv.into_iter().map(OsString::from))
             .await?;
         let container = container_id(&out)?;
+        self.same_image(&container, &probe_image).await?;
         blocking(move || match recheck {
             Recheck::Scan(scan, v) => Ok(scan.recheck_host(&v)?),
             Recheck::Pins(pins) => Ok(pins.iter().try_for_each(HostPin::recheck)?),
@@ -445,7 +461,84 @@ impl Launcher {
         })
     }
 
-    /// Step 7: the container still runs, as the process whose mounts were checked. A container
+    /// Step 2 (security review): the mount-link probe, created, inited, read, walked and then
+    /// removed, whatever the walk found; any failure refuses the launch. Returns the image id the
+    /// probe ran.
+    async fn probe(&self, built: &Built) -> Result<String, LaunchError> {
+        let walked = self.probe_walk(built).await;
+        let removed = self
+            .remove_container(&built.probe.name)
+            .await
+            .map_err(probe_err("rm"));
+        let image = walked?;
+        removed?;
+        Ok(image)
+    }
+
+    /// The probe's `create`, `init`, inspect (its pid and image id), the walk of every
+    /// destination of the launch under its held `/proc/<pid>` directory, and a second inspect
+    /// while that directory is held, which must show the same pid and image.
+    async fn probe_walk(&self, built: &Built) -> Result<String, LaunchError> {
+        let p = &built.probe;
+        self.run("create", p.argv.iter().map(OsString::from))
+            .await
+            .map_err(probe_err("create"))?;
+        self.run("init", self.podman.spec_args("init", &p.name))
+            .await
+            .map_err(probe_err("init"))?;
+        let out = self
+            .run("inspect", inspect_args(PID_IMAGE_FORMAT, &p.name))
+            .await
+            .map_err(probe_err("inspect"))?;
+        let (pid, image) = parse_pid_image(&out).ok_or_else(|| LaunchError::Probe {
+            step: "inspect",
+            msg: format!("unexpected {:?}", out.trim()),
+        })?;
+        let dests = destinations(&built.intent);
+        let dir = blocking(move || {
+            let dir = open_proc(pid).map_err(|msg| LaunchError::Probe { step: "walk", msg })?;
+            walk_in(&dir, &dests).map_err(|e| match e {
+                WalkError::Link(r) => LaunchError::MountLink(r),
+                e @ WalkError::Root(_) => LaunchError::Probe {
+                    step: "walk",
+                    msg: e.to_string(),
+                },
+            })?;
+            Ok(dir)
+        })
+        .await?;
+        // While the `/proc/<pid>` fd is held, the probe still shows the pid and image it was
+        // read with: the walk ran in its root, not in a process that reused the pid in between.
+        let again = self
+            .run("inspect", inspect_args(PID_IMAGE_FORMAT, &p.name))
+            .await
+            .map_err(probe_err("inspect"))?;
+        drop(dir);
+        if parse_pid_image(&again) != Some((pid, image.clone())) {
+            return Err(LaunchError::Probe {
+                step: "walk",
+                msg: format!("the probe is no longer pid {pid}: {:?}", again.trim()),
+            });
+        }
+        Ok(image)
+    }
+
+    /// The created container runs the image the probe walked: compared before `init`.
+    async fn same_image(&self, container: &str, probe: &str) -> Result<(), LaunchError> {
+        let out = self
+            .run("inspect", inspect_args(IMAGE_FORMAT, container))
+            .await
+            .map_err(probe_err("image"))?;
+        match parse_image(&out) {
+            Some(image) if image == probe => Ok(()),
+            got => Err(LaunchError::Probe {
+                step: "image",
+                msg: format!("the container's image {got:?} is not the probe's {probe}"),
+            }),
+        }
+    }
+
+    /// Step 8: the container still runs, as the process whose mounts were checked. A container
     /// that exited is already gone (`--rm`), so a failed inspect means "not running" too.
     async fn confirm_running(&self, container: &str, pid: u32) -> Result<(), LaunchError> {
         let state = self
@@ -563,23 +656,14 @@ async fn finish(
     }
 }
 
-/// Step 5, blocking: opens `/proc/<pid>` (the fd then names the process whose mounts are checked
+/// Step 6, blocking: opens `/proc/<pid>` (the fd then names the process whose mounts are checked
 /// next), compares every pin inside, and for the workspace opens its cgroup event files.
 fn inside(
     pid: u32,
     expect: &[Expect],
     role: Role,
 ) -> Result<(rustix::fd::OwnedFd, Option<Observed>), LaunchError> {
-    let p = format!("/proc/{pid}");
-    let dir = sally_core::fd::open(
-        p.as_str(),
-        rustix::fs::OFlags::PATH | rustix::fs::OFlags::DIRECTORY,
-        rustix::fs::Mode::empty(),
-    )
-    .map_err(|e| LaunchError::Command {
-        verb: "init",
-        msg: format!("cannot open {p}: {e}"),
-    })?;
+    let dir = open_proc(pid).map_err(|msg| LaunchError::Command { verb: "init", msg })?;
     check_in_container(&dir, expect).map_err(LaunchError::MountMismatch)?;
     let observed = match role {
         Role::Workspace => Some(Observed::at_launch(&dir).map_err(LaunchError::CgroupEvents)?),
@@ -587,4 +671,34 @@ fn inside(
         Role::Harness | Role::Inference => None,
     };
     Ok((dir, observed))
+}
+
+/// Blocking: opens `/proc/<pid>`, so the fd names that process from then on.
+fn open_proc(pid: u32) -> Result<rustix::fd::OwnedFd, String> {
+    let p = format!("/proc/{pid}");
+    sally_core::fd::open(
+        p.as_str(),
+        rustix::fs::OFlags::PATH | rustix::fs::OFlags::DIRECTORY,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|e| format!("cannot open {p}: {e}"))
+}
+
+/// `podman inspect --format <format> <container>`.
+fn inspect_args(format: &str, container: &str) -> [OsString; 4] {
+    [
+        "inspect".into(),
+        "--format".into(),
+        format.into(),
+        container.into(),
+    ]
+}
+
+/// A failed podman step of the mount-link probe, as a probe refusal (podman's text as `run`
+/// bounded it).
+fn probe_err(step: &'static str) -> impl Fn(LaunchError) -> LaunchError {
+    move |e| LaunchError::Probe {
+        step,
+        msg: e.to_string(),
+    }
 }

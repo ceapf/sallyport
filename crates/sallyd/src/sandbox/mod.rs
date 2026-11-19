@@ -18,6 +18,7 @@ mod disk;
 mod images;
 mod inside;
 mod launch;
+mod mount_probe;
 pub mod oci;
 pub(crate) mod orphans;
 mod overlap;

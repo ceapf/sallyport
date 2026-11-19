@@ -4,7 +4,8 @@
 #
 # - Gives the run a fresh id: SALLYPORT_TEST_RUN, 8 characters of [a-z0-9], always generated
 #   here (an inherited value is overwritten, so two runs started from one shell never share it).
-#   The fixture names its containers `sp-{ws,h,infer}-t<run>-…` and its images
+#   The fixture names its containers `sp-{ws,h,infer}-t<run>-…` (a launch's mount-link probe
+#   `sp-probe-{ws,h,infer}-t<run>-…`) and its images
 #   `localhost/sallyport-test{,-net,-exit}:<run>-<hash>`.
 # - Afterwards, also on INT/TERM, removes only this run's containers (anchored names, then
 #   `podman rm`), then only this run's image tags (anchored names, plain `podman rmi` under the
@@ -62,7 +63,7 @@ mine() {
   out="$("$podman" "$@")" || { echo "test-run: podman $1 failed" >&2; return 5; }
   printf '%s\n' "$out" | grep -E "$re" || [ $? -eq 1 ]
 }
-own_containers() { mine "^sp-(ws|h|infer)-t${id}-" ps --all --format '{{.Names}}'; }
+own_containers() { mine "^sp-(probe-)?(ws|h|infer)-t${id}-" ps --all --format '{{.Names}}'; }
 own_images() {
   mine "^localhost/sallyport-test(-net|-exit)?:${id}-[0-9a-f]{16}\$" \
     images --format '{{.Repository}}:{{.Tag}}'

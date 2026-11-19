@@ -124,9 +124,13 @@ impl Launcher {
         }
     }
 
-    /// Cleanup after a failed launch: the container by name if `create` was attempted (it may
-    /// exist without a printed id), then the directories this launch created.
+    /// Cleanup after a failed launch: the mount-link probe and the container, each by name if
+    /// its `create` was attempted (it may exist without a printed id), then the directories this
+    /// launch created.
     pub(super) async fn clean_failed(&self, p: &Progress) -> Result<(), LaunchError> {
+        if let Some(name) = &p.probe {
+            self.remove_container(name).await?;
+        }
         if let Some(name) = &p.container {
             self.remove_container(name).await?;
         }
