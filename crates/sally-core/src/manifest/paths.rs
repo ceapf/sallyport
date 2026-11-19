@@ -505,8 +505,8 @@ const MAX_ANCESTORS: usize = 4096;
 /// reservation keeps its own copy of this walk (`sandbox::overlap`); that fix makes them one.
 pub(crate) fn identity_chain(dir: &Path) -> std::io::Result<Vec<DirId>> {
     use rustix::fs::{Mode, OFlags};
-    let flags = OFlags::PATH | OFlags::DIRECTORY;
-    let mut fd = crate::fd::open(dir, flags | OFlags::NOFOLLOW, Mode::empty())?;
+    let flags = OFlags::PATH.union(OFlags::DIRECTORY);
+    let mut fd = crate::fd::open(dir, flags.union(OFlags::NOFOLLOW), Mode::empty())?;
     let mut chain = Vec::new();
     for _ in 0..MAX_ANCESTORS {
         let st = rustix::fs::fstat(&fd)?;
