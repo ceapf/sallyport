@@ -363,7 +363,8 @@ made from the link's text, joined (when relative) to the real path of the folder
 as the kernel resolves it, and also matches where that resolves: through a stow-folded
 `~/.local/bin -> ~/dotfiles/bin` holding `t -> ../tools/t` the rule is `~/dotfiles/tools/t`, both
 hops of `~/.bashrc -> ~/df/bashrc -> /data/x/bashrc` are protected, and a dangling link protects
-its target before it exists. A link whose target is already inside a rule adds nothing.
+its target before it exists. A link whose target is already inside a built-in, environment or
+`filesystem.deny` rule adds nothing.
 Reading is bounded: at most 65 536 entries per validation, counted across all folders. Past that,
 with more than 256 `$PATH` or 32 `$GOPATH` folders, or when a folder cannot be read (one that is
 gone, not a folder, or that the user can neither list nor enter is skipped; one the user can
@@ -511,8 +512,9 @@ See `manifests/examples/`:
   access. Mount a folder the user owns, or one whose mode bits grant the access directly.
 - **Links out of protected folders are read when the session is validated, to depth 2 (§2).** A
   link made later, one deeper than depth 2, one inside a linked folder, a non-dot entry of a home,
-  a link in a `$PATH` folder outside the homes (`/usr/local/bin/x -> ~/code/x`), and the middle
-  hops of a chain longer than two are not followed (THREAT_MODEL §6).
+  a link in a `$PATH` folder outside the homes (`/usr/local/bin/x -> ~/code/x`), the middle
+  hops of a chain longer than two, and a not-yet-existing target spelled with `..` after a
+  linked component (only its textual form is protected) are not followed (THREAT_MODEL §6).
 - **A large protected folder can refuse every manifest with mounts.** A listed folder, or one of
   its subfolders, holding tens of thousands of entries (a cache subfolder with a file per item)
   can take the scan past the 65 536 entries it reads; validation then fails `denylist-incomplete`
