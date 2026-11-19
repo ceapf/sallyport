@@ -313,86 +313,70 @@ fn rt_ag_09_stage_size_is_enforced_during_one_long_exec() {
 
 /// The size of each large lower file in the copy-up clause: well above its `stage_size`.
 const LOWER: u64 = 1 << 30;
-/// The most the session's upper directory may hold while the broker writes one byte to a lower
-/// file of [`LOWER`] bytes: an eighth of it.
+/// The most this process may write while the broker writes one byte to a lower file of [`LOWER`]
+/// bytes: an eighth of it.
 const COPY_BOUND: u64 = LOWER / 8;
+const MIB_BYTES: usize = 1 << 20;
 
-/// A lower file of [`LOWER`] bytes of data (not a hole, which a copy-up would skip), and its
-/// SHA-256.
-fn lower_file(path: &std::path::Path) -> Vec<u8> {
+/// One MiB of the lower files' repeating pattern.
+fn pattern() -> Vec<u8> {
+    (0..MIB_BYTES).map(|i| (i % 251) as u8).collect()
+}
+
+/// A lower file of [`LOWER`] bytes of data (not a hole, which a copy-up would skip).
+fn lower_file(path: &std::path::Path) {
     use std::io::Write as _;
-    let block: Vec<u8> = (0..MIB_BYTES).map(|i| (i % 251) as u8).collect();
-    let mut f = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+    let block = pattern();
+    let mut f = std::fs::File::create(path).unwrap();
     for _ in 0..LOWER / MIB_BYTES as u64 {
         f.write_all(&block).unwrap();
     }
-    f.into_inner().unwrap().sync_all().unwrap();
-    digest(path)
 }
 
-const MIB_BYTES: usize = 1 << 20;
-
-fn digest(path: &std::path::Path) -> Vec<u8> {
-    use sha2::Digest as _;
+/// Whether the file at `path` is still exactly [`lower_file`]'s content.
+fn lower_intact(path: &std::path::Path) -> bool {
     use std::io::Read as _;
-    let mut h = sha2::Sha256::new();
+    let (block, mut buf) = (pattern(), vec![0_u8; MIB_BYTES]);
     let mut f = std::fs::File::open(path).unwrap();
-    let mut buf = vec![0_u8; MIB_BYTES];
-    loop {
-        let n = f.read(&mut buf).unwrap();
-        if n == 0 {
-            return h.finalize().to_vec();
-        }
-        h.update(&buf[..n]);
-    }
+    let blocks = LOWER / MIB_BYTES as u64;
+    (0..blocks).all(|_| f.read_exact(&mut buf).is_ok() && buf == block)
+        && f.read(&mut buf).unwrap() == 0
 }
 
-/// Bytes allocated to the regular files under `dir` (a walk; entries that vanish mid-walk are
-/// skipped).
-fn allocated(dir: &std::path::Path) -> u64 {
-    use std::os::unix::fs::MetadataExt as _;
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    entries
-        .flatten()
-        .map(|e| match e.metadata() {
-            Ok(m) if m.is_dir() => allocated(&e.path()),
-            Ok(m) if m.is_file() => m.blocks() * 512,
-            _ => 0,
-        })
-        .sum()
+/// This process's written-bytes counter (`write_bytes` in `/proc/self/io`): what it caused to be
+/// written to storage, counted when page-cache pages are dirtied, over all its threads and the
+/// children it reaped. Without task I/O accounting there is no counter and this panics, so the
+/// control fails rather than skips.
+fn written() -> u64 {
+    let io = std::fs::read_to_string("/proc/self/io").expect("task I/O accounting");
+    io.lines()
+        .find_map(|l| l.strip_prefix("write_bytes:"))
+        .expect("a write_bytes line")
+        .trim()
+        .parse()
+        .expect("a byte count")
 }
 
-/// Runs `work` while a sampler walks `dir` every millisecond; returns `work`'s output and the
-/// most the walk saw allocated.
-async fn peak_while<T: Send + 'static>(
-    dir: &std::path::Path,
-    work: impl std::future::Future<Output = T>,
-) -> (T, u64) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    let done = Arc::new(AtomicBool::new(false));
-    let (d, stop) = (dir.to_owned(), Arc::clone(&done));
-    let sampler = std::thread::spawn(move || {
-        let mut peak = 0;
-        while !stop.load(Ordering::SeqCst) {
-            peak = peak.max(allocated(&d));
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        peak.max(allocated(&d))
-    });
+/// Runs `work`; returns its output and what this process wrote meanwhile ([`written`]).
+async fn written_by<T>(work: impl std::future::Future<Output = T>) -> (T, u64) {
+    let before = written();
     let out = work.await;
-    done.store(true, Ordering::SeqCst);
-    (out, sampler.join().unwrap())
+    (out, written().saturating_sub(before))
 }
 
-/// RT-AG-09: the broker's write to an existing file in a `staged` mount copies nothing up. While
-/// one `fs_write` of one byte to a lower file far above `stage_size` runs, a walk of the
-/// session's upper directory never sees more than [`COPY_BOUND`]: the reopen truncates, so
-/// overlayfs copies the file up empty. Control (analogue), first, through the same sampler and
-/// mount: the unfixed sequence (a write open without `O_TRUNC`, then `ftruncate(0)`, holding the
-/// exec gate as the tool does) on a sibling lower file of the same size shows at least half the
-/// file (the copy's blocks stay while the truncate frees them).
+/// RT-AG-09: the broker's write to an existing file in a `staged` mount copies nothing up. One
+/// `fs_write` of one byte to a lower file far above `stage_size` makes this process write at
+/// most [`COPY_BOUND`]: the reopen truncates, so overlayfs copies the file up empty. The tool runs
+/// in this process (the blocking pool), so a copy-up's writes count here; the counter is
+/// cumulative, not sampled, so nothing can slip between two readings. Control (analogue), first,
+/// through the same probe and mount: the unfixed sequence (a write open without `O_TRUNC`, then
+/// `ftruncate(0)`, holding the exec gate as the tool does) on a sibling lower file of the same
+/// size writes at least half the file. The counter covers every thread and every reaped child,
+/// and is quiet here because the exec gate is held through each write (by the test for the
+/// control, by the tool for its own), so no pause or exec process starts; nextest runs one test
+/// per process; and the I/O lock keeps other fixtures out. Known
+/// limit: where the state directory is on tmpfs or a reflink filesystem a copy-up writes no
+/// counted pages, and the control fails there.
 #[test]
 fn rt_ag_09_a_write_to_a_large_lower_file_copies_nothing_up() {
     let _serial = io_lock(true);
@@ -400,18 +384,18 @@ fn rt_ag_09_a_write_to_a_large_lower_file_copies_nothing_up() {
         let x = Lx::with_floor(DiskFloor::default());
         let st = x.f.root.join("home/code/other");
         std::fs::create_dir_all(&st).unwrap();
-        let (big, sibling) = (lower_file(&st.join("big")), lower_file(&st.join("sibling")));
+        lower_file(&st.join("big"));
+        lower_file(&st.join("sibling"));
         let v = x.f.load(&format!(
             "{}runtime:\n  stage_size: 64MiB\n{TOOLS}  shell: deny\n",
             mounts(&[mount("~/code/other", "/workspace/o", "staged")])
         ));
         let r = x.launch(&v, "copyup").await.unwrap();
         let s = session(&x, &v, &r, Duration::from_secs(30));
-        let upper = x.paths("copyup").stage(0).upper;
         let in_view = format!("/proc/{}/root/workspace/o/sibling", r.init_pid());
         let gate = r.exec_gate();
         let held = gate.lock().await;
-        let ((), control) = peak_while(&upper, async move {
+        let ((), control) = written_by(async move {
             tokio::task::spawn_blocking(move || {
                 let f = std::fs::OpenOptions::new()
                     .write(true)
@@ -426,23 +410,20 @@ fn rt_ag_09_a_write_to_a_large_lower_file_copies_nothing_up() {
         drop(held);
         assert!(
             control >= LOWER / 2,
-            "control: the sampler sees a copy-up ({control} bytes)"
+            "control: the probe sees a copy-up ({control} bytes written)"
         );
-        let (out, peak) = peak_while(
-            &upper,
-            s.call(
-                "fs_write",
-                json!({"path": "/workspace/o/big", "content_b64": "eA=="}),
-            ),
-        )
+        let (out, wrote) = written_by(s.call(
+            "fs_write",
+            json!({"path": "/workspace/o/big", "content_b64": "eA=="}),
+        ))
         .await;
         assert!(!out.is_error, "{}", out.text);
-        eprintln!("upper directory peak: {control} bytes (control), {peak} (the write)");
-        assert!(peak <= COPY_BOUND, "the write copied {peak} bytes up");
+        eprintln!("bytes written: {control} (control), {wrote} (the write)");
+        assert!(wrote <= COPY_BOUND, "the write copied {wrote} bytes up");
         let (_, seen) = exec_in(r.container(), &["cat", "/workspace/o/big"]);
         assert_eq!(seen, "x");
-        assert_eq!(digest(&st.join("big")), big, "the host's lower file");
-        assert_eq!(digest(&st.join("sibling")), sibling);
+        assert!(lower_intact(&st.join("big")), "the host's lower file");
+        assert!(lower_intact(&st.join("sibling")));
         assert!(exists(r.container()));
         x.stop(r).await;
     });

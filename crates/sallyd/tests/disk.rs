@@ -53,6 +53,11 @@ fn free_now() -> u64 {
 /// unless 8 GiB more than the margin is free, so a broken watchdog cannot fill a nearly full disk
 /// (re-review L6).
 fn floor_below_free(margin: u64) -> Lx {
+    floor_and_launcher(margin).1
+}
+
+/// [`floor_below_free`], with the floor's bytes.
+fn floor_and_launcher(margin: u64) -> (u64, Lx) {
     let free = free_now();
     assert!(
         free >= margin + 8192 * MIB,
@@ -60,10 +65,12 @@ fn floor_below_free(margin: u64) -> Lx {
         (margin + 8192 * MIB) / MIB,
         free / MIB
     );
-    Lx::with_floor(DiskFloor {
-        min_bytes: free - margin,
+    let floor = free - margin;
+    let x = Lx::with_floor(DiskFloor {
+        min_bytes: floor,
         percent: 0,
-    })
+    });
+    (floor, x)
 }
 
 /// Removes a host file the test made, even when the test fails.
@@ -133,9 +140,10 @@ fn rt_ag_09_a_full_speed_writer_in_an_rw_mount_is_stopped_by_the_floor() {
 /// The broker's own writes obey the floor. In a `brokered` mount that writes unasked
 /// (`approve: {writes: []}`) the file tool is the only writer, and it writes on the host outside
 /// the container. Control, in the same session and handler: right after the floor is placed, a
-/// write succeeds and the host sees it. Then tool writes cross the floor: the one refused is
-/// refused `disk-floor`, so is the next, its file absent on the host, and the watchdog (which
-/// watches the mount's root) kills the session with `session.resource_limit`.
+/// write succeeds and the host sees it. Then tool writes cross the floor and the one refused is
+/// refused `disk-floor`. With free space then held down by a host file, the next write is refused
+/// too, its file absent on the host, and the watchdog (which watches the mount's root) kills the
+/// session with `session.resource_limit`.
 #[test]
 fn rt_ag_09_broker_writes_in_a_brokered_mount_are_stopped_by_the_floor() {
     let Some(_serial) =
@@ -145,7 +153,7 @@ fn rt_ag_09_broker_writes_in_a_brokered_mount_are_stopped_by_the_floor() {
     };
     rt().block_on(async {
         let room = 128 * MIB;
-        let x = floor_below_free(room);
+        let (floor, x) = floor_and_launcher(room);
         let notes = x.f.root.join("home/code/notes");
         std::fs::create_dir_all(&notes).unwrap();
         let v = x.f.load(&format!(
@@ -185,9 +193,23 @@ fn rt_ag_09_broker_writes_in_a_brokered_mount_are_stopped_by_the_floor() {
             (Some("failed"), Some("disk-floor")),
             "{result}"
         );
-        // The very next write, at once: the crossing write leaves the filesystem only up to one
-        // write below the floor, and the killed container's removal frees about as much again
-        // (measured: 44 KiB below at the refusal, 53 KiB above once the container was gone).
+        // The crossing leaves the filesystem at most one write below the floor, and anything that
+        // frees as much (the killed container's own removal does) would lift it back above before
+        // the checks below. A host file now holds it down; the crossing was the tool writes'.
+        let hold = x.f.root.join("hold-down");
+        let _hold_guard = RemoveFile(hold.clone());
+        let f = std::fs::File::create(&hold).unwrap();
+        rustix::fs::fallocate(&f, rustix::fs::FallocateFlags::empty(), 0, 64 * MIB).unwrap();
+        let dev = |p: &std::path::Path| rustix::fs::stat(p).unwrap().st_dev;
+        assert_eq!(
+            dev(&hold),
+            dev(&notes),
+            "hold-down: on the mount's filesystem"
+        );
+        assert!(
+            free_now() < floor,
+            "hold-down: free space is below the floor"
+        );
         let out = write("after", "eA==").await;
         assert_eq!(out.text, "failed: disk-floor");
         assert!(!notes.join("after").exists());
