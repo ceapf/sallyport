@@ -419,12 +419,18 @@ the empty mounts file or the verifier. A refusal audits the real role.
 
 **Disk watchdog** (#14, Task 6c; maintainer design after the 6c-1 reviews). A sandbox writes to
 the host disk through its `rw` mounts and through the upper directories of its `staged` mounts
-and of its `.git` overlays. Each session whose sandbox can do either gets two tasks:
+and of its `.git` overlays; the broker's file tools write to the host folder of its `brokered`
+mounts on its behalf. Each session whose sandbox can do any of these gets two tasks:
 
 - **Free-space floor** (the hard, race-free guarantee; `disk.rs`).
   - It watches every filesystem the sandbox can write to: the state filesystem, when the session
-    has staged mounts or `.git` overlays, and the filesystem of each `rw` mount root. Each is held
-    by an `O_PATH` fd.
+    has staged mounts or `.git` overlays, and the filesystem of each `rw` and each `brokered`
+    mount root. Each is held by an `O_PATH` fd.
+  - The broker is a writer outside the container, which the kill does not reach, so each file
+    tool write is first held to the same floor on the filesystem its parent directory is on, and
+    is refused `disk-floor` below it (`tools::fs::write`). This is the watchdog's own predicate,
+    not a reservation: the write that crosses the floor is admitted, and the overshoot is at most
+    the writes already past the check, one agent frame each.
   - Every 250 ms it reads `fstatfs`. When the space available to unprivileged users falls below
     the floor, `max(4 GiB, 5 %)` by default, the session is killed. The audit reason is
     `disk-floor`, with the filesystem, the free bytes and the floor.
@@ -868,9 +874,12 @@ never reaches the host folder of a `staged` or `ro` mount. A file is reached `O_
 regular after `fstat` and is judged (below) before the same inode is opened for I/O through
 `/proc/self/fd`, so a FIFO or device is never opened. That open is `O_NONBLOCK`: a file another
 process holds a lease on fails at once instead of parking a broker thread (and, for a write,
-the exec gate) until the lease breaks (ruling Q40). A write opens without `O_TRUNC` and
-truncates after those checks; on `brokered` mounts a file with more than one link is refused
-(`hard-link`).
+the exec gate) until the lease breaks (ruling Q40). A write is first held to the session's
+free-space floor on the filesystem its parent directory is on, before it has any effect
+(`disk-floor`; see the disk watchdog, §3.5). An existing file is then truncated by that open
+(`O_TRUNC`), after the checks, so a `staged` mount's lower file is copied up empty, never with
+its data; a new one is created `O_EXCL`. On `brokered` mounts a file with more than one link is
+refused (`hard-link`).
 
 **Whose permissions** (architect ruling Q39). `sallyd` holds supplementary groups the sandbox
 lacks: the workspace runs as `uid:gid` alone (§3). So in every mode, for every operation, the
