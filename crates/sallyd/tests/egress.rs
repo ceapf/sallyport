@@ -569,9 +569,9 @@ async fn a_thousand_open_tunnels() {
     handle.shutdown().await;
 }
 
-/// 1 000 connections against a cap of 32: 968 are answered 429 at accept. Past 32 + 64 accepted
-/// at once the accept loop waits (architect Q20), so the flood also runs through that bound and
-/// the listen backlog.
+/// 1 000 connections against a cap of 32: 968 are answered 429 at accept. They are opened at the
+/// admission rate, so about 32 + 20 are in flight at once and the in-flight bound (32 + 64,
+/// architect Q20) is not reached here; `net_tests` covers that bound.
 async fn over_the_cap_is_429() {
     let dir = Scratch::new("rt-net-09-cap");
     let events = Arc::new(common::container::Events::default());

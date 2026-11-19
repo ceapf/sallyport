@@ -3,10 +3,11 @@
 //! tested without containers; `net.rs` holds the real ones.
 //!
 //! Order (decision 3, architect Q1/Q8): admission (the in-flight slot and the admission rate, in
-//! `net.rs`; a connection over the rate is closed unread and only counted), head, CONNECT only, authority, policy (host,
-//! port, grant), the host's own addresses, one lookup, the address filter over every address,
-//! `egress.allow`, connect to the pinned addresses in order, `200`, tunnel, `egress.close`. Every
-//! refusal is audited before its reply; a failed audit append closes without a reply or a dial.
+//! `net.rs`; a connection over the rate is closed unread and only counted), head, CONNECT only,
+//! authority, policy (host, port, grant), the host's own addresses, one lookup, the address
+//! filter over every address, `egress.allow`, connect to the pinned addresses in order, `200`,
+//! tunnel, `egress.close`. Every refusal is audited before its reply; a failed audit append
+//! closes without a reply or a dial.
 
 use std::future::Future;
 use std::io;
