@@ -532,6 +532,26 @@ async fn a_closed_connection_still_lets_its_calls_finish() {
     assert_eq!(fake.done.load(Ordering::SeqCst), 1);
 }
 
+/// A normal close still writes what is queued: a peer that stops sending while a call runs
+/// gets that call's reply, and then the end of the stream (only teardown cuts the writer).
+#[tokio::test]
+async fn a_peer_that_stops_sending_still_gets_the_reply_of_a_running_call() {
+    let (agent, fake, _) = setup();
+    let mut c = start(&agent);
+    c.send(&call(1, "block")).await;
+    reach(&fake.calls, 1).await;
+    c.w.shutdown().await.unwrap();
+    fake.release.notify_one();
+    let reply = c.recv().await.expect("closed before the reply");
+    assert_eq!(reply["id"], json!(1));
+    assert_eq!(reply["result"]["content"][0]["text"], json!("ran block"));
+    assert_eq!(c.recv().await, None, "more than one reply");
+    tokio::time::timeout(Duration::from_secs(5), c.server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 #[tokio::test]
 async fn a_closed_connection_withdraws_only_its_unfinished_calls() {
     let (agent, fake, _) = setup();
@@ -1100,6 +1120,68 @@ async fn session_teardown_drops_in_flight_calls() {
         assert_eq!(fake.ended.load(Ordering::SeqCst), 1, "orderly: {orderly}");
         assert_eq!(fake.done.load(Ordering::SeqCst), 0, "orderly: {orderly}");
         assert_eq!(agent.in_flight.available_permits(), MAX_IN_FLIGHT);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Session teardown ends a connection's writer as well as its calls: with two answered calls
+/// whose 1 MiB replies a peer has not read (one stalled in its write, one queued), a dropped
+/// handle, or an orderly shutdown past STOP_GRACE, frees both slots at once, well before
+/// WRITE_TIMEOUT, and the peer then reads to the end of the stream without a complete
+/// second reply: nothing more was written after teardown.
+#[tokio::test(start_paused = true)]
+async fn session_teardown_ends_the_writer_and_drops_queued_replies() {
+    let dir = std::env::temp_dir().join(format!("sp-agent-writer-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir).unwrap();
+    let me = rustix::process::getuid().as_raw();
+    for orderly in [false, true] {
+        let path = dir.join(format!("agent-{orderly}.sock"));
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let (agent, fake, _) = setup();
+        let h = Arc::clone(&agent).listen(listener, me);
+        let mut s = UnixStream::connect(&path).await.unwrap();
+        for i in 1..=2 {
+            let mut msg = serde_json::to_vec(&call(i, "big")).unwrap();
+            msg.push(b'\n');
+            s.write_all(&msg).await.unwrap();
+        }
+        reach(&fake.done, 2).await;
+        let stalled = tokio::time::Instant::now();
+        // A reply larger than the socket's buffer: the first write stalls, the second waits.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            agent.in_flight.available_permits(),
+            MAX_IN_FLIGHT - 2,
+            "orderly: {orderly}: both replies hold their slots before teardown"
+        );
+        if orderly {
+            h.shutdown().await;
+        } else {
+            drop(h);
+        }
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(stalled.elapsed() < WRITE_TIMEOUT, "orderly: {orderly}");
+        assert_eq!(
+            agent.in_flight.available_permits(),
+            MAX_IN_FLIGHT,
+            "orderly: {orderly}: teardown left a writer holding slots"
+        );
+        let mut got = Vec::new();
+        tokio::time::timeout(WRITE_TIMEOUT, s.read_to_end(&mut got))
+            .await
+            .expect("orderly: no end of stream after teardown")
+            .unwrap();
+        assert!(stalled.elapsed() < WRITE_TIMEOUT, "orderly: {orderly}");
+        let lines = got.iter().filter(|&&b| b == b'\n').count();
+        assert!(
+            lines < 2,
+            "orderly: {orderly}: {lines} replies written after teardown"
+        );
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -23,7 +23,9 @@
 //!   [`MAX_IN_FLIGHT`], however many connections it has and whether or not they read. A call
 //!   whose handler could not write an entry gets no reply. Session teardown does drop calls:
 //!   after [`listen::STOP_GRACE`] (`Handle::shutdown`) or at once (the `Handle` dropped)
-//!   (architect ruling Q17).
+//!   (architect ruling Q17). Teardown ends each connection's writer too: nothing more is written
+//!   to the peer (a line in mid-write is cut short, then the stream ends), and every queued
+//!   reply and its slot are dropped.
 //! - Finished calls are reaped as they end. A call whose task panics is reported to the
 //!   session's crash reporter as `agent.call` at once (the session then stops); its id and slot
 //!   are released and its connection stays open until the session's stop.
@@ -272,14 +274,15 @@ impl<T: ToolHandler> Agent<T> {
         listen::spawn(listener, self, MAX_CONNECTIONS, uid, "agent.sock", crash)
     }
 
-    /// Serves one stream to its end.
+    /// Serves one stream to its end. Dropping the future (session teardown) ends its writer
+    /// and its calls with it.
     pub async fn serve_stream<S>(self: Arc<Self>, stream: S)
     where
         S: AsyncRead + AsyncWrite + Send + 'static,
     {
         let (r, w) = tokio::io::split(stream);
         let (out, rx) = mpsc::channel(OUTBOX);
-        let writer = tokio::spawn(write_loop(w, rx));
+        let writer = Writer(tokio::spawn(write_loop(w, rx)));
         let mut conn = Conn::new(out);
         self.frames(r, &mut conn).await;
         self.close(conn, writer).await;
@@ -327,10 +330,11 @@ impl<T: ToolHandler> Agent<T> {
     }
 
     /// Ends a connection whose frames are done.
-    async fn close(&self, conn: Conn, writer: JoinHandle<()>) {
+    async fn close(&self, conn: Conn, mut writer: Writer) {
         // Dispatched calls run to their end, though the peer is gone (rulings Q7, Q17; only
         // session teardown aborts them), but a prompt one waits on is withdrawn: nobody is
-        // left to receive its result (architect ruling Q27). Then the writer drains and closes.
+        // left to receive its result (architect ruling Q27). Then the writer drains and closes,
+        // awaited through its guard, so a teardown during the drain still aborts it.
         let open: Vec<u64> = lock(&conn.pending).values().map(|f| f.call).collect();
         for call in open {
             self.handler.withdraw(call, Withdraw::Closed).await;
@@ -340,7 +344,7 @@ impl<T: ToolHandler> Agent<T> {
         while let Some(r) = tasks.join_next().await {
             self.reaped(r);
         }
-        let _ = writer.await;
+        let _ = (&mut writer.0).await;
     }
 
     /// A call task's end: a panic goes to the session's reporter.
@@ -654,6 +658,17 @@ impl<T: ToolHandler> Server for Agent<T> {
 
     fn stop(&self) {
         self.stop.send_replace(true);
+    }
+}
+
+/// A connection's writer task, aborted when the guard drops: a torn-down connection writes
+/// nothing more, and its queued replies and their slots go with the task. Aborting a writer
+/// that has already ended does nothing.
+struct Writer(JoinHandle<()>);
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
