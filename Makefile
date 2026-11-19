@@ -230,14 +230,17 @@ doctor:
 # Red-team rows implemented so far: every test named `rt_<row>_…` in the workspace (Task 6c);
 # Task 13 adds the harness and the remaining M1 rows. No GPU needed. RT-AG-09 needs cgroup v2:
 # without it the run fails, never skips (CLAUDE.md). An empty selection fails too, and so does a
-# selection whose only ignored rt_ test is not the WSL one or that runs fewer than REDTEAM_FLOOR
-# rt_ tests (scripts/redteam-guard.sh): raise the floor when rows land, lower it only with the
-# removal of a test in the same PR. The lists are plain text: CI sets CARGO_TERM_COLOR=always,
-# and nextest would wrap each name in colour codes.
+# selection whose only ignored rt_ test is not the WSL one or that does not run exactly
+# REDTEAM_COUNT rt_ tests (scripts/redteam-guard.sh). The filter also takes every test of a module
+# named rt_ (approvals::rt_tests). A PR that adds rt_ tests raises the count by the number it adds;
+# the count goes down only in a PR that removes a test, named in its description. On a rebase
+# conflict here, the count is main's plus the branch's own additions; the guard checks the sum.
+# The lists are plain text: CI sets CARGO_TERM_COLOR=always, and nextest would wrap each name in
+# colour codes.
 REDTEAM_FILTER := test(/(^|::)rt_/)
 REDTEAM_WSL_TEST := rt_fs_11_wsl_a_windows_executable_does_not_reach_windows
 REDTEAM_WSL_FILTER := test(=$(REDTEAM_WSL_TEST))
-REDTEAM_FLOOR := 178
+REDTEAM_COUNT := 178
 REDTEAM_LISTS := target/redteam-lists
 redteam:
 	@v=$$(podman info --format '{{.Host.CgroupsVersion}}'); \
@@ -245,7 +248,7 @@ redteam:
 	@mkdir -p $(REDTEAM_LISTS)
 	$(CARGO) nextest list --color never --workspace --message-format oneline --run-ignored only -E '$(REDTEAM_FILTER)' >$(REDTEAM_LISTS)/ignored
 	$(CARGO) nextest list --color never --workspace --message-format oneline -E '$(REDTEAM_FILTER)' >$(REDTEAM_LISTS)/run
-	bash scripts/redteam-guard.sh $(REDTEAM_WSL_TEST) $(REDTEAM_FLOOR) $(REDTEAM_LISTS)/ignored $(REDTEAM_LISTS)/run
+	bash scripts/redteam-guard.sh $(REDTEAM_WSL_TEST) $(REDTEAM_COUNT) $(REDTEAM_LISTS)/ignored $(REDTEAM_LISTS)/run
 	$(TEST_RUN) $(CARGO) nextest run --workspace --no-fail-fast --no-tests=fail -E '$(REDTEAM_FILTER)'
 	@# RT-FS-11's .exe part is the one approved ignored rt_ test: run on WSL, listed as skipped elsewhere.
 	@if [ -e /proc/sys/fs/binfmt_misc/WSLInterop ]; then \
