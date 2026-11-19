@@ -214,7 +214,8 @@ async fn image_control(
         after.contains(&entry.to_owned()),
         "control: {mode}: the host folder gained no {entry}: {after:?}"
     );
-    std::fs::remove_dir(dir.join(entry)).unwrap();
+    std::fs::remove_dir(dir.join(entry))
+        .unwrap_or_else(|e| panic!("control: {mode}: remove {entry}: {e}"));
     assert_eq!(tree(dir), before, "control: {mode}: cleaned up");
 }
 
@@ -231,8 +232,7 @@ fn rt_fs_02_the_image_working_directory_creates_nothing_in_a_mount() {
         host_file(&x, "code/myproject/README", "keep\n");
         let image = image_with("WORKDIR /workspace/p/made-at-init\n");
         for mode in ["ro", "brokered"] {
-            let entry = "made-at-init";
-            image_control(&x, &dir, &image, mode, LeaveOut::Workdir, entry).await;
+            image_control(&x, &dir, &image, mode, LeaveOut::Workdir, "made-at-init").await;
             let before = tree(&dir);
             assert!(before.contains(&"README".to_owned()), "control: {before:?}");
             let got = launch_image(&x, &manifest(&x, mode), image.clone(), mode).await;

@@ -860,8 +860,7 @@ impl Lx {
     }
 
     /// [`Lx::control_workspace`] from `image` (an [`image_with`] image) instead of the test
-    /// image. The [`LeaveOut`] variants that add binds need the test image, so they are not
-    /// used here.
+    /// image. The [`LeaveOut`] variants that add binds need the test image, so they panic here.
     #[allow(dead_code)] // Only the escape tests run image controls.
     pub async fn control_workspace_image(
         &self,
@@ -870,6 +869,10 @@ impl Lx {
         image: &ImageRef,
         leave_out: LeaveOut<'_>,
     ) -> String {
+        assert!(
+            !matches!(leave_out, LeaveOut::Bind { .. } | LeaveOut::Binds(_)),
+            "an image control adds no bind (they are placed before the test image)"
+        );
         let argv = self.product_workspace_argv(v, tag, image);
         self.control(argv, leave_out).await
     }
@@ -896,9 +899,10 @@ impl Lx {
     #[allow(dead_code)] // Only the launch tests run the backstop.
     pub async fn backstop_workspace(&self, v: &ValidatedManifest, tag: &str, secs: u64) -> String {
         let mut argv = self.product_workspace_argv(v, tag, &test_image());
-        let at = only_timeout(&argv);
+        let at = only_flag(&argv, "--timeout", "--timeout");
         let want = v.manifest().runtime.timeout.as_secs() + 300;
-        assert_eq!(argv[at + 1], want.to_string(), "the product backstop");
+        let got = value_after(&argv, at, "the product backstop");
+        assert_eq!(got, want.to_string(), "the product backstop");
         argv[at + 1] = secs.to_string();
         self.create_and_start(argv).await
     }
@@ -930,16 +934,18 @@ impl Lx {
                 *spec = recursive;
             }
             LeaveOut::Timeout => {
-                let at = only_timeout(&argv);
+                let at = only_flag(&argv, "--timeout", "--timeout");
+                value_after(&argv, at, "the product backstop");
                 argv.drain(at..at + 2);
             }
             LeaveOut::Workdir => {
-                let at = only(&argv, "--workdir");
-                assert_eq!(argv[at + 1], "/", "the product working directory");
+                let at = only_flag(&argv, "--workdir", "--workdir");
+                let dir = value_after(&argv, at, "the product working directory");
+                assert_eq!(dir, "/", "the product working directory");
                 argv.drain(at..at + 2);
             }
             LeaveOut::ImageVolume => {
-                let at = only(&argv, "--image-volume=ignore");
+                let at = only_flag(&argv, "--image-volume", "--image-volume=ignore");
                 argv.remove(at);
             }
         }
@@ -997,8 +1003,9 @@ pub enum LeaveOut<'a> {
 }
 
 /// The index of the argv's one argument starting with `flag`; panics unless there is exactly
-/// one and it is `flag` itself.
-fn only(argv: &[String], flag: &str) -> usize {
+/// one such argument and it is exactly `token` (the flag alone when its value follows as the
+/// next token, or `flag=value`).
+fn only_flag(argv: &[String], flag: &str, token: &str) -> usize {
     let at: Vec<usize> = argv
         .iter()
         .enumerate()
@@ -1006,22 +1013,16 @@ fn only(argv: &[String], flag: &str) -> usize {
         .map(|(i, _)| i)
         .collect();
     assert_eq!(at.len(), 1, "exactly one {flag} in {argv:?}");
-    assert_eq!(argv[at[0]], flag, "{flag} as one token");
+    assert_eq!(argv[at[0]], token, "{flag} is {token}");
     at[0]
 }
 
-/// The index of the argv's one `--timeout` (its value follows); panics unless there is exactly
-/// one.
-fn only_timeout(argv: &[String]) -> usize {
-    let at: Vec<usize> = argv
-        .iter()
-        .enumerate()
-        .filter(|(_, a)| a.starts_with("--timeout"))
-        .map(|(i, _)| i)
-        .collect();
-    assert_eq!(at.len(), 1, "exactly one --timeout in {argv:?}");
-    assert_eq!(argv[at[0]], "--timeout", "two tokens");
-    at[0]
+/// The token after `argv[at]` (a two-token flag's value); panics, naming `what`, when the
+/// argv ends there.
+fn value_after<'a>(argv: &'a [String], at: usize, what: &str) -> &'a str {
+    argv.get(at + 1)
+        .map(String::as_str)
+        .unwrap_or_else(|| panic!("{what}: no value after {}", argv[at]))
 }
 
 /// Whether `podman ps --all` lists a container named exactly `name`; a failed `ps` panics, so
@@ -1061,7 +1062,9 @@ impl Drop for Lx {
         let names = podman(&["ps", "--all", "--format", "{{.Names}}"]);
         for name in String::from_utf8_lossy(&names.stdout).lines() {
             if self.owns(name) {
-                let _ = podman(&["rm", "--force", "--time", "0", name]);
+                // With its anonymous volumes: a control without `--image-volume=ignore` makes
+                // them.
+                let _ = podman(&["rm", "--force", "--volumes", "--time", "0", name]);
             }
         }
         let _ = podman(&["unshare", "rm", "-rf", "--", self.f.root.to_str().unwrap()]);
