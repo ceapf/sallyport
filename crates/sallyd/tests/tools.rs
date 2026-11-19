@@ -311,6 +311,143 @@ fn rt_ag_09_stage_size_is_enforced_during_one_long_exec() {
     });
 }
 
+/// The size of each large lower file in the copy-up clause: well above its `stage_size`.
+const LOWER: u64 = 1 << 30;
+/// The most the session's upper directory may hold while the broker writes one byte to a lower
+/// file of [`LOWER`] bytes: an eighth of it.
+const COPY_BOUND: u64 = LOWER / 8;
+
+/// A lower file of [`LOWER`] bytes of data (not a hole, which a copy-up would skip), and its
+/// SHA-256.
+fn lower_file(path: &std::path::Path) -> Vec<u8> {
+    use std::io::Write as _;
+    let block: Vec<u8> = (0..MIB_BYTES).map(|i| (i % 251) as u8).collect();
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+    for _ in 0..LOWER / MIB_BYTES as u64 {
+        f.write_all(&block).unwrap();
+    }
+    f.into_inner().unwrap().sync_all().unwrap();
+    digest(path)
+}
+
+const MIB_BYTES: usize = 1 << 20;
+
+fn digest(path: &std::path::Path) -> Vec<u8> {
+    use sha2::Digest as _;
+    use std::io::Read as _;
+    let mut h = sha2::Sha256::new();
+    let mut f = std::fs::File::open(path).unwrap();
+    let mut buf = vec![0_u8; MIB_BYTES];
+    loop {
+        let n = f.read(&mut buf).unwrap();
+        if n == 0 {
+            return h.finalize().to_vec();
+        }
+        h.update(&buf[..n]);
+    }
+}
+
+/// Bytes allocated to the regular files under `dir` (a walk; entries that vanish mid-walk are
+/// skipped).
+fn allocated(dir: &std::path::Path) -> u64 {
+    use std::os::unix::fs::MetadataExt as _;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|e| match e.metadata() {
+            Ok(m) if m.is_dir() => allocated(&e.path()),
+            Ok(m) if m.is_file() => m.blocks() * 512,
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Runs `work` while a sampler walks `dir` every millisecond; returns `work`'s output and the
+/// most the walk saw allocated.
+async fn peak_while<T: Send + 'static>(
+    dir: &std::path::Path,
+    work: impl std::future::Future<Output = T>,
+) -> (T, u64) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let done = Arc::new(AtomicBool::new(false));
+    let (d, stop) = (dir.to_owned(), Arc::clone(&done));
+    let sampler = std::thread::spawn(move || {
+        let mut peak = 0;
+        while !stop.load(Ordering::SeqCst) {
+            peak = peak.max(allocated(&d));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        peak.max(allocated(&d))
+    });
+    let out = work.await;
+    done.store(true, Ordering::SeqCst);
+    (out, sampler.join().unwrap())
+}
+
+/// RT-AG-09: the broker's write to an existing file in a `staged` mount copies nothing up. While
+/// one `fs_write` of one byte to a lower file far above `stage_size` runs, a walk of the
+/// session's upper directory never sees more than [`COPY_BOUND`]: the reopen truncates, so
+/// overlayfs copies the file up empty. Control (analogue), first, through the same sampler and
+/// mount: the unfixed sequence (a write open without `O_TRUNC`, then `ftruncate(0)`, holding the
+/// exec gate as the tool does) on a sibling lower file of the same size shows at least half the
+/// file (the copy's blocks stay while the truncate frees them).
+#[test]
+fn rt_ag_09_a_write_to_a_large_lower_file_copies_nothing_up() {
+    let _serial = io_lock(true);
+    rt().block_on(async {
+        let x = Lx::with_floor(DiskFloor::default());
+        let st = x.f.root.join("home/code/other");
+        std::fs::create_dir_all(&st).unwrap();
+        let (big, sibling) = (lower_file(&st.join("big")), lower_file(&st.join("sibling")));
+        let v = x.f.load(&format!(
+            "{}runtime:\n  stage_size: 64MiB\n{TOOLS}  shell: deny\n",
+            mounts(&[mount("~/code/other", "/workspace/o", "staged")])
+        ));
+        let r = x.launch(&v, "copyup").await.unwrap();
+        let s = session(&x, &v, &r, Duration::from_secs(30));
+        let upper = x.paths("copyup").stage(0).upper;
+        let in_view = format!("/proc/{}/root/workspace/o/sibling", r.init_pid());
+        let gate = r.exec_gate();
+        let held = gate.lock().await;
+        let ((), control) = peak_while(&upper, async move {
+            tokio::task::spawn_blocking(move || {
+                let f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&in_view)
+                    .unwrap();
+                f.set_len(0).unwrap();
+            })
+            .await
+            .unwrap();
+        })
+        .await;
+        drop(held);
+        assert!(
+            control >= LOWER / 2,
+            "control: the sampler sees a copy-up ({control} bytes)"
+        );
+        let (out, peak) = peak_while(
+            &upper,
+            s.call(
+                "fs_write",
+                json!({"path": "/workspace/o/big", "content_b64": "eA=="}),
+            ),
+        )
+        .await;
+        assert!(!out.is_error, "{}", out.text);
+        eprintln!("upper directory peak: {control} bytes (control), {peak} (the write)");
+        assert!(peak <= COPY_BOUND, "the write copied {peak} bytes up");
+        let (_, seen) = exec_in(r.container(), &["cat", "/workspace/o/big"]);
+        assert_eq!(seen, "x");
+        assert_eq!(digest(&st.join("big")), big, "the host's lower file");
+        assert_eq!(digest(&st.join("sibling")), sibling);
+        assert!(exists(r.container()));
+        x.stop(r).await;
+    });
+}
+
 /// Ruling Q29: a staged write lands in the session's upper directory, the host folder is
 /// byte-identical, and the change is listed; an `rw` write lands in the host folder through the
 /// workspace's view. After the session, nothing resolves (the init is gone).
