@@ -1416,6 +1416,46 @@ async fn a_panicked_call_is_reported_at_once_and_releases_its_id_and_slot() {
     assert!(crashes.try_recv().is_err(), "one panic, one report");
 }
 
+/// Served through the session's listener: a call that panics in the handler (where the real
+/// handler prepares and gates the call) is reported as `agent.call` within 5 s while its
+/// connection is still open, and the connection goes on answering. One panic, one report.
+#[tokio::test]
+async fn a_panicking_call_through_the_listener_is_reported_while_its_connection_is_open() {
+    let dir = std::env::temp_dir().join(format!("sp-agent-panic-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("agent.sock");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let (agent, _, _, mut crashes) = watched();
+    let h = Arc::clone(&agent).listen(listener, rustix::process::getuid().as_raw());
+    let (r, mut w) = UnixStream::connect(&path).await.unwrap().into_split();
+    w.write_all(&framed(&call(1, "panic"))).await.unwrap();
+    let crash = crashed(&mut crashes).await;
+    assert_eq!(crash.task, "agent.call");
+    assert!(
+        crash.payload.contains("the tool panicked"),
+        "{}",
+        crash.payload
+    );
+    // The panicked call gets no reply; the next request on the same stream is answered.
+    w.write_all(&framed(&req(2, "tools/list", json!({}))))
+        .await
+        .unwrap();
+    let mut line = String::new();
+    let mut r = tokio::io::BufReader::new(r);
+    tokio::time::timeout(Duration::from_secs(5), r.read_line(&mut line))
+        .await
+        .expect("no reply within 5 s")
+        .unwrap();
+    let l: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(l["id"], json!(2), "{l}");
+    assert_eq!(l["result"]["tools"][0]["name"], json!("echo"));
+    assert!(crashes.try_recv().is_err(), "one panic, one report");
+    drop((r, w));
+    h.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A call that panics after its connection closed is reported from the close loop, which
 /// joins the connection's calls.
 #[tokio::test]
@@ -1548,6 +1588,31 @@ async fn answered_calls_leave_no_task_behind() {
     };
     tokio::join!(agent.frames(near, &mut conn), peer);
     assert_eq!(conn.tasks.len(), 0);
+}
+
+/// Finished calls are removed while the connection is still open: after 1,000 calls, each
+/// answered before the next is sent, the open connection holds at most [`MAX_IN_FLIGHT`] call
+/// tasks. (The last call may have ended without being reaped yet, so this is not zero.)
+#[tokio::test(start_paused = true)]
+async fn an_open_connection_holds_at_most_the_cap_after_a_thousand_calls() {
+    let (agent, _, _) = setup();
+    let (mut conn, mut rx, near, mut far) = owned_conn();
+    let peer = async {
+        for i in 0..1000 {
+            far.write_all(&framed(&call(i, "echo"))).await.unwrap();
+            assert_eq!(next_reply(&mut rx).await["id"], json!(i));
+        }
+    };
+    tokio::select! {
+        () = agent.frames(near, &mut conn) => panic!("the read loop ended"),
+        () = peer => {}
+    }
+    let held = conn.tasks.len();
+    assert!(
+        held <= MAX_IN_FLIGHT,
+        "the open connection holds {held} tasks"
+    );
+    drop(far);
 }
 
 /// Only calls still running stay: k blocked calls, then the end of the stream, leave k tasks.
