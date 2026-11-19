@@ -5,6 +5,8 @@
  * small file.
  *
  *   probe socket <family> <type> <protocol>   socket(2)
+ *   probe socketpair <family> <type> <protocol>
+ *                                             socketpair(2)
  *   probe unshare <flags>                     unshare(2)
  *   probe clone <flags>                       clone(2), fork-like; the child exits at once
  *   probe clone3 <flags>                      clone3(2), fork-like; the child exits at once
@@ -126,6 +128,10 @@ int main(int argc, char **argv) {
         long fd = socket((int)num(argv[2]), (int)num(argv[3]), (int)num(argv[4]));
         return report(fd);
     }
+    if (argc == 5 && strcmp(argv[1], "socketpair") == 0) {
+        int sv[2];
+        return report(socketpair((int)num(argv[2]), (int)num(argv[3]), (int)num(argv[4]), sv));
+    }
     if (argc == 3 && strcmp(argv[1], "unshare") == 0) {
         return report(unshare((int)num(argv[2])));
     }
@@ -146,7 +152,8 @@ int main(int argc, char **argv) {
     if (argc == 7 && strcmp(argv[1], "send") == 0) {
         return send_to(argv + 2);
     }
-    fprintf(stderr, "usage: probe socket <family> <type> <protocol> | unshare|clone|clone3 <flags>"
+    fprintf(stderr, "usage: probe socket|socketpair <family> <type> <protocol>"
+                    " | unshare|clone|clone3 <flags>"
                     " | connect|send <family> <type> <protocol> <address> <port>\n");
     return 2;
 }

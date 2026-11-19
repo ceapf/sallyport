@@ -193,7 +193,8 @@ mod tests {
         serde_json::from_str(s).unwrap()
     }
 
-    /// The filters Podman 4.9.3 wrote into real configs on x86_64 (Task 14 probe): the
+    /// The filters Podman 4.9.3 wrote into real configs on x86_64 (Task 14 probe; captured
+    /// again with all capabilities dropped when `socketpair` gained its own rule): the
     /// conversion here must reproduce them exactly, rule order included.
     #[test]
     fn the_embedded_profiles_convert_exactly_as_podman_converts_them() {
@@ -202,7 +203,7 @@ mod tests {
         assert_eq!(expected(profile(Role::Workspace), "x86_64").unwrap(), ws);
         assert_eq!(expected(profile(Role::Harness), "x86_64").unwrap(), ws);
         assert_eq!(expected(profile(Role::Inference), "x86_64").unwrap(), inf);
-        assert_eq!(ws.syscalls.len(), 18);
+        assert_eq!(ws.syscalls.len(), 19);
     }
 
     fn rule(extra: &str) -> String {

@@ -14,7 +14,8 @@ properties below, so a regenerated profile that drifts fails CI.
   the default ENOSYS and libc falls back to `clone`.
 - `socket` is allowed per address family (AF_UNIX, AF_INET, AF_INET6, AF_NETLINK with
   NETLINK_ROUTE only; inference AF_UNIX only). Families network namespaces do not isolate (AF_VSOCK reaches the hypervisor
-  host) and everything else get ENOSYS.
+  host) and everything else get ENOSYS. `socketpair` is allowed for AF_UNIX only, in every role;
+  every other family gets ENOSYS too.
 - Only native architectures: no 32-bit sub-architectures, so `int 0x80` (and `socketcall`,
   which cannot be argument-filtered) never reaches an allow rule.
 """
@@ -38,7 +39,7 @@ REMOVED = frozenset(
     """.split()
 )
 # Dropped from every rule and re-added below with argument filters.
-REPLACED = frozenset({"clone", "clone3", "socket"})
+REPLACED = frozenset({"clone", "clone3", "socket", "socketpair"})
 
 AF_UNIX, AF_INET, AF_INET6, AF_NETLINK = 1, 2, 10, 16
 NETLINK_ROUTE = 0
@@ -94,6 +95,14 @@ def with_sockets(profile: dict[str, Any], families: list[int]) -> dict[str, Any]
                 "comment": f"Address family {family} (ARCHITECTURE section 3.4).",
             }
         )
+    rules.append(
+        {
+            "names": ["socketpair"],
+            "action": "SCMP_ACT_ALLOW",
+            "args": [{"index": 0, "value": AF_UNIX, "valueTwo": 0, "op": "SCMP_CMP_EQ"}],
+            "comment": "socketpair: address family 1 only (ARCHITECTURE section 3.4).",
+        }
+    )
     return {**profile, "syscalls": rules}
 
 

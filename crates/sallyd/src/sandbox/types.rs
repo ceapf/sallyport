@@ -80,7 +80,7 @@ pub const INSTALLATION_LABEL: &str = "sallyport.installation";
 
 /// Every container's working directory, chosen by the launcher (`--workdir`), never by the
 /// image: a runtime creates a missing working directory while it places the mounts, so an
-/// image-chosen one below a mount's guest path would land in the host folder.
+/// image-chosen one below a mount's guest path would land in the host folder (RT-FS-02).
 pub const WORKDIR: &str = "/";
 
 /// The id of one Sallyport installation (one state directory): a random UUID v4 in its
