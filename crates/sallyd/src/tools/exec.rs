@@ -64,7 +64,7 @@ use super::shell::{
 use crate::sandbox::{Podman, Running};
 
 /// The session's mounts as the tools reach them, from its launch: the container init's view and
-/// the launcher's free-space floor ([`super::mounts`]). The session registry and the container
+/// the launcher's free-space floor (`tools::mounts`). The session registry and the container
 /// tests' fixture both build the tools' mounts with this, so the floor the tools hold writes to
 /// is the launch's.
 #[must_use]

@@ -371,12 +371,14 @@ async fn written_by<T>(work: impl std::future::Future<Output = T>) -> (T, u64) {
 /// cumulative, not sampled, so nothing can slip between two readings. Control (analogue), first,
 /// through the same probe and mount: the unfixed sequence (a write open without `O_TRUNC`, then
 /// `ftruncate(0)`, holding the exec gate as the tool does) on a sibling lower file of the same
-/// size writes at least half the file. The counter covers every thread and every reaped child,
-/// and is quiet here because the exec gate is held through each write (by the test for the
-/// control, by the tool for its own), so no pause or exec process starts; nextest runs one test
-/// per process; and the I/O lock keeps other fixtures out. Known
-/// limit: where the state directory is on tmpfs or a reflink filesystem a copy-up writes no
-/// counted pages, and the control fails there.
+/// size writes at least half the file. The counter covers every thread and every reaped child.
+/// It is near quiet here, not silent: no command runs in the container, the I/O lock keeps
+/// other fixtures out, and under nextest each test has its own process; but a stage walk woken
+/// by the control's copy can pause and walk the container during the write, and its podman
+/// children count when reaped (as can another test in the same process under `cargo test`).
+/// Each is a few hundred KiB against a 128 MiB bound, and extra writes can only fail the test.
+/// Known limit: where the state directory is on tmpfs or a reflink filesystem (btrfs, XFS with
+/// reflink) a copy-up writes no counted pages, and the control fails there.
 #[test]
 fn rt_ag_09_a_write_to_a_large_lower_file_copies_nothing_up() {
     let _serial = io_lock(true);
@@ -410,7 +412,8 @@ fn rt_ag_09_a_write_to_a_large_lower_file_copies_nothing_up() {
         drop(held);
         assert!(
             control >= LOWER / 2,
-            "control: the probe sees a copy-up ({control} bytes written)"
+            "control: the probe sees a copy-up ({control} bytes written; a state directory on \
+             tmpfs or a reflink filesystem copies up without counted writes)"
         );
         let (out, wrote) = written_by(s.call(
             "fs_write",

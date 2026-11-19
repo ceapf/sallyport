@@ -4,8 +4,8 @@
 //! A session's watched filesystems are the ones written on its behalf: the filesystem of
 //! Sallyport's state directory when the session has staged mounts or `.git` overlays, the
 //! filesystem of every `rw` mount root (written by the sandbox), and that of every `brokered`
-//! mount root (written by the broker's file tools). Each is held open (an `O_PATH` fd) for the session's
-//! lifetime and polled with `fstatfs`. When the space available to unprivileged users falls below
+//! mount root (written by the broker's file tools). Each is held open (an `O_PATH` fd) for the
+//! session's lifetime and polled with `fstatfs`. When the space available to unprivileged users falls below
 //! the floor, `max(min_bytes, percent % of the filesystem)`, the session is killed. A launch is
 //! refused unless every watched filesystem has the floor free, plus `runtime.stage_size` on the
 //! state filesystem.
