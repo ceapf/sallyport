@@ -1156,11 +1156,14 @@ does a shutdown that cannot confirm its container gone. A stop that failed only 
 container was removed (the `sandbox.stop` append, the scratch removal) also has none until a
 retry succeeds; it is reported as not confirmed gone (TODO(#157), Q246).
 
-A file operation already inside its blocking call is never cut. One still running after the
-drain leaves `in_flight > 0`: the stop answers failed and the session stays stop-failed until
-it returns; then the supervisor removes the container by itself. Its `tool.result` is refused
-by the seal (an oplog line names it), so `in_flight: n` counts the `tool.run` entries that have
-no result. Residual risk: a hung file system under a mount keeps an idle container (listener
+A file operation already inside its blocking call is never cut. What it can still do is bounded
+in data, not in time: a write writes its own content (at most one agent frame, 256 KiB) and never
+copies an existing file (§4.3); a delete removes one name; how long the call takes is the file
+system's. One still running after the drain leaves `in_flight > 0`: the stop answers failed and
+the session stays stop-failed until it returns; then the supervisor removes the container by
+itself. Its `tool.result` is refused by the seal (an oplog line names it), so `in_flight: n`
+counts the `tool.run` entries that have no result. Residual risk: a hung or slow file system
+under a mount, or the release of a very large file's blocks, keeps an idle container (listener
 closed, shells killed, nothing new can start) until that operation returns; if `sallyd` shuts
 down meanwhile, the container outlives it with no watchdog until the next start's sweep
 (TODO(#96), Q66). Either way conmon's backstop ends it `runtime.timeout` + 300 s after its
