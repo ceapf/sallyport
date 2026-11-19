@@ -183,9 +183,8 @@ struct Out {
 /// removes the id by dropping it, so a panicked call's id can be sent again.
 struct Pending {
     map: Arc<Mutex<HashMap<Id, InFlight>>>,
-    id: Id,
-    /// Not yet taken: a drop removes the id.
-    armed: bool,
+    /// `Some` until taken: a drop removes the id only then.
+    id: Option<Id>,
 }
 
 impl Pending {
@@ -198,25 +197,24 @@ impl Pending {
         lock(map).insert(id.clone(), flight);
         Self {
             map: Arc::clone(map),
-            id,
-            armed: true,
+            id: Some(id),
         }
     }
 
     /// Removes the id as the call returns, before its reply is queued (a later call may reuse
-    /// the id only then); the id, and whether its reply is suppressed (a cancel named it, or
-    /// it is gone).
-    fn take(mut self) -> (Id, bool) {
-        self.armed = false;
-        let cancelled = lock(&self.map).remove(&self.id).is_none_or(|f| f.cancelled);
-        (self.id.clone(), cancelled)
+    /// the id only then); whether its reply is suppressed because a cancel named it. Only
+    /// `take` and the drop remove an entry, so it is always there here: the "gone" case
+    /// (suppressed too) is defensive only.
+    fn take(mut self) -> bool {
+        let flight = self.id.take().and_then(|id| lock(&self.map).remove(&id));
+        flight.is_none_or(|f| f.cancelled)
     }
 }
 
 impl Drop for Pending {
     fn drop(&mut self) {
-        if self.armed {
-            lock(&self.map).remove(&self.id);
+        if let Some(id) = self.id.take() {
+            lock(&self.map).remove(&id);
         }
     }
 }
@@ -384,7 +382,9 @@ impl<T: ToolHandler> Agent<T> {
         };
         let handler = Arc::clone(&self.handler);
         let (tx, rx) = oneshot::channel();
-        // Through the reporter, so a panic is reported even after the caller went away.
+        // Through the reporter, so a panic is reported even after the caller went away. Its
+        // abort handle is not kept: a call its caller dropped still runs to its end (only its
+        // prompt is withdrawn), like a call on a closed connection.
         self.crash.spawn(CALL_TASK, {
             let handler = Arc::clone(&handler);
             async move {
@@ -544,11 +544,11 @@ impl<T: ToolHandler> Agent<T> {
             }
             Err(Unadmitted::Unrecorded) => return false,
         };
-        let pending = Pending::insert(&conn.pending, id, call);
+        let pending = Pending::insert(&conn.pending, id.clone(), call);
         let (handler, out) = (Arc::clone(&self.handler), conn.out.clone());
         conn.tasks.spawn(async move {
             let outcome = handler.call(call, name, arguments).await;
-            let (id, cancelled) = pending.take();
+            let cancelled = pending.take();
             // `None`: an entry could not be written, so nothing ran and nothing is answered.
             // The slot leaves with the reply and is released once it is written; with no
             // reply, or a writer gone, it is released here.

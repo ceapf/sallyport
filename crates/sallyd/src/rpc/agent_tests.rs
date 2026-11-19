@@ -683,7 +683,8 @@ fn flood(mut w: WriteHalf<DuplexStream>, tool: &'static str, n: i64) -> JoinHand
 /// A call keeps its slot until its reply has left the broker, so a peer that reads nothing
 /// holds at most MAX_IN_FLIGHT replies there, on one connection or many: the next call, on
 /// any connection of the session, is refused (and recorded). Observed past the time the
-/// rate lets all 100 frames in and before WRITE_TIMEOUT closes the connection; past it, the
+/// rate would let all 100 frames in (the reader stops sooner: once the outbox is full, it
+/// waits to queue a refusal) and before WRITE_TIMEOUT closes the connection; past it, the
 /// slots of every queued and waiting reply are free again.
 #[tokio::test(start_paused = true)]
 async fn a_peer_that_reads_nothing_holds_at_most_max_in_flight_replies() {
@@ -709,7 +710,9 @@ async fn a_peer_that_reads_nothing_holds_at_most_max_in_flight_replies() {
     // Past WRITE_TIMEOUT the writer gives up and the connection closes.
     tokio::time::sleep(WRITE_TIMEOUT).await;
     let mut rest = Vec::new();
-    let _ = r.read_to_end(&mut rest).await;
+    // Bounded: a writer that never gave up would hang the test here instead of failing it.
+    let read = tokio::time::timeout(WRITE_TIMEOUT, r.read_to_end(&mut rest)).await;
+    assert!(read.is_ok(), "the connection never closed");
     server.await.unwrap();
     sender.abort();
     assert_eq!(agent.in_flight.available_permits(), MAX_IN_FLIGHT);
@@ -739,6 +742,7 @@ async fn a_slow_reader_gets_one_reply_to_every_call() {
     let n = 100;
     let sender = flood(w, "echo", n);
     let (mut ids, mut refused) = (Vec::new(), 0);
+    let (mut first_refused, mut last_ran) = (None, None);
     for _ in 0..n {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let mut line = String::new();
@@ -747,13 +751,22 @@ async fn a_slow_reader_gets_one_reply_to_every_call() {
             "the server closed"
         );
         let v: Value = serde_json::from_str(&line).unwrap();
+        let id = v["id"].as_i64().unwrap();
         if v["error"]["data"]["reason"] == json!("too-many-in-flight") {
             refused += 1;
+            first_refused = Some(first_refused.map_or(id, |f: i64| f.min(id)));
         } else {
             assert_eq!(v["result"]["content"][0]["text"], json!("ran echo"), "{v}");
+            last_ran = last_ran.max(Some(id));
         }
-        ids.push(v["id"].as_i64().unwrap());
+        ids.push(id);
     }
+    // Slots come back as replies are read: a call sent after the first refusal still ran.
+    let (first_refused, last_ran) = (first_refused.unwrap(), last_ran.unwrap());
+    assert!(
+        last_ran > first_refused,
+        "no slot came back: last call run {last_ran}, first refused {first_refused}"
+    );
     ids.sort_unstable();
     assert_eq!(ids, (0..n).collect::<Vec<_>>());
     assert_eq!(fake.calls.load(Ordering::SeqCst), n as usize - refused);
@@ -1423,8 +1436,10 @@ async fn a_call_that_panics_after_its_connection_closed_is_still_reported() {
     server.await.unwrap();
 }
 
-/// A reply still waiting to leave does not hold its id: a call reusing the id gets its own
-/// reply, and both arrive.
+/// A call's id is released when it returns, before its reply is written: while the first
+/// reply's write is stalled on a peer that has not read it, a call reusing the id is admitted
+/// and gets its own reply, and both arrive. (The first reply is in the writer here, not
+/// queued behind others: the claim is about the id's release, not the outbox.)
 #[tokio::test(start_paused = true)]
 async fn an_id_reused_while_its_first_reply_waits_gets_its_own_reply() {
     let (agent, fake, _) = setup();
@@ -1463,7 +1478,11 @@ async fn a_driven_call_that_panics_is_reported_and_answers_unrecorded() {
     );
     let crash = crashed(&mut crashes).await;
     assert_eq!(crash.task, "agent.call");
+    // The slot moves into the call's task, so its unwinding frees it today; this pins that
+    // against a later change that holds the slot outside the task.
     assert_eq!(agent.in_flight.available_permits(), MAX_IN_FLIGHT);
+    // A caller that got its answer withdraws nothing: without the disarm after the answer,
+    // the guard's drop would withdraw the call's prompt here (shown failing that way).
     tokio::task::yield_now().await;
     assert!(fake.withdrawn.lock().unwrap().is_empty());
 }
@@ -1562,6 +1581,11 @@ async fn a_reap_mid_frame_loses_no_byte() {
         tokio::task::yield_now().await;
         fake.release.notify_one();
         assert_eq!(next_reply(&mut rx).await["id"], json!(1));
+        // Give the loop turns to reap the ended call while the frame is still half read.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(rx.try_recv().is_err(), "the half frame was answered");
         far.write_all(tail).await.unwrap();
         let l = next_reply(&mut rx).await;
         assert_eq!(l["id"], json!(2));
@@ -1577,6 +1601,7 @@ async fn a_reap_mid_frame_loses_no_byte() {
 async fn a_frame_waiting_for_its_token_survives_a_reap() {
     let (agent, fake, _) = setup();
     let (mut conn, mut rx, near, mut far) = owned_conn();
+    let rate = &agent.rate;
     let peer = async move {
         far.write_all(&framed(&call(0, "block"))).await.unwrap();
         reach(&fake.calls, 1).await;
@@ -1593,6 +1618,13 @@ async fn a_frame_waiting_for_its_token_survives_a_reap() {
         for _ in 0..8 {
             tokio::task::yield_now().await;
         }
+        // At the reap, frame 999 is unanswered and no token is free (an empty bucket's take
+        // takes nothing): it is waiting for its token.
+        assert!(rx.try_recv().is_err(), "999 was answered before the reap");
+        assert!(
+            lock(rate).take().is_err(),
+            "a token was free: 999 was not waiting"
+        );
         fake.release.notify_one();
         let mut ids = vec![
             next_reply(&mut rx).await["id"].clone(),
