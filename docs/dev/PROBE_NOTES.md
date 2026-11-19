@@ -196,6 +196,11 @@ line per fact, with where it was found. Check a note again before relying on it 
   them. `/proc/<pid>/limits` and `status` stay world-readable. Opening `/proc/<init>` of a
   session container from a non-dumpable `sallyd` is proven when a session starts through the
   binary (Task 12 PR B). (Task 12, `tests/daemon.rs`)
+- A folder bound on its own child (`mount --bind a/b a/b/x`, in a private mount namespace under
+  `podman unshare`): `stat` gives `a/b/x` the identity of `a/b`, `a/b/x/..` gives `a/b` again
+  (`..` from a mount root climbs to the mount point's parent), and `a/b/x/../..` gives `a`. So
+  an identity walk with `..` reads one identity twice before the real parent, and must not take
+  a repeat for `/`. (Kernel 6.18 WSL2, Podman 4.9.3; RT-AG-08b)
 
 ## Busybox (test image)
 

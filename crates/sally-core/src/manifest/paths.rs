@@ -491,6 +491,64 @@ pub(crate) struct DirId {
     pub(crate) ino: u64,
 }
 
+/// The most directories an identity chain walks before it gives up: deeper than any real path.
+const MAX_ANCESTORS: usize = 4096;
+
+/// The identities of `dir` and of each of its ancestors up to `/`, walking `..` from a directory
+/// handle, never the path string. `..` climbs the path the walk came in by, so the chain of a bind
+/// alias starts with the aliased folder's identity: two mounts of one folder, or of a folder and
+/// one inside it, share an element whatever their paths. The root is opened without following a
+/// symlink, and with `O_PATH`, so a search-only folder can be walked. The walk ends as [`climb`]
+/// says; a folder bound on its own child appears twice.
+///
+/// Residuals: a bind of a *subdirectory* hides its real parents from this chain, and two binds of
+/// `/` nested directly in each other end the walk at the inner one. TODO(#17): comparing
+/// `(st_dev, path inside the filesystem)` from mountinfo closes both. TODO(#242): `sallyd`'s
+/// session reservation keeps its own copy of this walk (`sandbox::overlap`), with the early stop
+/// [`climb`] avoids; #242 makes `sallyd` call this one.
+pub(crate) fn identity_chain(dir: &Path) -> std::io::Result<Vec<DirId>> {
+    use rustix::fs::{Mode, OFlags};
+    let flags = OFlags::PATH.union(OFlags::DIRECTORY);
+    let root = fd_id(&crate::fd::open("/", flags, Mode::empty())?)?;
+    let mut fd = crate::fd::open(dir, flags.union(OFlags::NOFOLLOW), Mode::empty())?;
+    let start = fd_id(&fd)?;
+    climb(start, root, || {
+        let parent = crate::fd::openat(&fd, "..", flags, Mode::empty())?;
+        fd = parent;
+        fd_id(&fd)
+    })
+}
+
+/// The identity of the directory `fd` refers to.
+fn fd_id(fd: &std::os::fd::OwnedFd) -> std::io::Result<DirId> {
+    let st = rustix::fs::fstat(fd)?;
+    Ok(DirId {
+        dev: st.st_dev,
+        ino: st.st_ino,
+    })
+}
+
+/// The chain from `start`, each next identity read by `step` (the parent of the last one). It
+/// ends when `step` reads `root` right after `root`, as `..` does at `/`; any other repeat is
+/// kept, because a folder bound on its own child reads the same identity twice before its real
+/// parent, and `root` met once mid-chain (under a bind of `/`) does not end it either. A walk that
+/// has not ended after [`MAX_ANCESTORS`] steps fails, and so does a step that fails.
+fn climb(
+    start: DirId,
+    root: DirId,
+    mut step: impl FnMut() -> std::io::Result<DirId>,
+) -> std::io::Result<Vec<DirId>> {
+    let mut chain = vec![start];
+    for _ in 0..MAX_ANCESTORS {
+        let id = step()?;
+        if id == root && chain.last() == Some(&root) {
+            return Ok(chain);
+        }
+        chain.push(id);
+    }
+    Err(std::io::Error::other("ancestor walk did not reach /"))
+}
+
 /// Checks a mount host path and returns its realpath and directory identity.
 ///
 /// Order matters: a lexical denylist check first (so `/mnt/c` is `denylisted` even where it
@@ -1254,5 +1312,112 @@ mod tests {
         assert!(overlaps(Path::new("/a/b"), Path::new("/a")));
         assert!(overlaps(Path::new("/a"), Path::new("/a")));
         assert!(!overlaps(Path::new("/a/bc"), Path::new("/a/b")));
+    }
+
+    fn id_of(p: &Path) -> DirId {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(p).unwrap();
+        DirId {
+            dev: m.dev(),
+            ino: m.ino(),
+        }
+    }
+
+    /// The chain starts at the folder itself, goes on with its parent, and ends at `/`.
+    #[test]
+    fn an_identity_chain_climbs_from_the_folder_to_the_root() {
+        let base = std::env::temp_dir().join(format!("sp-core-chain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("a/b");
+        std::fs::create_dir_all(&dir).unwrap();
+        let chain = identity_chain(&dir);
+        let want = [id_of(&dir), id_of(&base.join("a")), id_of(&base)];
+        std::fs::remove_dir_all(&base).unwrap();
+        let chain = chain.unwrap();
+        assert_eq!(chain.get(..3), Some(&want[..]), "{chain:?}");
+        assert_eq!(chain.last(), Some(&id_of(Path::new("/"))));
+        assert_eq!(
+            chain
+                .iter()
+                .filter(|i| **i == id_of(Path::new("/")))
+                .count(),
+            1,
+            "the root once: {chain:?}"
+        );
+    }
+
+    const fn n(ino: u64) -> DirId {
+        DirId { dev: 1, ino }
+    }
+
+    const R: DirId = n(1);
+
+    /// Runs `climb` from the first identity of `seq` over the rest, returning the chain and how
+    /// many steps it asked for.
+    fn climbed(seq: &[DirId]) -> (std::io::Result<Vec<DirId>>, usize) {
+        let mut rest = seq.iter().skip(1).copied();
+        let mut asked = 0;
+        let got = climb(*seq.first().unwrap(), R, || {
+            asked += 1;
+            rest.next()
+                .ok_or_else(|| std::io::Error::other("test sequence ended"))
+        });
+        (got, asked)
+    }
+
+    #[test]
+    fn a_climb_ends_at_the_root_read_twice() {
+        let (d, b, a, p, m) = (n(4), n(5), n(6), n(7), n(8));
+        let cases: [(&[DirId], &[DirId]); 4] = [
+            // An ordinary folder.
+            (&[d, R, R], &[d, R]),
+            // A folder bound on its own child reads its identity twice before its parent.
+            (&[b, b, a, R, R], &[b, b, a, R]),
+            // Under a bind of `/` at a child of `m`, the root's identity mid-chain does not end it.
+            (&[p, R, m, R, R], &[p, R, m, R]),
+            // `/` itself.
+            (&[R, R], &[R]),
+        ];
+        for (seq, want) in cases {
+            let (got, asked) = climbed(seq);
+            assert_eq!(got.unwrap(), want, "{seq:?}");
+            assert_eq!(asked, seq.len() - 1, "{seq:?}");
+        }
+    }
+
+    #[test]
+    fn a_climb_that_never_reaches_the_root_fails_at_the_bound() {
+        let mut asked = 0;
+        let got = climb(n(9), R, || {
+            asked += 1;
+            Ok(n(9))
+        });
+        assert!(got.is_err(), "{got:?}");
+        assert_eq!(asked, MAX_ANCESTORS);
+    }
+
+    #[test]
+    fn a_failed_step_fails_the_climb() {
+        let (got, asked) = climbed(&[n(4), n(5)]);
+        assert!(got.is_err(), "{got:?}");
+        assert_eq!(asked, 2);
+    }
+
+    /// The walk opens with `O_PATH` (no read permission needed) and never through a symlink.
+    #[test]
+    fn an_identity_chain_needs_no_read_permission_and_refuses_a_symlinked_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("sp-core-chain-perm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("d");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(&dir, base.join("link")).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o100)).unwrap();
+        let chain = identity_chain(&dir);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = identity_chain(&base.join("link"));
+        std::fs::remove_dir_all(&base).unwrap();
+        assert!(chain.is_ok(), "search-only dir: {chain:?}");
+        assert!(link.is_err(), "symlinked root: {link:?}");
     }
 }

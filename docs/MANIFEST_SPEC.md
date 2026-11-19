@@ -227,7 +227,15 @@ an object carrying a POSIX ACL is open to its owner only (architect ruling Q39; 
   nested `.git` folders, and git repositories inside the mount that are not named `.git` (a bare
   `project.git`, a separate git dir).
 - Mounts may not overlap on the host side (a `rw` parent would bypass a `brokered` child's
-  approvals) and guests may not repeat or nest.
+  approvals) and guests may not repeat or nest. Host overlap is judged by realpath and by
+  directory identity (`st_dev`, `st_ino` of each root and its ancestors), whatever the two modes:
+  a bind mount, or a second mount of the same filesystem, that reaches a folder another mount
+  holds (the folder, or one containing it) is refused `overlap` like a nested path. A bind of a
+  *subdirectory* is not seen (#17): a `rw` mount can then hold part or all of a `brokered` one.
+  A folder bound on its own child is followed up to its real parents. A hard-linked file shared
+  by a `rw` mount and a `brokered` mount is not an overlap either: a write through the `rw` name
+  is not approved (#241). A root whose ancestors cannot all be searched, or whose walk does not
+  reach `/` within 4096 steps, cannot be compared, and is refused `not-found`.
 - Across live sessions (AMENDMENTS-02 B4), folders may overlap only when neither session mounts
   them `rw` or `brokered`; the launch is refused (`overlap`) otherwise.
 - A Unix socket anywhere in a mount refuses the launch (`socket-in-mount`, RT-FS-13). Another
@@ -416,11 +424,11 @@ yet (TODO(#231)).
 | `runtime.timeout` | `sallyd::session` timer → `podman kill`; backstop: `--timeout <runtime.timeout + 300 s>` on the workspace and harness `create`, enforced by conmon from `podman init` without `sallyd` (#92, RT-AG-16) | runtime | session stopped, audit `session.timeout`; a container whose `sallyd` was killed outright is killed by conmon at the backstop and removed (`--rm`), with no entry |
 | `runtime.tmp_size/tmp_exec` | `podman run --tmpfs /tmp:…` | launch | a full `/tmp` returns ENOSPC; contained, not audited (a tmpfs has no kernel event) |
 | `runtime.stage_size` (soft) | `sallyd::sandbox` disk watchdog: when the state filesystem's usage grows past the session's headroom, `podman pause`, walk the staged and `.git` overlay upper dirs (10 s deadline), `unpause` → `podman kill` + `rm` until gone; launch needs the floor plus `stage_size` free | launch + runtime | session killed, audit `session.resource_limit` (before the kill; `session.kill_failed` if the first kill fails); staged data kept |
-| (no field) free-space floor, `max(4 GiB, 5 %)` | `sallyd::sandbox` disk watchdog: `fstatfs` every 250 ms of every filesystem the sandbox can write to (state, `rw` mount roots) | launch + runtime | below the floor: session killed, audit `session.resource_limit` reason `disk-floor`; launch refused `disk-floor` |
+| (no field) free-space floor, `max(4 GiB, 5 %)` | `sallyd::sandbox` disk watchdog: `fstatfs` every 250 ms of every filesystem the sandbox can write to, itself or through the broker (state, `rw` and `brokered` mount roots); the broker's file tools check the floor before each write (`tools::fs::write`) | launch + runtime + each broker write | below the floor: session killed, audit `session.resource_limit` reason `disk-floor`; launch refused `disk-floor`; a broker write refused `disk-floor` |
 | `model.ref` | `sallyd::infer` resolves in library; refuses unverified/unknown | session start | error to UI |
 | `model.context/gpu_layers` | `sallyd::infer` → llama-server args, clamped by fit estimator | load | clamped, warning |
 | `model.context` (token limit) | `sallyd::llm` (`body::check`): a request's `max_tokens` / `max_completion_tokens` above it is refused (and 0 always is); absent, the backend is given `model.context` as the bound. The M3 fit estimator clamps further | each `llm.sock` request | 400 `token-limit` (0: `bad-value`) + audit `llm.deny` |
-| `filesystem.mounts[].host` | validator (realpath, denylist, is-dir, not-symlink) **and again** at launch: the launch scan re-opens the root without following symlinks and compares `st_dev:st_ino`, pins are re-checked before `podman init`, and bind mounts are compared inside the container after `init` (ARCHITECTURE §3.5) | validate + launch | reject / `sandbox.refuse` / `sandbox.mount_mismatch` |
+| `filesystem.mounts[].host` | validator (realpath, denylist, is-dir, not-symlink) **and again** at launch: the launch scan re-opens the root without following symlinks and compares `st_dev:st_ino`, pins are re-checked before `podman init`, and bind mounts are compared inside the container after `init` (ARCHITECTURE §3.5). Validation only: the mounts of one manifest may not overlap, by path or by directory identity (§1, Mount); the launch re-checks each root's identity, not the overlap | validate + launch | reject / `sandbox.refuse` / `sandbox.mount_mismatch` |
 | `filesystem.mounts[].guest` | validator (`/workspace/…`, no `..`, unique) | validate | reject |
 | `filesystem.mounts[].mode` | workspace `podman run` (`sallyd::sandbox::workspace_argv`): bind `ro`/`rw` with `nosuid,nodev,bind` (non-recursive); `brokered` → `ro` + broker `fs_*`; `staged` → `:O` overlay with upper/work in session scratch | launch + each `fs_*` call | EROFS in workspace; `fs_write`/`fs_delete` denied on `ro` (`read-only`); on `staged` they land in the overlay's upper directory; in every mode a call the sandbox's `uid:gid` could not make by mode bits is `permission` (Q39) |
 | `filesystem.mounts[].approve` | validator (glob syntax, §1 Mount) + `sallyd::approvals` glob match on canonical relative path; omitted = `["**"]` | validate + each brokered write/delete | reject; pending → approve/deny |
@@ -486,7 +494,7 @@ never on message text); the field path uses `a.b[0].c` form.
 | `secret-store` / `secret-grant` / `secret-filler` | launch refusals (`sandbox.refuse`, Task 9a-3): the secrets store cannot be read / a grant whose format and `basic_user` do not pair (exactly one placeholder; `basic_user` exactly with `{basic}`), whose header or rendered value cannot be sent, two grants on one header of one host, or a form of the secret too long to redact / every redaction filler candidate occurs in a form of the session's secrets (names no secret). (`basic-unsupported`, Task 9a-3's refusal of `{basic}`, was deleted in Task 9b.) |
 | `secret-like-env` | MCP env name looks like a secret |
 | `bad-header` / `bad-format` | injection header/format invalid |
-| `mount-changed` | launch-time re-check: mount root replaced since validation |
+| `mount-changed` | launch-time re-check: mount root replaced since validation; or replaced between its own check and the walk of its ancestors during validation |
 | `digest-mismatch` | launch refusal (`sandbox.refuse`): the pinned image is not in local storage, or the local image does not carry the pinned digest (`sallyd::sandbox::images`); images are never pulled |
 | `no-default-image` | launch refusal (`sandbox.refuse`): the manifest names no `runtime.image` and no bundled workspace image is installed (#88); nothing is reserved or created (architect Q58) |
 | `unacknowledged-risk` | an `acknowledge_*` flag is needed (§1.1) |
