@@ -563,6 +563,22 @@ impl Lx {
         )
     }
 
+    /// [`next_sallyd`](Self::next_sallyd) over a podman wrapper, as
+    /// [`with_podman`](Self::with_podman). Its `Drop` still removes leftovers through the real
+    /// podman, never the wrapper.
+    #[allow(dead_code)] // Only the orphan tests play a second sallyd over a wrapper.
+    pub fn next_sallyd_with_podman(&self, wrap: impl FnOnce(&Path) -> PathBuf) -> Self {
+        let real = resolve_podman(None).unwrap().path().to_owned();
+        Self::build_as(
+            None,
+            None,
+            Some(wrap(&real)),
+            DiskFloor::default(),
+            Some(io_lock(false)),
+            Some(self.installation.clone()),
+        )
+    }
+
     fn build(
         podman_home: Option<PathBuf>,
         runtime: Option<&Path>,
