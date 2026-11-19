@@ -746,10 +746,12 @@ async fn a_slow_reader_gets_one_reply_to_every_call() {
     for _ in 0..n {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let mut line = String::new();
-        assert!(
-            r.read_line(&mut line).await.unwrap() > 0,
-            "the server closed"
-        );
+        // Bounded: on the paused clock a missing reply would otherwise hang, not fail.
+        let n = tokio::time::timeout(Duration::from_secs(60), r.read_line(&mut line))
+            .await
+            .expect("no reply")
+            .unwrap();
+        assert!(n > 0, "the server closed");
         let v: Value = serde_json::from_str(&line).unwrap();
         let id = v["id"].as_i64().unwrap();
         if v["error"]["data"]["reason"] == json!("too-many-in-flight") {
@@ -1457,7 +1459,11 @@ async fn an_id_reused_while_its_first_reply_waits_gets_its_own_reply() {
     let mut texts = Vec::new();
     for _ in 0..2 {
         let mut line = String::new();
-        r.read_line(&mut line).await.unwrap();
+        // Bounded: on the paused clock a missing reply would otherwise hang, not fail.
+        tokio::time::timeout(Duration::from_secs(60), r.read_line(&mut line))
+            .await
+            .expect("no reply")
+            .unwrap();
         let v: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["id"], json!(1));
         texts.push(v["result"]["content"][0]["text"].as_str().unwrap().len());
