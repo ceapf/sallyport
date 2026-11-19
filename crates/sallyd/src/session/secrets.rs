@@ -5,9 +5,9 @@
 //! their forms ([`SessionForms`]: each value's `secret_forms`, each grant's rendered header value
 //! and `{basic}` blob). The launcher registers that same [`Arc`] here right after `prepare`
 //! returns, before `net.sock` is bound or any container exists; whoever writes the session's
-//! last entry unregisters it (the launcher after `sandbox.refuse`; for a session,
-//! `Launcher::close` right after `session.closed`, which follows `session.stop` and the
-//! teardown, #94). Every change rebuilds one [`Redactor`] over the union of the
+//! last entry unregisters it (the launcher after `sandbox.refuse`, or after `sandbox.cleaned`
+//! when a failed launch's cleanup was retried; for a session, `Launcher::close` right after
+//! `session.closed`, which follows `session.stop` and the teardown, #94). Every change rebuilds one [`Redactor`] over the union of the
 //! registered sets and swaps it into each [`RedactorTarget`], under one lock, so the audit log
 //! and the operational log always redact the same set. A value two live sessions share stays
 //! redacted until both are unregistered. Nothing here loads a value, and nothing is copied: the

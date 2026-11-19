@@ -68,6 +68,10 @@ impl Subject {
 /// (`stop_role_unreceived`).
 pub(crate) const STOP_RETRIES_AFTER_REMOVAL: u32 = 3;
 
+/// Every how many tries a failed launch's cleanup, while a container may remain, says so again
+/// in the oplog (about once a minute at the retry pause).
+pub(crate) const CLEANUP_REPORT_EVERY: u32 = 30;
+
 /// What became of a failed launch's directories when its cleanup ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Directories {
@@ -110,6 +114,7 @@ pub(crate) struct CleanupTries {
 impl CleanupTries {
     /// Records one try: whether its mount-link probe and container are confirmed gone, and
     /// whether everything it set out to remove was removed. Then what comes next.
+    #[must_use]
     pub(crate) fn record(&mut self, containers_gone: bool, all_removed: bool) -> NextTry {
         self.attempts = self.attempts.saturating_add(1);
         if !containers_gone {
@@ -131,6 +136,20 @@ impl CleanupTries {
     pub(crate) fn attempts(&self) -> u32 {
         self.attempts
     }
+
+    /// Whether the try just recorded is one the oplog hears of again: every
+    /// [`CLEANUP_REPORT_EVERY`]th.
+    #[must_use]
+    pub(crate) fn worth_reporting(&self) -> bool {
+        self.attempts.is_multiple_of(CLEANUP_REPORT_EVERY)
+    }
+}
+
+/// Whether a cleanup has confirmed both its containers gone: neither the mount-link probe nor
+/// the role's container is still to be removed. Only then may the claim go (ARCHITECTURE §3.5).
+#[must_use]
+pub(crate) fn containers_gone(probe_left: Option<&str>, container_left: Option<&str>) -> bool {
+    probe_left.is_none() && container_left.is_none()
 }
 
 /// The containers a failed launch's cleanup set out to remove, by name: its mount-link probe
@@ -359,7 +378,7 @@ mod tests {
         let mut t = CleanupTries::default();
         assert_eq!(t.record(false, false), NextTry::Again);
         // Gone at try 2; tries 3, 4 and 5 are the bounded ones.
-        for _ in 0..=STOP_RETRIES_AFTER_REMOVAL.saturating_sub(1) {
+        for _ in 0..STOP_RETRIES_AFTER_REMOVAL {
             assert_eq!(t.record(true, false), NextTry::Again);
         }
         assert_eq!(
@@ -406,6 +425,32 @@ mod tests {
         };
         assert_eq!(t.record(false, false), NextTry::Again);
         assert_eq!(t.attempts(), u32::MAX);
+    }
+
+    /// Both containers must be gone: a probe or a container still to be removed keeps the
+    /// cleanup in its unbounded phase, holding the claim.
+    #[test]
+    fn the_containers_are_gone_only_when_neither_is_left() {
+        assert!(containers_gone(None, None));
+        assert!(!containers_gone(Some("sp-probe-ws-a"), None));
+        assert!(!containers_gone(None, Some("sp-ws-a")));
+        assert!(!containers_gone(Some("sp-probe-ws-a"), Some("sp-ws-a")));
+    }
+
+    /// A held claim is reported every thirtieth try, about once a minute: not at the tries
+    /// between, and never at the first (which the task's start line already reports).
+    #[test]
+    fn a_long_retry_is_reported_every_thirty_tries() {
+        assert_eq!(CLEANUP_REPORT_EVERY, 30);
+        let mut t = CleanupTries::default();
+        let mut reported = Vec::new();
+        for _ in 0..90 {
+            let _ = t.record(false, false);
+            if t.worth_reporting() {
+                reported.push(t.attempts());
+            }
+        }
+        assert_eq!(reported, [30, 60, 90]);
     }
 
     /// The shared bound is three tries, the one `stop_role_unreceived` already used.

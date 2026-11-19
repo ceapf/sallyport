@@ -34,7 +34,7 @@ use sally_core::manifest::{AuditLevel, ValidatedManifest};
 use serde_json::Value;
 
 use super::error::{cpu_only, running_as};
-use super::parts::{CleanupTries, HostPin, Made, Subject};
+use super::parts::{CleanupTries, HostPin, Made, NextTry, Subject, containers_gone};
 use super::{
     HarnessRequest, InferenceRequest, LaunchError, Launcher, Progress, Running, START_GRACE,
     WorkspaceRequest, blocking,
@@ -186,28 +186,14 @@ pub(super) enum Launched {
 
 /// What a failed launch holds until its cleanup ends (its claim; a workspace's forms too), and
 /// how its entries name it: owned, so a cleanup retried in its own task outlives the request.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(super) struct Held {
-    subject: Subject,
-    role: Role,
-    level: AuditLevel,
-}
-
-impl Held {
     /// Who the launch was for.
-    pub(super) fn subject(&self) -> Subject {
-        self.subject.clone()
-    }
-
+    pub(super) subject: Subject,
     /// Its role.
-    pub(super) fn role(&self) -> Role {
-        self.role
-    }
-
+    pub(super) role: Role,
     /// Its session's (or instance's) audit level.
-    pub(super) fn level(&self) -> AuditLevel {
-        self.level
-    }
+    pub(super) level: AuditLevel,
 }
 
 impl Request {
@@ -357,9 +343,15 @@ impl Launcher {
             Ok(()) => self.forget(&held).await,
             Err(first) => {
                 let mut tries = CleanupTries::default();
-                let gone = progress.probe.is_none() && progress.container.is_none();
-                // The first try failed, so it never ends the cleanup here.
-                let _ = tries.record(gone, false);
+                let gone =
+                    containers_gone(progress.probe.as_deref(), progress.container.as_deref());
+                // The first try failed, so it never ends the cleanup here: the bound after the
+                // containers' removal is at least one more try.
+                let next = tries.record(gone, false);
+                debug_assert_eq!(next, NextTry::Again);
+                // A workspace's task is bounded by the session limit (it keeps its claim), a
+                // harness's by one per session. TODO(#134): an inference instance has no claim,
+                // so nothing bounds its tasks once its launch is reachable.
                 let this = Arc::clone(self);
                 let _ = self.crash.spawn("sandbox.cleanup", async move {
                     this.finish_failed(held, made, progress, tries, first).await;

@@ -649,7 +649,7 @@ impl Lx {
             oplog: oplog.clone(),
             installation: installation.clone(),
             // A panic in a retried cleanup is not what these tests watch: a test that waits on
-            // the cleanup fails on its own bound.
+            // the cleanup fails on its own bound. TODO(#239): keep the receiver, fail fast.
             crash: sallyd::daemon::crash::CrashReporter::channel().0,
         });
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);

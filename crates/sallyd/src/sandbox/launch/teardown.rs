@@ -8,6 +8,7 @@ use serde_json::json;
 
 use super::parts::{
     CleanupTries, Directories, Made, NextTry, STOP_RETRIES_AFTER_REMOVAL, cleaned_entry,
+    containers_gone,
 };
 use super::start::Held;
 use super::{
@@ -19,7 +20,8 @@ use crate::sandbox::orphans::{
 };
 use crate::sandbox::types::{Role, SessionPaths};
 
-/// Which orphan sweep runs (architect Q61), named in each `sandbox.orphan_removed`.
+/// Which orphan sweep runs (architect Q61), named in each `sandbox.orphan_removed` and
+/// `sandbox.orphan_remove_failed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sweep {
     /// Once, under the single-instance lock, before `control.sock` is bound.
@@ -77,7 +79,7 @@ impl Launcher {
                 .await?;
             // By ID: a name re-used since the listing is another container (PS-L5). Through the
             // removal that thaws and retries: a `sallyd` killed in a stage walk leaves its
-            // container paused.
+            // container paused. TODO(#239): one whose removal keeps failing is left thawed.
             match self.remove_container(&o.container).await {
                 Ok(()) => removed.push(o.name.clone()),
                 Err(e) => {
@@ -192,7 +194,11 @@ impl Launcher {
     /// [`STOP_RETRY`] without bound, holding the claim and auditing nothing; once both are
     /// confirmed gone the directories get at most [`STOP_RETRIES_AFTER_REMOVAL`] more tries.
     /// Then, in this order: `sandbox.cleaned` (with an oplog error line first when the
-    /// directories are kept), the claim freed, the session's forms released.
+    /// directories are kept), the claim freed, the session's forms released. The oplog says
+    /// when the retries start, and again every
+    /// [`CLEANUP_REPORT_EVERY`](super::parts::CLEANUP_REPORT_EVERY) tries while a container
+    /// may remain, so a claim held this way is visible. Nothing ends the task but its own end or
+    /// the runtime's. TODO(#239): shutdown does not count a cleanup still retrying.
     pub(super) async fn finish_failed(
         &self,
         held: Held,
@@ -201,11 +207,18 @@ impl Launcher {
         mut tries: CleanupTries,
         first: LaunchError,
     ) {
+        let subject = &held.subject;
+        let id = (subject.kind(), subject.id().as_str());
+        self.oplog.error(
+            "sandbox",
+            "a failed launch's cleanup is retried",
+            &[id, ("error", &first.to_string())],
+        );
         let mut last = first;
         let directories = loop {
             tokio::time::sleep(STOP_RETRY).await;
             let result = self.clean_failed(&mut p).await;
-            let gone = p.probe.is_none() && p.container.is_none();
+            let gone = containers_gone(p.probe.as_deref(), p.container.as_deref());
             let next = tries.record(gone, result.is_ok());
             if let Err(e) = result {
                 last = e;
@@ -214,8 +227,19 @@ impl Launcher {
                 NextTry::Again => {}
                 NextTry::Done(d) => break d,
             }
+            if !gone && tries.worth_reporting() {
+                self.oplog.error(
+                    "sandbox",
+                    "a failed launch's container still not removed",
+                    &[
+                        id,
+                        ("attempts", &tries.attempts().to_string()),
+                        ("error", &last.to_string()),
+                    ],
+                );
+            }
         };
-        let (subject, role) = (held.subject(), held.role());
+        let role = held.role;
         if directories == Directories::Kept {
             self.oplog.error(
                 "sandbox",
@@ -226,8 +250,8 @@ impl Launcher {
                 ],
             );
         }
-        let entry = cleaned_entry(&subject, role, &made, tries.attempts(), directories);
-        if self.audit(entry, held.level()).await.is_err() {
+        let entry = cleaned_entry(subject, role, &made, tries.attempts(), directories);
+        if self.audit(entry, held.level).await.is_err() {
             self.oplog.error(
                 "sandbox",
                 "audit entry not written",

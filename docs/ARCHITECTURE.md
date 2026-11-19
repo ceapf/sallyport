@@ -284,17 +284,20 @@ are released only once the container is confirmed gone.
 When that cleanup itself fails (`sandbox.refuse` names it `incomplete, kept: …`), the rest of
 it runs in its own task on the daemon's crash reporter; a panic in that task stops the daemon.
 While the mount-link probe or the container may exist it retries every 2 s without bound,
-holding the session's claim and auditing nothing. Once both are confirmed gone, the directories
-get at most three more tries (`STOP_RETRIES_AFTER_REMOVAL`, the bound a stop nobody received
-uses); a first try that removed both and failed only on the directories starts there. Then, in
-this order: `sandbox.cleaned` (`role`, the `container` and `probe` names or null, `attempts`
-counting every try, `directories: removed|kept`; no decision and no podman text; directories
-given up also get one oplog error line with the last error), the claim freed, and a workspace's
-secret forms released. A failed append is an oplog line, and the claim is freed and the forms
-released anyway. So a failed launch holds its claim until its containers are confirmed gone and
-its directories removed or given up. Open risk: until it is removed, such a container has no
-disk watchdog, and no egress (its listener was dropped with the launch); if `sallyd` exits
-first, the next start's sweep removes it, and conmon's backstop bounds it meanwhile.
+holding the launch's claim and auditing nothing; the oplog says when the retries start and again
+every 30 tries. A workspace keeps its session claim (so the session stays live and the sweep
+leaves it); a harness keeps its harness claim until its session stops, after which the sweep may
+remove the container too, which the retry then finds gone. Once both are confirmed gone, the
+directories get at most three more tries (`STOP_RETRIES_AFTER_REMOVAL`, the bound a stop nobody
+received uses); a first try that removed both and failed only on the directories starts there.
+Then, in this order: `sandbox.cleaned` (`role`, the `container` and `probe` names or null,
+`attempts` counting every try, `directories: removed|kept`; no decision and no podman text;
+directories given up also get one oplog error line with the last error), the claim freed, and a
+workspace's secret forms released. A failed append is an oplog line, and the claim is freed and
+the forms released anyway. So a failed launch holds its claim until its containers are confirmed
+gone and its directories removed or given up. Open risk: until it is removed, such a container
+has no disk watchdog, and no egress (its listener was dropped with the launch); if `sallyd`
+exits first, the next start's sweep removes it, and conmon's backstop bounds it meanwhile.
 
 0. **Image** (architect Q58). The workspace image is resolved first: the manifest's
    `runtime.image`, else the bundled default. While no bundled image is installed (#88) the
