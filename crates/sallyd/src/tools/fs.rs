@@ -24,10 +24,9 @@
 //! component is first reached `O_PATH`, checked regular and judged on that fd; only then is the
 //! same inode opened for I/O through `/proc/self/fd`, so a FIFO or device is never opened, read
 //! from or written to. That open is `O_NONBLOCK`, so a file another process holds a lease on
-//! fails at once instead of stalling the call (ruling Q40). An existing file is opened without
-//! `O_TRUNC` and
-//! truncated only after the checks; a new one is created `O_EXCL`, so the case judged is the
-//! case that happened. On
+//! fails at once instead of stalling the call (ruling Q40). An existing file is truncated by that
+//! open (`O_TRUNC`), after the checks, so a `staged` mount's lower file is never copied up with
+//! its data; a new one is created `O_EXCL`, so the case judged is the case that happened. On
 //! `brokered` mounts a regular file with more than one link is refused (`hard-link`): the broker
 //! would write through to a file outside the mount. Every check is repeated at run time from the
 //! pinned root (the window between prepare and run can last `approvals.timeout`).
@@ -187,8 +186,10 @@ fn read_file() -> OFlags {
     OFlags::RDONLY | OFlags::NONBLOCK
 }
 
+// `O_TRUNC` truncates at the open, after the checks on the `O_PATH` handle: on a `staged`
+// mount overlayfs then copies the lower file up empty instead of copying its data.
 fn write_existing() -> OFlags {
-    OFlags::WRONLY | OFlags::NONBLOCK
+    OFlags::WRONLY | OFlags::NONBLOCK | OFlags::TRUNC
 }
 
 // `O_CREAT | O_EXCL` never follows a symlink and only ever makes a new regular file, so no
@@ -546,9 +547,7 @@ pub fn write(root: &Root, rel: &str, bytes: &[u8], brokered: bool) -> Result<(),
             let st = rustix::fs::fstat(&p).map_err(FsError::from_errno)?;
             kind_ok(&st, brokered)?;
             root.judge(&p, W)?;
-            let f = reopen(&p, write_existing())?;
-            rustix::fs::ftruncate(&f, 0).map_err(FsError::from_errno)?;
-            f
+            reopen(&p, write_existing())?
         }
         Err(FsError::NotFound) => {
             root.judge(&parent, WX)?;
