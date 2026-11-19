@@ -1078,8 +1078,15 @@ fn the_limits_are_pinned() {
             max_connections: 7,
             max_request: 8 << 20,
             max_response: 64 << 20,
+            admission_rate: 20,
+            admission_burst: 40,
         }
     );
+    assert_eq!((ADMISSION_RATE, ADMISSION_BURST), (20, 40));
+    assert_eq!(crate::egress::net::SHED_INTERVAL, Duration::from_secs(1));
+    // A session with the default cap can open every connection it may hold in one burst.
+    let default_cap = sally_core::manifest::Network::default().max_connections;
+    assert!(ADMISSION_BURST >= default_cap, "{default_cap}");
     assert_eq!(MAX_RESPONSE_HEAD, 64 * 1024);
     assert_eq!(MAX_DIALS, 3);
     assert_eq!((MAX_ADDRS, MAX_ANSWER, ADMISSION_EXTRA), (16, 64, 64));

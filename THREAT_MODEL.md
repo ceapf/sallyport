@@ -252,6 +252,7 @@ G7 Make the machine unusable
 ├─ Huge model download fills disk                   [size check vs free space before pull → RT-MDL-09]
 ├─ GGUF with 2^40 tensors makes the parser spin     [bounded counts → RT-MDL-03]
 ├─ Giant proxy request                              [header/body limits → RT-NET-09]
+├─ Connection flood grows the audit log             [net.sock admission rate: over-rate connections closed unread, one `egress.shed` a second → RT-AUD-02; RESIDUAL: requests inside an admitted intercepted tunnel, #228]
 ├─ Sessions enough to fail the orphan sweep         [64 live at most, refused `session-limit` at reservation → sallyd unit tests sandbox::budget, overlap, orphans; RESIDUAL §6]
 └─ VRAM never released after crash                  [container exit → sallyd reaps; RESIDUAL: driver bugs]
 ```

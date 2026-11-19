@@ -15,6 +15,7 @@ use sally_core::manifest::{AuditLevel, BuiltinTool, ValidatedManifest};
 use tokio::net::{TcpStream, UnixListener, UnixStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::Instant;
 
 use super::ca::{self, CaError, SessionTls, Validity};
 use super::hostaddrs;
@@ -23,6 +24,7 @@ use super::local::{ClientTls, Connector, LOCAL_QUEUE, Local, ORIGIN, Opened, Rea
 use super::policy::Policy;
 use super::roots::{BundleFiles, Roots, RootsError};
 use super::server::{Dialer, HostAddrs, Interception, Limits, Parts, Proxy, Resolver, until_true};
+use crate::rpc::rate::Rate;
 use crate::sandbox::AuditSink;
 
 /// File name of the egress socket in the workspace socket directory (ARCHITECTURE §3.1).
@@ -31,6 +33,9 @@ pub const NET_SOCK: &str = "net.sock";
 pub const MAX_PROC_BYTES: u64 = 1024 * 1024;
 /// Pause after a failed `accept` (EMFILE and the like) before the next one.
 pub const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+/// How long connections closed over the admission rate are counted before their one
+/// `egress.shed` entry is written.
+pub const SHED_INTERVAL: Duration = Duration::from_secs(1);
 /// How long a stopping listener waits for its connections to write `egress.close`.
 pub const STOP_GRACE: Duration = Duration::from_secs(5);
 
@@ -44,8 +49,10 @@ pub type Lookup = Arc<dyn Fn(&str, u16) -> io::Result<Vec<SocketAddr>> + Send + 
 /// Name lookups off the runtime, at most as many at once as `slots` holds. A lookup that finds no
 /// free slot fails at once and never queues; a slot stays taken until its blocking call returns,
 /// even after the caller gave up. Lookups and audit appends share tokio's blocking pool: stuck
-/// lookups take at most `slots` of its threads, so the audit log is never held up while the pool
-/// is larger than that (tokio's default is 512).
+/// lookups take at most `slots` of its threads, so lookups alone never hold the audit log up
+/// while the pool is larger than that (tokio's default is 512). Appends wait on the one audit
+/// writer whatever the pool; what bounds how many a sandbox causes is each socket's rate (on
+/// `net.sock`, the admission rate of [`serve_with`]).
 // TODO(#47): the daemon's runtime builder must keep `max_blocking_threads` well above
 // MAX_LOOKUPS, and its test must use that builder.
 #[derive(Clone)]
@@ -237,7 +244,12 @@ impl Drop for EgressHandle {
 
 /// Runs the accept loop of `listener` for `proxy`: one task per connection, at most
 /// [`Limits::in_flight`](super::server::Limits::in_flight) at once (architect Q20); past that
-/// nothing more is accepted until a connection ends. No broker-originated connections.
+/// nothing more is accepted until a connection ends. An accepted connection over the session's
+/// admission rate ([`Limits::admission_rate`], [`Limits::admission_burst`]) is closed at once,
+/// unread and without an entry of its own; one `egress.shed` per [`SHED_INTERVAL`] says how many
+/// were, and a stop writes the count of an unfinished interval (an abort before that entry is
+/// written, past [`STOP_GRACE`] or on drop, loses it, as it does an `egress.close`). No
+/// broker-originated connections.
 pub fn serve<R, D, H>(listener: UnixListener, proxy: Arc<Proxy<R, D, H>>) -> EgressHandle
 where
     R: Resolver,
@@ -249,7 +261,9 @@ where
 
 /// [`serve`], and with `reach` the broker-originated connections of a [`Local`] connector
 /// (`local.rs`): each waits for an in-flight slot like an accepted stream, is served in the same
-/// set (so a stop waits for its `egress.close` too), inside its origin's scope.
+/// set (so a stop waits for its `egress.close` too), inside its origin's scope. They never cross
+/// `net.sock` and draw nothing from the admission rate: each is one `tools/call`, already held to
+/// `agent.sock`'s rate, and a shared bucket would let the workspace starve the harness's fetch.
 pub fn serve_with<R, D, H>(
     listener: UnixListener,
     proxy: Arc<Proxy<R, D, H>>,
@@ -261,49 +275,160 @@ where
     H: HostAddrs,
 {
     let (stop, stopping) = watch::channel(false);
-    let in_flight = Arc::new(Semaphore::new(proxy.limits().in_flight()));
-    let (tx, mut rx) = mpsc::channel::<Opened>(LOCAL_QUEUE);
+    let (tx, rx) = mpsc::channel::<Opened>(LOCAL_QUEUE);
     let connector = reach.map(|r| Local::new(tx, r));
-    let task = tokio::spawn(async move {
-        let mut conns = JoinSet::new();
-        let stopped = until_true(stopping);
-        tokio::pin!(stopped);
-        let mut local_open = true;
-        loop {
-            tokio::select! {
-                biased;
-                () = &mut stopped => break,
-                // TODO(#49): log a connection task that panicked.
-                Some(_) = conns.join_next(), if !conns.is_empty() => {}
-                admitted = admit(&in_flight, &listener, &mut rx, local_open) => match admitted {
-                    Ok(Admitted::Accepted(slot, stream)) => {
+    let task = tokio::spawn(accept_loop(listener, proxy, rx, stopping));
+    EgressHandle {
+        stop,
+        task: Some(task),
+        connector,
+    }
+}
+
+/// The accept task of [`serve_with`]: admits from `listener` and `rx` until `stopping`, then
+/// stops the proxy, writes the count still owed and waits for every connection to end.
+async fn accept_loop<R, D, H>(
+    listener: UnixListener,
+    proxy: Arc<Proxy<R, D, H>>,
+    mut rx: mpsc::Receiver<Opened>,
+    stopping: watch::Receiver<bool>,
+) where
+    R: Resolver,
+    D: Dialer,
+    H: HostAddrs,
+{
+    let in_flight = Arc::new(Semaphore::new(proxy.limits().in_flight()));
+    let mut conns = JoinSet::new();
+    let stopped = until_true(stopping);
+    tokio::pin!(stopped);
+    let mut local_open = true;
+    let mut shedding = Shedding::of(proxy.limits());
+    loop {
+        let due = shedding.due();
+        let at = due.unwrap_or_else(Instant::now);
+        tokio::select! {
+            biased;
+            () = &mut stopped => break,
+            // TODO(#49): log a connection task that panicked.
+            Some(_) = conns.join_next(), if !conns.is_empty() => {}
+            // Before `admit`, so a flood cannot hold the count back.
+            () = tokio::time::sleep_until(at), if due.is_some() => {
+                write_shed(&proxy, &mut shedding).await;
+            }
+            admitted = admit(&in_flight, &listener, &mut rx, local_open) => match admitted {
+                Ok(Admitted::Accepted(slot, stream)) => {
+                    if shedding.admit(Instant::now()) {
                         let p = Arc::clone(&proxy);
                         conns.spawn(async move {
                             let _slot = slot;
                             p.serve(stream).await;
                         });
+                    } else {
+                        drop((slot, stream));
                     }
-                    Ok(Admitted::Local(slot, (stream, origin))) => {
-                        let p = Arc::clone(&proxy);
-                        conns.spawn(ORIGIN.scope(origin, async move {
-                            let _slot = slot;
-                            p.serve(stream).await;
-                        }));
-                    }
-                    Ok(Admitted::LocalGone) => local_open = false,
-                    Err(_) => tokio::time::sleep(ACCEPT_BACKOFF).await,
-                },
-            }
+                }
+                Ok(Admitted::Local(slot, (stream, origin))) => {
+                    let p = Arc::clone(&proxy);
+                    conns.spawn(ORIGIN.scope(origin, async move {
+                        let _slot = slot;
+                        p.serve(stream).await;
+                    }));
+                }
+                Ok(Admitted::LocalGone) => local_open = false,
+                Err(_) => tokio::time::sleep(ACCEPT_BACKOFF).await,
+            },
         }
-        drop(listener);
-        rx.close();
-        proxy.stop();
-        while conns.join_next().await.is_some() {}
-    });
-    EgressHandle {
-        stop,
-        task: Some(task),
-        connector,
+    }
+    drop(listener);
+    rx.close();
+    proxy.stop();
+    // No next try at the stop: a count whose entry fails here is lost, as a failed
+    // `egress.close` is.
+    write_shed(&proxy, &mut shedding).await;
+    while conns.join_next().await.is_some() {}
+}
+
+/// The admission rate of one session's `net.sock` and the connections it closed since the last
+/// `egress.shed`. Owned by the accept task.
+struct Shedding {
+    rate: Rate,
+    /// Connections closed over the rate and not yet in an entry.
+    closed: u64,
+    /// When the first of them was closed.
+    first: Option<Instant>,
+    /// When their entry is next due.
+    due: Option<Instant>,
+}
+
+impl Shedding {
+    /// Nothing closed yet, the burst whole.
+    fn of(limits: &Limits) -> Self {
+        Self {
+            rate: Rate::new(limits.admission_rate, limits.admission_burst),
+            closed: 0,
+            first: None,
+            due: None,
+        }
+    }
+
+    /// Whether a connection accepted at `now` is admitted; one that is not is counted, and the
+    /// first of an interval sets when its entry is due.
+    fn admit(&mut self, now: Instant) -> bool {
+        if self.rate.take().is_ok() {
+            return true;
+        }
+        self.closed = self.closed.saturating_add(1);
+        if self.first.is_none() {
+            self.first = Some(now);
+            self.due = Some(now + SHED_INTERVAL);
+        }
+        false
+    }
+
+    /// When an entry is due, while one is owed.
+    fn due(&self) -> Option<Instant> {
+        self.due
+    }
+
+    /// The owed entry's `(closed, window_ms)` at `now`: the count and the milliseconds since the
+    /// first close it counts.
+    fn report(&self, now: Instant) -> Option<(u64, u64)> {
+        let first = self.first?;
+        let ms = now.saturating_duration_since(first).as_millis();
+        Some((self.closed, u64::try_from(ms).unwrap_or(u64::MAX)))
+    }
+
+    /// The entry was written: the next close opens a new interval.
+    fn written(&mut self) {
+        self.closed = 0;
+        self.first = None;
+        self.due = None;
+    }
+
+    /// The entry was not written: the count and its window stay, and the next try is one
+    /// interval after `now`. Only at the stop, with no next try, does a failed entry lose its
+    /// count.
+    fn failed(&mut self, now: Instant) {
+        if self.first.is_some() {
+            self.due = Some(now + SHED_INTERVAL);
+        }
+    }
+}
+
+/// Writes the `egress.shed` owed, if any, and records whether it was written.
+async fn write_shed<R, D, H>(proxy: &Proxy<R, D, H>, shedding: &mut Shedding)
+where
+    R: Resolver,
+    D: Dialer,
+    H: HostAddrs,
+{
+    let now = Instant::now();
+    if let Some((closed, window_ms)) = shedding.report(now) {
+        if proxy.shed(closed, window_ms).await {
+            shedding.written();
+        } else {
+            shedding.failed(now);
+        }
     }
 }
 

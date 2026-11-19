@@ -2,10 +2,12 @@
 //! dialer and host-address source it is built with (Task 8 decision 10), so every decision is
 //! tested without containers; `net.rs` holds the real ones.
 //!
-//! Order (decision 3, architect Q1/Q8): admission, head, CONNECT only, authority, policy (host,
-//! port, grant), the host's own addresses, one lookup, the address filter over every address,
-//! `egress.allow`, connect to the pinned addresses in order, `200`, tunnel, `egress.close`. Every
-//! refusal is audited before its reply; a failed audit append closes without a reply or a dial.
+//! Order (decision 3, architect Q1/Q8): admission (the in-flight slot and the admission rate, in
+//! `net.rs`; a connection over the rate is closed unread and only counted), head, CONNECT only,
+//! authority, policy (host, port, grant), the host's own addresses, one lookup, the address
+//! filter over every address, `egress.allow`, connect to the pinned addresses in order, `200`,
+//! tunnel, `egress.close`. Every refusal is audited before its reply; a failed audit append
+//! closes without a reply or a dial.
 
 use std::future::Future;
 use std::io;
@@ -53,6 +55,15 @@ pub const MAX_ANSWER: usize = 64;
 // TODO(#48): raise RLIMIT_NOFILE and cap connections across sessions; one session at 1024 needs
 // about 1088 + 1024 descriptors.
 pub const ADMISSION_EXTRA: usize = 64;
+/// Connections a session's `net.sock` admits per second on average (`net.rs`); the ones over the
+/// rate are closed unread and counted in `egress.shed`. The same figures as `agent.sock`'s request
+/// rate, by choice.
+// TODO(#228): requests inside an admitted intercepted tunnel each have their entries and are not
+// held by this rate.
+pub const ADMISSION_RATE: u32 = 20;
+/// Connections a session's `net.sock` admits back to back before [`ADMISSION_RATE`] applies; at
+/// least the manifest's default `max_connections`, so a session can fill its cap in one burst.
+pub const ADMISSION_BURST: u32 = 40;
 /// The reply that opens a tunnel.
 pub const ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
 /// `filter` value of a refusal made because the host's own addresses could not be read.
@@ -122,6 +133,10 @@ pub struct Limits {
     pub max_request: u64,
     /// Body bytes of one intercepted response at most (`network.max_response_bytes`).
     pub max_response: u64,
+    /// [`ADMISSION_RATE`].
+    pub admission_rate: u32,
+    /// [`ADMISSION_BURST`].
+    pub admission_burst: u32,
 }
 
 impl Limits {
@@ -143,6 +158,8 @@ impl Limits {
             max_connections,
             max_request: net.max_request_bytes.bytes(),
             max_response: net.max_response_bytes.bytes(),
+            admission_rate: ADMISSION_RATE,
+            admission_burst: ADMISSION_BURST,
         }
     }
 
@@ -528,6 +545,14 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
     /// carry its origin (`local.rs`). Taken on the connection's task, before any `spawn_blocking`.
     fn sink(&self) -> Arc<dyn AuditSink> {
         super::local::sink(&self.audit)
+    }
+
+    /// Writes `egress.shed`: `closed` connections over the admission rate were closed unread in
+    /// the last `window_ms` milliseconds (`net.rs`). Whether the entry was written.
+    pub(super) async fn shed(&self, closed: u64, window_ms: u64) -> bool {
+        let args = json!({"reason": "rate", "closed": closed, "window_ms": window_ms});
+        self.append(self.entry("egress.shed", Some("deny")).args(args))
+            .await
     }
 
     /// Appends off the runtime; whether the entry was written.

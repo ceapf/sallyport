@@ -257,10 +257,7 @@ async fn past_the_in_flight_bound_nothing_more_is_accepted_until_one_ends() {
     // in-flight slot. The bound is 0 + 64.
     let handle = start(Arc::new(OnePublic), Arc::clone(&audit), 0, &sock);
     let bound = Limits::new(0).in_flight();
-    let mut clients = Vec::new();
-    for _ in 0..=bound {
-        clients.push(UnixStream::connect(&sock).await.unwrap());
-    }
+    let clients = connect_paced(&sock, bound + 1).await;
     until("the bound to fill", || gate.entered() == bound).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(gate.entered(), bound, "connection bound+1 is not accepted");
@@ -278,6 +275,488 @@ async fn past_the_in_flight_bound_nothing_more_is_accepted_until_one_ends() {
     handle.shutdown().await;
     drop(clients);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// RT-AUD-02, `net.sock` leg: a flood of connections cannot grow the audit log
+/// faster than the admission rate. Each session admits [`ADMISSION_BURST`] connections back to
+/// back and [`ADMISSION_RATE`] per second after; the rest are closed unread, without an entry
+/// each, and one `egress.shed` per [`SHED_INTERVAL`] says how many.
+#[tokio::test(start_paused = true)]
+async fn rt_aud_02_a_connection_flood_on_net_sock_is_closed_and_counted() {
+    use super::super::server::{ADMISSION_BURST, ADMISSION_RATE};
+    let dir = scratch("flood");
+    let sock = dir.join("net.sock");
+    let audit = Arc::new(Ends::default());
+    let frozen = freeze();
+    let handle = start(Arc::new(OnePublic), Arc::clone(&audit), 32, &sock);
+    let refused = "evil.test:443";
+
+    let out = bounded("the control", exchange(&sock, refused)).await;
+    assert!(
+        out.starts_with("HTTP/1.1 403 "),
+        "control: a refused CONNECT within the rate is answered: {out}"
+    );
+    assert_eq!(
+        audit.rows(),
+        ["egress.deny host-not-allowed"],
+        "control: and has its entry"
+    );
+    // The control took one slot of the burst; one second at the rate gives it back.
+    tokio::time::advance(Duration::from_secs(1)).await;
+
+    let started = tokio::time::Instant::now();
+    let before = audit.rows().len();
+    let (mut answered, mut closed) = (0usize, 0usize);
+    for _ in 0..1000 {
+        match flood_exchange(&sock, refused).await {
+            Some(out) if out.starts_with("HTTP/1.1 403 ") => answered += 1,
+            None => closed += 1,
+            Some(out) => panic!("neither a 403 nor closed unread: {out:?}"),
+        }
+        let rows = audit.rows().len() - before;
+        let elapsed = started.elapsed().as_secs_f64();
+        let bound = f64::from(ADMISSION_BURST) + f64::from(ADMISSION_RATE) * elapsed;
+        assert!(rows as f64 <= bound, "{rows} entries after {elapsed} s");
+    }
+    assert_eq!(started.elapsed(), Duration::ZERO, "the clock stood still");
+    assert_eq!(answered, ADMISSION_BURST as usize, "the burst is answered");
+    let rows = audit.rows();
+    let new = rows.get(before..).unwrap();
+    assert_eq!(new.len(), answered, "one entry per answered connection");
+    assert!(
+        new.iter().all(|r| r == "egress.deny host-not-allowed"),
+        "no entry per closed connection, no count yet: {new:?}"
+    );
+
+    tokio::time::advance(SHED_INTERVAL).await;
+    let shed = format!("egress.shed rate closed={closed} window_ms=1000");
+    settle("the count entry", || audit.rows().len() > before + answered).await;
+    assert_eq!(audit.rows().get(before + answered..).unwrap(), [shed]);
+    assert_eq!(answered + closed, 1000);
+
+    let out = bounded("the exchange after", exchange(&sock, refused)).await;
+    assert!(
+        out.starts_with("HTTP/1.1 403 "),
+        "closing is not a latch: {out}"
+    );
+    frozen.thaw().await;
+    handle.shutdown().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// No connection closed, no `egress.shed`: not per interval, not at the stop.
+#[tokio::test(start_paused = true)]
+async fn within_the_rate_nothing_is_counted() {
+    use super::super::server::ADMISSION_BURST;
+    let dir = scratch("noshed");
+    let sock = dir.join("net.sock");
+    let audit = Arc::new(Ends::default());
+    let frozen = freeze();
+    let handle = start(Arc::new(OnePublic), Arc::clone(&audit), 32, &sock);
+    let burst = ADMISSION_BURST as usize;
+    assert_eq!(flood(&sock, burst).await, (burst, 0));
+    tokio::time::advance(SHED_INTERVAL * 2).await;
+    frozen.thaw().await;
+    handle.shutdown().await;
+    let rows = audit.rows();
+    assert_eq!(rows.len(), burst);
+    assert!(
+        rows.iter().all(|r| r == "egress.deny host-not-allowed"),
+        "{rows:?}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A stop in the middle of an interval writes its count, with the window so far.
+#[tokio::test(start_paused = true)]
+async fn a_stop_writes_the_count_of_an_unfinished_interval() {
+    use super::super::server::ADMISSION_BURST;
+    let dir = scratch("stopshed");
+    let sock = dir.join("net.sock");
+    let audit = Arc::new(Ends::default());
+    let frozen = freeze();
+    let handle = start(Arc::new(OnePublic), Arc::clone(&audit), 32, &sock);
+    let burst = ADMISSION_BURST as usize;
+    assert_eq!(flood(&sock, burst + 5).await, (burst, 5));
+    tokio::time::advance(Duration::from_millis(300)).await;
+    // Still frozen, so the window is exact; bounded in real time instead.
+    bounded("the stop", handle.shutdown()).await;
+    frozen.thaw().await;
+    assert_eq!(
+        audit.rows().last().map(String::as_str),
+        Some("egress.shed rate closed=5 window_ms=300")
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A count whose entry could not be written is kept, window and all, and goes into the next
+/// entry one interval later.
+#[tokio::test(start_paused = true)]
+async fn a_failed_count_entry_carries_its_count_into_the_next() {
+    use super::super::server::{ADMISSION_BURST, ADMISSION_RATE};
+    use std::sync::atomic::Ordering::SeqCst;
+    let dir = scratch("failshed");
+    let sock = dir.join("net.sock");
+    let audit = Arc::new(Ends {
+        fail_sheds: 1.into(),
+        ..Ends::default()
+    });
+    let frozen = freeze();
+    let handle = start(Arc::new(OnePublic), Arc::clone(&audit), 32, &sock);
+    let (burst, rate) = (ADMISSION_BURST as usize, ADMISSION_RATE as usize);
+    assert_eq!(flood(&sock, burst + 5).await, (burst, 5));
+    tokio::time::advance(SHED_INTERVAL).await;
+    settle("the first try", || audit.shed_tries.load(SeqCst) == 1).await;
+    assert!(!audit.rows().iter().any(|r| r.starts_with("egress.shed")));
+    // One interval gave the rate back: `rate` more are answered, 5 more closed.
+    assert_eq!(flood(&sock, rate + 5).await, (rate, 5));
+    tokio::time::advance(SHED_INTERVAL).await;
+    settle("the second try", || audit.shed_tries.load(SeqCst) == 2).await;
+    assert_eq!(
+        audit.rows().last().map(String::as_str),
+        Some("egress.shed rate closed=10 window_ms=2000")
+    );
+    frozen.thaw().await;
+    handle.shutdown().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Broker-originated connections never cross `net.sock`; with the session's
+/// burst spent they are still served, and they are not in the count.
+#[tokio::test(start_paused = true)]
+async fn a_connectors_connections_are_served_and_uncounted_while_the_rate_is_spent() {
+    use super::super::server::ADMISSION_BURST;
+    let dir = scratch("localshed");
+    let sock = dir.join("net.sock");
+    let audit = Arc::new(Ends::default());
+    let frozen = freeze();
+    let roots = super::super::roots::Roots {
+        store: Arc::new(rustls::RootCertStore::empty()),
+        pem: String::new(),
+        skipped: 0,
+        path: "/test-roots.pem".into(),
+    };
+    let handle = start_with(
+        Arc::new(OnePublic),
+        Arc::clone(&audit),
+        32,
+        &sock,
+        Some(roots),
+    );
+    let burst = ADMISSION_BURST as usize;
+    assert_eq!(flood(&sock, burst + 3).await, (burst, 3));
+    let mut local = handle
+        .connector()
+        .unwrap()
+        .open(serde_json::json!({"call": 1}))
+        .unwrap();
+    let out = bounded("the connector's exchange", async {
+        local
+            .write_all(b"CONNECT evil.test:443 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut out = String::new();
+        local.read_to_string(&mut out).await.unwrap();
+        out
+    })
+    .await;
+    assert!(out.starts_with("HTTP/1.1 403 "), "served: {out}");
+    tokio::time::advance(SHED_INTERVAL).await;
+    settle("the count entry", || {
+        audit.rows().iter().any(|r| r.starts_with("egress.shed"))
+    })
+    .await;
+    let rows = audit.rows();
+    assert_eq!(
+        rows.iter().filter(|r| r.contains("origin=")).count(),
+        1,
+        "{rows:?}"
+    );
+    assert_eq!(
+        rows.last().map(String::as_str),
+        Some("egress.shed rate closed=3 window_ms=1000")
+    );
+    frozen.thaw().await;
+    handle.shutdown().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The count's timer comes before accepting: with connections waiting on the listener when the
+/// interval ends, its entry counts the closes of that interval, not the waiting ones.
+#[tokio::test(start_paused = true)]
+async fn the_count_is_written_before_waiting_connections_are_accepted() {
+    use super::super::server::ADMISSION_BURST;
+    let dir = scratch("shedfirst");
+    let sock = dir.join("net.sock");
+    let audit = Arc::new(Ends::default());
+    let frozen = freeze();
+    let handle = start(Arc::new(OnePublic), Arc::clone(&audit), 32, &sock);
+    let burst = ADMISSION_BURST as usize;
+    assert_eq!(flood(&sock, burst + 10).await, (burst, 10));
+    // Queued without yielding, so the accept loop sees them only once the interval has ended:
+    // that second gives back 20 connections, and the other 40 would be closed.
+    let waiting: Vec<_> = (0..60)
+        .map(|_| std::os::unix::net::UnixStream::connect(&sock).unwrap())
+        .collect();
+    tokio::time::advance(SHED_INTERVAL).await;
+    let shed = || {
+        audit
+            .rows()
+            .into_iter()
+            .find(|r| r.starts_with("egress.shed"))
+    };
+    settle("the count entry", || shed().is_some()).await;
+    assert_eq!(
+        shed().as_deref(),
+        Some("egress.shed rate closed=10 window_ms=1000"),
+        "the interval's closes, before any waiting connection"
+    );
+    frozen.thaw().await;
+    handle.shutdown().await;
+    drop(waiting);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The rate comes before the 429: a flood against a full cap is answered 429, each with its
+/// entry, only within the burst; the rest is closed unread and counted.
+#[tokio::test(start_paused = true)]
+async fn past_the_cap_the_rate_closes_before_the_429() {
+    use super::super::server::ADMISSION_BURST;
+    let dir = scratch("capshed");
+    let sock = dir.join("net.sock");
+    let audit = Arc::new(Ends::default());
+    let frozen = freeze();
+    let handle = start(Arc::new(OnePublic), Arc::clone(&audit), 1, &sock);
+    // Takes the one live slot (and one connection of the burst), and sends nothing. Accepted
+    // first and its task spawned first, so on this current-thread runtime it holds the slot
+    // before any flood connection asks (if not, the flood's 403 fails the test loudly).
+    let held = UnixStream::connect(&sock).await.unwrap();
+    let (mut answered, mut closed) = (0usize, 0usize);
+    for _ in 0..100 {
+        match flood_exchange(&sock, "evil.test:443").await {
+            Some(out) if out.starts_with("HTTP/1.1 429 ") => answered += 1,
+            None => closed += 1,
+            Some(out) => panic!("neither a 429 nor closed unread: {out:?}"),
+        }
+    }
+    let within = ADMISSION_BURST as usize - 1;
+    assert_eq!((answered, closed), (within, 100 - within));
+    let rows = audit.rows();
+    assert_eq!(rows.len(), within, "one entry per 429: {rows:?}");
+    assert!(
+        rows.iter()
+            .all(|r| r == "egress.limit too-many-connections"),
+        "{rows:?}"
+    );
+    tokio::time::advance(SHED_INTERVAL).await;
+    settle("the count entry", || audit.rows().len() > within).await;
+    assert_eq!(
+        audit.rows().last().cloned(),
+        Some(format!("egress.shed rate closed={closed} window_ms=1000"))
+    );
+    frozen.thaw().await;
+    drop(held);
+    handle.shutdown().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+fn shedding(rate: u32, burst: u32) -> Shedding {
+    Shedding::of(&Limits {
+        admission_rate: rate,
+        admission_burst: burst,
+        ..Limits::new(4)
+    })
+}
+
+#[tokio::test(start_paused = true)]
+async fn shedding_admits_the_burst_then_counts_closes_from_the_first() {
+    let mut s = shedding(2, 3);
+    let t0 = tokio::time::Instant::now();
+    for _ in 0..3 {
+        assert!(s.admit(t0));
+    }
+    assert_eq!(
+        (s.due(), s.report(t0)),
+        (None, None),
+        "nothing closed, nothing owed"
+    );
+    assert!(!s.admit(t0));
+    tokio::time::advance(Duration::from_millis(100)).await;
+    let t1 = tokio::time::Instant::now();
+    assert!(!s.admit(t1));
+    assert_eq!(
+        s.due(),
+        Some(t0 + SHED_INTERVAL),
+        "due an interval after the first close"
+    );
+    assert_eq!(s.report(t1), Some((2, 100)));
+    // Half a second at 2/s gives one connection back.
+    tokio::time::advance(Duration::from_millis(400)).await;
+    let t2 = tokio::time::Instant::now();
+    assert!(s.admit(t2));
+    assert_eq!(s.report(t2), Some((2, 500)));
+    s.written();
+    assert_eq!(
+        (s.due(), s.report(t2)),
+        (None, None),
+        "written: nothing owed"
+    );
+    assert!(!s.admit(t2));
+    assert_eq!(
+        s.due(),
+        Some(t2 + SHED_INTERVAL),
+        "the next close opens a new window"
+    );
+    assert_eq!(s.report(t2), Some((1, 0)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_shed_keeps_count_and_window_and_is_due_an_interval_later() {
+    let mut s = shedding(1, 1);
+    s.failed(tokio::time::Instant::now());
+    assert_eq!(s.due(), None, "nothing owed: a failure arms nothing");
+    let t0 = tokio::time::Instant::now();
+    assert!(s.admit(t0));
+    assert!(!s.admit(t0));
+    tokio::time::advance(SHED_INTERVAL).await;
+    let t1 = tokio::time::Instant::now();
+    s.failed(t1);
+    assert_eq!(s.due(), Some(t1 + SHED_INTERVAL));
+    assert!(s.admit(t1), "one second at 1/s gives one back");
+    assert!(!s.admit(t1));
+    assert_eq!(
+        s.due(),
+        Some(t1 + SHED_INTERVAL),
+        "a later close does not move it"
+    );
+    assert_eq!(
+        s.report(t1),
+        Some((2, 1000)),
+        "the window runs from the first close"
+    );
+    s.closed = u64::MAX;
+    assert!(!s.admit(t1));
+    assert_eq!(s.report(t1), Some((u64::MAX, 1000)), "the count saturates");
+}
+
+/// Holds a paused clock still while it lives: tokio does not auto-advance time while a
+/// blocking task runs, so waiting on real socket IO cannot move it; only `advance` does.
+struct Frozen {
+    hold: std::sync::mpsc::Sender<()>,
+    task: tokio::task::JoinHandle<Option<()>>,
+}
+
+fn freeze() -> Frozen {
+    let (hold, held) = std::sync::mpsc::channel::<()>();
+    let task = tokio::task::spawn_blocking(move || held.recv().ok());
+    Frozen { hold, task }
+}
+
+impl Frozen {
+    /// Lets time auto-advance again.
+    async fn thaw(self) {
+        drop(self.hold);
+        self.task.await.unwrap();
+    }
+}
+
+/// `n` refused CONNECTs one after another: how many were answered 403 and how many closed
+/// unread.
+async fn flood(sock: &Path, n: usize) -> (usize, usize) {
+    let mut answered = 0;
+    for _ in 0..n {
+        match flood_exchange(sock, "evil.test:443").await {
+            Some(out) if out.starts_with("HTTP/1.1 403 ") => answered += 1,
+            None => {}
+            Some(out) => panic!("neither a 403 nor closed unread: {out:?}"),
+        }
+    }
+    (answered, n - answered)
+}
+
+/// A CONNECT to `target`: its whole answer, or `None` when the connection was closed unread
+/// (nothing came back, or the write or read met the closed end). Bounded in real time.
+async fn flood_exchange(sock: &Path, target: &str) -> Option<String> {
+    bounded("a flood exchange", async {
+        let mut s = UnixStream::connect(sock).await.unwrap();
+        let closed = |e: io::Error| {
+            assert!(
+                matches!(
+                    e.kind(),
+                    io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                ),
+                "{e}"
+            );
+        };
+        if let Err(e) = s
+            .write_all(format!("CONNECT {target} HTTP/1.1\r\n\r\n").as_bytes())
+            .await
+        {
+            closed(e);
+            return None;
+        }
+        let mut out = String::new();
+        match s.read_to_string(&mut out).await {
+            Ok(_) if out.is_empty() => None,
+            Ok(_) => Some(out),
+            Err(e) => {
+                closed(e);
+                None
+            }
+        }
+    })
+    .await
+}
+
+/// Connects `n` clients no faster than the admission rate lets in: the burst at once, then one
+/// per `1 s / ADMISSION_RATE` with a margin, so none is closed over the rate (a test that needs
+/// more than a burst of admitted connections is paced; its assertions are unchanged).
+async fn connect_paced(sock: &Path, n: usize) -> Vec<UnixStream> {
+    use super::super::server::{ADMISSION_BURST, ADMISSION_RATE};
+    let step = Duration::from_secs(1) / ADMISSION_RATE + Duration::from_millis(10);
+    let mut clients = Vec::new();
+    for i in 0..n {
+        if i >= ADMISSION_BURST as usize {
+            tokio::time::sleep(step).await;
+        }
+        clients.push(UnixStream::connect(sock).await.unwrap());
+    }
+    clients
+}
+
+/// How long a frozen-clock test waits on the server in real time before it fails.
+const REAL_LIMIT: Duration = Duration::from_secs(10);
+
+/// Waits up to [`REAL_LIMIT`] of real time for `f`, without moving a paused clock.
+async fn settle(what: &str, f: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + REAL_LIMIT;
+    while !f() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(1)))
+            .await
+            .unwrap();
+    }
+}
+
+/// Awaits `fut` for at most [`REAL_LIMIT`] of real time, without moving a paused clock: while
+/// [`Frozen`] holds the clock no server timeout can fire, so a server that stops answering fails
+/// the test instead of hanging it. The watchdog is a blocking task, which holds the clock too.
+async fn bounded<T>(what: &str, fut: impl Future<Output = T>) -> T {
+    let (done, wait) = std::sync::mpsc::channel::<()>();
+    let mut watchdog = tokio::task::spawn_blocking(move || wait.recv_timeout(REAL_LIMIT));
+    tokio::pin!(fut);
+    tokio::select! {
+        biased;
+        out = &mut fut => {
+            drop(done);
+            let _ = watchdog.await;
+            out
+        }
+        _ = &mut watchdog => panic!("{what}: no end after {REAL_LIMIT:?} of real time"),
+    }
 }
 
 #[tokio::test]
@@ -401,10 +880,7 @@ async fn the_last_free_slot_serves_a_queued_connector_connection() {
         Some(roots),
     );
     let bound = Limits::new(0).in_flight();
-    let mut clients = Vec::new();
-    for _ in 1..bound {
-        clients.push(UnixStream::connect(&sock).await.unwrap());
-    }
+    let clients = connect_paced(&sock, bound - 1).await;
     until("all but one slot to fill", || gate.entered() == bound - 1).await;
     let local = handle
         .connector()
@@ -450,10 +926,7 @@ async fn dropping_the_handle_ends_a_queued_connector_connection_unserved() {
         Some(roots),
     );
     let bound = Limits::new(0).in_flight();
-    let mut clients = Vec::new();
-    for _ in 0..bound {
-        clients.push(UnixStream::connect(&sock).await.unwrap());
-    }
+    let clients = connect_paced(&sock, bound).await;
     until("every slot to fill", || gate.entered() == bound).await;
     let c = handle.connector().unwrap();
     let mut queued = c.open(serde_json::json!({"call": 1})).unwrap();
@@ -608,11 +1081,14 @@ impl HostAddrs for NoneOwned {
         Ok(vec![])
     }
 }
-/// Records "event end-or-reason" per entry; with a gate, each append waits there first.
+/// Records "event end-or-reason" per entry; with a gate, each append waits there first. The
+/// first `fail_sheds` `egress.shed` appends fail; `shed_tries` counts them all.
 #[derive(Default)]
 struct Ends {
     rows: std::sync::Mutex<Vec<String>>,
     gate: Option<Arc<Gate>>,
+    fail_sheds: std::sync::atomic::AtomicUsize,
+    shed_tries: std::sync::atomic::AtomicUsize,
 }
 impl Ends {
     fn rows(&self) -> Vec<String> {
@@ -628,6 +1104,19 @@ impl AuditSink for Ends {
         if let Some(g) = &self.gate {
             g.pass();
         }
+        if e.event() == "egress.shed" {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.shed_tries.fetch_add(1, SeqCst);
+            let fail = self
+                .fail_sheds
+                .try_update(SeqCst, SeqCst, |n| n.checked_sub(1));
+            if fail.is_ok() {
+                return Err(sally_core::audit::AuditError::Io {
+                    path: "test".into(),
+                    source: io::Error::other("refused"),
+                });
+            }
+        }
         let a = e.resolved(&sally_core::audit::Redactor::default());
         let why = a["end"]
             .as_str()
@@ -636,10 +1125,15 @@ impl AuditSink for Ends {
         let origin = a
             .get("origin")
             .map_or_else(String::new, |o| format!(" origin={o}"));
+        let shed = if e.event() == "egress.shed" {
+            format!(" closed={} window_ms={}", a["closed"], a["window_ms"])
+        } else {
+            String::new()
+        };
         self.rows
             .lock()
             .unwrap()
-            .push(format!("{} {why}{origin}", e.event()));
+            .push(format!("{} {why}{origin}{shed}", e.event()));
         Ok(())
     }
 }
