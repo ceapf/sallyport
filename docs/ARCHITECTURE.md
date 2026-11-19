@@ -802,7 +802,7 @@ hand-written in `sallyd::rpc`; no MCP SDK crate is in the TCB.
 | `ping` | legacy only: empty result |
 | `tools/list` | the session's tools with their JSON schemas; never a cursor (one is `-32602`) |
 | `tools/call` (`name`, `arguments`) | recorded `rpc.request` (the tool and the arguments' shape, never their values), then dispatched with the broker's call number (unique in the session; the harness's id is only display text) to the gated handler: the executor (Task 11) builds the action that will run, the approvals gate admits it (policy; a prompt bound to the action's digest), and the executor runs only the resulting ticket, writing its effect entry first (#62). Blocks until executed, denied or timed out (`approvals.timeout`); a denial is `isError: true` with text `denied: <code>`; a call whose entry could not be written gets no reply. Approval never round-trips through the sandbox |
-| `notifications/cancelled` (`requestId`, `reason?`) | both lifecycles: suppresses the reply of a matching in-flight call (recorded `rpc.cancel` first) and withdraws a prompt it waits on (`approval.withdraw`); a closed connection withdraws its calls' prompts the same way. The handler is never dropped by a cancel or a closed connection and keeps its slot until it returns; session teardown aborts it (after `STOP_GRACE`, 2 s, or at once when the listener handle is dropped), so a handler is safe to drop at any await (#62) |
+| `notifications/cancelled` (`requestId`, `reason?`) | both lifecycles: suppresses the reply of a matching in-flight call (recorded `rpc.cancel` first) and withdraws a prompt it waits on (`approval.withdraw`); a closed connection withdraws its calls' prompts the same way. The handler is never dropped by a cancel or a closed connection, and the call keeps its slot until its reply has been written or dropped (a writer that gives up, and session teardown, drop queued replies); session teardown aborts it (after `STOP_GRACE`, 2 s, or at once when the listener handle is dropped), so a handler is safe to drop at any await (#62) |
 
 Everything else → `-32601` + `rpc.deny`: resources, prompts, sampling, elicitation, roots,
 logging, subscriptions, tasks, and every control method. The server never sends a request of its
@@ -825,8 +825,8 @@ A request with one 2026 key but not the other, or with neither on a connection t
 **Bounds** (each a named constant with a boundary test): frames 256 KiB (an oversize frame is
 recorded, then the connection closes); nesting depth 64; ids ≤ 128 bytes; method names ≤ 64
 bytes; tool names 1–128 bytes; duplicate JSON keys refused. Per session: 8 connections (the
-listener stops accepting at the cap), 16 `tools/call` in flight (the 17th is `-32000`
-`too-many-in-flight`, recorded first), a reused in-flight id `-32600`, and 20 requests read per
+listener stops accepting at the cap), 16 `tools/call` in flight, replies not yet written included (the
+17th is `-32000` `too-many-in-flight`, recorded first), a reused in-flight id `-32600`, and 20 requests read per
 second with a burst of 40. Over the rate the broker stops reading (backpressure): requests are
 slowed, never dropped unrecorded. A reply the peer does not take within 10 s closes the
 connection. Prompts: at most `approvals.max_pending` wait at once, and new ones come at most one

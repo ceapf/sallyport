@@ -71,7 +71,9 @@ pub enum Driven {
     Done(ToolOutcome),
     /// Refused before the handler, with the `rpc.deny` reason.
     Denied(&'static str),
-    /// An entry could not be written: nothing ran, or no answer exists.
+    /// No answer exists: an entry could not be written (before the effect, nothing ran; when
+    /// the call's result entry failed, the effect happened and its answer is withheld), or the
+    /// call's task panicked (reported as `agent.call`).
     Unrecorded,
 }
 
@@ -137,7 +139,8 @@ pub trait ToolHandler: Send + Sync + 'static {
     /// Runs one call. `call` is the number [`begin`](Self::begin) gave it. It must write
     /// its own effect entry (each tool's fields, ARCHITECTURE §4.3) before the effect or the
     /// denial reply, at every `audit.level`: the `rpc.request` entry carries no argument values.
-    /// `None` means an entry could not be written: nothing ran, and no reply is sent.
+    /// `None` means an entry could not be written, and no reply is sent: before the effect,
+    /// nothing ran; when the result entry fails, the effect happened and its reply is withheld.
     ///
     /// A cancel or a closed connection never drops a call; it is told through
     /// [`withdraw`](Self::withdraw). Session teardown does drop calls: after
@@ -549,7 +552,8 @@ impl<T: ToolHandler> Agent<T> {
         conn.tasks.spawn(async move {
             let outcome = handler.call(call, name, arguments).await;
             let cancelled = pending.take();
-            // `None`: an entry could not be written, so nothing ran and nothing is answered.
+            // `None`: an entry could not be written, so nothing is answered (nothing ran, or
+            // the effect happened and its result entry failed).
             // The slot leaves with the reply and is released once it is written; with no
             // reply, or a writer gone, it is released here.
             if let (false, Some(outcome)) = (cancelled, outcome) {
