@@ -415,27 +415,29 @@ fn recheck_distinguishes_a_replaced_directory_from_a_moved_path() {
 /// Entries the scan reads per validation (the `links::BUDGET` pin is in `paths.rs`).
 const SCAN_BUDGET: usize = 65_536;
 
-/// One entry past the real budget in a scanned folder (a thumbnail cache): a manifest with a
-/// mount is refused `denylist-incomplete` at `filesystem`, naming the folder, as its only error,
-/// at validation and at the library's re-check; a manifest with no mounts reads no folder and
-/// is accepted.
+/// A scanned folder past the real budget (a cache subfolder holding as many files as the
+/// budget, read at depth 2 of `~/.cache`): a manifest with a mount is refused
+/// `denylist-incomplete` at `filesystem`, naming the folder, as its only error, at validation
+/// and at the library's re-check; a manifest with no mounts reads no folder and is accepted.
 #[test]
 fn a_scan_past_the_budget_refuses_only_manifests_with_mounts() {
     let f = Fixture::new();
     let body = mounts(&mount("~/code/myproject", "/workspace/p", "rw"));
     let v = f.load(&body).unwrap().manifest;
-    let thumbs = f.home().join(".cache/thumbnails");
-    std::fs::create_dir_all(&thumbs).unwrap();
-    // `.cache` holds `thumbnails`, which holds the rest: SCAN_BUDGET + 1 entries in all.
+    let many = f.home().join(".cache/many");
+    std::fs::create_dir_all(&many).unwrap();
+    // `many` alone holds the budget's worth; with `.cache`'s own entry and the fixture's other
+    // folders the scan passes the budget inside `many`.
     for n in 0..SCAN_BUDGET {
-        std::fs::File::create(thumbs.join(n.to_string())).unwrap();
+        std::fs::File::create(many.join(n.to_string())).unwrap();
     }
     let r = f.load(&body);
     assert_rejects(&r, "filesystem", Code::DenylistIncomplete);
     let msg = rendered(&r).join("\n");
     assert!(
         msg.contains(&format!("budget of {SCAN_BUDGET} entries"))
-            && msg.contains(&thumbs.display().to_string()),
+            && msg.contains(&many.display().to_string())
+            && msg.ends_with(" [denylist-incomplete]"),
         "{msg}"
     );
     let e = v.recheck_mounts(&f.env).unwrap_err();
@@ -444,6 +446,6 @@ fn a_scan_past_the_budget_refuses_only_manifests_with_mounts() {
     assert_ok(&f.load(""));
     // Control: without the cache the same manifest is accepted (the exact boundary is pinned
     // in `paths.rs`, where every entry read is known).
-    std::fs::remove_dir_all(&thumbs).unwrap();
+    std::fs::remove_dir_all(&many).unwrap();
     assert_ok(&f.load(&body));
 }

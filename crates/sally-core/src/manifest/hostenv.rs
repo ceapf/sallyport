@@ -70,7 +70,7 @@ pub(crate) fn env_dirs(lookup: impl Fn(&str) -> Option<OsString>) -> Vec<EnvDir>
         }
     }
     if let Some(v) = lookup("GOPATH") {
-        for p in std::env::split_paths(&v).filter(|p| p.is_absolute()) {
+        for p in std::env::split_paths(&v) {
             add(p.join("bin"), "GOPATH");
             add(p.join("pkg"), "GOPATH");
         }

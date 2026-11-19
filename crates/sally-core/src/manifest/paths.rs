@@ -143,11 +143,13 @@ impl Denylist {
     /// expanded to absolute paths): [`Denylist::without_links`], then a rule for each link out
     /// of a protected folder. The second value says why the list is incomplete, if it is; the
     /// rules built up to that point are kept.
+    #[must_use]
     pub(crate) fn for_env(env: &HostEnv, extra: &[PathBuf]) -> (Self, Option<String>) {
         Self::with_budget(env, extra, links::BUDGET)
     }
 
     /// [`Denylist::for_env`], reading at most `budget` directory entries for links.
+    #[must_use]
     pub(crate) fn with_budget(
         env: &HostEnv,
         extra: &[PathBuf],
@@ -226,24 +228,30 @@ impl Denylist {
     /// Appends a rule for each link's target, labelled with the link and carrying the reason of
     /// the folder that holds it, unless every form of the target is already at or inside a
     /// subtree rule.
+    ///
+    /// Coverage is checked against the rules that are not link rules, and a target already
+    /// made a rule is skipped by its exact path, so the work grows linearly with the links.
     fn add_links(&mut self, links: Vec<Link>) {
+        let fixed = self.rules.len();
+        let mut targets = std::collections::HashSet::new();
         for l in links {
-            let label = format!(
-                "{}, which {} points to",
-                l.target.display(),
-                l.link.display()
-            );
+            let shown = normalize(&l.target);
+            if !targets.insert(shown.clone()) {
+                continue;
+            }
+            let label = format!("{}, which {} points to", shown.display(), l.link.display());
             let r = rule(&l.target, Scope::Subtree, Some(&label), Some(l.reason));
-            if !r.forms.iter().all(|f| self.covers(f)) {
+            if !r.forms.iter().all(|f| self.covers(f, fixed)) {
                 self.rules.push(r);
             }
         }
     }
 
-    /// Whether `p` is at or inside one of the subtree rules.
-    fn covers(&self, p: &Path) -> bool {
+    /// Whether `p` is at or inside one of the first `upto` rules that is a subtree rule.
+    fn covers(&self, p: &Path, upto: usize) -> bool {
         self.rules
             .iter()
+            .take(upto)
             .filter(|r| r.scope == Scope::Subtree)
             .any(|r| r.forms.iter().any(|f| p.starts_with(f)))
     }
@@ -307,14 +315,16 @@ fn homes(env: &HostEnv) -> impl Iterator<Item = &PathBuf> {
     std::iter::once(&env.home).chain(&env.other_homes)
 }
 
-/// Whether `p`, lexically or resolved, lies at or under a home (lexical or resolved).
-fn under_a_home(env: &HostEnv, p: &Path) -> bool {
-    let forms = |q: &Path| [Some(normalize(q)), std::fs::canonicalize(q).ok()];
-    let home_forms: Vec<PathBuf> = homes(env).flat_map(|h| forms(h)).flatten().collect();
-    forms(p)
+/// A path's lexical form and, when it resolves, its real one.
+fn forms_of(p: &Path) -> impl Iterator<Item = PathBuf> {
+    [Some(normalize(p)), std::fs::canonicalize(p).ok()]
         .into_iter()
         .flatten()
-        .any(|f| home_forms.iter().any(|h| f.starts_with(h)))
+}
+
+/// Whether `p`, lexically or resolved, lies at or under one of `homes` (each home's forms).
+fn under_a_home(homes: &[PathBuf], p: &Path) -> bool {
+    forms_of(p).any(|f| homes.iter().any(|h| f.starts_with(h)))
 }
 
 /// Reads the folders whose links become rules (MANIFEST_SPEC §2), each to [`links::DEPTH`]:
@@ -332,8 +342,9 @@ fn scan_folders(env: &HostEnv, scan: &mut Scan) -> Result<(), Incomplete> {
     {
         scan.read(dir, links::DEPTH, CONFIG)?;
     }
+    let home_forms: Vec<PathBuf> = homes(env).flat_map(|h| forms_of(h)).collect();
     for d in env_rule_dirs(env) {
-        if d.var != "PATH" || under_a_home(env, &d.path) {
+        if d.var != "PATH" || under_a_home(&home_forms, &d.path) {
             scan.read(&d.path, links::DEPTH, ENV_DIR)?;
         }
     }
@@ -574,6 +585,12 @@ mod tests {
         }
     }
 
+    /// Every rule but the link rules, for an `env` whose homes are made up (`/home/u`): no
+    /// folder of the test host is read.
+    fn fixed(e: &HostEnv, extra: &[PathBuf]) -> Denylist {
+        Denylist::without_links(e, extra)
+    }
+
     /// The complete denylist (the test fails if it could not be completed).
     #[track_caller]
     fn deny(e: &HostEnv, extra: &[PathBuf]) -> Denylist {
@@ -584,7 +601,7 @@ mod tests {
 
     #[test]
     fn root_only_rules_allow_descendants() {
-        let d = deny(&env("/home/u"), &[]);
+        let d = fixed(&env("/home/u"), &[]);
         assert!(d.refusal(Path::new("/")).is_some());
         assert!(d.refusal(Path::new("/home/u")).is_some());
         assert_eq!(d.refusal(Path::new("/home/u/code")), None);
@@ -593,7 +610,7 @@ mod tests {
 
     #[test]
     fn subtree_rules_refuse_inside_and_ancestors() {
-        let d = deny(&env("/home/u"), &[]);
+        let d = fixed(&env("/home/u"), &[]);
         for p in [
             "/home/u/.ssh",
             "/home/u/.ssh/keys",
@@ -613,7 +630,7 @@ mod tests {
     /// list, are refused (and so is anything inside them).
     #[test]
     fn the_second_list_of_home_folders_is_refused() {
-        let d = deny(&env("/home/u"), &[]);
+        let d = fixed(&env("/home/u"), &[]);
         for p in [
             ".azure",
             ".terraform.d",
@@ -648,7 +665,7 @@ mod tests {
     fn other_homes_are_protected_too() {
         let mut e = env("/tmp/fakehome");
         e.other_homes.push("/home/user".into());
-        let d = deny(&e, &[]);
+        let d = fixed(&e, &[]);
         assert!(d.refusal(Path::new("/home/user/.ssh")).is_some());
         assert!(d.refusal(Path::new("/home/user")).is_some());
         assert_eq!(d.refusal(Path::new("/home/user/code")), None);
@@ -656,7 +673,7 @@ mod tests {
 
     #[test]
     fn extra_rules_apply() {
-        let d = deny(&env("/home/u"), &[PathBuf::from("/home/u/private")]);
+        let d = fixed(&env("/home/u"), &[PathBuf::from("/home/u/private")]);
         assert!(d.refusal(Path::new("/home/u/private/x")).is_some());
         assert_eq!(d.refusal(Path::new("/home/u/public")), None);
     }
@@ -875,6 +892,36 @@ mod tests {
         }
     }
 
+    /// A relative link in a protected folder that is itself a link (a stow-folded
+    /// `~/.local/bin -> ~/dotfiles/bin` holding `t -> ../tools/t`) protects where the kernel
+    /// resolves it, `~/dotfiles/tools/t`, not `~/.local/tools/t`.
+    #[test]
+    fn a_relative_link_in_a_linked_folder_protects_the_real_target() {
+        let t = TmpHome::new("folded");
+        let home = t.home();
+        std::fs::create_dir_all(home.join("dotfiles/bin")).unwrap();
+        std::fs::create_dir_all(home.join("dotfiles/tools")).unwrap();
+        std::os::unix::fs::symlink("../tools/t", home.join("dotfiles/bin/t")).unwrap();
+        link(&home, ".local/bin", "dotfiles/bin");
+        let d = deny(&env(home.to_str().unwrap()), &[]);
+        let w = why(&d, &home, "dotfiles/tools");
+        assert!(w.contains(".local/bin/t points to"), "{w}");
+    }
+
+    /// Two links to one target make one rule.
+    #[test]
+    fn a_target_named_by_two_links_is_one_rule() {
+        let t = TmpHome::new("twice");
+        let home = t.home();
+        let before = deny(&env(home.to_str().unwrap()), &[]).rules.len();
+        link(&home, ".local/bin/a", "tools/x");
+        link(&home, ".local/bin/b", "tools/x");
+        assert_eq!(
+            deny(&env(home.to_str().unwrap()), &[]).rules.len(),
+            before + 1
+        );
+    }
+
     /// A dangling link protects its lexical target, which may appear later.
     #[test]
     fn a_dangling_link_protects_its_lexical_target() {
@@ -931,7 +978,7 @@ mod tests {
     fn an_env_folder_that_is_the_home_refuses_under_it() {
         let mut e = env("/home/u");
         e.env_dirs = vec![env_dir(Path::new("/home/u"), "CARGO_HOME")];
-        let d = deny(&e, &[]);
+        let d = fixed(&e, &[]);
         let w = d.refusal(Path::new("/home/u/code/x")).unwrap_or_default();
         assert!(w.contains("/home/u (from $CARGO_HOME)"), "{w}");
     }
@@ -940,8 +987,9 @@ mod tests {
     /// naming `$PATH`, with those 256 still rules.
     #[test]
     fn path_entries_past_the_bound_leave_the_list_incomplete() {
+        // A home that does not exist, so the scan reads nothing of the test host's.
         let entry = |n: usize| PathBuf::from(format!("/opt/p{n}"));
-        let mut e = env("/home/u");
+        let mut e = env("/sp-absent-root/home/u");
         e.env_dirs = (1..=MAX_PATH_DIRS)
             .map(|n| env_dir(&entry(n), "PATH"))
             .collect();
@@ -956,12 +1004,11 @@ mod tests {
         assert!(d.refusal(&entry(MAX_PATH_DIRS)).is_some());
         assert_eq!(d.refusal(&entry(MAX_PATH_DIRS + 1)), None);
         assert!(d.refusal(Path::new("/opt/cargo")).is_some());
-        // Without links (no mounts) the bound is not applied and nothing is reported.
-        assert!(
-            Denylist::without_links(&e, &[])
-                .refusal(&entry(1))
-                .is_some()
-        );
+        // Without links (no mounts) the first 256 are still rules; nothing is reported, as
+        // `without_links` returns no reason.
+        let d = Denylist::without_links(&e, &[]);
+        assert!(d.refusal(&entry(MAX_PATH_DIRS)).is_some());
+        assert_eq!(d.refusal(&entry(MAX_PATH_DIRS + 1)), None);
     }
 
     /// Q-C: the scan's budget, through the named constructor: exactly enough entries completes

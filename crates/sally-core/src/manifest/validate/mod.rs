@@ -123,11 +123,11 @@ impl ValidatedManifest {
     ///
     /// This narrows but does not close the race with the container runtime; the sandbox driver
     /// must additionally pin the directory (task 6). Performs blocking filesystem I/O.
-    // TODO(#231): no production code calls this yet; `sallyd`'s launch scan compares each
-    // mount root's identity only, so the denylist is as of the session's validation.
     ///
     /// # Errors
     /// [`Rejected`] listing every mount that changed or now fails a check.
+    // TODO(#231): no production code calls this yet; `sallyd`'s launch scan compares each
+    // mount root's identity only, so the denylist is as of the session's validation.
     pub fn recheck_mounts(&self, env: &HostEnv) -> Result<(), Rejected> {
         let mut d = Diags::default();
         let deny = fs::denylist(&self.manifest, env, &mut d);

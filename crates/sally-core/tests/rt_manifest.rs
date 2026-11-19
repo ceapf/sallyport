@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 
 use common::rendered_all;
 use common::{Fixture, HEADER, assert_rejects, fake_token, rendered};
-use sally_core::manifest::{Code, MAX_MANIFEST_BYTES, parse, parse_bytes, to_yaml, validate};
+use sally_core::manifest::{
+    Code, EnvDir, MAX_MANIFEST_BYTES, parse, parse_bytes, to_yaml, validate,
+};
 
 /// The control of a return-value refusal (#122): `body`, which differs from the refused case
 /// only in the attribute under test, is accepted by the same load.
@@ -819,15 +821,26 @@ fn refused_naming(f: &Fixture, host: &str, mode: &str, named: &str) {
 /// same mount is accepted before the link exists, by the same validator.
 #[test]
 fn rt_fs_19_a_link_out_of_a_protected_folder_protects_its_target() {
-    let f = Fixture::new();
+    let mut f = Fixture::new();
     let home = f.home().to_owned();
     std::fs::create_dir_all(home.join("tools/t/bin")).unwrap();
     std::fs::write(home.join("tools/t/bin/t"), "").unwrap();
-    for dir in ["dotfiles/gh", "rc", "later", "tools/u"] {
+    for dir in [
+        "dotfiles/gh",
+        "rc",
+        "later",
+        "tools/u",
+        "plugs",
+        "crates",
+        "cargohome/bin",
+    ] {
         std::fs::create_dir_all(home.join(dir)).unwrap();
     }
     let body = mount("~/tools/t", "rw");
     twin_ok(&f, &body);
+    for host in ["~/plugs", "~/crates", "~/cargohome"] {
+        twin_ok(&f, &mount(host, "rw"));
+    }
     let before = f.load(&body).unwrap().manifest;
 
     // `~/.local/bin/t -> ~/tools/t/bin/t` (pipx / uv tool layout).
@@ -846,9 +859,26 @@ fn rt_fs_19_a_link_out_of_a_protected_folder_protects_its_target() {
     // A dangling link protects its lexical target before it exists.
     let gone = link(&f, ".local/bin/gone", "later/gone");
     refused_naming(&f, "~/later", "rw", &gone);
+    // A link at depth 2 (a subfolder of a protected folder).
+    let plug = link(&f, ".config/app/plug", "plugs/p");
+    refused_naming(&f, "~/plugs", "rw", &plug);
+    // A folder the environment names is a rule naming its variable, and its links are read.
+    f.env.env_dirs = vec![EnvDir {
+        path: home.join("cargohome"),
+        var: "CARGO_HOME",
+    }];
+    let r = f.load(&mount("~/cargohome", "rw"));
+    assert_rejects(&r, "filesystem.mounts[0].host", Code::Denylisted);
+    assert!(
+        rendered(&r).join("\n").contains("(from $CARGO_HOME)"),
+        "{r:#?}"
+    );
+    let c = link(&f, "cargohome/bin/c", "crates/c");
+    refused_naming(&f, "~/crates", "rw", &c);
 
-    // Allow twin, with every link above in place: an ordinary folder, a sibling of a link's
-    // target, and a link whose target is already inside a rule changes nothing.
+    // Allow twin, with every link above in place: an ordinary folder and a sibling of a link's
+    // target are accepted. A link whose target is inside a rule is in place too (that it adds
+    // no rule is pinned in `paths.rs`).
     link(&f, ".local/bin/k", ".ssh/key");
     for host in ["~/code/myproject", "~/tools/u"] {
         twin_ok(&f, &mount(host, "rw"));

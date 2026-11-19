@@ -7,11 +7,9 @@
 //! validation. What becomes a rule is the denylist's decision (`paths.rs`).
 #![deny(clippy::indexing_slicing)]
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-
-use super::paths::normalize;
 
 /// Directory entries read per validation, across every folder scanned.
 pub(crate) const BUDGET: usize = 65_536;
@@ -24,8 +22,10 @@ pub(crate) const DEPTH: usize = 2;
 pub(crate) struct Link {
     /// The link itself.
     pub(crate) link: PathBuf,
-    /// Its lexical target: the link text, joined to the link's folder when relative,
-    /// normalized. The denylist adds the canonical form when it resolves.
+    /// Its target as the kernel reads it: the link text, joined, when relative, to the real
+    /// path of the folder holding the link, and not normalized (a `..` after a linked
+    /// component must resolve physically). The denylist matches its normalized form and,
+    /// when it resolves, its canonical form.
     pub(crate) target: PathBuf,
     /// The reason of the rule whose folder holds the link.
     pub(crate) reason: &'static str,
@@ -49,11 +49,12 @@ pub(crate) enum Incomplete {
     },
 }
 
-/// One validation's scan: what is left of the budget, the folders read, and the links found.
+/// One validation's scan: what is left of the budget, the folders read (real path, and the
+/// depth they were read to), and the links found.
 #[derive(Debug)]
 pub(crate) struct Scan {
     left: usize,
-    seen: HashSet<PathBuf>,
+    seen: HashMap<PathBuf, usize>,
     links: Vec<Link>,
 }
 
@@ -85,14 +86,14 @@ impl Scan {
     pub(crate) fn with_budget(budget: usize) -> Self {
         Self {
             left: budget,
-            seen: HashSet::new(),
+            seen: HashMap::new(),
             links: Vec::new(),
         }
     }
 
     /// Reads `dir`'s entries to `depth` levels (1: its entries only) and records every symlink
-    /// among them with `reason`. A folder already read is skipped; a linked folder is recorded,
-    /// never entered.
+    /// among them with `reason`. A folder already read to at least `depth` (under any spelling)
+    /// is skipped; a linked folder is recorded, never entered.
     ///
     /// # Errors
     /// [`Incomplete`]: the budget ran out, or a read failed other than by [`absent`]. The links
@@ -107,7 +108,8 @@ impl Scan {
     }
 
     /// Reads only `home`'s own entries and records the symlinks whose names start with `.`
-    /// (dotfiles, which shells and tools load). Every entry read counts.
+    /// (dotfiles, which shells and tools load). Every entry read counts. Called after every
+    /// [`Scan::read`]: a home already read whole is not read again for its dotfiles.
     ///
     /// # Errors
     /// As [`Scan::read`].
@@ -131,10 +133,13 @@ impl Scan {
         if depth == 0 {
             return Ok(());
         }
-        let key = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_owned());
-        if !self.seen.insert(key) {
+        // The real folder: relative link text resolves against it, as the kernel resolves it,
+        // and a folder is read again only to a greater depth than before.
+        let real = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_owned());
+        if self.seen.get(&real).is_some_and(|read| *read >= depth) {
             return Ok(());
         }
+        self.seen.insert(real.clone(), depth);
         let Some(entries) = settle(std::fs::read_dir(dir), dir)? else {
             return Ok(());
         };
@@ -158,11 +163,11 @@ impl Scan {
                 };
                 self.links.push(Link {
                     link: path,
-                    target: normalize(&dir.join(text)),
+                    target: real.join(text),
                     reason,
                 });
             } else if kind.is_dir() {
-                self.walk(&path, depth - 1, reason, keep)?;
+                self.walk(&real.join(entry.file_name()), depth - 1, reason, keep)?;
             }
         }
         Ok(())
@@ -244,10 +249,10 @@ mod tests {
         assert_eq!(links(&t.0.join("p"), 0, BUDGET).unwrap(), Vec::new());
     }
 
-    /// Q-I: the target is the link text made absolute, even when it resolves elsewhere (a
-    /// two-hop chain) or nowhere (a dangling link).
+    /// Q-I: the target is the link text made absolute, unresolved, even when it resolves
+    /// elsewhere (a two-hop chain) or nowhere (a dangling link).
     #[test]
-    fn the_target_is_lexical() {
+    fn the_target_is_the_link_text_made_absolute() {
         let t = Tree::new("lexical");
         let p = t.dir("p");
         t.dir("hop");
@@ -265,8 +270,8 @@ mod tests {
             targets,
             [
                 PathBuf::from("/nowhere/abs"),
-                t.0.join("hop/one"),
-                t.0.join("gone/x")
+                p.join("../hop/one"),
+                p.join("../gone/x")
             ]
         );
     }
@@ -307,6 +312,42 @@ mod tests {
         // Read again (also by another spelling of the same folder): nothing counted.
         assert_eq!(s.read(&p, DEPTH, WHY), Ok(()));
         assert_eq!(s.read(&t.0.join("p/../p"), DEPTH, WHY), Ok(()));
+    }
+
+    /// A folder first reached as a subfolder (read to depth 1) is read again to depth 2 when it
+    /// is a scan root of its own (`$DOCKER_CONFIG=~/.config/docker` after `~/.config`).
+    #[test]
+    fn a_folder_reached_shallower_is_read_again_deeper() {
+        let t = Tree::new("deeper");
+        let p = t.dir("p");
+        let x = t.dir("p/sub/x");
+        symlink(t.file("tgt"), x.join("l")).unwrap();
+        let mut s = Scan::with_budget(BUDGET);
+        s.read(&p, DEPTH, WHY).unwrap();
+        s.read(&p.join("sub"), DEPTH, WHY).unwrap();
+        let found: Vec<PathBuf> = s.into_links().into_iter().map(|l| l.link).collect();
+        assert_eq!(found, [x.join("l")]);
+    }
+
+    /// A relative link text resolves against the folder's real path, as the kernel resolves
+    /// it: through a linked folder (`~/.local/bin -> ~/dotfiles/bin`, `t -> ../tools/t`) the
+    /// target is `~/dotfiles/tools/t`. The link keeps the spelling it was found under.
+    #[test]
+    fn a_relative_link_resolves_against_the_real_folder() {
+        let t = Tree::new("realdir");
+        let real = t.dir("dotfiles/bin");
+        symlink("../tools/t", real.join("t")).unwrap();
+        t.dir("local");
+        symlink(&real, t.0.join("local/bin")).unwrap();
+        let found = links(&t.0.join("local/bin"), DEPTH, BUDGET).unwrap();
+        assert_eq!(
+            found,
+            [Link {
+                link: t.0.join("local/bin/t"),
+                target: real.join("../tools/t"),
+                reason: WHY,
+            }]
+        );
     }
 
     #[test]
