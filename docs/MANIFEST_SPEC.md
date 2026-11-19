@@ -334,8 +334,8 @@ environment (passwd entry only if `$HOME` is unset or relative).
   - `$XDG_CONFIG_HOME`, `$XDG_DATA_HOME`, `$XDG_RUNTIME_DIR` (each when set, plus `sallyport/`);
   - the folders the environment names, each when absolute: `$CARGO_HOME`, `$RUSTUP_HOME`,
     `$GNUPGHOME`, `$NVM_DIR`, `$PYENV_ROOT`, `$XDG_CACHE_HOME`, `$GOBIN`, `$DOCKER_CONFIG`,
-    `$ZDOTDIR`, `$PNPM_HOME`, `$VOLTA_HOME`, `$BUN_INSTALL`, `$PYTHONUSERBASE`, `$UV_TOOL_DIR`,
-    `$GRADLE_USER_HOME`, `$PASSWORD_STORE_DIR`, `bin` and `pkg` under each `$GOPATH` element (at
+    `$ZDOTDIR`, `$PNPM_HOME`, `$VOLTA_HOME`, `$BUN_INSTALL`, `$PYTHONUSERBASE`, `$PIPX_HOME`,
+    `$PIPX_BIN_DIR`, `$UV_TOOL_DIR`, `$GRADLE_USER_HOME`, `$PASSWORD_STORE_DIR`, `bin` and `pkg` under each `$GOPATH` element (at
     most 32 folders), and every `$PATH` entry (at most 256); past either bound the list is
     incomplete (below). Messages name the variable ("is inside /opt/go/bin (from $GOBIN)"). A
     folder named this way that is `/`, a home, or an ancestor of one is kept as a rule, so it
@@ -531,7 +531,8 @@ See `manifests/examples/`:
   manifest with mounts** (`denylist-incomplete`, naming it), since its files still run by name
   and its links cannot be read. Make it listable, or remove it.
 - **A tool folder moved by a variable that is not on the §2 list is not a rule** (#232). List it
-  in `filesystem.deny`.
+  in `filesystem.deny`. Nor is a listed variable's value that is not absolute, even where the
+  tool expands it itself (a literal `~/…` or a relative `$PIPX_HOME`, which pipx expands).
 - **The environment that counts is `sallyd`'s own, read once when it starts.** A variable set
   only in the user's shell is not seen, so a daemon started with a minimal environment has fewer
   environment rules than the shell. `sally manifest validate` uses the CLI's environment and is

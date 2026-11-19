@@ -41,9 +41,11 @@ pub struct EnvDir {
 }
 
 /// Variables whose value is one folder the host runs or loads code from, or keeps credentials
-/// in (the env-moved forms of the built-in home folders), each documented by its tool as one
-/// directory.
-// TODO(#232): more tools' variables, each to be checked against the tool's own documentation.
+/// in (the env-moved forms of the built-in home folders), each documented by its tool, or read
+/// by its source, as one directory (pipx's two: `src/pipx/paths.py` at commit 3ce2b3c7, read
+/// through `get_expanded_environ`, never split).
+// TODO(#232): more tools' variables, each to be checked against the tool's own documentation
+// or source.
 const SINGLE_DIR_VARS: &[&str] = &[
     "CARGO_HOME",
     "RUSTUP_HOME",
@@ -58,6 +60,8 @@ const SINGLE_DIR_VARS: &[&str] = &[
     "VOLTA_HOME",         // .volta
     "BUN_INSTALL",        // .bun
     "PYTHONUSERBASE",     // .local: user site-packages and scripts
+    "PIPX_HOME",          // .local/share/pipx
+    "PIPX_BIN_DIR",       // .local/bin
     "UV_TOOL_DIR",        // .local/share/uv/tools
     "GRADLE_USER_HOME",   // .gradle
     "PASSWORD_STORE_DIR", // .password-store
@@ -240,6 +244,8 @@ mod tests {
                 "VOLTA_HOME",
                 "BUN_INSTALL",
                 "PYTHONUSERBASE",
+                "PIPX_HOME",
+                "PIPX_BIN_DIR",
                 "UV_TOOL_DIR",
                 "GRADLE_USER_HOME",
                 "PASSWORD_STORE_DIR",

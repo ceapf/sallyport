@@ -42,8 +42,9 @@ pub(crate) const MAX_PATH_DIRS: usize = 256;
 pub(crate) const MAX_GOPATH_DIRS: usize = 32;
 
 /// The variables that name a list of folders, each with the most of its folders that become
-/// rules. With one folder for each single-folder variable (`hostenv.rs`), the environment adds
-/// at most that many plus 32 + 256 rules and scan roots.
+/// rules. With one folder for each of the 18 single-folder variables (`hostenv.rs`), the
+/// environment adds at most 18 + 32 + 256 = 306 rules and scan roots (the XDG folders, the
+/// built-in rules, container storage, `filesystem.deny` and link rules are not counted here).
 const LIST_BOUNDS: [(&str, usize); 2] = [("PATH", MAX_PATH_DIRS), ("GOPATH", MAX_GOPATH_DIRS)];
 
 /// Under each home directory. Credentials, Sallyport's own state, and anything the host
