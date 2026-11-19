@@ -14,6 +14,7 @@ pub mod forms;
 pub mod intercept;
 pub mod locks;
 pub mod search;
+pub mod tools;
 
 use sallyd::sandbox::{
     CheckedRuntime, CommonArgs, ImageRef, Installation, LaunchScan, ScanLimits, SessionId,

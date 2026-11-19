@@ -4,117 +4,23 @@
 //! read-only bind. The fixture is `common::container`; these tests never skip.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use sally_core::manifest::{AuditLevel, ValidatedManifest};
-use sallyd::approvals::Gated;
-use sallyd::approvals::policy::Policy;
-use sallyd::approvals::queue::{self, Approver, Client, Decision, Desk, Limits, Seen};
-use sallyd::approvals::render::Prompt;
-use sallyd::daemon::crash::CrashReporter;
-use sallyd::rpc::agent::ToolHandler;
-use sallyd::rpc::mcp::ToolOutcome;
-use sallyd::rpc::record::Recorder;
-use sallyd::sandbox::{DiskFloor, Running};
+use sally_core::manifest::ValidatedManifest;
+use sallyd::approvals::queue::{Client, Decision};
+use sallyd::sandbox::DiskFloor;
 use sallyd::tools::exec::PodmanExec;
 use sallyd::tools::ops::Ops;
 use sallyd::tools::shell::{Runner, Status};
-use sallyd::tools::{Parts, Tools, mounts as tool_mounts};
 use serde_json::{Value, json};
 
 mod common;
 use common::container::*;
+use common::tools::{seen, session};
 use common::*;
 
 const ME: Client = Client { uid: 1000, pid: 7 };
-
-#[derive(Default)]
-struct Shown(Mutex<Vec<Prompt>>);
-
-impl Approver for Shown {
-    fn attached(&self) -> bool {
-        true
-    }
-    fn requested(&self, p: &Prompt) {
-        self.0.lock().unwrap().push(p.clone());
-    }
-    fn flood(&self, _: &str) {}
-    fn closed(&self, _: &str) {}
-}
-
-/// What a client shown `p` sends with its answer (these prompts are never cut).
-fn seen(p: &Prompt) -> Seen<'_> {
-    Seen {
-        digest: &p.digest,
-        full_shown: false,
-    }
-}
-
-struct Session {
-    gated: Gated<Tools<PodmanExec>>,
-    desk: Desk,
-    shown: Arc<Shown>,
-}
-
-impl Session {
-    async fn call(&self, name: &str, args: Value) -> ToolOutcome {
-        let n = self.gated.begin();
-        self.gated
-            .call(n, name.to_owned(), args.as_object().unwrap().clone())
-            .await
-            .expect("every entry was written")
-    }
-
-    async fn shown(&self, n: usize) -> Prompt {
-        for _ in 0..5000 {
-            if let Some(p) = self.shown.0.lock().unwrap().get(n - 1) {
-                return p.clone();
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-        panic!("no prompt");
-    }
-}
-
-/// The session's tools behind the real gate, as Task 12 will wire them.
-fn session(x: &Lx, v: &ValidatedManifest, r: &Running, timeout: Duration) -> Session {
-    let rec = Recorder::new(
-        x.events.clone(),
-        r.paths().id().as_str().to_owned(),
-        AuditLevel::Full,
-    );
-    let shown = Arc::new(Shown::default());
-    let (gate, desk) = queue::new(
-        r.paths().id().as_str().to_owned(),
-        Policy::from_manifest(v),
-        Limits {
-            timeout,
-            max_pending: 4,
-        },
-        rec.clone(),
-        Some(Arc::clone(&shown) as Arc<dyn Approver>),
-    );
-    let ops = Ops::new();
-    let tools = Tools::new(Parts {
-        builtin: v.manifest().tools.builtin.clone(),
-        mounts: tool_mounts(v, &r.init_dir(), r.disk_floor()),
-        record: rec,
-        exec_gate: r.exec_gate(),
-        ops: ops.clone(),
-        crash: CrashReporter::channel().0,
-        // The launcher's ids: the workspace's `--user`.
-        ids: ids(),
-        shell: PodmanExec::new(x.podman.clone(), r, ops),
-        // The container tests do not reach the network; fetch has its own tests (#75).
-        fetch: None,
-    });
-    Session {
-        gated: Gated::new(gate, tools),
-        desk,
-        shown,
-    }
-}
 
 const TOOLS: &str = "tools:\n  builtin: [fs_list, fs_read, fs_write, fs_delete, shell]\n";
 
