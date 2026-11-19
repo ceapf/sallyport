@@ -346,6 +346,9 @@ async fn refused_at(
 ///   probe's refusal reason is what this leg holds. It rests on the link-above control.
 /// - A link at `/tmp` (to a path below the first mount): refused at `/tmp`, so destinations that
 ///   are not the manifest's are walked too. It rests on the link-above control.
+/// - A link at `/etc/hostname`, one of podman's standard destinations (to a path below an `rw`
+///   first mount): refused at `/etc/hostname`, so the standard set is walked too. It rests on
+///   the link-above control.
 #[test]
 fn rt_fs_02_an_image_link_at_or_above_a_mount_creates_nothing() {
     rt().block_on(async {
@@ -369,6 +372,10 @@ fn rt_fs_02_an_image_link_at_or_above_a_mount_creates_nothing() {
         x.stop(r).await;
         let after: Vec<_> = dirs.iter().map(|d| tree(d)).collect();
         assert_eq!(after, before, "allow: a host folder changed");
+        assert!(
+            !x.listed(),
+            "allow: a container is left, the probe included"
+        );
 
         let at =
             image_with("RUN mkdir -p /workspace && ln -s /workspace/p/made-by-link /workspace/q\n");
@@ -379,6 +386,17 @@ fn rt_fs_02_an_image_link_at_or_above_a_mount_creates_nothing() {
             image_with("RUN mkdir -p /workspace/a && rm -rf /tmp && ln -s /workspace/a/tmp /tmp\n");
         let v = two_mounts(&x, ("/workspace/a", "ro"), "/workspace/b/c");
         refused_at(&x, &dirs, (&v, &tmp, "tmp"), "/tmp").await;
+
+        // Built in a second stage: the build keeps `/etc/hostname` mounted, so a plain `RUN`
+        // cannot replace it.
+        let hostname = image_with(
+            "RUN mkdir /r && for d in bin etc home lib media mnt opt root sbin srv usr var; \
+             do cp -a /$d /r/; done && mkdir -p /r/proc /r/sys /r/dev /r/run /r/tmp \
+             /r/workspace/a && rm -f /r/etc/hostname \
+             && ln -s /workspace/a/hostname /r/etc/hostname\nFROM scratch\nCOPY --from=0 /r/ /\n",
+        );
+        let v = two_mounts(&x, ("/workspace/a", "rw"), "/workspace/b/c");
+        refused_at(&x, &dirs, (&v, &hostname, "hostname"), "/etc/hostname").await;
     });
 }
 

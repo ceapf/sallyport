@@ -475,8 +475,9 @@ impl Launcher {
         Ok(image)
     }
 
-    /// The probe's `create`, `init`, inspect (its pid and image id) and the walk of every
-    /// destination of the launch under its held `/proc/<pid>` directory.
+    /// The probe's `create`, `init`, inspect (its pid and image id), the walk of every
+    /// destination of the launch under its held `/proc/<pid>` directory, and a second inspect
+    /// while that directory is held, which must show the same pid and image.
     async fn probe_walk(&self, built: &Built) -> Result<String, LaunchError> {
         let p = &built.probe;
         self.run("create", p.argv.iter().map(OsString::from))
@@ -494,7 +495,7 @@ impl Launcher {
             msg: format!("unexpected {:?}", out.trim()),
         })?;
         let dests = destinations(&built.intent);
-        blocking(move || {
+        let dir = blocking(move || {
             let dir = open_proc(pid).map_err(|msg| LaunchError::Probe { step: "walk", msg })?;
             walk_in(&dir, &dests).map_err(|e| match e {
                 WalkError::Link(r) => LaunchError::MountLink(r),
@@ -502,9 +503,23 @@ impl Launcher {
                     step: "walk",
                     msg: e.to_string(),
                 },
-            })
+            })?;
+            Ok(dir)
         })
         .await?;
+        // While the `/proc/<pid>` fd is held, the probe still shows the pid and image it was
+        // read with: the walk ran in its root, not in a process that reused the pid in between.
+        let again = self
+            .run("inspect", inspect_args(PID_IMAGE_FORMAT, &p.name))
+            .await
+            .map_err(probe_err("inspect"))?;
+        drop(dir);
+        if parse_pid_image(&again) != Some((pid, image.clone())) {
+            return Err(LaunchError::Probe {
+                step: "walk",
+                msg: format!("the probe is no longer pid {pid}: {:?}", again.trim()),
+            });
+        }
         Ok(image)
     }
 
@@ -512,7 +527,8 @@ impl Launcher {
     async fn same_image(&self, container: &str, probe: &str) -> Result<(), LaunchError> {
         let out = self
             .run("inspect", inspect_args(IMAGE_FORMAT, container))
-            .await?;
+            .await
+            .map_err(probe_err("image"))?;
         match parse_image(&out) {
             Some(image) if image == probe => Ok(()),
             got => Err(LaunchError::Probe {

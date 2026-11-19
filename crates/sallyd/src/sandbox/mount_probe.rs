@@ -8,6 +8,12 @@
 //! refuses the launch; the probe is removed before the real container is created, and both must
 //! run the same image id.
 //!
+//! The walk sees the image's tree only: a destination nested inside a host folder (a `.git`
+//! shield inside an `rw` mount) resolves there at the real `init`, and stays covered by the
+//! launch scan, its host re-check and the post-init pin check. The walk runs as the host user,
+//! so a destination below an image directory that user cannot search (mode 0700 under
+//! `keep-id`) is refused (`EACCES`): fail-closed, never a fallback.
+//!
 //! The parts here are pure and tested without a container: the walk over a directory fd, the
 //! probe's name, the probe argv derived from the real one, and the parse of `podman inspect`'s
 //! pid and image id. The orchestration is in `launch/start.rs`.

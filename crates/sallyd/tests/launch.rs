@@ -111,8 +111,10 @@ fn no_default_image_refuses_before_anything_is_reserved() {
 
 /// AMENDMENTS-02 B4, launcher level (#17): the mount source is swapped after the host re-check,
 /// while `podman init` runs (a runtime wrapper renames the granted directory and puts another in
-/// its place when `crun create` is called). The post-init check sees another object, the launch
-/// is refused before `start` and audited as `sandbox.mount_mismatch`, and nothing ran.
+/// its place when `crun create` is called for a bundle whose config mounts it: the real
+/// container's, not the mount-link probe's, which has no bind and runs first). The post-init
+/// check sees another object, the launch is refused before `start` and audited as
+/// `sandbox.mount_mismatch`, and nothing ran.
 #[test]
 fn a_mount_swapped_during_init_is_a_mismatch() {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
@@ -123,8 +125,11 @@ fn a_mount_swapped_during_init_is_a_mismatch() {
     let wrapper = dir.join("crun-swap");
     let write_wrapper = |granted: &std::path::Path| {
         let script = format!(
-            "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = create ] && [ ! -e '{m}' ]; then\n    \
-             touch '{m}'; mv '{g}' '{g}.orig' && mkdir '{g}'\n  fi\ndone\nexec '{rt}' \"$@\"\n",
+            "#!/bin/sh\ncreate=; bundle=; prev=\nfor a in \"$@\"; do\n  \
+             [ \"$a\" = create ] && create=1\n  \
+             [ \"$prev\" = --bundle ] || [ \"$prev\" = -b ] && bundle=\"$a\"\n  prev=\"$a\"\ndone\n\
+             if [ -n \"$create\" ] && [ ! -e '{m}' ] && grep -qF '{g}' \"$bundle/config.json\"; then\n  \
+             touch '{m}'; mv '{g}' '{g}.orig' && mkdir '{g}'\nfi\nexec '{rt}' \"$@\"\n",
             m = marker.display(),
             g = granted.display(),
             rt = test_runtime().display(),

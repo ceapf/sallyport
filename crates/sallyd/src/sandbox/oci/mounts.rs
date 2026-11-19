@@ -98,6 +98,8 @@ fn standard_wants(f: &Facts) -> [Want; 12] {
 /// Every mount destination of a container with this intent: podman's standard set, `/tmp` when
 /// the argv mounts a tmpfs there, and every `-v` guest path. The verifier's [`wanted`] has
 /// exactly these keys (tested); the mount-link probe walks them before the real `create`.
+/// TODO(#116): GPU inference adds CDI mounts this list does not hold, and its probe carries no
+/// GPU device; both must be walked before GPU inference is enabled.
 #[must_use]
 pub fn destinations(i: &Intent) -> Vec<String> {
     STANDARD
