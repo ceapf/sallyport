@@ -94,7 +94,7 @@ included), egress connection (`egress.allow` with host:port and the pinned addre
 unread, `egress.close` with the address used and the byte counts, and per intercepted request
 `egress.request` (method + path, never bodies) and response `egress.response` with the secrets
 redacted and the bytes, names only; ARCHITECTURE §7 "Egress audit events"), approval, launch,
-and model import.
+and model import. The audit writer refuses the detail mark on any other event.
 
 ### 1.1 Approval gates, acknowledgements, and `[data-can-leave]` (SI-5)
 
@@ -245,11 +245,13 @@ host (here and in `secrets[].inject.host`) has at least two labels: `localhost` 
 is rejected, since the proxy refuses such names and looks every name up absolute. A
 wildcard that reaches hosts anyone can register counts as unrestricted and needs
 `acknowledge_unrestricted_egress: true` like `"*"`: its base is a listed shared-hosting suffix
-(`*.github.io`, `*.workers.dev`, `*.r2.dev`, `*.ngrok-free.app`, `*.hf.space`, …), a parent of
-one (`*.windows.net`, `*.googleapis.com`), or anywhere under a shared tree, a provider whose
-registrable hosts sit at any depth (`*.amazonaws.com`, `*.s3.us-east-1.amazonaws.com`,
-`*.web.core.windows.net`). The lists are two maintained constants, `host::SHARED_SUFFIXES` and
-`host::SHARED_TREES`; the summary marks such a rule "anyone can register these". The lists are
+(`*.github.io`, `*.workers.dev`, `*.r2.dev`, `*.ngrok-free.app`, …), a parent of a listed entry
+(`*.googleapis.com`), or a shared tree or anywhere under one, a provider whose registrable hosts
+sit at any depth (`*.amazonaws.com`, `*.windows.net`, `*.s3.us-east-1.amazonaws.com`,
+`*.web.core.windows.net`, `*.a.run.app`). The lists are two maintained constants,
+`host::SHARED_SUFFIXES` and `host::SHARED_TREES` (an entry is a tree when the Public Suffix
+List's private section names hosts more than one label below it); the summary marks such a
+rule "anyone can register these". The lists are
 curated, so a wildcard over a shared-hosting suffix they do not name is an ordinary rule
 (TODO(#235): derive them from the Public Suffix List). Matching: lowercase, trailing dot
 stripped; `*.example.com` matches `a.example.com` and `a.b.example.com` but **not**
