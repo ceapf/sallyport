@@ -423,7 +423,7 @@ pub struct InferenceSpec {
 /// A model blob in the library, pinned by identity (#10): `<blobs>/sha256/<64 lowercase hex>`, a
 /// regular file owned by the current user with no write bit (the library stores blobs 0444),
 /// opened without following a symlink. The SHA-256 itself is checked once, at import (SI-6,
-/// M2); TODO(M2): the import in `sally-core::model` becomes the only constructor.
+/// M2); TODO(#210): the import in `sally-core::model` becomes the only constructor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedModel {
     path: PathBuf,
