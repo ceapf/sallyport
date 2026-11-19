@@ -54,6 +54,8 @@ expect 1 "run one above the count" "$only" 6 5 \
   "6 rt_ tests run, REDTEAM_COUNT in the Makefile is 5: raise it to 6" "missing"
 expect 1 "run one below the count" "$only" 4 5 \
   "4 rt_ tests run, REDTEAM_COUNT in the Makefile is 5: 1 missing" "raise"
+expect 1 "below the count, never told to lower it" "$only" 4 5 \
+  "find the lost tests. The count goes down only in a PR that removes a test" "lower"
 expect 1 "above, compared as numbers" "$only" 10 9 "raise it to 10" "missing"
 expect 1 "below, compared as numbers" "$only" 9 10 "1 missing" "raise"
 expect 1 "a second ignored rt_ test" "${only}sallyd::launch rt_fs_13_x
@@ -81,6 +83,7 @@ lines "$tmp/run" 5
 usage "a count that is not a number" five
 usage "a count of zero" 0
 usage "a count with a leading zero" 05
+usage "a count with trailing text" 5x
 
 [ "$fail" -eq 0 ] && echo "redteam_guard_test: ok"
 exit "$fail"
