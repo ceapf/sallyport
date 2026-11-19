@@ -42,14 +42,11 @@ impl HostPattern {
 /// TODO(#235): derive from the Public Suffix List's private section.
 const SHARED_SUFFIXES: &[&str] = &[
     "cloudfront.net",
-    "appspot.com",
     "web.app",
     "firebaseapp.com",
-    "azurewebsites.net",
-    "storage.googleapis.com",
-    "hf.space",
+    "cloudfunctions.net",
+    "amplifyapp.com",
     "gradio.live",
-    "run.app",
     "github.io",
     "githubusercontent.com",
     "gitlab.io",
@@ -63,12 +60,12 @@ const SHARED_SUFFIXES: &[&str] = &[
     "fly.dev",
     "onrender.com",
     "glitch.me",
-    "ngrok.io",
     "ngrok.app",
     "ngrok-free.app",
+    "ngrok.dev",
+    "ngrok-free.dev",
     "loca.lt",
     "serveo.net",
-    "replit.dev",
     "repl.co",
     "deno.dev",
     "surge.sh",
@@ -78,14 +75,34 @@ const SHARED_SUFFIXES: &[&str] = &[
 ];
 
 /// Shared trees: providers whose registrable hosts sit at any depth below the entry (regional
-/// and per-service endpoints such as `<bucket>.s3.<region>.amazonaws.com` or
-/// `<account>.z13.web.core.windows.net`), so a wildcard over any base under one counts too.
-const SHARED_TREES: &[&str] = &["amazonaws.com", "core.windows.net"];
+/// and per-service endpoints such as `<bucket>.s3.<region>.amazonaws.com`,
+/// `<app>.<region>-01.azurewebsites.net` or `<service>.a.run.app`), so a wildcard over any base
+/// under one counts too. An entry is a tree when the Public Suffix List's private section lists
+/// `*.<entry>`, or `<x>.<entry>` beside the entry, or only names two or more labels below it
+/// (read at publicsuffix/list commit f7796455091118a5617cc7588523b083a8223301).
+/// `storage.googleapis.com` is the exception: the list does not name it; it is a tree because a
+/// verified domain owner may name a bucket with dots (`example.com.storage.googleapis.com`), from
+/// a security review and not yet confirmed from the provider's naming documentation (#235).
+const SHARED_TREES: &[&str] = &[
+    "amazonaws.com",
+    "on.aws",
+    "elasticbeanstalk.com",
+    "awsapprunner.com",
+    "windows.net",
+    "azurewebsites.net",
+    "storage.googleapis.com",
+    "run.app",
+    "appspot.com",
+    "hf.space",
+    "ngrok.io",
+    "replit.dev",
+];
 
 impl HostPattern {
-    /// `*`, or a wildcard that reaches hosts anyone can register: its base is an entry of
-    /// [`SHARED_SUFFIXES`] or [`SHARED_TREES`], or a parent of one (`*.windows.net` covers
-    /// `*.core.windows.net`), or lies under a shared tree (`*.s3.us-east-1.amazonaws.com`).
+    /// `*`, or a wildcard that reaches hosts anyone can register: its base is a listed entry
+    /// (an entry of [`SHARED_SUFFIXES`] or a tree of [`SHARED_TREES`]), a parent of one
+    /// (`*.googleapis.com` covers `*.storage.googleapis.com`), or lies under a listed shared
+    /// tree (`*.s3.us-east-1.amazonaws.com`, `*.web.core.windows.net`).
     #[must_use]
     pub fn is_effectively_unrestricted(&self) -> bool {
         match self {
@@ -345,20 +362,44 @@ mod tests {
             "*.workers.dev",
             "*.co.uk",
             // Hosting a stranger can register under, by an exact entry.
-            "*.storage.googleapis.com",
-            "*.hf.space",
             "*.gradio.live",
-            "*.run.app",
+            "*.amplifyapp.com",
+            "*.cloudfunctions.net",
+            "*.ngrok.dev",
+            "*.ngrok-free.dev",
             // A parent of an entry: its wildcard matches the entry's hosts too.
             "*.googleapis.com",
-            "*.windows.net",
             // A tree itself, and anywhere under one: regional and service endpoints.
             "*.amazonaws.com",
-            "*.core.windows.net",
             "*.s3.us-east-1.amazonaws.com",
             "*.execute-api.eu-west-1.amazonaws.com",
+            "*.windows.net",
+            "*.core.windows.net",
+            "*.notcore.windows.net",
             "*.web.core.windows.net",
             "*.z13.web.core.windows.net",
+            "*.servicebus.windows.net",
+            "*.storage.googleapis.com",
+            "*.com.storage.googleapis.com",
+            "*.run.app",
+            "*.a.run.app",
+            "*.appspot.com",
+            "*.r.appspot.com",
+            "*.azurewebsites.net",
+            "*.eastus-01.azurewebsites.net",
+            "*.hf.space",
+            "*.static.hf.space",
+            "*.myorg.hf.space",
+            "*.ngrok.io",
+            "*.eu.ngrok.io",
+            "*.replit.dev",
+            "*.picard.replit.dev",
+            "*.on.aws",
+            "*.lambda-url.us-east-1.on.aws",
+            "*.elasticbeanstalk.com",
+            "*.us-east-1.elasticbeanstalk.com",
+            "*.awsapprunner.com",
+            "*.us-east-1.awsapprunner.com",
         ] {
             assert!(
                 parse_host_pattern(p).is_ok_and(|h| h.is_effectively_unrestricted()),
@@ -373,9 +414,8 @@ mod tests {
             // Label boundaries: a shared name inside a label is not that name.
             "*.xamazonaws.com",
             "*.ows.net",
-            "*.notcore.windows.net",
-            // Under a flat entry: one account's own subdomains.
-            "*.myorg.hf.space",
+            "*.notstorage.googleapis.com",
+            "*.leapis.com",
             // Exact hosts are never unrestricted, even under a tree.
             "x.s3.us-east-1.amazonaws.com",
         ] {
