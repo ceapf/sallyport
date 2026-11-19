@@ -20,7 +20,7 @@ use super::oci::intent::{Built, Intent, Wanted};
 use super::scan::{GitScan, LaunchScan};
 use super::types::{
     ArgvError, CommonArgs, INSTALLATION_LABEL, ImageRef, InferenceSpec, OverlayDirs, Role,
-    SessionPaths, input,
+    SessionPaths, WORKDIR, input,
 };
 
 /// The entry point baked into the workspace and harness images.
@@ -187,6 +187,8 @@ impl Argv {
             "--user",
             &format!("{}:{}", c.ids.uid, c.ids.gid),
         ]);
+        // Image-declared volumes are disabled: the image does not add mounts.
+        a.push(["--workdir", WORKDIR, "--image-volume=ignore"]);
         Ok(a)
     }
 

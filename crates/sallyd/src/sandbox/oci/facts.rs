@@ -140,9 +140,9 @@ impl ContainerPaths {
 }
 
 /// The fields of an image's `Config` that reach the OCI config (architect Q101). Not
-/// `deny_unknown_fields`: every effect of any other image field (a `Volumes` entry, say) shows in
-/// `config.json`, where unknown keys and extra mounts are refused. A field used here with the
-/// wrong type refuses.
+/// `deny_unknown_fields`: every effect of any other image field shows in `config.json`, where
+/// unknown keys and extra mounts are refused (image-declared volumes are disabled by the argv's
+/// `--image-volume=ignore`). A field used here with the wrong type refuses.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct ImageConfig {
     /// `NAME=value` pairs.
@@ -151,9 +151,6 @@ pub struct ImageConfig {
     /// Podman prepends it to the command.
     #[serde(rename = "Entrypoint", default)]
     pub entrypoint: Option<Vec<String>>,
-    /// The process's working directory.
-    #[serde(rename = "WorkingDir", default)]
-    pub working_dir: Option<String>,
     /// The stop signal, as the image names it.
     #[serde(rename = "StopSignal", default)]
     pub stop_signal: Option<String>,
@@ -357,7 +354,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.env, Some(vec!["PATH=/bin".to_owned()]));
-        assert_eq!(c.working_dir.as_deref(), Some("/"));
         assert_eq!(c.entrypoint, None);
         let c = ImageConfig::parse(br#"{"Entrypoint":["/e"],"StopSignal":"SIGTERM"}"#).unwrap();
         assert_eq!(c.entrypoint, Some(vec!["/e".to_owned()]));
@@ -365,13 +361,15 @@ mod tests {
         for bad in [
             &br#"{"Env":"PATH=/bin"}"#[..],
             br#"{"Env":[],"Env":[]}"#,
-            br#"{"WorkingDir":1}"#,
+            br#"{"StopSignal":1}"#,
             b"[]",
             b"{} {}",
             b"\xff",
         ] {
             assert!(ImageConfig::parse(bad).is_err(), "{bad:?}");
         }
+        // The working directory is the launcher's, so the image's is not read at all.
+        assert!(ImageConfig::parse(br#"{"WorkingDir":1}"#).is_ok());
         let full = format!("{{}}{}", " ".repeat(MAX_INSPECT - 2));
         assert_eq!(full.len(), MAX_INSPECT);
         assert!(ImageConfig::parse(full.as_bytes()).is_ok());
