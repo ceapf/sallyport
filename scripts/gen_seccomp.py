@@ -100,7 +100,7 @@ def with_sockets(profile: dict[str, Any], families: list[int]) -> dict[str, Any]
             "names": ["socketpair"],
             "action": "SCMP_ACT_ALLOW",
             "args": [{"index": 0, "value": AF_UNIX, "valueTwo": 0, "op": "SCMP_CMP_EQ"}],
-            "comment": "socketpair: address family 1 only (ARCHITECTURE section 3.4).",
+            "comment": "socketpair: address family 1 only (ARCHITECTURE section 3.4; RT-NET-12).",
         }
     )
     return {**profile, "syscalls": rules}

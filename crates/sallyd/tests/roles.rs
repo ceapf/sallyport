@@ -6,8 +6,9 @@
 //! builders, created and started with hermetic podman exactly as the argv says (their launchers,
 //! #123, are tested in `tests/oci.rs` and `tests/role_launch.rs`). The probe is
 //! `tests/redteam/probe/probe.c`. Every refusal must be `ENOSYS` (38), the seccomp profiles'
-//! default action: the kernel never returns it for `socket`,
-//! `unshare`, `clone` or `clone3` itself, so the profile is what refused. That holds for
+//! default action: the kernel never returns it for `socket`, `socketpair`, `unshare`, `clone`
+//! or `clone3` itself (an unsupported family or protocol is `EAFNOSUPPORT`, `EPROTONOSUPPORT`
+//! or `EOPNOTSUPP`), so the profile is what refused. That holds for
 //! `clone3` only from kernel 5.3 on, where the syscall exists; [`kernel_has_clone3`] checks it.
 //! The fixture is `common::container`; these tests never skip.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -150,7 +151,11 @@ async fn finish(x: &Lx, boxes: Vec<Boxed>) {
 /// hypervisor host) and netlink protocols other than `NETLINK_ROUTE`. Inference allows `AF_UNIX`
 /// only; workspace and harness add `AF_INET`, `AF_INET6` and `NETLINK_ROUTE` (loopback only:
 /// `--network=none`). Raw IP sockets pass the family filter but need `CAP_NET_RAW`, which no
-/// role has.
+/// role has. `socketpair` is allowed for `AF_UNIX` only, in every role: its control makes
+/// `AF_UNIX` stream and datagram pairs, and every other family (the denied ones, `AF_INET`,
+/// `AF_INET6`, `AF_NETLINK`) must fail with `ENOSYS`. The kernel answers an unsupported
+/// `socketpair` family with `EOPNOTSUPP` or `EAFNOSUPPORT`, never `ENOSYS`, so that errno can
+/// only come from the profile.
 #[test]
 fn rt_net_12_socket_families_outside_the_role_list_fail() {
     rt().block_on(async {

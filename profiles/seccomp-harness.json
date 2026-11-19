@@ -798,7 +798,7 @@
      "valueTwo": 0
     }
    ],
-   "comment": "socketpair: address family 1 only (ARCHITECTURE section 3.4).",
+   "comment": "socketpair: address family 1 only (ARCHITECTURE section 3.4; RT-NET-12).",
    "names": [
     "socketpair"
    ]
