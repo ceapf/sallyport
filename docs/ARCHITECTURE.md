@@ -1290,7 +1290,16 @@ sallyport/
   cannot take every slot; both bounds hold, and a slot is held only while a lookup is in flight.
   A lookup over either bound is `resolve-failed` at once. Making both numbers configurable: #86.
   Each session's accept loop holds at most `max_connections + 64` accepted connections (the
-  extra ones are answered 429); past that it stops accepting until one ends. Descriptors are
+  extra ones are answered 429); past that it stops accepting until one ends. Admission rate:
+  each session's `net.sock` admits at most 20 connections a second on average, 40 back to back
+  (`ADMISSION_RATE`, `ADMISSION_BURST`: the same figures as `agent.sock`, by choice; 40 is at
+  least the default `max_connections`). The rate is taken after the in-flight slot and before
+  anything else, the 429 included: an accepted connection over it is closed at once, unread, with
+  no reply and no entry of its own, and its slot is freed. An over-rate connection is closed
+  unread and has no effect; it is counted, not entered one by one: one `egress.shed` per second
+  (`SHED_INTERVAL`) while any were closed, and one at the stop for an unfinished second. A count
+  whose entry fails to append is kept and goes into the next one. Broker-originated connections
+  (the fetch connector) never cross `net.sock` and draw nothing from the rate. Descriptors are
   bounded across sessions (#48, architect Q45): `sallyd` raises its soft `NOFILE` to the hard
   limit (at most 2^20), and sessions together may reserve half of it. A session costs
   `2 * (network.max_connections + 64) + 64` (the proxy's two descriptors per connection, plus
@@ -1338,6 +1347,10 @@ sallyport/
   - `egress.limit` (decision `deny`): as `egress.deny`, for `too-many-connections` (decided at
     accept: `{reason}` only), `head-too-large`, `head-timeout`, `request-too-large` and
     `response-too-large`.
+  - `egress.shed` (decision `deny`): `{reason: "rate", closed, window_ms}`, after the closes it
+    counts: `closed` connections over the admission rate were closed unread in the `window_ms`
+    milliseconds since the first of them. Written when that window is 1 s old, or at the stop;
+    never while none was closed.
   - Inside an intercepted tunnel a refusal carries `{reason, host, port, target, target_bytes,
     target_cut}` (`response-too-large` adds `part: "head" | "body"`) and is written before the
     reply or the cut. Where hyper answers by itself before the proxy sees the head (a head over
