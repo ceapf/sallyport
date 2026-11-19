@@ -5,8 +5,8 @@
 //! - it carries [`INSTALLATION_LABEL`] equal to this installation's id. A container with no
 //!   label, or another installation's (another daemon, a test run), is never removed. The listing
 //!   is pre-filtered by podman on the label, and the value is compared again here;
-//! - its name is a session container's (`sp-ws-<id>`, `sp-h-<id>`) with a plain id inside the
-//!   sweep's scope;
+//! - its name is a session container's (`sp-ws-<id>`, `sp-h-<id>`) or its mount-link probe's
+//!   (`sp-probe-ws-<id>`, `sp-probe-h-<id>`) with a plain id inside the sweep's scope;
 //! - no live session owns that id.
 //!
 //! The listing is one line per container, `<full ID> <name> <installation label>`, each a JSON
@@ -14,9 +14,9 @@
 //! newline cannot forge a line (PROBE_NOTES). Only that one label is asked for, never the whole
 //! set: a container's labels include its image's, so a line would otherwise be as long as an
 //! image author likes (architect Q307). A line is daemon-bounded (ID, name and UUID): at most
-//! 179 bytes for a session container, 182 for an inference instance (`sp-infer-`), so about
-//! 360 containers fit under the launcher's 64 KiB stdout cap; a longer listing is refused there
-//! (#173). The live sessions are bounded so their worst listing fits with room to spare
+//! 185 bytes for a session container or its probe (`sp-probe-ws-`), 188 for an inference
+//! instance's probe (`sp-probe-infer-`), so about 350 containers fit under the launcher's 64 KiB
+//! stdout cap; a longer listing is refused there (#173). The live sessions are bounded so their worst listing fits with room to spare
 //! ([`super::budget::MAX_LIVE_SESSIONS`], checked when a launch reserves its id; the relation
 //! is tested below). Inference instances and outside-made containers are not counted, which
 //! leaves a residual (TODO(#134)). A line that does not parse fails the whole sweep, never
@@ -29,10 +29,13 @@ use serde_json::Value;
 
 use super::types::{INSTALLATION_LABEL, Installation};
 
-/// The name prefixes of session containers. An inference instance (`sp-infer-<id>`) is not a
-/// session: its liveness is not in `Sessions`, so it is not swept here. TODO(#134): sweep
-/// instances against their own liveness set before any RPC reaches the inference launch.
-pub const SESSION_PREFIXES: [&str; 2] = ["sp-ws-", "sp-h-"];
+/// The name prefixes of session containers, and of their mount-link probes (security review): a
+/// probe left by a killed launch carries its session's id, so it is swept exactly when that
+/// session is not live, never while its launch runs. An inference instance (`sp-infer-<id>`), and
+/// its probe (`sp-probe-infer-<id>`), is not a session: its liveness is not in `Sessions`, so it
+/// is not swept here. TODO(#134): sweep instances and their probes against their own liveness
+/// set before any RPC reaches the inference launch.
+pub const SESSION_PREFIXES: [&str; 4] = ["sp-ws-", "sp-h-", "sp-probe-ws-", "sp-probe-h-"];
 
 /// `podman ps` arguments listing this installation's containers, one per line.
 #[must_use]
@@ -161,7 +164,7 @@ mod tests {
     use crate::sandbox::budget::MAX_LIVE_SESSIONS;
     use crate::sandbox::commands::OUTPUT_CAP;
     use crate::sandbox::launch::stdout_text;
-    use crate::sandbox::types::SessionId;
+    use crate::sandbox::types::{Role, SessionId};
 
     const OWN: &str = "0123abcd-ef01-4234-8567-89abcdef0123";
     const OTHER: &str = "fedcba98-7654-4321-8fed-cba987654321";
@@ -358,18 +361,20 @@ mod tests {
         }
     }
 
-    /// The longest listing line a session container can have, newline included: a full ID, the
-    /// longer session prefix with a 64-character id, and an installation UUID, each a JSON
-    /// string. It and [`line`] follow the `--format` of [`ps_args`], which
-    /// `the_listing_asks_podman_for_this_installations_label` pins: a change there is a change
-    /// here.
-    const MAX_PS_LINE: usize = 179;
+    /// The longest listing line a session container or its probe can have, newline included: a
+    /// full ID, the longest session prefix (a probe's) with a 64-character id, and an
+    /// installation UUID, each a JSON string. It and [`line`] follow the `--format` of
+    /// [`ps_args`], which `the_listing_asks_podman_for_this_installations_label` pins: a change
+    /// there is a change here.
+    const MAX_PS_LINE: usize = 185;
 
-    /// An inference instance's container prefix: listed by the sweep, not swept, not counted.
-    const INFERENCE_PREFIX: &str = "sp-infer-";
+    /// An inference instance's probe prefix, the longest of any: listed by the sweep, not swept,
+    /// not counted.
+    const INFERENCE_PROBE_PREFIX: &str = "sp-probe-infer-";
 
-    /// Listing lines counted per live session: twice its two containers ([`SESSION_PREFIXES`]),
-    /// the factor of two being margin.
+    /// Listing lines counted per live session: twice its two containers (a workspace and a
+    /// harness, each a probe until the probe is removed before its real `create`), the factor of
+    /// two being margin.
     const LINES_PER_SESSION: usize = 4;
 
     /// Listing room no live session accounts for: inference instances, which the sweep lists but
@@ -394,9 +399,41 @@ mod tests {
             .max()
             .unwrap();
         assert_eq!(longest, MAX_PS_LINE);
-        // An inference instance's line, uncounted and in the headroom, is 3 bytes longer.
-        let infer = listed(&format!("{INFERENCE_PREFIX}{id}")).len();
+        // An inference probe's line, uncounted and in the headroom, is 3 bytes longer.
+        let infer = listed(&format!("{INFERENCE_PROBE_PREFIX}{id}")).len();
         assert_eq!(infer, MAX_PS_LINE + 3);
+    }
+
+    /// The sweep knows every session role's probe prefix, and only those: an inference probe is
+    /// not a session's.
+    #[test]
+    fn the_session_prefixes_are_the_session_roles_and_their_probes() {
+        use crate::sandbox::check::container_prefix;
+        use crate::sandbox::mount_probe::probe_prefix;
+        let want = [
+            container_prefix(Role::Workspace),
+            container_prefix(Role::Harness),
+            probe_prefix(Role::Workspace),
+            probe_prefix(Role::Harness),
+        ];
+        assert_eq!(SESSION_PREFIXES, want);
+        assert_eq!(probe_prefix(Role::Inference), INFERENCE_PROBE_PREFIX);
+    }
+
+    /// A probe left by a killed launch is swept with its session's id, and only once that
+    /// session is not live; an inference probe never.
+    #[test]
+    fn a_probe_is_swept_by_its_sessions_liveness() {
+        let listing = [
+            line("sp-probe-ws-a-1", Some(OWN)),
+            line("sp-probe-h-a-2", Some(OWN)),
+            line("sp-probe-ws-a-3", Some(OWN)), // live
+            line("sp-probe-infer-a-4", Some(OWN)),
+        ]
+        .join("\n");
+        let o = orphans(&listing, &own(), "", |id| id == "a-3").unwrap();
+        let got: Vec<_> = o.iter().map(|o| (o.name.as_str(), o.id.as_str())).collect();
+        assert_eq!(got, [("sp-probe-ws-a-1", "a-1"), ("sp-probe-h-a-2", "a-2")]);
     }
 
     #[test]
@@ -416,7 +453,7 @@ mod tests {
         let block = |n: usize| -> String {
             (0..LINES_PER_SESSION)
                 .map(|k| {
-                    let l = listed(&format!("sp-ws-{:a<64}", format!("{n}-{k}")));
+                    let l = listed(&format!("sp-probe-ws-{:a<64}", format!("{n}-{k}")));
                     assert_eq!(l.len(), MAX_PS_LINE, "{l}");
                     l
                 })

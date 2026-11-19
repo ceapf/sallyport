@@ -190,23 +190,21 @@ async fn launch_image(
         .map_err(|e| format!("{e:?}"))
 }
 
-/// Control (#122) for the two image tests below: the product workspace argv for `mode` from
-/// `image`, with `leave_out` taken out, started by hermetic podman; the host folder `dir` must
-/// then gain `entry`. The container is removed and the entry deleted, so the host folder is as
-/// it was for the product leg.
+/// Control (#122) for the image tests below: the product workspace argv for `v` (labelled
+/// `mode`) from `image`, with `leave_out` taken out, started by hermetic podman; the host folder
+/// `dir` must then gain `entry`. The container is removed and the entry deleted, so the host
+/// folder is as it was for the product leg.
 async fn image_control(
     x: &Lx,
     dir: &Path,
     image: &sallyd::sandbox::ImageRef,
-    mode: &str,
+    (v, mode): (&sally_core::manifest::ValidatedManifest, &str),
     leave_out: LeaveOut<'_>,
     entry: &str,
 ) {
     let before = tree(dir);
     let tag = format!("c{mode}");
-    let id = x
-        .control_workspace_image(&manifest(x, mode), &tag, image, leave_out)
-        .await;
+    let id = x.control_workspace_image(v, &tag, image, leave_out).await;
     let after = tree(dir);
     x.hermetic(&["rm".to_owned(), "-f".to_owned(), "-v".to_owned(), id])
         .await;
@@ -232,7 +230,16 @@ fn rt_fs_02_the_image_working_directory_creates_nothing_in_a_mount() {
         host_file(&x, "code/myproject/README", "keep\n");
         let image = image_with("WORKDIR /workspace/p/made-at-init\n");
         for mode in ["ro", "brokered"] {
-            image_control(&x, &dir, &image, mode, LeaveOut::Workdir, "made-at-init").await;
+            let v = manifest(&x, mode);
+            image_control(
+                &x,
+                &dir,
+                &image,
+                (&v, mode),
+                LeaveOut::Workdir,
+                "made-at-init",
+            )
+            .await;
             let before = tree(&dir);
             assert!(before.contains(&"README".to_owned()), "control: {before:?}");
             let got = launch_image(&x, &manifest(&x, mode), image.clone(), mode).await;
@@ -265,7 +272,8 @@ fn rt_fs_02_an_image_volume_creates_nothing_in_a_mount() {
         host_file(&x, "code/myproject/README", "keep\n");
         let image = image_with("VOLUME /workspace/p/vol\n");
         for mode in ["ro", "brokered"] {
-            image_control(&x, &dir, &image, mode, LeaveOut::ImageVolume, "vol").await;
+            let v = manifest(&x, mode);
+            image_control(&x, &dir, &image, (&v, mode), LeaveOut::ImageVolume, "vol").await;
             let before = tree(&dir);
             assert!(before.contains(&"README".to_owned()), "control: {before:?}");
             let got = launch_image(&x, &manifest(&x, mode), image.clone(), mode).await;
@@ -280,6 +288,97 @@ fn rt_fs_02_an_image_volume_creates_nothing_in_a_mount() {
             );
             assert!(started.is_ok(), "{mode}: {started:?}");
         }
+    });
+}
+
+/// Two mounts: `~/code/myproject` at `a` in `mode`, then `~/code/other` at `b` read-only.
+fn two_mounts(x: &Lx, (a, mode): (&str, &str), b: &str) -> sally_core::manifest::ValidatedManifest {
+    x.f.load(&mounts(&[
+        mount("~/code/myproject", a, mode),
+        mount("~/code/other", b, "ro"),
+    ]))
+}
+
+/// A launch from `image` that the mount-link probe must refuse at `dest`: refused with the
+/// probe's own reason naming `dest` (not the post-init mount check, not a podman error), both
+/// host folders unchanged, and no container of the fixture left, the probe included.
+async fn refused_at(
+    x: &Lx,
+    dirs: &[std::path::PathBuf; 2],
+    (v, image, tag): (
+        &sally_core::manifest::ValidatedManifest,
+        &sallyd::sandbox::ImageRef,
+        &str,
+    ),
+    dest: &str,
+) {
+    let before: Vec<_> = dirs.iter().map(|d| tree(d)).collect();
+    let got = launch_image(x, v, image.clone(), tag).await;
+    let after: Vec<_> = dirs.iter().map(|d| tree(d)).collect();
+    let got = match got {
+        Ok(r) => {
+            x.stop(r).await;
+            Err("the launch started".to_owned())
+        }
+        Err(e) => Ok(e),
+    };
+    assert_eq!(after, before, "{tag}: a host folder changed ({got:?})");
+    let err = got.unwrap_or_else(|e| panic!("{tag}: {e}"));
+    assert!(
+        err.contains(&format!("MountLink(Refused {{ dest: \"{dest}\"")),
+        "{tag}: not the probe's refusal at {dest}: {err}"
+    );
+    assert!(!x.listed(), "{tag}: a container is left");
+}
+
+/// RT-FS-02, mount placement (security review): an image whose root filesystem holds a link at
+/// or above a mount destination creates nothing in any host folder; the launcher's mount-link
+/// probe walks every destination before the runtime places any mount and refuses.
+///
+/// - Link above (`/workspace/b -> /workspace/a`, mounts `/workspace/a` then `/workspace/b/c`),
+///   for an `ro`, a `brokered` and an `rw` first mount. Control (#122), asserted first in each
+///   mode: the same product argv run outside the launcher (no probe) makes the runtime create
+///   `c` in the first mount's host folder. Product leg: refused at `/workspace/b/c`.
+/// - Allow: the same directories with no link launch, and nothing changes.
+/// - Link at (`/workspace/q -> /workspace/p/made-by-link`, mounts `/workspace/p`,
+///   `/workspace/q`): refused at `/workspace/q`. For this image the runtime also refuses at
+///   `init` (measured), so the host-unchanged clause does not depend on the probe here; the
+///   probe's refusal reason is what this leg holds. It rests on the link-above control.
+/// - A link at `/tmp` (to a path below the first mount): refused at `/tmp`, so destinations that
+///   are not the manifest's are walked too. It rests on the link-above control.
+#[test]
+fn rt_fs_02_an_image_link_at_or_above_a_mount_creates_nothing() {
+    rt().block_on(async {
+        let x = Lx::new();
+        host_file(&x, "code/myproject/README", "keep\n");
+        host_file(&x, "code/other/README", "keep\n");
+        let dirs = [home(&x).join("code/myproject"), home(&x).join("code/other")];
+        let above = image_with("RUN mkdir -p /workspace/a && ln -s /workspace/a /workspace/b\n");
+        for mode in ["ro", "brokered", "rw"] {
+            let v = two_mounts(&x, ("/workspace/a", mode), "/workspace/b/c");
+            image_control(&x, &dirs[0], &above, (&v, mode), LeaveOut::Probe, "c").await;
+            refused_at(&x, &dirs, (&v, &above, mode), "/workspace/b/c").await;
+        }
+
+        let v = two_mounts(&x, ("/workspace/a", "ro"), "/workspace/b/c");
+        let plain = image_with("RUN mkdir -p /workspace/a /workspace/b\n");
+        let before: Vec<_> = dirs.iter().map(|d| tree(d)).collect();
+        let r = launch_image(&x, &v, plain, "allow")
+            .await
+            .expect("allow: no link launches");
+        x.stop(r).await;
+        let after: Vec<_> = dirs.iter().map(|d| tree(d)).collect();
+        assert_eq!(after, before, "allow: a host folder changed");
+
+        let at =
+            image_with("RUN mkdir -p /workspace && ln -s /workspace/p/made-by-link /workspace/q\n");
+        let v = two_mounts(&x, ("/workspace/p", "ro"), "/workspace/q");
+        refused_at(&x, &dirs, (&v, &at, "at"), "/workspace/q").await;
+
+        let tmp =
+            image_with("RUN mkdir -p /workspace/a && rm -rf /tmp && ln -s /workspace/a/tmp /tmp\n");
+        let v = two_mounts(&x, ("/workspace/a", "ro"), "/workspace/b/c");
+        refused_at(&x, &dirs, (&v, &tmp, "tmp"), "/tmp").await;
     });
 }
 

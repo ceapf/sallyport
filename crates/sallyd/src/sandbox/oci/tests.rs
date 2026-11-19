@@ -915,6 +915,46 @@ fn mounts_are_exactly_the_intended_set() {
     });
 }
 
+/// The mount-link probe walks exactly the destinations the verifier holds the config to: podman's
+/// standard set, `/tmp` exactly when the argv mounts a tmpfs there, and every `-v` guest path,
+/// each once.
+#[test]
+fn the_probe_destinations_are_the_keys_the_verifier_wants() {
+    use std::collections::BTreeSet;
+    let f = facts();
+    let keys = |i: &Intent| -> BTreeSet<String> {
+        super::mounts::wanted(i, &f).unwrap().into_keys().collect()
+    };
+    let with_tmp = intent();
+    let mut no_tmp = intent();
+    no_tmp.tmp = None;
+    let mut no_mounts = intent();
+    no_mounts.mounts.clear();
+    for i in [&with_tmp, &no_tmp, &no_mounts] {
+        let d = super::mounts::destinations(i);
+        let set: BTreeSet<String> = d.iter().cloned().collect();
+        assert_eq!(set.len(), d.len(), "each destination once: {d:?}");
+        assert_eq!(set, keys(i));
+    }
+    let has = |i: &Intent, p: &str| super::mounts::destinations(i).iter().any(|d| d == p);
+    assert!(has(&with_tmp, "/tmp"));
+    assert!(!has(&no_tmp, "/tmp"));
+    for g in ["/workspace/p", "/workspace/p/.git", "/run/sallyport"] {
+        assert!(has(&with_tmp, g), "{g}");
+        assert!(!has(&no_mounts, g), "{g}");
+    }
+    for s in [
+        "/proc",
+        "/dev",
+        "/etc/passwd",
+        "/run/.containerenv",
+        super::process::INIT_GUEST,
+    ] {
+        assert!(has(&no_mounts, s), "{s}");
+    }
+    assert_eq!(super::mounts::destinations(&no_mounts).len(), 13);
+}
+
 /// The `oci_config` fuzz target's seed is a config the verifier accepts for this fixture (the
 /// target's fixture is the same), so the fuzzer starts from the accepting path.
 #[test]

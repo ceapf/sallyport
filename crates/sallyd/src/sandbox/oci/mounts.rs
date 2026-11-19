@@ -23,7 +23,7 @@ enum Src {
 
 /// One mount the config must hold.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Want {
+pub(super) struct Want {
     kind: &'static str,
     source: Src,
     options: BTreeSet<String>,
@@ -40,136 +40,133 @@ fn want(kind: &'static str, source: &str, options: &[&str]) -> Want {
 /// Options of podman's own read-only binds from the container's userdata directories.
 const USERDATA: [&str; 6] = ["bind", "rprivate", "ro", "nosuid", "noexec", "nodev"];
 
-/// Podman's standard mounts for every role (4.9.3, `--init`, `--no-hosts`, `--network=none`).
-fn standard(f: &Facts) -> Vec<(String, Want)> {
+/// The destinations of podman's standard mounts, in the order of [`standard_wants`].
+const STANDARD: [&str; 12] = [
+    "/proc",
+    "/sys",
+    "/sys/fs/cgroup",
+    "/dev",
+    "/dev/pts",
+    "/dev/mqueue",
+    "/dev/shm",
+    "/etc/passwd",
+    "/etc/group",
+    "/run/.containerenv",
+    "/etc/hostname",
+    INIT_GUEST,
+];
+
+/// What each of [`STANDARD`] must be, in its order.
+fn standard_wants(f: &Facts) -> [Want; 12] {
     let (s, r) = (&f.paths.static_dir, &f.paths.run_dir);
     let nse = ["nosuid", "noexec", "nodev"];
-    vec![
-        ("/proc".into(), want("proc", "proc", &nse)),
-        (
-            "/sys".into(),
-            want("sysfs", "sysfs", &["nosuid", "noexec", "nodev", "ro"]),
+    [
+        want("proc", "proc", &nse),
+        want("sysfs", "sysfs", &["nosuid", "noexec", "nodev", "ro"]),
+        want(
+            "cgroup",
+            "cgroup",
+            &["rprivate", "nosuid", "noexec", "nodev", "relatime", "ro"],
         ),
-        (
-            "/sys/fs/cgroup".into(),
-            want(
-                "cgroup",
-                "cgroup",
-                &["rprivate", "nosuid", "noexec", "nodev", "relatime", "ro"],
-            ),
+        want(
+            "tmpfs",
+            "tmpfs",
+            &["nosuid", "strictatime", "mode=755", "size=65536k", "ro"],
         ),
-        (
-            "/dev".into(),
-            want(
-                "tmpfs",
-                "tmpfs",
-                &["nosuid", "strictatime", "mode=755", "size=65536k", "ro"],
-            ),
+        want(
+            "devpts",
+            "devpts",
+            &[
+                "nosuid",
+                "noexec",
+                "newinstance",
+                "ptmxmode=0666",
+                "mode=0620",
+                "gid=5",
+            ],
         ),
-        (
-            "/dev/pts".into(),
-            want(
-                "devpts",
-                "devpts",
-                &[
-                    "nosuid",
-                    "noexec",
-                    "newinstance",
-                    "ptmxmode=0666",
-                    "mode=0620",
-                    "gid=5",
-                ],
-            ),
-        ),
-        ("/dev/mqueue".into(), want("mqueue", "mqueue", &nse)),
-        (
-            "/dev/shm".into(),
-            want("bind", &format!("{s}/shm"), &USERDATA),
-        ),
-        (
-            "/etc/passwd".into(),
-            want("bind", &format!("{s}/passwd"), &USERDATA),
-        ),
-        (
-            "/etc/group".into(),
-            want("bind", &format!("{s}/group"), &USERDATA),
-        ),
-        (
-            "/run/.containerenv".into(),
-            want("bind", &format!("{r}/.containerenv"), &USERDATA),
-        ),
-        (
-            "/etc/hostname".into(),
-            want("bind", &f.paths.hostname, &USERDATA),
-        ),
-        (
-            INIT_GUEST.into(),
-            want("bind", &f.init, &["bind", "ro", "rprivate"]),
-        ),
+        want("mqueue", "mqueue", &nse),
+        want("bind", &format!("{s}/shm"), &USERDATA),
+        want("bind", &format!("{s}/passwd"), &USERDATA),
+        want("bind", &format!("{s}/group"), &USERDATA),
+        want("bind", &format!("{r}/.containerenv"), &USERDATA),
+        want("bind", &f.paths.hostname, &USERDATA),
+        want("bind", &f.init, &["bind", "ro", "rprivate"]),
     ]
 }
 
-/// Everything the config must mount, by destination.
-fn wanted(i: &Intent, f: &Facts) -> Result<BTreeMap<String, Want>, Mismatch> {
-    let mut all = standard(f);
-    if let Some((size, exec)) = i.tmp {
-        let size = format!("size={size}");
-        let exec = if exec { "exec" } else { "noexec" };
-        all.push((
-            "/tmp".into(),
+/// Every mount destination of a container with this intent: podman's standard set, `/tmp` when
+/// the argv mounts a tmpfs there, and every `-v` guest path. The verifier's [`wanted`] has
+/// exactly these keys (tested); the mount-link probe walks them before the real `create`.
+#[must_use]
+pub fn destinations(i: &Intent) -> Vec<String> {
+    STANDARD
+        .iter()
+        .map(|d| (*d).to_owned())
+        .chain(i.tmp.map(|_| "/tmp".to_owned()))
+        .chain(i.mounts.iter().map(|m| match m {
+            Wanted::Bind { guest, .. } | Wanted::Overlay { guest, .. } => guest.clone(),
+        }))
+        .collect()
+}
+
+/// The `--tmpfs /tmp` mount.
+fn tmp_want(size: u64, exec: bool) -> Want {
+    let size = format!("size={size}");
+    let exec = if exec { "exec" } else { "noexec" };
+    want(
+        "tmpfs",
+        "tmpfs",
+        &[
+            "rw",
+            exec,
+            "nosuid",
+            "nodev",
+            &size,
+            "rprivate",
+            "tmpcopyup",
+        ],
+    )
+}
+
+/// A `-v` mount.
+fn mount_want(m: &Wanted) -> Want {
+    match m {
+        Wanted::Bind { host, rw, .. } => {
+            let access = if *rw { "rw" } else { "ro" };
             want(
-                "tmpfs",
-                "tmpfs",
-                &[
-                    "rw",
-                    exec,
-                    "nosuid",
-                    "nodev",
-                    &size,
-                    "rprivate",
-                    "tmpcopyup",
-                ],
-            ),
-        ));
-    }
-    for m in &i.mounts {
-        all.push(match m {
-            Wanted::Bind { host, guest, rw } => {
-                let access = if *rw { "rw" } else { "ro" };
-                (
-                    guest.clone(),
-                    want(
-                        "bind",
-                        host,
-                        &[access, "nosuid", "nodev", "bind", "rprivate"],
-                    ),
-                )
-            }
-            Wanted::Overlay {
+                "bind",
                 host,
-                guest,
-                upper,
-                work,
-            } => (
-                guest.clone(),
-                Want {
-                    kind: "overlay",
-                    source: Src::Merge,
-                    options: [
-                        format!("lowerdir={host}"),
-                        format!("upperdir={upper}"),
-                        format!("workdir={work}"),
-                        "private".into(),
-                        "userxattr".into(),
-                    ]
-                    .into_iter()
-                    .collect(),
-                },
-            ),
-        });
+                &[access, "nosuid", "nodev", "bind", "rprivate"],
+            )
+        }
+        Wanted::Overlay {
+            host, upper, work, ..
+        } => Want {
+            kind: "overlay",
+            source: Src::Merge,
+            options: [
+                format!("lowerdir={host}"),
+                format!("upperdir={upper}"),
+                format!("workdir={work}"),
+                "private".into(),
+                "userxattr".into(),
+            ]
+            .into_iter()
+            .collect(),
+        },
     }
+}
+
+/// Everything the config must mount, by destination: [`destinations`], each with what it must
+/// be (built in the same order).
+pub(super) fn wanted(i: &Intent, f: &Facts) -> Result<BTreeMap<String, Want>, Mismatch> {
+    let wants = standard_wants(f)
+        .into_iter()
+        .chain(i.tmp.map(|(size, exec)| tmp_want(size, exec)))
+        .chain(i.mounts.iter().map(mount_want));
     let mut out = BTreeMap::new();
-    for (dest, w) in all {
+    for (dest, w) in destinations(i).into_iter().zip(wants) {
         if out.insert(dest.clone(), w).is_some() {
             // The argv checker refuses two mounts at one guest path; this is a bug guard.
             return Err(Mismatch::new(format!("mounts[{dest}]"), "intended twice"));

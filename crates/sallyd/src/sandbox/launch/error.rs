@@ -8,6 +8,7 @@ use crate::egress::inject::CredentialsError;
 use crate::egress::net::EgressError;
 use crate::sandbox::dirs::DirError;
 use crate::sandbox::inside::Mismatch;
+use crate::sandbox::mount_probe::Refused;
 use crate::sandbox::overlap::{HarnessClaimError, ReserveError};
 use crate::sandbox::podman::PodmanError;
 use crate::sandbox::scan::ScanError;
@@ -38,6 +39,21 @@ pub enum LaunchError {
     /// A mount inside the container is not the pinned object.
     #[error("sandbox.mount_mismatch: {0}")]
     MountMismatch(Mismatch),
+    /// The image's root filesystem holds a link at or above a mount destination, or a
+    /// destination that is neither a directory nor a regular file (security review): found in
+    /// the mount-link probe, before the runtime places any mount. Names the guest destination
+    /// only.
+    #[error("image link at a mount destination: {0}")]
+    MountLink(Refused),
+    /// The mount-link probe could not be created, inited, read, walked or removed, or ran
+    /// another image than the container: the launch never goes on without it.
+    #[error("mount-link probe {step}: {msg}")]
+    Probe {
+        /// The step that failed (`create`, `init`, `inspect`, `walk`, `rm`, `image`).
+        step: &'static str,
+        /// Podman's error, or what was found.
+        msg: String,
+    },
     /// The OCI config podman generated is not what the argv intended (Task 14, RT-SUP-04): the
     /// first differing field, never the config.
     #[error("sandbox.config_mismatch: {0}")]
@@ -138,6 +154,8 @@ impl LaunchError {
             | Self::Dirs(_)
             | Self::Argv(_)
             | Self::Podman(_)
+            | Self::MountLink(_)
+            | Self::Probe { .. }
             | Self::NotRunning(_)
             | Self::DiskSpace(_)
             | Self::CgroupEvents(_)
@@ -171,6 +189,8 @@ impl LaunchError {
             Self::Argv(_) => "argv",
             Self::Podman(_) => "podman-config",
             Self::MountMismatch(_) => "mount-mismatch",
+            Self::MountLink(_) => "mount-link",
+            Self::Probe { .. } => "probe",
             Self::ConfigMismatch(_) => "config-mismatch",
             Self::NotRunning(_) => "not-running",
             Self::DiskSpace(_) => "disk-floor",
@@ -382,6 +402,32 @@ mod tests {
         });
         assert_eq!(m.event(), "sandbox.mount_mismatch");
         assert_eq!(LaunchError::NoDefaultImage.event(), "sandbox.refuse");
+    }
+
+    /// A link found by the mount-link probe and a failed probe step are two refusals, neither a
+    /// mount mismatch; each names only the guest destination or the probe step.
+    #[test]
+    fn a_mount_link_and_a_failed_probe_have_their_own_reasons() {
+        let link = LaunchError::MountLink(Refused {
+            dest: "/workspace/b/c".into(),
+            why: "not reached without a link".into(),
+        });
+        assert_eq!(link.event(), "sandbox.refuse");
+        assert_eq!(link.reason(), "mount-link");
+        assert_eq!(
+            link.to_string(),
+            "image link at a mount destination: /workspace/b/c: not reached without a link"
+        );
+        let probe = LaunchError::Probe {
+            step: "init",
+            msg: "podman init: exit 125".into(),
+        };
+        assert_eq!(probe.event(), "sandbox.refuse");
+        assert_eq!(probe.reason(), "probe");
+        assert_eq!(
+            probe.to_string(),
+            "mount-link probe init: podman init: exit 125"
+        );
     }
 
     #[test]

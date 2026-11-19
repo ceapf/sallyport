@@ -16,7 +16,8 @@ use sally_core::manifest::{
 };
 
 use super::check::{Allowed, Grant, Source, check_argv};
-use super::oci::intent::{Built, Intent, Wanted};
+use super::mount_probe::{probe_argv, probe_name};
+use super::oci::intent::{Built, Intent, Probe, Wanted};
 use super::scan::{GitScan, LaunchScan};
 use super::types::{
     ArgvError, CommonArgs, INSTALLATION_LABEL, ImageRef, InferenceSpec, OverlayDirs, Role,
@@ -137,6 +138,8 @@ fn git_rel(p: &Path, what: &str) -> Result<String, ArgvError> {
 struct Argv {
     args: Vec<String>,
     intent: Intent,
+    /// The container name (`--name`).
+    name: String,
 }
 
 impl Argv {
@@ -146,6 +149,7 @@ impl Argv {
         let mut a = Self {
             args: Vec::new(),
             intent: Intent::begin(role, c.ids, c.profiles.clone()),
+            name: name.clone(),
         };
         a.push([
             "--runtime",
@@ -279,11 +283,18 @@ impl Argv {
         Ok(())
     }
 
+    /// The checked argv, and its mount-link probe's (security review): the same argv with no
+    /// bind, overlay or GPU device and the probe's name, checked under [`Allowed::probe`].
     fn finish(self, allowed: &Allowed) -> Result<Built, ArgvError> {
         check_argv(&self.args, allowed)?;
+        let name = probe_name(&self.name, self.intent.role)
+            .ok_or_else(|| ArgvError::Forbidden(format!("{} has no probe name", self.name)))?;
+        let argv = probe_argv(&self.args, &name, &self.intent.image);
+        check_argv(&argv, &allowed.probe())?;
         Ok(Built {
             argv: self.args,
             intent: self.intent,
+            probe: Probe { name, argv },
         })
     }
 }
@@ -307,6 +318,7 @@ fn allowed(
         sources,
         scratch: scratch.map(Path::to_owned),
         installation: c.installation.clone(),
+        probe: false,
     }
 }
 

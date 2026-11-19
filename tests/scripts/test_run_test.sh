@@ -81,6 +81,14 @@ check "leaked container swept" bash -c "test \$(grep -c '^sp-ws-t' '$tmp/s/conta
 check "other runs untouched (leak)" untouched
 check "containers removed before images" bash -c "awk '/^rmi /{i=NR} /^rm /{r=NR} END{exit !(r && (!i || r < i))}' '$tmp/s/log'"
 
+# A launch's mount-link probe of this run is this run's too; another run's probe is not.
+go 'echo "sp-probe-ws-t$SALLYPORT_TEST_RUN-1-0-a" >>"$STUB/containers"
+    echo "sp-probe-h-tzzzzzzzz-1-0-a" >>"$STUB/containers"'
+check "a leaked probe exits 3 (got $rc)" test "$rc" -eq 3
+check "a leaked probe is swept" bash -c "! grep -qE '^sp-probe-ws-t[a-z0-9]{8}-1-0-a\$' '$tmp/s/containers'"
+check "another run's probe is kept" grep -qxF 'sp-probe-h-tzzzzzzzz-1-0-a' "$tmp/s/containers"
+check "other runs untouched (probe)" untouched
+
 # Command failure keeps its own status; leftovers are still swept.
 go "$own exit 7"
 check "command failure keeps its status (got $rc)" test "$rc" -eq 7

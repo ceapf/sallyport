@@ -117,6 +117,7 @@ fn scans_must_cover_each_rw_mount_exactly_once() {
             crate::sandbox::UserIds { uid: 1, gid: 1 },
             dir.clone(),
         ),
+        name: "sp-ws-s".into(),
     };
     let paths = SessionPaths::new(
         super::super::types::SessionId::parse("s").unwrap(),

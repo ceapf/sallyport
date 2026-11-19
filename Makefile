@@ -146,7 +146,7 @@ MUTANTS_WIDE_CORE := $(addprefix crates/sally-core/src/,manifest/image.rs manife
                      hf/mod.rs hf/error.rs hf/names.rs hf/list.rs hf/plan.rs hf/head.rs)
 MUTANTS_WIDE_SALLYD := $(addprefix crates/sallyd/src/sandbox/,argv.rs check.rs types.rs profiles.rs \
                        overlap.rs scan.rs images.rs changes.rs cgroup.rs dirs.rs podman.rs binaries.rs \
-                       disk.rs stage.rs \
+                       disk.rs stage.rs mount_probe.rs \
                        launch/error.rs launch/parts.rs budget.rs orphans.rs oci/mod.rs oci/config.rs oci/facts.rs \
                        oci/intent.rs oci/linux.rs oci/mounts.rs oci/process.rs oci/seccomp.rs) \
                        $(addprefix crates/sallyd/src/daemon/,mod.rs crash.rs startup.rs stale.rs install.rs) \
@@ -240,7 +240,7 @@ doctor:
 REDTEAM_FILTER := test(/(^|::)rt_/)
 REDTEAM_WSL_TEST := rt_fs_11_wsl_a_windows_executable_does_not_reach_windows
 REDTEAM_WSL_FILTER := test(=$(REDTEAM_WSL_TEST))
-REDTEAM_COUNT := 179
+REDTEAM_COUNT := 180
 REDTEAM_LISTS := target/redteam-lists
 redteam:
 	@v=$$(podman info --format '{{.Host.CgroupsVersion}}'); \
