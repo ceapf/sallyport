@@ -632,6 +632,9 @@ impl Lx {
             // launcher's lines too (`session.closed` not audited, for one).
             oplog: oplog.clone(),
             installation: installation.clone(),
+            // A panic in a retried cleanup is not what these tests watch: a test that waits on
+            // the cleanup fails on its own bound.
+            crash: sallyd::daemon::crash::CrashReporter::channel().0,
         });
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
