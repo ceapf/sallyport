@@ -53,58 +53,67 @@ pub(super) fn check_filesystem(m: &Manifest, env: &HostEnv, d: &mut Diags) -> Ve
         return Vec::new();
     }
     let mut resolved = Vec::with_capacity(mounts.len());
-    for (i, mount) in mounts.iter().enumerate() {
-        let at = |f: &str| format!("filesystem.mounts[{i}].{f}");
-        let host = match paths::check_mount_host(&mount.host, &env.home, &deny) {
-            Ok((real, _)) if mount.mode != MountMode::Ro && in_git_metadata(&real) => {
-                d.error(
-                    at("host"),
-                    Code::ProtectedPath,
-                    format!(
-                        "{:?} is inside git metadata, which your host runs (hooks, config); \
-                         mount the project directory instead, or use mode: ro",
-                        mount.host
-                    ),
-                );
-                None
-            }
-            Ok((real, id)) => match chain_of(&mount.host, &real, id) {
-                Ok(chain) => Some((real, id, chain)),
-                Err((code, msg)) => {
-                    d.error(at("host"), code, msg);
-                    None
-                }
-            },
-            Err((code, msg)) => {
-                d.error(at("host"), code, msg);
-                None
-            }
-        };
+    for (index, mount) in mounts.iter().enumerate() {
+        let at = |f: &str| format!("filesystem.mounts[{index}].{f}");
+        let host = checked_root(&mount.host, mount.mode, &env.home, &deny)
+            .map_err(|(code, msg)| d.error(at("host"), code, msg))
+            .ok();
         if let Err(msg) = paths::check_guest(&mount.guest) {
             d.error(at("guest"), Code::GuestPath, msg);
         }
         let approve = check_approve(m, mount.mode, mount.approve.as_ref(), &at("approve"), d);
         if let Some((host, id, chain)) = host {
-            resolved.push((
-                i,
-                ResolvedMount {
-                    host,
-                    guest: mount.guest.clone(),
-                    mode: mount.mode,
-                    approve,
-                    id,
-                },
+            let mount = ResolvedMount {
+                host,
+                guest: mount.guest.clone(),
+                mode: mount.mode,
+                approve,
+                id,
+            };
+            resolved.push(Checked {
+                index,
+                mount,
                 chain,
-            ));
+            });
         }
     }
     check_overlaps(m, &resolved, d);
-    resolved.into_iter().map(|(_, r, _)| r).collect()
+    resolved.into_iter().map(|c| c.mount).collect()
+}
+
+/// A mount that passed its host checks: its index in the manifest, the resolved mount and its
+/// root's identity chain, which only the overlap check needs.
+struct Checked {
+    index: usize,
+    mount: ResolvedMount,
+    chain: Vec<DirId>,
+}
+
+/// A mount's host side, checked: realpath, denylist and type ([`paths::check_mount_host`]), not
+/// inside git metadata unless read-only, and the root's identity chain ([`chain_of`]).
+fn checked_root(
+    raw: &str,
+    mode: MountMode,
+    home: &Path,
+    deny: &Denylist,
+) -> Result<(PathBuf, DirId, Vec<DirId>), (Code, String)> {
+    let (real, id) = paths::check_mount_host(raw, home, deny)?;
+    if mode != MountMode::Ro && in_git_metadata(&real) {
+        return Err((
+            Code::ProtectedPath,
+            format!(
+                "{raw:?} is inside git metadata, which your host runs (hooks, config); mount the \
+                 project directory instead, or use mode: ro"
+            ),
+        ));
+    }
+    let chain = chain_of(raw, &real, id)?;
+    Ok((real, id, chain))
 }
 
 /// The identity chain of a checked mount root, failing closed: a walk that fails refuses the
-/// mount, and so does a chain that does not start at the identity the root's check saw (the
-/// folder was swapped in between).
+/// mount (a root whose ancestors cannot all be searched included), and so does a chain that does
+/// not start at the identity the root's check saw (the folder was swapped in between).
 fn chain_of(raw: &str, real: &Path, id: DirId) -> Result<Vec<DirId>, (Code, String)> {
     let chain = paths::identity_chain(real)
         .map_err(|e| (Code::NotFound, format!("{raw:?} cannot be inspected: {e}")))?;
@@ -273,7 +282,7 @@ pub enum GlobError {
 /// TODO(#241): a hard-linked file shared by a `rw` mount and a `brokered` mount is one inode
 /// under two unrelated folders, which neither test sees; a write through the `rw` name is not
 /// approved.
-fn check_overlaps(m: &Manifest, resolved: &[(usize, ResolvedMount, Vec<DirId>)], d: &mut Diags) {
+fn check_overlaps(m: &Manifest, resolved: &[Checked], d: &mut Diags) {
     let checked = |guest: &str| paths::check_guest(guest).is_ok();
     // TODO(#195): a guest that passed its check and a host realpath both hold `/`, so a quoted
     // one is not masked. Only a realpath can hold a `"` or a backtick: a `"` in one (written
@@ -311,10 +320,10 @@ fn check_overlaps(m: &Manifest, resolved: &[(usize, ResolvedMount, Vec<DirId>)],
     }
     let roots: Vec<Root<'_>> = resolved
         .iter()
-        .map(|(index, r, chain)| Root {
-            index: *index,
-            host: &r.host,
-            chain,
+        .map(|c| Root {
+            index: c.index,
+            host: &c.mount.host,
+            chain: &c.chain,
         })
         .collect();
     check_host_overlaps(&roots, d);
@@ -368,8 +377,8 @@ fn overlap_message(host: &Path, other: &Path, j: usize, kind: Overlap) -> String
     let why = match kind {
         Overlap::Path => "",
         Overlap::Identity => {
-            ": the two paths reach the same directory (a bind mount, or a second mount of one \
-             filesystem)"
+            ": the two paths reach the same directory, or one that contains the other's (a bind \
+             mount, or a second mount of one filesystem)"
         }
     };
     format!(
@@ -400,7 +409,8 @@ mod tests {
         assert_eq!(
             overlap_message(Path::new("/h/m"), Path::new("/h/p/d"), 0, Overlap::Identity),
             "\"/h/m\" overlaps \"/h/p/d\" (filesystem.mounts[0]): the two paths reach the same \
-             directory (a bind mount, or a second mount of one filesystem)"
+             directory, or one that contains the other's (a bind mount, or a second mount of one \
+             filesystem)"
         );
     }
 
