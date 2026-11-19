@@ -652,7 +652,7 @@ mod tests {
         }
     }
 
-    /// DS2: credential folders and folders the host runs or loads code from, beyond the first
+    /// Credential folders and folders the host runs or loads code from, beyond the first
     /// list, are refused (and so is anything inside them).
     #[test]
     fn the_second_list_of_home_folders_is_refused() {
@@ -855,8 +855,9 @@ mod tests {
         d.refusal(&home.join(rel)).unwrap_or_default()
     }
 
-    /// Q-B: a link rule carries the reason of the folder holding it (here CONFIG, and the
-    /// dotfile reason for a home dotfile); Q-A: a non-dot home link is not followed.
+    /// A link rule carries the reason of the folder holding it (here CONFIG, and the dotfile
+    /// reason for a home dotfile); of a home's own entries only dot names are followed, so a
+    /// non-dot home link is not.
     #[test]
     fn link_rules_carry_their_folders_reason_and_dotfiles_only() {
         let t = TmpHome::new("reasons");
@@ -880,8 +881,57 @@ mod tests {
         assert_eq!(d.refusal(&home.join("data")), None);
     }
 
-    /// Q-B: link rules come after every other rule, so a path both refuse keeps the built-in's
-    /// message. Q-D: a link whose target is inside a rule adds no rule.
+    /// Every other holding folder passes its own reason on: a credential folder, a cache,
+    /// Sallyport's state, the XDG config and data folders (outside the home, so only their
+    /// scan finds these links) and an environment folder.
+    #[test]
+    fn link_rules_carry_each_holding_folders_reason() {
+        let t = TmpHome::new("classes");
+        let home = t.home();
+        let conf = t.0.join("xdgconf");
+        let data = t.0.join("xdgdata");
+        let cargo = t.0.join("cargo");
+        for dir in [&conf, &data, &cargo] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let ext = |dir: &Path, name: &str, target: &str| {
+            let l = dir.join(name);
+            std::os::unix::fs::symlink(home.join(target), &l).unwrap();
+            l
+        };
+        let cases = [
+            (link(&home, ".ssh/k", "credt/k"), "credt", CREDENTIALS),
+            (link(&home, ".cache/c", "cachet/c"), "cachet", CACHE),
+            (
+                link(&home, ".local/share/sallyport/s", "statet/s"),
+                "statet",
+                SALLYPORT,
+            ),
+            (ext(&conf, "app", "conft/app"), "conft", CONFIG),
+            (ext(&data, "app", "datat/app"), "datat", CONFIG),
+            (ext(&cargo, "c", "envt/c"), "envt", ENV_DIR),
+        ];
+        let mut e = env(home.to_str().unwrap());
+        e.xdg_config_home = Some(conf.clone());
+        e.xdg_data_home = Some(data.clone());
+        e.env_dirs = vec![env_dir(&cargo, "CARGO_HOME")];
+        let d = deny(&e, &[]);
+        for (l, target, reason) in &cases {
+            let w = why(&d, &home, target);
+            assert!(
+                w.contains(&format!("which {} points to", l.display())) && w.ends_with(reason),
+                "{target}: {w}"
+            );
+        }
+        // Control: without the XDG and environment folders their links are not found.
+        let d = deny(&env(home.to_str().unwrap()), &[]);
+        for target in ["conft", "datat", "envt"] {
+            assert_eq!(d.refusal(&home.join(target)), None, "{target}");
+        }
+    }
+
+    /// Link rules come after every other rule, so a path both refuse keeps the built-in's
+    /// message. A link whose target is inside a rule adds no rule.
     #[test]
     fn built_in_messages_win_and_covered_links_add_nothing() {
         let t = TmpHome::new("order");
@@ -901,7 +951,7 @@ mod tests {
         assert!(w.contains(".local/bin/x") && w.ends_with(EXECUTED), "{w}");
     }
 
-    /// Q-I: the rule is made from the lexical target, and `rule` adds the canonical one: with a
+    /// The rule is made from the lexical target, and `rule` adds the canonical one: with a
     /// two-hop chain both the first hop's folder and the final target's are refused.
     #[test]
     fn a_two_hop_link_protects_both_hops() {
@@ -998,7 +1048,7 @@ mod tests {
         }
     }
 
-    /// DS2 and Q-D: an environment folder is a rule naming its variable, and its links are read
+    /// An environment folder is a rule naming its variable, and its links are read
     /// wherever it lies; a `$PATH` entry's links are read only under a home.
     #[test]
     fn env_folders_are_rules_and_their_links_are_read() {
@@ -1031,7 +1081,7 @@ mod tests {
         assert_eq!(d.refusal(&home.join("syslink")), None);
     }
 
-    /// Q-G: an environment folder that is a home is kept as a rule: every mount under it is
+    /// An environment folder that is a home is kept as a rule: every mount under it is
     /// refused, and the message names the variable.
     #[test]
     fn an_env_folder_that_is_the_home_refuses_under_it() {
@@ -1048,7 +1098,7 @@ mod tests {
         assert!(w.contains("/home/u (from $ZDOTDIR)"), "{w}");
     }
 
-    /// Q-F: the first 256 `$PATH` entries are rules; one more leaves the list incomplete,
+    /// The first 256 `$PATH` entries are rules; one more leaves the list incomplete,
     /// naming `$PATH`, with those 256 still rules.
     #[test]
     fn path_entries_past_the_bound_leave_the_list_incomplete() {
@@ -1142,7 +1192,7 @@ mod tests {
         );
     }
 
-    /// Q-C: the scan's budget, through the named constructor: exactly enough entries completes
+    /// The scan's budget, through the named constructor: exactly enough entries completes
     /// the list, one fewer names the folder being read and the budget; links found before
     /// that are kept. The bounds are pinned.
     #[test]
@@ -1176,7 +1226,7 @@ mod tests {
         assert!(why(&d, &home, "kept").contains(&l.display().to_string()));
     }
 
-    /// DS1: a link inside a protected folder protects its target. `~/.local/bin/t ->
+    /// A link inside a protected folder protects its target. `~/.local/bin/t ->
     /// ~/dotfiles/bin/t` (the target outside every listed rule): mounting `~/dotfiles` would let
     /// the sandbox rewrite what the host runs, so it is refused, and the refusal names the link.
     #[test]

@@ -279,7 +279,7 @@ mod tests {
         assert_eq!(links(&t.0.join("p"), 0, BUDGET).unwrap(), Vec::new());
     }
 
-    /// Q-I: the target is the link text made absolute, unresolved, even when it resolves
+    /// The target is the link text made absolute, unresolved, even when it resolves
     /// elsewhere (a two-hop chain) or nowhere (a dangling link).
     #[test]
     fn the_target_is_the_link_text_made_absolute() {

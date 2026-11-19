@@ -840,8 +840,18 @@ fn rt_fs_19_a_link_out_of_a_protected_folder_protects_its_target() {
     }
     let body = mount("~/tools/t", "rw");
     twin_ok(&f, &body);
-    for host in ["~/plugs", "~/crates", "~/cargohome", "~/stow/ktools"] {
-        twin_ok(&f, &mount(host, "rw"));
+    // Control: every mount refused below is accepted here, before its link or variable exists.
+    for (host, mode) in [
+        ("~/tools", "ro"),
+        ("~/dotfiles", "ro"),
+        ("~/rc", "rw"),
+        ("~/later", "rw"),
+        ("~/plugs", "rw"),
+        ("~/crates", "rw"),
+        ("~/cargohome", "rw"),
+        ("~/stow/ktools", "rw"),
+    ] {
+        twin_ok(&f, &mount(host, mode));
     }
     let before = f.load(&body).unwrap().manifest;
 

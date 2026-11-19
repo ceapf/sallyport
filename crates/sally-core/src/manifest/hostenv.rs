@@ -247,7 +247,7 @@ mod tests {
         );
     }
 
-    /// DS2: the env-moved folders, `$GOPATH`'s `bin` and `pkg`, and `$PATH`'s entries; relative
+    /// The env-moved folders, `$GOPATH`'s `bin` and `pkg`, and `$PATH`'s entries; relative
     /// values and repeats are dropped, and every listed variable is read.
     #[test]
     fn env_dirs_reads_each_variable() {
