@@ -232,7 +232,8 @@ doctor:
 # without it the run fails, never skips (CLAUDE.md). An empty selection fails too, and so does a
 # selection whose only ignored rt_ test is not the WSL one or that runs fewer than REDTEAM_FLOOR
 # rt_ tests (scripts/redteam-guard.sh): raise the floor when rows land, lower it only with the
-# removal of a test in the same PR.
+# removal of a test in the same PR. The lists are plain text: CI sets CARGO_TERM_COLOR=always,
+# and nextest would wrap each name in colour codes.
 REDTEAM_FILTER := test(/(^|::)rt_/)
 REDTEAM_WSL_TEST := rt_fs_11_wsl_a_windows_executable_does_not_reach_windows
 REDTEAM_WSL_FILTER := test(=$(REDTEAM_WSL_TEST))
@@ -242,8 +243,8 @@ redteam:
 	@v=$$(podman info --format '{{.Host.CgroupsVersion}}'); \
 	  [ "$$v" = v2 ] || { echo "redteam: cgroup v2 required (RT-AG-09), podman reports '$$v'"; exit 1; }
 	@mkdir -p $(REDTEAM_LISTS)
-	$(CARGO) nextest list --workspace --message-format oneline --run-ignored only -E '$(REDTEAM_FILTER)' >$(REDTEAM_LISTS)/ignored
-	$(CARGO) nextest list --workspace --message-format oneline -E '$(REDTEAM_FILTER)' >$(REDTEAM_LISTS)/run
+	$(CARGO) nextest list --color never --workspace --message-format oneline --run-ignored only -E '$(REDTEAM_FILTER)' >$(REDTEAM_LISTS)/ignored
+	$(CARGO) nextest list --color never --workspace --message-format oneline -E '$(REDTEAM_FILTER)' >$(REDTEAM_LISTS)/run
 	bash scripts/redteam-guard.sh $(REDTEAM_WSL_TEST) $(REDTEAM_FLOOR) $(REDTEAM_LISTS)/ignored $(REDTEAM_LISTS)/run
 	$(TEST_RUN) $(CARGO) nextest run --workspace --no-fail-fast --no-tests=fail -E '$(REDTEAM_FILTER)'
 	@# RT-FS-11's .exe part is the one approved ignored rt_ test: run on WSL, listed as skipped elsewhere.
