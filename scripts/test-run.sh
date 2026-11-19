@@ -80,7 +80,7 @@ sweep() { # <command status>; prints nothing on a clean run
   local status="$1" left still n
   left="$(own_containers)" || { worse "$status" 5; return $?; }
   while IFS= read -r n; do
-    [ -z "$n" ] || "$podman" rm --force --time 0 "$n" >/dev/null 2>&1 || true
+    [ -z "$n" ] || "$podman" rm --force --volumes --time 0 "$n" >/dev/null 2>&1 || true
   done <<<"$left"
   # Untag under the image lock, so it never interleaves with another run's build.
   if ! (
