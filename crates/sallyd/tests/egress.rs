@@ -527,6 +527,7 @@ async fn a_thousand_open_tunnels() {
         if i % 64 == 0 {
             tokio::task::yield_now().await;
         }
+        pace(i).await;
         let mut c = tokio::net::UnixStream::connect(&sock).await.unwrap();
         c.write_all(b"CONNECT a.mock.test:443 HTTP/1.1\r\n\r\n")
             .await
@@ -560,6 +561,10 @@ async fn a_thousand_open_tunnels() {
     let ev = events.list();
     assert_eq!(ev.iter().filter(|e| *e == "egress.allow").count(), TUNNELS);
     assert!(!ev.iter().any(|e| e == "egress.limit"), "none refused");
+    assert!(
+        !ev.iter().any(|e| e == "egress.shed"),
+        "none closed over the rate"
+    );
     drop(clients);
     handle.shutdown().await;
 }
@@ -576,6 +581,7 @@ async fn over_the_cap_is_429() {
         if i % 16 == 0 {
             tokio::task::yield_now().await;
         }
+        pace(i).await;
         let mut c = tokio::net::UnixStream::connect(&sock).await.unwrap();
         // A connection over the cap is answered and closed at accept, maybe before this write.
         let _ = c
@@ -600,8 +606,24 @@ async fn over_the_cap_is_429() {
         .filter(|e| *e == "egress.limit")
         .count();
     assert_eq!(limits, 968);
+    let ev = events.list();
+    assert!(
+        !ev.iter().any(|e| e == "egress.shed"),
+        "none closed over the rate"
+    );
     drop(clients);
     handle.shutdown().await;
+}
+
+/// Waits before connection `i` so these legs open their connections at the session's admission
+/// rate: the burst at once, then one per `1 s / ADMISSION_RATE` with a small
+/// margin, so every one is admitted and the row's numbers stay as they were.
+async fn pace(i: usize) {
+    use sallyd::egress::server::{ADMISSION_BURST, ADMISSION_RATE};
+    if i >= ADMISSION_BURST as usize {
+        let step = Duration::from_secs(1) / ADMISSION_RATE + Duration::from_millis(2);
+        tokio::time::sleep(step).await;
+    }
 }
 
 /// Raises this process's soft nofile limit to `need` (client and proxy ends live in one process).
