@@ -14,6 +14,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::BTreeSet;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -173,8 +174,8 @@ fn ag_inner() {
         ]);
         load(&format!("{HEADER}{body}"), &env, &BTreeSet::new())
     };
-    // The later mount's root in the earlier one's chain (the first two), the earlier one's in
-    // the later one's (the fourth), and the same folder (the third).
+    // The earlier mount's root in the later one's chain (the first two), the later one's in the
+    // earlier one's (the fourth), and the same folder (the third).
     let cases = [
         (("{}", "rw"), ("proj/docs", "brokered")),
         (("proj", "rw"), ("{}/docs", "brokered")),
@@ -192,8 +193,7 @@ fn ag_inner() {
         let (a, b) = (named(a, "mirror"), named(b, "mirror"));
         refused_overlap(two((&a, am), (&b, bm)), &format!("{a} {am} + {b} {bm}"));
     }
-    let more = self_bound(&code, &two);
-    drop(more);
+    drop(self_bound(&code, &two));
     drop(_binds);
     drop(root);
     println!("{AG_DONE}");
@@ -218,6 +218,19 @@ fn self_bound(code: &Path, two: &Two<'_>) -> [Bound; 2] {
         Bound::new(&code.join("a/b"), &code.join("a/b/x")),
         Bound::new(&code.join("a"), &code.join("z")),
     ];
+    // Control: the setup is a self-bind. `a/b/x` and its `..` both read `a/b`'s identity, and
+    // only the next `..` reaches `a`, so the old stop rule would end the walk at `a/b`.
+    let id = |rel: &str| {
+        let m = std::fs::metadata(code.join(rel)).unwrap();
+        (m.dev(), m.ino())
+    };
+    assert_eq!(id("a/b/x"), id("a/b"), "control: a/b/x is a/b");
+    assert_eq!(
+        id("a/b/x/.."),
+        id("a/b"),
+        "control: .. of a/b/x is a/b again"
+    );
+    assert_eq!(id("a/b/x/../.."), id("a"), "control: the next .. is a");
     let (x, z) = (code.join("a/b/x"), code.join("z"));
     for p in [&x, &z] {
         assert_eq!(
@@ -272,7 +285,10 @@ impl Bound {
 
 impl Drop for Bound {
     fn drop(&mut self) {
-        let _ = Command::new("umount").arg(&self.0).status();
+        match Command::new("umount").arg(&self.0).status() {
+            Ok(st) if st.success() => {}
+            other => eprintln!("umount {:?} failed: {other:?}", self.0),
+        }
     }
 }
 

@@ -1373,7 +1373,7 @@ mod tests {
             (&[d, R, R], &[d, R]),
             // A folder bound on its own child reads its identity twice before its parent.
             (&[b, b, a, R, R], &[b, b, a, R]),
-            // Under a bind of `/` at `m`, the root's identity mid-chain does not end it.
+            // Under a bind of `/` at a child of `m`, the root's identity mid-chain does not end it.
             (&[p, R, m, R, R], &[p, R, m, R]),
             // `/` itself.
             (&[R, R], &[R]),

@@ -234,8 +234,8 @@ an object carrying a POSIX ACL is open to its owner only (architect ruling Q39; 
   *subdirectory* is not seen (#17): a `rw` mount can then hold part or all of a `brokered` one.
   A folder bound on its own child is followed up to its real parents. A hard-linked file shared
   by a `rw` mount and a `brokered` mount is not an overlap either: a write through the `rw` name
-  is not approved (#241). A root whose ancestors cannot all be searched cannot be compared, and
-  is refused `not-found`.
+  is not approved (#241). A root whose ancestors cannot all be searched, or whose walk does not
+  reach `/` within 4096 steps, cannot be compared, and is refused `not-found`.
 - Across live sessions (AMENDMENTS-02 B4), folders may overlap only when neither session mounts
   them `rw` or `brokered`; the launch is refused (`overlap`) otherwise.
 - A Unix socket anywhere in a mount refuses the launch (`socket-in-mount`, RT-FS-13). Another
@@ -494,7 +494,7 @@ never on message text); the field path uses `a.b[0].c` form.
 | `secret-store` / `secret-grant` / `secret-filler` | launch refusals (`sandbox.refuse`, Task 9a-3): the secrets store cannot be read / a grant whose format and `basic_user` do not pair (exactly one placeholder; `basic_user` exactly with `{basic}`), whose header or rendered value cannot be sent, two grants on one header of one host, or a form of the secret too long to redact / every redaction filler candidate occurs in a form of the session's secrets (names no secret). (`basic-unsupported`, Task 9a-3's refusal of `{basic}`, was deleted in Task 9b.) |
 | `secret-like-env` | MCP env name looks like a secret |
 | `bad-header` / `bad-format` | injection header/format invalid |
-| `mount-changed` | launch-time re-check: mount root replaced since validation; or replaced while validation walked its ancestors |
+| `mount-changed` | launch-time re-check: mount root replaced since validation; or replaced between its own check and the walk of its ancestors during validation |
 | `digest-mismatch` | launch refusal (`sandbox.refuse`): the pinned image is not in local storage, or the local image does not carry the pinned digest (`sallyd::sandbox::images`); images are never pulled |
 | `no-default-image` | launch refusal (`sandbox.refuse`): the manifest names no `runtime.image` and no bundled workspace image is installed (#88); nothing is reserved or created (architect Q58) |
 | `unacknowledged-risk` | an `acknowledge_*` flag is needed (§1.1) |

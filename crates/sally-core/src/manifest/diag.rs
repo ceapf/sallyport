@@ -60,8 +60,8 @@ pub enum Code {
     BadHeader,
     /// An injection format lacks exactly one `{value}` or contains control characters.
     BadFormat,
-    /// A mount root changed between validation and launch (RT-FS-06), or while validation walked
-    /// its ancestors.
+    /// A mount root changed between validation and launch (RT-FS-06), or between its own check
+    /// and the walk of its ancestors during validation.
     MountChanged,
     /// A risky setting that needs its `acknowledge_*` flag (SI-5: widening is always explicit).
     UnacknowledgedRisk,
