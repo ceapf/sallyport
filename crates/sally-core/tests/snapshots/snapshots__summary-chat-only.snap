@@ -7,5 +7,5 @@ This agent:
 - sees no host files.
 - has no network access.
 - cannot run shell commands.
-- is audited at reduced detail (every action, connection, HTTP request line and file read is still recorded; inference response metadata is not).
+- is audited at reduced detail (every action, connection, intercepted HTTP request line and file read is still recorded; inference response metadata is not).
 - is limited to 2 CPUs, 2GiB memory, 64 processes, and 8h of wall time.
