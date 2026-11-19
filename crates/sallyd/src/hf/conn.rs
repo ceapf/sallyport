@@ -4,8 +4,9 @@
 //! [`crate::egress::roots::BundleFiles`]).
 //!
 //! The rule is the egress proxy's (SI-9's reason applies to `sallyd`'s own credential-carrying
-//! connection): one lookup, at most [`MAX_ANSWER`] answers; if any answer is loopback, private,
-//! link-local or one of this host's own addresses, nothing is dialled; otherwise at most
+//! connection): one lookup, at most [`MAX_ANSWER`] answers; if the proxy's address filter
+//! ([`addr::denied_by`]) refuses any answer (not global unicast, one of this host's own addresses,
+//! or inside a network this host is directly connected to), nothing is dialled; otherwise at most
 //! [`MAX_DIALS`] of the answers are tried in order, each by address, never by name. The host
 //! name only chooses the certificate the server must present.
 
@@ -46,7 +47,10 @@ pub(super) async fn pinned<R: Resolver, H: HostAddrs>(
         Ok(Ok(found)) if !found.is_empty() && found.len() <= MAX_ANSWER => found,
         _ => return Err(PullError::ResolveFailed(host.to_owned())),
     };
-    if found.iter().any(|s| addr::is_denied(s.ip(), &own)) {
+    if found
+        .iter()
+        .any(|s| addr::denied_by(s.ip(), &own).is_some())
+    {
         return Err(PullError::AddressDenied(host.to_owned()));
     }
     Ok(found

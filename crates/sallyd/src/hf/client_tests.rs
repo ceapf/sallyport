@@ -11,6 +11,7 @@ use super::testkit::{
     Hub, PUBLIC, SHA, TmpLib, foreign_ca_pem, found, gguf, list_json, reply, sha,
 };
 use super::*;
+use crate::egress::addr::Net;
 use crate::egress::roots::{BundleFiles, RootsError};
 
 /// A token assembled at run time, so no credential-shaped literal is in the source.
@@ -228,6 +229,23 @@ async fn denied_addresses_are_never_dialled() {
         .unwrap_err();
     assert_eq!(err.code(), "hf_address_denied");
     assert_eq!(hub.dials(), 1, "an own address was dialled");
+
+    // A public answer inside a network this host is directly connected to is refused, as the
+    // egress proxy refuses it. Control: the same answer is dialled before the network is listed.
+    let near = Hub::new(|_, _| reply("200 OK", &[], b""));
+    near.answer(PUBLIC);
+    let _ = bounded(near.client(None).files(&repo(), &Revision::main())).await;
+    assert_eq!(near.dials(), 1, "control: the public answer is dialled");
+    near.connected(Net::prefix(PUBLIC, 24).unwrap());
+    let err = bounded(near.client(None).files(&repo(), &Revision::main()))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "hf_address_denied");
+    assert_eq!(
+        near.dials(),
+        1,
+        "an address on a connected network was dialled"
+    );
 
     // One denied answer among public ones refuses the host: nothing is dialled, not even the
     // public answer listed first.
