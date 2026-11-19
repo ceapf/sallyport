@@ -37,6 +37,15 @@ const ENV_DIR: &str =
 /// (`denylist-incomplete`, MANIFEST_SPEC §2).
 pub(crate) const MAX_PATH_DIRS: usize = 256;
 
+/// At most this many `$GOPATH` folders (`bin` and `pkg` of 16 elements) become rules; more leave
+/// the denylist incomplete.
+pub(crate) const MAX_GOPATH_DIRS: usize = 32;
+
+/// The variables that name a list of folders, each with the most of its folders that become
+/// rules. With the single-folder variables (`hostenv.rs`) the environment adds at most
+/// 16 + 32 + 256 = 304 rules and scan roots.
+const LIST_BOUNDS: [(&str, usize); 2] = [("PATH", MAX_PATH_DIRS), ("GOPATH", MAX_GOPATH_DIRS)];
+
 /// Under each home directory. Credentials, Sallyport's own state, and anything the host
 /// executes or loads on the user's behalf (persistence → host code execution, THREAT_MODEL G4).
 const HOME_SUBTREES: &[(&str, &str)] = &[
@@ -159,11 +168,7 @@ impl Denylist {
         let mut scan = Scan::with_budget(budget);
         let read = scan_folders(env, &mut scan);
         list.add_links(scan.into_links());
-        let path_dirs = env.env_dirs.iter().filter(|d| d.var == "PATH").count();
-        let mut why = Vec::new();
-        if path_dirs > MAX_PATH_DIRS {
-            why.push(format!("$PATH names more than {MAX_PATH_DIRS} folders"));
-        }
+        let mut why = over_bound(env);
         match read {
             Ok(()) => {}
             Err(Incomplete::Budget { folder }) => why.push(format!(
@@ -182,7 +187,8 @@ impl Denylist {
     }
 
     /// Every rule but the link rules: the built-in list, the XDG folders, the folders the
-    /// environment names (the first [`MAX_PATH_DIRS`] `$PATH` entries), and `extra`. Reads no
+    /// environment names (the first [`MAX_PATH_DIRS`] `$PATH` and [`MAX_GOPATH_DIRS`] `$GOPATH`
+    /// folders), and `extra`. Reads no
     /// folder's entries: for a manifest with no mounts, which nothing is checked against.
     pub(crate) fn without_links(env: &HostEnv, extra: &[PathBuf]) -> Self {
         let mut rules = vec![root_rule(Path::new("/"), "the filesystem root")];
@@ -297,17 +303,35 @@ impl Denylist {
     }
 }
 
-/// The environment's folders that become rules: all of them but the `$PATH` entries past the
-/// first [`MAX_PATH_DIRS`].
+/// The most folders of `var` that become rules, if it names a list ([`LIST_BOUNDS`]).
+fn bound_of(var: &str) -> Option<usize> {
+    LIST_BOUNDS
+        .iter()
+        .find(|(v, _)| *v == var)
+        .map(|(_, bound)| *bound)
+}
+
+/// The environment's folders that become rules: all of them but, for each variable that names
+/// a list, the folders past its bound.
 fn env_rule_dirs(env: &HostEnv) -> impl Iterator<Item = &EnvDir> {
-    let mut path_dirs = 0_usize;
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     env.env_dirs.iter().filter(move |d| {
-        if d.var != "PATH" {
+        let Some(bound) = bound_of(d.var) else {
             return true;
-        }
-        path_dirs = path_dirs.saturating_add(1);
-        path_dirs <= MAX_PATH_DIRS
+        };
+        let n = counts.entry(d.var).or_insert(0);
+        *n = n.saturating_add(1);
+        *n <= bound
     })
+}
+
+/// One sentence for each list variable that names more folders than its bound.
+fn over_bound(env: &HostEnv) -> Vec<String> {
+    LIST_BOUNDS
+        .iter()
+        .filter(|(var, bound)| env.env_dirs.iter().filter(|d| d.var == *var).count() > *bound)
+        .map(|(var, bound)| format!("${var} names more than {bound} folders"))
+        .collect()
 }
 
 /// The homes: `$HOME` and the others that get the same protection.
@@ -981,6 +1005,12 @@ mod tests {
         let d = fixed(&e, &[]);
         let w = d.refusal(Path::new("/home/u/code/x")).unwrap_or_default();
         assert!(w.contains("/home/u (from $CARGO_HOME)"), "{w}");
+        // The same for an exported `ZDOTDIR=$HOME`, though it names zsh's default place.
+        e.env_dirs = vec![env_dir(Path::new("/home/u"), "ZDOTDIR")];
+        let w = fixed(&e, &[])
+            .refusal(Path::new("/home/u/code/x"))
+            .unwrap_or_default();
+        assert!(w.contains("/home/u (from $ZDOTDIR)"), "{w}");
     }
 
     /// Q-F: the first 256 `$PATH` entries are rules; one more leaves the list incomplete,
@@ -1011,14 +1041,79 @@ mod tests {
         assert_eq!(d.refusal(&entry(MAX_PATH_DIRS + 1)), None);
     }
 
+    /// A search-only folder in a protected folder leaves the list incomplete, naming it.
+    #[test]
+    fn an_enterable_unlistable_folder_leaves_the_list_incomplete() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let open = std::fs::Permissions::from_mode(0o755);
+                let _ = std::fs::set_permissions(&self.0, open);
+            }
+        }
+        let t = TmpHome::new("unlistable");
+        let home = t.home();
+        let sub = home.join(".cargo/sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let _restore = Restore(sub.clone());
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o311)).unwrap();
+        assert!(std::fs::read_dir(&sub).is_err(), "control: unlistable here");
+        let (_, why) = Denylist::for_env(&env(home.to_str().unwrap()), &[]);
+        assert_eq!(
+            why,
+            Some(format!(
+                "the denylist could not be completed: {:?} could not be read for links out of \
+                 protected folders: it can be entered but not listed",
+                sub.display().to_string()
+            ))
+        );
+    }
+
+    /// The first 32 `$GOPATH` folders are rules; one more leaves the list incomplete naming
+    /// `$GOPATH`, while a variable listed after it is still a rule. With both list variables
+    /// over their bounds one sentence names both.
+    #[test]
+    fn gopath_folders_past_the_bound_leave_the_list_incomplete() {
+        let entry = |n: usize| PathBuf::from(format!("/opt/g{n}"));
+        let mut e = env("/sp-absent-root/home/u");
+        e.env_dirs = (1..=MAX_GOPATH_DIRS)
+            .map(|n| env_dir(&entry(n), "GOPATH"))
+            .collect();
+        let d = deny(&e, &[]);
+        assert!(d.refusal(&entry(MAX_GOPATH_DIRS)).is_some());
+        e.env_dirs
+            .push(env_dir(&entry(MAX_GOPATH_DIRS + 1), "GOPATH"));
+        e.env_dirs.push(env_dir(Path::new("/opt/p1"), "PATH"));
+        let (d, why) = Denylist::for_env(&e, &[]);
+        assert_eq!(
+            why.as_deref(),
+            Some("the denylist could not be completed: $GOPATH names more than 32 folders")
+        );
+        assert!(d.refusal(&entry(MAX_GOPATH_DIRS)).is_some());
+        assert_eq!(d.refusal(&entry(MAX_GOPATH_DIRS + 1)), None);
+        assert!(d.refusal(Path::new("/opt/p1")).is_some());
+        e.env_dirs.extend(
+            (2..=MAX_PATH_DIRS + 1).map(|n| env_dir(&PathBuf::from(format!("/opt/p{n}")), "PATH")),
+        );
+        let (_, why) = Denylist::for_env(&e, &[]);
+        assert_eq!(
+            why.as_deref(),
+            Some(
+                "the denylist could not be completed: $PATH names more than 256 folders; \
+                 $GOPATH names more than 32 folders"
+            )
+        );
+    }
+
     /// Q-C: the scan's budget, through the named constructor: exactly enough entries completes
     /// the list, one fewer names the folder being read and the budget; links found before
     /// that are kept. The bounds are pinned.
     #[test]
     fn the_scan_budget_names_the_folder() {
         assert_eq!(
-            (links::BUDGET, links::DEPTH, MAX_PATH_DIRS),
-            (65_536, 2, 256)
+            (links::BUDGET, links::DEPTH, MAX_PATH_DIRS, MAX_GOPATH_DIRS),
+            (65_536, 2, 256, 32)
         );
         let t = TmpHome::new("budget");
         let home = t.home();

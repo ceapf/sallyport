@@ -40,7 +40,7 @@ pub(crate) enum Incomplete {
         folder: PathBuf,
     },
     /// `folder`, or an entry in it, could not be read for a reason other than its absence or
-    /// the user's own lack of access.
+    /// the user's own lack of access, or `folder` can be entered but not listed.
     Unreadable {
         /// The folder being read.
         folder: PathBuf,
@@ -59,12 +59,34 @@ pub(crate) struct Scan {
 }
 
 /// Whether an I/O error means "nothing there to load" (gone, not a folder, or not readable by
-/// the user, whose tools then cannot load it either) rather than a failed read.
+/// the user) rather than a failed read. For an entry, its type or its link text that holds:
+/// the user's tools cannot load through it either. A folder that cannot be listed is decided
+/// by [`unlistable`] instead, since a folder the user can enter still runs its files by name.
 fn absent(kind: ErrorKind) -> bool {
     matches!(
         kind,
         ErrorKind::NotFound | ErrorKind::NotADirectory | ErrorKind::PermissionDenied
     )
+}
+
+/// What a folder that cannot be listed (`read_dir` refused with `PermissionDenied`) means, from
+/// `search`, the kernel's answer to whether the user may enter it: one the user cannot enter
+/// either is skipped (nothing in it can be loaded), and one the user can enter refuses, naming
+/// it: its files still run by name, so its links cannot go unread.
+fn unlistable(search: std::io::Result<()>, dir: &Path) -> Result<(), Incomplete> {
+    match settle(search, dir)? {
+        Some(()) => Err(Incomplete::Unreadable {
+            folder: dir.to_owned(),
+            error: "it can be entered but not listed".to_owned(),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Whether the user may enter (search) `dir`, as the kernel decides it (ACLs and groups
+/// included).
+fn search(dir: &Path) -> std::io::Result<()> {
+    rustix::fs::access(dir, rustix::fs::Access::EXEC_OK).map_err(std::io::Error::from)
 }
 
 /// One read's result while reading `dir`: the value, `None` when the error is [`absent`] (skip
@@ -140,7 +162,13 @@ impl Scan {
             return Ok(());
         }
         self.seen.insert(real.clone(), depth);
-        let Some(entries) = settle(std::fs::read_dir(dir), dir)? else {
+        let listed = std::fs::read_dir(dir);
+        if let Err(e) = &listed
+            && e.kind() == ErrorKind::PermissionDenied
+        {
+            return unlistable(search(dir), dir);
+        }
+        let Some(entries) = settle(listed, dir)? else {
             return Ok(());
         };
         for entry in entries {
@@ -353,9 +381,81 @@ mod tests {
     #[test]
     fn a_missing_or_non_folder_path_reads_nothing() {
         let t = Tree::new("missing");
+        // An executable file: one the user may "search", so only `NotADirectory` skips it.
         let file = t.file("f");
+        set_mode(&file, 0o755);
         assert_eq!(links(&t.0.join("absent"), DEPTH, 0), Ok(Vec::new()));
         assert_eq!(links(&file, DEPTH, 0), Ok(Vec::new()));
+    }
+
+    fn set_mode(p: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// Gives `dir` mode `mode`, and back 0o755 on drop (before the tree is removed).
+    struct Mode(PathBuf);
+
+    impl Mode {
+        fn set(dir: &Path, mode: u32) -> Self {
+            set_mode(dir, mode);
+            // Control: the fixture is really unlistable here (a root runner would list it and
+            // the test would pass without the rule; fail instead).
+            let listed = std::fs::read_dir(dir).map(|_| ());
+            assert_eq!(
+                listed.map_err(|e| e.kind()),
+                Err(ErrorKind::PermissionDenied),
+                "the fixture folder must be unlistable for this user"
+            );
+            Self(dir.to_owned())
+        }
+    }
+
+    impl Drop for Mode {
+        fn drop(&mut self) {
+            set_mode(&self.0, 0o755);
+        }
+    }
+
+    /// An unlistable folder the user can enter (search-only, 0o311) refuses, naming it; one the
+    /// user can neither list nor enter (0o000) is skipped.
+    #[test]
+    fn an_enterable_unlistable_folder_refuses_and_a_closed_one_is_skipped() {
+        let t = Tree::new("unlistable");
+        let p = t.dir("p");
+        let hidden = t.dir("p/hidden");
+        symlink(t.file("tgt"), hidden.join("l")).unwrap();
+        let mode = Mode::set(&hidden, 0o311);
+        assert_eq!(
+            links(&p, DEPTH, BUDGET),
+            Err(Incomplete::Unreadable {
+                folder: hidden.clone(),
+                error: "it can be entered but not listed".to_owned(),
+            })
+        );
+        drop(mode);
+        let _closed = Mode::set(&hidden, 0o000);
+        assert_eq!(links(&p, DEPTH, BUDGET), Ok(Vec::new()));
+    }
+
+    /// The decision on an unlistable folder, from the kernel's answer on entering it.
+    #[test]
+    fn unlistable_refuses_when_it_can_be_entered() {
+        let dir = Path::new("/d");
+        assert_eq!(
+            unlistable(Ok(()), dir),
+            Err(Incomplete::Unreadable {
+                folder: dir.to_owned(),
+                error: "it can be entered but not listed".to_owned(),
+            })
+        );
+        for k in [ErrorKind::PermissionDenied, ErrorKind::NotFound] {
+            assert_eq!(unlistable(Err(k.into()), dir), Ok(()), "{k:?}");
+        }
+        assert!(matches!(
+            unlistable(Err(std::io::Error::other("x")), dir),
+            Err(Incomplete::Unreadable { .. })
+        ));
     }
 
     /// A read's value passes; an absent one is skipped; any other error stops the scan, naming

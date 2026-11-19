@@ -41,7 +41,9 @@ pub struct EnvDir {
 }
 
 /// Variables whose value is one folder the host runs or loads code from, or keeps credentials
-/// in (the env-moved forms of the built-in home folders).
+/// in (the env-moved forms of the built-in home folders), each documented by its tool as one
+/// directory.
+// TODO(#232): more tools' variables, each to be checked against the tool's own documentation.
 const SINGLE_DIR_VARS: &[&str] = &[
     "CARGO_HOME",
     "RUSTUP_HOME",
@@ -51,16 +53,26 @@ const SINGLE_DIR_VARS: &[&str] = &[
     "XDG_CACHE_HOME",
     "GOBIN",
     "DOCKER_CONFIG",
+    "ZDOTDIR",            // zsh startup files
+    "PNPM_HOME",          // pnpm's global bin
+    "VOLTA_HOME",         // .volta
+    "BUN_INSTALL",        // .bun
+    "PYTHONUSERBASE",     // .local: user site-packages and scripts
+    "UV_TOOL_DIR",        // .local/share/uv/tools
+    "GRADLE_USER_HOME",   // .gradle
+    "PASSWORD_STORE_DIR", // .password-store
 ];
 
 /// The folders the environment names, from `lookup` (a variable's value, if set): each
 /// [`SINGLE_DIR_VARS`] value, `bin` and `pkg` under each `$GOPATH` element, and each `$PATH`
 /// entry. Only absolute values count (a relative one names no fixed folder); the first of
-/// repeated paths is kept.
+/// repeated paths is kept. Every distinct entry is kept: the denylist bounds `$PATH` and
+/// `$GOPATH` when it builds its rules.
 pub(crate) fn env_dirs(lookup: impl Fn(&str) -> Option<OsString>) -> Vec<EnvDir> {
     let mut out: Vec<EnvDir> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let mut add = |path: PathBuf, var: &'static str| {
-        if path.is_absolute() && !out.iter().any(|d| d.path == path) {
+        if path.is_absolute() && seen.insert(path.clone()) {
             out.push(EnvDir { path, var });
         }
     };
@@ -210,6 +222,33 @@ mod tests {
 
     /// DS2: the env-moved folders, `$GOPATH`'s `bin` and `pkg`, and `$PATH`'s entries; relative
     /// values and repeats are dropped, and every listed variable is read.
+    /// The list of single-folder variables, pinned by name (the test below builds its
+    /// expectation from the list, so it could not notice a dropped name).
+    #[test]
+    fn the_single_folder_variables_are_pinned() {
+        assert_eq!(
+            SINGLE_DIR_VARS,
+            [
+                "CARGO_HOME",
+                "RUSTUP_HOME",
+                "GNUPGHOME",
+                "NVM_DIR",
+                "PYENV_ROOT",
+                "XDG_CACHE_HOME",
+                "GOBIN",
+                "DOCKER_CONFIG",
+                "ZDOTDIR",
+                "PNPM_HOME",
+                "VOLTA_HOME",
+                "BUN_INSTALL",
+                "PYTHONUSERBASE",
+                "UV_TOOL_DIR",
+                "GRADLE_USER_HOME",
+                "PASSWORD_STORE_DIR",
+            ]
+        );
+    }
+
     #[test]
     fn env_dirs_reads_each_variable() {
         let mut vars: Vec<(&str, String)> = SINGLE_DIR_VARS
