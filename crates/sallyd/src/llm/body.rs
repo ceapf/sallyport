@@ -1,12 +1,14 @@
 //! The chat-completion request body from the untrusted harness (ARCHITECTURE §4.4, Task 7
 //! decision 1). Bounds first: the size and the nesting depth are checked on the raw bytes. Then
-//! every member, at every level, must be on the allowlist and of the right shape; anything else
-//! is refused with the path of the member. `n` must be 1, message content is text only, the
-//! token limit is at most the session's context, and `model` is dropped (the session's model is
-//! used). A key repeated in any object is malformed. Tool and function names match
-//! `[A-Za-z0-9_-]{1,64}`; `tool_calls` belong to assistant messages and `tool_call_id` to tool
-//! messages (architect ruling Q11). What passes is forwarded as checked: nothing the harness sent
-//! reaches the backend unless this module named it.
+//! every member, at every level, must be on the allowlist and of the right shape, except inside
+//! a function's `parameters` and `response_format.json_schema`: each must be an object, and its
+//! contents pass as opaque JSON (#55). Anything else is refused with the path of the member.
+//! `n` must be 1, message content is text only, the token limit is at most the session's
+//! context, and `model` is dropped (the session's model is used). A key repeated in any object
+//! is malformed. Tool and function names match `[A-Za-z0-9_-]{1,64}`; `tool_calls` belong to
+//! assistant messages and `tool_call_id` to tool messages (architect ruling Q11). What passes is
+//! forwarded as checked: nothing the harness sent reaches the backend unless this module named
+//! it.
 #![deny(clippy::indexing_slicing)]
 
 use serde_json::{Map, Value};

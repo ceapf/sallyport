@@ -13,10 +13,12 @@
 //!    (0600) in the workspace socket directory and start its egress listener (Task 8, architect
 //!    Q7; `none` binds nothing). The listener lives in [`Running`]: `stop` shuts it down after
 //!    the container is gone, and a failed launch drops it;
-//! 4. to 7. the one start path (`launch/start.rs`): audit `sandbox.launch`, `podman create`, the
-//!    host re-check, `podman init`, the in-container pin check (`sandbox.mount_mismatch` on a
-//!    difference), the OCI config verifier (Task 14, `sandbox.config_mismatch`), `podman start`
-//!    and the running check.
+//! 4. to 7. the one start path (`launch/start.rs`): audit `sandbox.launch`, the mount-link probe
+//!    (`mount_probe.rs`: a link at or above a mount destination in the image refuses the launch
+//!    before the runtime places any of the session container's mounts), `podman create` and its
+//!    image id compared with the probe's, the host re-check, `podman init`, the in-container pin
+//!    check (`sandbox.mount_mismatch` on a difference), the OCI config verifier (Task 14,
+//!    `sandbox.config_mismatch`), `podman start` and the running check.
 //!
 //! A session whose sandbox can write to the host disk (`staged` mounts, `.git` overlays) gets a
 //! watchdog that kills it when those writes exceed `runtime.stage_size` (#14; `watchdog.rs`).

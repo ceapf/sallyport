@@ -149,8 +149,9 @@ policy (`Allowed`), an **allowlist**:
 - only the options below, each with its exact value or value shape (`--user` is the session's
   ids, the seccomp profile is the role's file under the profiles directory, `--device` only
   `nvidia.com/gpu=all` and only for inference, environment variables only the role's exact
-  name/value pairs plus `expose_env` placeholders); `--image-volume=ignore` and a bare
-  `--no-healthcheck` are required, and every other health-check option is refused;
+  name/value pairs plus `expose_env` placeholders); `--workdir /` (that value only, as two
+  tokens), `--image-volume=ignore` and a bare `--no-healthcheck` are required, and every other
+  health-check option is refused;
 - every option at most once (mounts, variables and `--security-opt` kinds included), every
   hardening option exactly once;
 - every `-v` source a declared source of that role at its declared guest path: `ro` grants only a
@@ -264,6 +265,10 @@ review). Every remaining non-errno rule is a plain `SCMP_ACT_ALLOW`, and:
   (`NETLINK_ROUTE` only, by equality) for workspace and harness, `AF_UNIX` only for inference. Every other
   family fails, in particular `AF_VSOCK`, which network namespaces do not isolate (on WSL2 and
   other VMs it reaches the host).
+- `socketpair` is allowed for `AF_UNIX` only, in every role, by one rule with an equality on the
+  family argument; every other family (`AF_INET`, `AF_INET6` and `AF_NETLINK` included) fails
+  with `ENOSYS`, the profile's answer, which the kernel never gives for an unsupported
+  `socketpair` family.
 - Only native architectures are listed (x86-64, aarch64, no 32-bit sub-architectures), so the
   32-bit ABI (`int 0x80`, the unfilterable `socketcall`) never reaches an allow rule.
 
@@ -273,14 +278,15 @@ The profiles are `profiles/seccomp-{workspace,harness,inference}.json`, derived 
 outside Sallyport's control decides what a sandbox may call. Unit tests check the profile JSON
 independently of the generator (`sandbox::profiles`:
 `no_rule_of_any_role_allows_a_removed_syscall_under_any_condition`,
-`sockets_are_an_allowlist_of_address_families`, `clone_is_allowed_only_without_namespace_flags`,
-`only_native_architectures_are_listed`). The OCI config verifier compares each container's
-`linux.seccomp` with the embedded profile by content before `start` (`sandbox::oci`
-`the_cgroup_path_seccomp_and_masked_paths_are_checked`; RT-SUP-04). In a container, three probes
-meet the filter: RT-FS-07 (`mknod`, `ENOSYS`), RT-FS-17 (`unshare`, `clone` with namespace flags,
-`clone3`) and RT-NET-12 (socket families outside the role's list). The other removals are checked
-in the JSON only, by no system call in a container. RT-FS-09 tests the masked and read-only
-`/proc` and `/sys` paths, not the profile.
+`sockets_are_an_allowlist_of_address_families`, `socketpair_is_allowed_for_af_unix_only`,
+`clone_is_allowed_only_without_namespace_flags`, `only_native_architectures_are_listed`). The
+OCI config verifier compares each container's `linux.seccomp` with the embedded profile by
+content before `start` (`sandbox::oci` `the_cgroup_path_seccomp_and_masked_paths_are_checked`;
+RT-SUP-04). In a container, three probes meet the filter: RT-FS-07 (`mknod`, `ENOSYS`), RT-FS-17
+(`unshare`, `clone` with namespace flags, `clone3`) and RT-NET-12 (`socket` and `socketpair`
+families outside the role's list, with `AF_UNIX` pairs made as its analogue control). The other
+removals are checked in the JSON only, by no system call in a container. RT-FS-09 tests the
+masked and read-only `/proc` and `/sys` paths, not the profile.
 
 ### 3.5 Launch (normative, Task 6b)
 `sallyd::sandbox::Launcher::launch_workspace`, in this order. The launch runs in its own task:
@@ -302,7 +308,8 @@ are released only once the container is confirmed gone.
    directory reached through a bind alias or a second mount of the same filesystem therefore
    still conflicts. No sandbox ever holds write access to an ancestor, a descendant or the same
    directory as another session's mount, so no live sandbox can swap what another session's
-   launch scan pinned. `Launcher::remove_orphans` removes `sp-ws-*`/`sp-h-*` containers a
+   launch scan pinned. `Launcher::remove_orphans` removes `sp-ws-*`/`sp-h-*` containers (and
+   their mount-link probes, `sp-probe-ws-*`/`sp-probe-h-*`) a
    previous `sallyd` of this installation left running (audited `sandbox.orphan_removed` with
    the name, the full ID it removes by, and `sweep: startup`); `sallyd` calls it before it accepts the first launch, then every 60 s
    (`sweep: periodic`, architect Q61): a `podman create` a killed `sallyd` left running can make
@@ -318,16 +325,17 @@ are released only once the container is confirmed gone.
    sweep is an oplog line, retried at the next. The listing asks podman for one label only,
    `<full ID> <name> <installation label>`, each a JSON string, never the whole label set: a
    container's labels include its image's, so a line would be as long as an image author likes
-   (architect Q307). A line is daemon-bounded (ID, name and UUID): at most 179 bytes for a
-   session container, 182 for an inference instance. A listing over 64 KiB is refused whole,
-   never cut (#173): a cut on a line boundary would parse as a shorter listing that misses the
-   containers past it. That cap bounds the sweep at about 360 containers: past it, the startup
+   (architect Q307). A line is daemon-bounded (ID, name and UUID): at most 185 bytes for a
+   session container or its probe, 188 for an inference instance's probe. A listing over 64 KiB
+   is refused whole, never cut (#173): a cut on a line boundary would parse as a shorter listing
+   that misses the containers past it. That cap bounds the sweep at about 350 containers: past it, the startup
    sweep refuses the start and a periodic one fails. So the live sessions are bounded where
    they are admitted: at most 64 (`MAX_LIVE_SESSIONS`), counted in the same step that reserves
    the overlap claims and descriptors, before either is checked. The 65th is refused
    `session-limit` before anything is created (stop a session to launch another). A live
-   session has at most two lines; counting four of the longest length per live session (twice,
-   as margin), 64 sessions list about 45 KiB, which leaves at least 16 KiB for lines no session
+   session has at most two lines (a container is listed as its probe until the probe is removed,
+   before its real `create`); counting four of the longest length per live session (twice, as
+   margin), 64 sessions list about 46 KiB, which leaves at least 16 KiB for lines no session
    accounts for: inference instances, which are listed but not counted (#134), and leftovers of
    killed predecessors or containers made outside the daemon under its label. Those can still
    push a listing past the cap (`THREAT_MODEL.md` §6). The relation is unit-tested in
@@ -374,8 +382,16 @@ are released only once the container is confirmed gone.
    shuts it down after the container is gone (open tunnels audit `egress.close` with `end:
    session-stopped`), a failed launch drops it. Then **audit** `sandbox.launch` (SI-4: before
    anything is visible).
-6. `podman create`; then every pin is re-checked on the host (`LaunchScan::recheck_host`), then
-   `podman init`. The runtime builds the mounts but starts nothing.
+6. The **mount-link probe** (RT-FS-02, `sandbox/mount_probe.rs`): a probe container of the same
+   image from the checked argv minus every `-v` bind and overlay and the GPU device flag
+   (its name recorded first), `create` and `init`, its pid and image id read, every mount
+   destination of the launch walked inside its root filesystem with no link allowed, then
+   removed and confirmed gone whatever the walk found. A link at or above a destination, or any
+   failure, refuses the launch. The walk sees the image's tree only: a destination nested in a
+   host folder (a `.git` shield in an `rw` mount) stays with the launch scan, the host re-check
+   and step 7's pin check. Then `podman create`, its image id compared with the probe's; then
+   every pin is re-checked on the host (`LaunchScan::recheck_host`), then `podman init`. The
+   runtime builds the mounts but starts nothing.
 7. **Post-init mount check** (B4). From the host, under `/proc/<init-pid>/root` with
    `RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS`, every bind-mounted pin (mount roots, the `.git`
    parent self-binds, `.git` pointer files) must show its pinned `st_dev:st_ino`. On a mismatch
@@ -389,10 +405,11 @@ are released only once the container is confirmed gone.
    keep-id map shape, the seccomp filter by content (the embedded profile converted for the
    native architecture), exactly the mounts with their options (each overlay's `lowerdir`
    included, parents before children), the args and environment as built plus the image's
-   `Env`/`WorkingDir`, rlimits, cgroup limits with swap equal to memory, `cgroupsPath` in the
-   systemd form only (doctor requires systemd), masked and read-only paths, annotations and
-   hostname. Beside the config, podman's `.Config.Timeout` (read by the same `podman inspect`)
-   must equal the argv's `--timeout`, and 0 when it has none (#92, Q193), and its
+   `Env`, the working directory `/` whatever the image declares (`--workdir /`), rlimits,
+   cgroup limits with swap equal to memory, `cgroupsPath` in the systemd form only (doctor
+   requires systemd), masked and read-only paths, annotations and hostname. Beside the config,
+   podman's `.Config.Timeout` (read by the same `podman inspect`) must equal the argv's
+   `--timeout`, and 0 when it has none (#92, Q193), and its
    `.Config.Healthcheck` (same inspect) must be exactly the disabled form `{"Test":["NONE"]}`
    that `--no-healthcheck` records, else the field named is `healthcheck`. On a difference the
    container is removed and `sandbox.config_mismatch` is audited
@@ -407,10 +424,12 @@ are released only once the container is confirmed gone.
 harness (`Launcher::launch_harness`) and CPU inference (`Launcher::launch_inference`) launches
 share one path (`sandbox/launch/start.rs`): each role's refusals that need nothing made and its
 claim, the re-check of step 2, the role's own preparation (its image found in local storage,
-then its directories and argv), and steps 5 (audit) to 8. `podman create`, `init` and `start`,
-the empty mounts file (`Podman::spec_args`) and the config verifier are called there only, and
-every podman command runs through hermetic podman, so no role starts without the private `HOME`,
-the empty mounts file or the verifier. A refusal audits the real role.
+then its directories and argv), and steps 5 (audit) to 8, in the order audit, probe, `create`
+and the image-id compare, host re-check, `init`, pin compare, verifier, `start`. `podman create`,
+`init` and `start`, the empty mounts file (`Podman::spec_args`), the mount-link probe and the
+config verifier are called there only, and every podman command runs through hermetic podman, so
+no role starts without the private `HOME`, the empty mounts file, the probe or the verifier. A
+refusal audits the real role.
 - **Harness**: `no-default-image` first (`harness.image`, else the bundled default, #88); then it
   claims its session's harness, refused `no-session` unless the session is live and `overlap` if
   a harness is already claimed (live check and claim under one lock, so a second launch can never
@@ -426,7 +445,8 @@ the empty mounts file or the verifier. A refusal audits the real role.
   fresh and 0700: an id in use is refused before anything is created. The model blob (its
   import identity) and the socket directory are pinned, re-checked and compared like the
   harness's. `stop_role` audits `sandbox.stop {role, instance}` and removes the container and
-  both directories. The orphan sweeps do not cover `sp-infer-*` yet (#134).
+  both directories. The orphan sweeps do not cover an inference container (`sp-infer-<id>`) or
+  its probe (`sp-probe-infer-<id>`) yet (#134).
 - The disk watchdog and the cgroup event observer stay workspace-only (#132).
 
 **Disk watchdog** (#14, Task 6c; maintainer design after the 6c-1 reviews). A sandbox writes to
@@ -1095,7 +1115,10 @@ TODO(#28): the harness container and `llm.sock` (Task 13, Task 12 PR C).
   then every session stops at once. A second signal meanwhile exits non-zero at once.
   A `sallyd` killed outright stops nothing; conmon's `--timeout` backstop (§3.3, #92) ends each
   session container `runtime.timeout` + 300 s after its `podman init`, and the next start's
-  orphan sweep removes whatever is left.
+  orphan sweep removes the workspace and harness containers and probes still left. An inference
+  container (no backstop) and its probe are not swept, and the start's stale-state step removes
+  only `sessions/` and `control.sock`, so `infer/<id>` under both the runtime and the data
+  directory survives too: all of them stay until removed by hand (#134).
 - `start-failed`.
 - `exited`: the container ended on its own. The registry checks the init's `/proc/<pid>` fd
   every 250 ms (Q62); a lookup through it fails once that process is gone, even if its pid is
@@ -1790,9 +1813,9 @@ upstream release binaries checked against committed SHA-256 sums):
 Nightly (`nightly.yml`): `make mutants`, cargo-mutants over the deny paths
 (`manifest::validate`, `paths`, `links`, `location`, `host`, `config` today; the egress, rpc, llm,
 approvals and tools modules run in the wide job, `make mutants-wide-sallyd`, `tools::exec`
-excepted: its
-decisions need a container and its `rt_` tests hold it) with a **zero-survivor gate**: a surviving mutant in a deny path is an untested
-control. cargo-mutants runs with `TMPDIR` under `target/` because `/tmp` is denylisted.
+excepted: its decisions need a container and its `rt_` tests hold it) with a **zero-survivor
+gate**: a surviving mutant in a deny path is an untested control. cargo-mutants runs with
+`TMPDIR` under `target/` because `/tmp` is denylisted.
 Each mutant builds with the `mutants` cargo profile (the test profile without debug info) and
 runs its tests under nextest's `mutants` profile (`.config/nextest.toml`, 4 test threads): a
 test past the 30 s per-test limit is terminated and its mutant counts as caught, and the gate

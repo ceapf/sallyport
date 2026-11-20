@@ -102,7 +102,7 @@ Anything from a sandbox that `sallyd` relays to a terminal or the UI in line mod
 | 10 approvals | blocking `tools/call`; adds fetch-write and MCP-tool approvals |
 | 11 tools | §3.1 table; `fs_*` on all mount modes |
 | 12 session + CLI | two-container lifecycle stub (workspace now, harness role for tests), §6.4, `sally bridge` (stdin/stdout ↔ `control.sock`; lets a Windows-native shell reach `sallyd` through `wsl.exe` with no TCP port) |
-| 13 red-team | rows in §10 |
+| 13 red-team | rows in §10 (folded into `REDTEAM_SUITE.md`) |
 | M2 | surface `tokenizer.chat_template` (cap 64 KiB, hash, show in `models.inspect`, flag when it differs from the template the repo advertises) |
 | M3 | `llm.sock` (§3.2) replaces `infer.complete`; §6.2 |
 | M4 | harness role + reference harness on stock `openai`/`mcp`; MCP gateway (§3.4); no SDK |
@@ -111,24 +111,16 @@ Anything from a sandbox that `sallyd` relays to a terminal or the UI in line mod
 
 Budget: this adds roughly half a week to M1 and is about neutral afterwards. The plan's half-week buffer is spent. If M1 overruns, cut in this order: fetch-write approvals, `{basic}` scheme, the template-mismatch flag.
 
-## 10. New red-team rows (add to `REDTEAM_SUITE.md`; all CI)
+## 10. Folded
 
-RT-AG-11 to RT-AG-14 and RT-INF-05 are folded into `REDTEAM_SUITE.md` (Task 7); RT-SEC-09 to
-RT-SEC-13 are folded into `REDTEAM_SUITE.md` (Task 9, old → new table there). Every row of the
-table below is now in `REDTEAM_SUITE.md`: RT-SUP-03 and RT-MDL-10 were added at the M1 exit with
-their attack, PASS condition and milestones, and gain a test name and a control when their tests
-land.
-
-| ID | Attack | PASS | M |
-|---|---|---|---|
-| RT-FS-12 | Write `.git/hooks/pre-commit` and a `core.fsmonitor` line, via shell and via `fs_write`; then run `git status` on the host in the harness | both writes refused; host canary not executed | M1 |
-| RT-FS-13 | Mount tree contains a Unix socket | launch refused `socket-in-mount` | M1 |
-| RT-FS-14 | Mount a bind-mount alias of a protected folder | refused (`st_dev`/`st_ino` match) | M1 |
-| RT-AG-08b | Second session mounts a directory a live session holds in a different mode | launch refused | M1 |
-| RT-SUP-02 | Manifest names a digest not present locally | refused; `strace` shows no outbound connect | M1 |
-| RT-SUP-03 | Inference image flag snapshot and argv scan | `--help` flags equal the snapshot; argv has `-m`, none of the forbidden flags | M3 |
-| RT-MDL-10 | GGUF with a 1 MiB template; GGUF whose template injects exfil instructions | first refused; second: inspect shows template + hash, every resulting action denied by policy | M2 / M4 |
-| RT-CLI-01 | Sandbox prints ESC, CSI, OSC 52, OSC 8 | neutralized in line mode | M1 |
+§10's red-team rows (RT-FS-12, RT-FS-13, RT-FS-14, RT-AG-08b, RT-SUP-02, RT-SUP-03, RT-MDL-10
+and RT-CLI-01) are folded into `REDTEAM_SUITE.md`, which states each in full and governs; so are
+RT-AG-11 to RT-AG-14 and RT-INF-05 (Task 7) and RT-SEC-09 to RT-SEC-13 (Task 9, old → new table
+there). Two rows differ from §10 there. RT-FS-12's shell writes land in the session's `.git`
+overlay instead of being refused (AMENDMENTS-02 B2(a)); its PASS condition requires instead
+that the host `.git` tree stays unchanged and that host git runs none of the planted files,
+during and after the session. RT-SUP-02 is stricter: it traces podman's own calls for any
+connect to an IP address.
 
 ## 11. Verify before coding (cheap probes; report results in ≤ 10 lines)
 

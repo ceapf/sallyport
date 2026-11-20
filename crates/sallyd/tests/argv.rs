@@ -441,6 +441,116 @@ fn every_role_starts_with_the_checked_runtime_and_has_the_section_6_1_flags() {
     }
 }
 
+// ---- docs/ARCHITECTURE.md says what the builders push ---------------------------------------
+
+/// docs/ARCHITECTURE.md as committed.
+fn architecture() -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/ARCHITECTURE.md");
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+/// The text of the `### <number>` section of `doc`, its heading line through the line before the
+/// next line that starts with `#` (any heading, or a `#` line in a block, ends it). A missing
+/// heading fails the test.
+fn doc_section<'a>(doc: &'a str, number: &str) -> &'a str {
+    let head = format!("### {number} ");
+    let start = doc
+        .find(&format!("\n{head}"))
+        .unwrap_or_else(|| panic!("no heading {head:?} in ARCHITECTURE.md"))
+        + 1;
+    let rest = &doc[start..];
+    let end = rest[1..].find("\n#").map_or(rest.len(), |i| i + 2);
+    &rest[..end]
+}
+
+/// The contents of every fenced block in `section`, in order.
+fn fenced_blocks(section: &str) -> Vec<String> {
+    section
+        .split("```")
+        .skip(1)
+        .step_by(2)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The whitespace-separated tokens of `block`, each line's `#` comment left out (no argv token
+/// in these blocks holds a `#`).
+fn block_tokens(block: &str) -> std::collections::BTreeSet<String> {
+    block
+        .lines()
+        .flat_map(|l| {
+            l.split_once('#')
+                .map_or(l, |(code, _)| code)
+                .split_whitespace()
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Security review: the normative argv block of docs/ARCHITECTURE.md §3.2 lost flags the builders
+/// push (`--workdir /`, `--image-volume=ignore`), so a later change held to the document could
+/// drop them without contradicting it. Every `--` option that all three roles' argvs carry, taken
+/// from the builders' own output, is in the §3.2 prologue block or in each of §3.3's three role
+/// blocks.
+#[test]
+fn every_flag_all_roles_carry_is_in_the_architecture_argv_blocks() {
+    let f = Fx::new();
+    let argvs = every_argv(&f);
+    let flags = |a: &Vec<String>| -> std::collections::BTreeSet<String> {
+        a.iter().filter(|t| t.starts_with("--")).cloned().collect()
+    };
+    let common = argvs
+        .iter()
+        .map(flags)
+        .reduce(|x, y| x.intersection(&y).cloned().collect())
+        .expect("every_argv builds three roles");
+    assert!(!common.is_empty(), "no option common to every role");
+    let doc = architecture();
+    let prologue = fenced_blocks(doc_section(&doc, "3.2"));
+    assert_eq!(prologue.len(), 1, "§3.2 has one argv block");
+    let prologue = block_tokens(&prologue[0]);
+    let roles: Vec<_> = fenced_blocks(doc_section(&doc, "3.3"))
+        .iter()
+        .map(|b| block_tokens(b))
+        .collect();
+    assert_eq!(roles.len(), 3, "§3.3 has one argv block per role");
+    let missing: Vec<_> = common
+        .iter()
+        .filter(|t| !prologue.contains(*t) && !roles.iter().all(|r| r.contains(*t)))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "options every role's argv carries, absent from ARCHITECTURE §3.2 and §3.3: {missing:?}"
+    );
+}
+
+/// Security review: ARCHITECTURE §3.5 step 7 said the OCI config verifier accepts the image's
+/// `WorkingDir`, which it refuses: the process's working directory must be the launcher's `/`
+/// (`sandbox::oci` process check). The step is found first, then its verifier sentence, so a
+/// renumbered or reworded step fails rather than passes.
+#[test]
+fn the_verifier_step_does_not_accept_the_image_working_directory() {
+    let doc = architecture();
+    let launch = doc_section(&doc, "3.5");
+    let start = launch
+        .find("\n7. ")
+        .expect("§3.5 has a step 7 (post-init mount check and OCI config verifier)");
+    let rest = &launch[start + 1..];
+    let step = &rest[..rest.find("\n8. ").expect("§3.5 has a step 8 after step 7")];
+    assert!(
+        step.contains("OCI config verifier"),
+        "step 7 holds the verifier sentence: {step}"
+    );
+    assert!(
+        !step.contains("WorkingDir"),
+        "step 7 says the verifier accepts the image's WorkingDir: {step}"
+    );
+    assert!(
+        step.contains("the working directory `/` whatever the image declares"),
+        "step 7 does not say the verifier holds the working directory to `/`: {step}"
+    );
+}
+
 /// The checker requires image-declared volumes to be ignored, as one token: a missing flag,
 /// another mode, the two-token spelling and a second copy are refused.
 #[test]
