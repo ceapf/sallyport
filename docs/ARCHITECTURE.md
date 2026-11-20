@@ -1780,7 +1780,7 @@ upstream release binaries checked against committed SHA-256 sums):
 
 | Job | Gate |
 |---|---|
-| `rust` | `make fmt clippy forbid-unsafe nextest` (cargo-nextest, plus doctests) |
+| `rust` | `make fmt clippy forbid-unsafe mutants-paths nextest` (cargo-nextest, plus doctests) |
 | `deny` | `cargo deny check` for the workspace and `fuzz/` |
 | `coverage` | `make coverage`: cargo-llvm-cov, `sally-core` ≥ 90 % lines; each of `sallyd/src/{egress,rpc,llm,approvals,tools}/` ≥ 85 % over its files together (lib tests, `scripts/coverage-gate.sh`) |
 | `fuzz` | 60 s per cargo-fuzz target on a pinned nightly |
@@ -1788,8 +1788,9 @@ upstream release binaries checked against committed SHA-256 sums):
 | `doctor-syntax` | `bash -n scripts/doctor.sh` |
 
 Nightly (`nightly.yml`): `make mutants`, cargo-mutants over the deny paths
-(`manifest::validate`, `paths`, `host`, `config` today; the egress, rpc, llm, approvals and
-tools modules run in the wide job, `make mutants-wide-sallyd`, `tools::exec` excepted: its
+(`manifest::validate`, `paths`, `links`, `location`, `host`, `config` today; the egress, rpc, llm,
+approvals and tools modules run in the wide job, `make mutants-wide-sallyd`, `tools::exec`
+excepted: its
 decisions need a container and its `rt_` tests hold it) with a **zero-survivor gate**: a surviving mutant in a deny path is an untested
 control. cargo-mutants runs with `TMPDIR` under `target/` because `/tmp` is denylisted.
 Each mutant builds with the `mutants` cargo profile (the test profile without debug info) and
@@ -1799,7 +1800,9 @@ lists it in the job summary. A test that runs past the 7.5 s slow period in the 
 baseline fails the gate, which keeps the limit at least 4x the slowest test. Every test process
 runs under `prlimit --data` (2 GiB, so at most 8 GiB across the 4 threads), so a mutant that
 allocates without end fails its own test instead of exhausting the runner; the gate lists those
-too (#82).
+too (#82). A run in which no mutant was caught, missed or timed out fails the gate (an unviable
+mutant counts for nothing), and `make mutants-paths` (in `make lint` and the `rust` job) fails
+when an entry of a mutation list matches no Rust file or a list is empty.
 
 Dev-dependencies: `insta` (summary and diagnostic snapshots; review changes with
 `cargo insta review`) and `proptest` (wildcard matcher, host-pattern round trip; the token

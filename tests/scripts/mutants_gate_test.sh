@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# tests/scripts/mutants_gate_test.sh — scripts/mutants-gate.sh fails on missed mutants only
-# (maintainer ruling, issue #36): a timed-out mutant counts as detected and is listed in the job
-# summary; any other cargo-mutants failure still fails. Runs via `make test-scripts`.
+# tests/scripts/mutants_gate_test.sh — scripts/mutants-gate.sh fails on missed mutants (maintainer
+# ruling, issue #36): a timed-out mutant counts as detected and is listed in the job summary; any
+# other cargo-mutants failure still fails, and so does a run in which no mutant was caught, missed
+# or timed out (an unviable mutant counts for nothing). Runs via `make test-scripts`.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -139,8 +140,8 @@ if grep -Fxq 'baseline' "$tmp/summary" 2>/dev/null; then
 fi
 
 # The per-test limit's margin (architect ruling R1): a SLOW line in the unmutated baseline, plain
-# or in colour, fails the gate; so does a missing baseline log once any mutant was tested. A run
-# that tested no mutant passes without one, and a clean baseline passes.
+# or in colour, fails the gate; so does a missing baseline log once any mutant was tested. A clean
+# baseline passes. A run that tested no mutant fails whatever its baseline (below).
 slow_plain='        SLOW [>  7.500s] (───) sallyd llm::server::tests::t'
 slow_colour=$'\033[1;33m        SLOW\033[0m [>  7.500s] (───) sallyd x::y'
 for line in "$slow_plain" "$slow_colour"; do
@@ -165,11 +166,63 @@ if [ "$(gate_rc 0)" -ne 1 ]; then
   echo "FAIL: a run that tested mutants passed without a baseline log" >&2
   fail=1
 fi
+# A run that tested no mutant proves nothing: a --file that matches nothing, or a file with no
+# mutant, leaves all four lists empty and no baseline log (cargo-mutants 27.1.0 returns before the
+# baseline), and an unviable mutant never built. The gate fails it with its own message, whatever
+# the exit code; one caught or timed-out mutant beside unviable ones still passes.
+empty_msg='no mutant was tested'
+# gate_err <cargo-mutants exit>: the gate's exit code, then its stderr, on $tmp/out.
+gate_err() {
+  local rc=0 err
+  err="$(GITHUB_STEP_SUMMARY="$tmp/summary" bash "$gate" "$1" "$tmp/out" 2>&1 >/dev/null)" || rc=$?
+  printf '%s\n%s' "$rc" "$err"
+}
+# expect_empty <label> <cargo-mutants exit>: the gate fails on $tmp/out with the empty-run message.
+expect_empty() {
+  local out rc
+  out="$(gate_err "$2")"
+  rc="${out%%$'\n'*}"
+  if [ "$rc" -ne 1 ]; then
+    echo "FAIL: $1: exit $rc, want 1" >&2
+    fail=1
+  fi
+  if ! grep -Fq "$empty_msg" <<<"$out"; then
+    echo "FAIL: $1: the gate does not say that no mutant was tested" >&2
+    fail=1
+  fi
+}
+fresh_out
+: >"$tmp/out/caught.txt"
+expect_empty "no mutant tested, clean baseline, exit 0" 0
 fresh_out
 rm "$tmp/out/log/baseline.log"
 : >"$tmp/out/caught.txt"
+expect_empty "no mutant tested and no baseline log, exit 0" 0
+fresh_out
+: >"$tmp/out/caught.txt"
+printf '%s\n' 'src/u.rs:1:1: replace u -> String with String::new()' >"$tmp/out/unviable.txt"
+expect_empty "only unviable mutants, exit 0" 0
+if ! gate_err 0 | grep -Fq '(1 unviable)'; then
+  echo "FAIL: only unviable mutants: the gate does not give the unviable count" >&2
+  fail=1
+fi
+for code in 2 3; do
+  fresh_out
+  rm "$tmp/out/log/baseline.log"
+  : >"$tmp/out/caught.txt"
+  expect_empty "no mutant tested, exit $code" "$code"
+done
+fresh_out
+printf '%s\n' 'src/u.rs:1:1: replace u -> String with String::new()' >"$tmp/out/unviable.txt"
 if [ "$(gate_rc 0)" -ne 0 ]; then
-  echo "FAIL: a run that tested no mutant failed for want of a baseline log" >&2
+  echo "FAIL: one caught mutant beside an unviable one failed the gate" >&2
+  fail=1
+fi
+fresh_out
+: >"$tmp/out/caught.txt"
+printf '%s\n' "$t1" >"$tmp/out/timeout.txt"
+if [ "$(gate_rc 3)" -ne 0 ]; then
+  echo "FAIL: a run whose only tested mutant timed out failed the gate" >&2
   fail=1
 fi
 fresh_out
