@@ -285,10 +285,10 @@ fn run_remote(cmd: Remote, paths: &Paths) -> u8 {
             accept_manifest,
             ..
         }) => match gated(manifest, accept_manifest.as_deref(), paths, &mut stderr) {
-            Ok(text) => text,
+            Ok(text) => Some(text),
             Err(code) => return code,
         },
-        _ => String::new(),
+        _ => None,
     };
     let mut client = match socket_path(paths).and_then(|p| Client::connect(&p)) {
         Ok(c) => c,
@@ -299,18 +299,21 @@ fn run_remote(cmd: Remote, paths: &Paths) -> u8 {
         err: &mut stderr,
     };
     match (cmd, tty) {
-        (Remote::Session(cmd), _) => match cmd {
-            SessionCmd::Start { script, .. } => {
-                commands::session_start(&mut client, &launch, script.as_deref(), &mut o)
+        (Remote::Session(cmd), _) => match (cmd, launch) {
+            (SessionCmd::Start { script, .. }, Some(text)) => {
+                commands::session_start(&mut client, &text, script.as_deref(), &mut o)
             }
-            SessionCmd::Drive { id } => drive::session_drive(&mut client, &id, &mut o),
-            SessionCmd::List => commands::session_list(&mut client, &mut o),
-            SessionCmd::Stop { id } => commands::session_stop(&mut client, &id, &mut o),
-            SessionCmd::Changes { id } => commands::session_changes(&mut client, &id, &mut o),
+            // The gate gave every launch its text above.
+            (SessionCmd::Start { .. }, None) => EXIT_FAILED,
+            (SessionCmd::Drive { id }, _) => drive::session_drive(&mut client, &id, &mut o),
+            (SessionCmd::List, _) => commands::session_list(&mut client, &mut o),
+            (SessionCmd::Stop { id }, _) => commands::session_stop(&mut client, &id, &mut o),
+            (SessionCmd::Changes { id }, _) => commands::session_changes(&mut client, &id, &mut o),
         },
-        (Remote::Sandbox(SandboxCmd::Run { argv, .. }), _) => {
-            run::sandbox_run(&mut client, &launch, &argv, std::io::stdin(), &mut o)
-        }
+        (Remote::Sandbox(SandboxCmd::Run { argv, .. }), _) => match launch {
+            Some(text) => run::sandbox_run(&mut client, &text, &argv, std::io::stdin(), &mut o),
+            None => EXIT_FAILED,
+        },
         (Remote::Approvals, _) => commands::approvals(&mut client, &mut o),
         (Remote::Approve, Some(tty)) => approve_on(&tty, &mut client, o.err),
         (Remote::Approve, None) => EXIT_FAILED,
@@ -341,13 +344,17 @@ fn gated(
         return consent::launch_text(manifest, g, err);
     };
     let (Ok(r), Ok(mut w)) = (tty.try_clone(), tty.try_clone()) else {
+        let _ = writeln!(
+            err,
+            "sally: the terminal (/dev/tty) could not be opened for the question"
+        );
         return Err(EXIT_FAILED);
     };
     // One byte at a time, as `approve` reads: nothing typed ahead waits where tcflush cannot
     // reach it.
     let mut input = BufReader::with_capacity(1, r);
     let mut flush = || {
-        let _ = rustix::termios::tcflush(&tty, rustix::termios::QueueSelector::IFlush);
+        rustix::termios::tcflush(&tty, rustix::termios::QueueSelector::IFlush).map_err(Into::into)
     };
     let mut t = Tty {
         input: &mut input,
@@ -370,7 +377,7 @@ fn approve_on(tty: &std::fs::File, client: &mut Client, err: &mut dyn std::io::W
     // typed ahead waits in a buffer that tcflush cannot reach.
     let mut input = BufReader::with_capacity(1, r);
     let mut flush = || {
-        let _ = rustix::termios::tcflush(tty, rustix::termios::QueueSelector::IFlush);
+        rustix::termios::tcflush(tty, rustix::termios::QueueSelector::IFlush).map_err(Into::into)
     };
     let mut t = Tty {
         input: &mut input,

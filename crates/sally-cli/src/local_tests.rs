@@ -147,6 +147,14 @@ fn a_secret_grant_needs_the_name_in_the_store() {
             && out.ends_with("valid (sallyd checks again when a session starts)\n"),
         "{out}"
     );
+    // Its summary ends with the hash of the text read, which a launch's flag names (0).
+    let (code, out, _) = run(|o| manifest_summary(&m, &s.store(), o));
+    assert_eq!(code, EXIT_OK, "{out}");
+    let text = std::fs::read_to_string(&m).unwrap();
+    assert!(
+        out.ends_with(&format!("sha256 {}\n", consent::digest(&text).as_hex())),
+        "{out}"
+    );
 }
 
 /// Architect Q226, the twin of the test above: manifest text the CLI prints (here a mount's
@@ -192,6 +200,12 @@ fn a_non_ascii_mount_path_is_escaped_and_the_run_exits_1() {
     assert!(
         out.contains("sc-loc-caf\\u{e9}-") && out.is_ascii(),
         "{out}"
+    );
+    // A launch cannot show that line, so it starts nothing: no hash to accept it with.
+    assert!(!out.contains("sha256 "), "{out}");
+    assert!(
+        err.contains("starts nothing: ") && err.contains("sc-loc-caf\\u{e9}-"),
+        "{err}"
     );
 }
 

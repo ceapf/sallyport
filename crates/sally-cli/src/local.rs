@@ -80,7 +80,9 @@ pub fn manifest_validate(path: &Path, store: &Path, o: &mut Out<'_>) -> u8 {
 /// against the secrets store at `store` as `manifest validate` is, then a last line
 /// `sha256 <hex>`: the hash of the text read, which a launch's `--accept-manifest` names. The
 /// warnings and acknowledged risks a launch shows go to `err`, so a review sees everything the
-/// hash accepts.
+/// hash accepts, and so does a mount host not written as the folder it is (a launch accepted by
+/// the hash alone refuses it). A manifest whose launch block holds a line that cannot be shown
+/// starts nothing: no hash for it, and 1.
 pub fn manifest_summary(path: &Path, store: &Path, o: &mut Out<'_>) -> u8 {
     let (text, v) = match validated(path, store, o) {
         Ok(v) => v,
@@ -89,10 +91,32 @@ pub fn manifest_summary(path: &Path, store: &Path, o: &mut Out<'_>) -> u8 {
     for l in consent::besides_summary(&v) {
         let _ = writeln!(o.err, "{}", clean::line(&l).text);
     }
+    if let Err(e) = HostEnv::from_process()
+        .map_err(|e| e.to_string())
+        .and_then(|env| {
+            v.manifest
+                .check_hosts_as_written(&env.home)
+                .map_err(|e| e.to_string())
+        })
+    {
+        let _ = writeln!(o.err, "{}", clean::line(&e).text);
+    }
+    let shown = consent::block(&v);
     let mut p = Printer::new(o);
     p.text(&summary(&v.manifest));
-    p.line(&["sha256 ", consent::digest(&text).as_hex()]);
-    p.code()
+    match shown {
+        Ok(_) => {
+            p.line(&["sha256 ", consent::digest(&text).as_hex()]);
+            p.code()
+        }
+        Err(dirty) => {
+            let _ = writeln!(
+                p.o.err,
+                "sally: a launch cannot show this line, so it starts nothing: {dirty}"
+            );
+            EXIT_REFUSED
+        }
+    }
 }
 
 /// `sally audit verify` (architect Q115): 0 verified; 1 the log failed verification (the first

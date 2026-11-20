@@ -306,7 +306,44 @@ fn off_a_terminal_needs_the_hash_of_the_text_it_sends(l: Launch, tag: &str) {
     assert!(f.methods().is_empty(), "{l:?}: {:?}", f.methods());
     // Control: the hash of the text on disk sends exactly that text.
     let o = launch(&f, &h, l, &m, &["--accept-manifest", &new]);
-    assert_eq!(created(&f), [wider], "{l:?}: {}", stderr(&o));
+    assert_eq!(
+        created(&f),
+        std::slice::from_ref(&wider),
+        "{l:?}: {}",
+        stderr(&o)
+    );
+
+    // The hash names the text, not the folders: a host written through a link could mount
+    // another folder later with the same text. Control first: the folder written as itself.
+    std::fs::create_dir_all(h.join("real/sub")).unwrap();
+    std::os::unix::fs::symlink(h.join("real"), h.join("link")).unwrap();
+    let host = |written: &str| {
+        format!(
+            "{HEAD}filesystem:\n  mounts:\n    - {{host: \"{written}\", guest: /workspace/p, \
+             mode: rw}}\n{RISKY}"
+        )
+    };
+    let direct = host("~/real/sub");
+    std::fs::write(&m, &direct).unwrap();
+    let (_, hash) = reviewed(&f, &h, &m);
+    let o = launch(&f, &h, l, &m, &["--accept-manifest", &hash]);
+    assert_eq!(
+        created(&f),
+        [wider.clone(), direct.clone()],
+        "{l:?}: {}",
+        stderr(&o)
+    );
+    std::fs::write(&m, host("~/link/sub")).unwrap();
+    let (_, hash) = reviewed(&f, &h, &m);
+    let o = launch(&f, &h, l, &m, &["--accept-manifest", &hash]);
+    assert_eq!(o.status.code(), Some(1), "{l:?}: {}", stderr(&o));
+    assert!(
+        stderr(&o).contains("filesystem.mounts[0].host is written \"~/link/sub\""),
+        "{l:?}: {}",
+        stderr(&o)
+    );
+    assert!(!stderr(&o).contains(&hash), "{}", stderr(&o));
+    assert_eq!(created(&f), [wider, direct], "{l:?}: nothing more sent");
 }
 
 #[test]

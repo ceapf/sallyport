@@ -7,8 +7,8 @@
 //!   that prompt closed meanwhile, the line is discarded, never applied to the next one.
 //! - A cut prompt shows its full text before the question; one whose full text could not be
 //!   sent, or whose text failed the clean-check, can only be denied.
-//! - The terminal closing (end of input) or failing denies the prompt on screen, and `sally`
-//!   exits non-zero.
+//! - The terminal closing (end of input) or failing, its typed-ahead input included when it
+//!   cannot be discarded, denies the prompt on screen, and `sally` exits non-zero.
 //! - The connection ending (sallyd stopped, or dropped this approver for falling behind; architect
 //!   Q91) is told in one line, and `sally` exits non-zero: the prompts still pending are denied.
 
@@ -28,8 +28,9 @@ pub struct Tty<'a> {
     pub input: &'a mut dyn BufRead,
     /// Prompts and questions.
     pub output: &'a mut dyn Write,
-    /// Discards typed-ahead input; called before each read.
-    pub flush: &'a mut dyn FnMut(),
+    /// Discards typed-ahead input; called before each read. When it fails, nothing is read:
+    /// the input could be an answer typed before the question.
+    pub flush: &'a mut dyn FnMut() -> std::io::Result<()>,
 }
 
 /// A human's answer.
@@ -205,11 +206,11 @@ fn ask(c: &mut Client, tty: &mut Tty<'_>, q: &mut Queue, p: &Prompt) -> Result<O
         };
         let _ = write!(tty.output, "{question}");
         let _ = tty.output.flush();
-        (tty.flush)();
         let mut line = String::new();
-        let read = tty.input.read_line(&mut line);
+        let read = (tty.flush)().and_then(|()| tty.input.read_line(&mut line));
         if !matches!(read, Ok(n) if n > 0) {
-            // The terminal is gone: the prompt on screen is denied.
+            // The terminal is gone, or what it holds may have been typed before the question:
+            // the prompt on screen is denied.
             let _ = decide(c, p, Answer::Deny, false);
             let _ = writeln!(
                 tty.output,
