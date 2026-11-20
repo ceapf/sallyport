@@ -450,7 +450,8 @@ fn architecture() -> String {
 }
 
 /// The text of the `### <number>` section of `doc`, its heading line through the line before the
-/// next `#` heading. A missing heading fails the test.
+/// next line that starts with `#` (any heading, or a `#` line in a block, ends it). A missing
+/// heading fails the test.
 fn doc_section<'a>(doc: &'a str, number: &str) -> &'a str {
     let head = format!("### {number} ");
     let start = doc
@@ -472,11 +473,16 @@ fn fenced_blocks(section: &str) -> Vec<String> {
         .collect()
 }
 
-/// The whitespace-separated tokens of `block`, each line's ` # ` comment left out.
+/// The whitespace-separated tokens of `block`, each line's `#` comment left out (no argv token
+/// in these blocks holds a `#`).
 fn block_tokens(block: &str) -> std::collections::BTreeSet<String> {
     block
         .lines()
-        .flat_map(|l| l.split(" #").next().unwrap_or("").split_whitespace())
+        .flat_map(|l| {
+            l.split_once('#')
+                .map_or(l, |(code, _)| code)
+                .split_whitespace()
+        })
         .map(str::to_owned)
         .collect()
 }
@@ -497,7 +503,7 @@ fn every_flag_all_roles_carry_is_in_the_architecture_argv_blocks() {
         .iter()
         .map(flags)
         .reduce(|x, y| x.intersection(&y).cloned().collect())
-        .unwrap();
+        .expect("every_argv builds three roles");
     assert!(!common.is_empty(), "no option common to every role");
     let doc = architecture();
     let prologue = fenced_blocks(doc_section(&doc, "3.2"));
@@ -538,6 +544,10 @@ fn the_verifier_step_does_not_accept_the_image_working_directory() {
     assert!(
         !step.contains("WorkingDir"),
         "step 7 says the verifier accepts the image's WorkingDir: {step}"
+    );
+    assert!(
+        step.contains("the working directory `/` whatever the image declares"),
+        "step 7 does not say the verifier holds the working directory to `/`: {step}"
     );
 }
 

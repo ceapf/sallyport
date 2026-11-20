@@ -279,14 +279,14 @@ outside Sallyport's control decides what a sandbox may call. Unit tests check th
 independently of the generator (`sandbox::profiles`:
 `no_rule_of_any_role_allows_a_removed_syscall_under_any_condition`,
 `sockets_are_an_allowlist_of_address_families`, `socketpair_is_allowed_for_af_unix_only`,
-`clone_is_allowed_only_without_namespace_flags`, `only_native_architectures_are_listed`). The OCI config verifier compares each container's
-`linux.seccomp` with the embedded profile by content before `start` (`sandbox::oci`
-`the_cgroup_path_seccomp_and_masked_paths_are_checked`; RT-SUP-04). In a container, three probes
-meet the filter: RT-FS-07 (`mknod`, `ENOSYS`), RT-FS-17 (`unshare`, `clone` with namespace flags,
-`clone3`) and RT-NET-12 (`socket` and `socketpair` families outside the role's list, with
-`AF_UNIX` pairs made as its control). The other removals are checked in the JSON only, by no
-system call in a container. RT-FS-09 tests the masked and read-only `/proc` and `/sys` paths,
-not the profile.
+`clone_is_allowed_only_without_namespace_flags`, `only_native_architectures_are_listed`). The
+OCI config verifier compares each container's `linux.seccomp` with the embedded profile by
+content before `start` (`sandbox::oci` `the_cgroup_path_seccomp_and_masked_paths_are_checked`;
+RT-SUP-04). In a container, three probes meet the filter: RT-FS-07 (`mknod`, `ENOSYS`), RT-FS-17
+(`unshare`, `clone` with namespace flags, `clone3`) and RT-NET-12 (`socket` and `socketpair`
+families outside the role's list, with `AF_UNIX` pairs made as its analogue control). The other
+removals are checked in the JSON only, by no system call in a container. RT-FS-09 tests the
+masked and read-only `/proc` and `/sys` paths, not the profile.
 
 ### 3.5 Launch (normative, Task 6b)
 `sallyd::sandbox::Launcher::launch_workspace`, in this order. The launch runs in its own task:
@@ -308,7 +308,8 @@ are released only once the container is confirmed gone.
    directory reached through a bind alias or a second mount of the same filesystem therefore
    still conflicts. No sandbox ever holds write access to an ancestor, a descendant or the same
    directory as another session's mount, so no live sandbox can swap what another session's
-   launch scan pinned. `Launcher::remove_orphans` removes `sp-ws-*`/`sp-h-*` containers a
+   launch scan pinned. `Launcher::remove_orphans` removes `sp-ws-*`/`sp-h-*` containers (and
+   their mount-link probes, `sp-probe-ws-*`/`sp-probe-h-*`) a
    previous `sallyd` of this installation left running (audited `sandbox.orphan_removed` with
    the name, the full ID it removes by, and `sweep: startup`); `sallyd` calls it before it accepts the first launch, then every 60 s
    (`sweep: periodic`, architect Q61): a `podman create` a killed `sallyd` left running can make
@@ -324,16 +325,17 @@ are released only once the container is confirmed gone.
    sweep is an oplog line, retried at the next. The listing asks podman for one label only,
    `<full ID> <name> <installation label>`, each a JSON string, never the whole label set: a
    container's labels include its image's, so a line would be as long as an image author likes
-   (architect Q307). A line is daemon-bounded (ID, name and UUID): at most 179 bytes for a
-   session container, 182 for an inference instance. A listing over 64 KiB is refused whole,
-   never cut (#173): a cut on a line boundary would parse as a shorter listing that misses the
-   containers past it. That cap bounds the sweep at about 360 containers: past it, the startup
+   (architect Q307). A line is daemon-bounded (ID, name and UUID): at most 185 bytes for a
+   session container or its probe, 188 for an inference instance's probe. A listing over 64 KiB
+   is refused whole, never cut (#173): a cut on a line boundary would parse as a shorter listing
+   that misses the containers past it. That cap bounds the sweep at about 350 containers: past it, the startup
    sweep refuses the start and a periodic one fails. So the live sessions are bounded where
    they are admitted: at most 64 (`MAX_LIVE_SESSIONS`), counted in the same step that reserves
    the overlap claims and descriptors, before either is checked. The 65th is refused
    `session-limit` before anything is created (stop a session to launch another). A live
-   session has at most two lines; counting four of the longest length per live session (twice,
-   as margin), 64 sessions list about 45 KiB, which leaves at least 16 KiB for lines no session
+   session has at most two lines (a container is listed as its probe until the probe is removed,
+   before its real `create`); counting four of the longest length per live session (twice, as
+   margin), 64 sessions list about 46 KiB, which leaves at least 16 KiB for lines no session
    accounts for: inference instances, which are listed but not counted (#134), and leftovers of
    killed predecessors or containers made outside the daemon under its label. Those can still
    push a listing past the cap (`THREAT_MODEL.md` §6). The relation is unit-tested in
@@ -381,7 +383,7 @@ are released only once the container is confirmed gone.
    session-stopped`), a failed launch drops it. Then **audit** `sandbox.launch` (SI-4: before
    anything is visible).
 6. The **mount-link probe** (RT-FS-02, `sandbox/mount_probe.rs`): a probe container of the same
-   image from the checked argv minus every host-folder bind, overlay and the GPU device flag
+   image from the checked argv minus every `-v` bind and overlay and the GPU device flag
    (its name recorded first), `create` and `init`, its pid and image id read, every mount
    destination of the launch walked inside its root filesystem with no link allowed, then
    removed and confirmed gone whatever the walk found. A link at or above a destination, or any
@@ -405,8 +407,9 @@ are released only once the container is confirmed gone.
    included, parents before children), the args and environment as built plus the image's
    `Env`, the working directory `/` whatever the image declares (`--workdir /`), rlimits,
    cgroup limits with swap equal to memory, `cgroupsPath` in the systemd form only (doctor
-   requires systemd), masked and read-only paths, annotations and hostname. Beside the config, podman's `.Config.Timeout` (read by the same `podman inspect`)
-   must equal the argv's `--timeout`, and 0 when it has none (#92, Q193), and its
+   requires systemd), masked and read-only paths, annotations and hostname. Beside the config,
+   podman's `.Config.Timeout` (read by the same `podman inspect`) must equal the argv's
+   `--timeout`, and 0 when it has none (#92, Q193), and its
    `.Config.Healthcheck` (same inspect) must be exactly the disabled form `{"Test":["NONE"]}`
    that `--no-healthcheck` records, else the field named is `healthcheck`. On a difference the
    container is removed and `sandbox.config_mismatch` is audited
@@ -1114,8 +1117,8 @@ TODO(#28): the harness container and `llm.sock` (Task 13, Task 12 PR C).
   session container `runtime.timeout` + 300 s after its `podman init`, and the next start's
   orphan sweep removes the workspace and harness containers and probes still left. An inference
   container (no backstop) and its probe are not swept, and the start's stale-state step removes
-  only `sessions/` and `control.sock`, so `infer/<id>` survives too: both stay until removed by
-  hand (#134).
+  only `sessions/` and `control.sock`, so `infer/<id>` under both the runtime and the data
+  directory survives too: all of them stay until removed by hand (#134).
 - `start-failed`.
 - `exited`: the container ended on its own. The registry checks the init's `/proc/<pid>` fd
   every 250 ms (Q62); a lookup through it fails once that process is gone, even if its pid is

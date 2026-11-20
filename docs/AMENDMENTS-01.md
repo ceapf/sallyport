@@ -116,9 +116,11 @@ Budget: this adds roughly half a week to M1 and is about neutral afterwards. The
 §10's red-team rows (RT-FS-12, RT-FS-13, RT-FS-14, RT-AG-08b, RT-SUP-02, RT-SUP-03, RT-MDL-10
 and RT-CLI-01) are folded into `REDTEAM_SUITE.md`, which states each in full and governs; so are
 RT-AG-11 to RT-AG-14 and RT-INF-05 (Task 7) and RT-SEC-09 to RT-SEC-13 (Task 9, old → new table
-there). Two rows are stricter there than §10 had them: RT-FS-12's shell writes land in the
-session's `.git` overlay instead of being refused, and the host `.git` tree stays unchanged
-(AMENDMENTS-02 B2(a)); RT-SUP-02 traces podman's own calls for any connect to an IP address.
+there). Two rows differ from §10 there. RT-FS-12's shell writes land in the session's `.git`
+overlay instead of being refused (AMENDMENTS-02 B2(a)); its PASS condition requires instead
+that the host `.git` tree stays unchanged and that host git runs none of the planted files,
+during and after the session. RT-SUP-02 is stricter: it traces podman's own calls for any
+connect to an IP address.
 
 ## 11. Verify before coding (cheap probes; report results in ≤ 10 lines)
 

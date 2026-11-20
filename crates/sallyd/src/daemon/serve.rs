@@ -21,7 +21,8 @@
 //! `runtime.timeout` + 300 s after its `podman init`; the next start's orphan sweep removes the
 //! workspace and harness containers and probes still left. An inference container has no
 //! backstop and no sweep yet, and step 4 removes only `sessions/` and `control.sock`, so the
-//! container, its probe and `infer/<id>` stay until removed by hand (TODO(#134)).
+//! container, its probe and `infer/<id>` (under both the runtime and the data directory) stay
+//! until removed by hand (TODO(#134)).
 
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
