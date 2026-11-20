@@ -27,7 +27,7 @@ pub use diag::{Code, Diagnostic, Rejected, Severity};
 pub use host::{HostError, HostPattern, parse_host_pattern, parse_hostname};
 pub use hostenv::{EnvDir, HostEnv, HostEnvError};
 pub use image::is_pinned_image_ref;
-pub use location::{LocationError, ManifestPlace};
+pub use location::{HostAsWritten, LocationError, ManifestPlace};
 pub use parse::{MAX_MANIFEST_BYTES, parse, parse_bytes, to_yaml};
 pub use summary::summary;
 pub use types::{

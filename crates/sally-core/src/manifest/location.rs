@@ -11,13 +11,17 @@
 //! root renamed after validation). `staged` and `ro` mounts never refuse: the session cannot change
 //! the host folder through them.
 //!
+//! A launch whose only consent is a hash of the text (`--accept-manifest`) also needs each mount
+//! host written as the folder it resolves to ([`ValidatedManifest::check_hosts_as_written`]):
+//! the hash names the text, and a link on a host's way can point elsewhere later.
+//!
 //! TODO(#254): residuals: a link chain that passes through a writable folder at an intermediate
 //! hop, a hard link of the manifest file into a writable folder, and a bind of a subdirectory
 //! (whose real parents the identity chain does not see; #17).
 
 use std::path::{Path, PathBuf};
 
-use super::paths::{DirId, identity_chain};
+use super::paths::{DirId, expand, identity_chain};
 use super::types::MountMode;
 use super::validate::ValidatedManifest;
 
@@ -40,7 +44,7 @@ pub struct ManifestPlace {
 pub enum LocationError {
     /// The manifest lies inside a folder the manifest lets the session write.
     #[error(
-        "the manifest {} lies inside filesystem.mounts[{mount}] ({}), which the session can \
+        "the manifest's folder {} lies inside filesystem.mounts[{mount}] ({}), which the session can \
          write: keep the manifest outside every rw and brokered mount",
         manifest.display(),
         root.display()
@@ -107,6 +111,15 @@ struct Root<'a> {
     mode: MountMode,
 }
 
+/// Whether a mount of `mode` lets the session change the host folder: `rw` directly, `brokered`
+/// through the broker. Exhaustive, so a new mode must say.
+fn session_writes(mode: MountMode) -> bool {
+    match mode {
+        MountMode::Rw | MountMode::Brokered => true,
+        MountMode::Ro | MountMode::Staged => false,
+    }
+}
+
 /// The first `(holder, root)` pair where a writable root holds the holder, by path (the
 /// holder's realpath is the root's or lies under it, compared by component) or by identity (the
 /// holder's chain holds the root's identity). Pure: the decision of
@@ -115,9 +128,7 @@ fn first_inside<'a>(
     holders: &'a [Holder],
     roots: &'a [Root<'a>],
 ) -> Option<(&'a Holder, &'a Root<'a>)> {
-    let writable = roots
-        .iter()
-        .filter(|r| matches!(r.mode, MountMode::Rw | MountMode::Brokered));
+    let writable = roots.iter().filter(|r| session_writes(r.mode));
     for root in writable {
         for h in holders {
             if h.realpath.starts_with(root.host) || h.chain.contains(&root.id) {
@@ -128,7 +139,61 @@ fn first_inside<'a>(
     None
 }
 
+/// A mount host written as another path than the folder it resolved to: through a link, or
+/// with `.` or `..`. Such a host can resolve to another folder later with the same text, so a
+/// hash of the text does not name the folders mounted.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "filesystem.mounts[{mount}].host is written {written:?} but resolves to {}: a launch \
+     accepted by --accept-manifest needs each mount host written as the folder it is",
+    resolved.display()
+)]
+pub struct HostAsWritten {
+    /// The mount's index in `filesystem.mounts`.
+    pub mount: usize,
+    /// The host as the manifest writes it.
+    pub written: String,
+    /// The host realpath the summary shows.
+    pub resolved: PathBuf,
+}
+
+/// The index of the first `(written, resolved)` host pair whose written path, `~` expanded
+/// against `home`, is not the resolved path (compared by component). Pure: the decision of
+/// [`ValidatedManifest::check_hosts_as_written`].
+fn first_not_as_written(hosts: &[(&str, &Path)], home: &Path) -> Option<usize> {
+    hosts.iter().position(|(written, resolved)| {
+        expand(written, home).map_or(true, |p| p.as_path() != *resolved)
+    })
+}
+
 impl ValidatedManifest {
+    /// Refuses a launch accepted by a hash of the text alone when a mount host is not written
+    /// as the folder it resolved to (`home` expands `~`): the same text could then mount
+    /// another folder than the summary showed.
+    ///
+    /// # Errors
+    /// [`HostAsWritten`] naming the first such mount.
+    pub fn check_hosts_as_written(&self, home: &Path) -> Result<(), HostAsWritten> {
+        let raw = &self.manifest().filesystem.mounts;
+        let hosts: Vec<(&str, &Path)> = raw
+            .iter()
+            .zip(self.mounts())
+            .map(|(r, m)| (r.host.as_str(), m.host.as_path()))
+            .collect();
+        match first_not_as_written(&hosts, home) {
+            Some(mount) => Err(HostAsWritten {
+                mount,
+                written: hosts
+                    .get(mount)
+                    .map_or_else(String::new, |h| h.0.to_owned()),
+                resolved: hosts
+                    .get(mount)
+                    .map_or_else(PathBuf::new, |h| h.1.to_path_buf()),
+            }),
+            None => Ok(()),
+        }
+    }
+
     /// Refuses a launch of this manifest from `place` when a folder holding it lies inside one of
     /// the manifest's `rw` or `brokered` mounts (module docs).
     ///
@@ -307,6 +372,82 @@ mod tests {
         for h in &place.holders {
             assert_eq!(h.chain[0], identity_chain(&h.realpath).unwrap()[0]);
         }
+    }
+
+    /// Allow: hosts written as their realpaths, absolute or under `~`. Deny: a host written
+    /// through a link, with `..`, or not expandable; the first such mount is named.
+    #[test]
+    fn a_host_must_be_written_as_the_folder_it_resolved_to() {
+        let home = Path::new("/home/u");
+        let p = Path::new("/home/u/code/p");
+        let q = Path::new("/srv/q");
+        assert_eq!(first_not_as_written(&[], home), None);
+        assert_eq!(
+            first_not_as_written(&[("~/code/p", p), ("/srv/q", q), ("/srv/q/", q)], home),
+            None
+        );
+        assert_eq!(first_not_as_written(&[("~", home)], home), None);
+        for (written, at) in [
+            ("~/code/link", 1),
+            ("~/code/x/../p", 1),
+            ("/home/u/code/P", 1),
+            ("code/p", 1),
+            ("~other/p", 1),
+        ] {
+            assert_eq!(
+                first_not_as_written(&[("/srv/q", q), (written, p)], home),
+                Some(at),
+                "{written}"
+            );
+        }
+        assert_eq!(
+            first_not_as_written(&[("~/code/link", p), ("/srv/x", q)], home),
+            Some(0)
+        );
+    }
+
+    /// The check on a real manifest: a host written through a link on its way (validation
+    /// refuses a host that is a link itself) is named with both paths; the same folder written
+    /// as its realpath passes.
+    #[test]
+    fn a_validated_mount_written_through_a_link_is_named() {
+        use crate::manifest::{HostEnv, load};
+        // Under the workspace's target dir: /tmp is never mountable.
+        let home = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/tmp")
+            .join(format!("sc-aswritten-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("real/sub")).unwrap();
+        let home = std::fs::canonicalize(home).unwrap();
+        let real = home.join("real/sub");
+        std::os::unix::fs::symlink(home.join("real"), home.join("link")).unwrap();
+        let env = HostEnv {
+            home: home.clone(),
+            other_homes: Vec::new(),
+            xdg_config_home: None,
+            xdg_data_home: None,
+            xdg_runtime_dir: None,
+            podman_storage: Vec::new(),
+            env_dirs: Vec::new(),
+            nproc: 8,
+            mem_bytes: 16 << 30,
+        };
+        let names = std::collections::BTreeSet::<String>::new();
+        let body = |host: &str| {
+            format!(
+                "apiVersion: sallyport/v1\nkind: Manifest\nname: t\nmodel:\n  ref: any\n\
+                 filesystem:\n  mounts:\n    - {{host: \"{host}\", guest: /workspace/p, mode: ro}}\n"
+            )
+        };
+        let v = load(&body("~/link/sub"), &env, &names).unwrap().manifest;
+        let e = v.check_hosts_as_written(&env.home).unwrap_err();
+        assert_eq!(e.mount, 0);
+        assert_eq!(e.written, "~/link/sub");
+        assert_eq!(e.resolved, real);
+        assert!(e.to_string().contains("filesystem.mounts[0].host"), "{e}");
+        let v = load(&body("~/real/sub"), &env, &names).unwrap().manifest;
+        assert_eq!(v.check_hosts_as_written(&env.home), Ok(()));
+        std::fs::remove_dir_all(&home).unwrap();
     }
 
     #[test]
