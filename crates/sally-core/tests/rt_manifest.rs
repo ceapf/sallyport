@@ -524,7 +524,48 @@ fn rt_man_02_image_transport_prefixes_are_refused() {
 
 // ---- RT-MAN-03: the manifest file's place ---------------------------------------------------
 // The red-team tests of RT-MAN-03 run the `sally` binary (sally-cli tests/consent.rs) and a real
-// launch (sallyd tests/session.rs). This one holds the check they call on a validated manifest.
+// launch (sallyd tests/session.rs). Here: what a validated manifest keeps after its file changes,
+// and the place check the launchers call on it.
+
+/// A validated manifest keeps the validated mount after its file is rewritten wider, its re-check
+/// still passes, and the rewritten file is rejected when it is loaded again.
+#[test]
+fn rt_man_03_validated_manifest_is_independent_of_the_file() {
+    let f = Fixture::new();
+    let path = f.root.join("m.yaml");
+    let safe = format!(
+        "{HEADER}filesystem:\n  mounts:\n    - {{host: \"~/code/myproject\", guest: /workspace/p, mode: ro}}\n"
+    );
+    std::fs::write(&path, &safe).unwrap();
+    let v = f
+        .load_with(
+            &std::fs::read_to_string(&path).unwrap()[HEADER.len()..],
+            &[],
+        )
+        .unwrap()
+        .manifest;
+
+    // Attacker rewrites the file after validation.
+    std::fs::write(
+        &path,
+        safe.replace("~/code/myproject", "~/.ssh")
+            .replace("mode: ro", "mode: rw"),
+    )
+    .unwrap();
+
+    // The validated struct (what launch consumes) still holds the validated mount ...
+    assert_eq!(v.mounts()[0].mode, sally_core::manifest::MountMode::Ro);
+    assert!(v.mounts()[0].host.ends_with("code/myproject"));
+    // ... the mount re-check still passes (the *host directory* did not change) ...
+    assert!(v.recheck_mounts(&f.env).is_ok());
+    // ... and re-loading the mutated file is rejected.
+    let reread = std::fs::read_to_string(&path).unwrap();
+    assert_rejects(
+        &f.load(&reread[HEADER.len()..]),
+        "filesystem.mounts[0].host",
+        Code::Denylisted,
+    );
+}
 
 /// A manifest kept inside one of its own `rw` or `brokered` mounts is refused, naming the mount;
 /// kept inside a `staged` or `ro` one, or outside every mount, it is not.
