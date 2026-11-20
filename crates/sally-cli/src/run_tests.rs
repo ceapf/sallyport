@@ -227,30 +227,26 @@ impl Drop for Daemon {
     }
 }
 
-fn manifest(tag: &str) -> PathBuf {
-    let p = std::env::temp_dir().join(format!("sp-cli-r-{tag}-{}.yaml", std::process::id()));
-    std::fs::write(&p, "name: t\n").unwrap();
-    p
-}
+/// The manifest text a run sends: the launch gate that reads and checks it is tested through the
+/// binary (`tests/consent.rs`).
+const MANIFEST: &str = "name: t\n";
 
 /// Runs `sandbox run` against `d` with `stdin`: the exit code, stdout, stderr.
 fn run(d: &Daemon, tag: &str, stdin: Vec<u8>) -> (u8, String, String) {
     run_with(d, tag, Cursor::new(stdin))
 }
 
-/// [`run`] with any stdin.
-fn run_with(d: &Daemon, tag: &str, stdin: impl Read + Send + 'static) -> (u8, String, String) {
+/// [`run`] with any stdin. `_tag` names the case at the call (it once named a manifest file).
+fn run_with(d: &Daemon, _tag: &str, stdin: impl Read + Send + 'static) -> (u8, String, String) {
     let mut c = Client::connect(&d.path).unwrap();
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let mut o = Out {
         out: &mut out,
         err: &mut err,
     };
-    let m = manifest(tag);
     let argv = vec!["sh".to_owned()];
-    let code = sandbox_run(&mut c, &m, &argv, stdin, &mut o);
+    let code = sandbox_run(&mut c, MANIFEST, &argv, stdin, &mut o);
     drop(c);
-    let _ = std::fs::remove_file(&m);
     (
         code,
         String::from_utf8(out).unwrap(),
@@ -743,10 +739,9 @@ fn dirty_output_then_stdin_not_utf8_exits_refused() {
         let mut c = Client::connect(&d.path).unwrap();
         let mut out = Signalling(Vec::new(), shown);
         let mut err = Vec::new();
-        let m = manifest(&tag);
         let code = sandbox_run(
             &mut c,
-            &m,
+            MANIFEST,
             &["sh".to_owned()],
             AfterShown(wait),
             &mut Out {
@@ -755,7 +750,6 @@ fn dirty_output_then_stdin_not_utf8_exits_refused() {
             },
         );
         drop(c);
-        let _ = std::fs::remove_file(&m);
         let err = String::from_utf8(err).unwrap();
         let own = "sally: stdin is not UTF-8 text; the command was ended\n";
         if dirty {

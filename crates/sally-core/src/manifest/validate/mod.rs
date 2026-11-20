@@ -78,8 +78,9 @@ pub struct EgressRule {
 
 /// A manifest that passed validation. Only [`validate`] constructs one.
 ///
-/// This is the canonical struct launch works from (RT-MAN-03): it owns all data, so editing or
-/// deleting the manifest file after validation cannot change what is launched.
+/// This is the canonical struct launch works from: it owns all data and is built from the text a
+/// launcher sent, never from a path. A launcher that reads a manifest file reads it once, checks
+/// its place with [`ValidatedManifest::check_place`], and sends that same text (RT-MAN-03).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedManifest {
     manifest: Manifest,

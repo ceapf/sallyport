@@ -211,10 +211,16 @@ fn run_with(f: &Fake, lines: &[&str], hook: Option<(usize, Hook)>) -> Run {
 /// sender the test still holds) fails the test, and its worker is left behind.
 /// `std::thread::scope` cannot bound it: a scope joins its threads before it returns, even while
 /// unwinding, so it would hang with them.
-fn run_bounded(
+fn run_bounded(x: (Client, SyncSender<Frame>), lines: &[&str], hook: Option<(usize, Hook)>) -> Run {
+    run_flushing(x, lines, hook, true)
+}
+
+/// [`run_bounded`] on a terminal whose typed-ahead input can be discarded (`flush_ok`) or not.
+fn run_flushing(
     (mut c, queue): (Client, SyncSender<Frame>),
     lines: &[&str],
     hook: Option<(usize, Hook)>,
+    flush_ok: bool,
 ) -> Run {
     let lines: VecDeque<String> = lines.iter().map(|l| format!("{l}\n")).collect();
     let (done, result) = mpsc::channel();
@@ -227,7 +233,14 @@ fn run_bounded(
         };
         let mut input = BufReader::with_capacity(4096, script);
         let (mut shown, mut err, mut flushes) = (Vec::new(), Vec::new(), 0);
-        let mut flush = || flushes += 1;
+        let mut flush = || {
+            flushes += 1;
+            if flush_ok {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("tcflush failed"))
+            }
+        };
         let code = {
             let mut tty = Tty {
                 input: &mut input,
@@ -308,6 +321,21 @@ fn end_of_input_denies_the_prompt_on_screen() {
         [json!({"id": "p1", "decision": "deny", "digest": "d-p1", "full_shown": false})]
     );
     assert!(r.shown.contains("denied p1"), "{}", r.shown);
+}
+
+/// A terminal whose typed-ahead input cannot be discarded is not read: the `approve` it holds
+/// could have been typed before the question, so the prompt on screen is denied.
+#[test]
+fn a_terminal_that_cannot_discard_typed_ahead_input_denies() {
+    let f = daemon("noflush", vec![prompt("p1")], 9);
+    let r = run_flushing(client(&f), &["approve"], None, false);
+    assert_eq!(r.code, EXIT_REFUSED);
+    assert_eq!(
+        f.decides(),
+        [json!({"id": "p1", "decision": "deny", "digest": "d-p1", "full_shown": false})]
+    );
+    assert!(r.shown.contains("denied p1"), "{}", r.shown);
+    assert_eq!(r.flushes, 1);
 }
 
 fn queued(frame: &Value) -> Frame {

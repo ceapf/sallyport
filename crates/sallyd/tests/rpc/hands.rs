@@ -31,14 +31,15 @@ async fn hands(x: &Lx) -> Hands {
     std::fs::create_dir_all(&host).unwrap();
     let canary = format!("CANARY_HANDS_{:x}", std::process::id());
     std::fs::write(host.join("canary.txt"), &canary).unwrap();
-    let v = x.f.load(&format!(
+    let validated = x.f.validated(&format!(
         "{}network:\n  mode: proxy\n  allow:\n    - host: mock.test\n\
          tools:\n  builtin: [fs_write, fs_delete, shell]\n  shell: allow\n  \
          acknowledge_unapproved: [shell]\n",
         mounts(&[mount("~/code/hands", "/workspace/p", "rw")])
     ));
+    let v = validated.manifest.clone();
     let reg = x.registry(x.events.clone(), Some(test_image()));
-    let info = reg.start(Arc::new(v.clone())).await.unwrap();
+    let info = reg.start(Arc::new(validated)).await.unwrap();
     let req = HarnessRequest {
         paths: x.session_paths(&info.id),
         manifest: Arc::new(v.clone()),

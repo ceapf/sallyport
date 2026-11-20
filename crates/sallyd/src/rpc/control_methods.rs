@@ -10,7 +10,7 @@ use std::os::fd::AsFd;
 use std::sync::Arc;
 
 use sally_core::audit::{Actor, NewEntry};
-use sally_core::manifest::{ValidatedManifest, load};
+use sally_core::manifest::{Validated, load};
 use sally_core::secrets::StoreNames;
 use sally_core::text::escape_capped;
 use sally_proto::ModelKind;
@@ -76,10 +76,12 @@ pub trait SessionSet: Clone + Send + Sync + 'static {
     fn desk(&self, id: &str) -> Option<Desk>;
     /// Session `id`'s drive handle: only a session declared driven at start has one.
     fn driver(&self, id: &str) -> Option<Arc<Driver>>;
-    /// Starts a session for `manifest`; with a `script`, declared driven (architect Q119).
+    /// Starts a session from the validator's whole verdict `validated` (the manifest with its
+    /// warnings, so none can be dropped by omission); with a `script`, declared driven (architect
+    /// Q119).
     fn start(
         &self,
-        manifest: Arc<ValidatedManifest>,
+        validated: Arc<Validated>,
         script: Option<Script>,
     ) -> impl Future<Output = Result<SessionInfo, StartError>> + Send;
     /// Stops session `id` (a client's request); `None`: no such session.
@@ -485,12 +487,7 @@ impl<S: SessionSet> Control<S> {
             }
             None => return Done::Close,
         };
-        match self
-            .p
-            .sessions
-            .start(Arc::new(validated.manifest), script)
-            .await
-        {
+        match self.p.sessions.start(Arc::new(validated), script).await {
             Ok(info) => {
                 // Bound before the reply is written: a connection gone by then stops it at
                 // once (architect Q150).
@@ -512,10 +509,13 @@ impl<S: SessionSet> Control<S> {
             Err(e) => {
                 let reason = start_reason(&e);
                 let detail = escape_capped(e.to_string().as_bytes(), DETAIL_CHARS);
-                let args = json!({
+                let mut args = json!({
                     "method": method::SESSIONS_CREATE, "reason": reason, "detail": detail,
                     "client": who(client),
                 });
+                if let (Some(id), Some(a)) = (refused_start_id(&e), args.as_object_mut()) {
+                    a.insert("id".to_owned(), json!(id));
+                }
                 let data = refusal(reason, Some(detail), Vec::new());
                 self.refuse(Actor::Sallyd, "session.refuse", args, data)
                     .await
@@ -656,6 +656,25 @@ impl<S: SessionSet> Control<S> {
     }
 }
 
+/// The session a refused start had minted, when its `session.refuse` names it: a start whose
+/// entry append, or that append's task, failed. Its log holds the records of what was accepted
+/// and no launch entry after them, so this refusal is their ending. Listed in full so a new
+/// kind of failure must say.
+// TODO(#259): `Socket` and `Exited` also fail after the id exists; their session's own log
+// ends itself, but the refusal does not name it.
+fn refused_start_id(e: &StartError) -> Option<&str> {
+    match e {
+        StartError::Audit { id, .. } | StartError::Join { id, .. } => Some(id),
+        StartError::ShuttingDown
+        | StartError::Id(_)
+        | StartError::Paths(_)
+        | StartError::Launch(_)
+        | StartError::Exited(_)
+        | StartError::Socket(_)
+        | StartError::Task(_) => None,
+    }
+}
+
 /// The refusal reason of a start failure other than a launch refusal (architect Q88 iii);
 /// listed in full so a new kind of failure is named here, not swept into one.
 fn start_reason(e: &StartError) -> &'static str {
@@ -665,9 +684,9 @@ fn start_reason(e: &StartError) -> &'static str {
         StartError::Id(_)
         | StartError::Paths(_)
         | StartError::Exited(_)
-        | StartError::Audit(_)
+        | StartError::Audit { .. }
         | StartError::Socket(_)
-        | StartError::Join(_)
+        | StartError::Join { .. }
         | StartError::Task(_) => "start-failed",
     }
 }

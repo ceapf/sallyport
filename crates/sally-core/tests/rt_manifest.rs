@@ -1,6 +1,7 @@
 //! Red-team tests for the manifest layer (tests/redteam/REDTEAM_SUITE.md).
 //!
-//! Covered here: RT-MAN-01, RT-MAN-02, RT-MAN-03 (validate half), RT-FS-05 (validate half),
+//! Covered here: RT-MAN-01, RT-MAN-02, RT-MAN-03 (the place check the launchers call; its red-team
+//! tests run the `sally` binary and a real launch), RT-FS-05 (validate half),
 //! RT-FS-06 (validate + re-check half), RT-SEC-08, RT-MAN-04, RT-FS-19. The launch halves ("no container launched",
 //! "launch uses the stored struct") are asserted again by the sandbox/session tests (tasks 6, 12).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -12,7 +13,8 @@ use std::time::{Duration, Instant};
 use common::rendered_all;
 use common::{Fixture, HEADER, assert_rejects, fake_token, rendered};
 use sally_core::manifest::{
-    Code, EnvDir, MAX_MANIFEST_BYTES, parse, parse_bytes, to_yaml, validate,
+    Code, EnvDir, LocationError, MAX_MANIFEST_BYTES, ManifestPlace, parse, parse_bytes, to_yaml,
+    validate,
 };
 
 /// The control of a return-value refusal (#122): `body`, which differs from the refused case
@@ -520,8 +522,13 @@ fn rt_man_02_image_transport_prefixes_are_refused() {
     }
 }
 
-// ---- RT-MAN-03: TOCTOU on the manifest file -----------------------------------------------------
+// ---- RT-MAN-03: the manifest file's place ---------------------------------------------------
+// The red-team tests of RT-MAN-03 run the `sally` binary (sally-cli tests/consent.rs) and a real
+// launch (sallyd tests/session.rs). Here: what a validated manifest keeps after its file changes,
+// and the place check the launchers call on it.
 
+/// A validated manifest keeps the validated mount after its file is rewritten wider, its re-check
+/// still passes, and the rewritten file is rejected when it is loaded again.
 #[test]
 fn rt_man_03_validated_manifest_is_independent_of_the_file() {
     let f = Fixture::new();
@@ -537,7 +544,6 @@ fn rt_man_03_validated_manifest_is_independent_of_the_file() {
         )
         .unwrap()
         .manifest;
-    let snapshot = v.clone();
 
     // Attacker rewrites the file after validation.
     std::fs::write(
@@ -547,8 +553,7 @@ fn rt_man_03_validated_manifest_is_independent_of_the_file() {
     )
     .unwrap();
 
-    // The validated struct (what launch consumes) is unchanged ...
-    assert_eq!(v, snapshot);
+    // The validated struct (what launch consumes) still holds the validated mount ...
     assert_eq!(v.mounts()[0].mode, sally_core::manifest::MountMode::Ro);
     assert!(v.mounts()[0].host.ends_with("code/myproject"));
     // ... the mount re-check still passes (the *host directory* did not change) ...
@@ -560,6 +565,39 @@ fn rt_man_03_validated_manifest_is_independent_of_the_file() {
         "filesystem.mounts[0].host",
         Code::Denylisted,
     );
+}
+
+/// A manifest kept inside one of its own `rw` or `brokered` mounts is refused, naming the mount;
+/// kept inside a `staged` or `ro` one, or outside every mount, it is not.
+#[test]
+fn the_place_check_refuses_a_manifest_inside_its_own_writable_mount() {
+    let f = Fixture::new();
+    let inside = f.home().join("code/myproject/m.yaml");
+    let outside = f.root.join("m.yaml");
+    for (mode, refused) in [
+        ("rw", true),
+        ("brokered", true),
+        ("staged", false),
+        ("ro", false),
+    ] {
+        let body = format!(
+            "filesystem:\n  mounts:\n    - {{host: \"~/code/other\", guest: /workspace/o, mode: ro}}\n    - {{host: \"~/code/myproject\", guest: /workspace/p, mode: {mode}}}\n"
+        );
+        let v = f.load(&body).unwrap().manifest;
+        for (file, want) in [(&inside, refused), (&outside, false)] {
+            std::fs::write(file, format!("{HEADER}{body}")).unwrap();
+            let r = v.check_place(&ManifestPlace::inspect(file).unwrap());
+            match r {
+                Err(LocationError::Inside { mount, root, .. }) => {
+                    assert!(want, "{mode} {}: refused", file.display());
+                    assert_eq!(mount, 1);
+                    assert_eq!(root, v.mounts()[1].host);
+                }
+                Err(e) => panic!("{mode}: {e}"),
+                Ok(()) => assert!(!want, "{mode} {}: not refused", file.display()),
+            }
+        }
+    }
 }
 
 // ---- RT-FS-05: denylisted mounts ---------------------------------------------------------------

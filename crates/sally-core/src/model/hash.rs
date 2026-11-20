@@ -1,5 +1,6 @@
 //! A model's SHA-256 (SI-6): [`Hasher`] over the bytes as they stream past, and [`Digest`], the
-//! only name a library blob has.
+//! only name a library blob has. Also the hash of a manifest's text that `sally`'s
+//! `--accept-manifest` names.
 
 use std::fmt::{self, Write as _};
 

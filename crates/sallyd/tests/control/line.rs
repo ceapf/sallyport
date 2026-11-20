@@ -200,7 +200,8 @@ fn rt_cli_01_sally_sandbox_run_prints_the_escaped_text() {
             out: &mut out,
             err: &mut err,
         };
-        sally_cli::run::sandbox_run(&mut client, &manifest, &argv, std::io::empty(), &mut o)
+        let text = std::fs::read_to_string(&manifest).unwrap();
+        sally_cli::run::sandbox_run(&mut client, &text, &argv, std::io::empty(), &mut o)
     };
     let (out, err) = (
         String::from_utf8(out).unwrap(),
@@ -655,7 +656,8 @@ fn m1_acceptance_line_1_through_sally_sandbox_run() {
                     out: &mut o_out,
                     err: &mut o_err,
                 };
-                sally_cli::run::sandbox_run(&mut client, &manifest, &argv, stdin, &mut o)
+                let text = std::fs::read_to_string(&manifest).unwrap();
+                sally_cli::run::sandbox_run(&mut client, &text, &argv, stdin, &mut o)
             })
         };
         let end = std::time::Instant::now() + Duration::from_secs(120);

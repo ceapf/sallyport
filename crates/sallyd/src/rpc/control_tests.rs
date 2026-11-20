@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
-use sally_core::manifest::{FetchWrites, ShellPolicy, ValidatedManifest};
+use sally_core::manifest::{FetchWrites, ShellPolicy, Validated};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, DuplexStream, ReadHalf, WriteHalf, split};
 
 use super::*;
@@ -33,6 +33,8 @@ const PEER: Peer = Peer {
 struct Fake {
     live: StdMutex<Vec<(SessionInfo, Option<Desk>)>>,
     started: StdMutex<Vec<String>>,
+    /// The validator's verdict each start was given.
+    verdicts: StdMutex<Vec<Arc<Validated>>>,
     start_err: StdMutex<Option<StartError>>,
     /// What a stop of a listed session answers (`None`: stopped).
     stop_fails: StdMutex<Option<String>>,
@@ -105,14 +107,15 @@ impl SessionSet for Arc<Fake> {
 
     fn start(
         &self,
-        manifest: Arc<ValidatedManifest>,
+        validated: Arc<Validated>,
         script: Option<Script>,
     ) -> impl Future<Output = Result<SessionInfo, StartError>> + Send {
         self.scripts.lock().unwrap().push(script);
+        self.verdicts.lock().unwrap().push(Arc::clone(&validated));
         let r = match self.start_err.lock().unwrap().take() {
             Some(e) => Err(e),
             None => {
-                let name = manifest.manifest().name.clone();
+                let name = validated.manifest.manifest().name.clone();
                 self.started.lock().unwrap().push(name);
                 Ok(info("s-new"))
             }
@@ -766,6 +769,39 @@ async fn a_valid_manifest_starts_a_session() {
     assert_eq!(f.events(), ["rpc.request"]);
 }
 
+/// `sessions.create` hands the session set the validator's whole verdict, so
+/// the acknowledged risk and the warning reach the launch, which records them. Control: the same
+/// manifest whose shell commands need approval acknowledges nothing and warns of nothing.
+#[tokio::test]
+async fn a_create_hands_the_launch_its_acknowledged_risks_and_warnings() {
+    let risky = format!(
+        "{MANIFEST}tools:\n  builtin: [shell]\n  shell: allow\n  \
+         destructive_requires_approval: false\n  acknowledge_unapproved: [shell]\n"
+    );
+    let quiet = format!("{MANIFEST}tools:\n  builtin: [shell]\n  shell: approve\n");
+    let f = fx("verdict");
+    for text in [&risky, &quiet] {
+        let r = f
+            .connect()
+            .call("sessions.create", json!({"manifest": text}))
+            .await;
+        assert_eq!(r["result"]["id"], json!("s-new"), "{r}");
+    }
+    let got = f.fake.verdicts.lock().unwrap().clone();
+    assert_eq!(
+        got[0].manifest.acknowledged_risks(),
+        ["tools.acknowledge_unapproved: shell"]
+    );
+    let warned: Vec<(String, &str)> = got[0]
+        .warnings
+        .iter()
+        .map(|w| (w.code.to_string(), w.path.as_str()))
+        .collect();
+    assert_eq!(warned, [("risky".to_owned(), "tools.shell")]);
+    assert!(got[1].manifest.acknowledged_risks().is_empty());
+    assert!(got[1].warnings.is_empty(), "{:?}", got[1].warnings);
+}
+
 /// A manifest granting `X_KEY` on `api.example.com`.
 fn granting() -> String {
     format!(
@@ -892,6 +928,58 @@ async fn another_start_failure_is_refused_and_recorded() {
             f.sink.last("session.refuse"),
             json!({"method": "sessions.create", "reason": code, "detail": detail, "client": client()})
         );
+    }
+}
+
+/// A start whose entry could not be appended, or whose append's task failed (here a record of
+/// what the validation accepted), had minted its session: the `session.refuse` names that
+/// session and the entry, so the session's log ends in a refusal. Unwritten, there is no reply.
+#[tokio::test]
+async fn a_start_whose_entry_failed_is_refused_naming_its_session() {
+    let audit = || StartError::Audit {
+        id: "s-5".to_owned(),
+        event: "manifest.warn".to_owned(),
+        source: sally_core::audit::AuditError::InvalidEntry("x"),
+    };
+    let join = || StartError::Join {
+        id: "s-6".to_owned(),
+        event: "manifest.warn".to_owned(),
+        text: crate::daemon::crash::JOIN_PANICKED,
+    };
+    for (failed, id, starts) in [
+        (
+            &audit as &dyn Fn() -> StartError,
+            "s-5",
+            "audit: manifest.warn: ",
+        ),
+        (&join, "s-6", "audit task: manifest.warn: "),
+    ] {
+        let f = fx("entry-failed");
+        *f.fake.start_err.lock().unwrap() = Some(failed());
+        let r = f
+            .connect()
+            .call("sessions.create", json!({"manifest": MANIFEST}))
+            .await;
+        let detail = failed().to_string();
+        assert!(detail.starts_with(starts), "{detail}");
+        assert_eq!(reason(&r), "start-failed");
+        assert_eq!(r["error"]["data"]["detail"], json!(detail));
+        assert_eq!(f.events(), ["rpc.request", "session.refuse"]);
+        assert_eq!(
+            f.sink.last("session.refuse"),
+            json!({"method": "sessions.create", "id": id, "reason": "start-failed",
+                   "detail": detail, "client": client()})
+        );
+        let f = fx("entry-failed-unwritten");
+        *f.fake.start_err.lock().unwrap() = Some(failed());
+        f.sink
+            .fail_from
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let mut w = f.connect();
+        w.send("sessions.create", json!({"manifest": MANIFEST}))
+            .await;
+        w.ended().await;
+        assert_eq!(f.events(), ["rpc.request"], "{id}");
     }
 }
 

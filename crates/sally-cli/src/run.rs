@@ -23,7 +23,6 @@
 //! end of input. TODO(#138): `--tty`, raw terminal passthrough, before M1 exit.
 
 use std::io::Read;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -32,7 +31,7 @@ use sally_proto::{Attached, KillReason, MAX_INPUT_BYTES, Output, Session, Stream
 use serde_json::{Value, json};
 
 use crate::client::{Client, Decoded, Error, Writer};
-use crate::commands::{Out, call, failed, read_manifest};
+use crate::commands::{Out, call, failed};
 use crate::{EXIT_FAILED, EXIT_REFUSED, clean};
 
 /// The exit code of a command `sallyd` killed (as a shell reports a `SIGKILL`).
@@ -115,22 +114,15 @@ fn kill_name(k: KillReason) -> &'static str {
     }
 }
 
-/// Runs `argv` in a session of `manifest`, its stdin `stdin`.
+/// Runs `argv` in a session of the manifest `text` (as the launch gate read and checked it,
+/// [`crate::consent::launch_text`]), its stdin `stdin`.
 pub fn sandbox_run(
     c: &mut Client,
-    manifest: &Path,
+    text: &str,
     argv: &[String],
     stdin: impl Read + Send + 'static,
     o: &mut Out<'_>,
 ) -> u8 {
-    let text = match read_manifest(manifest) {
-        Ok(t) => t,
-        Err(msg) => {
-            let shown = clean::line(&manifest.display().to_string()).text;
-            let _ = writeln!(o.err, "sally: {shown}: {msg}");
-            return EXIT_FAILED;
-        }
-    };
     let params = json!({"manifest": text, "lifetime": "connection"});
     let session = match call::<Session>(c, method::SESSIONS_CREATE, params) {
         Ok(s) => s,

@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 use sally_cli::approve::{Tty, approve};
 use sally_cli::client::{Client, socket_path};
 use sally_cli::commands::{self, Out, failed};
-use sally_cli::{EXIT_FAILED, EXIT_OK, clean, doctor, drive, local, run, secrets, usage};
+use sally_cli::{EXIT_FAILED, EXIT_OK, clean, consent, doctor, drive, local, run, secrets, usage};
 use sally_core::paths::Paths;
 
 /// Talk to `sallyd`: start, list and stop sessions, see what they staged, answer approvals.
@@ -114,6 +114,11 @@ enum SessionCmd {
         /// terminal's `session drive`, with no harness and no model socket.
         #[arg(long)]
         script: Option<PathBuf>,
+        /// The SHA-256 of the manifest's text, as `sally manifest summary` prints it last. Off a
+        /// terminal, a manifest with warnings or acknowledged risks starts only with it; on a
+        /// terminal the start still asks.
+        #[arg(long = "accept-manifest", value_name = "SHA256")]
+        accept_manifest: Option<String>,
     },
     /// Run a driven session's script to its end, one turn at a time.
     Drive {
@@ -146,6 +151,11 @@ enum SandboxCmd {
         /// The manifest.
         #[arg(long)]
         manifest: PathBuf,
+        /// The SHA-256 of the manifest's text, as `sally manifest summary` prints it last. Off a
+        /// terminal, a manifest with warnings or acknowledged risks runs only with it; on a
+        /// terminal the run still asks.
+        #[arg(long = "accept-manifest", value_name = "SHA256")]
+        accept_manifest: Option<String>,
         /// The command and its arguments, after `--`.
         #[arg(last = true, required = true)]
         argv: Vec<String>,
@@ -263,6 +273,23 @@ fn run_remote(cmd: Remote, paths: &Paths) -> u8 {
         },
         Remote::Session(_) | Remote::Sandbox(_) | Remote::Approvals => None,
     };
+    // A launch's gate runs before the daemon is contacted: what it sends is the text it checked.
+    let launch = match &cmd {
+        Remote::Session(SessionCmd::Start {
+            manifest,
+            accept_manifest,
+            ..
+        })
+        | Remote::Sandbox(SandboxCmd::Run {
+            manifest,
+            accept_manifest,
+            ..
+        }) => match gated(manifest, accept_manifest.as_deref(), paths, &mut stderr) {
+            Ok(text) => Some(text),
+            Err(code) => return code,
+        },
+        _ => None,
+    };
     let mut client = match socket_path(paths).and_then(|p| Client::connect(&p)) {
         Ok(c) => c,
         Err(e) => return failed(&e, &mut stderr),
@@ -272,22 +299,80 @@ fn run_remote(cmd: Remote, paths: &Paths) -> u8 {
         err: &mut stderr,
     };
     match (cmd, tty) {
-        (Remote::Session(cmd), _) => match cmd {
-            SessionCmd::Start { manifest, script } => {
-                commands::session_start(&mut client, &manifest, script.as_deref(), &mut o)
+        (Remote::Session(cmd), _) => match (cmd, launch) {
+            (SessionCmd::Start { script, .. }, Some(text)) => {
+                commands::session_start(&mut client, &text, script.as_deref(), &mut o)
             }
-            SessionCmd::Drive { id } => drive::session_drive(&mut client, &id, &mut o),
-            SessionCmd::List => commands::session_list(&mut client, &mut o),
-            SessionCmd::Stop { id } => commands::session_stop(&mut client, &id, &mut o),
-            SessionCmd::Changes { id } => commands::session_changes(&mut client, &id, &mut o),
+            // The gate gave every launch its text above.
+            (SessionCmd::Start { .. }, None) => {
+                let _ = writeln!(o.err, "sally: internal: the launch has no checked text");
+                EXIT_FAILED
+            }
+            (SessionCmd::Drive { id }, _) => drive::session_drive(&mut client, &id, &mut o),
+            (SessionCmd::List, _) => commands::session_list(&mut client, &mut o),
+            (SessionCmd::Stop { id }, _) => commands::session_stop(&mut client, &id, &mut o),
+            (SessionCmd::Changes { id }, _) => commands::session_changes(&mut client, &id, &mut o),
         },
-        (Remote::Sandbox(SandboxCmd::Run { manifest, argv }), _) => {
-            run::sandbox_run(&mut client, &manifest, &argv, std::io::stdin(), &mut o)
-        }
+        (Remote::Sandbox(SandboxCmd::Run { argv, .. }), _) => match launch {
+            Some(text) => run::sandbox_run(&mut client, &text, &argv, std::io::stdin(), &mut o),
+            None => {
+                let _ = writeln!(o.err, "sally: internal: the launch has no checked text");
+                EXIT_FAILED
+            }
+        },
         (Remote::Approvals, _) => commands::approvals(&mut client, &mut o),
         (Remote::Approve, Some(tty)) => approve_on(&tty, &mut client, o.err),
         (Remote::Approve, None) => EXIT_FAILED,
     }
+}
+
+/// The launch gate for the manifest named `manifest` ([`consent::launch_text`]): core dumps off
+/// first (the store's names are read), then the text to send, or the exit code. The terminal is
+/// `/dev/tty`, used only when stdin is a terminal too; nothing from stdin is ever an answer.
+fn gated(
+    manifest: &std::path::Path,
+    accept: Option<&str>,
+    paths: &Paths,
+    err: &mut dyn std::io::Write,
+) -> Result<String, u8> {
+    if let Err(e) = secrets::harden() {
+        let _ = writeln!(err, "sally: core dumps could not be turned off: {e}");
+        return Err(EXIT_FAILED);
+    }
+    let store = paths.secrets_file();
+    let on_terminal = rustix::termios::isatty(std::io::stdin());
+    let Some(tty) = on_terminal.then(open_tty).and_then(Result::ok) else {
+        let g = consent::Gate {
+            store: &store,
+            accept,
+            terminal: None,
+        };
+        return consent::launch_text(manifest, g, err);
+    };
+    let (Ok(r), Ok(mut w)) = (tty.try_clone(), tty.try_clone()) else {
+        let _ = writeln!(
+            err,
+            "sally: the terminal (/dev/tty) could not be opened for the question"
+        );
+        return Err(EXIT_FAILED);
+    };
+    // One byte at a time, as `approve` reads: nothing typed ahead waits where tcflush cannot
+    // reach it.
+    let mut input = BufReader::with_capacity(1, r);
+    let mut flush = || {
+        rustix::termios::tcflush(&tty, rustix::termios::QueueSelector::IFlush).map_err(Into::into)
+    };
+    let mut t = Tty {
+        input: &mut input,
+        output: &mut w,
+        flush: &mut flush,
+    };
+    let g = consent::Gate {
+        store: &store,
+        accept,
+        terminal: Some(&mut t),
+    };
+    consent::launch_text(manifest, g, err)
 }
 
 fn approve_on(tty: &std::fs::File, client: &mut Client, err: &mut dyn std::io::Write) -> u8 {
@@ -298,7 +383,7 @@ fn approve_on(tty: &std::fs::File, client: &mut Client, err: &mut dyn std::io::W
     // typed ahead waits in a buffer that tcflush cannot reach.
     let mut input = BufReader::with_capacity(1, r);
     let mut flush = || {
-        let _ = rustix::termios::tcflush(tty, rustix::termios::QueueSelector::IFlush);
+        rustix::termios::tcflush(tty, rustix::termios::QueueSelector::IFlush).map_err(Into::into)
     };
     let mut t = Tty {
         input: &mut input,

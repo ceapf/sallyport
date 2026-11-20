@@ -122,22 +122,14 @@ fn session_line(p: &mut Printer<'_, '_>, s: &Session) {
     }
 }
 
-/// `sally session start <manifest> [--script <file>]`: sends the manifest's text, and with a
-/// script a scripted model declared driven (architect Q119); prints the session.
-pub fn session_start(
-    c: &mut Client,
-    manifest: &Path,
-    script: Option<&Path>,
-    o: &mut Out<'_>,
-) -> u8 {
+/// `sally session start <manifest> [--script <file>]`: sends `text`, the manifest's text as the
+/// launch gate read and checked it ([`crate::consent::launch_text`]), and with a script a
+/// scripted model declared driven (architect Q119); prints the session.
+pub fn session_start(c: &mut Client, text: &str, script: Option<&Path>, o: &mut Out<'_>) -> u8 {
     let unreadable = |path: &Path, msg: &str, o: &mut Out<'_>| {
         let shown = clean::line(&path.display().to_string()).text;
         let _ = writeln!(o.err, "sally: {shown}: {msg}");
         EXIT_FAILED
-    };
-    let text = match read_manifest(manifest) {
-        Ok(t) => t,
-        Err(msg) => return unreadable(manifest, &msg, o),
     };
     let mut params = json!({"manifest": text});
     if let Some(path) = script {
