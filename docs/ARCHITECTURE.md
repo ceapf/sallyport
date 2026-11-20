@@ -1788,8 +1788,9 @@ upstream release binaries checked against committed SHA-256 sums):
 | `doctor-syntax` | `bash -n scripts/doctor.sh` |
 
 Nightly (`nightly.yml`): `make mutants`, cargo-mutants over the deny paths
-(`manifest::validate`, `paths`, `links`, `host`, `config` today; the egress, rpc, llm, approvals and
-tools modules run in the wide job, `make mutants-wide-sallyd`, `tools::exec` excepted: its
+(`manifest::validate`, `paths`, `links`, `location`, `host`, `config` today; the egress, rpc, llm,
+approvals and tools modules run in the wide job, `make mutants-wide-sallyd`, `tools::exec`
+excepted: its
 decisions need a container and its `rt_` tests hold it) with a **zero-survivor gate**: a surviving mutant in a deny path is an untested
 control. cargo-mutants runs with `TMPDIR` under `target/` because `/tmp` is denylisted.
 Each mutant builds with the `mutants` cargo profile (the test profile without debug info) and
