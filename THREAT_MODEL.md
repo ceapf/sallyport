@@ -199,11 +199,18 @@ G2 Access ~/.ssh/id_ed25519 from Z3
 │  ├─ Kernel exploit via syscall surface            [seccomp tightened; RESIDUAL → v2 gVisor]
 │  └─ WSL interop: run cmd.exe / reach /mnt/c       [never mounted; interop socket absent → RT-FS-11]
 ├─ Write to a RO mount                              [EROFS → RT-FS-02]
-└─ Have the runtime create a directory in an earlier mount's host folder at `init`, through an
-   image link at or above a mount destination, before any check can refuse
-                                                    [the post-init mount check and the verifier refuse the
-                                                     launch afterwards; what was created stays. RESIDUAL:
-                                                     not measured; §6]
+└─ Have the runtime create a directory in a host folder at `init`, on the image's say: an image
+   working directory or volume below a mount's guest path, or an image link at or above a mount
+   destination
+                                                    [working directory fixed at `/` (`--workdir`, the
+                                                     verifier requires it), image volumes ignored
+                                                     (`--image-volume=ignore`), and the mount-link
+                                                     probe refuses a link before the real create →
+                                                     RT-FS-02; RESIDUAL: the probe walks the image's
+                                                     tree and Sallyport's own destinations only (OPEN,
+                                                     fix planned, #273: a mount podman adds of its
+                                                     own), and inference probes are not swept
+                                                     (#134); §6]
 ```
 
 ### G3. Exfiltrate data (A1, A10, A8)
@@ -489,7 +496,7 @@ G7 Make the machine unusable
 |---|---|---|
 | Kernel exploit from Z2/Z3 escapes the container (WSL2 kernel 6.18; shared kernel) | No GPU-capable stronger isolation exists on WSL2 (`/dev/dxg` is unsupported by gVisor nvproxy; microVM GPU passthrough unavailable) | v2: gVisor for Z3 (systrap on WSL2, KVM on native Linux); native-Linux users get nvproxy for Z2 |
 | OCI runtime (crun) breakout, e.g. the `/proc`-write class | The runtime is in the TCB; a breakout lands as the user's UID, which owns the secrets store. Rootless mode probably blunts the known `/proc`-write breakouts, **but that is not a control**. Mitigations: Sallyport never uses the distro `crun` (release build, never security-patched); it passes `--runtime` to a pinned upstream crun ≥ 1.25.1 (`/proc` hardening), checksum- and signature-verified at install, and doctor V14 warns otherwise (AMENDMENTS-02 B5) | gVisor for the workspace and harness roles (M6 spike) |
-| What the runtime creates at `init` on the image's say. The image's root filesystem decides where a guest path resolves, through a link at or above a mount destination, and the runtime creates a missing destination while earlier binds may not yet be read-only. The post-init mount check (no-symlink resolution) and the OCI config verifier refuse the launch afterwards, but a directory already made in an earlier mount's host folder stays; the config is identical, so the verifier cannot see it. Not measured | The launch is refused before `start`, so nothing of the image runs; what stays is an empty directory | Not measured; measure first with a container test; none planned until then |
+| What the runtime creates at `init` on the image's say. A runtime creates a missing working directory, an image volume or a missing mount destination while it places the mounts, and the image's root filesystem decides where a guest path resolves, through a link at or above a mount destination, while earlier binds may not yet be read-only: the image could make it create a directory in a host folder | Every container's working directory is `/`, set by the launcher and required by the verifier; image volumes are ignored at create; before the real `podman create` the mount-link probe inits a container of the same image without host-folder binds and walks every destination of the launch, and a link at or above any of them refuses the launch (RT-FS-02, each leg with its control). Left: the walk sees the image's tree only, so a destination nested inside a host folder resolves there at the real `init` and stays with the launch scan, its host re-check and the post-init pin check; an inference instance's probe is not swept (#134); and the probe walks only the destinations Sallyport intends, so on a host where podman adds a mount of its own (#121) an image link at that destination is still followed at the real `init`, before the verifier refuses the launch. That case needs such a host and an attacker-chosen image; not measured | Open, fix planned, #273: the probe's own mounts are compared with the intended ones before the real create; #134 for the inference probe |
 | Covert exfiltration through an allowlisted host | Any allowed destination can carry data | v2: egress DLP heuristics; per-session byte budgets (v1 logs counts) |
 | DNS-lookup exfiltration through a wildcard rule: with `*.example.com` (or `*`) allowed, a sandbox can encode data in the labels of `CONNECT <data>.example.com:443`; the host resolves the name, so the data reaches that domain's nameservers even when the connect fails | A wildcard grants every name under it by design; the lookup happens only after the policy allowed the name, and every attempt is audited (`egress.allow`/`egress.deny` with the name) | Prefer exact hosts; v2 per-session lookup budgets and label-entropy heuristics |
 | A wildcard over shared hosting the validator does not know: a wildcard reaching hosts anyone can register needs `acknowledge_unrestricted_egress` only when its base is a listed entry (suffix or tree), a parent of one, or under a listed shared tree (`sally-core::manifest::host`); the lists are curated, so an unlisted service's wildcard is an ordinary rule, registry second levels beyond `co.uk`, `com.au` and `co.jp` are not listed, and an exact host that serves anyone's content by path is never flagged | The lists cover the hosting, tunnel and object-storage services an exfiltrating agent would reach for; every rule is still shown to the user in the summary before launch, and every connection is audited | #235: derive the lists from the Public Suffix List's private section (vendored, no network) |
