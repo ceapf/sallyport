@@ -149,7 +149,8 @@ policy (`Allowed`), an **allowlist**:
 - only the options below, each with its exact value or value shape (`--user` is the session's
   ids, the seccomp profile is the role's file under the profiles directory, `--device` only
   `nvidia.com/gpu=all` and only for inference, environment variables only the role's exact
-  name/value pairs plus `expose_env` placeholders);
+  name/value pairs plus `expose_env` placeholders); `--image-volume=ignore` and a bare
+  `--no-healthcheck` are required, and every other health-check option is refused;
 - every option at most once (mounts, variables and `--security-opt` kinds included), every
   hardening option exactly once;
 - every `-v` source a declared source of that role at its declared guest path: `ro` grants only a
@@ -175,6 +176,7 @@ podman --runtime <checked runtime_path>          # AMENDMENTS-02 B5: never the d
   --security-opt seccomp=<data>/sessions/<id>/profiles/seccomp-{workspace|harness|inference}.json
   --security-opt label=disable
   --userns=keep-id --user <uid>:<gid>
+  --workdir / --image-volume=ignore --no-healthcheck   # the image adds no mount (RT-FS-02) and no health check (RT-SUP-05)
 ```
 `label=disable`: the mounts are the user's own directories, which SELinux would only allow after relabelling (`:z`/`:Z` rewrites host labels); keeping SELinux confinement on SELinux hosts is #29 (M6).
 `--user` is the caller's own `getuid`/`getgid` (the snapshots' `1000:1000` is the fixture's): with `keep-id` that is the host user inside, so `rw` writes stay the user's.
@@ -382,7 +384,9 @@ are released only once the container is confirmed gone.
    `Env`/`WorkingDir`, rlimits, cgroup limits with swap equal to memory, `cgroupsPath` in the
    systemd form only (doctor requires systemd), masked and read-only paths, annotations and
    hostname. Beside the config, podman's `.Config.Timeout` (read by the same `podman inspect`)
-   must equal the argv's `--timeout`, and 0 when it has none (#92, Q193). On a difference the
+   must equal the argv's `--timeout`, and 0 when it has none (#92, Q193), and its
+   `.Config.Healthcheck` (same inspect) must be exactly the disabled form `{"Test":["NONE"]}`
+   that `--no-healthcheck` records, else the field named is `healthcheck`. On a difference the
    container is removed and `sandbox.config_mismatch` is audited
    with the first differing field (never a value of the environment or the command). GPU
    inference is refused until M3 (#116); an image with an entrypoint until #117.
@@ -491,7 +495,8 @@ Teardown stays with `Launcher::stop`, which keeps the staged data. Dropping the 
 stops every watchdog task and any walk in progress. A launch nobody received is stopped with retries
 until its container is gone, and keeps its watchdog meanwhile.
 
-**Teardown** (`Launcher::stop`) audits `sandbox.stop`, then runs `podman rm --force --time 0`
+**Teardown** (`Launcher::stop`) audits `sandbox.stop`, then runs
+`podman rm --force --volumes --time 0` (every removal takes the container's anonymous volumes)
 and confirms the container is gone (`podman container exists`). If it is not gone, the session
 keeps its claims and the caller gets the handle back to retry. Otherwise teardown removes
 `git/` and `profiles/` through `podman unshare` (overlay work directories belong to the

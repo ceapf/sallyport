@@ -5,8 +5,9 @@
 //! Sallyport's control decides what a sandbox may call.
 //!
 //! Neither root is reachable from a sandbox: `~/.local/share/sallyport` and `$XDG_RUNTIME_DIR`
-//! are on the built-in mount denylist (SI-7), and a sandbox sees only its own socket directory,
-//! read-only. Blocking I/O; call from `spawn_blocking`.
+//! are on the built-in mount denylist (SI-7), and a sandbox sees only its own socket directory:
+//! read-only for a workspace or harness, read-write for an inference instance (whose engine
+//! creates `infer.sock` there). Blocking I/O; call from `spawn_blocking`.
 
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
