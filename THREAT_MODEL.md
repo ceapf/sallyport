@@ -271,7 +271,7 @@ G5 Get a denied action executed
 │  └─ Tell whether an approver is attached, and how fast it answers
 │                                                   [RESIDUAL, low alone: the reply says `denied:
 │                                                    no-approver`, at once; with an approver the call
-│                                                    waits for the human's answer; it
+│                                                    waits for the human's answer. This
 │                                                    lets a session time a flood or the approver drop
 │                                                    (G7); §6]
 ├─ Disguise the command (ANSI, bidi, newlines, long padding)
