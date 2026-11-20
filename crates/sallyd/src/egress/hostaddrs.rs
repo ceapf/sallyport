@@ -6,10 +6,12 @@
 //! a node (`+-- <ipv4>/<len> <n> <n> <n>`), a leaf (`|-- <ipv4>`), or a route line under a leaf
 //! (`/<len> <scope> <type>`, then an optional `tos=<n>`; the kernel prints an unknown scope as
 //! `scope=<n>` and an unknown type as `type <n>`, which has one token too many and refuses). A
-//! `/32 host LOCAL` line is an address the host owns. Any other route line is a network the host
-//! reaches with no gateway, except one of length 0, a route that only drops traffic
-//! (`BLACKHOLE`, `UNREACHABLE`, `PROHIBIT`), and a `universe` route: the scope the kernel gives a
-//! route through a gateway (a device route given that scope by hand is therefore not counted).
+//! `/32 host LOCAL` line is an address the host owns. Any other route line is a network the
+//! filter refuses, whatever its scope, except a default-like route (length 0 to 7), a route that
+//! only drops traffic (`BLACKHOLE`, `UNREACHABLE`, `PROHIBIT`) and a `THROW` line. The table
+//! cannot tell a route through a gateway from a device route (both may print `universe`), so a
+//! specific prefix reached through a gateway is refused too; only what is reached through a
+//! default-like route stays outside the rule.
 //!
 //! `if_inet6` has one line per IPv6 address: 32 hex digits, the interface index (2 to 8 hex
 //! digits), prefix length, scope and flags (2 each), the interface name. The address is owned,
@@ -28,8 +30,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use super::addr::{HostNets, Net};
 
-/// IPv4 route types that only drop traffic.
-const DROP_V4: [&str; 3] = ["BLACKHOLE", "UNREACHABLE", "PROHIBIT"];
+/// IPv4 route types that name no network: those that only drop traffic, and `THROW` (a lookup
+/// that ends in this table and goes on to the next rule, not a route).
+const IGNORED_V4: [&str; 4] = ["BLACKHOLE", "UNREACHABLE", "PROHIBIT", "THROW"];
 /// `RTF_GATEWAY` in `ipv6_route`'s flags.
 const RTF_GATEWAY: u128 = 0x2;
 /// `RTF_REJECT` in `ipv6_route`'s flags: blackhole, unreachable, prohibit and throw routes.
@@ -237,8 +240,8 @@ struct RouteV4<'a> {
 }
 
 impl RouteV4<'_> {
-    /// What the line says about `ip`, its leaf: nothing for a route of length 0, one that only
-    /// drops, or one through a gateway (`universe`). A leaf with bits set below the line's
+    /// What the line says about `ip`, its leaf: nothing for a default-like route (length 0 to
+    /// 7) or an ignored type; the scope is not read. A leaf with bits set below the line's
     /// length is not a network the kernel writes: it refuses the list.
     fn judge(&self, ip: Ipv4Addr) -> Result<Option<Fib>, Bad> {
         if self.len == 0 {
@@ -254,7 +257,9 @@ impl RouteV4<'_> {
         if (self.len, self.scope, self.kind) == (32, "host", "LOCAL") {
             return Ok(Some(Fib::Own(ip)));
         }
-        if DROP_V4.contains(&self.kind) || self.scope == "universe" {
+        // Lengths 1 to 7 are default-like: a full-tunnel VPN's two half-space routes must not
+        // refuse every address.
+        if self.len < 8 || IGNORED_V4.contains(&self.kind) {
             return Ok(None);
         }
         Ok(Some(Fib::Connected(net)))

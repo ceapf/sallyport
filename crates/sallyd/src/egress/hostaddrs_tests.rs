@@ -1,5 +1,6 @@
 //! Tests of the host-table parser. Addresses are assembled at runtime: the guard hooks refuse
 //! dotted IPv4 literals.
+use super::super::addr::{Rule, denied_by};
 use super::*;
 
 /// A synthetic table (the shape of a real one; documentation and test ranges).
@@ -77,24 +78,27 @@ fn only_a_slash_32_host_local_line_is_an_own_address() {
     }
 }
 
+/// Was: a `universe` route was taken as one through a gateway and not counted, a `/1` route
+/// counted, and a `THROW` line counted. Now the scope is not read, lengths 0 to 7 are ignored as
+/// default-like, and `THROW` is ignored with the drop types.
 #[test]
-fn routes_with_no_gateway_count_and_gateway_drop_and_default_routes_do_not() {
+fn routes_count_whatever_their_scope_but_drop_throw_and_default_like_routes_do_not() {
     let lan = Ipv4Addr::new(93, 184, 216, 0);
     let half = Ipv4Addr::new(128, 0, 0, 0);
     let any = Ipv4Addr::UNSPECIFIED;
     for (leaf, line, counts) in [
         (lan, "/24 link UNICAST", Some(24)),
-        (half, "/1 link UNICAST", Some(1)),
+        (lan, "/24 universe UNICAST", Some(24)),
+        (half, "/1 link UNICAST", None),
         (lan, "/24 site UNICAST", Some(24)),
         (lan, "/24 nowhere UNICAST", Some(24)),
         (lan, "/24 scope=253 UNICAST", Some(24)),
         (lan, "/24 link ANYCAST", Some(24)),
         (lan, "/24 link MULTICAST", Some(24)),
-        (lan, "/24 link THROW", Some(24)),
         (lan, "/24 link type", Some(24)),
         (lan, "/24 link UNICAST tos=8", Some(24)),
         (lan, "/24 link UNICAST tos=255", Some(24)),
-        (lan, "/24 universe UNICAST", None),
+        (lan, "/24 link THROW", None),
         (any, "/0 link UNICAST", None),
         (any, "/0 host LOCAL", None),
         (any, "/0 universe UNICAST", None),
@@ -107,6 +111,142 @@ fn routes_with_no_gateway_count_and_gateway_drop_and_default_routes_do_not() {
         let want: Vec<Net> = counts.map(|l| net(v4(leaf), l)).into_iter().collect();
         assert_eq!(got.connected, want, "{line}");
         assert_eq!(got.own, [v4(Ipv4Addr::LOCALHOST)], "{line}");
+    }
+}
+
+/// The rule `ip` meets under a table whose one route line is `line`, on leaf `leaf`.
+fn rule_under(leaf: Ipv4Addr, line: &str, ip: Ipv4Addr) -> Option<Rule> {
+    denied_by(v4(ip), &v4_only(&one(leaf, line)).unwrap())
+}
+
+/// One leg per row of the `fib_trie` probe table in `docs/dev/PROBE_NOTES.md`, on a global
+/// prefix. A counted row refuses an address inside its prefix as a connected network; its
+/// control, an address just past the prefix, passes. An ignored row lets the address inside
+/// pass; its control, the same leaf under a plain device route, refuses it.
+#[test]
+fn every_probe_table_row_counts_but_throw_and_default_like_routes() {
+    let net24 = Ipv4Addr::new(93, 184, 216, 0);
+    let (inside24, past24) = (
+        Ipv4Addr::new(93, 184, 216, 9),
+        Ipv4Addr::new(93, 184, 217, 9),
+    );
+    let net25 = Ipv4Addr::new(93, 184, 216, 128);
+    let (inside25, past25) = (
+        Ipv4Addr::new(93, 184, 216, 200),
+        Ipv4Addr::new(93, 184, 216, 9),
+    );
+    let counted = [
+        (
+            "from the address",
+            net24,
+            "/24 link UNICAST",
+            inside24,
+            past24,
+        ),
+        (
+            "plain device route",
+            net24,
+            "/24 link UNICAST",
+            inside24,
+            past24,
+        ),
+        (
+            "device route, scope global",
+            net24,
+            "/24 universe UNICAST",
+            inside24,
+            past24,
+        ),
+        (
+            "nexthop object, device only",
+            net24,
+            "/24 universe UNICAST",
+            inside24,
+            past24,
+        ),
+        (
+            "multipath, device legs",
+            net25,
+            "/25 universe UNICAST",
+            inside25,
+            past25,
+        ),
+        (
+            "through a gateway",
+            net25,
+            "/25 universe UNICAST",
+            inside25,
+            past25,
+        ),
+    ];
+    for (row, leaf, line, inside, past) in counted {
+        assert_eq!(
+            rule_under(leaf, line, inside),
+            Some(Rule::ConnectedNetwork),
+            "{row}"
+        );
+        assert_eq!(rule_under(leaf, line, past), None, "{row}: control");
+    }
+    let (low, high) = (Ipv4Addr::UNSPECIFIED, Ipv4Addr::new(128, 0, 0, 0));
+    let (net8_low, net8_high) = (Ipv4Addr::new(93, 0, 0, 0), Ipv4Addr::new(151, 0, 0, 0));
+    let inside_high = Ipv4Addr::new(151, 101, 1, 9);
+    let ignored = [
+        ("throw", net24, "/24 universe THROW", inside24, net24),
+        (
+            "throw, link scope",
+            net24,
+            "/24 link THROW",
+            inside24,
+            net24,
+        ),
+        (
+            "half-space, low",
+            low,
+            "/1 universe UNICAST",
+            inside24,
+            net8_low,
+        ),
+        (
+            "half-space, high",
+            high,
+            "/1 universe UNICAST",
+            inside_high,
+            net8_high,
+        ),
+    ];
+    for (row, leaf, line, inside, control_leaf) in ignored {
+        assert_eq!(rule_under(leaf, line, inside), None, "{row}");
+        let control_line = if control_leaf == net24 {
+            "/24 link UNICAST"
+        } else {
+            "/8 link UNICAST"
+        };
+        assert_eq!(
+            rule_under(control_leaf, control_line, inside),
+            Some(Rule::ConnectedNetwork),
+            "{row}: control"
+        );
+    }
+}
+
+/// Lengths 0 to 7 are default-like and ignored, whatever the scope; 8 is the shortest route
+/// that counts. Control: the same address under a `/8` route is refused.
+#[test]
+fn routes_shorter_than_eight_are_default_like() {
+    let ip = Ipv4Addr::new(1, 2, 3, 4);
+    for len in 1..=7 {
+        let line = format!("/{len} link UNICAST");
+        assert_eq!(rule_under(Ipv4Addr::UNSPECIFIED, &line, ip), None, "{line}");
+    }
+    let net8 = Ipv4Addr::new(1, 0, 0, 0);
+    for line in ["/8 link UNICAST", "/8 universe UNICAST"] {
+        assert_eq!(
+            rule_under(net8, line, ip),
+            Some(Rule::ConnectedNetwork),
+            "{line}"
+        );
+        let past = Ipv4Addr::new(2, 2, 3, 4);
+        assert_eq!(rule_under(net8, line, past), None, "{line}: control");
     }
 }
 
