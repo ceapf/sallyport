@@ -202,7 +202,7 @@ fn a_session_starts_in_order_and_stops_once_on_request() {
 const RISKY_SHELL: &str = "tools:\n  builtin: [shell]\n  shell: allow\n  \
                            destructive_requires_approval: false\n  acknowledge_unapproved: [shell]\n";
 
-/// RT-MAN-03, the launch half (manifest-2 W1): a launch records each acknowledged risk in effect
+/// RT-MAN-03, the launch half: a launch records each acknowledged risk in effect
 /// and the validator's warnings (code and field only) in the session's log before anything is
 /// launched, hence before `session.start`. Control: the same manifest whose shell commands need
 /// approval acknowledges nothing and records neither.
@@ -257,6 +257,41 @@ fn rt_man_03_a_launch_records_each_acknowledged_risk_and_the_warnings_before_ses
     });
 }
 
+/// A failed append of either record of what the validation accepted refuses the start before
+/// anything is launched (SI-4): no `sandbox.launch`, no container, nothing listed.
+#[test]
+fn an_unrecorded_acknowledged_risk_or_warning_launches_nothing() {
+    rt().block_on(async {
+        for event in ["manifest.acknowledged_risk", "manifest.warn"] {
+            let r = registry();
+            r.x.events.fail(&[event]);
+            let v = Arc::new(r.x.f.validated(RISKY_SHELL));
+            let e = r.reg.start(v).await.unwrap_err();
+            // The failure names the entry that failed and the session the start minted.
+            let StartError::Audit {
+                id, event: failed, ..
+            } = &e
+            else {
+                panic!("{event}: {e}");
+            };
+            assert_eq!(failed, event);
+            assert!(id.starts_with(&format!("{}-", r.x.scope)), "{id}");
+            assert!(
+                e.to_string().starts_with(&format!("audit: {event}: ")),
+                "{e}"
+            );
+            let all = r.x.events.list();
+            assert!(
+                all.iter().all(|e| !e.starts_with("sandbox.")),
+                "{event}: {all:?}"
+            );
+            assert!(r.reg.list().is_empty(), "{event}");
+            assert!(agent_socks(&r.sink.sockets).is_empty(), "{event}");
+            assert!(!r.x.listed(), "{event}: a container of this test is left");
+        }
+    });
+}
+
 /// A failed `session.start` append binds nothing and stops the workspace. Its entry may have
 /// reached the log before the error, so a best-effort `session.stop` (`start-failed`) follows
 /// (security review L6): never a `session.start` without its stop.
@@ -268,7 +303,10 @@ fn an_unaudited_session_start_binds_nothing_and_stops_the_workspace() {
             Some(Box::new(|_| Err(AuditError::InvalidEntry("fake failure"))));
         let v = Arc::new(r.x.f.validated(""));
         let e = r.reg.start(v).await.unwrap_err();
-        assert!(matches!(e, StartError::Audit(_)), "{e}");
+        assert!(
+            matches!(&e, StartError::Audit { event, .. } if event == "session.start"),
+            "{e}"
+        );
         assert!(agent_socks(&r.sink.sockets).is_empty());
         assert!(r.reg.list().is_empty());
         assert_eq!(
@@ -302,7 +340,7 @@ fn a_failed_starts_workspace_not_confirmed_gone_stays_listed_and_is_retried() {
             .fail(&["session.start", "session.stop", "sandbox.stop"]);
         let v = Arc::new(r.x.f.validated(""));
         let e = r.reg.start(v).await.unwrap_err();
-        assert!(matches!(e, StartError::Audit(_)), "{e}");
+        assert!(matches!(e, StartError::Audit { .. }), "{e}");
         let listed = r.reg.list();
         assert_eq!(listed.len(), 1, "{listed:?}");
         assert_eq!(listed[0].state, SessionState::StopFailed);

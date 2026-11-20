@@ -769,7 +769,7 @@ async fn a_valid_manifest_starts_a_session() {
     assert_eq!(f.events(), ["rpc.request"]);
 }
 
-/// Manifest-2 W1: `sessions.create` hands the session set the validator's whole verdict, so
+/// `sessions.create` hands the session set the validator's whole verdict, so
 /// the acknowledged risk and the warning reach the launch, which records them. Control: the same
 /// manifest whose shell commands need approval acknowledges nothing and warns of nothing.
 #[tokio::test]
@@ -929,6 +929,44 @@ async fn another_start_failure_is_refused_and_recorded() {
             json!({"method": "sessions.create", "reason": code, "detail": detail, "client": client()})
         );
     }
+}
+
+/// A start whose entry could not be appended (here a record of what the validation accepted)
+/// had minted its session: the `session.refuse` names that session and the entry that failed,
+/// so the session's log ends in a refusal. Unwritten, there is no reply.
+#[tokio::test]
+async fn a_start_whose_entry_failed_is_refused_naming_its_session() {
+    let failed = || StartError::Audit {
+        id: "s-5".to_owned(),
+        event: "manifest.warn".to_owned(),
+        source: sally_core::audit::AuditError::InvalidEntry("x"),
+    };
+    let f = fx("entry-failed");
+    *f.fake.start_err.lock().unwrap() = Some(failed());
+    let r = f
+        .connect()
+        .call("sessions.create", json!({"manifest": MANIFEST}))
+        .await;
+    let detail = failed().to_string();
+    assert!(detail.starts_with("audit: manifest.warn: "), "{detail}");
+    assert_eq!(reason(&r), "start-failed");
+    assert_eq!(r["error"]["data"]["detail"], json!(detail));
+    assert_eq!(f.events(), ["rpc.request", "session.refuse"]);
+    assert_eq!(
+        f.sink.last("session.refuse"),
+        json!({"method": "sessions.create", "id": "s-5", "reason": "start-failed",
+               "detail": detail, "client": client()})
+    );
+    let f = fx("entry-failed-unwritten");
+    *f.fake.start_err.lock().unwrap() = Some(failed());
+    f.sink
+        .fail_from
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let mut w = f.connect();
+    w.send("sessions.create", json!({"manifest": MANIFEST}))
+        .await;
+    w.ended().await;
+    assert_eq!(f.events(), ["rpc.request"]);
 }
 
 #[tokio::test]

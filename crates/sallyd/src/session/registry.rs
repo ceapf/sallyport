@@ -132,9 +132,19 @@ pub enum StartError {
     /// The container ended before the session started.
     #[error("the container ended before the session started: {0}")]
     Exited(#[source] io::Error),
-    /// `session.start` could not be audited; nothing was bound and the workspace was stopped.
-    #[error("audit: session.start: {0}")]
-    Audit(#[source] AuditError),
+    /// An entry of the start could not be audited: a record of what the validation accepted
+    /// (nothing was launched), or `session.start` (nothing was bound and the workspace was
+    /// stopped).
+    #[error("audit: {event}: {source}")]
+    Audit {
+        /// The session the start minted; the refusal names it.
+        id: String,
+        /// The entry that could not be appended.
+        event: String,
+        /// Why.
+        #[source]
+        source: AuditError,
+    },
     /// `agent.sock` could not be bound; the session ended `start-failed`.
     #[error("{AGENT_SOCK}: {0}")]
     Socket(#[source] io::Error),
@@ -236,12 +246,19 @@ impl Registry {
         self.live().get(id).and_then(|l| l.crash.clone())
     }
 
-    pub(super) async fn audit(&self, entry: NewEntry, level: AuditLevel) -> Result<(), StartError> {
+    /// Appends `entry` of session `sid`'s start; a failure names the session and the entry.
+    pub(super) async fn audit(
+        &self,
+        sid: &str,
+        entry: NewEntry,
+        level: AuditLevel,
+    ) -> Result<(), StartError> {
+        let (id, event) = (sid.to_owned(), entry.event().to_owned());
         let sink = Arc::clone(&self.p.audit);
         tokio::task::spawn_blocking(move || sink.append(entry, level))
             .await
             .map_err(|e| StartError::Join(crate::daemon::crash::join_text(&e)))?
-            .map_err(StartError::Audit)
+            .map_err(|source| StartError::Audit { id, event, source })
     }
 
     /// Starts a session from the validator's whole verdict `validated` (the manifest with its
@@ -295,9 +312,13 @@ impl Registry {
         // append refuses the start with nothing launched.
         let level = validated.manifest.manifest().audit.level;
         for entry in accepted::entries(&sid, &validated) {
-            self.audit(entry, level).await?;
+            self.audit(&sid, entry, level).await?;
         }
-        let manifest = Arc::new(validated.manifest.clone());
+        // The caller's verdict is usually its last handle: take the manifest without a copy.
+        let manifest = Arc::new(
+            Arc::try_unwrap(validated)
+                .map_or_else(|shared| shared.manifest.clone(), |v| v.manifest),
+        );
         let (crash, crashes) = CrashReporter::channel();
         let running = self
             .p
@@ -346,7 +367,7 @@ impl Registry {
                 "container": running.name(),
                 "model": json!(model),
             }));
-        if let Err(e) = self.audit(start, level).await {
+        if let Err(e) = self.audit(&sid, start, level).await {
             self.p
                 .oplog
                 .error(LOG, "session.start not audited", &[("session", &sid)]);

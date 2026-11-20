@@ -509,10 +509,15 @@ impl<S: SessionSet> Control<S> {
             Err(e) => {
                 let reason = start_reason(&e);
                 let detail = escape_capped(e.to_string().as_bytes(), DETAIL_CHARS);
-                let args = json!({
+                let mut args = json!({
                     "method": method::SESSIONS_CREATE, "reason": reason, "detail": detail,
                     "client": who(client),
                 });
+                // A start whose entry failed had minted its session: the refusal names it, so
+                // its log's records of what was accepted have their ending here.
+                if let (StartError::Audit { id, .. }, Some(a)) = (&e, args.as_object_mut()) {
+                    a.insert("id".to_owned(), json!(id));
+                }
                 let data = refusal(reason, Some(detail), Vec::new());
                 self.refuse(Actor::Sallyd, "session.refuse", args, data)
                     .await
@@ -662,7 +667,7 @@ fn start_reason(e: &StartError) -> &'static str {
         StartError::Id(_)
         | StartError::Paths(_)
         | StartError::Exited(_)
-        | StartError::Audit(_)
+        | StartError::Audit { .. }
         | StartError::Socket(_)
         | StartError::Join(_)
         | StartError::Task(_) => "start-failed",
