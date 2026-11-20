@@ -22,6 +22,7 @@ pub mod approve;
 pub mod clean;
 pub mod client;
 pub mod commands;
+pub mod consent;
 pub mod doctor;
 pub mod drive;
 pub mod local;

@@ -1349,7 +1349,7 @@ fn the_daemon_validates_and_injects_from_the_store_the_cli_writes() {
     let (mut run_out, mut run_err) = (Vec::new(), Vec::new());
     let code = sally_cli::run::sandbox_run(
         &mut c,
-        &file,
+        &std::fs::read_to_string(&file).unwrap(),
         &argv,
         std::io::empty(),
         &mut sally_cli::commands::Out {

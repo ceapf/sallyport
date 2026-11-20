@@ -181,7 +181,14 @@ fn a_non_ascii_mount_path_is_escaped_and_the_run_exits_1() {
         "{out}"
     );
     let (code, out, err) = run(|o| manifest_summary(&m, &s.store(), o));
-    assert_eq!((code, err.as_str()), (EXIT_REFUSED, ""), "{out}");
+    // The summary on stdout; the warning a launch shows, on stderr (escaped too).
+    assert_eq!(code, EXIT_REFUSED, "{out}");
+    assert!(
+        err.starts_with("warning: network.allow: ")
+            && err.contains("sc-loc-caf\\u{e9}-")
+            && err.is_ascii(),
+        "{err}"
+    );
     assert!(
         out.contains("sc-loc-caf\\u{e9}-") && out.is_ascii(),
         "{out}"

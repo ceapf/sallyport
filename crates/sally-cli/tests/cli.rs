@@ -3,83 +3,15 @@
 //! `$XDG_RUNTIME_DIR`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixListener;
-use std::path::PathBuf;
-use std::process::{Command, Output};
-use std::sync::{Arc, Mutex};
+mod common;
 
-use serde_json::{Value, json};
+use std::process::Command;
 
-/// A fake daemon answering each request with `reply(request)`, keeping every request.
-struct Fake {
-    runtime: PathBuf,
-    requests: Arc<Mutex<Vec<Value>>>,
-}
+use common::{Fake, result, stderr, stdout};
+use serde_json::json;
 
-impl Fake {
-    fn new(tag: &str, reply: impl Fn(&Value) -> String + Send + 'static) -> Self {
-        // Short: the socket path below must fit SUN_LEN under a deep TMPDIR (the mutation runs'
-        // target/mutants-tmp), so tags stay short too.
-        let runtime = std::env::temp_dir().join(format!("sc-{tag}-{}", std::process::id()));
-        assert!(tag.len() <= 8, "tag {tag:?}: keep it short");
-        let _ = std::fs::remove_dir_all(&runtime);
-        std::fs::create_dir_all(runtime.join("sallyport")).unwrap();
-        let listener = UnixListener::bind(runtime.join("sallyport/control.sock")).unwrap();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let reqs = Arc::clone(&requests);
-        std::thread::spawn(move || {
-            for conn in listener.incoming() {
-                let Ok(s) = conn else { return };
-                let mut w = s.try_clone().unwrap();
-                for l in BufReader::new(s).lines() {
-                    let Ok(l) = l else { break };
-                    let req: Value = serde_json::from_str(&l).unwrap();
-                    reqs.lock().unwrap().push(req.clone());
-                    let _ = w.write_all(reply(&req).as_bytes());
-                }
-            }
-        });
-        Self { runtime, requests }
-    }
-
-    fn sally(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_sally"))
-            .args(args)
-            .env("XDG_RUNTIME_DIR", &self.runtime)
-            .output()
-            .unwrap()
-    }
-
-    fn methods(&self) -> Vec<String> {
-        let reqs = self.requests.lock().unwrap();
-        reqs.iter()
-            .map(|r| r["method"].as_str().unwrap().to_owned())
-            .collect()
-    }
-}
-
-impl Drop for Fake {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.runtime);
-    }
-}
-
-/// A result frame for `req`, as one line.
-fn result(req: &Value, r: Value) -> String {
-    format!(
-        "{}\n",
-        json!({"jsonrpc": "2.0", "id": req["id"], "result": r})
-    )
-}
-
-fn stdout(o: &Output) -> String {
-    String::from_utf8(o.stdout.clone()).unwrap()
-}
-
-fn stderr(o: &Output) -> String {
-    String::from_utf8(o.stderr.clone()).unwrap()
-}
+/// A valid manifest with no warning and no acknowledged risk: a launch sends it without asking.
+const VALID: &str = "apiVersion: sallyport/v1\nkind: Manifest\nname: t\nmodel:\n  ref: any\n";
 
 /// RT-FS-15 (client side, architect Q79): a path `sallyd` escaped is printed exactly as sent.
 /// Control: `sallyd`'s escaping (the daemon-side test, `rt_fs_15_…` in sallyd's tests).
@@ -188,13 +120,13 @@ fn start_sends_the_manifest_text_and_prints_the_session() {
         result(req, r)
     });
     let manifest = f.runtime.join("m.yaml");
-    std::fs::write(&manifest, "name: t\n").unwrap();
+    std::fs::write(&manifest, VALID).unwrap();
     let o = f.sally(&["session", "start", manifest.to_str().unwrap()]);
     assert_eq!(stdout(&o), "s-1  running  t  sp-w-s-1\n");
     assert_eq!(o.status.code(), Some(0));
     assert_eq!(
         f.requests.lock().unwrap()[0]["params"],
-        json!({"manifest": "name: t\n"})
+        json!({"manifest": VALID})
     );
     let o = f.sally(&["session", "list"]);
     assert_eq!(
@@ -229,7 +161,7 @@ fn a_script_is_sent_as_a_scripted_model_declared_driven() {
         result(req, s)
     });
     let manifest = f.runtime.join("m.yaml");
-    std::fs::write(&manifest, "name: t\n").unwrap();
+    std::fs::write(&manifest, VALID).unwrap();
     let script = f.runtime.join("s.jsonl");
     std::fs::write(&script, "{\"fail\":true}\n").unwrap();
     let o = f.sally(&[
@@ -242,7 +174,7 @@ fn a_script_is_sent_as_a_scripted_model_declared_driven() {
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
     assert_eq!(
         f.requests.lock().unwrap()[0]["params"],
-        json!({"manifest": "name: t\n",
+        json!({"manifest": VALID,
                "model": {"kind": "scripted", "script": "{\"fail\":true}\n", "driven": true}})
     );
     // The hash sallyd computed is printed, so the user can match it to their file (Q103).
@@ -256,7 +188,7 @@ fn a_script_is_sent_as_a_scripted_model_declared_driven() {
 fn a_script_over_the_cap_is_never_sent() {
     let f = Fake::new("bigscr", |req| result(req, json!({})));
     let manifest = f.runtime.join("m.yaml");
-    std::fs::write(&manifest, "name: t\n").unwrap();
+    std::fs::write(&manifest, VALID).unwrap();
     let script = f.runtime.join("s.jsonl");
     std::fs::write(&script, "a".repeat(sally_proto::MAX_SCRIPT_BYTES + 1)).unwrap();
     let o = f.sally(&[
@@ -295,18 +227,17 @@ fn drive_runs_to_the_end_over_one_connection_and_sends_only_drive() {
     }
 }
 
-/// A manifest of exactly the cap is read and sent.
+/// A manifest of exactly the cap is read and sent (a valid one, padded with a comment).
 #[test]
 fn a_manifest_at_the_cap_is_sent() {
     let f = Fake::new("at-cap", |req| result(req, json!({})));
     let manifest = f.runtime.join("m.yaml");
-    std::fs::write(
-        &manifest,
-        "a".repeat(sally_core::manifest::MAX_MANIFEST_BYTES),
-    )
-    .unwrap();
-    let _ = f.sally(&["session", "start", manifest.to_str().unwrap()]);
-    assert_eq!(f.methods(), ["sessions.create"]);
+    let pad = sally_core::manifest::MAX_MANIFEST_BYTES - VALID.len() - 2;
+    let text = format!("{VALID}#{}\n", "a".repeat(pad));
+    assert_eq!(text.len(), sally_core::manifest::MAX_MANIFEST_BYTES);
+    std::fs::write(&manifest, &text).unwrap();
+    let o = f.sally(&["session", "start", manifest.to_str().unwrap()]);
+    assert_eq!(f.methods(), ["sessions.create"], "{}", stderr(&o));
 }
 
 /// A complete, clean prompt list exits 0; one with a dirty prompt text is printed escaped and
