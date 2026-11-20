@@ -509,8 +509,11 @@ yet (TODO(#231)).
 
 ## 4. Validation output
 
-`sally manifest validate m.yaml` prints either `OK` plus the plain-English summary, or a list of
-errors like:
+`sally manifest validate m.yaml` exits 0 for a valid manifest: its warnings, then the line
+`valid (sallyd checks again when a session starts)`, on standard output (1 instead if one of
+those lines fails the CLI's clean-check). It prints no summary: `sally manifest summary` does
+(§1.2). A rejected manifest exits 1 with every error and warning on standard error; a manifest
+or secrets store that cannot be read exits 2. The errors look like:
 
 ```
 error: filesystem.mounts[0].host: "~/" is the home directory root (denylisted) [denylisted]

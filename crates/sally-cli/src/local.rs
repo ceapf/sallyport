@@ -61,8 +61,9 @@ fn rejected(r: &Rejected, err: &mut dyn std::io::Write) -> u8 {
     EXIT_REFUSED
 }
 
-/// `sally manifest validate FILE`: 0 valid (warnings on `err`), 1 rejected, 2 unreadable (the
-/// manifest, or the secrets store at `store` when the manifest names a secret).
+/// `sally manifest validate FILE`: 0 valid (its warnings, then the `valid` line, on `out`; 1
+/// instead when one of them fails the clean-check), 1 rejected (errors and warnings on `err`), 2
+/// unreadable (the manifest, or the secrets store at `store` when the manifest names a secret).
 pub fn manifest_validate(path: &Path, store: &Path, o: &mut Out<'_>) -> u8 {
     let (_, v) = match validated(path, store, o) {
         Ok(v) => v,
