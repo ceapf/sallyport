@@ -150,8 +150,15 @@ pub enum StartError {
     Socket(#[source] io::Error),
     /// An audit append's task failed: a daemon-chosen text, never tokio's, which quotes the
     /// panic message escaped before any mask (architect Q297).
-    #[error("audit task: {0}")]
-    Join(&'static str),
+    #[error("audit task: {event}: {text}")]
+    Join {
+        /// The session the start minted; the refusal names it.
+        id: String,
+        /// The entry whose append's task failed.
+        event: String,
+        /// The fixed text for the failure.
+        text: &'static str,
+    },
     /// The start's own task ended without an answer (it panicked; `sallyd` is stopping).
     #[error("the start task ended: {0}")]
     Task(#[source] oneshot::error::RecvError),
@@ -253,12 +260,21 @@ impl Registry {
         entry: NewEntry,
         level: AuditLevel,
     ) -> Result<(), StartError> {
-        let (id, event) = (sid.to_owned(), entry.event().to_owned());
+        let event = entry.event().to_owned();
         let sink = Arc::clone(&self.p.audit);
-        tokio::task::spawn_blocking(move || sink.append(entry, level))
-            .await
-            .map_err(|e| StartError::Join(crate::daemon::crash::join_text(&e)))?
-            .map_err(|source| StartError::Audit { id, event, source })
+        match tokio::task::spawn_blocking(move || sink.append(entry, level)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(source)) => Err(StartError::Audit {
+                id: sid.to_owned(),
+                event,
+                source,
+            }),
+            Err(e) => Err(StartError::Join {
+                id: sid.to_owned(),
+                event,
+                text: crate::daemon::crash::join_text(&e),
+            }),
+        }
     }
 
     /// Starts a session from the validator's whole verdict `validated` (the manifest with its
@@ -725,10 +741,17 @@ mod tests {
     #[tokio::test]
     async fn a_panicked_audit_task_is_a_fixed_text() {
         let h = tokio::task::spawn_blocking(|| panic!("sp-q\"uote-vvvvvvvvvvvv"));
-        let e = StartError::Join(crate::daemon::crash::join_text(&h.await.unwrap_err()));
+        let e = StartError::Join {
+            id: "s-1".to_owned(),
+            event: "manifest.warn".to_owned(),
+            text: crate::daemon::crash::join_text(&h.await.unwrap_err()),
+        };
         assert_eq!(
             e.to_string(),
-            format!("audit task: {}", crate::daemon::crash::JOIN_PANICKED)
+            format!(
+                "audit task: manifest.warn: {}",
+                crate::daemon::crash::JOIN_PANICKED
+            )
         );
     }
 

@@ -5,9 +5,9 @@
 //! precede `sandbox.launch` and `session.start`. A warning's message text is never recorded:
 //! only the code and the field path the validator produced.
 //!
-//! A failed append refuses the start with nothing launched. The session's log then holds the
-//! entries written before the failure and no `sandbox.launch` or `sandbox.refuse` after them: a
-//! refused start. The control log's `session.refuse` (`start-failed`) names the session (`id`)
+//! A failed append, or an append whose task failed, refuses the start with nothing launched.
+//! The session's log then holds the entries written before the failure and no `sandbox.launch`
+//! or `sandbox.refuse` after them: a refused start. The control log's `session.refuse` (`start-failed`) names the session (`id`)
 //! and, in its detail, the entry that failed.
 
 use sally_core::audit::{Actor, NewEntry};

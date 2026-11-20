@@ -931,42 +931,56 @@ async fn another_start_failure_is_refused_and_recorded() {
     }
 }
 
-/// A start whose entry could not be appended (here a record of what the validation accepted)
-/// had minted its session: the `session.refuse` names that session and the entry that failed,
-/// so the session's log ends in a refusal. Unwritten, there is no reply.
+/// A start whose entry could not be appended, or whose append's task failed (here a record of
+/// what the validation accepted), had minted its session: the `session.refuse` names that
+/// session and the entry, so the session's log ends in a refusal. Unwritten, there is no reply.
 #[tokio::test]
 async fn a_start_whose_entry_failed_is_refused_naming_its_session() {
-    let failed = || StartError::Audit {
+    let audit = || StartError::Audit {
         id: "s-5".to_owned(),
         event: "manifest.warn".to_owned(),
         source: sally_core::audit::AuditError::InvalidEntry("x"),
     };
-    let f = fx("entry-failed");
-    *f.fake.start_err.lock().unwrap() = Some(failed());
-    let r = f
-        .connect()
-        .call("sessions.create", json!({"manifest": MANIFEST}))
-        .await;
-    let detail = failed().to_string();
-    assert!(detail.starts_with("audit: manifest.warn: "), "{detail}");
-    assert_eq!(reason(&r), "start-failed");
-    assert_eq!(r["error"]["data"]["detail"], json!(detail));
-    assert_eq!(f.events(), ["rpc.request", "session.refuse"]);
-    assert_eq!(
-        f.sink.last("session.refuse"),
-        json!({"method": "sessions.create", "id": "s-5", "reason": "start-failed",
-               "detail": detail, "client": client()})
-    );
-    let f = fx("entry-failed-unwritten");
-    *f.fake.start_err.lock().unwrap() = Some(failed());
-    f.sink
-        .fail_from
-        .store(1, std::sync::atomic::Ordering::SeqCst);
-    let mut w = f.connect();
-    w.send("sessions.create", json!({"manifest": MANIFEST}))
-        .await;
-    w.ended().await;
-    assert_eq!(f.events(), ["rpc.request"]);
+    let join = || StartError::Join {
+        id: "s-6".to_owned(),
+        event: "manifest.warn".to_owned(),
+        text: crate::daemon::crash::JOIN_PANICKED,
+    };
+    for (failed, id, starts) in [
+        (
+            &audit as &dyn Fn() -> StartError,
+            "s-5",
+            "audit: manifest.warn: ",
+        ),
+        (&join, "s-6", "audit task: manifest.warn: "),
+    ] {
+        let f = fx("entry-failed");
+        *f.fake.start_err.lock().unwrap() = Some(failed());
+        let r = f
+            .connect()
+            .call("sessions.create", json!({"manifest": MANIFEST}))
+            .await;
+        let detail = failed().to_string();
+        assert!(detail.starts_with(starts), "{detail}");
+        assert_eq!(reason(&r), "start-failed");
+        assert_eq!(r["error"]["data"]["detail"], json!(detail));
+        assert_eq!(f.events(), ["rpc.request", "session.refuse"]);
+        assert_eq!(
+            f.sink.last("session.refuse"),
+            json!({"method": "sessions.create", "id": id, "reason": "start-failed",
+                   "detail": detail, "client": client()})
+        );
+        let f = fx("entry-failed-unwritten");
+        *f.fake.start_err.lock().unwrap() = Some(failed());
+        f.sink
+            .fail_from
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let mut w = f.connect();
+        w.send("sessions.create", json!({"manifest": MANIFEST}))
+            .await;
+        w.ended().await;
+        assert_eq!(f.events(), ["rpc.request"], "{id}");
+    }
 }
 
 #[tokio::test]

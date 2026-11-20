@@ -25,17 +25,27 @@ use common::*;
 type Hook = Box<dyn Fn(&Path) -> Result<(), AuditError> + Send + Sync>;
 
 /// The registry's audit sink: forwards to the fixture's events, keeps every entry's `Debug`
-/// form (which shows its session id), and runs `hook` (with the sessions' socket root) when
-/// `session.start` is appended, before it is recorded.
+/// form (which shows its session id), runs `hook` (with the sessions' socket root) when
+/// `session.start` is appended, before it is recorded, and panics on an append of `panic_on`
+/// (the append's task then fails).
 struct Hooked {
     events: Arc<Events>,
     sockets: PathBuf,
     hook: Mutex<Option<Hook>>,
     debug: Mutex<Vec<String>>,
+    panic_on: Mutex<Option<&'static str>>,
 }
 
 impl AuditSink for Hooked {
     fn append(&self, e: NewEntry, level: AuditLevel) -> Result<(), AuditError> {
+        if self
+            .panic_on
+            .lock()
+            .unwrap()
+            .is_some_and(|p| p == e.event())
+        {
+            panic!("the test's audit sink panics on {}", e.event());
+        }
         if e.event() == "session.start"
             && let Some(h) = self.hook.lock().unwrap().as_ref()
         {
@@ -80,6 +90,7 @@ fn registry_hub(default_image: Option<sallyd::sandbox::ImageRef>, hub: Arc<Hub>)
         sockets: x.xdg.join("sallyport/sessions"),
         hook: Mutex::new(None),
         debug: Mutex::new(Vec::new()),
+        panic_on: Mutex::new(None),
     });
     let log = Lines::default();
     let reg = x.registry_hub(
@@ -257,29 +268,48 @@ fn rt_man_03_a_launch_records_each_acknowledged_risk_and_the_warnings_before_ses
     });
 }
 
-/// A failed append of either record of what the validation accepted refuses the start before
-/// anything is launched (SI-4): no `sandbox.launch`, no container, nothing listed.
+/// A failed append of either record of what the validation accepted, or an append whose task
+/// failed, refuses the start before anything is launched (SI-4): no `sandbox.launch`, no
+/// container, nothing listed. The failure names the entry and the session the start minted.
 #[test]
 fn an_unrecorded_acknowledged_risk_or_warning_launches_nothing() {
     rt().block_on(async {
-        for event in ["manifest.acknowledged_risk", "manifest.warn"] {
+        for (event, panics) in [
+            ("manifest.acknowledged_risk", false),
+            ("manifest.warn", false),
+            ("manifest.warn", true),
+        ] {
             let r = registry();
-            r.x.events.fail(&[event]);
+            if panics {
+                *r.sink.panic_on.lock().unwrap() = Some(event);
+            } else {
+                r.x.events.fail(&[event]);
+            }
             let v = Arc::new(r.x.f.validated(RISKY_SHELL));
             let e = r.reg.start(v).await.unwrap_err();
-            // The failure names the entry that failed and the session the start minted.
-            let StartError::Audit {
-                id, event: failed, ..
-            } = &e
-            else {
-                panic!("{event}: {e}");
+            let (id, failed, prefix) = match &e {
+                StartError::Audit { id, event, .. } if !panics => (id, event, "audit"),
+                StartError::Join { id, event, .. } if panics => (id, event, "audit task"),
+                _ => panic!("{event} {panics}: {e}"),
             };
             assert_eq!(failed, event);
-            assert!(id.starts_with(&format!("{}-", r.x.scope)), "{id}");
             assert!(
-                e.to_string().starts_with(&format!("audit: {event}: ")),
+                e.to_string().starts_with(&format!("{prefix}: {event}: ")),
                 "{e}"
             );
+            // The id is the session's own: the entry written before the failure carries it.
+            if event == "manifest.warn" {
+                let debug = r.sink.debug.lock().unwrap().clone();
+                assert!(
+                    debug
+                        .iter()
+                        .any(|d| d.contains("manifest.acknowledged_risk")
+                            && d.contains(&format!("{id:?}"))),
+                    "{id}: {debug:?}"
+                );
+            } else {
+                assert!(id.starts_with(&format!("{}-", r.x.scope)), "{id}");
+            }
             let all = r.x.events.list();
             assert!(
                 all.iter().all(|e| !e.starts_with("sandbox.")),
@@ -1123,6 +1153,7 @@ fn rt_ag_15_an_operation_past_the_drain_and_a_panic_during_the_stop_end_before_s
             sockets: x.xdg.join("sallyport/sessions"),
             hook: Mutex::new(None),
             debug: Mutex::new(Vec::new()),
+            panic_on: Mutex::new(None),
         });
         let lines = Lines::default();
         let log = sallyd::oplog::Oplog::new(lines.clone());

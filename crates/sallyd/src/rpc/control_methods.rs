@@ -513,9 +513,7 @@ impl<S: SessionSet> Control<S> {
                     "method": method::SESSIONS_CREATE, "reason": reason, "detail": detail,
                     "client": who(client),
                 });
-                // A start whose entry failed had minted its session: the refusal names it, so
-                // its log's records of what was accepted have their ending here.
-                if let (StartError::Audit { id, .. }, Some(a)) = (&e, args.as_object_mut()) {
+                if let (Some(id), Some(a)) = (refused_start_id(&e), args.as_object_mut()) {
                     a.insert("id".to_owned(), json!(id));
                 }
                 let data = refusal(reason, Some(detail), Vec::new());
@@ -658,6 +656,25 @@ impl<S: SessionSet> Control<S> {
     }
 }
 
+/// The session a refused start had minted, when its `session.refuse` names it: a start whose
+/// entry append, or that append's task, failed. Its log holds the records of what was accepted
+/// and no launch entry after them, so this refusal is their ending. Listed in full so a new
+/// kind of failure must say.
+// TODO(#259): `Socket` and `Exited` also fail after the id exists; their session's own log
+// ends itself, but the refusal does not name it.
+fn refused_start_id(e: &StartError) -> Option<&str> {
+    match e {
+        StartError::Audit { id, .. } | StartError::Join { id, .. } => Some(id),
+        StartError::ShuttingDown
+        | StartError::Id(_)
+        | StartError::Paths(_)
+        | StartError::Launch(_)
+        | StartError::Exited(_)
+        | StartError::Socket(_)
+        | StartError::Task(_) => None,
+    }
+}
+
 /// The refusal reason of a start failure other than a launch refusal (architect Q88 iii);
 /// listed in full so a new kind of failure is named here, not swept into one.
 fn start_reason(e: &StartError) -> &'static str {
@@ -669,7 +686,7 @@ fn start_reason(e: &StartError) -> &'static str {
         | StartError::Exited(_)
         | StartError::Audit { .. }
         | StartError::Socket(_)
-        | StartError::Join(_)
+        | StartError::Join { .. }
         | StartError::Task(_) => "start-failed",
     }
 }
