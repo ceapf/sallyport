@@ -150,8 +150,8 @@ it only reports). In order:
   identity. `staged` and `ro` mounts never refuse. Only this manifest's own mounts are read
   (#262). Not covered (#254): a link chain that passes through a writable folder at an
   intermediate hop, a hard link of the file into a writable folder, and a bind of a
-  subdirectory; the file is then read by its path, with no regular-file check and no identity
-  compare against what was inspected.
+  subdirectory. On every launch the file is read by its resolved path after the inspection,
+  with no regular-file check and no identity compare against what was inspected.
 - **What is shown.** Before anything is sent, the launch shows the summary, each warning and each
   acknowledged risk, on the terminal the answer is read from when a question follows and on
   stderr otherwise. A line that fails the CLI's clean-check refuses the launch (exit 1).
@@ -499,7 +499,7 @@ yet (TODO(#231)).
 | `tools.destructive_requires_approval` | pattern tagger `sallyd::tools::tag` (Task 11, architect ruling Q33), its verdict an input to `sallyd::approvals` | each shell call in `allow` mode | pending if tagged, or if no tagger ran |
 | `tools.fetch_writes` | `sallyd::tools::fetch` → `sallyd::approvals`; the ticket binds the method, the canonical URL, the harness's headers and the body, never an injected credential (#75 rulings Q3, Q4); headers the proxy would drop are refused at prepare, so the prompt shows only what is sent | each non-GET/HEAD fetch, and each GET/HEAD with a body, a method-override header (`X-HTTP-Method-Override`, `X-HTTP-Method`, `X-Method-Override`) or body framing (`Content-Length`, `Transfer-Encoding`) | pending if `approve` |
 | `tools.acknowledge_unapproved` | validator (`ack.rs`); launch audit `manifest.acknowledged_risk` | validate + launch | reject if needed and unset |
-| (no field) the manifest file's place and the launch consent | `sally` CLI (`consent.rs`; `sally_core::manifest::ManifestPlace`, `check_place`, `check_hosts_as_written`), §1.2 | `session start` / `sandbox run` | refuse (exit 1; 2 for a malformed flag or a file that cannot be inspected or read), nothing sent to `sallyd` |
+| (no field) the manifest file's place and the launch consent | `sally` CLI (`consent.rs`; `sally_core::manifest::ManifestPlace`, `check_place`, `check_hosts_as_written`), §1.2 | `session start` / `sandbox run` | refuse (exit 1; 2 for a malformed flag, or a manifest, secrets store or host environment that cannot be inspected or read), nothing sent to `sallyd` |
 | (no field) what the validation accepted | `sallyd::session` (`accepted.rs`): `manifest.acknowledged_risk` per acknowledgement, one `manifest.warn` | launch, before `sandbox.launch` | a failed append refuses the start; nothing launched |
 | `tools.mcp[]` | env-name filter in validator; broker MCP gateway (M4) | validate + each relayed call | reject secret-like env; pending if `approve: always` |
 | `[data-can-leave]` | validator warning + `summary()` first line + UI | validate | warning (never blocks) |
