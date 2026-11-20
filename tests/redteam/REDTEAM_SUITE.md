@@ -256,13 +256,12 @@ milestone column. A lettered row counts as its own row: SEC 16 is RT-SEC-01..15 
 ### Adding a test
 1. Pick the SI it defends. 2. Add a row here with a concrete attack and a *mechanically checkable*
 PASS condition. 3. Implement it as a function named `rt_<category>_<nn>_…` in the crate that owns
-the defence, and add its file to the row's Test column in the order the Harness section gives.
-4. Reference the
-ID in the code comment of the mitigation. A mitigation without a test ID in its comment fails
-review. 5. A PASS clause that asserts something absent, refused or unreachable names its control
-in the row, and the control lands in the same PR as the test (#122): the same probe, with the
-defence left out, finds the thing. It runs inside the same `rt_` test, before the absence
-assertion, through the same probe string or scan function, and its messages start with
+the defence, and add its file to the row's Test column in the order the Harness section gives. 4.
+Reference the ID in the code comment of the mitigation. A mitigation without a test ID in its
+comment fails review. 5. A PASS clause that asserts something absent, refused or unreachable
+names its control in the row, and the control lands in the same PR as the test (#122): the same
+probe, with the defence left out, finds the thing. It runs inside the same `rt_` test, before the
+absence assertion, through the same probe string or scan function, and its messages start with
 `control:`. Record it as "Control: `<test>` in-test (<what is left out>)"; where the hard rules
 forbid leaving the defence out, as "Control (analogue): …", naming what succeeds instead and
 the flag a defence-off control would need. A recorder that saw nothing (a fake resolver or
