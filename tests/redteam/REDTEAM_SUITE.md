@@ -10,19 +10,23 @@ reason; review enforces this (no CI step reads skip reasons yet).
 
 - Each row's test is a Rust test named `rt_<category>_<nn>_…` after its ID (category in lower
   case, the number and any letter as in the ID: RT-SEC-06b is `rt_sec_06b_…`), in the crate that
-  owns the defence: container tests under `crates/<crate>/tests/`, container-free ones beside the
-  code under `crates/<crate>/src/`. Each row's **Test** column names every file that holds a
-  function with its prefix, container tests first; "none yet" means the row lands in a later
-  milestone (its M column). `make redteam` runs every test whose name starts `rt_`
-  (`REDTEAM_FILTER` in the `Makefile`) with cargo-nextest, and fails when cgroup v2 is missing or
-  nothing is selected.
+  owns the defence, as an integration test under `crates/<crate>/tests/` or a unit test under
+  `crates/<crate>/src/`. The `tests/` files include ones that start no container, for example
+  `crates/sally-core/tests/rt_manifest.rs`, `crates/sally-cli/tests/audit_cli.rs` and
+  `crates/sallyd/tests/scan.rs`. Each row's **Test** column names every file that holds a
+  function with its prefix: the `tests/` files first, then the `src/` files, each group in byte
+  order of the full path (`crates/sally-cli/…` before `crates/sally-core/…` before
+  `crates/sallyd/…`); "none yet" means the row lands in a later milestone (its M column).
+  `make redteam` runs every test whose name starts `rt_` (`REDTEAM_FILTER` in the `Makefile`)
+  with cargo-nextest, and fails when cgroup v2 is missing or nothing is selected.
 - **Fixtures** are built in code, not read from files. `crates/sallyd/tests/common/` holds the
   container helpers (`container.rs`), the fake network side of the egress proxy (`egress.rs`:
   the resolver, dialer and host-address source handed to the launcher through the constructor
   seam production fills with the system resolver and TCP dialer, Task 8 decision 10, and an
   in-process echo upstream, so no packet leaves the host; no test-only code path exists in
   `sallyd`), the intercepted-TLS rig (`intercept.rs`), the redaction-form helpers (`forms.rs`),
-  audit-log search (`search.rs`) and run-scoped locks (`locks.rs`). sally-core's are in
+  audit-log search (`search.rs`), run-scoped locks (`locks.rs`) and a session's built-in tools
+  behind the real gate on a launched workspace (`tools.rs`). sally-core's are in
   `crates/sally-core/tests/common/`.
 - **Canaries** are fixed text assembled at runtime, one per fixture secret name, and held by the
   fixture secret store, so no credential-shaped literal is in the tree; they are the same in every
@@ -251,7 +255,8 @@ milestone column. A lettered row counts as its own row: SEC 16 is RT-SEC-01..15 
 ### Adding a test
 1. Pick the SI it defends. 2. Add a row here with a concrete attack and a *mechanically checkable*
 PASS condition. 3. Implement it as a function named `rt_<category>_<nn>_…` in the crate that owns
-the defence, and add its file to the row's Test column. 4. Reference the
+the defence, and add its file to the row's Test column in the order the Harness section gives.
+4. Reference the
 ID in the code comment of the mitigation. A mitigation without a test ID in its comment fails
 review. 5. A PASS clause that asserts something absent, refused or unreachable names its control
 in the row, and the control lands in the same PR as the test (#122): the same probe, with the
