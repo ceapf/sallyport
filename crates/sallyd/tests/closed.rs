@@ -216,7 +216,8 @@ fn a_launch_refused_after_its_egress_started_writes_no_session_closed() {
         let reg = registry(&x);
         x.events.fail(&["sandbox.launch"]);
         reg.start(Arc::new(x.f.validated(GRANT))).await.unwrap_err();
-        assert_eq!(x.events.list(), ["sandbox.refuse"]);
+        // The grant's [data-can-leave] warning is recorded before anything is launched.
+        assert_eq!(x.events.list(), ["manifest.warn", "sandbox.refuse"]);
         assert!(x.redactors.sessions().is_empty(), "the forms stayed");
         assert!(reg.list().is_empty(), "{:?}", reg.list());
     });
