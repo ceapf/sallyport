@@ -367,7 +367,7 @@ G7 Make the machine unusable
 |---|---|---|
 | `--network=none`, `--no-hosts` on every container (no `--dns=none`: Podman 4.9 rejects it with `none`; `none` already yields no resolver) | `sallyd::sandbox::argv`, checked by `sandbox::check` | RT-NET-01, 02, 08 |
 | Shim → Unix socket → policy proxy; CONNECT by hostname; port allowlist | `sally-shim`, `sallyd::egress` | RT-NET-03..07, 10 |
-| Resolve-then-filter-then-pin connect; deny loopback/private/link-local/own/connected networks | `sallyd::egress::server` (`check`), `egress::addr`, `egress::hostaddrs` | RT-NET-07 |
+| Resolve-then-filter-then-pin connect; deny loopback/private/link-local/own/connected networks | `sallyd::egress::server` (`check`), `egress::addr`, `egress::hostaddrs`, `egress::net` (`ProcHostAddrs`) | RT-NET-07 |
 | Label-boundary wildcard matching | sally-core `manifest::host` (`HostPattern::matches`), called from `sallyd::egress::policy` (`decide`) | RT-NET-06 |
 | Per-host header injection inside TLS the proxy terminates (grant hosts only; others spliced); no request carrying a grant header is sent unless its `egress.request` entry was written (an entry that cannot be written sends nothing); strip `Accept-Encoding`, `Range`, `If-Range`; refuse a `Content-Encoding` other than one `identity`; redact every response header and body with every form of every session secret, at the same length; no redirects | `sallyd::egress::server::intercept`, `sallyd::egress::rewrite` (9a-2); `sallyd::egress::inject`, `sallyd::egress::redact` (9a-3, `{basic}` 9b) | RT-SEC-03..07, 09..13 |
 | Secrets module: values never serialized; `Debug` redacted; zeroize | `sally-core::secrets`; values only in `sallyd` (`egress::inject`), the placeholder the only `--env` value | RT-SEC-01, 02, 07 |
