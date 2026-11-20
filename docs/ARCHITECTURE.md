@@ -610,8 +610,10 @@ peer to be its own uid (architect Q78), and it reads replies under the same 1 Mi
 | `audit.tail` (filter, follow) / `audit.verify` | log |
 
 In M1 the CLI runs `doctor` (host facts only; container checks are #119), `manifest
-validate|summary` (an advisory verdict: `sallyd` validates again at `sessions.create`),
-`audit verify|tail` (read-only, no `audit.lock`) and `secrets set|list|rm` itself, without
+validate|summary` (an advisory verdict: `sallyd` validates again at `sessions.create`; at
+launch, `sally session start` and `sally sandbox run` run the same validation as a refusing
+gate, check where the manifest file is kept and ask for consent to the text shown before they
+send it, MANIFEST_SPEC §1.2), `audit verify|tail` (read-only, no `audit.lock`) and `secrets set|list|rm` itself, without
 `sallyd` (architect Q52, Q106–Q110). Paths come from `sally_core::paths`, as `sallyd`'s do.
 `secrets set|rm` write the store directly under its writers' lock: an exclusive `flock` on a
 separate 0600 `secrets.lock`, given up after 10 s with nothing changed. `save` writes a temp
@@ -647,7 +649,10 @@ request is `-32000` with `data`
   `sandbox.refuse` could not be written gets no reply. A launch whose task ended without a
   result is `start-failed` with its own `session.refuse` naming the session (architect Q98;
   TODO(#113): what such a task leaves behind). Any other start failure is `shutting-down` or
-  `start-failed` with its own `session.refuse`.
+  `start-failed` with its own `session.refuse`. A start whose `manifest.acknowledged_risk` or
+  `manifest.warn` entry could not be written, or whose writing task failed, launches nothing;
+  its `session.refuse` (`start-failed`) carries the session's `id` and, in `detail`, the entry
+  that failed.
 - `sessions.create` with a `model` (architect Q119): only `{kind: "scripted", script, driven:
   true}` starts. `script` is JSON Lines text of at most 256 KiB (`sally_proto::MAX_SCRIPT_BYTES`;
   `sallyd` opens no file), parsed whole before anything launches: each line is exactly one of
@@ -1589,9 +1594,15 @@ sallyport/
     and for a message `content_bytes`, `content_sha256`; written before the turn's first call.
   - `manifest.refuse` (actor `sallyd`, decision `refuse`): `{error}`, the validator's errors,
     escaped, at most 1024 characters; nothing is launched.
+  - `manifest.acknowledged_risk` (actor `sallyd`, decision `allow`, in the session's log):
+    `{risk}`, one per acknowledgement in effect, in the validator's order; then `manifest.warn`
+    (actor `sallyd`, no decision): `{count, warnings: [{code, path}]}`, at most 32 listed and
+    never a message, only when the validation gave a warning. Both are written before
+    `sandbox.launch`.
   - `session.refuse` (actor `sallyd`, decision `refuse`): `{method, id?, reason, detail?,
     error?, client}`; reasons `unknown-session`, `listing-failed`, `shutting-down`,
-    `start-failed`, `stop-failed`.
+    `start-failed`, `stop-failed`. A `start-failed` carries `id` when the start had minted the
+    session's id (a failed manifest entry or entry task).
   - `rpc.cancel` (actor `harness`): `{id}`, only for a cancel that matches an in-flight call,
     before its reply is suppressed.
   - `llm.request` (actor `harness`, decision `allow`): `{path}` for `/v1/models`; for a chat

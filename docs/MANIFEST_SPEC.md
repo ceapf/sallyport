@@ -116,7 +116,9 @@ an unknown entry (anything but `shell`, `fetch` or `mcp:<name of a declared serv
 `invalid-value`, a repeated one `duplicate`. `network.acknowledge_unrestricted_egress` set but not
 needed stays an `inconsistent` warning. `ValidatedManifest::acknowledged_risks()` lists what is in
 effect (`network.acknowledge_unrestricted_egress`, `tools.acknowledge_unapproved: <entry>`); the
-UI shows a red banner and launch records one `manifest.acknowledged_risk` audit event per entry.
+UI shows a red banner. Before `sandbox.launch`, a launch records one `manifest.acknowledged_risk`
+audit event per entry (`risk`, decision `allow`) and, when the validation gave any warning, one
+`manifest.warn` (`count`, and the first 32 warnings as `code` and field `path`; never a message).
 
 **`[data-can-leave]`** (AMENDMENTS-01 §5, Agents Rule of Two). The model and everything it reads
 are untrusted input. When a manifest has **private data** (any mount or secret) and an **outward
@@ -133,6 +135,39 @@ HEAD never prompt, whatever `tools.fetch_writes` says. There is no acknowledge f
 normal shape of a useful agent, so the point is that the user sees it every time. On a rejected
 manifest, a grant whose secret name or `inject.host` failed its own check appears as "whatever
 the secret at secrets[i] unlocks": neither value is echoed outside its own error.
+
+### 1.2 Launching from a manifest file (the CLI's gate, RT-MAN-03)
+
+`sally session start` and `sally sandbox run` read the manifest file once and send that text; at
+launch, the CLI's own validation is a refusing gate (for `sally manifest validate` and `summary`
+it only reports). In order:
+
+- **Place.** A manifest kept inside a folder the same manifest mounts `rw` or `brokered` is
+  refused (exit 1, nothing sent): the session could rewrite the next session's grants. Two
+  folders are checked, the one holding the name as given (a link there can be pointed elsewhere)
+  and the one holding the file it resolves to; each is refused when its realpath is, or lies
+  under, such a mount's root, or when its chain of directory identities holds that root's
+  identity. `staged` and `ro` mounts never refuse. Not covered (#254): a link chain that passes
+  through a writable folder at an intermediate hop, a hard link of the file into a writable
+  folder, and a bind of a subdirectory.
+- **What is shown.** Before anything is sent, the launch shows the summary, each warning and each
+  acknowledged risk, on the terminal the answer is read from when a question follows and on
+  stderr otherwise. A line that fails the CLI's clean-check refuses the launch (exit 1).
+- **Consent.** A manifest with any warning or acknowledged risk needs it. On a terminal (stdin is
+  one and `/dev/tty` opens) it is `yes` typed after the question, with typed-ahead input
+  discarded; `--accept-manifest` does not replace it there. Off a terminal it is
+  `--accept-manifest <sha256>`, the SHA-256 of the exact text read: a malformed value fails
+  (exit 2) before anything is read, a hash of other text refuses (exit 1), and no launch output
+  prints the hash of what was read. With the hash alone as consent, every mount host must be
+  written as the folder it resolves to (exit 1 otherwise): the hash names the text, not the
+  folders. `~` expands against `HOME` as given, so where `HOME`'s own path goes through a link,
+  a `~` host cannot launch by hash alone (#255).
+
+`sally manifest summary` ends with the line `sha256 <hex>`, the hash a launch's
+`--accept-manifest` names. Its stderr carries the warnings and acknowledged risks a launch shows,
+and any mount host not written as its folder. A manifest whose launch block holds a line that
+cannot be shown prints no hash and exits 1. `sallyd` validates the text it is sent again, under
+its own host facts (#255).
 
 ### Ranges and formats (checked by the validator)
 | Field | Rule |
@@ -453,6 +488,8 @@ yet (TODO(#231)).
 | `tools.destructive_requires_approval` | pattern tagger `sallyd::tools::tag` (Task 11, architect ruling Q33), its verdict an input to `sallyd::approvals` | each shell call in `allow` mode | pending if tagged, or if no tagger ran |
 | `tools.fetch_writes` | `sallyd::tools::fetch` → `sallyd::approvals`; the ticket binds the method, the canonical URL, the harness's headers and the body, never an injected credential (#75 rulings Q3, Q4); headers the proxy would drop are refused at prepare, so the prompt shows only what is sent | each non-GET/HEAD fetch, and each GET/HEAD with a body, a method-override header (`X-HTTP-Method-Override`, `X-HTTP-Method`, `X-Method-Override`) or body framing (`Content-Length`, `Transfer-Encoding`) | pending if `approve` |
 | `tools.acknowledge_unapproved` | validator (`ack.rs`); launch audit `manifest.acknowledged_risk` | validate + launch | reject if needed and unset |
+| (no field) the manifest file's place and the launch consent | `sally` CLI (`consent.rs`; `sally_core::manifest::ManifestPlace`, `check_place`, `check_hosts_as_written`), §1.2 | `session start` / `sandbox run` | refuse (exit 1), nothing sent to `sallyd` |
+| (no field) what the validation accepted | `sallyd::session` (`accepted.rs`): `manifest.acknowledged_risk` per acknowledgement, one `manifest.warn` | launch, before `sandbox.launch` | a failed append refuses the start; nothing launched |
 | `tools.mcp[]` | env-name filter in validator; broker MCP gateway (M4) | validate + each relayed call | reject secret-like env; pending if `approve: always` |
 | `[data-can-leave]` | validator warning + `summary()` first line + UI | validate | warning (never blocks) |
 | `approvals.timeout/max_pending` | `sallyd::approvals`; new prompts also limited to one per 2 s, burst `max_pending` (ARCHITECTURE §4.2) | each request | expire → deny; over either bound → `denied: approval-flood`, one `approval.deny` each + one `approval.flood` per episode |
