@@ -354,7 +354,7 @@ G7 Make the machine unusable
 │                                                   [RESIDUAL until the inference stage: no RPC or daemon path
 │                                                    reaches the inference launch yet; §6]
 ├─ A workspace or harness launch or start task panics after its container started
-│                                                   [OPEN (#113): the container counts as live, so no sweep
+│                                                   [OPEN, fix planned, #113: the container counts as live, so no sweep
 │                                                    takes it; no watchdog; it ends at the backstop or the
 │                                                    next daemon start; §6]
 ├─ Sessions enough to fail the orphan sweep         [64 live at most, refused `session-limit` at reservation → sallyd unit tests sandbox::budget, overlap, orphans; RESIDUAL §6]
