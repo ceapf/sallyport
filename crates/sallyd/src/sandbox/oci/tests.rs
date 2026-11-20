@@ -36,6 +36,7 @@ fn facts() -> Facts {
             static_dir: s,
             run_dir: r,
             timeout: 7500,
+            health: json!({"Test": ["NONE"]}),
         },
         image: ImageConfig {
             env: Some(vec!["PATH=/usr/bin:/bin".into()]),
@@ -361,6 +362,28 @@ fn the_timeout_podman_recorded_is_exactly_the_argv_s() {
     assert_eq!(mismatch(&none, 0), Ok(()));
     for t in [1, 7500] {
         assert_eq!(mismatch(&none, t), Err("timeout".to_owned()), "{t}");
+    }
+}
+
+/// Security review: a container whose inspect output shows a health check other than the
+/// disabled form is refused on `healthcheck`, without the image-chosen value in the reason.
+#[test]
+fn a_health_check_podman_recorded_is_refused() {
+    let i = intent();
+    let v = good(&i, &facts());
+    check(&v, &i, &facts()).unwrap();
+    for h in [
+        json!({"Test": ["CMD-SHELL", "touch /tmp/sp-secret-marker"]}),
+        json!(null),
+    ] {
+        let mut f = facts();
+        f.paths.health = h.clone();
+        let e = check(&v, &i, &f).unwrap_err();
+        assert_eq!(e.field, "healthcheck", "{h}");
+        assert_eq!(
+            e.why,
+            "podman's .Config.Healthcheck is not the disabled form"
+        );
     }
 }
 

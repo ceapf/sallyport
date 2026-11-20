@@ -80,6 +80,7 @@ check "leak names the container" grep -q 'sp-ws-t[a-z0-9]\{8\}-1-0-a' "$tmp/out"
 check "leaked container swept" bash -c "test \$(grep -c '^sp-ws-t' '$tmp/s/containers') -eq 2"
 check "other runs untouched (leak)" untouched
 check "containers removed before images" bash -c "awk '/^rmi /{i=NR} /^rm /{r=NR} END{exit !(r && (!i || r < i))}' '$tmp/s/log'"
+check "containers removed with their anonymous volumes" bash -c "! grep '^rm ' '$tmp/s/log' | grep -qv -- ' --volumes '"
 
 # A launch's mount-link probe of this run is this run's too; another run's probe is not.
 go 'echo "sp-probe-ws-t$SALLYPORT_TEST_RUN-1-0-a" >>"$STUB/containers"

@@ -152,11 +152,18 @@ pub use super::locks::*;
 /// name). Each run owns its tags: `scripts/test-run.sh` untags only its own afterwards, and
 /// `--layers=false` leaves no untagged intermediate images (architect Q25).
 fn build(name: &str, entry: &str, shim: Option<&[u8]>) -> (String, String) {
-    build_with(name, entry, shim, "")
+    build_with(name, entry, shim, "", None)
 }
 
-/// As [`build`], with `extra` appended to the Containerfile (it is part of the input key).
-fn build_with(name: &str, entry: &str, shim: Option<&[u8]>, extra: &str) -> (String, String) {
+/// As [`build`], with `extra` appended to the Containerfile and, when `format` is set, built in
+/// that image format instead of the default OCI one (both are part of the input key).
+fn build_with(
+    name: &str,
+    entry: &str,
+    shim: Option<&[u8]>,
+    extra: &str,
+    format: Option<&str>,
+) -> (String, String) {
     use std::hash::{Hash, Hasher};
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/redteam/probe/probe.c");
     let mut h = std::hash::DefaultHasher::new();
@@ -164,10 +171,12 @@ fn build_with(name: &str, entry: &str, shim: Option<&[u8]>, extra: &str) -> (Str
     if !extra.is_empty() {
         extra.hash(&mut h);
     }
+    // After `extra`, and tagged by `Option`, so no `extra` reads as a format.
+    format.hash(&mut h);
     let tag = format!("localhost/{name}:{}-{:016x}", image_run(), h.finish());
     let _held = lock("test-image", true);
     if !podman(&["image", "exists", &tag]).status.success() {
-        build_image(&tag, entry, shim, extra);
+        build_image(&tag, entry, shim, extra, format);
     }
     let out = podman(&["image", "inspect", "--format", "{{.Digest}}", &tag]);
     assert!(
@@ -185,7 +194,7 @@ fn build_with(name: &str, entry: &str, shim: Option<&[u8]>, extra: &str) -> (Str
 /// The `llama-server` stand-in: it idles.
 const STAND_IN: &str = "#!/bin/sh\nexec sleep 2147483647\n";
 
-fn build_image(tag: &str, entry: &str, shim: Option<&[u8]>, extra: &str) {
+fn build_image(tag: &str, entry: &str, shim: Option<&[u8]>, extra: &str, format: Option<&str>) {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("test-image-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -203,7 +212,7 @@ fn build_image(tag: &str, entry: &str, shim: Option<&[u8]>, extra: &str) {
     executable(&dir.join("entry"), entry.as_bytes());
     executable(&dir.join("llama-server"), STAND_IN.as_bytes());
     probe_binary(&dir.join("probe"));
-    let out = podman(&[
+    let mut args = vec![
         "build",
         "--pull=never",
         "--network=none",
@@ -211,10 +220,12 @@ fn build_image(tag: &str, entry: &str, shim: Option<&[u8]>, extra: &str) {
         "--timestamp",
         "0",
         "-q",
-        "-t",
-        tag,
-        dir.to_str().unwrap(),
-    ]);
+    ];
+    if let Some(f) = format {
+        args.extend(["--format", f]);
+    }
+    args.extend(["-t", tag, dir.to_str().unwrap()]);
+    let out = podman(&args);
     assert!(
         out.status.success(),
         "build: {}",
@@ -310,7 +321,14 @@ pub fn exiting_image() -> ImageRef {
 /// untags it with the run's other test images.
 pub fn image_with(extra: &str) -> ImageRef {
     // The entry idles, as the stand-in does.
-    let (_, pinned) = build_with("sallyport-test", STAND_IN, None, extra);
+    let (_, pinned) = build_with("sallyport-test", STAND_IN, None, extra, None);
+    ImageRef::parse(&pinned).unwrap()
+}
+
+/// As [`image_with`], built in Docker format.
+#[allow(dead_code)] // Only the image-metadata tests build one.
+pub fn docker_image_with(extra: &str) -> ImageRef {
+    let (_, pinned) = build_with("sallyport-test", STAND_IN, None, extra, Some("docker"));
     ImageRef::parse(&pinned).unwrap()
 }
 
@@ -921,7 +939,15 @@ impl Lx {
     /// A [`LeaveOut::Bind`] source must lie strictly below this fixture's root (it panics
     /// otherwise), so a control never mounts anything of the real host.
     #[allow(dead_code)] // Only the escape, launch, roles and session tests run controls.
-    pub async fn control(&self, mut argv: Vec<String>, leave_out: LeaveOut<'_>) -> String {
+    pub async fn control(&self, argv: Vec<String>, leave_out: LeaveOut<'_>) -> String {
+        let argv = self.left_out(argv, leave_out);
+        self.create_and_start(argv).await
+    }
+
+    /// The product-built `argv` with exactly the defence `leave_out` left out, as
+    /// [`Lx::control`] creates it.
+    #[allow(dead_code)] // Only the escape, launch, oci, roles and session tests run controls.
+    pub fn left_out(&self, mut argv: Vec<String>, leave_out: LeaveOut<'_>) -> Vec<String> {
         match leave_out {
             LeaveOut::Bind { host, guest } => self.add_binds(&mut argv, &[(host, guest)]),
             LeaveOut::Binds(binds) => self.add_binds(&mut argv, binds),
@@ -956,9 +982,13 @@ impl Lx {
                 let at = only_flag(&argv, "--image-volume", "--image-volume=ignore");
                 argv.remove(at);
             }
+            LeaveOut::Healthcheck => {
+                let at = only_flag(&argv, "--no-healthcheck", "--no-healthcheck");
+                argv.remove(at);
+            }
             LeaveOut::Probe => {}
         }
-        self.create_and_start(argv).await
+        argv
     }
 
     /// `path` canonicalized; panics unless it lies strictly below this fixture's root.
@@ -1010,6 +1040,9 @@ pub enum LeaveOut<'a> {
     /// Disabled image volumes: `--image-volume=ignore` is removed, so the image's volumes are
     /// created.
     ImageVolume,
+    /// Disabled image health checks: `--no-healthcheck` is removed, so the image's health check
+    /// applies.
+    Healthcheck,
     /// The mount-link probe (security review): the argv is unedited. Running it outside the
     /// launcher leaves out every launcher-side check, and of those only the probe runs before
     /// `init`, so it is the one defence left out of what the runtime does at `init`.

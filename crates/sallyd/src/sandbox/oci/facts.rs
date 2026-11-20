@@ -1,7 +1,8 @@
 //! What the verifier needs besides the intent, read through hermetic podman at launch time and
 //! checked here (architect Q99, Q101, Q116: the checks are decisions, so they are pure and in the
-//! mutation scope): the container's own directories and podman's `.Config.Timeout` (the conmon
-//! backstop, #92, architect Q193) from `podman inspect`, and the image's `Config`.
+//! mutation scope): the container's own directories, podman's `.Config.Timeout` (the conmon
+//! backstop, #92, architect Q193) and its `.Config.Healthcheck` (security review) from
+//! `podman inspect`, and the image's `Config`.
 
 use serde::Deserialize;
 
@@ -11,7 +12,7 @@ use super::Mismatch;
 /// object, every value JSON-escaped by the template.
 pub const INSPECT_FORMAT: &str = "{\"static\":{{json .StaticDir}},\"config\":{{json .OCIConfigPath}},\
      \"hostname\":{{json .HostnamePath}},\"rootfs\":{{json .GraphDriver.Data.MergedDir}},\
-     \"timeout\":{{json .Config.Timeout}}}";
+     \"timeout\":{{json .Config.Timeout}},\"health\":{{json .Config.Healthcheck}}}";
 
 /// The `podman image inspect --format` template whose output [`ImageConfig::parse`] reads.
 pub const IMAGE_FORMAT: &str = "{{json .Config}}";
@@ -29,6 +30,8 @@ struct Inspected {
     rootfs: String,
     /// A non-negative integer: a string, a float, a negative number or `null` refuses.
     timeout: u64,
+    /// Any JSON value, judged by [`health_disabled`]; no key at all refuses.
+    health: serde_json::Value,
 }
 
 /// The container's own directories, checked against its id, and its backstop.
@@ -49,6 +52,16 @@ pub struct ContainerPaths {
     /// Podman's `.Config.Timeout`: the seconds after `podman init` at which conmon kills the
     /// container, 0 for none (#92; not part of the OCI config).
     pub timeout: u64,
+    /// Podman's `.Config.Healthcheck`, as recorded (not part of the OCI config). Image-chosen:
+    /// never echoed.
+    pub health: serde_json::Value,
+}
+
+/// Whether `health` is the record of a disabled health check: exactly `{"Test":["NONE"]}`, the
+/// form the argv's `--no-healthcheck` gives, and nothing more.
+#[must_use]
+pub fn health_disabled(health: &serde_json::Value) -> bool {
+    *health == serde_json::json!({ "Test": ["NONE"] })
 }
 
 fn inspect_err(why: impl AsRef<str>) -> Mismatch {
@@ -135,14 +148,17 @@ impl ContainerPaths {
             hostname: i.hostname,
             rootfs: i.rootfs,
             timeout: i.timeout,
+            health: i.health,
         })
     }
 }
 
 /// The fields of an image's `Config` that reach the OCI config (architect Q101). Not
-/// `deny_unknown_fields`: every effect of any other image field shows in `config.json`, where
-/// unknown keys and extra mounts are refused (image-declared volumes are disabled by the argv's
-/// `--image-volume=ignore`). A field used here with the wrong type refuses.
+/// `deny_unknown_fields`: the other fields are not read here. Image health checks and
+/// image-declared volumes are disabled by the argv (`--no-healthcheck`, `--image-volume=ignore`),
+/// and a container whose inspect output shows a health check is refused. Whatever reaches
+/// `config.json` is checked there: unknown keys and extra mounts are refused. A field used here
+/// with the wrong type refuses.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct ImageConfig {
     /// `NAME=value` pairs.
@@ -208,9 +224,58 @@ mod tests {
     fn inspect(static_dir: &str, config: &str, hostname: &str, rootfs: &str) -> String {
         serde_json::json!({
             "static": static_dir, "config": config, "hostname": hostname, "rootfs": rootfs,
-            "timeout": 7500,
+            "timeout": 7500, "health": {"Test": ["NONE"]},
         })
         .to_string()
+    }
+
+    /// `good()` as inspect output, with `health` set to `h` (`None`: the key left out).
+    fn with_health(h: Option<serde_json::Value>) -> Result<ContainerPaths, Mismatch> {
+        let [a, b, c, d] = good();
+        let mut v: serde_json::Value = serde_json::from_str(&inspect(&a, &b, &c, &d)).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        match h {
+            Some(h) => obj.insert("health".into(), h),
+            None => obj.remove("health"),
+        };
+        ContainerPaths::parse(v.to_string().as_bytes(), &id())
+    }
+
+    /// Security review: podman's record of the health check is read whole, whatever its shape
+    /// (the verifier judges it); no key at all refuses as `inspect`.
+    #[test]
+    fn the_health_check_record_is_read_whole_and_required() {
+        use serde_json::json;
+        assert_eq!(parse(&good()).unwrap().health, json!({"Test": ["NONE"]}));
+        for any in [json!(null), json!("x"), json!({"Test": ["CMD", "true"]})] {
+            assert_eq!(with_health(Some(any.clone())).unwrap().health, any);
+        }
+        assert_eq!(with_health(None).unwrap_err().field, "inspect");
+    }
+
+    /// Security review: only the form the argv's `--no-healthcheck` gives is the disabled
+    /// health check; anything else, including that form with more in it, is not.
+    #[test]
+    fn only_the_recorded_disabled_form_is_a_disabled_health_check() {
+        use serde_json::json;
+        assert!(health_disabled(&json!({"Test": ["NONE"]})));
+        for bad in [
+            json!(null),
+            json!({}),
+            json!({"Test": []}),
+            json!({"Test": ["none"]}),
+            json!({"Test": ["NONE", "x"]}),
+            json!({"Test": "NONE"}),
+            json!({"Test": ["CMD-SHELL", "touch /tmp/m"]}),
+            json!({"Test": ["CMD", "true"]}),
+            json!({"Test": ["NONE"], "Interval": 1_000_000_000}),
+            json!({"test": ["NONE"]}),
+            json!("NONE"),
+            json!(["NONE"]),
+            json!(0),
+        ] {
+            assert!(!health_disabled(&bad), "{bad}");
+        }
     }
 
     /// `good()` as inspect output, with `timeout` set to `t` (`None`: the key left out).

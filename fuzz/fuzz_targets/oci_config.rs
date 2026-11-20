@@ -54,6 +54,8 @@ fn fixture() -> (Intent, Facts) {
             // The intent names no `--timeout`, so podman's record is 0 and every input reaches
             // the config parser (#92).
             timeout: 0,
+            // The disabled health check, so every input reaches the config parser.
+            health: serde_json::json!({ "Test": ["NONE"] }),
         },
         image: ImageConfig {
             env: Some(vec!["PATH=/usr/bin:/bin".into()]),

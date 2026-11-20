@@ -36,6 +36,7 @@ label=disable
 --workdir
 /
 --image-volume=ignore
+--no-healthcheck
 --tmpfs
 /tmp:rw,noexec,nosuid,nodev,size=268435456
 --pids-limit

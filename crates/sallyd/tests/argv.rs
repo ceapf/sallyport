@@ -425,6 +425,7 @@ fn every_role_starts_with_the_checked_runtime_and_has_the_section_6_1_flags() {
             "--init",
             "--env-host=false",
             "--image-volume=ignore",
+            "--no-healthcheck",
         ] {
             assert_eq!(
                 a.iter().filter(|x| *x == flag).count(),
@@ -461,6 +462,32 @@ fn checker_requires_image_volumes_ignored() {
         &replacing(&a, flag, &[]),
         &allowed,
         "without --image-volume",
+    );
+}
+
+/// Security review: the checker requires image health checks to be switched off, as the bare
+/// flag: a missing flag, a second copy, a value, and any health-check option are refused.
+#[test]
+fn checker_requires_image_health_checks_off() {
+    let f = Fx::new();
+    let (a, allowed) = base(&f);
+    check_argv(&a, &allowed).unwrap();
+    let flag = "--no-healthcheck";
+    for new in [
+        &[flag, flag][..],
+        &["--no-healthcheck=false"],
+        &["--no-healthcheck=true"],
+        &[flag, "--health-cmd", "true"],
+        &[flag, "--health-cmd=true"],
+        &[flag, "--health-interval", "1s"],
+        &[flag, "--health-interval=1s"],
+    ] {
+        assert_forbidden(&replacing(&a, flag, new), &allowed, &format!("{new:?}"));
+    }
+    assert_forbidden(
+        &replacing(&a, flag, &[]),
+        &allowed,
+        "without --no-healthcheck",
     );
 }
 
