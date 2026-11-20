@@ -79,8 +79,8 @@ fn only_a_slash_32_host_local_line_is_an_own_address() {
 }
 
 /// Was: a `universe` route was taken as one through a gateway and not counted, a `/1` route
-/// counted, and a `THROW` line counted. Now the scope is not read, lengths 0 to 7 are ignored as
-/// default-like, and `THROW` is ignored with the drop types.
+/// counted, and a `THROW` line counted. Now the scope no longer decides whether a route counts,
+/// lengths 0 to 7 are ignored as default-like, and `THROW` is ignored with the drop types.
 #[test]
 fn routes_count_whatever_their_scope_but_drop_throw_and_default_like_routes_do_not() {
     let lan = Ipv4Addr::new(93, 184, 216, 0);
@@ -120,9 +120,11 @@ fn rule_under(leaf: Ipv4Addr, line: &str, ip: Ipv4Addr) -> Option<Rule> {
 }
 
 /// One leg per row of the `fib_trie` probe table in `docs/dev/PROBE_NOTES.md`, on a global
-/// prefix. A counted row refuses an address inside its prefix as a connected network; its
-/// control, an address just past the prefix, passes. An ignored row lets the address inside
-/// pass; its control, the same leaf under a plain device route, refuses it.
+/// prefix, plus the two half-space `/1` routes of a full-tunnel VPN (not probed; `universe`
+/// taken, as for any route through a gateway). A counted row refuses an address inside its
+/// prefix as a connected network; its control, an address just past the prefix, passes. An
+/// ignored row lets the address inside pass; its control, the same address under a counted
+/// route, is refused.
 #[test]
 fn every_probe_table_row_counts_but_throw_and_default_like_routes() {
     let net24 = Ipv4Addr::new(93, 184, 216, 0);
@@ -190,37 +192,33 @@ fn every_probe_table_row_counts_but_throw_and_default_like_routes() {
     let (low, high) = (Ipv4Addr::UNSPECIFIED, Ipv4Addr::new(128, 0, 0, 0));
     let (net8_low, net8_high) = (Ipv4Addr::new(93, 0, 0, 0), Ipv4Addr::new(151, 0, 0, 0));
     let inside_high = Ipv4Addr::new(151, 101, 1, 9);
+    let (device24, device8) = ((net24, "/24 link UNICAST"), "/8 link UNICAST");
     let ignored = [
-        ("throw", net24, "/24 universe THROW", inside24, net24),
+        ("throw", net24, "/24 universe THROW", inside24, device24),
         (
             "throw, link scope",
             net24,
             "/24 link THROW",
             inside24,
-            net24,
+            device24,
         ),
         (
             "half-space, low",
             low,
             "/1 universe UNICAST",
             inside24,
-            net8_low,
+            (net8_low, device8),
         ),
         (
             "half-space, high",
             high,
             "/1 universe UNICAST",
             inside_high,
-            net8_high,
+            (net8_high, device8),
         ),
     ];
-    for (row, leaf, line, inside, control_leaf) in ignored {
+    for (row, leaf, line, inside, (control_leaf, control_line)) in ignored {
         assert_eq!(rule_under(leaf, line, inside), None, "{row}");
-        let control_line = if control_leaf == net24 {
-            "/24 link UNICAST"
-        } else {
-            "/8 link UNICAST"
-        };
         assert_eq!(
             rule_under(control_leaf, control_line, inside),
             Some(Rule::ConnectedNetwork),

@@ -12,7 +12,8 @@ pub enum Rule {
     ReservedRange,
     /// An address this host owns.
     OwnAddress,
-    /// Inside a network this host is directly connected to (a route with no gateway).
+    /// Inside a network in the host's route tables: an IPv4 route of length 8 or more, gateway
+    /// or not; an IPv6 route without the gateway or reject flag; an own IPv6 address's prefix.
     ConnectedNetwork,
 }
 

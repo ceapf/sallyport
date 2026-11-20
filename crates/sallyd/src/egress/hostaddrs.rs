@@ -241,8 +241,9 @@ struct RouteV4<'a> {
 
 impl RouteV4<'_> {
     /// What the line says about `ip`, its leaf: nothing for a default-like route (length 0 to
-    /// 7) or an ignored type; the scope is not read. A leaf with bits set below the line's
-    /// length is not a network the kernel writes: it refuses the list.
+    /// 7) or an ignored type; the scope is read only to know a `/32 host LOCAL` own address. A
+    /// leaf with bits set below the line's length is not a network the kernel writes: it
+    /// refuses the list.
     fn judge(&self, ip: Ipv4Addr) -> Result<Option<Fib>, Bad> {
         if self.len == 0 {
             return if ip.is_unspecified() {
