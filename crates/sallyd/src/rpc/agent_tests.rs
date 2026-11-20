@@ -703,11 +703,18 @@ async fn rt_ag_17_a_peer_that_reads_nothing_holds_at_most_max_in_flight_replies(
         "calls admitted while the peer reads nothing"
     );
     let mut other = start(&agent);
+    // The flood has already recorded refusals with the same reason: count this one's own.
+    let before = denies(&sink).len();
     let e = other.call(&call(1, "echo")).await;
     assert_eq!(e["error"]["data"]["reason"], json!("too-many-in-flight"));
     assert_eq!(
         denies(&sink).last().map(String::as_str),
         Some("too-many-in-flight")
+    );
+    assert_eq!(
+        denies(&sink).len(),
+        before + 1,
+        "the refusal on the second connection wrote its own rpc.deny"
     );
     // Past WRITE_TIMEOUT the writer gives up and the connection closes.
     tokio::time::sleep(WRITE_TIMEOUT).await;
@@ -723,13 +730,19 @@ async fn rt_ag_17_a_peer_that_reads_nothing_holds_at_most_max_in_flight_replies(
         again.send(&call(i, "block")).await;
     }
     reach(&fake.calls, 2 * MAX_IN_FLIGHT).await;
+    assert_eq!(
+        fake.calls.load(Ordering::SeqCst),
+        2 * MAX_IN_FLIGHT,
+        "control: once the slots are free, every call on a new connection reaches the handler"
+    );
     for _ in 0..MAX_IN_FLIGHT {
         fake.release.notify_one();
     }
     for _ in 0..MAX_IN_FLIGHT {
         assert_eq!(
             again.recv().await.unwrap()["result"]["content"][0]["text"],
-            json!("ran block")
+            json!("ran block"),
+            "control: each call on the new connection gets its reply"
         );
     }
 }
