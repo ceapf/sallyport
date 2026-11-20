@@ -20,15 +20,15 @@
 //!   entries are written) and only its reply is suppressed; a prompt it waits on is withdrawn
 //!   through the handler (#54; ruling Q27). Its in-flight slot is held until its reply has been
 //!   written or dropped, so the replies the broker holds for a session are at most
-//!   [`MAX_IN_FLIGHT`], however many connections it has and whether or not they read. A call
-//!   whose handler could not write an entry gets no reply. Session teardown does drop calls:
-//!   after [`listen::STOP_GRACE`] (`Handle::shutdown`) or at once (the `Handle` dropped)
-//!   (architect ruling Q17). Teardown ends each connection's writer too: nothing more is written
-//!   to the peer (a line in mid-write is cut short, then the stream ends), and every queued
-//!   reply and its slot are dropped.
-//! - Finished calls are reaped as they end. A call whose task panics is reported to the
-//!   session's crash reporter as `agent.call` at once (the session then stops); its id and slot
-//!   are released and its connection stays open until the session's stop.
+//!   [`MAX_IN_FLIGHT`], however many connections it has and whether or not they read
+//!   (RT-AG-17). A call whose handler could not write an entry gets no reply. Session
+//!   teardown does drop calls: after [`listen::STOP_GRACE`] (`Handle::shutdown`) or at once (the
+//!   `Handle` dropped) (architect ruling Q17). Teardown ends each connection's writer too:
+//!   nothing more is written to the peer (a line in mid-write is cut short, then the stream
+//!   ends), and every queued reply and its slot are dropped.
+//! - Finished calls are reaped as they end (RT-AG-17). A call whose task panics is reported to
+//!   the session's crash reporter as `agent.call` at once (the session then stops); its id and
+//!   slot are released and its connection stays open until the session's stop.
 //! - The broker never sends a request; replies are the only messages it writes.
 
 use std::collections::HashMap;

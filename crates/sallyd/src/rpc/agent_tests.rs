@@ -680,6 +680,8 @@ fn flood(mut w: WriteHalf<DuplexStream>, tool: &'static str, n: i64) -> JoinHand
     })
 }
 
+/// RT-AG-17.
+///
 /// A call keeps its slot until its reply has left the broker, so a peer that reads nothing
 /// holds at most MAX_IN_FLIGHT replies there, on one connection or many: the next call, on
 /// any connection of the session, is refused (and recorded). Observed past the time the
@@ -687,7 +689,7 @@ fn flood(mut w: WriteHalf<DuplexStream>, tool: &'static str, n: i64) -> JoinHand
 /// waits to queue a refusal) and before WRITE_TIMEOUT closes the connection; past it, the
 /// slots of every queued and waiting reply are free again.
 #[tokio::test(start_paused = true)]
-async fn a_peer_that_reads_nothing_holds_at_most_max_in_flight_replies() {
+async fn rt_ag_17_a_peer_that_reads_nothing_holds_at_most_max_in_flight_replies() {
     let (agent, fake, sink) = setup();
     let Client { mut r, w, server } = start_with(&agent, TIGHT);
     let n = 100;
@@ -1590,11 +1592,13 @@ async fn answered_calls_leave_no_task_behind() {
     assert_eq!(conn.tasks.len(), 0);
 }
 
+/// RT-AG-17.
+///
 /// Finished calls are removed while the connection is still open: after 1,000 calls, each
 /// answered before the next is sent, the open connection holds at most [`MAX_IN_FLIGHT`] call
 /// tasks. (The last call may have ended without being reaped yet, so this is not zero.)
 #[tokio::test(start_paused = true)]
-async fn an_open_connection_holds_at_most_the_cap_after_a_thousand_calls() {
+async fn rt_ag_17_an_open_connection_holds_at_most_the_cap_after_a_thousand_calls() {
     let (agent, _, _) = setup();
     let (mut conn, mut rx, near, mut far) = owned_conn();
     let peer = async {
