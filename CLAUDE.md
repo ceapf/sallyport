@@ -87,7 +87,7 @@ Orchestration that only container tests can prove (`sandbox/launch.rs`, `launch/
 container-free tests run: unit tests, all of sally-core's `tests/`, `sallyd` `argv` + `scan`,
 `sally-shim` `relay` + `relay_bin` + `relay_write_errors`. A new file that fits the rule joins its list in the same PR. Nightly, two jobs:
 - `make mutants` (deny paths): sally-core `manifest/validate/*.rs`, `manifest/paths.rs`,
-  `manifest/links.rs`, `manifest/host.rs`, `config.rs`.
+  `manifest/links.rs`, `manifest/location.rs`, `manifest/host.rs`, `config.rs`.
 - `make mutants-wide-{core,sallyd,shim,cli}` (sharded): sally-core `manifest/{image,hostenv,parse,
   summary,types,units,diag}.rs`, `secrets/{store,secret,names}.rs`,
   `audit/{entry,redact,verify,writer,declared,layout,tail}.rs`, `fsutil.rs`, `fd.rs`, `text.rs`,
@@ -100,7 +100,7 @@ container-free tests run: unit tests, all of sally-core's `tests/`, `sallyd` `ar
   `sandbox/oci/{mod,config,facts,intent,linux,mounts,process,seccomp}.rs`,
   `daemon/{mod,crash,startup,stale,install}.rs`,
   `oplog.rs`, `hf/{mod,error,conn,wire}.rs` (tests hermetic: a mock Hub behind the dialer seam),
-  `session/{lookup,types,exit,secrets}.rs`, `egress/{addr,authority,head,policy,server,
+  `session/{lookup,types,exit,secrets,accepted}.rs`, `egress/{addr,authority,head,policy,server,
   hostaddrs,tunnel,net,ca,roots,rewrite,intercept,intercept_parts,intercept_tls,intercept_report,
   meter,inject,redact,local}.rs` (net.rs tests stay hermetic: nothing leaves the machine),
   `rpc/{agent,control,control_methods,control_line,control_wire,drive,attach,line,frame,json,listen,
@@ -109,7 +109,7 @@ container-free tests run: unit tests, all of sally-core's `tests/`, `sallyd` `ar
   `approvals/queue/{decide,fields,types}.rs`,
   `tools/{args,path,tag,fs,shell,procs,mod,dac,ops,fetch,fetch_url,fetch_client,pipe}.rs`; sally-shim
   `args.rs`, `relay.rs`; sally-cli `clean.rs`, `client.rs`, `commands.rs`, `approve.rs`,
-  `secrets.rs`, `local.rs`, `doctor.rs`, `usage.rs`, `drive.rs`, `run.rs` (clap definitions and
+  `secrets.rs`, `local.rs`, `doctor.rs`, `usage.rs`, `drive.rs`, `run.rs`, `consent.rs` (clap definitions and
   `main.rs` are out).
 
 ## Agent / model routing (ECC)

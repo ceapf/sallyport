@@ -86,7 +86,7 @@ coverage:
 # (architect ruling Q6, Task 8), and so do approvals (maintainer's Task 10 decision 8, architect
 # ruling Q26) and tools (Task 11 decision 8, ruling Q38; tools/exec.rs stays with the rt_ tests).
 MUTANTS_FILES := crates/sally-core/src/manifest/validate/*.rs crates/sally-core/src/manifest/paths.rs \
-                 crates/sally-core/src/manifest/links.rs \
+                 crates/sally-core/src/manifest/links.rs crates/sally-core/src/manifest/location.rs \
                  crates/sally-core/src/manifest/host.rs crates/sally-core/src/config.rs
 # cargo-mutants copies the tree to $$TMPDIR; /tmp is denylisted for mounts, so the copy (and the
 # test fixtures under its target dir) must live elsewhere. Move the fixtures, not the wall.
@@ -153,7 +153,7 @@ MUTANTS_WIDE_SALLYD := $(addprefix crates/sallyd/src/sandbox/,argv.rs check.rs t
                        $(addprefix crates/sallyd/src/daemon/,mod.rs crash.rs startup.rs stale.rs install.rs) \
                        crates/sallyd/src/oplog.rs \
                        $(addprefix crates/sallyd/src/hf/,mod.rs error.rs conn.rs wire.rs) \
-                       $(addprefix crates/sallyd/src/session/,lookup.rs types.rs exit.rs secrets.rs) \
+                       $(addprefix crates/sallyd/src/session/,lookup.rs types.rs exit.rs secrets.rs accepted.rs) \
                        $(addprefix crates/sallyd/src/egress/,addr.rs authority.rs head.rs policy.rs server.rs \
                        hostaddrs.rs tunnel.rs net.rs ca.rs roots.rs rewrite.rs intercept.rs \
                        intercept_parts.rs intercept_tls.rs intercept_report.rs meter.rs inject.rs redact.rs \
@@ -172,7 +172,7 @@ MUTANTS_WIDE_SHIM := $(addprefix crates/sally-shim/src/,args.rs relay.rs)
 # the approve loop, and the local commands (secrets, manifest/audit, doctor's decisions); its clap
 # definitions and main.rs are out. Its tests start no container (a fake daemon on a Unix socket).
 MUTANTS_WIDE_CLI := $(addprefix crates/sally-cli/src/,clean.rs client.rs commands.rs approve.rs \
-                    secrets.rs local.rs doctor.rs usage.rs drive.rs run.rs)
+                    secrets.rs local.rs doctor.rs usage.rs drive.rs run.rs consent.rs)
 MUTANTS_WIDE_TESTS_CORE :=
 MUTANTS_WIDE_TESTS_SALLYD := --lib --test=argv --test=scan
 MUTANTS_WIDE_TESTS_SHIM := --lib --test=relay --test=relay_bin --test=relay_write_errors
@@ -241,7 +241,7 @@ doctor:
 REDTEAM_FILTER := test(/(^|::)rt_/)
 REDTEAM_WSL_TEST := rt_fs_11_wsl_a_windows_executable_does_not_reach_windows
 REDTEAM_WSL_FILTER := test(=$(REDTEAM_WSL_TEST))
-REDTEAM_COUNT := 188
+REDTEAM_COUNT := 196
 REDTEAM_LISTS := target/redteam-lists
 redteam:
 	@v=$$(podman info --format '{{.Host.CgroupsVersion}}'); \
