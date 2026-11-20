@@ -147,9 +147,11 @@ it only reports). In order:
   folders are checked, the one holding the name as given (a link there can be pointed elsewhere)
   and the one holding the file it resolves to; each is refused when its realpath is, or lies
   under, such a mount's root, or when its chain of directory identities holds that root's
-  identity. `staged` and `ro` mounts never refuse. Not covered (#254): a link chain that passes
-  through a writable folder at an intermediate hop, a hard link of the file into a writable
-  folder, and a bind of a subdirectory.
+  identity. `staged` and `ro` mounts never refuse. Only this manifest's own mounts are read
+  (#262). Not covered (#254): a link chain that passes through a writable folder at an
+  intermediate hop, a hard link of the file into a writable folder, and a bind of a
+  subdirectory; the file is then read by its path, with no regular-file check and no identity
+  compare against what was inspected.
 - **What is shown.** Before anything is sent, the launch shows the summary, each warning and each
   acknowledged risk, on the terminal the answer is read from when a question follows and on
   stderr otherwise. A line that fails the CLI's clean-check refuses the launch (exit 1).
@@ -161,13 +163,22 @@ it only reports). In order:
   prints the hash of what was read. With the hash alone as consent, every mount host must be
   written as the folder it resolves to (exit 1 otherwise): the hash names the text, not the
   folders. `~` expands against `HOME` as given, so where `HOME`'s own path goes through a link,
-  a `~` host cannot launch by hash alone (#255).
+  a `~` host cannot launch by hash alone (#255). A given `--accept-manifest` is checked for
+  every manifest, with or without warnings. Not covered (#262): a manifest with no warning and
+  no acknowledged risk is sent with no question, so one kept in a folder another manifest mounts
+  `rw` or `brokered` can be changed by that other session and launched unasked unless the flag
+  is given. Keep a manifest outside every folder any manifest mounts `rw` or `brokered`.
 
 `sally manifest summary` ends with the line `sha256 <hex>`, the hash a launch's
 `--accept-manifest` names. Its stderr carries the warnings and acknowledged risks a launch shows,
 and any mount host not written as its folder. A manifest whose launch block holds a line that
-cannot be shown prints no hash and exits 1. `sallyd` validates the text it is sent again, under
-its own host facts (#255).
+cannot be shown prints no hash and exits 1.
+
+Not covered (#255): what is shown, and what a typed `yes` or a hash accepts, comes from the CLI's
+own validation under its own host facts. `sallyd` validates the text it is sent again under its
+own and resolves the mount hosts again after the CLI's check, so a folder replaced at the same
+path after that check, or a `HOME` that differs between the CLI and `sallyd`, is not seen by the
+consent.
 
 ### Ranges and formats (checked by the validator)
 | Field | Rule |
@@ -488,7 +499,7 @@ yet (TODO(#231)).
 | `tools.destructive_requires_approval` | pattern tagger `sallyd::tools::tag` (Task 11, architect ruling Q33), its verdict an input to `sallyd::approvals` | each shell call in `allow` mode | pending if tagged, or if no tagger ran |
 | `tools.fetch_writes` | `sallyd::tools::fetch` → `sallyd::approvals`; the ticket binds the method, the canonical URL, the harness's headers and the body, never an injected credential (#75 rulings Q3, Q4); headers the proxy would drop are refused at prepare, so the prompt shows only what is sent | each non-GET/HEAD fetch, and each GET/HEAD with a body, a method-override header (`X-HTTP-Method-Override`, `X-HTTP-Method`, `X-Method-Override`) or body framing (`Content-Length`, `Transfer-Encoding`) | pending if `approve` |
 | `tools.acknowledge_unapproved` | validator (`ack.rs`); launch audit `manifest.acknowledged_risk` | validate + launch | reject if needed and unset |
-| (no field) the manifest file's place and the launch consent | `sally` CLI (`consent.rs`; `sally_core::manifest::ManifestPlace`, `check_place`, `check_hosts_as_written`), §1.2 | `session start` / `sandbox run` | refuse (exit 1), nothing sent to `sallyd` |
+| (no field) the manifest file's place and the launch consent | `sally` CLI (`consent.rs`; `sally_core::manifest::ManifestPlace`, `check_place`, `check_hosts_as_written`), §1.2 | `session start` / `sandbox run` | refuse (exit 1; 2 for a malformed flag or a file that cannot be inspected or read), nothing sent to `sallyd` |
 | (no field) what the validation accepted | `sallyd::session` (`accepted.rs`): `manifest.acknowledged_risk` per acknowledgement, one `manifest.warn` | launch, before `sandbox.launch` | a failed append refuses the start; nothing launched |
 | `tools.mcp[]` | env-name filter in validator; broker MCP gateway (M4) | validate + each relayed call | reject secret-like env; pending if `approve: always` |
 | `[data-can-leave]` | validator warning + `summary()` first line + UI | validate | warning (never blocks) |

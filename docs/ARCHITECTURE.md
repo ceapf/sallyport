@@ -612,8 +612,9 @@ peer to be its own uid (architect Q78), and it reads replies under the same 1 Mi
 In M1 the CLI runs `doctor` (host facts only; container checks are #119), `manifest
 validate|summary` (an advisory verdict: `sallyd` validates again at `sessions.create`; at
 launch, `sally session start` and `sally sandbox run` run the same validation as a refusing
-gate, check where the manifest file is kept and ask for consent to the text shown before they
-send it, MANIFEST_SPEC §1.2), `audit verify|tail` (read-only, no `audit.lock`) and `secrets set|list|rm` itself, without
+gate, check where the manifest file is kept, show what it grants and, for a manifest with a
+warning or an acknowledged risk, ask for consent before they send it, MANIFEST_SPEC §1.2),
+`audit verify|tail` (read-only, no `audit.lock`) and `secrets set|list|rm` itself, without
 `sallyd` (architect Q52, Q106–Q110). Paths come from `sally_core::paths`, as `sallyd`'s do.
 `secrets set|rm` write the store directly under its writers' lock: an exclusive `flock` on a
 separate 0600 `secrets.lock`, given up after 10 s with nothing changed. `save` writes a temp
@@ -1601,8 +1602,10 @@ sallyport/
     `sandbox.launch`.
   - `session.refuse` (actor `sallyd`, decision `refuse`): `{method, id?, reason, detail?,
     error?, client}`; reasons `unknown-session`, `listing-failed`, `shutting-down`,
-    `start-failed`, `stop-failed`. A `start-failed` carries `id` when the start had minted the
-    session's id (a failed manifest entry or entry task).
+    `start-failed`, `stop-failed`. A `start-failed` carries `id` when an audit append of the
+    start (a manifest entry or `session.start`), or that append's task, failed, and after a
+    launch task that was lost (Q98); not yet for a failed `agent.sock` bind or a container
+    that exited early (#259).
   - `rpc.cancel` (actor `harness`): `{id}`, only for a cancel that matches an in-flight call,
     before its reply is suppressed.
   - `llm.request` (actor `harness`, decision `allow`): `{path}` for `/v1/models`; for a chat
