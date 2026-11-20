@@ -12,7 +12,9 @@ use sally_core::manifest::{AuditLevel, parse_host_pattern};
 use tokio::io::DuplexStream;
 
 use super::*;
+use crate::egress::addr::HostNets;
 use crate::egress::ca::SessionTls;
+use crate::egress::hostaddrs::HostAddrsError;
 pub(super) use crate::egress::inject::testing::{credentials, value};
 use crate::egress::policy::{Grant, Policy, Rule};
 use crate::egress::server::{Interception, Parts};
@@ -264,8 +266,8 @@ impl Resolver for Public {
 pub(super) struct NoOwn;
 
 impl HostAddrs for NoOwn {
-    async fn own(&self) -> io::Result<Vec<IpAddr>> {
-        Ok(vec![])
+    async fn own(&self) -> Result<HostNets, HostAddrsError> {
+        Ok(HostNets::default())
     }
 }
 

@@ -1,8 +1,91 @@
-//! The egress address filter (SI-9): a resolved address passes only if it is global unicast and
-//! not one the host itself owns. IPv6 forms that carry an IPv4 address (v4-mapped, NAT64
-//! `64:ff9b::/96`, 6to4 `2002::/16`) are judged by that IPv4 address.
+//! The egress address filter (SI-9): a resolved address passes only if it is global unicast, not
+//! one the host itself owns, and not inside a network the host is directly connected to. IPv6
+//! forms that carry an IPv4 address (v4-mapped, NAT64 `64:ff9b::/96`, 6to4 `2002::/16`) are
+//! judged by that IPv4 address as well.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+/// Which rule of the filter refused an address, in the order they are checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rule {
+    /// Not global unicast (a reserved, private, loopback, link-local or documentation range).
+    ReservedRange,
+    /// An address this host owns.
+    OwnAddress,
+    /// Inside a network in the host's route tables: an IPv4 route of length 8 or more, gateway
+    /// or not; an IPv6 route without the gateway or reject flag; an own IPv6 address's prefix.
+    ConnectedNetwork,
+}
+
+impl Rule {
+    /// The name the `egress.deny` entry records.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReservedRange => "reserved-range",
+            Self::OwnAddress => "own-address",
+            Self::ConnectedNetwork => "connected-network",
+        }
+    }
+}
+
+/// A network: an address and a prefix length of at least 1 (a prefix of length 0 is never a
+/// network here: it would be every address).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Net {
+    addr: IpAddr,
+    len: u32,
+}
+
+impl Net {
+    /// The network of length `len` that holds `addr` (its bits below `len` cleared), or `None`
+    /// when `len` is 0 or longer than the address.
+    #[must_use]
+    pub fn prefix(addr: IpAddr, len: u32) -> Option<Self> {
+        let masked = match addr {
+            IpAddr::V4(a) if (1..=32).contains(&len) => {
+                IpAddr::V4(Ipv4Addr::from(u32::from(a) & v4_mask(len)))
+            }
+            IpAddr::V6(a) if (1..=128).contains(&len) => {
+                IpAddr::V6(Ipv6Addr::from(u128::from(a) & v6_mask(len)))
+            }
+            _ => return None,
+        };
+        Some(Self { addr: masked, len })
+    }
+
+    /// The network's first address (no bit set below its length).
+    #[must_use]
+    pub fn addr(&self) -> IpAddr {
+        self.addr
+    }
+
+    /// The prefix length, in bits.
+    #[must_use]
+    pub fn bits(&self) -> u32 {
+        self.len
+    }
+
+    /// Whether `ip` (of the same family) is inside this network.
+    #[must_use]
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (self.addr, ip) {
+            (IpAddr::V4(n), IpAddr::V4(a)) => u32::from(a) & v4_mask(self.len) == u32::from(n),
+            (IpAddr::V6(n), IpAddr::V6(a)) => u128::from(a) & v6_mask(self.len) == u128::from(n),
+            _ => false,
+        }
+    }
+}
+
+/// What the host's own tables say: the addresses it owns and the networks it is directly
+/// connected to (sorted and without duplicates when the tables are parsed).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostNets {
+    /// Addresses this host owns.
+    pub own: Vec<IpAddr>,
+    /// Networks this host is directly connected to.
+    pub connected: Vec<Net>,
+}
 
 /// IPv4 networks that are not global unicast, as (network, prefix length).
 const DENIED_V4: &[(u32, u32)] = &[
@@ -33,16 +116,24 @@ const DENIED_V6: &[(u128, u32)] = &[
     (0x3fff_0000 << 96, 20), // 3fff::/20, documentation
 ];
 
+/// The mask of a `len`-bit IPv4 prefix (`len` in 1..=32).
+fn v4_mask(len: u32) -> u32 {
+    u32::MAX.checked_shl(32 - len).unwrap_or(0)
+}
+
+/// The mask of a `len`-bit IPv6 prefix (`len` in 1..=128).
+fn v6_mask(len: u32) -> u128 {
+    u128::MAX.checked_shl(128 - len).unwrap_or(0)
+}
+
 /// Whether `addr` is inside `net/len` (`len` in 1..=32).
 fn in_v4(addr: u32, (net, len): (u32, u32)) -> bool {
-    let mask = u32::MAX.checked_shl(32 - len).unwrap_or(0);
-    addr & mask == net
+    addr & v4_mask(len) == net
 }
 
 /// Whether `addr` is inside `net/len` (`len` in 1..=128).
 fn in_v6(addr: u128, (net, len): (u128, u32)) -> bool {
-    let mask = u128::MAX.checked_shl(128 - len).unwrap_or(0);
-    addr & mask == net
+    addr & v6_mask(len) == net
 }
 
 fn v4_denied(a: Ipv4Addr) -> bool {
@@ -73,21 +164,31 @@ fn v6_denied(a: Ipv6Addr) -> bool {
     !in_v6(x, GLOBAL_V6) || DENIED_V6.iter().any(|&net| in_v6(x, net))
 }
 
-/// Whether the proxy must refuse to connect to `ip`: not global unicast, or owned by this host
-/// (`own`, compared both as given and by the IPv4 address an IPv6 form carries).
+/// The rule under which the proxy must refuse to connect to `ip`, or `None` when it may. Checked
+/// in [`Rule`]'s order: not global unicast; owned by this host; inside a network this host is
+/// directly connected to. The host's tables are compared with `ip` as given and with the IPv4
+/// address an IPv6 form carries.
 #[must_use]
-pub fn is_denied(ip: IpAddr, own: &[IpAddr]) -> bool {
+pub fn denied_by(ip: IpAddr, host: &HostNets) -> Option<Rule> {
+    let reserved = match ip {
+        IpAddr::V4(a) => v4_denied(a),
+        IpAddr::V6(a) => v6_denied(a),
+    };
+    if reserved {
+        return Some(Rule::ReservedRange);
+    }
     let carried = match ip {
         IpAddr::V6(a) => embedded_v4(a).map(IpAddr::V4),
         IpAddr::V4(_) => None,
     };
-    if own.contains(&ip) || carried.is_some_and(|c| own.contains(&c)) {
-        return true;
+    let forms = || std::iter::once(ip).chain(carried);
+    if forms().any(|f| host.own.contains(&f)) {
+        return Some(Rule::OwnAddress);
     }
-    match ip {
-        IpAddr::V4(a) => v4_denied(a),
-        IpAddr::V6(a) => v6_denied(a),
+    if forms().any(|f| host.connected.iter().any(|n| n.contains(f))) {
+        return Some(Rule::ConnectedNetwork);
     }
+    None
 }
 
 #[cfg(test)]
@@ -101,6 +202,19 @@ mod tests {
 
     fn v6(s: &str) -> IpAddr {
         IpAddr::V6(s.parse().unwrap())
+    }
+
+    /// The filter with `own` as the host's addresses and no connected network.
+    fn is_denied(ip: IpAddr, own: &[IpAddr]) -> bool {
+        let host = HostNets {
+            own: own.to_vec(),
+            connected: Vec::new(),
+        };
+        denied_by(ip, &host).is_some()
+    }
+
+    fn net(ip: IpAddr, len: u32) -> Net {
+        Net::prefix(ip, len).unwrap()
     }
 
     #[test]
@@ -192,5 +306,101 @@ mod tests {
         assert!(is_denied(v6("2002:5db8:d822::1"), &own));
         assert!(is_denied(v6("2606:4700::1111"), &own));
         assert!(!is_denied(v4(0x0808_0808), &own));
+    }
+
+    #[test]
+    fn a_prefix_is_one_to_the_address_length_long_and_clears_the_bits_below() {
+        for (ip, max) in [(v4(0x5DB8_D801), 32), (v6("2606:4700::1"), 128)] {
+            assert_eq!(Net::prefix(ip, 0), None, "{ip}/0");
+            assert_eq!(Net::prefix(ip, max), Some(Net { addr: ip, len: max }));
+            assert_eq!(Net::prefix(ip, max + 1), None, "{ip}/{}", max + 1);
+        }
+        // Every bit below the length is cleared, every bit above kept.
+        let n = net(v4(0xFFFF_FFFF), 1);
+        assert_eq!((n.addr(), n.bits()), (v4(0x8000_0000), 1));
+        assert_eq!(net(v6("2606:4700::"), 48).bits(), 48);
+        assert_eq!(net(v4(0x5DB8_D8FF), 24).addr(), v4(0x5DB8_D800));
+        assert_eq!(net(v4(0x5DB8_D8FF), 31).addr(), v4(0x5DB8_D8FE));
+        let n = net(v6("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"), 1);
+        assert_eq!((n.addr(), n.len), (v6("8000::"), 1));
+        assert_eq!(net(v6("2606:4700:10::1"), 64).addr(), v6("2606:4700:10::"));
+        assert_eq!(net(v6("2606:4700:10::1"), 127).addr(), v6("2606:4700:10::"));
+        // Two addresses on one network give the same network.
+        assert_eq!(net(v4(0x5DB8_D801), 24), net(v4(0x5DB8_D807), 24));
+    }
+
+    #[test]
+    fn a_network_holds_exactly_its_prefix_whatever_its_host_bits() {
+        // A /24 written with host bits set, as a table gives an own address's prefix.
+        let n = net(v4(0x5DB8_D801), 24);
+        for (x, inside) in [
+            (0x5DB8_D800, true),
+            (0x5DB8_D8FF, true),
+            (0x5DB8_D7FF, false),
+            (0x5DB8_D900, false),
+        ] {
+            assert_eq!(n.contains(v4(x)), inside, "{x:#x}");
+        }
+        let n = net(v6("2606:4700:10::1"), 64);
+        for (s, inside) in [
+            ("2606:4700:10::", true),
+            ("2606:4700:10:0:ffff:ffff:ffff:ffff", true),
+            ("2606:4700:f:ffff:ffff:ffff:ffff:ffff", false),
+            ("2606:4700:10:1::", false),
+        ] {
+            assert_eq!(n.contains(v6(s)), inside, "{s}");
+        }
+        assert!(net(v4(0x5DB8_D800), 32).contains(v4(0x5DB8_D800)));
+        assert!(!net(v4(0x5DB8_D800), 32).contains(v4(0x5DB8_D801)));
+        assert!(net(v6("2606:4700::"), 1).contains(v6("7fff::1")));
+        assert!(!net(v6("2606:4700::"), 1).contains(v6("8000::1")));
+        // A network never holds an address of the other family.
+        assert!(!net(v4(0x5DB8_D800), 24).contains(v6("::ffff:5db8:d801")));
+        assert!(!net(v6("::"), 1).contains(v4(0x5DB8_D801)));
+    }
+
+    #[test]
+    fn each_rule_is_named_and_checked_in_order() {
+        let peer = v4(0x5DB8_D807);
+        let host = HostNets {
+            own: vec![v4(0x5DB8_D801), v4(0x0A00_0001)],
+            connected: vec![net(v4(0x5DB8_D800), 24), net(v4(0x0A00_0000), 8)],
+        };
+        // A private address that is also owned and connected: the first rule names it.
+        assert_eq!(denied_by(v4(0x0A00_0001), &host), Some(Rule::ReservedRange));
+        // A public address that is owned and connected.
+        assert_eq!(denied_by(v4(0x5DB8_D801), &host), Some(Rule::OwnAddress));
+        assert_eq!(denied_by(peer, &host), Some(Rule::ConnectedNetwork));
+        assert_eq!(denied_by(v4(0x5DB8_D907), &host), None);
+        assert_eq!(denied_by(peer, &HostNets::default()), None);
+        let names = [
+            Rule::ReservedRange,
+            Rule::OwnAddress,
+            Rule::ConnectedNetwork,
+        ]
+        .map(Rule::as_str);
+        assert_eq!(
+            names,
+            ["reserved-range", "own-address", "connected-network"]
+        );
+    }
+
+    #[test]
+    fn a_connected_network_refuses_every_spelling_that_carries_its_address() {
+        let host = HostNets {
+            own: Vec::new(),
+            connected: vec![net(v4(0x5DB8_D800), 24), net(v6("2606:4700:10::"), 64)],
+        };
+        for s in [
+            "::ffff:5db8:d807",
+            "64:ff9b::5db8:d807",
+            "2002:5db8:d807::1",
+            "2606:4700:10::7",
+        ] {
+            assert_eq!(denied_by(v6(s), &host), Some(Rule::ConnectedNetwork), "{s}");
+        }
+        for s in ["::ffff:5db8:d907", "64:ff9b::5db8:d907", "2606:4700:11::7"] {
+            assert_eq!(denied_by(v6(s), &host), None, "{s}");
+        }
     }
 }

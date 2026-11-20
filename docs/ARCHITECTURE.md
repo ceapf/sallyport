@@ -81,7 +81,7 @@ flowchart LR
 | `sally-core::secrets` | Load/store 0600 TOML; `Secret` newtype with redacted `Debug`, `zeroize` on drop; name-only references everywhere else | **yes** |
 | `sally-core::hf` | The HF Hub client's decisions, with no socket: names validated and encoded, the bounded parse of a repository's file list (path, size, LFS sha256 at one commit), each hop's request (host, path, range, whether it carries the token), the decision on each response head (redirect, bounded wait, body, refusal) and the resume rules. Search and the Range fetch of a GGUF header come later (#214) | no (but handles untrusted bytes → bounded, fuzzed) |
 | `sally-core::library` | SQLite index of blobs; content-addressed store; immutability (`chmod 0444`). The SQLite is the bundled one this crate pins; the database is only an index, and the blob directory decides what a model's bytes are. Bytes enter `blobs/` two ways, both ending in one tail (read-only, linked, then the row), and only a file the library created is ever linked: import runs the whole SI-6 chain on its own copy; a download is a partial the library creates and locks, which verify checks against the publisher's SHA-256 before anything else reads it, then magic and parse, without the library's lock; promote takes only a verified download | yes |
-| `sallyd::hf` | The HF client's transport: one lookup on the host, loopback/private/link-local/own answers refused, a pinned address dialled on 443, TLS verified against the anchors of a checked CA bundle (`egress::roots::BundleFiles`, the client's only constructor argument for them; production: the system bundle owned by root); requests exactly as `sally-core::hf` plans them, the token only on a hop to `huggingface.co` itself; file bytes only into the library's download. No production caller yet (#209) | yes |
+| `sallyd::hf` | The HF client's transport: one lookup on the host, answers the egress proxy's address filter refuses (loopback/private/link-local/own/connected networks) refused, a pinned address dialled on 443, TLS verified against the anchors of a checked CA bundle (`egress::roots::BundleFiles`, the client's only constructor argument for them; production: the system bundle owned by root); requests exactly as `sally-core::hf` plans them, the token only on a hop to `huggingface.co` itself; file bytes only into the library's download. No production caller yet (#209) | yes |
 | `sallyd::sandbox` | Build `podman run` argv from manifest + profile; mount prep (realpath re-check, socket dirs); launch/exec/kill/wait; image digest check | **yes** |
 | `sallyd::rpc` | `control.sock` (trusted methods, §4.1) and per-session `agent.sock` (the MCP subset, §4.2); bounded NDJSON framing, duplicate-key-refusing JSON, per-session rate and connection caps, `SO_PEERCRED` UID check before a byte is read, an audit entry before every reply | **yes** |
 | `sallyd::llm` | Per-session `llm.sock` (§4.4): HTTP/1.1 through hyper; the broker reads and decides on the head itself and gates hyper's writes; strict body allowlist; the model backend is a constructor argument (M3 wires the engine) | **yes** |
@@ -1283,8 +1283,10 @@ sallyport/
   is malformed (the manifest validator refuses one too). The head is re-parsed only after the
   first read, a read that brought a line end, or a full buffer, at most 128 times (more is
   `head-too-large`), so a client sending a byte at a time costs no more than one sending a line
-  at a time. Then policy, the host's own addresses (a `/proc` file over 1 MiB, or unreadable,
-  refuses every connection as `ip-range-denied`), one lookup (5 s) of the absolute name
+  at a time. Then policy, the host's own addresses and connected networks (`/proc/net/fib_trie`,
+  `if_inet6` and `ipv6_route`, read together; a file over 1 MiB, unreadable or not understood,
+  or only one of the two IPv6 files present, refuses every connection as `ip-range-denied`), one
+  lookup (5 s) of the absolute name
   `host.` (no search list), the address filter over every address (any denied address refuses
   the name; an answer of more than 64 addresses is `resolve-failed`, before duplicates are
   dropped), at most 3 pinned addresses tried (10 s each), `200`, and a tunnel with one 16 KiB
@@ -1355,7 +1357,13 @@ sallyport/
     target_cut}` (the request-target masked with the session's own forms first, then cut at 256
     bytes and escaped, never a header; §7 Redaction), or `{reason, head_bytes}` when no target
     was parsed; `filter: "host-addresses-unavailable"` when the host's own addresses could not
-    be read.
+    be read, with `cause` from a closed set: a table could not be read (which, and the I/O
+    error kind), was over the bound, or has a malformed line (which, and its number); the
+    `fib_trie` has no loopback address; only one of the two IPv6 tables exists; or the reader
+    task failed. Never a line's content or a path. When
+    the address filter refused, `address` (the first refused address of the
+    answer, as resolved) and `rule` (`reserved-range`, `own-address` or `connected-network`).
+    The reply to the sandbox carries the reason only.
   - `egress.limit` (decision `deny`): as `egress.deny`, for `too-many-connections` (decided at
     accept: `{reason}` only), `head-too-large`, `head-timeout`, `request-too-large` and
     `response-too-large`.

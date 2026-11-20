@@ -11,6 +11,7 @@ use super::testkit::{
     Hub, PUBLIC, SHA, TmpLib, foreign_ca_pem, found, gguf, list_json, reply, sha,
 };
 use super::*;
+use crate::egress::addr::Net;
 use crate::egress::roots::{BundleFiles, RootsError};
 
 /// A token assembled at run time, so no credential-shaped literal is in the source.
@@ -195,8 +196,9 @@ async fn a_file_that_does_not_fit_sends_no_request() {
     assert!(full.names("downloads").is_empty());
 }
 
-/// A host that resolves to loopback, a private address or this host's own is never dialled;
-/// the control, a public answer through the same recorder, records one lookup and one dial.
+/// A host that resolves to loopback, a private address, this host's own, or an address inside a
+/// network this host is directly connected to is never dialled; the control, a public answer
+/// through the same recorder, records one lookup and one dial.
 #[tokio::test]
 async fn denied_addresses_are_never_dialled() {
     let body = list_json(&[]);
@@ -228,6 +230,41 @@ async fn denied_addresses_are_never_dialled() {
         .unwrap_err();
     assert_eq!(err.code(), "hf_address_denied");
     assert_eq!(hub.dials(), 1, "an own address was dialled");
+
+    // A public answer inside a network this host is directly connected to is refused, as the
+    // egress proxy refuses it. Control: the same answer is dialled before the network is listed.
+    let body = list_json(&[]);
+    let near = Hub::new(move |_, _| reply("200 OK", &[], &body));
+    near.answer(PUBLIC);
+    bounded(near.client(None).files(&repo(), &Revision::main()))
+        .await
+        .unwrap();
+    assert_eq!(near.dials(), 1, "control: the public answer is dialled");
+    near.connected(Net::prefix(PUBLIC, 24).unwrap());
+    let err = bounded(near.client(None).files(&repo(), &Revision::main()))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "hf_address_denied");
+    assert_eq!(
+        near.dials(),
+        1,
+        "an address on a connected network was dialled"
+    );
+
+    // Host tables that cannot be read refuse the host before any lookup or dial. Control: the
+    // same Hub looked up and dialled with readable tables above.
+    let lookups = near.lookups().len();
+    near.tables_unreadable();
+    let err = bounded(near.client(None).files(&repo(), &Revision::main()))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "hf_address_denied");
+    assert_eq!(
+        near.lookups().len(),
+        lookups,
+        "looked up without host tables"
+    );
+    assert_eq!(near.dials(), 1, "dialled without host tables");
 
     // One denied answer among public ones refuses the host: nothing is dialled, not even the
     // public answer listed first.

@@ -13,6 +13,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use sallyd::egress::addr::HostNets;
+use sallyd::egress::hostaddrs::HostAddrsError;
 use sallyd::egress::net::Egress;
 use sallyd::egress::server::{Dialer, HostAddrs, Resolver};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -270,19 +272,19 @@ async fn read_request<S: AsyncRead + Unpin>(s: &mut S, buf: &mut Vec<u8>) -> Opt
     }
 }
 
-/// The host's own addresses, as the test sets them.
+/// The host's own addresses and connected networks, as the test sets them.
 #[derive(Default)]
-pub struct Owned(Mutex<Vec<IpAddr>>);
+pub struct Owned(Mutex<HostNets>);
 
 impl Owned {
-    /// Replaces the list.
-    pub fn set(&self, ips: Vec<IpAddr>) {
-        *self.0.lock().unwrap() = ips;
+    /// Replaces the tables.
+    pub fn set(&self, host: HostNets) {
+        *self.0.lock().unwrap() = host;
     }
 }
 
 impl HostAddrs for Owned {
-    async fn own(&self) -> io::Result<Vec<IpAddr>> {
+    async fn own(&self) -> Result<HostNets, HostAddrsError> {
         Ok(self.0.lock().unwrap().clone())
     }
 }

@@ -8,7 +8,9 @@ use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, PKCS_ECD
 use sally_core::audit::NewEntry;
 use sally_core::manifest::{AuditLevel, parse_host_pattern};
 
+use super::super::addr::HostNets;
 use super::super::ca::{BUNDLE_FILE, CA_FILE, GRACE};
+use super::super::hostaddrs::HostAddrsError;
 use super::super::inject::StoreFile;
 use super::super::policy::{Grant, Rule};
 use super::super::server::{Dialer, HostAddrs, Resolver};
@@ -30,8 +32,8 @@ impl Dialer for Nothing {
 }
 
 impl HostAddrs for Nothing {
-    async fn own(&self) -> io::Result<Vec<IpAddr>> {
-        Ok(Vec::new())
+    async fn own(&self) -> Result<HostNets, HostAddrsError> {
+        Ok(HostNets::default())
     }
 }
 

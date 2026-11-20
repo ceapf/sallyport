@@ -254,6 +254,37 @@ line per fact, with where it was found. Check a note again before relying on it 
   are `/32 link BROADCAST`. The table appears twice (`Main:` and `Local:`). About 1.3 KiB on WSL2.
 - `/proc/net/if_inet6`: one line per IPv6 address, 32 hex digits then index, prefix length,
   scope, flags and the interface name. Absent when IPv6 is disabled. (Task 8, `egress/hostaddrs.rs`)
+- Seen on WSL2 (kernel 6.18): `fib_trie` holds only table headers, `+-- <ip>/<len> <n> <n> <n>`
+  nodes, `|-- <ip>` leaves and route lines; several route lines can follow one leaf (`/32 host
+  LOCAL` then `/32 link BROADCAST`); the connected network is `/<len> link UNICAST` and the
+  default route `/0 universe UNICAST`. `ipv6_route` lines have ten fields (destination, length,
+  source, length, next hop: hex; metric, reference count, use count, flags: 8 hex digits each;
+  interface); the unreachable default on `lo` has flags `00200200` (`RTF_REJECT` 0x200 set),
+  a local `/128` `80200001`. Not seen here and taken from the kernel's printing code, unverified:
+  a `tos=<n>` field after the type, an unknown scope as `scope=<n>`, an unknown type as `type
+  <n>` (two tokens: the parser refuses the list), an interface index of three or more hex digits
+  in `if_inet6` (printed `%02x`), an `ipv6_route` line with no interface name. (Connected-network
+  filter, `egress/hostaddrs.rs`)
+- `fib_trie` has no gateway column, and its scope does not tell a gateway route from a device
+  route. Probe in a scratch user network namespace (WSL2 kernel 6.18, iproute2 6.1). `<a>` to
+  `<g>` stand for distinct documentation and benchmark prefixes; `<gw>` is an address in `<a>`:
+
+  | Route added | `fib_trie` line |
+  |---|---|
+  | `<a>/24 dev d0 proto kernel` (from the address) | `/24 link UNICAST` |
+  | `<b>/24 dev d0` (plain device route) | `/24 link UNICAST` |
+  | `<c>/24 dev d0 scope global` | `/24 universe UNICAST` |
+  | `<d>/24 nhid 1` (nexthop object, `dev d0` only) | `/24 universe UNICAST` |
+  | `<e>/25 nexthop dev d0 nexthop dev d0` (multipath, device legs) | `/25 universe UNICAST` |
+  | `<f>/25 via <gw>` (through a gateway) | `/25 universe UNICAST` |
+  | `throw <g>/24` | `/24 universe THROW` |
+
+  So the filter reads no scope: every IPv4 route line of length 8 to 32 counts, the drop types
+  and `THROW` excepted, and a specific prefix through a gateway is refused too. Lengths 0 to 7
+  are default-like and ignored (a full-tunnel VPN's two half-space `/1` routes). Not probed:
+  how routing daemons and VPN agents install their routes. (Connected-network filter,
+  `every_probe_table_row_counts_but_throw_and_default_like_routes` in
+  `egress/hostaddrs_tests.rs`)
 - A Unix socket path over 107 bytes fails `bind` with `InvalidInput` ("path must be shorter than
   SUN_LEN"); the test fixture's `CARGO_TARGET_TMPDIR` paths exceed it. Binding through
   `/proc/self/fd/<dir fd>/<name>` of an `O_PATH` directory works and keeps the name short.

@@ -11,6 +11,7 @@ use sally_core::manifest::parse_host_pattern;
 use tokio::io::{DuplexStream, duplex};
 
 use super::*;
+use crate::egress::hostaddrs::Table;
 use crate::egress::policy::{Grant, Rule};
 
 /// A public address (documentation-free, globally routed).
@@ -87,11 +88,22 @@ impl Dialer for FakeDialer {
     }
 }
 
-struct FakeHost(Option<Vec<IpAddr>>);
+/// The host's tables, or (`Err`) why they cannot be used.
+struct FakeHost(Result<HostNets, HostAddrsError>);
+
+impl FakeHost {
+    /// A host owning `own` and connected to no network.
+    fn owning(own: Vec<IpAddr>) -> Self {
+        Self(Ok(HostNets {
+            own,
+            connected: Vec::new(),
+        }))
+    }
+}
 
 impl HostAddrs for FakeHost {
-    async fn own(&self) -> io::Result<Vec<IpAddr>> {
-        self.0.clone().ok_or_else(|| io::ErrorKind::NotFound.into())
+    async fn own(&self) -> Result<HostNets, HostAddrsError> {
+        self.0.clone()
     }
 }
 
@@ -166,7 +178,7 @@ impl Default for Setup {
                 .with("a.mock.test", vec![vec![public(1)]])
                 .with("mock.test", vec![vec![public(2)]]),
             dialer: FakeDialer::default(),
-            host: FakeHost(Some(vec![])),
+            host: FakeHost::owning(vec![]),
             sink: Sink::default(),
             max: 8,
             grants: vec![],
@@ -555,13 +567,17 @@ async fn one_denied_address_refuses_the_whole_name() {
         assert_eq!(got, reply(Reason::IpRangeDenied), "{bad}");
         assert!(rig.dials().is_empty(), "{bad}");
         assert_eq!(rig.sink.events(), ["egress.deny"]);
+        // The entry names the refused address and the rule it met, not only the reason.
+        let args = rig.sink.args("egress.deny");
+        assert_eq!(args.get("address"), Some(&json!(bad.to_string())), "{bad}");
+        assert_eq!(args.get("rule"), Some(&json!("reserved-range")), "{bad}");
     }
 }
 
 #[tokio::test]
 async fn the_hosts_own_addresses_are_refused_and_an_unknown_list_refuses_all() {
     let own = Setup {
-        host: FakeHost(Some(vec![public(1)])),
+        host: FakeHost::owning(vec![public(1)]),
         ..Setup::default()
     }
     .rig();
@@ -570,11 +586,18 @@ async fn the_hosts_own_addresses_are_refused_and_an_unknown_list_refuses_all() {
         reply(Reason::IpRangeDenied)
     );
     assert!(own.dials().is_empty());
+    let args = own.sink.args("egress.deny");
+    assert_eq!(args.get("address"), Some(&json!(public(1).to_string())));
+    assert_eq!(args.get("rule"), Some(&json!("own-address")));
     let unknown = Setup {
-        host: FakeHost(None),
+        host: FakeHost(Err(HostAddrsError::Malformed {
+            table: Table::Ipv6Route,
+            line: 7,
+        })),
         ..Setup::default()
     }
     .rig();
+    // The reply is the reason only: no cause or line number (an oracle for the table's size).
     assert_eq!(
         unknown.send(&connect("a.mock.test:443")).await,
         reply(Reason::IpRangeDenied)
@@ -586,8 +609,39 @@ async fn the_hosts_own_addresses_are_refused_and_an_unknown_list_refuses_all() {
         json!({
             "reason": "ip-range-denied", "target": "a.mock.test:443", "target_bytes": 15,
             "target_cut": false, "filter": "host-addresses-unavailable",
+            "cause": "ipv6_route line 7 is malformed",
         })
     );
+}
+
+/// A name whose answer holds a neighbour on a network the host is directly connected to is
+/// refused, nothing is dialled, and the entry names that neighbour; the same answer passes for a
+/// host connected to no such network (the control).
+#[tokio::test]
+async fn a_neighbour_on_a_connected_network_is_refused_and_named() {
+    let neighbour = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 7));
+    let answer = vec![public(1), neighbour];
+    let connected = |nets: Vec<crate::egress::addr::Net>| Setup {
+        resolver: FakeResolver::default().with("a.mock.test", vec![answer.clone()]),
+        host: FakeHost(Ok(HostNets {
+            own: vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 1))],
+            connected: nets,
+        })),
+        ..Setup::default()
+    };
+    let lan = crate::egress::addr::Net::prefix(neighbour, 24).unwrap();
+    let rig = connected(vec![lan]).rig();
+    let got = rig.send(&connect("a.mock.test:443")).await;
+    assert_eq!(got, reply(Reason::IpRangeDenied));
+    assert!(rig.dials().is_empty());
+    assert_eq!(rig.sink.events(), ["egress.deny"]);
+    let args = rig.sink.args("egress.deny");
+    assert_eq!(args.get("address"), Some(&json!(neighbour.to_string())));
+    assert_eq!(args.get("rule"), Some(&json!("connected-network")));
+    let control = connected(Vec::new()).rig();
+    let got = control.send(&connect("a.mock.test:443")).await;
+    assert!(got.starts_with("HTTP/1.1 200 "), "{got}");
+    assert_eq!(control.dials(), [sock(public(1), 443)]);
 }
 
 #[tokio::test]

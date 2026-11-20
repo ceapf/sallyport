@@ -1,6 +1,7 @@
 //! A mock Hub for the client's tests: one TLS server behind the [`Dialer`] seam (an in-memory
 //! duplex stream; no listener of any kind), a resolver that answers whatever address a test
-//! sets, an own-address list, and a recorder of every lookup, dial and request.
+//! sets, an own-address list, a connected-network list, and a recorder of every lookup, dial and
+//! request.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use std::io;
@@ -16,6 +17,8 @@ use sally_core::model::hash::{Digest, Hasher};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream, duplex};
 
 use super::{HfClient, SharedLibrary};
+use crate::egress::addr::{HostNets, Net};
+use crate::egress::hostaddrs::HostAddrsError;
 use crate::egress::roots::BundleFiles;
 use crate::egress::scratch::{Scratch, scratch};
 use crate::egress::server::{Dialer, HostAddrs, Resolver};
@@ -58,6 +61,8 @@ pub(super) struct Hub {
     handler: Handler,
     answer: Arc<Mutex<Vec<IpAddr>>>,
     own: Arc<Mutex<Vec<IpAddr>>>,
+    connected: Arc<Mutex<Vec<Net>>>,
+    tables_unreadable: Arc<Mutex<bool>>,
     lookups: Arc<Mutex<Vec<String>>>,
     dials: Arc<Mutex<usize>>,
     closed: Arc<Mutex<usize>>,
@@ -76,6 +81,8 @@ impl Hub {
             handler: Arc::new(handler),
             answer: Arc::new(Mutex::new(vec![PUBLIC])),
             own: Arc::new(Mutex::new(Vec::new())),
+            connected: Arc::new(Mutex::new(Vec::new())),
+            tables_unreadable: Arc::new(Mutex::new(false)),
             lookups: Arc::new(Mutex::new(Vec::new())),
             dials: Arc::new(Mutex::new(0)),
             closed: Arc::new(Mutex::new(0)),
@@ -118,6 +125,16 @@ impl Hub {
     /// This host owns `ip` from now on.
     pub(super) fn own(&self, ip: IpAddr) {
         self.own.lock().unwrap().push(ip);
+    }
+
+    /// This host is directly connected to `net` from now on.
+    pub(super) fn connected(&self, net: Net) {
+        self.connected.lock().unwrap().push(net);
+    }
+
+    /// This host's address tables cannot be read from now on.
+    pub(super) fn tables_unreadable(&self) {
+        *self.tables_unreadable.lock().unwrap() = true;
     }
 
     pub(super) fn lookups(&self) -> Vec<String> {
@@ -201,8 +218,14 @@ impl Dialer for Hub {
 }
 
 impl HostAddrs for Hub {
-    async fn own(&self) -> io::Result<Vec<IpAddr>> {
-        Ok(self.own.lock().unwrap().clone())
+    async fn own(&self) -> Result<HostNets, HostAddrsError> {
+        if *self.tables_unreadable.lock().unwrap() {
+            return Err(HostAddrsError::ReaderFailed);
+        }
+        Ok(HostNets {
+            own: self.own.lock().unwrap().clone(),
+            connected: self.connected.lock().unwrap().clone(),
+        })
     }
 }
 

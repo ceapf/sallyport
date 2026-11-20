@@ -4,7 +4,7 @@
 //! them, so its tests are the `rt_net_*` rows plus the unit tests below.
 
 use std::io::{self, Read};
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,8 +17,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 
+use super::addr::HostNets;
 use super::ca::{self, CaError, SessionTls, Validity};
-use super::hostaddrs;
+use super::hostaddrs::{self, HostAddrsError, Table};
 use super::inject::{Credentials, CredentialsError, SecretSource, Spec};
 use super::local::{ClientTls, Connector, LOCAL_QUEUE, Local, ORIGIN, Opened, Reach, host_grants};
 use super::policy::Policy;
@@ -127,12 +128,14 @@ impl Dialer for TcpDialer {
     }
 }
 
-/// The host's addresses from `/proc/net/fib_trie` and `/proc/net/if_inet6`, read on every
-/// connection (addresses change; the files are small).
+/// The host's addresses and connected networks from `/proc/net/fib_trie`, `/proc/net/if_inet6`
+/// and `/proc/net/ipv6_route`, read together on every connection (addresses and routes change;
+/// the files are small).
 #[derive(Debug, Clone)]
 pub struct ProcHostAddrs {
     fib_trie: PathBuf,
     if_inet6: PathBuf,
+    ipv6_route: PathBuf,
 }
 
 impl Default for ProcHostAddrs {
@@ -140,42 +143,60 @@ impl Default for ProcHostAddrs {
         Self {
             fib_trie: "/proc/net/fib_trie".into(),
             if_inet6: "/proc/net/if_inet6".into(),
+            ipv6_route: "/proc/net/ipv6_route".into(),
         }
     }
 }
 
 impl HostAddrs for ProcHostAddrs {
-    async fn own(&self) -> io::Result<Vec<IpAddr>> {
+    async fn own(&self) -> Result<HostNets, HostAddrsError> {
         let me = self.clone();
         tokio::task::spawn_blocking(move || me.read())
             .await
-            .map_err(io::Error::other)?
+            .map_err(|_| HostAddrsError::ReaderFailed)?
     }
 }
 
 impl ProcHostAddrs {
-    fn read(&self) -> io::Result<Vec<IpAddr>> {
-        let fib = read_bounded(&self.fib_trie)?;
-        let v6 = match read_bounded(&self.if_inet6) {
-            Ok(s) => Some(s),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e),
+    fn read(&self) -> Result<HostNets, HostAddrsError> {
+        let fib = read_bounded(&self.fib_trie, Table::FibTrie)?;
+        let addrs = read_optional(&self.if_inet6, Table::IfInet6)?;
+        let routes = read_optional(&self.ipv6_route, Table::Ipv6Route)?;
+        let v6 = hostaddrs::Ipv6Tables {
+            addrs: addrs.as_deref(),
+            routes: routes.as_deref(),
         };
-        hostaddrs::parse(&fib, v6.as_deref()).map_err(io::Error::other)
+        hostaddrs::parse(&fib, v6)
     }
 }
 
-/// Reads at most [`MAX_PROC_BYTES`]; a longer file is an error.
-fn read_bounded(path: &Path) -> io::Result<String> {
+/// [`read_bounded`], with a file that does not exist read as `None` (IPv6 is off).
+fn read_optional(path: &Path, table: Table) -> Result<Option<String>, HostAddrsError> {
+    match read_bounded(path, table) {
+        Ok(s) => Ok(Some(s)),
+        Err(HostAddrsError::Unreadable {
+            kind: io::ErrorKind::NotFound,
+            ..
+        }) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Reads at most [`MAX_PROC_BYTES`]; a longer file is an error. Errors name the table and how
+/// the read failed, never the path.
+fn read_bounded(path: &Path, table: Table) -> Result<String, HostAddrsError> {
+    let unreadable = |e: io::Error| HostAddrsError::Unreadable {
+        table,
+        kind: e.kind(),
+    };
     let mut text = String::new();
-    std::fs::File::open(path)?
+    std::fs::File::open(path)
+        .map_err(unreadable)?
         .take(MAX_PROC_BYTES + 1)
-        .read_to_string(&mut text)?;
+        .read_to_string(&mut text)
+        .map_err(unreadable)?;
     if u64::try_from(text.len()).unwrap_or(u64::MAX) > MAX_PROC_BYTES {
-        return Err(io::Error::other(format!(
-            "{}: over the size bound",
-            path.display()
-        )));
+        return Err(HostAddrsError::TooLarge { table });
     }
     Ok(text)
 }
