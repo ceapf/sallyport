@@ -2,9 +2,9 @@
 CARGO ?= cargo --locked
 MUSL  := x86_64-unknown-linux-musl
 
-.PHONY: lint fmt clippy fuzz-check deny forbid-unsafe test test-scripts nextest coverage mutants mutants-wide-core mutants-wide-sallyd mutants-wide-shim mutants-wide-cli zizmor shim shim-check fuzz redteam redteam-gpu e2e-gpu doctor
+.PHONY: lint fmt clippy fuzz-check deny forbid-unsafe test test-scripts nextest coverage mutants mutants-wide-core mutants-wide-sallyd mutants-wide-shim mutants-wide-cli mutants-paths zizmor shim shim-check fuzz redteam redteam-gpu e2e-gpu doctor
 
-lint: fmt clippy fuzz-check forbid-unsafe deny
+lint: fmt clippy fuzz-check forbid-unsafe deny mutants-paths
 
 fmt:
 	$(CARGO) fmt --all -- --check
@@ -50,11 +50,12 @@ test: test-scripts shim-check
 	$(TEST_RUN) $(CARGO) test -q --workspace
 
 # Shell-script tests (doctor's --redact filter, the commit trailer check, the mutation and
-# coverage gates, the test-run sweep, the CI disk check).
+# coverage gates, the mutation lists' path check, the test-run sweep, the CI disk check).
 test-scripts:
 	bash tests/scripts/redact_test.sh
 	bash tests/scripts/check_trailers_test.sh
 	bash tests/scripts/mutants_gate_test.sh
+	bash tests/scripts/mutants_paths_test.sh
 	bash tests/scripts/coverage_gate_test.sh
 	bash tests/scripts/test_run_test.sh
 	bash tests/scripts/disk_lock_test.sh
@@ -117,8 +118,9 @@ mutants_host_check = $(if $(MUTANTS_HOST),,$(error MUTANTS_HOST is empty: `rustc
 # runner applies under nextest too.
 MUTANTS_ENV := TMPDIR=$(MUTANTS_TMP) NEXTEST_PROFILE=mutants \
                CARGO_TARGET_$(MUTANTS_HOST)_RUNNER='prlimit --data=$(MUTANTS_DATA_CAP) --'
-# The gate fails on missed mutants only; a timed-out mutant hangs a test, so it counts as
-# detected and goes to the job summary (maintainer ruling, #36; scripts/mutants-gate.sh).
+# The gate fails on missed mutants; a timed-out mutant hangs a test, so it counts as detected and
+# goes to the job summary (maintainer ruling, #36; scripts/mutants-gate.sh). A run in which no
+# mutant was caught, missed or timed out fails too: it proves nothing.
 # MUTANTS_OUT=<dir> moves mutants.out, as for the wider scope below; unset, it stays in the root.
 mutants:
 	$(mutants_host_check)mkdir -p $(MUTANTS_TMP)
@@ -193,6 +195,19 @@ mutants-wide-shim:
 	$(call mutants_wide,sally-shim,$(MUTANTS_WIDE_SHIM),$(MUTANTS_WIDE_TESTS_SHIM))
 mutants-wide-cli:
 	$(call mutants_wide,sally-cli,$(MUTANTS_WIDE_CLI),$(MUTANTS_WIDE_TESTS_CLI))
+
+# Every entry of every mutation list names Rust source that exists; a glob matches at least one
+# file; no list is empty (scripts/mutants-paths.sh). Entries are quoted, so the script sees each
+# glob as written. Every list is checked before the target fails.
+mutants_paths = bash scripts/mutants-paths.sh $(1) $(foreach f,$(2),'$(f)') || fail=1;
+mutants-paths:
+	@fail=0; \
+	$(call mutants_paths,MUTANTS_FILES,$(MUTANTS_FILES)) \
+	$(call mutants_paths,MUTANTS_WIDE_CORE,$(MUTANTS_WIDE_CORE)) \
+	$(call mutants_paths,MUTANTS_WIDE_SALLYD,$(MUTANTS_WIDE_SALLYD)) \
+	$(call mutants_paths,MUTANTS_WIDE_SHIM,$(MUTANTS_WIDE_SHIM)) \
+	$(call mutants_paths,MUTANTS_WIDE_CLI,$(MUTANTS_WIDE_CLI)) \
+	exit $$fail
 
 # GitHub Actions static analysis.
 zizmor:

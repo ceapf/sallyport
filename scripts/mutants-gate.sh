@@ -5,7 +5,9 @@
 # those caught by nextest's per-test limit, and those caught by the test memory cap (#82). Any
 # other cargo-mutants failure (usage, baseline, internal error) still fails, and so does an
 # unmutated baseline in which a test ran past nextest's slow period: that breaks the per-test
-# limit's margin (architect ruling R1, #82).
+# limit's margin (architect ruling R1, #82). A run in which no mutant was caught, missed or timed
+# out fails too: it proves nothing (a `--file` that matches nothing, a file with no mutant, or
+# only unviable mutants, which never built).
 # Tested by tests/scripts/mutants_gate_test.sh.
 set -euo pipefail
 
@@ -35,9 +37,12 @@ for f in missed.txt timeout.txt; do
 done
 missed="$(cat "$out/missed.txt")"
 timeouts="$(cat "$out/timeout.txt")"
-# Every mutant tested lands in one of these lists.
-tested="$(cat "$out"/caught.txt "$out"/missed.txt "$out"/timeout.txt "$out"/unviable.txt \
-  2>/dev/null || true)"
+# A mutant some test ran against lands in caught, missed or timeout.txt; an unviable one never
+# built, so no test ran against it. With no mutant at all, cargo-mutants 27.1.0 still writes the
+# four lists, empty (output.rs:148-158), and returns before the baseline (lab.rs:46-49), after
+# rotating any earlier output away (main.rs:616); re-read those on a version bump.
+tested="$(cat "$out"/caught.txt "$out"/missed.txt "$out"/timeout.txt 2>/dev/null || true)"
+unviable="$(grep -c '' "$out/unviable.txt" 2>/dev/null || true)"
 
 # The mutants whose log matches an extended regex, colour codes stripped. A log's first "*** "
 # line names its mutant (the log opens with a blank line); the baseline is not a mutant.
@@ -94,6 +99,12 @@ if [ "$code" -eq 2 ] && [ -z "$missed" ]; then
 fi
 if [ "$code" -eq 3 ] && [ -z "$timeouts" ]; then
   echo "mutants-gate: cargo-mutants reported timeouts but $out/timeout.txt is empty" >&2
+  fail=1
+fi
+if [ -z "$tested" ]; then
+  echo "mutants-gate: no mutant was tested: caught.txt, missed.txt and timeout.txt in $out are" \
+    "empty (${unviable:-0} unviable); a --file that matches nothing, or a file with no mutant," \
+    "proves nothing" >&2
   fail=1
 fi
 # The per-test limit's margin (.config/nextest.toml): a test that runs past the slow period in the
