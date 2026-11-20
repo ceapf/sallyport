@@ -1,18 +1,21 @@
 //! Permission manifests: parse, validate, summarize (MANIFEST_SPEC.md).
 //!
 //! The pipeline is `bytes → parse → Manifest → validate → ValidatedManifest`. Only a
-//! [`ValidatedManifest`] can be launched. It is a self-contained canonical struct: launch never
-//! re-reads the manifest file (RT-MAN-03). It does re-check mount roots on the host to catch a
-//! swap after validation (RT-FS-06).
+//! [`ValidatedManifest`] can be launched. It is a self-contained canonical struct built from text:
+//! `sallyd` is given the manifest's text, never a path. A launcher reading a manifest file
+//! inspects its place first ([`ManifestPlace`]), reads it once and sends that text (RT-MAN-03).
+//! The launch does re-check mount roots on the host to catch a swap after validation (RT-FS-06).
 //!
-//! Blocking I/O: [`validate`], [`load`], and [`ValidatedManifest::recheck_mounts`] call
-//! `lstat`/`realpath` on the host. Async callers must run them under `spawn_blocking`.
+//! Blocking I/O: [`validate`], [`load`], [`ManifestPlace::inspect`] and
+//! [`ValidatedManifest::recheck_mounts`] call `lstat`/`realpath` on the host. Async callers must
+//! run them under `spawn_blocking`.
 
 mod diag;
 mod host;
 mod hostenv;
 mod image;
 mod links;
+mod location;
 mod parse;
 mod paths;
 mod summary;
@@ -24,6 +27,7 @@ pub use diag::{Code, Diagnostic, Rejected, Severity};
 pub use host::{HostError, HostPattern, parse_host_pattern, parse_hostname};
 pub use hostenv::{EnvDir, HostEnv, HostEnvError};
 pub use image::is_pinned_image_ref;
+pub use location::{LocationError, ManifestPlace};
 pub use parse::{MAX_MANIFEST_BYTES, parse, parse_bytes, to_yaml};
 pub use summary::summary;
 pub use types::{
