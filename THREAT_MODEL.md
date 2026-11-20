@@ -163,6 +163,30 @@ G1 Obtain GITHUB_TOKEN value from inside Z3
 └─ Define my own secret in the manifest             [manifests reference names only → RT-SEC-08]
 ```
 
+The Hub token (A2) travels on a connection `sallyd` opens itself. The pull has no production
+caller yet (#209), so nothing sends it today.
+
+```
+G1 Misuse the Hub token on sallyd's own connection (AT4)
+├─ Redirect a request to another host               [redirects only https, port 443, no userinfo, to Hub
+│                                                    hosts on a label boundary; the token only on a hop to
+│                                                    `huggingface.co` → sally-core hf::plan
+│                                                    `redirect_hosts_are_hub_domains_on_a_label_boundary`,
+│                                                    `other_redirects_are_refused`; sallyd hf
+│                                                    `a_redirect_off_the_hub_is_not_followed`,
+│                                                    `a_pull_follows_the_cdn_redirect_without_the_token`]
+├─ Redirect a chain back to the API host after it left it
+│                                                   [OPEN, fix planned, #266: that hop carries the token; §6]
+├─ Serve the file list from a host a redirect named [OPEN, fix planned, #266: the list is read there; §6]
+├─ Answer the lookup with an address of the user's network
+│                                                   [the egress proxy's address filter, a pinned address
+│                                                    dialled → sallyd hf `denied_addresses_are_never_dialled`]
+└─ Choose the trust anchors through the environment [roots only from a checked bundle, never chosen by
+                                                     the environment → sallyd hf
+                                                     `the_client_takes_its_roots_only_from_a_checked_bundle`,
+                                                     `the_client_trusts_no_anchor_but_its_bundle`]
+```
+
 ### G2. Read or modify host files outside granted mounts (A1)
 ```
 G2 Access ~/.ssh/id_ed25519 from Z3
@@ -261,6 +285,11 @@ G4 Run attacker code outside any sandbox
 ├─ Pickle payload in model file                     [refused by extension+magic; never deserialized → RT-MDL-01, RT-MDL-02]
 ├─ GGUF parser exploit in llama.cpp                 [strict Rust pre-parse rejects malformed headers → RT-MDL-03;
 │                                                    engine runs in Z2 anyway; RESIDUAL: 0-day + container escape]
+├─ Launch a blob changed after its import, or one stored under looser rules
+│                                                   [blobs stored 0444 in Sallyport's state directory;
+│                                                    OPEN (#210): a stored blob is never hashed again,
+│                                                    and the launch side checks its path, owner and
+│                                                    mode only; §6]
 ├─ safetensors header bomb                          [`.safetensors` refused by name, `format_not_allowed`, before any
 │                                                    byte is read (`sally-core::model::detect`); the bounded header
 │                                                    check is M2 Task 2, not built → RT-MDL-08 when it lands]
@@ -436,6 +465,11 @@ G7 Make the machine unusable
 │                                                    on its own connection; RESIDUAL after it: a watcher
 │                                                    that reads slowly is still dropped; §6]
 ├─ Huge model download fills disk                   [size check vs free space before pull → RT-MDL-09]
+│  ├─ Keep stopped pulls' partials on the disk      [OPEN (#211): kept with no limit on count or age;
+│  │                                                 a 0444 leftover refuses every later pull of its
+│  │                                                 digest; §6]
+│  └─ Hold a pull open by sending a little inside each idle window
+│                                                   [RESIDUAL: only the 60 s idle wait is bounded; §6]
 ├─ GGUF with 2^40 tensors makes the parser spin     [bounded counts → RT-MDL-03]
 ├─ Giant proxy request                              [header/body limits → RT-NET-09]
 ├─ Grow `sallyd`'s own memory through `agent.sock` calls: finished call tasks, replies the
@@ -528,6 +562,11 @@ G7 Make the machine unusable
 | Secret copies outside `Secret` (Task 9a-3, architect D8). The rendered header value is kept as a `Secret` and wiped at session end, but each request builds a `HeaderValue`, and hyper's and rustls's write buffers hold the plaintext request; on the way back an echoed form sits in hyper's and rustls's read buffers, the upstream's parsed `HeaderMap` and each upstream body frame before redaction: those copies are freed, not wiped (as the leaf keys in Session CA limits (3)). The redaction's held-back bytes are wiped; its forms are built in buffers wiped as they drop and held once per session in `SessionForms`, wiped with its last holder | No safe-Rust way to wipe buffers inside hyper and rustls | TODO(#69) |
 | Session CA limits (Task 9a-1). (1) Where one grant host lies beneath another (`api.github.com` beside `github.com`), the outer host's subdomains are not excluded, so the CA could vouch for other names under it. (2) rustls-webpki clients ignore a trust anchor's pathlen 0. (3) The CA key is wiped right after the leaves are minted, and the leaf keys when the session ends; `zeroize` covers Sallyport's copies and rcgen's serialized copy, but the PKCS#8 document ring returns during key generation and ring's (later rustls's) key objects are freed, not wiped. The proxy builds each leaf's signer from the leaf's key in place, so it keeps no plain copy of its own (9a-2 review R7; #69) | (1) and (2) matter only to someone holding the CA key, which never leaves `sallyd` memory and is dropped before the container starts. Name constraints still bind every client tested (OpenSSL, Python, rustls-webpki, GnuTLS, Go; RT-SEC-10), and pathlen 0 binds all but rustls-webpki. (3) A same-UID memory reader is out of scope. All three accepted by the maintainer (Task 9a-2), because the CA key does not outlive minting | (1) one CA per grant host if a client ever needs it; (3) revisit when ring exposes zeroizing keys |
 | GPU driver attack surface exposed to a compromised `llama-server` via `/dev/dxg` | Inherent to GPU access | Native Linux + nvproxy; nothing on WSL2 |
+| The Hub token on `sallyd`'s own connection. The token goes only on a hop to `huggingface.co`, and redirects go only to Hub hosts over https on port 443, but a redirect chain that has left the API host and comes back to it carries the token again, and the file list is read from whatever Hub host a redirect named | The pull has no production caller yet (#209), so nothing sends the token today; every hop is TLS verified against a checked bundle, and the publisher's SHA-256 is checked before anything reads the bytes | Open, fix planned, #266: no request carries the token once a chain has left the API host, and the file list is read from the API host only |
+| Download partials are kept. A stopped pull's partial under `downloads/` stays, with no limit on count or age, each up to the size its download was admitted for, so repeated stopped pulls can hold the disk down to the reserve. A crash between the blob link and the row leaves a 0444 partial that every later begin of that digest refuses (`download_not_private`) until it is removed by hand. No API lists or removes partials | Each download is admitted against free space above a reserve (RT-MDL-09); the pull has no production caller yet (#209) | Open (#211): a sweep of `downloads/` under the same lock |
+| A file body has no total deadline. Only the wait for its next bytes is bounded (60 s), so a mirror that sends a little inside each idle window keeps the pull, its connection and the digest's lock open as long as it likes, and a second pull of that digest is refused busy | The pull has no production caller yet (#209); a pull is the user's own, and stopping it keeps the partial for a resume | None planned |
+| Model import is audited after its effect (SI-4). As built, the blob and the row exist, and `list` and `stored` answer them, before `model.import` is appended: a pull verifies and promotes in one call and a file import is one call, so a caller has no point between decision and effect, and a failed append leaves a stored model with no entry | No production caller reaches an import or a pull yet; the entry lands with the first one | Open (#209): the first caller writes `model.import` and `model.refuse` before their effect is visible |
+| Stored blobs are checked once (SI-6 holds at import). After the store a blob is guarded by its mode bits only: `stored` (which lets a pull skip the download), `inspect`, and an import or promote that finds a blob under its digest accept it on type, owner, mode and size. The launch side's pin checks the path, owner and mode, so a blob stored under looser rules stays launchable after the rules tighten, and one whose row is gone still pins. No production code builds that pin yet | The blobs are the user's own 0444 files in Sallyport's state directory, which no sandbox can write; changing them needs the user's uid (§3) | Open (#210): the caller that hands a blob to an engine checks its SHA-256 then, and the import becomes the pin's only constructor |
 | Destructive-pattern matching is bypassable | It is a UX aid; the mount set is the boundary | Documented; `approve` is the recommended mode |
 | A fetch is a read by its method alone. A GET or HEAD with no body, no method-override header and no body framing runs without a prompt under `fetch_writes: approve`. At a grant host it carries the injected credential, so a GET that changes state there runs unasked; data can leave in the URL or headers of a read nobody was asked about | Shown before launch in part. The summary's fetch line reads "fetch can only read (GET/HEAD) without your approval."; it does not say that a GET can change state at a host (#263). When the manifest has a mount or a secret and an allow rule, the `data-can-leave` finding marks grant hosts "acting as you" and ends "The fetch tool's GET requests are not prompted and can carry data out in the URL." (MANIFEST_SPEC §1.1); it names the URL only. The proxy's host rules still bound where a read can go; every fetch is audited (`tool.run`) before its `CONNECT` | None planned |
 | The conversation (A10) is not private data to the validator. The `[data-can-leave]` finding and the acknowledgements count mounts and secrets only, so a manifest with an allow rule and `fetch_writes: allow`, `shell: allow` or an MCP server with `approve: never`, but no mount and no secret, gets no finding and needs no acknowledgement for what it can send, while the model can send the conversation to the allowed host | The summary's network and fetch lines name the channel; every allowed host is a rule the manifest states, and every connection is audited | None planned |
