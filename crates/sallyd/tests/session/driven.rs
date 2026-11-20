@@ -17,18 +17,14 @@ const SHELL_TOUCH: &str = "{\"tool_calls\":[{\"name\":\"shell\",\"arguments\":\
     {\"cmd\":[\"touch\",\"/workspace/p/ran\"],\"cwd\":\"/workspace/p\"}}]}\n";
 
 /// A manifest with one rw mount at `~/code/<dir>` and the shell under `mode`.
-fn manifest(
-    r: &Rx,
-    dir: &str,
-    mode: &str,
-) -> (Arc<sally_core::manifest::ValidatedManifest>, PathBuf) {
+fn manifest(r: &Rx, dir: &str, mode: &str) -> (Arc<sally_core::manifest::Validated>, PathBuf) {
     let at = r.x.f.root.join("home/code").join(dir);
     std::fs::create_dir_all(&at).unwrap();
     let text = format!(
         "{}tools:\n  builtin: [shell]\n  shell: {mode}\n",
         mounts(&[mount(&format!("~/code/{dir}"), "/workspace/p", "rw")])
     );
-    (Arc::new(r.x.f.load(&text)), at)
+    (Arc::new(r.x.f.validated(&text)), at)
 }
 
 /// The `Debug` text of every entry of session `id` written so far. TODO(#129): a typed actor
@@ -49,7 +45,7 @@ pub(super) fn entries_of(r: &Rx, id: &str) -> Vec<String> {
 fn rt_drv_01_a_driven_session_serves_no_socket_and_says_what_model_it_has() {
     rt().block_on(async {
         let r = registry();
-        let v = Arc::new(r.x.f.load(""));
+        let v = Arc::new(r.x.f.validated(""));
         let s = r
             .reg
             .start_with(Arc::clone(&v), Some(script("{\"fail\":true}\n")))
@@ -229,7 +225,7 @@ fn rt_drv_03_a_driven_call_past_the_drain_writes_nothing_after_the_stop() {
         let r = registry();
         let at = r.x.f.root.join("home/code/drv03b");
         std::fs::create_dir_all(&at).unwrap();
-        let v = Arc::new(r.x.f.load(&format!(
+        let v = Arc::new(r.x.f.validated(&format!(
             "{}tools:\n  builtin: [fs_write]\n",
             mounts(&[mount("~/code/drv03b", "/workspace/p", "rw")])
         )));

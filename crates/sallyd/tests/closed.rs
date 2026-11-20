@@ -89,7 +89,7 @@ fn rt_aud_03_nothing_of_a_session_follows_session_closed() {
         // Not the TLS upstream: the fake dialer echoes, so the spliced tunnel stays open.
         x.egress.resolver.set("mock2.test", vec![vec![public(1)]]);
         let reg = registry(&x);
-        let s = reg.start(Arc::new(x.f.load(SPLICED))).await.unwrap();
+        let s = reg.start(Arc::new(x.f.validated(SPLICED))).await.unwrap();
         let sock = x.session_paths(&s.id).workspace_sockets().join("net.sock");
         let mut tunnel = connect(&sock, "mock2.test").await;
         tunnel.write_all(b"ping").await.unwrap();
@@ -136,7 +136,7 @@ fn rt_aud_03_a_failed_start_ends_with_session_closed() {
         let x = Lx::new();
         let reg = registry(&x);
         x.events.fail(&["session.start", "session.stop"]);
-        reg.start(Arc::new(x.f.load(""))).await.unwrap_err();
+        reg.start(Arc::new(x.f.validated(""))).await.unwrap_err();
         assert!(reg.list().is_empty(), "{:?}", reg.list());
         assert_eq!(
             x.events.list(),
@@ -164,7 +164,7 @@ fn a_session_stays_listed_until_its_session_closed_is_written() {
     rt().block_on(async {
         let x = Lx::new();
         let reg = registry(&x);
-        let s = reg.start(Arc::new(x.f.load(""))).await.unwrap();
+        let s = reg.start(Arc::new(x.f.validated(""))).await.unwrap();
         let _unhold = x.events.held(&["session.closed"]);
         let ask = |reg: &Arc<Registry>| {
             let (reg, id) = (Arc::clone(reg), s.id.clone());
@@ -215,7 +215,7 @@ fn a_launch_refused_after_its_egress_started_writes_no_session_closed() {
         let x = Lx::new();
         let reg = registry(&x);
         x.events.fail(&["sandbox.launch"]);
-        reg.start(Arc::new(x.f.load(GRANT))).await.unwrap_err();
+        reg.start(Arc::new(x.f.validated(GRANT))).await.unwrap_err();
         assert_eq!(x.events.list(), ["sandbox.refuse"]);
         assert!(x.redactors.sessions().is_empty(), "the forms stayed");
         assert!(reg.list().is_empty(), "{:?}", reg.list());
@@ -229,7 +229,7 @@ fn a_refused_session_closed_still_answers_stopped_and_releases_the_forms() {
     rt().block_on(async {
         let x = Lx::new();
         let reg = registry(&x);
-        let s = reg.start(Arc::new(x.f.load(GRANT))).await.unwrap();
+        let s = reg.start(Arc::new(x.f.validated(GRANT))).await.unwrap();
         assert_eq!(x.redactors.sessions(), std::slice::from_ref(&s.id));
         x.events.fail(&["session.closed"]);
         assert_eq!(
@@ -281,7 +281,7 @@ fn an_unconfirmed_container_gets_session_closed_only_once_it_is_gone() {
     rt().block_on(async {
         let x = Lx::with_podman(|real| rm_failing_podman(&dir, real));
         let reg = registry(&x);
-        let s = reg.start(Arc::new(x.f.load(""))).await.unwrap();
+        let s = reg.start(Arc::new(x.f.validated(""))).await.unwrap();
         std::fs::write(dir.join("fail-rm"), b"").unwrap();
         assert!(matches!(
             reg.stop(&s.id, StopReason::Request).await,

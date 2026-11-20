@@ -7,7 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use sally_core::manifest::{HostEnv, ValidatedManifest, load};
+use sally_core::manifest::{HostEnv, Validated, ValidatedManifest, load};
 pub mod container;
 pub mod egress;
 pub mod forms;
@@ -115,9 +115,15 @@ impl Fx {
     }
 
     pub fn load(&self, body: &str) -> ValidatedManifest {
+        self.validated(body).manifest
+    }
+
+    /// The validator's whole verdict for `body`: the manifest with its warnings, as a session
+    /// starts from it.
+    pub fn validated(&self, body: &str) -> Validated {
         let secrets: BTreeSet<String> = egress::STORED.map(str::to_owned).into_iter().collect();
         match load(&format!("{HEADER}{body}"), &self.env, &secrets) {
-            Ok(v) => v.manifest,
+            Ok(v) => v,
             Err(e) => panic!("{e:#?}"),
         }
     }

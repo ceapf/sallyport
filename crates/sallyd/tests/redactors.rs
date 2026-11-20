@@ -29,8 +29,8 @@ const TWO: &str = "network:\n  mode: proxy\n  allow:\n    - host: mock.test\n   
                    - name: MOCK3_TOKEN\n    inject: {host: mock3.test, \
                    header: X-Api-Key, format: \"{value}\"}\n";
 
-fn manifest(x: &Lx, body: &str) -> Arc<sally_core::manifest::ValidatedManifest> {
-    Arc::new(x.f.load(body))
+fn manifest(x: &Lx, body: &str) -> Arc<sally_core::manifest::Validated> {
+    Arc::new(x.f.validated(body))
 }
 
 /// A started session's values are redacted while it lives, and in the clear once its stop
@@ -222,7 +222,7 @@ fn an_orphaned_launch_releases_its_secrets() {
         let id = paths.id().as_str().to_owned();
         let req = WorkspaceRequest {
             paths,
-            manifest: manifest(&x, ONE),
+            manifest: Arc::new(x.f.load(ONE)),
             default_image: Some(test_image()),
             crash: sallyd::daemon::crash::CrashReporter::channel().0,
         };
@@ -257,7 +257,7 @@ fn a_refused_launch_releases_its_secrets_after_sandbox_refuse() {
         let id = paths.id().as_str().to_owned();
         let req = WorkspaceRequest {
             paths,
-            manifest: manifest(&x, ONE),
+            manifest: Arc::new(x.f.load(ONE)),
             default_image: Some(test_image()),
             crash: sallyd::daemon::crash::CrashReporter::channel().0,
         };

@@ -10,7 +10,7 @@ use std::os::fd::AsFd;
 use std::sync::Arc;
 
 use sally_core::audit::{Actor, NewEntry};
-use sally_core::manifest::{ValidatedManifest, load};
+use sally_core::manifest::{Validated, load};
 use sally_core::secrets::StoreNames;
 use sally_core::text::escape_capped;
 use sally_proto::ModelKind;
@@ -76,10 +76,12 @@ pub trait SessionSet: Clone + Send + Sync + 'static {
     fn desk(&self, id: &str) -> Option<Desk>;
     /// Session `id`'s drive handle: only a session declared driven at start has one.
     fn driver(&self, id: &str) -> Option<Arc<Driver>>;
-    /// Starts a session for `manifest`; with a `script`, declared driven (architect Q119).
+    /// Starts a session from the validator's whole verdict `validated` (the manifest with its
+    /// warnings, so none can be dropped by omission); with a `script`, declared driven (architect
+    /// Q119).
     fn start(
         &self,
-        manifest: Arc<ValidatedManifest>,
+        validated: Arc<Validated>,
         script: Option<Script>,
     ) -> impl Future<Output = Result<SessionInfo, StartError>> + Send;
     /// Stops session `id` (a client's request); `None`: no such session.
@@ -485,12 +487,7 @@ impl<S: SessionSet> Control<S> {
             }
             None => return Done::Close,
         };
-        match self
-            .p
-            .sessions
-            .start(Arc::new(validated.manifest), script)
-            .await
-        {
+        match self.p.sessions.start(Arc::new(validated), script).await {
             Ok(info) => {
                 // Bound before the reply is written: a connection gone by then stops it at
                 // once (architect Q150).

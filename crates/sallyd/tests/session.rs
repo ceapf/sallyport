@@ -155,7 +155,7 @@ fn a_session_starts_in_order_and_stops_once_on_request() {
             *s.lock().unwrap() = Some(agent_socks(root).len());
             Ok(())
         }));
-        let v = Arc::new(r.x.f.load(""));
+        let v = Arc::new(r.x.f.validated(""));
         let info = r.reg.start(v).await.unwrap();
         assert_eq!(
             *seen.lock().unwrap(),
@@ -198,6 +198,65 @@ fn a_session_starts_in_order_and_stops_once_on_request() {
     });
 }
 
+/// A manifest with one acknowledged risk and its warning: shell commands run unapproved.
+const RISKY_SHELL: &str = "tools:\n  builtin: [shell]\n  shell: allow\n  \
+                           destructive_requires_approval: false\n  acknowledge_unapproved: [shell]\n";
+
+/// RT-MAN-03, the launch half (manifest-2 W1): a launch records each acknowledged risk in effect
+/// and the validator's warnings (code and field only) in the session's log before anything is
+/// launched, hence before `session.start`. Control: the same manifest whose shell commands need
+/// approval acknowledges nothing and records neither.
+#[test]
+fn rt_man_03_a_launch_records_each_acknowledged_risk_and_the_warnings_before_session_start() {
+    rt().block_on(async {
+        let r = registry();
+        let info = r
+            .reg
+            .start(Arc::new(r.x.f.validated(RISKY_SHELL)))
+            .await
+            .unwrap();
+        let all = r.x.events.list();
+        let at = |name: &str| {
+            all.iter()
+                .position(|e| e == name)
+                .unwrap_or_else(|| panic!("{name} not in {all:?}"))
+        };
+        assert!(
+            at("manifest.acknowledged_risk") < at("manifest.warn"),
+            "{all:?}"
+        );
+        assert!(at("manifest.warn") < at("sandbox.launch"), "{all:?}");
+        assert!(at("sandbox.launch") < at("session.start"), "{all:?}");
+        let risk = r.x.events.args("manifest.acknowledged_risk").unwrap();
+        assert_eq!(risk, json!({"risk": "tools.acknowledge_unapproved: shell"}));
+        let warn = r.x.events.args("manifest.warn").unwrap();
+        assert_eq!(
+            warn,
+            json!({"count": 1, "warnings": [{"code": "risky", "path": "tools.shell"}]})
+        );
+        assert_eq!(
+            r.reg.stop(&info.id, StopReason::Request).await,
+            Some(StopOutcome::Stopped)
+        );
+
+        let r = registry();
+        let quiet = RISKY_SHELL
+            .replace("shell: allow", "shell: approve")
+            .replace("  acknowledge_unapproved: [shell]\n", "");
+        let info = r
+            .reg
+            .start(Arc::new(r.x.f.validated(&quiet)))
+            .await
+            .unwrap();
+        let all = r.x.events.list();
+        assert!(all.iter().all(|e| !e.starts_with("manifest.")), "{all:?}");
+        assert_eq!(
+            r.reg.stop(&info.id, StopReason::Request).await,
+            Some(StopOutcome::Stopped)
+        );
+    });
+}
+
 /// A failed `session.start` append binds nothing and stops the workspace. Its entry may have
 /// reached the log before the error, so a best-effort `session.stop` (`start-failed`) follows
 /// (security review L6): never a `session.start` without its stop.
@@ -207,7 +266,7 @@ fn an_unaudited_session_start_binds_nothing_and_stops_the_workspace() {
         let r = registry();
         *r.sink.hook.lock().unwrap() =
             Some(Box::new(|_| Err(AuditError::InvalidEntry("fake failure"))));
-        let v = Arc::new(r.x.f.load(""));
+        let v = Arc::new(r.x.f.validated(""));
         let e = r.reg.start(v).await.unwrap_err();
         assert!(matches!(e, StartError::Audit(_)), "{e}");
         assert!(agent_socks(&r.sink.sockets).is_empty());
@@ -241,7 +300,7 @@ fn a_failed_starts_workspace_not_confirmed_gone_stays_listed_and_is_retried() {
         let r = registry();
         r.x.events
             .fail(&["session.start", "session.stop", "sandbox.stop"]);
-        let v = Arc::new(r.x.f.load(""));
+        let v = Arc::new(r.x.f.validated(""));
         let e = r.reg.start(v).await.unwrap_err();
         assert!(matches!(e, StartError::Audit(_)), "{e}");
         let listed = r.reg.list();
@@ -280,7 +339,7 @@ fn a_failed_starts_workspace_not_confirmed_gone_stays_listed_and_is_retried() {
 fn no_default_image_starts_nothing() {
     rt().block_on(async {
         let r = registry_with(None);
-        let v = Arc::new(r.x.f.load(""));
+        let v = Arc::new(r.x.f.validated(""));
         let e = r.reg.start(v).await.unwrap_err();
         assert!(
             matches!(e, StartError::Launch(LaunchError::NoDefaultImage)),
@@ -304,7 +363,7 @@ fn a_bind_failure_ends_the_session_start_failed() {
             }
             Ok(())
         }));
-        let v = Arc::new(r.x.f.load(""));
+        let v = Arc::new(r.x.f.validated(""));
         let e = r.reg.start(v).await.unwrap_err();
         assert!(matches!(e, StartError::Socket(_)), "{e}");
         assert!(r.reg.list().is_empty());
@@ -329,10 +388,11 @@ fn a_bind_failure_ends_the_session_start_failed() {
 fn a_container_that_exits_ends_its_session_and_frees_its_mounts() {
     rt().block_on(async {
         let r = registry();
-        let v = Arc::new(
-            r.x.f
-                .load(&mounts(&[mount("~/code/myproject", "/workspace/p", "rw")])),
-        );
+        let v = Arc::new(r.x.f.validated(&mounts(&[mount(
+            "~/code/myproject",
+            "/workspace/p",
+            "rw",
+        )])));
         let info = r.reg.start(Arc::clone(&v)).await.unwrap();
         r.x.hermetic(&["kill".to_owned(), info.container.clone()])
             .await;
@@ -356,7 +416,7 @@ fn a_container_that_exits_ends_its_session_and_frees_its_mounts() {
 fn a_panicking_session_task_ends_only_its_session() {
     rt().block_on(async {
         let r = registry();
-        let v = Arc::new(r.x.f.load(""));
+        let v = Arc::new(r.x.f.validated(""));
         let a = r.reg.start(Arc::clone(&v)).await.unwrap();
         let b = r.reg.start(v).await.unwrap();
         r.reg
@@ -391,7 +451,7 @@ fn a_panicking_session_task_ends_only_its_session() {
 fn a_session_past_its_timeout_is_stopped() {
     rt().block_on(async {
         let r = registry();
-        let v = Arc::new(r.x.f.load("runtime:\n  timeout: 1m\n"));
+        let v = Arc::new(r.x.f.validated("runtime:\n  timeout: 1m\n"));
         let info = r.reg.start(v).await.unwrap();
         until("the timeout", Duration::from_secs(90), || {
             r.reg.list().is_empty()
@@ -414,7 +474,7 @@ fn a_session_past_its_timeout_is_stopped() {
 fn shutdown_stops_every_session_and_refuses_new_ones() {
     rt().block_on(async {
         let r = registry();
-        let v = Arc::new(r.x.f.load(""));
+        let v = Arc::new(r.x.f.validated(""));
         let a = r.reg.start(Arc::clone(&v)).await.unwrap();
         let b = r.reg.start(Arc::clone(&v)).await.unwrap();
         assert!(r.reg.shutdown().await.is_empty());
@@ -467,7 +527,7 @@ fn rt_ag_08_a_foreign_session_id_reaches_only_its_own_session() {
             let at = r.x.f.root.join(format!("home/code/{dir}"));
             std::fs::create_dir_all(&at).unwrap();
             std::fs::write(at.join(file), b"x").unwrap();
-            Arc::new(r.x.f.load(&format!(
+            Arc::new(r.x.f.validated(&format!(
                 "{}tools:\n  builtin: [fs_list]\n",
                 mounts(&[mount(&format!("~/code/{dir}"), "/workspace/p", "ro")])
             )))
@@ -491,8 +551,12 @@ fn rt_ag_08_a_foreign_session_id_reaches_only_its_own_session() {
                 guest: &guest,
             };
             let id =
-                r.x.control_workspace(&va, &format!("ag08c{n}"), leave_out)
-                    .await;
+                r.x.control_workspace(
+                    &Arc::new(va.manifest.clone()),
+                    &format!("ag08c{n}"),
+                    leave_out,
+                )
+                .await;
             let (_, out) = exec_in(&id, &["sh", "-c", &ag08_probe(dir)]);
             assert!(out.contains(holds), "control: {guest}: {out}");
             let (code, out) = exec_in(&a.container, &["sh", "-c", &ag08_probe(dir)]);
@@ -578,7 +642,7 @@ fn a_session_fetches_through_its_own_proxy_and_only_with_one() {
                 .map(|t| t["name"].as_str().unwrap().to_owned())
                 .collect()
         };
-        let start = |body: &str| r.reg.start(Arc::new(r.x.f.load(body)));
+        let start = |body: &str| r.reg.start(Arc::new(r.x.f.validated(body)));
         let sock = |id: &str| r.x.session_paths(id).harness_sockets().join(AGENT_SOCK);
 
         // (a), (b)
@@ -671,7 +735,7 @@ fn rt_ag_15_nothing_of_a_session_follows_its_stop() {
         let r = registry();
         let at = r.x.f.root.join("home/code/rt15");
         std::fs::create_dir_all(&at).unwrap();
-        let v = Arc::new(r.x.f.load(&format!(
+        let v = Arc::new(r.x.f.validated(&format!(
             "{}tools:\n  builtin: [fs_list, fs_write, shell]\n  shell: allow\n",
             mounts(&[mount("~/code/rt15", "/workspace/p", "rw")])
         )));
@@ -752,7 +816,10 @@ fn rt_ag_15_a_prompt_pending_at_the_stop_is_withdrawn_before_it() {
         let hub = Arc::new(Hub::default());
         let r = registry_hub(Some(test_image()), Arc::clone(&hub));
         let mut watch = hub.watch();
-        let v = Arc::new(r.x.f.load("tools:\n  builtin: [shell]\n  shell: approve\n"));
+        let v = Arc::new(
+            r.x.f
+                .validated("tools:\n  builtin: [shell]\n  shell: approve\n"),
+        );
         let s = r.reg.start(v).await.unwrap();
         let sock = r.x.session_paths(&s.id).harness_sockets().join(AGENT_SOCK);
         let (conn, _dir) = connect(&sock).await;
@@ -856,7 +923,7 @@ fn meta() -> Value {
 fn rt_ag_15_an_rpc_entry_being_written_at_the_stop_lands_before_session_stop() {
     rt().block_on(async {
         let r = registry();
-        let v = Arc::new(r.x.f.load("tools:\n  builtin: [fs_list]\n"));
+        let v = Arc::new(r.x.f.validated("tools:\n  builtin: [fs_list]\n"));
         let s = r.reg.start(v).await.unwrap();
         let sock = r.x.session_paths(&s.id).harness_sockets().join(AGENT_SOCK);
         let (mut conn, _dir) = connect(&sock).await;
@@ -905,7 +972,7 @@ fn rt_ag_15_a_call_during_the_stop_is_denied_before_anything_runs() {
         let r = registry();
         let at = r.x.f.root.join("home/code/rt15c");
         std::fs::create_dir_all(&at).unwrap();
-        let v = Arc::new(r.x.f.load(&format!(
+        let v = Arc::new(r.x.f.validated(&format!(
             "{}tools:\n  builtin: [shell]\n  shell: allow\n",
             mounts(&[mount("~/code/rt15c", "/workspace/p", "rw")])
         )));
@@ -1024,7 +1091,7 @@ fn rt_ag_15_an_operation_past_the_drain_and_a_panic_during_the_stop_end_before_s
         let reg = x.registry_logged(sink, Some(test_image()), log.clone());
         let at = x.f.root.join("home/code/rt15b");
         std::fs::create_dir_all(&at).unwrap();
-        let v = Arc::new(x.f.load(&format!(
+        let v = Arc::new(x.f.validated(&format!(
             "{}tools:\n  builtin: [fs_write]\n",
             mounts(&[mount("~/code/rt15b", "/workspace/p", "rw")])
         )));

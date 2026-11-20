@@ -209,12 +209,13 @@ async fn sockets_are_exactly(container: &str, want: &[&str]) {
 async fn registry_harness(x: &Lx) -> (Arc<Registry>, SessionInfo, String) {
     x.f.tree("code/myproject", &[], &[]);
     std::fs::write(x.f.root.join("home/code/myproject/hello.txt"), b"hi").unwrap();
-    let v = x.f.load(&format!(
+    let validated = x.f.validated(&format!(
         "{}tools:\n  builtin: [fs_list]\n",
         mounts(&[mount("~/code/myproject", "/workspace/p", "ro")])
     ));
+    let v = validated.manifest.clone();
     let reg = x.registry(x.events.clone(), Some(test_image()));
-    let info = reg.start(Arc::new(v.clone())).await.unwrap();
+    let info = reg.start(Arc::new(validated)).await.unwrap();
     let paths = x.session_paths(&info.id);
     let common = CommonArgs {
         runtime: x.runtime.clone(),

@@ -22,12 +22,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use sally_core::audit::{Actor, AuditError, NewEntry};
-use sally_core::manifest::{AuditLevel, ValidatedManifest};
+use sally_core::manifest::{AuditLevel, Validated, ValidatedManifest};
 use sally_proto::{ModelKind, SessionModel};
 use serde_json::json;
 use tokio::sync::RwLock;
 use tokio::sync::{mpsc, oneshot};
 
+use super::accepted;
 use super::exit::Exit;
 use super::supervise::{Request, Supervised};
 use super::types::{StopReason, fresh_id};
@@ -243,17 +244,18 @@ impl Registry {
             .map_err(StartError::Audit)
     }
 
-    /// Starts a session for `manifest` and returns it once `agent.sock` is served. The start
-    /// runs in a task of its own: dropping this future does not interrupt it.
+    /// Starts a session from the validator's whole verdict `validated` (the manifest with its
+    /// warnings, so none can be dropped by omission) and returns it once `agent.sock` is served.
+    /// The start runs in a task of its own: dropping this future does not interrupt it.
     ///
     /// # Errors
     /// [`StartError`]. Nothing of the session is left running, except a container that could not
     /// be confirmed gone (listed as stop-failed).
     pub async fn start(
         self: &Arc<Self>,
-        manifest: Arc<ValidatedManifest>,
+        validated: Arc<Validated>,
     ) -> Result<SessionInfo, StartError> {
-        self.start_with(manifest, None).await
+        self.start_with(validated, None).await
     }
 
     /// [`start`](Self::start), declared driven when there is a `script` (architect Q119).
@@ -262,13 +264,13 @@ impl Registry {
     /// [`StartError`], as for [`start`](Self::start).
     pub async fn start_with(
         self: &Arc<Self>,
-        manifest: Arc<ValidatedManifest>,
+        validated: Arc<Validated>,
         script: Option<Script>,
     ) -> Result<SessionInfo, StartError> {
         let this = Arc::clone(self);
         let (tx, rx) = oneshot::channel();
         self.p.crash.spawn("session", async move {
-            let _ = tx.send(this.start_owned(manifest, script).await);
+            let _ = tx.send(this.start_owned(validated, script).await);
         });
         rx.await.map_err(StartError::Task)?
     }
@@ -278,7 +280,7 @@ impl Registry {
     /// [`Driver`] answers `sessions.drive`.
     async fn start_owned(
         self: Arc<Self>,
-        manifest: Arc<ValidatedManifest>,
+        validated: Arc<Validated>,
         script: Option<Script>,
     ) -> Result<SessionInfo, StartError> {
         let _start = self.starts.read().await;
@@ -289,6 +291,13 @@ impl Registry {
         let sid = id.as_str().to_owned();
         let paths =
             SessionPaths::new(id, &self.p.sockets, &self.p.data).map_err(StartError::Paths)?;
+        // What the validation accepted, recorded before anything is launched (SI-4): a failed
+        // append refuses the start with nothing launched.
+        let level = validated.manifest.manifest().audit.level;
+        for entry in accepted::entries(&sid, &validated) {
+            self.audit(entry, level).await?;
+        }
+        let manifest = Arc::new(validated.manifest.clone());
         let (crash, crashes) = CrashReporter::channel();
         let running = self
             .p
@@ -308,7 +317,6 @@ impl Registry {
                 return Err(StartError::Exited(e));
             }
         };
-        let level = v.audit.level;
         let ops = Ops::new();
         // The session's one audit handle (ruling 1, Q63): its stop seals it with `session.stop`.
         // TODO(#28): the `llm.sock` server (PR C) takes a clone of it.
@@ -638,10 +646,10 @@ impl crate::rpc::control_methods::SessionSet for Arc<Registry> {
 
     fn start(
         &self,
-        manifest: Arc<ValidatedManifest>,
+        validated: Arc<Validated>,
         script: Option<Script>,
     ) -> impl std::future::Future<Output = Result<SessionInfo, StartError>> + Send {
-        Registry::start_with(self, manifest, script)
+        Registry::start_with(self, validated, script)
     }
 
     fn stop(&self, id: &str) -> impl std::future::Future<Output = Option<StopOutcome>> + Send {
