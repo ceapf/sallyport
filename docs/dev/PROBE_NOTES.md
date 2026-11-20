@@ -178,6 +178,32 @@ line per fact, with where it was found. Check a note again before relying on it 
 - Podman 4.9.3 rootless (cgroup v2, crun 1.14.1) accepts `--cpus` above the host's CPU count:
   `--cpus 34` on a 32-CPU host creates, starts and exits 0. Only the manifest validator bounds
   `runtime.cpus` by the host (`HostEnv.nproc`). (#99, the line 1 test)
+- An image's working directory, missing below a bind's guest path, is created by the runtime
+  in the host folder at `init` when the argv leaves the working directory to the image, through
+  a read-only bind too (`ro` and `brokered`). Shown by the control of
+  `rt_fs_02_the_image_working_directory_creates_nothing_in_a_mount` (`LeaveOut::Workdir`) on
+  every `make redteam` run; the launcher's `--workdir /` stops it. (PR #223, RT-FS-02)
+- A volume an image declares below a bind's guest path is created in the host folder at `init`,
+  through a read-only bind too, unless `--image-volume=ignore`. Shown by the control of
+  `rt_fs_02_an_image_volume_creates_nothing_in_a_mount` (`LeaveOut::ImageVolume`) on every
+  `make redteam` run. (PR #223, RT-FS-02)
+- A link in the image above a later mount destination (`/workspace/b -> /workspace/a`, mounts
+  `/workspace/a` then `/workspace/b/c`) is followed while the runtime places the mounts: it
+  creates `c` inside the first mount's host folder, for an `ro`, a `brokered` and an `rw` first
+  mount. Shown by the control of `rt_fs_02_an_image_link_at_or_above_a_mount_creates_nothing`
+  (`LeaveOut::Probe`: the product argv run with no probe) on every `make redteam` run. (PR #230)
+- Measured once (Podman 4.9.3, crun, rootless; PR #230): a link at a destination
+  (`/workspace/q -> /workspace/p/made-by-link`) makes the runtime itself refuse at `init`; a
+  link at `/etc`, `/run` or `/dev` makes `init` fail; a link at `/tmp` lets `init` succeed.
+  Nothing landed outside Podman's storage in any of these.
+- Measured once (same setup, PR #230), the mount-link probe: about 150 to 200 ms added per
+  launch, warm; the first keep-id create from an image takes about 350 ms either way. It leaves
+  no container and no volume; the id-mapped copy of the image's top layer that the first keep-id
+  create makes is reused by the real create. The probe and the real container, created from one
+  digest reference, show the same image id. Through the probe's root with
+  `RESOLVE_IN_ROOT|RESOLVE_NO_SYMLINKS`, a link at or above a destination gives `ELOOP` and an
+  absent path `ENOENT`; with `O_NOFOLLOW` a link as the last component would open, so the walk
+  never uses it.
 
 ## Kernel and namespaces
 
@@ -207,6 +233,11 @@ line per fact, with where it was found. Check a note again before relying on it 
   (`..` from a mount root climbs to the mount point's parent), and `a/b/x/../..` gives `a`. So
   an identity walk with `..` reads one identity twice before the real parent, and must not take
   a repeat for `/`. (Kernel 6.18 WSL2, Podman 4.9.3; RT-AG-08b)
+- `socketpair` with a family the kernel does not support for pairs is the kernel's own error,
+  never `ENOSYS`: measured once, before the profile filtered `socketpair`, the workspace's
+  `socketpair(AF_VSOCK, SOCK_STREAM, 0)` gave errno 95 (`EOPNOTSUPP`). So RT-NET-12's `ENOSYS`
+  for every refused `socketpair` family can only come from the profile; its `AF_UNIX` pairs are
+  made in every role on every `make redteam` run. (PR #226; kernel version not recorded)
 
 ## Busybox (test image)
 
