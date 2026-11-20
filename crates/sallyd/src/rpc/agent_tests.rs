@@ -680,6 +680,8 @@ fn flood(mut w: WriteHalf<DuplexStream>, tool: &'static str, n: i64) -> JoinHand
     })
 }
 
+/// RT-AG-17.
+///
 /// A call keeps its slot until its reply has left the broker, so a peer that reads nothing
 /// holds at most MAX_IN_FLIGHT replies there, on one connection or many: the next call, on
 /// any connection of the session, is refused (and recorded). Observed past the time the
@@ -687,7 +689,7 @@ fn flood(mut w: WriteHalf<DuplexStream>, tool: &'static str, n: i64) -> JoinHand
 /// waits to queue a refusal) and before WRITE_TIMEOUT closes the connection; past it, the
 /// slots of every queued and waiting reply are free again.
 #[tokio::test(start_paused = true)]
-async fn a_peer_that_reads_nothing_holds_at_most_max_in_flight_replies() {
+async fn rt_ag_17_a_peer_that_reads_nothing_holds_at_most_max_in_flight_replies() {
     let (agent, fake, sink) = setup();
     let Client { mut r, w, server } = start_with(&agent, TIGHT);
     let n = 100;
@@ -701,11 +703,18 @@ async fn a_peer_that_reads_nothing_holds_at_most_max_in_flight_replies() {
         "calls admitted while the peer reads nothing"
     );
     let mut other = start(&agent);
+    // The flood has already recorded refusals with the same reason: count this one's own.
+    let before = denies(&sink).len();
     let e = other.call(&call(1, "echo")).await;
     assert_eq!(e["error"]["data"]["reason"], json!("too-many-in-flight"));
     assert_eq!(
         denies(&sink).last().map(String::as_str),
         Some("too-many-in-flight")
+    );
+    assert_eq!(
+        denies(&sink).len(),
+        before + 1,
+        "the refusal on the second connection wrote its own rpc.deny"
     );
     // Past WRITE_TIMEOUT the writer gives up and the connection closes.
     tokio::time::sleep(WRITE_TIMEOUT).await;
@@ -721,13 +730,19 @@ async fn a_peer_that_reads_nothing_holds_at_most_max_in_flight_replies() {
         again.send(&call(i, "block")).await;
     }
     reach(&fake.calls, 2 * MAX_IN_FLIGHT).await;
+    assert_eq!(
+        fake.calls.load(Ordering::SeqCst),
+        2 * MAX_IN_FLIGHT,
+        "control: once the slots are free, every call on a new connection reaches the handler"
+    );
     for _ in 0..MAX_IN_FLIGHT {
         fake.release.notify_one();
     }
     for _ in 0..MAX_IN_FLIGHT {
         assert_eq!(
             again.recv().await.unwrap()["result"]["content"][0]["text"],
-            json!("ran block")
+            json!("ran block"),
+            "control: each call on the new connection gets its reply"
         );
     }
 }
@@ -1590,11 +1605,13 @@ async fn answered_calls_leave_no_task_behind() {
     assert_eq!(conn.tasks.len(), 0);
 }
 
+/// RT-AG-17.
+///
 /// Finished calls are removed while the connection is still open: after 1,000 calls, each
 /// answered before the next is sent, the open connection holds at most [`MAX_IN_FLIGHT`] call
 /// tasks. (The last call may have ended without being reaped yet, so this is not zero.)
 #[tokio::test(start_paused = true)]
-async fn an_open_connection_holds_at_most_the_cap_after_a_thousand_calls() {
+async fn rt_ag_17_an_open_connection_holds_at_most_the_cap_after_a_thousand_calls() {
     let (agent, _, _) = setup();
     let (mut conn, mut rx, near, mut far) = owned_conn();
     let peer = async {

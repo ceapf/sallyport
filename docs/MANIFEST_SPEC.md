@@ -116,7 +116,9 @@ an unknown entry (anything but `shell`, `fetch` or `mcp:<name of a declared serv
 `invalid-value`, a repeated one `duplicate`. `network.acknowledge_unrestricted_egress` set but not
 needed stays an `inconsistent` warning. `ValidatedManifest::acknowledged_risks()` lists what is in
 effect (`network.acknowledge_unrestricted_egress`, `tools.acknowledge_unapproved: <entry>`); the
-UI shows a red banner and launch records one `manifest.acknowledged_risk` audit event per entry.
+UI shows a red banner. Before `sandbox.launch`, a launch records one `manifest.acknowledged_risk`
+audit event per entry (`risk`, decision `allow`) and, when the validation gave any warning, one
+`manifest.warn` (`count`, and the first 32 warnings as `code` and field `path`; never a message).
 
 **`[data-can-leave]`** (AMENDMENTS-01 §5, Agents Rule of Two). The model and everything it reads
 are untrusted input. When a manifest has **private data** (any mount or secret) and an **outward
@@ -133,6 +135,50 @@ HEAD never prompt, whatever `tools.fetch_writes` says. There is no acknowledge f
 normal shape of a useful agent, so the point is that the user sees it every time. On a rejected
 manifest, a grant whose secret name or `inject.host` failed its own check appears as "whatever
 the secret at secrets[i] unlocks": neither value is echoed outside its own error.
+
+### 1.2 Launching from a manifest file (the CLI's gate, RT-MAN-03)
+
+`sally session start` and `sally sandbox run` read the manifest file once and send that text; at
+launch, the CLI's own validation is a refusing gate (for `sally manifest validate` and `summary`
+it only reports). In order:
+
+- **Place.** A manifest kept inside a folder the same manifest mounts `rw` or `brokered` is
+  refused (exit 1, nothing sent): the session could rewrite the next session's grants. Two
+  folders are checked, the one holding the name as given (a link there can be pointed elsewhere)
+  and the one holding the file it resolves to; each is refused when its realpath is, or lies
+  under, such a mount's root, or when its chain of directory identities holds that root's
+  identity. `staged` and `ro` mounts never refuse. Only this manifest's own mounts are read
+  (#262). Not covered (#254): a link chain that passes through a writable folder at an
+  intermediate hop, a hard link of the file into a writable folder, and a bind of a
+  subdirectory. On every launch the file is read by its resolved path after the inspection,
+  with no regular-file check and no identity compare against what was inspected.
+- **What is shown.** Before anything is sent, the launch shows the summary, each warning and each
+  acknowledged risk, on the terminal the answer is read from when a question follows and on
+  stderr otherwise. A line that fails the CLI's clean-check refuses the launch (exit 1).
+- **Consent.** A manifest with any warning or acknowledged risk needs it. On a terminal (stdin is
+  one and `/dev/tty` opens) it is `yes` typed after the question, with typed-ahead input
+  discarded; `--accept-manifest` does not replace it there. Off a terminal it is
+  `--accept-manifest <sha256>`, the SHA-256 of the exact text read: a malformed value fails
+  (exit 2) before anything is read, a hash of other text refuses (exit 1), and no launch output
+  prints the hash of what was read. With the hash alone as consent, every mount host must be
+  written as the folder it resolves to (exit 1 otherwise): the hash names the text, not the
+  folders. `~` expands against `HOME` as given, so where `HOME`'s own path goes through a link,
+  a `~` host cannot launch by hash alone (#255). A given `--accept-manifest` is checked for
+  every manifest, with or without warnings. Not covered (#262): a manifest with no warning and
+  no acknowledged risk is sent with no question, so one kept in a folder another manifest mounts
+  `rw` or `brokered` can be changed by that other session and launched unasked unless the flag
+  is given. Keep a manifest outside every folder any manifest mounts `rw` or `brokered`.
+
+`sally manifest summary` ends with the line `sha256 <hex>`, the hash a launch's
+`--accept-manifest` names. Its stderr carries the warnings and acknowledged risks a launch shows,
+and any mount host not written as its folder. A manifest whose launch block holds a line that
+cannot be shown prints no hash and exits 1.
+
+Not covered (#255): what is shown, and what a typed `yes` or a hash accepts, comes from the CLI's
+own validation under its own host facts. `sallyd` validates the text it is sent again under its
+own and resolves the mount hosts again after the CLI's check, so a folder replaced at the same
+path after that check, or a `HOME` that differs between the CLI and `sallyd`, is not seen by the
+consent.
 
 ### Ranges and formats (checked by the validator)
 | Field | Rule |
@@ -176,7 +222,8 @@ Task 11 decision 1; ARCHITECTURE §4.3). Every such action is audited (SI-4).
 - `staged` (AMENDMENTS-02 B2(b)): an overlay whose lower layer is the host directory; every write
   lands in a kept upper directory under `~/.local/share/sallyport/sessions/<id>/stage/<n>/`, and
   the host directory is untouched. `sally session changes <id>` lists changed and deleted paths;
-  M1 is discard-only, applying arrives in M4.5. Podman accepts no other option next to `O`
+  M1 only lists (nothing is applied, nothing is deleted: the kept upper directories stay), and
+  applying and discarding arrive in M4.5. Podman accepts no other option next to `O`
   (probed on 4.9.3), so an overlay is not `nosuid,nodev`; `no-new-privileges`, `--cap-drop=ALL`
   and the seccomp profile (no `mknod`) keep set-id files and device nodes inert there. Editing the
   host folder while a staged session runs gives undefined results inside the sandbox; conflicts
@@ -210,8 +257,10 @@ an object carrying a POSIX ACL is open to its owner only (architect ruling Q39; 
   sandbox while the host's `.git` history, config, hooks and `commondir` stay byte-identical.
   Hooks or config a repository takes from its working tree (`core.hooksPath`, `include.path`,
   `.husky/`) are ordinary files in the writable folder and are not protected, nor is a `.git`
-  created after the launch scan; `summary()` says so. Commits
-  made in a session are discarded and file changes arrive as uncommitted modifications;
+  created after the launch scan; `summary()` says so. The same holds for what a link inside
+  `.git` points to in the working tree (a `.git/hooks` linked to a tracked folder): the link
+  stays byte-identical, its target is writable, and the host runs what the sandbox wrote there.
+  Commits made in a session are discarded and file changes arrive as uncommitted modifications;
   `summary()` says so. Every directory between the mount root and a nested `.git` entry is bound
   onto itself, so it cannot be renamed away from under its shield (`EBUSY`); the launch scan
   covers every `rw` mount (an `rw` mount without a scan is refused). More than 32 shielded
@@ -257,8 +306,10 @@ wildcard that reaches hosts anyone can register counts as unrestricted and needs
 (`*.googleapis.com`), or a shared tree or anywhere under one, a provider whose registrable hosts
 sit at any depth (`*.amazonaws.com`, `*.windows.net`, `*.s3.us-east-1.amazonaws.com`,
 `*.web.core.windows.net`, `*.a.run.app`). The lists are two maintained constants,
-`host::SHARED_SUFFIXES` and `host::SHARED_TREES` (read from the Public Suffix List's private
-section; `host::SHARED_TREES` states when an entry is a tree, and its two exceptions); the
+`host::SHARED_SUFFIXES` and `host::SHARED_TREES` (curated: most entries come from the Public
+Suffix List's private section, `co.uk`, `com.au` and `co.jp` from its registry section, and
+`gradio.live`, `glitch.me`, `loca.lt` and `serveo.net` from neither; `host::SHARED_TREES`
+states when an entry is a tree, and its exceptions); the
 summary marks such a rule "anyone can register these". The lists are
 curated, so a wildcard over a shared-hosting suffix they do not name is an ordinary rule
 (TODO(#235): derive them from the Public Suffix List). Matching: lowercase, trailing dot
@@ -353,9 +404,9 @@ environment (passwd entry only if `$HOME` is unset or relative).
     `$ZDOTDIR`, `$PNPM_HOME`, `$VOLTA_HOME`, `$BUN_INSTALL`, `$PYTHONUSERBASE`, `$PIPX_HOME`,
     `$PIPX_BIN_DIR`, `$UV_TOOL_DIR`, `$GRADLE_USER_HOME`, `$PASSWORD_STORE_DIR`, `bin` and
     `pkg` under each `$GOPATH` element (at most 32 folders), and every `$PATH` entry (at most
-    256); past either bound the list is incomplete (below). Messages name the variable ("is inside /opt/go/bin (from $GOBIN)"). A
-    folder named this way that is `/`, a home, or an ancestor of one is kept as a rule, so it
-    refuses every mount under it (§6);
+    256); past either bound the list is incomplete (below). Messages name the variable ("is
+    inside /opt/go/bin (from $GOBIN)"). A folder named this way that is `/`, a home, or an
+    ancestor of one is kept as a rule, so it refuses every mount under it (§6);
   - `/etc`, `/proc`, `/sys`, `/dev`, `/run`, `/var/run`, `/boot`, `/root`, `/mnt`,
     `/usr/lib/wsl`, `/tmp`, `/var/tmp` (`/tmp` holds other programs' Unix sockets — ssh-agent,
     X11 — and a read-only bind does not stop `connect()`, so it would be a path around SI-1);
@@ -420,9 +471,9 @@ yet (TODO(#231)).
 | `apiVersion`, `kind`, unknown fields | `sally-core::manifest::parse` | load | reject with field path |
 | `name` | parse | load | reject |
 | `runtime.image`, `harness.image` | validator (pinned) + `sallyd::sandbox::images` (`--pull=never`) | validate + launch | refuse unpinned refs; refuse if the digest is not present locally; refuse an image with an `Entrypoint` (`config-mismatch` on `process.args`, until #117) |
-| `runtime.cpus/memory/pids` | `sallyd::sandbox` → `podman run --cpus --memory --pids-limit`; the watchdog's cgroup observer re-reads `pids.events` `max` and `memory.events` `oom_kill` every 1 s (#27) | launch + runtime | out of range → reject at validate; the kernel refuses the fork or OOM-kills inside the container, the session runs on, audit `session.resource_limit` reason `pids-max` / `oom-kill` with the counter's value; launch refused `cgroup-events` if the files cannot be opened |
+| `runtime.cpus/memory/pids` | `sallyd::sandbox` → `podman create --cpus --memory --pids-limit`; the watchdog's cgroup observer re-reads `pids.events` `max` and `memory.events` `oom_kill` every 1 s (#27) | launch + runtime | out of range → reject at validate; the kernel refuses the fork or OOM-kills inside the container, the session runs on, audit `session.resource_limit` reason `pids-max` / `oom-kill` with the counter's value; launch refused `cgroup-events` if the files cannot be opened |
 | `runtime.timeout` | `sallyd::session` timer → `podman kill`; backstop: `--timeout <runtime.timeout + 300 s>` on the workspace and harness `create`, enforced by conmon from `podman init` without `sallyd` (#92, RT-AG-16) | runtime | session stopped, audit `session.timeout`; a container whose `sallyd` was killed outright is killed by conmon at the backstop and removed (`--rm`), with no entry |
-| `runtime.tmp_size/tmp_exec` | `podman run --tmpfs /tmp:…` | launch | a full `/tmp` returns ENOSPC; contained, not audited (a tmpfs has no kernel event) |
+| `runtime.tmp_size/tmp_exec` | `podman create --tmpfs /tmp:…` | launch | a full `/tmp` returns ENOSPC; contained, not audited (a tmpfs has no kernel event) |
 | `runtime.stage_size` (soft) | `sallyd::sandbox` disk watchdog: when the state filesystem's usage grows past the session's headroom, `podman pause`, walk the staged and `.git` overlay upper dirs (10 s deadline), `unpause` → `podman kill` + `rm` until gone; launch needs the floor plus `stage_size` free | launch + runtime | session killed, audit `session.resource_limit` (before the kill; `session.kill_failed` if the first kill fails); staged data kept |
 | (no field) free-space floor, `max(4 GiB, 5 %)` | `sallyd::sandbox` disk watchdog: `fstatfs` every 250 ms of every filesystem the sandbox can write to, itself or through the broker (state, `rw` and `brokered` mount roots); the broker's file tools check the floor before each write (`tools::fs::write`) | launch + runtime + each broker write | below the floor: session killed, audit `session.resource_limit` reason `disk-floor`; launch refused `disk-floor`; a broker write refused `disk-floor` |
 | `model.ref` | `sallyd::infer` resolves in library; refuses unverified/unknown | session start | error to UI |
@@ -430,7 +481,7 @@ yet (TODO(#231)).
 | `model.context` (token limit) | `sallyd::llm` (`body::check`): a request's `max_tokens` / `max_completion_tokens` above it is refused (and 0 always is); absent, the backend is given `model.context` as the bound. The M3 fit estimator clamps further | each `llm.sock` request | 400 `token-limit` (0: `bad-value`) + audit `llm.deny` |
 | `filesystem.mounts[].host` | validator (realpath, denylist, is-dir, not-symlink) **and again** at launch: the launch scan re-opens the root without following symlinks and compares `st_dev:st_ino`, pins are re-checked before `podman init`, and bind mounts are compared inside the container after `init` (ARCHITECTURE §3.5). Validation only: the mounts of one manifest may not overlap, by path or by directory identity (§1, Mount); the launch re-checks each root's identity, not the overlap | validate + launch | reject / `sandbox.refuse` / `sandbox.mount_mismatch` |
 | `filesystem.mounts[].guest` | validator (`/workspace/…`, no `..`, unique) | validate | reject |
-| `filesystem.mounts[].mode` | workspace `podman run` (`sallyd::sandbox::workspace_argv`): bind `ro`/`rw` with `nosuid,nodev,bind` (non-recursive); `brokered` → `ro` + broker `fs_*`; `staged` → `:O` overlay with upper/work in session scratch | launch + each `fs_*` call | EROFS in workspace; `fs_write`/`fs_delete` denied on `ro` (`read-only`); on `staged` they land in the overlay's upper directory; in every mode a call the sandbox's `uid:gid` could not make by mode bits is `permission` (Q39) |
+| `filesystem.mounts[].mode` | workspace `podman create` (`sallyd::sandbox::workspace_argv`): bind `ro`/`rw` with `nosuid,nodev,bind` (non-recursive); `brokered` → `ro` + broker `fs_*`; `staged` → `:O` overlay with upper/work in session scratch | launch + each `fs_*` call | EROFS in workspace; `fs_write`/`fs_delete` denied on `ro` (`read-only`); on `staged` they land in the overlay's upper directory; in every mode a call the sandbox's `uid:gid` could not make by mode bits is `permission` (Q39) |
 | `filesystem.mounts[].approve` | validator (glob syntax, §1 Mount) + `sallyd::approvals` glob match on canonical relative path; omitted = `["**"]` | validate + each brokered write/delete | reject; pending → approve/deny |
 | git metadata (AMENDMENTS-02 B2(a)) | validator (no writable mount inside `.git`); `.git` directories in `rw` mounts as overlays over session scratch, `.git` files bound read-only (argv builder, Task 6a; launch scan, Task 6b); broker `fs_write`/`fs_delete` | validate + launch + each call | reject / EROFS / `protected-path` |
 | `filesystem.deny` | validator adds to denylist | validate | reject |
@@ -448,6 +499,8 @@ yet (TODO(#231)).
 | `tools.destructive_requires_approval` | pattern tagger `sallyd::tools::tag` (Task 11, architect ruling Q33), its verdict an input to `sallyd::approvals` | each shell call in `allow` mode | pending if tagged, or if no tagger ran |
 | `tools.fetch_writes` | `sallyd::tools::fetch` → `sallyd::approvals`; the ticket binds the method, the canonical URL, the harness's headers and the body, never an injected credential (#75 rulings Q3, Q4); headers the proxy would drop are refused at prepare, so the prompt shows only what is sent | each non-GET/HEAD fetch, and each GET/HEAD with a body, a method-override header (`X-HTTP-Method-Override`, `X-HTTP-Method`, `X-Method-Override`) or body framing (`Content-Length`, `Transfer-Encoding`) | pending if `approve` |
 | `tools.acknowledge_unapproved` | validator (`ack.rs`); launch audit `manifest.acknowledged_risk` | validate + launch | reject if needed and unset |
+| (no field) the manifest file's place and the launch consent | `sally` CLI (`consent.rs`; `sally_core::manifest::ManifestPlace`, `check_place`, `check_hosts_as_written`), §1.2 | `session start` / `sandbox run` | refuse (exit 1; 2 for a malformed flag, or a manifest, secrets store or host environment that cannot be inspected or read), nothing sent to `sallyd` |
+| (no field) what the validation accepted | `sallyd::session` (`accepted.rs`): `manifest.acknowledged_risk` per acknowledgement, one `manifest.warn` | launch, before `sandbox.launch` | a failed append refuses the start; nothing launched |
 | `tools.mcp[]` | env-name filter in validator; broker MCP gateway (M4) | validate + each relayed call | reject secret-like env; pending if `approve: always` |
 | `[data-can-leave]` | validator warning + `summary()` first line + UI | validate | warning (never blocks) |
 | `approvals.timeout/max_pending` | `sallyd::approvals`; new prompts also limited to one per 2 s, burst `max_pending` (ARCHITECTURE §4.2) | each request | expire → deny; over either bound → `denied: approval-flood`, one `approval.deny` each + one `approval.flood` per episode |

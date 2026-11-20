@@ -270,9 +270,17 @@ review). Every remaining non-errno rule is a plain `SCMP_ACT_ALLOW`, and:
 The profiles are `profiles/seccomp-{workspace,harness,inference}.json`, derived by
 `scripts/gen_seccomp.py` from containers-common's profile and committed. They are embedded in
 `sallyd` and written into the session's 0700 `profiles/` directory at launch (#10), so no file
-outside Sallyport's control decides what a sandbox may call. Unit tests check the removals and
-the inference socket filter independently of the generator; RT-FS-07 and RT-FS-09 test them in
-a container.
+outside Sallyport's control decides what a sandbox may call. Unit tests check the profile JSON
+independently of the generator (`sandbox::profiles`:
+`no_rule_of_any_role_allows_a_removed_syscall_under_any_condition`,
+`sockets_are_an_allowlist_of_address_families`, `clone_is_allowed_only_without_namespace_flags`,
+`only_native_architectures_are_listed`). The OCI config verifier compares each container's
+`linux.seccomp` with the embedded profile by content before `start` (`sandbox::oci`
+`the_cgroup_path_seccomp_and_masked_paths_are_checked`; RT-SUP-04). In a container, three probes
+meet the filter: RT-FS-07 (`mknod`, `ENOSYS`), RT-FS-17 (`unshare`, `clone` with namespace flags,
+`clone3`) and RT-NET-12 (socket families outside the role's list). The other removals are checked
+in the JSON only, by no system call in a container. RT-FS-09 tests the masked and read-only
+`/proc` and `/sys` paths, not the profile.
 
 ### 3.5 Launch (normative, Task 6b)
 `sallyd::sandbox::Launcher::launch_workspace`, in this order. The launch runs in its own task:
@@ -602,7 +610,10 @@ peer to be its own uid (architect Q78), and it reads replies under the same 1 Mi
 | `audit.tail` (filter, follow) / `audit.verify` | log |
 
 In M1 the CLI runs `doctor` (host facts only; container checks are #119), `manifest
-validate|summary` (an advisory verdict: `sallyd` validates again at `sessions.create`),
+validate|summary` (an advisory verdict: `sallyd` validates again at `sessions.create`; at
+launch, `sally session start` and `sally sandbox run` run the same validation as a refusing
+gate, check where the manifest file is kept, show what it grants and, for a manifest with a
+warning or an acknowledged risk, ask for consent before they send it, MANIFEST_SPEC §1.2),
 `audit verify|tail` (read-only, no `audit.lock`) and `secrets set|list|rm` itself, without
 `sallyd` (architect Q52, Q106–Q110). Paths come from `sally_core::paths`, as `sallyd`'s do.
 `secrets set|rm` write the store directly under its writers' lock: an exclusive `flock` on a
@@ -639,7 +650,10 @@ request is `-32000` with `data`
   `sandbox.refuse` could not be written gets no reply. A launch whose task ended without a
   result is `start-failed` with its own `session.refuse` naming the session (architect Q98;
   TODO(#113): what such a task leaves behind). Any other start failure is `shutting-down` or
-  `start-failed` with its own `session.refuse`.
+  `start-failed` with its own `session.refuse`. A start whose `manifest.acknowledged_risk` or
+  `manifest.warn` entry could not be written, or whose writing task failed, launches nothing;
+  its `session.refuse` (`start-failed`) carries the session's `id` and, in `detail`, the entry
+  that failed.
 - `sessions.create` with a `model` (architect Q119): only `{kind: "scripted", script, driven:
   true}` starts. `script` is JSON Lines text of at most 256 KiB (`sally_proto::MAX_SCRIPT_BYTES`;
   `sallyd` opens no file), parsed whole before anything launches: each line is exactly one of
@@ -836,12 +850,13 @@ A request with one 2026 key but not the other, or with neither on a connection t
 **Bounds** (each a named constant with a boundary test): frames 256 KiB (an oversize frame is
 recorded, then the connection closes); nesting depth 64; ids ≤ 128 bytes; method names ≤ 64
 bytes; tool names 1–128 bytes; duplicate JSON keys refused. Per session: 8 connections (the
-listener stops accepting at the cap), 16 `tools/call` in flight, replies not yet written included (the
-17th is `-32000` `too-many-in-flight`, recorded first), a reused in-flight id `-32600`, and 20 requests read per
-second with a burst of 40. Over the rate the broker stops reading (backpressure): requests are
-slowed, never dropped unrecorded. A reply the peer does not take within 10 s closes the
-connection. Prompts: at most `approvals.max_pending` wait at once, and new ones come at most one
-per 2 s with a burst of `max_pending` (`approvals::queue::REFILL`, tunable); a call over either
+listener stops accepting at the cap), 16 `tools/call` in flight, replies not yet written
+included (the 17th is `-32000` `too-many-in-flight`, recorded first), a reused in-flight id
+`-32600`, and 20 requests read per second with a burst of 40. Over the rate the broker stops
+reading (backpressure): requests are slowed, never dropped unrecorded. A reply the peer does
+not take within 10 s closes the connection. Prompts: at most `approvals.max_pending` wait at
+once, and new ones come at most one per 2 s with a burst of `max_pending`
+(`approvals::queue::REFILL`, tunable); a call over either
 bound is denied `approval-flood` with its own `approval.deny` entry, and each flood episode (until
 the queue is empty and the rate full again) writes one `approval.flood`. With 16 calls in flight
 at most, a `max_pending` above 16 is never reached.
@@ -1148,11 +1163,14 @@ does a shutdown that cannot confirm its container gone. A stop that failed only 
 container was removed (the `sandbox.stop` append, the scratch removal) also has none until a
 retry succeeds; it is reported as not confirmed gone (TODO(#157), Q246).
 
-A file operation already inside its blocking call is never cut. One still running after the
-drain leaves `in_flight > 0`: the stop answers failed and the session stays stop-failed until
-it returns; then the supervisor removes the container by itself. Its `tool.result` is refused
-by the seal (an oplog line names it), so `in_flight: n` counts the `tool.run` entries that have
-no result. Residual risk: a hung file system under a mount keeps an idle container (listener
+A file operation already inside its blocking call is never cut. What it can still do is bounded
+in data, not in time: a write writes its own content (at most one agent frame, 256 KiB) and never
+copies an existing file (§4.3); a delete removes one name; how long the call takes is the file
+system's. One still running after the drain leaves `in_flight > 0`: the stop answers failed and
+the session stays stop-failed until it returns; then the supervisor removes the container by
+itself. Its `tool.result` is refused by the seal (an oplog line names it), so `in_flight: n`
+counts the `tool.run` entries that have no result. Residual risk: a hung or slow file system
+under a mount, or the release of a very large file's blocks, keeps an idle container (listener
 closed, shells killed, nothing new can start) until that operation returns; if `sallyd` shuts
 down meanwhile, the container outlives it with no watchdog until the next start's sweep
 (TODO(#96), Q66). Either way conmon's backstop ends it `runtime.timeout` + 300 s after its
@@ -1577,9 +1595,17 @@ sallyport/
     and for a message `content_bytes`, `content_sha256`; written before the turn's first call.
   - `manifest.refuse` (actor `sallyd`, decision `refuse`): `{error}`, the validator's errors,
     escaped, at most 1024 characters; nothing is launched.
+  - `manifest.acknowledged_risk` (actor `sallyd`, decision `allow`, in the session's log):
+    `{risk}`, one per acknowledgement in effect, in the validator's order; then `manifest.warn`
+    (actor `sallyd`, no decision): `{count, warnings: [{code, path}]}`, at most 32 listed and
+    never a message, only when the validation gave a warning. Both are written before
+    `sandbox.launch`.
   - `session.refuse` (actor `sallyd`, decision `refuse`): `{method, id?, reason, detail?,
     error?, client}`; reasons `unknown-session`, `listing-failed`, `shutting-down`,
-    `start-failed`, `stop-failed`.
+    `start-failed`, `stop-failed`. A `start-failed` carries `id` when an audit append of the
+    start (a manifest entry or `session.start`), or that append's task, failed, and after a
+    launch task that was lost (Q98); not yet for a failed `agent.sock` bind or a container
+    that exited early (#259).
   - `rpc.cancel` (actor `harness`): `{id}`, only for a cancel that matches an in-flight call,
     before its reply is suppressed.
   - `llm.request` (actor `harness`, decision `allow`): `{path}` for `/v1/models`; for a chat
