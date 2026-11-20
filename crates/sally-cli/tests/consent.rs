@@ -143,6 +143,15 @@ fn reviewed(f: &Fake, h: &Home, manifest: &Path) -> (String, String) {
     (format!("{summary}\n"), hash.to_owned())
 }
 
+/// What `sally manifest summary` prints on stderr for `manifest`.
+fn summary_err(f: &Fake, h: &Home, manifest: &Path) -> String {
+    let o = h
+        .apply(&mut f.command(&["manifest", "summary", manifest.to_str().unwrap()]))
+        .output()
+        .unwrap();
+    stderr(&o)
+}
+
 /// The warning lines `sally manifest validate` prints for `manifest`.
 fn warnings(f: &Fake, h: &Home, manifest: &Path) -> Vec<String> {
     let o = h
@@ -326,6 +335,8 @@ fn off_a_terminal_needs_the_hash_of_the_text_it_sends(l: Launch, tag: &str) {
     let direct = host("~/real/sub");
     std::fs::write(&m, &direct).unwrap();
     let (_, hash) = reviewed(&f, &h, &m);
+    let as_written = "filesystem.mounts[0].host is written";
+    assert!(!summary_err(&f, &h, &m).contains(as_written));
     let o = launch(&f, &h, l, &m, &["--accept-manifest", &hash]);
     assert_eq!(
         created(&f),
@@ -334,7 +345,13 @@ fn off_a_terminal_needs_the_hash_of_the_text_it_sends(l: Launch, tag: &str) {
         stderr(&o)
     );
     std::fs::write(&m, host("~/link/sub")).unwrap();
+    // The review says so too, and still gives the hash (a terminal's yes can accept it).
     let (_, hash) = reviewed(&f, &h, &m);
+    let said = summary_err(&f, &h, &m);
+    assert!(
+        said.contains(&format!("{as_written} \"~/link/sub\"")),
+        "{said}"
+    );
     let o = launch(&f, &h, l, &m, &["--accept-manifest", &hash]);
     assert_eq!(o.status.code(), Some(1), "{l:?}: {}", stderr(&o));
     assert!(

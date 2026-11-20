@@ -304,7 +304,10 @@ fn run_remote(cmd: Remote, paths: &Paths) -> u8 {
                 commands::session_start(&mut client, &text, script.as_deref(), &mut o)
             }
             // The gate gave every launch its text above.
-            (SessionCmd::Start { .. }, None) => EXIT_FAILED,
+            (SessionCmd::Start { .. }, None) => {
+                let _ = writeln!(o.err, "sally: internal: the launch has no checked text");
+                EXIT_FAILED
+            }
             (SessionCmd::Drive { id }, _) => drive::session_drive(&mut client, &id, &mut o),
             (SessionCmd::List, _) => commands::session_list(&mut client, &mut o),
             (SessionCmd::Stop { id }, _) => commands::session_stop(&mut client, &id, &mut o),
@@ -312,7 +315,10 @@ fn run_remote(cmd: Remote, paths: &Paths) -> u8 {
         },
         (Remote::Sandbox(SandboxCmd::Run { argv, .. }), _) => match launch {
             Some(text) => run::sandbox_run(&mut client, &text, &argv, std::io::stdin(), &mut o),
-            None => EXIT_FAILED,
+            None => {
+                let _ = writeln!(o.err, "sally: internal: the launch has no checked text");
+                EXIT_FAILED
+            }
         },
         (Remote::Approvals, _) => commands::approvals(&mut client, &mut o),
         (Remote::Approve, Some(tty)) => approve_on(&tty, &mut client, o.err),

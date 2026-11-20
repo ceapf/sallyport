@@ -176,13 +176,23 @@ fn the_consent_rule() {
 }
 
 /// A manifest file of its own for `test`, holding `body` after the header: (its path, its text).
-fn manifest_file(test: &str, body: &str) -> (std::path::PathBuf, String) {
+/// The folder is removed when the guard drops, a failing test included.
+fn manifest_file(test: &str, body: &str) -> (std::path::PathBuf, String, Gone) {
     let dir = std::env::temp_dir().join(format!("sally-consent-{}-{test}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("m.yaml");
     let text = format!("{HEAD}{body}");
     std::fs::write(&path, &text).unwrap();
-    (path, text)
+    (path, text, Gone(dir))
+}
+
+/// A folder removed on drop.
+struct Gone(std::path::PathBuf);
+
+impl Drop for Gone {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// [`launch_text`] off a terminal: the result and what `err` holds.
@@ -200,8 +210,8 @@ fn launch_off(path: &Path, accept: Option<&str>) -> (Result<String, u8>, String)
 
 #[test]
 fn off_a_terminal_a_given_hash_must_name_the_text_read() {
-    let (risky, risky_text) = manifest_file("off-risky", RISKY);
-    let (quiet, quiet_text) = manifest_file("off-quiet", "");
+    let (risky, risky_text, _risky) = manifest_file("off-risky", RISKY);
+    let (quiet, quiet_text, _quiet) = manifest_file("off-quiet", "");
     let right = digest(&risky_text).as_hex().to_owned();
     let wrong = digest(&quiet_text).as_hex().to_owned();
 
@@ -234,10 +244,6 @@ fn off_a_terminal_a_given_hash_must_name_the_text_read() {
     // A manifest that cannot be read fails.
     let gone = risky.with_file_name("gone.yaml");
     assert_eq!(launch_off(&gone, None).0, Err(EXIT_FAILED));
-
-    for p in [&risky, &quiet] {
-        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
-    }
 }
 
 /// [`launch_text`] on a terminal whose input is `typed`: the result, what the terminal shows,
@@ -274,8 +280,8 @@ fn launch_on(
 
 #[test]
 fn on_a_terminal_only_a_manifest_that_needs_consent_is_asked() {
-    let (risky, risky_text) = manifest_file("on-risky", RISKY);
-    let (quiet, quiet_text) = manifest_file("on-quiet", "");
+    let (risky, risky_text, _risky) = manifest_file("on-risky", RISKY);
+    let (quiet, quiet_text, _quiet) = manifest_file("on-quiet", "");
     let right = digest(&risky_text).as_hex().to_owned();
 
     let (r, shown, flushes) = launch_on(&quiet, None, b"no\n");
@@ -294,10 +300,6 @@ fn on_a_terminal_only_a_manifest_that_needs_consent_is_asked() {
         Err(EXIT_REFUSED)
     );
     assert_eq!(launch_on(&risky, Some(&right), b"yes\n").0, Ok(risky_text));
-
-    for p in [&risky, &quiet] {
-        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
-    }
 }
 
 #[test]

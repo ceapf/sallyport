@@ -80,7 +80,9 @@ pub fn launch_text(manifest: &Path, g: Gate<'_, '_>, err: &mut dyn Write) -> Res
     match decide(needs, terminal.is_some(), matches) {
         Verdict::Send => Ok(text),
         // TODO(#255): sallyd resolves the hosts again after this check, `~` follows this
-        // process's HOME, and a folder replaced at the same path is not seen here.
+        // process's HOME, and a folder replaced at the same path is not seen here. HOME is
+        // taken as given: where its own path goes through a link, every `~` host is refused
+        // here (write the realpath, or answer on a terminal).
         Verdict::ByHash => {
             let home = HostEnv::from_process().map(|env| env.home).map_err(|e| {
                 let _ = writeln!(err, "sally: {}", clean::line(&e.to_string()).text);
