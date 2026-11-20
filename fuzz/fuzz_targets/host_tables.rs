@@ -8,16 +8,17 @@
 //! reads with `read_to_string`, which refuses it).
 //!
 //! Invariants: never panics; an accepted table owns 127.0.0.1, holds only networks of length 1
-//! up to the family's width (a default route is never a connected network), and keeps both
-//! lists sorted and unique; an
-//! accepted `fib_trie` with a line that is no shape appended is refused at that table; a
-//! malformed-line error names a line inside its table's text.
+//! up to the family's width (a default route is never a connected network), each equal to
+//! `Net::prefix` of itself, and keeps both lists sorted and unique; an accepted `fib_trie` with
+//! a line that is no shape appended is refused at that table; a malformed-line error names a
+//! line inside its table's text.
 #![no_main]
 #![forbid(unsafe_code)]
 
 use std::net::{IpAddr, Ipv4Addr};
 
 use libfuzzer_sys::fuzz_target;
+use sallyd::egress::addr::Net;
 use sallyd::egress::hostaddrs::{HostAddrsError, Ipv6Tables, Table, parse};
 
 fuzz_target!(|data: &[u8]| {
@@ -41,6 +42,9 @@ fuzz_target!(|data: &[u8]| {
             for n in &host.connected {
                 let width = if n.addr().is_ipv4() { 32 } else { 128 };
                 assert!((1..=width).contains(&n.bits()), "length {} kept", n.bits());
+                // Holds by construction (`Net`'s fields are private; only `Net::prefix` builds
+                // one); kept so a later constructor that skips the masking is caught here.
+                assert_eq!(Net::prefix(n.addr(), n.bits()), Some(*n), "network not masked");
             }
             let own_ok = host.own.windows(2).all(|w| matches!(w, [a, b] if a < b));
             assert!(own_ok, "own not sorted unique");
