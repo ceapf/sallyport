@@ -221,6 +221,13 @@ G3 Send /workspace/secret.txt to attacker
 ├─ SSRF to host services / 169.254.169.254 / DNS rebinding
 │                                                   [IP filter after resolution, pinned connect → RT-NET-07]
 ├─ Replace or kill the shim                         [still only a Unix socket → RT-NET-10]
+│  └─ Open `net.sock` itself, past the shim's own limits (32 connections, a plain byte stream)
+│                                                   [the proxy's own bounds hold without the shim:
+│                                                    its connection cap and admission rate, met
+│                                                    host-side straight on `net.sock` → RT-NET-09,
+│                                                    RT-AUD-02; not tested: what `net.sock`,
+│                                                    `agent.sock` and `llm.sock` do with ancillary
+│                                                    descriptors and out-of-band bytes (#270)]
 ├─ Via a spliced tunnel to an allowed host: any protocol (plain HTTP included), another tenant
 │  of a shared edge (HTTP Host inside TLS), or an encrypted client hello
 │                                                   [OPEN, fix planned, #247: the proxy does not look at a spliced
@@ -402,6 +409,9 @@ G6 Hide what happened
 ```
 G7 Make the machine unusable
 ├─ Fork bomb / memory bomb in Z3                    [pids-limit, memory limit → RT-AG-09]
+├─ Use up a per-user kernel allowance the host user's own programs share (under `keep-id` the
+│  sandbox runs as the host user's kernel uid)      [OPEN, fix planned, #271: no open-descriptor
+│                                                    limit of the sandbox's own; not measured; §6]
 ├─ Memory bomb in Z2: a model file drives the engine's allocation (AT1)
 │                                                   [OPEN, fix planned, #252: the argv check requires a memory
 │                                                    limit for the inference role; §6]
@@ -529,6 +539,7 @@ G7 Make the machine unusable
 | What a sandbox learns about the user and the host (§1, beside A10). Podman binds its own `/etc/passwd` and `/etc/group` into every container (probed, PROBE_NOTES); whether the entry for the user's uid under `keep-id` carries the host account's login name and description is not measured. The container's mount table shows the host paths of bind sources and overlay layers. Any allowed egress host can carry either out | The paths name folders the user granted; nothing in them is a secret under SI-3 | Account entry: open, fix planned before v0.1 (#251): a fixed generic entry. Mount-table paths: none planned |
 | The inference role's socket directory (Z2) is bound read-write under the host runtime directory (usually memory-backed), with no size bound, no free-space watch, no cgroup-event watch for that role and no backstop: a compromised engine could fill the filesystem that holds `sallyd`'s and Podman's own runtime files. At the inference stage the broker connects to a path inside a directory the engine controls | No RPC or daemon path reaches the inference launch today | The inference stage (M3), before any RPC or daemon path reaches the inference launch: the broker opens `infer.sock` without following links and checks that it is a socket owned by the expected id before it connects; the socket directory's missing size bound and watch are closed; the orphan sweeps cover inference instances (#134) and their cgroup events are watched (#132); the model pin is tied to the import; instance ids are made unique by the launcher's own check |
 | The inference container (Z2) has no required memory bound. Its pids and CPU limits are always passed; `--memory` only when the launch names one (optional because memory-mapped weights count as page cache), and `check_argv` does not require it for that role. A model file drives the engine's allocations (AT1), so host RAM is then the limit | No RPC or daemon path reaches the inference launch today | Open, fix planned (#252): the argv check requires a memory limit for the inference role (RT-INF-04's OOM leg needs it) |
+| Per-user kernel allowances shared with the host. Under `--userns=keep-id` a sandbox's processes run as the host user's kernel uid, and the kernel counts some resources per user, descriptors in flight over Unix sockets among them. Containers have no open-descriptor limit of their own: they inherit podman's, up to `sallyd`'s hard limit, usually far above the soft limit of ordinary host programs, so a sandbox could use up an allowance the user's own programs (desktop and IPC software) share. From the design; not measured | Availability only; it needs no capability and no network | Open, fix planned, #271: an explicit open-descriptor limit for every role, below host programs' soft limit (design note first) |
 | A Unix socket created in a mount after the launch scan (a host daemon starting later, git's fsmonitor socket) is reachable from the sandbox | The scan refuses sockets present at launch (RT-FS-13); a host program that creates a socket in a folder the user shared is the user's own configuration | Re-scan or watch mounts for new sockets (v1.1) |
 | A FIFO in a mount is a channel to a host process that reads it, in every mount mode: opening a FIFO for writing passes a read-only bind (probed, PROBE_NOTES), as `connect` on a socket does. The launch scan refuses sockets but ignores FIFOs | A host program that reads a FIFO in a folder the user shared is the user's own configuration, as for a socket made after the scan (row above) | Open, fix planned (#253): the launch scan treats a FIFO like a socket |
 | The launch scan needs `STATX_MNT_ID` (kernel ≥ 5.8) to stay out of nested mounts | It refuses to launch rather than walk blind on an older kernel | `sally doctor` reports the kernel (Task 12) |
