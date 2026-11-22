@@ -102,11 +102,8 @@ fn under_audit_level_actions_both_entries_are_written() {
     let v = validated(&format!("{RISKY}audit:\n  level: actions\n"));
     let level = v.manifest.manifest().audit.level;
     assert_eq!(level, AuditLevel::Actions);
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/session-accepted-tests")
-        .join(format!("actions-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    // Removed on drop, a failing assertion included.
+    let dir = crate::egress::scratch::scratch("session-accepted-tests", "actions");
     let mut w = AuditWriter::open(&dir, Box::new(SystemClock)).unwrap();
     let e = entries("s-1", &v);
     let events: Vec<String> = e.iter().map(|x| x.event().to_owned()).collect();
@@ -115,7 +112,6 @@ fn under_audit_level_actions_both_entries_are_written() {
         let written = w.append(entry, level).unwrap();
         assert!(matches!(written, Appended::Written { .. }), "{written:?}");
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

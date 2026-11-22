@@ -115,8 +115,8 @@ pub fn launch_text(manifest: &Path, g: Gate<'_, '_>, err: &mut dyn Write) -> Res
         Verdict::NeedsFlag => {
             let _ = writeln!(
                 err,
-                "sally: off a terminal, a launch needs --accept-manifest with the hash `sally \
-                 manifest summary` prints last; not started"
+                "sally: with no terminal to ask on, a launch needs --accept-manifest with the \
+                 hash `sally manifest summary` prints last; not started"
             );
             Err(EXIT_REFUSED)
         }

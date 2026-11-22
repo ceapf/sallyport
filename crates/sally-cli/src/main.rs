@@ -328,7 +328,8 @@ fn run_remote(cmd: Remote, paths: &Paths) -> u8 {
 
 /// The launch gate for the manifest named `manifest` ([`consent::launch_text`]): core dumps off
 /// first (the store's names are read), then the text to send, or the exit code. The terminal is
-/// `/dev/tty`, used only when stdin is a terminal too; nothing from stdin is ever an answer.
+/// `/dev/tty`, opened only when stdin is a terminal too and no hash is given (the hash is the
+/// consent then); nothing from stdin is ever an answer.
 fn gated(
     manifest: &std::path::Path,
     accept: Option<&str>,
@@ -340,8 +341,8 @@ fn gated(
         return Err(EXIT_FAILED);
     }
     let store = paths.secrets_file();
-    let on_terminal = rustix::termios::isatty(std::io::stdin());
-    let Some(tty) = on_terminal.then(open_tty).and_then(Result::ok) else {
+    let ask = accept.is_none() && rustix::termios::isatty(std::io::stdin());
+    let Some(tty) = ask.then(open_tty).and_then(Result::ok) else {
         let g = consent::Gate {
             store: &store,
             accept,

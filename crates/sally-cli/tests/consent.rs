@@ -1,8 +1,9 @@
 //! RT-MAN-03 through the binary, against a fake `sallyd`: a launch (`sally session start`,
 //! `sally sandbox run`) shows what its manifest grants before it asks for anything, refuses a
 //! manifest kept inside a folder that manifest lets the session write, and needs consent bound to
-//! the exact text it sends: a typed `yes` on a terminal, the text's SHA-256 off one. Each property
-//! runs once per command through one helper.
+//! the exact text it sends, whatever its warnings: the text's SHA-256 (`--accept-manifest`), or
+//! with no hash a `yes` typed on a terminal. Each property runs once per command through one
+//! helper.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 mod common;
@@ -153,8 +154,10 @@ fn daemon_seeing(tag: &str, err: &Path) -> (Fake, Arc<Mutex<Option<String>>>) {
     let seen: Arc<Mutex<Option<String>>> = Arc::default();
     let (path, at_create) = (err.to_owned(), Arc::clone(&seen));
     let f = daemon(tag, move || {
-        // No file: the create came from a launch whose stderr was not logged.
+        // Taken and removed, so a later create from a launch whose stderr is not logged reads
+        // no file and keeps an empty text.
         *at_create.lock().unwrap() = Some(std::fs::read_to_string(&path).unwrap_or_default());
+        let _ = std::fs::remove_file(&path);
     });
     (f, seen)
 }
@@ -494,6 +497,9 @@ struct OnTerminal {
     child: Child,
     controller: std::fs::File,
     screen: Arc<Mutex<Vec<u8>>>,
+    /// Copies the terminal's output into `screen`; it ends once the launch's end closes the
+    /// terminal's last descriptor.
+    reader: std::thread::JoinHandle<()>,
 }
 
 impl OnTerminal {
@@ -512,7 +518,7 @@ impl OnTerminal {
         let child = h.apply(&mut c).spawn().unwrap();
         let screen: Arc<Mutex<Vec<u8>>> = Arc::default();
         let (mut reader, shown) = (controller.try_clone().unwrap(), Arc::clone(&screen));
-        std::thread::spawn(move || {
+        let copier = std::thread::spawn(move || {
             let mut buf = [0u8; 512];
             while let Ok(n @ 1..) = reader.read(&mut buf) {
                 shown.lock().unwrap().extend_from_slice(&buf[..n]);
@@ -522,6 +528,7 @@ impl OnTerminal {
             child,
             controller,
             screen,
+            reader: copier,
         }
     }
 
@@ -563,13 +570,19 @@ impl OnTerminal {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+        // Everything the launch wrote is on the screen once the copier has seen the terminal
+        // close (bounded: a copier still running after the wait leaves the screen as read).
+        let end = Instant::now() + WAIT;
+        while !self.reader.is_finished() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let screen = self.screen();
         let o = self.child.wait_with_output().unwrap();
         (o.status.code(), stderr(&o), screen)
     }
 }
 
-fn on_a_terminal_needs_a_typed_yes(l: Launch, tag: &str) {
+fn on_a_terminal_needs_a_typed_yes_or_the_hash(l: Launch, tag: &str) {
     let h = Home::new(tag);
     let f = daemon(tag, || {});
     let text = format!("{HEAD}{RISKY}");
@@ -657,11 +670,11 @@ fn on_a_terminal_needs_a_typed_yes(l: Launch, tag: &str) {
 }
 
 #[test]
-fn rt_man_03_session_start_on_a_terminal_needs_a_typed_yes() {
-    on_a_terminal_needs_a_typed_yes(Launch::Start, "tty-s");
+fn rt_man_03_session_start_on_a_terminal_needs_a_typed_yes_or_the_hash() {
+    on_a_terminal_needs_a_typed_yes_or_the_hash(Launch::Start, "tty-s");
 }
 
 #[test]
-fn rt_man_03_sandbox_run_on_a_terminal_needs_a_typed_yes() {
-    on_a_terminal_needs_a_typed_yes(Launch::Run, "tty-r");
+fn rt_man_03_sandbox_run_on_a_terminal_needs_a_typed_yes_or_the_hash() {
+    on_a_terminal_needs_a_typed_yes_or_the_hash(Launch::Run, "tty-r");
 }

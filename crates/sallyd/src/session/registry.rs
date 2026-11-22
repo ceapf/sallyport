@@ -1,10 +1,10 @@
 //! The session registry (Task 12, architect Q57): it starts sessions in a fixed order, supervises
 //! each one in its own task ([`super::supervise`]), and ends it exactly once.
 //!
-//! Start: the session id minted → audit what the validation accepted ([`super::accepted`]: one
-//! `manifest.acknowledged_risk` per acknowledgement in effect, then `manifest.warn`) →
-//! `launch_workspace` (overlap and fd budget reserved, `sandbox.launch` audited) → the init's
-//! exit watch → approvals, tools and the agent server built in memory → audit
+//! Start: the session id minted and its paths made → audit what the validation accepted
+//! ([`super::accepted`]: one `manifest.acknowledged_risk` per acknowledgement in effect, then
+//! `manifest.warn`) → `launch_workspace` (overlap and fd budget reserved, `sandbox.launch`
+//! audited) → the init's exit watch → approvals, tools and the agent server built in memory → audit
 //! `session.start {model:{kind:"none"}}` → bind `agent.sock` (0600) in the session's harness
 //! socket directory → listen. A failed append of what the validation accepted, or one whose task
 //! failed, launches nothing: the session's log keeps the entries written before it, with no
