@@ -9,13 +9,14 @@
 //! 4. The block (the summary, each warning, each acknowledged risk) is shown on the terminal the
 //!    answer is read from when a question follows, and on stderr otherwise. A block line that
 //!    fails the clean-check refuses the launch (1), naming the first such line, escaped.
-//! 5. A given `--accept-manifest` must name the SHA-256 of the text read (1 otherwise). No
-//!    launch output prints the hash of what was read.
-//! 6. A manifest with any warning or acknowledged risk needs consent. On a terminal (stdin is
-//!    one and `/dev/tty` opens) that is exactly `yes` typed after the question, with typed-ahead
-//!    input discarded (if it cannot be, nothing is read: 1), whether or not the flag is given.
-//!    Off a terminal it is the flag, and then every mount host must be written as the folder it
-//!    resolved to (1 otherwise): the hash names the text, not the folders.
+//!    Warnings and acknowledged risks decide only which lines follow the summary.
+//! 5. Every launch needs consent. A given `--accept-manifest` is the consent, on a terminal too:
+//!    it must name the SHA-256 of the text read (1 otherwise, never a question instead), and
+//!    every mount host must be written as the folder it resolved to (1 otherwise): the hash
+//!    names the text, not the folders. No launch output prints the hash of what was read.
+//! 6. With no flag, on a terminal (stdin is one and `/dev/tty` opens) the consent is exactly
+//!    `yes` typed after the question, with typed-ahead input discarded (if it cannot be, nothing
+//!    is read: 1). Off a terminal, a launch with no flag is refused (1).
 //!
 //! TODO(#255): the summary shown comes from this validation, under the CLI's own host facts;
 //! `sallyd` launches from its own.
@@ -64,8 +65,8 @@ pub fn launch_text(manifest: &Path, g: Gate<'_, '_>, err: &mut dyn Write) -> Res
         );
         EXIT_REFUSED
     })?;
-    let needs = needs_consent(&v);
-    let mut terminal = g.terminal.filter(|_| needs);
+    // The terminal is used only when a question follows: with no flag.
+    let mut terminal = g.terminal.filter(|_| accept.is_none());
     {
         let shown: &mut dyn Write = match terminal.as_mut() {
             Some(t) => &mut *t.output,
@@ -77,8 +78,7 @@ pub fn launch_text(manifest: &Path, g: Gate<'_, '_>, err: &mut dyn Write) -> Res
         let _ = shown.flush();
     }
     let matches = accept.map(|d| d == digest(&text));
-    match decide(needs, terminal.is_some(), matches) {
-        Verdict::Send => Ok(text),
+    match decide(terminal.is_some(), matches) {
         // TODO(#255): sallyd resolves the hosts again after this check, `~` follows this
         // process's HOME, and a folder replaced at the same path is not seen here. HOME is
         // taken as given: where its own path goes through a link, every `~` host is refused
@@ -115,8 +115,8 @@ pub fn launch_text(manifest: &Path, g: Gate<'_, '_>, err: &mut dyn Write) -> Res
         Verdict::NeedsFlag => {
             let _ = writeln!(
                 err,
-                "sally: this manifest has warnings or acknowledged risks; off a terminal, pass \
-                 --accept-manifest with the hash `sally manifest summary` prints last"
+                "sally: off a terminal, a launch needs --accept-manifest with the hash `sally \
+                 manifest summary` prints last; not started"
             );
             Err(EXIT_REFUSED)
         }
@@ -126,8 +126,6 @@ pub fn launch_text(manifest: &Path, g: Gate<'_, '_>, err: &mut dyn Write) -> Res
 /// What a launch does once its block is shown ([`decide`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
-    /// Send the text.
-    Send,
     /// The right hash is the consent: send once each mount host is written as the folder it is
     /// (`check_hosts_as_written`), since the hash names the text, not the folders.
     ByHash,
@@ -139,18 +137,17 @@ pub enum Verdict {
     NeedsFlag,
 }
 
-/// The consent rule, pure: `needs` is [`needs_consent`], `on_terminal` whether the question can
-/// be asked, `matches` whether a given `--accept-manifest` names the text read (`None`: not
-/// given). A given hash is always checked. A manifest that needs consent is asked on a terminal
-/// even with the right hash; off one, the right hash is its consent ([`Verdict::ByHash`]).
+/// The consent rule, pure; every launch needs consent, whatever its warnings. `on_terminal`:
+/// whether the question can be asked; `matches`: whether a given `--accept-manifest` names the
+/// text read (`None`: not given). A wrong hash refuses and the right one is the consent, on a
+/// terminal too; with no hash, a terminal asks and anything else refuses.
 #[must_use]
-pub fn decide(needs: bool, on_terminal: bool, matches: Option<bool>) -> Verdict {
-    match (needs, on_terminal, matches) {
-        (_, _, Some(false)) => Verdict::Mismatch,
-        (false, _, _) => Verdict::Send,
-        (true, true, _) => Verdict::Ask,
-        (true, false, Some(true)) => Verdict::ByHash,
-        (true, false, None) => Verdict::NeedsFlag,
+pub fn decide(on_terminal: bool, matches: Option<bool>) -> Verdict {
+    match (on_terminal, matches) {
+        (_, Some(false)) => Verdict::Mismatch,
+        (_, Some(true)) => Verdict::ByHash,
+        (true, None) => Verdict::Ask,
+        (false, None) => Verdict::NeedsFlag,
     }
 }
 
@@ -194,12 +191,6 @@ fn read_checked(
         return Err(EXIT_REFUSED);
     }
     Ok((text, v))
-}
-
-/// Whether a launch of `v` needs consent: any warning or acknowledged risk.
-#[must_use]
-pub fn needs_consent(v: &Validated) -> bool {
-    !v.warnings.is_empty() || !v.manifest.acknowledged_risks().is_empty()
 }
 
 /// The lines shown after the summary: each warning, then each acknowledged risk.

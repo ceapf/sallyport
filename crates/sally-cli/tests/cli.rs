@@ -10,8 +10,15 @@ use std::process::Command;
 use common::{Fake, result, stderr, stdout};
 use serde_json::json;
 
-/// A valid manifest with no warning and no acknowledged risk: a launch sends it without asking.
+/// A valid manifest with no warning and no acknowledged risk; a launch off a terminal still
+/// needs its hash ([`accept`]).
 const VALID: &str = "apiVersion: sallyport/v1\nkind: Manifest\nname: t\nmodel:\n  ref: any\n";
+
+/// `--accept-manifest` with the hash of `text`: a launch's consent off a terminal.
+fn accept(text: &str) -> [String; 2] {
+    let hash = sally_cli::consent::digest(text).as_hex().to_owned();
+    ["--accept-manifest".to_owned(), hash]
+}
 
 /// RT-FS-15 (client side, architect Q79): a path `sallyd` escaped is printed exactly as sent.
 /// Control: `sallyd`'s escaping (the daemon-side test, `rt_fs_15_…` in sallyd's tests).
@@ -121,7 +128,8 @@ fn start_sends_the_manifest_text_and_prints_the_session() {
     });
     let manifest = f.runtime.join("m.yaml");
     std::fs::write(&manifest, VALID).unwrap();
-    let o = f.sally(&["session", "start", manifest.to_str().unwrap()]);
+    let [flag, hash] = accept(VALID);
+    let o = f.sally(&["session", "start", manifest.to_str().unwrap(), &flag, &hash]);
     assert_eq!(stdout(&o), "s-1  running  t  sp-w-s-1\n");
     assert_eq!(o.status.code(), Some(0));
     assert_eq!(
@@ -164,12 +172,15 @@ fn a_script_is_sent_as_a_scripted_model_declared_driven() {
     std::fs::write(&manifest, VALID).unwrap();
     let script = f.runtime.join("s.jsonl");
     std::fs::write(&script, "{\"fail\":true}\n").unwrap();
+    let [flag, hash] = accept(VALID);
     let o = f.sally(&[
         "session",
         "start",
         manifest.to_str().unwrap(),
         "--script",
         script.to_str().unwrap(),
+        &flag,
+        &hash,
     ]);
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
     assert_eq!(
@@ -191,12 +202,15 @@ fn a_script_over_the_cap_is_never_sent() {
     std::fs::write(&manifest, VALID).unwrap();
     let script = f.runtime.join("s.jsonl");
     std::fs::write(&script, "a".repeat(sally_proto::MAX_SCRIPT_BYTES + 1)).unwrap();
+    let [flag, hash] = accept(VALID);
     let o = f.sally(&[
         "session",
         "start",
         manifest.to_str().unwrap(),
         "--script",
         script.to_str().unwrap(),
+        &flag,
+        &hash,
     ]);
     assert_eq!(o.status.code(), Some(2));
     assert!(stderr(&o).contains("larger than"), "{}", stderr(&o));
@@ -236,7 +250,8 @@ fn a_manifest_at_the_cap_is_sent() {
     let text = format!("{VALID}#{}\n", "a".repeat(pad));
     assert_eq!(text.len(), sally_core::manifest::MAX_MANIFEST_BYTES);
     std::fs::write(&manifest, &text).unwrap();
-    let o = f.sally(&["session", "start", manifest.to_str().unwrap()]);
+    let [flag, hash] = accept(&text);
+    let o = f.sally(&["session", "start", manifest.to_str().unwrap(), &flag, &hash]);
     assert_eq!(f.methods(), ["sessions.create"], "{}", stderr(&o));
 }
 

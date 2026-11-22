@@ -114,9 +114,9 @@ enum SessionCmd {
         /// terminal's `session drive`, with no harness and no model socket.
         #[arg(long)]
         script: Option<PathBuf>,
-        /// The SHA-256 of the manifest's text, as `sally manifest summary` prints it last. Off a
-        /// terminal, a manifest with warnings or acknowledged risks starts only with it; on a
-        /// terminal the start still asks.
+        /// The SHA-256 of the manifest's text, as `sally manifest summary` prints it last: the
+        /// start's consent in place of a typed yes. Off a terminal, a start needs it. The hash
+        /// says you have read this exact manifest. Never use a hash that came with the manifest.
         #[arg(long = "accept-manifest", value_name = "SHA256")]
         accept_manifest: Option<String>,
     },
@@ -151,9 +151,9 @@ enum SandboxCmd {
         /// The manifest.
         #[arg(long)]
         manifest: PathBuf,
-        /// The SHA-256 of the manifest's text, as `sally manifest summary` prints it last. Off a
-        /// terminal, a manifest with warnings or acknowledged risks runs only with it; on a
-        /// terminal the run still asks.
+        /// The SHA-256 of the manifest's text, as `sally manifest summary` prints it last: the
+        /// run's consent in place of a typed yes. Off a terminal, a run needs it. The hash says
+        /// you have read this exact manifest. Never use a hash that came with the manifest.
         #[arg(long = "accept-manifest", value_name = "SHA256")]
         accept_manifest: Option<String>,
         /// The command and its arguments, after `--`.

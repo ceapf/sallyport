@@ -109,15 +109,6 @@ fn an_answer_longer_than_the_bound_refuses() {
 }
 
 #[test]
-fn consent_is_needed_for_a_warning_or_an_acknowledged_risk_only() {
-    assert!(needs_consent(&validated(RISKY)));
-    assert!(!needs_consent(&validated("")));
-    let mut warned = validated("");
-    warned.warnings = validated(RISKY).warnings;
-    assert!(needs_consent(&warned));
-}
-
-#[test]
 fn the_block_is_the_summary_then_the_warnings_then_the_acknowledged_risks() {
     let v = validated(RISKY);
     let lines = block(&v).unwrap();
@@ -152,25 +143,19 @@ fn a_line_that_cannot_be_shown_withholds_the_block_and_is_named() {
 
 #[test]
 fn the_consent_rule() {
-    use Verdict::{Ask, ByHash, Mismatch, NeedsFlag, Send};
-    for (needs, on_terminal, matches, want) in [
-        (false, false, None, Send),
-        (false, true, None, Send),
-        (false, false, Some(true), Send),
-        (false, true, Some(true), Send),
-        (false, false, Some(false), Mismatch),
-        (false, true, Some(false), Mismatch),
-        (true, true, None, Ask),
-        (true, true, Some(true), Ask),
-        (true, true, Some(false), Mismatch),
-        (true, false, Some(true), ByHash),
-        (true, false, Some(false), Mismatch),
-        (true, false, None, NeedsFlag),
+    use Verdict::{Ask, ByHash, Mismatch, NeedsFlag};
+    for (on_terminal, matches, want) in [
+        (true, None, Ask),
+        (false, None, NeedsFlag),
+        (true, Some(true), ByHash),
+        (false, Some(true), ByHash),
+        (true, Some(false), Mismatch),
+        (false, Some(false), Mismatch),
     ] {
         assert_eq!(
-            decide(needs, on_terminal, matches),
+            decide(on_terminal, matches),
             want,
-            "{needs} {on_terminal} {matches:?}"
+            "{on_terminal} {matches:?}"
         );
     }
 }
@@ -224,14 +209,23 @@ fn off_a_terminal_a_given_hash_must_name_the_text_read() {
     );
     let (r, err) = launch_off(&risky, None);
     assert_eq!(r, Err(EXIT_REFUSED));
-    assert!(err.contains("pass --accept-manifest"), "{err}");
+    assert!(err.contains("a launch needs --accept-manifest"), "{err}");
     // The block is on stderr whatever the outcome; the hash of the text read never is.
     assert!(err.contains("acknowledged: "), "{err}");
     assert!(!err.contains(&right), "{err}");
 
-    // A manifest that needs no consent is sent without the flag, and refused with a wrong one.
-    assert_eq!(launch_off(&quiet, None).0, Ok(quiet_text.clone()));
+    // A manifest with no warning needs the flag too: refused without it or with a wrong one,
+    // sent with its own hash, its summary on stderr.
+    let (r, err) = launch_off(&quiet, None);
+    assert_eq!(r, Err(EXIT_REFUSED));
+    assert!(err.contains("a launch needs --accept-manifest"), "{err}");
+    assert!(err.starts_with("This agent:"), "{err}");
     assert_eq!(launch_off(&quiet, Some(&right)).0, Err(EXIT_REFUSED));
+    let quiet_hash = digest(&quiet_text).as_hex().to_owned();
+    assert_eq!(
+        launch_off(&quiet, Some(&quiet_hash)).0,
+        Ok(quiet_text.clone())
+    );
 
     // A malformed value fails before anything is read, and is never echoed.
     let upper = right.to_ascii_uppercase();
@@ -279,14 +273,19 @@ fn launch_on(
 }
 
 #[test]
-fn on_a_terminal_only_a_manifest_that_needs_consent_is_asked() {
+fn on_a_terminal_every_manifest_is_asked_unless_the_hash_is_given() {
     let (risky, risky_text, _risky) = manifest_file("on-risky", RISKY);
     let (quiet, quiet_text, _quiet) = manifest_file("on-quiet", "");
     let right = digest(&risky_text).as_hex().to_owned();
 
-    let (r, shown, flushes) = launch_on(&quiet, None, b"no\n");
-    assert_eq!(r, Ok(quiet_text));
-    assert_eq!((shown.as_str(), flushes), ("", 0), "nothing asked");
+    // A manifest with no warning is asked too.
+    let (r, shown, _) = launch_on(&quiet, None, b"no\n");
+    assert_eq!(r, Err(EXIT_REFUSED));
+    assert!(
+        shown.starts_with("This agent:") && shown.ends_with(QUESTION),
+        "{shown}"
+    );
+    assert_eq!(launch_on(&quiet, None, b"yes\n").0, Ok(quiet_text));
 
     let (r, shown, _) = launch_on(&risky, None, b"yes\n");
     assert_eq!(r, Ok(risky_text.clone()));
@@ -294,12 +293,15 @@ fn on_a_terminal_only_a_manifest_that_needs_consent_is_asked() {
         shown.contains("acknowledged: ") && shown.ends_with(QUESTION),
         "{shown}"
     );
-    // The right hash does not replace the question.
-    assert_eq!(
-        launch_on(&risky, Some(&right), b"no\n").0,
-        Err(EXIT_REFUSED)
-    );
-    assert_eq!(launch_on(&risky, Some(&right), b"yes\n").0, Ok(risky_text));
+    // The right hash replaces the question: nothing is shown on the terminal or read from it.
+    let (r, shown, flushes) = launch_on(&risky, Some(&right), b"no\n");
+    assert_eq!(r, Ok(risky_text));
+    assert_eq!((shown.as_str(), flushes), ("", 0), "nothing asked");
+    // A wrong hash refuses, and is never asked instead.
+    let wrong = digest("another text").as_hex().to_owned();
+    let (r, shown, flushes) = launch_on(&risky, Some(&wrong), b"yes\n");
+    assert_eq!(r, Err(EXIT_REFUSED));
+    assert_eq!((shown.as_str(), flushes), ("", 0), "nothing asked");
 }
 
 #[test]
