@@ -50,12 +50,14 @@ test: test-scripts shim-check
 	$(TEST_RUN) $(CARGO) test -q --workspace
 
 # Shell-script tests (doctor's --redact filter, the commit trailer check, the mutation and
-# coverage gates, the mutation lists' path check, the test-run sweep, the CI disk check).
+# coverage gates, the mutation lists' path check, the nightly's shard matrix, the test-run sweep,
+# the CI disk check).
 test-scripts:
 	bash tests/scripts/redact_test.sh
 	bash tests/scripts/check_trailers_test.sh
 	bash tests/scripts/mutants_gate_test.sh
 	bash tests/scripts/mutants_paths_test.sh
+	bash tests/scripts/nightly_shards_test.sh
 	bash tests/scripts/coverage_gate_test.sh
 	bash tests/scripts/test_run_test.sh
 	bash tests/scripts/disk_lock_test.sh
@@ -124,10 +126,13 @@ MUTANTS_ENV := TMPDIR=$(MUTANTS_TMP) NEXTEST_PROFILE=mutants \
 # The gate fails on missed mutants; a timed-out mutant hangs a test, so it counts as detected and
 # goes to the job summary (maintainer ruling, #36; scripts/mutants-gate.sh). A run in which no
 # mutant was caught, missed or timed out fails too: it proves nothing.
-# MUTANTS_OUT=<dir> moves mutants.out, as for the wider scope below; unset, it stays in the root.
+# MUTANTS_SHARD=k/n runs one round-robin shard, as for the wider scope below (the nightly shards
+# this job too); unset, the whole set runs. MUTANTS_OUT=<dir> moves mutants.out, as below; unset,
+# it stays in the root.
 mutants:
 	$(mutants_host_check)mkdir -p $(MUTANTS_TMP)
 	$(MUTANTS_ENV) $(DISK_LOCK) cargo mutants --package sally-core --no-shuffle \
+	  $(if $(MUTANTS_SHARD),--shard $(MUTANTS_SHARD) --sharding round-robin) \
 	  $(if $(MUTANTS_OUT),--output $(MUTANTS_OUT)) $(foreach f,$(MUTANTS_FILES),--file '$(f)'); \
 	  bash scripts/mutants-gate.sh $$? $(if $(MUTANTS_OUT),$(MUTANTS_OUT)/mutants.out,mutants.out)
 
@@ -137,7 +142,8 @@ mutants:
 # all start none). Launch, teardown and the watchdog tasks stay with the rt_ tests. egress/net.rs is
 # in (architect Q22): its unit tests are hermetic (fakes, a loopback dialer, `localhost` from
 # /etc/hosts), so no mutant's run sends a packet off the machine.
-# MUTANTS_SHARD=k/n runs one round-robin shard; MUTANTS_OUT=<dir> moves mutants.out.
+# MUTANTS_SHARD=k/n runs one round-robin shard (here and in `mutants` above); MUTANTS_OUT=<dir>
+# moves mutants.out.
 MUTANTS_WIDE_CORE := $(addprefix crates/sally-core/src/,manifest/image.rs manifest/hostenv.rs \
                      manifest/parse.rs manifest/summary.rs manifest/types.rs manifest/units.rs \
                      manifest/diag.rs secrets/store.rs secrets/secret.rs secrets/names.rs audit/entry.rs \

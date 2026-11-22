@@ -17,10 +17,21 @@ env:
   CARGO_MUTANTS_VERSION: "27.1.0"
   # Mutants run their tests under nextest (#82); the same pin as ci.yml.
   CARGO_NEXTEST_VERSION: "0.9.151"
+# Every mutation set runs in round-robin shards, each sized to finish within about two-thirds of
+# its job's limit; a set that outgrows that gets more shards, never fewer mutants.
+# scripts/nightly-shards.sh (in `make test-scripts`) fails when a set's rows do not list every
+# shard once. Measured in run 45048224610 (22 Nov 2026), mutant phase of the slowest shard, about
+# 7 minutes of setup on top: the deny paths 553 mutants, 71 minutes unsharded, 36 at 2 shards.
 jobs:
   mutants:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { shard: 0/2 }
+          - { shard: 1/2 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -39,23 +50,30 @@ jobs:
       - run: cargo install cargo-nextest --locked --version "$CARGO_NEXTEST_VERSION"
       - name: verify cargo-nextest version
         run: cargo nextest --version | grep -Fw "$CARGO_NEXTEST_VERSION"
-      - run: make mutants
+      - name: mutants (deny paths ${{ matrix.shard }})
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: make mutants MUTANTS_SHARD="$SHARD"
       - name: runner disk and memory (end)
         if: always()
         run: df -h / && free -m && du -sh target 2>/dev/null || true
+      # Named by the matrix row index, which here is the shard's k (a shard name holds a `/`).
       - if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: mutants-out
+          name: mutants-out-${{ strategy.job-index }}
           path: mutants.out/
           if-no-files-found: ignore
   # The wider scope (CLAUDE.md "Mutation scope"), zero survivors too. Only container-free tests
   # run per mutant, so no podman is needed. Each mutant rebuilds the crate and reruns its whole
-  # test set, about 27 s per mutant on these runners (#79), so the sallyd count sets the shards:
-  # 24 keeps each one near 45 minutes; mutant TIMEOUTs (#82) need the 150-minute sallyd limit. Some
-  # shards queue behind the concurrent-job limit; that is fine for a nightly. Tests run under
-  # nextest's `mutants` profile, whose 30 s per-test limit ends a hung test long before the
-  # whole-mutant timeout (#82); the 150-minute limit stays until a nightly shows the new timings.
+  # test set. Sized as the deny paths are (above), from run 45048224610: core 1619 mutants, 204
+  # minutes of work, its slowest shard about 39 minutes at 6 shards (both of its 2 shards hit the
+  # 90-minute limit); sallyd 3746 mutants, 2044 minutes, about 68 at 36 shards (117 at 24); cli 21
+  # and shim 2 unsharded. The counts leave room for the round-robin split to shift by a third as
+  # mutants are added. Mutant TIMEOUTs (#82) need the 150-minute sallyd limit. Some shards queue
+  # behind the concurrent-job limit; that is fine for a nightly. Tests run under nextest's
+  # `mutants` profile, whose 30 s per-test limit ends a hung test long before the whole-mutant
+  # timeout (#82).
   mutants-wide:
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ matrix.set == 'sallyd' && 150 || 90 }}
@@ -63,32 +81,48 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { set: core, shard: 0/2 }
-          - { set: core, shard: 1/2 }
-          - { set: sallyd, shard: 0/24 }
-          - { set: sallyd, shard: 1/24 }
-          - { set: sallyd, shard: 2/24 }
-          - { set: sallyd, shard: 3/24 }
-          - { set: sallyd, shard: 4/24 }
-          - { set: sallyd, shard: 5/24 }
-          - { set: sallyd, shard: 6/24 }
-          - { set: sallyd, shard: 7/24 }
-          - { set: sallyd, shard: 8/24 }
-          - { set: sallyd, shard: 9/24 }
-          - { set: sallyd, shard: 10/24 }
-          - { set: sallyd, shard: 11/24 }
-          - { set: sallyd, shard: 12/24 }
-          - { set: sallyd, shard: 13/24 }
-          - { set: sallyd, shard: 14/24 }
-          - { set: sallyd, shard: 15/24 }
-          - { set: sallyd, shard: 16/24 }
-          - { set: sallyd, shard: 17/24 }
-          - { set: sallyd, shard: 18/24 }
-          - { set: sallyd, shard: 19/24 }
-          - { set: sallyd, shard: 20/24 }
-          - { set: sallyd, shard: 21/24 }
-          - { set: sallyd, shard: 22/24 }
-          - { set: sallyd, shard: 23/24 }
+          - { set: core, shard: 0/6 }
+          - { set: core, shard: 1/6 }
+          - { set: core, shard: 2/6 }
+          - { set: core, shard: 3/6 }
+          - { set: core, shard: 4/6 }
+          - { set: core, shard: 5/6 }
+          - { set: sallyd, shard: 0/36 }
+          - { set: sallyd, shard: 1/36 }
+          - { set: sallyd, shard: 2/36 }
+          - { set: sallyd, shard: 3/36 }
+          - { set: sallyd, shard: 4/36 }
+          - { set: sallyd, shard: 5/36 }
+          - { set: sallyd, shard: 6/36 }
+          - { set: sallyd, shard: 7/36 }
+          - { set: sallyd, shard: 8/36 }
+          - { set: sallyd, shard: 9/36 }
+          - { set: sallyd, shard: 10/36 }
+          - { set: sallyd, shard: 11/36 }
+          - { set: sallyd, shard: 12/36 }
+          - { set: sallyd, shard: 13/36 }
+          - { set: sallyd, shard: 14/36 }
+          - { set: sallyd, shard: 15/36 }
+          - { set: sallyd, shard: 16/36 }
+          - { set: sallyd, shard: 17/36 }
+          - { set: sallyd, shard: 18/36 }
+          - { set: sallyd, shard: 19/36 }
+          - { set: sallyd, shard: 20/36 }
+          - { set: sallyd, shard: 21/36 }
+          - { set: sallyd, shard: 22/36 }
+          - { set: sallyd, shard: 23/36 }
+          - { set: sallyd, shard: 24/36 }
+          - { set: sallyd, shard: 25/36 }
+          - { set: sallyd, shard: 26/36 }
+          - { set: sallyd, shard: 27/36 }
+          - { set: sallyd, shard: 28/36 }
+          - { set: sallyd, shard: 29/36 }
+          - { set: sallyd, shard: 30/36 }
+          - { set: sallyd, shard: 31/36 }
+          - { set: sallyd, shard: 32/36 }
+          - { set: sallyd, shard: 33/36 }
+          - { set: sallyd, shard: 34/36 }
+          - { set: sallyd, shard: 35/36 }
           - { set: shim, shard: 0/1 }
           - { set: cli, shard: 0/1 }
     steps:
@@ -116,6 +150,8 @@ jobs:
       - name: runner disk and memory (end)
         if: always()
         run: df -h / && free -m && du -sh target 2>/dev/null || true
+      # The suffix is the matrix row index, not the shard's k: sallyd shard k is
+      # mutants-wide-sallyd-<k+6>, after core's six rows.
       - if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
