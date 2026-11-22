@@ -92,6 +92,32 @@ fn warnings_are_listed_up_to_the_cap_and_counted_in_full() {
     }
 }
 
+/// `audit.level` sets detail, never coverage (SI-4): under `actions` the writer still writes
+/// both launch entries.
+#[test]
+fn under_audit_level_actions_both_entries_are_written() {
+    use sally_core::audit::{Appended, AuditWriter, SystemClock};
+    use sally_core::manifest::AuditLevel;
+
+    let v = validated(&format!("{RISKY}audit:\n  level: actions\n"));
+    let level = v.manifest.manifest().audit.level;
+    assert_eq!(level, AuditLevel::Actions);
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/session-accepted-tests")
+        .join(format!("actions-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut w = AuditWriter::open(&dir, Box::new(SystemClock)).unwrap();
+    let e = entries("s-1", &v);
+    let events: Vec<String> = e.iter().map(|x| x.event().to_owned()).collect();
+    assert_eq!(events, ["manifest.acknowledged_risk", "manifest.warn"]);
+    for entry in e {
+        let written = w.append(entry, level).unwrap();
+        assert!(matches!(written, Appended::Written { .. }), "{written:?}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn the_cap_is_thirty_two() {
     assert_eq!(MAX_LISTED_WARNINGS, 32);

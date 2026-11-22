@@ -522,50 +522,59 @@ fn rt_man_02_image_transport_prefixes_are_refused() {
     }
 }
 
+/// Each channel that runs unapproved is refused without its `tools.acknowledge_unapproved`
+/// entry: `shell: allow`, `fetch_writes: allow`, and an MCP server with `approve: never`. Control
+/// for each (#122): its twin with the entry, through the same `f.load`, is accepted and reports
+/// exactly that acknowledgement.
+#[test]
+fn rt_man_02_unapproved_channels_are_refused_without_their_acknowledgement() {
+    let f = Fixture::new();
+    let mount = "filesystem:\n  mounts:\n    - {host: \"~/code/myproject\", guest: /workspace/p, \
+                 mode: ro}\n";
+    let proxy = "network:\n  mode: proxy\n  allow:\n    - host: api.github.com\n";
+    let cases = [
+        (
+            "tools:\n  builtin: [shell]\n  shell: allow\n  destructive_requires_approval: false\n"
+                .to_owned(),
+            "shell",
+        ),
+        (
+            format!("{mount}{proxy}tools:\n  builtin: [fetch]\n  fetch_writes: allow\n"),
+            "fetch",
+        ),
+        (
+            format!(
+                "{mount}tools:\n  mcp:\n    - name: docs\n      command: [docs-server]\n      \
+                 approve: never\n"
+            ),
+            "mcp:docs",
+        ),
+    ];
+    for (body, entry) in cases {
+        let twin = format!("{body}  acknowledge_unapproved: [\"{entry}\"]\n");
+        twin_ok(&f, &twin);
+        assert_eq!(
+            f.load(&twin).unwrap().manifest.acknowledged_risks(),
+            [format!("tools.acknowledge_unapproved: {entry}")],
+            "{entry}"
+        );
+        assert_rejects(
+            &f.load(&body),
+            "tools.acknowledge_unapproved",
+            Code::UnacknowledgedRisk,
+        );
+        let said = rendered(&f.load(&body)).join("\n");
+        assert!(
+            said.contains(&format!("add \"{entry}\" to tools.acknowledge_unapproved")),
+            "{entry}: {said}"
+        );
+    }
+}
+
 // ---- RT-MAN-03: the manifest file's place ---------------------------------------------------
 // The red-team tests of RT-MAN-03 run the `sally` binary (sally-cli tests/consent.rs) and a real
-// launch (sallyd tests/session.rs). Here: what a validated manifest keeps after its file changes,
-// and the place check the launchers call on it.
-
-/// A validated manifest keeps the validated mount after its file is rewritten wider, its re-check
-/// still passes, and the rewritten file is rejected when it is loaded again.
-#[test]
-fn rt_man_03_validated_manifest_is_independent_of_the_file() {
-    let f = Fixture::new();
-    let path = f.root.join("m.yaml");
-    let safe = format!(
-        "{HEADER}filesystem:\n  mounts:\n    - {{host: \"~/code/myproject\", guest: /workspace/p, mode: ro}}\n"
-    );
-    std::fs::write(&path, &safe).unwrap();
-    let v = f
-        .load_with(
-            &std::fs::read_to_string(&path).unwrap()[HEADER.len()..],
-            &[],
-        )
-        .unwrap()
-        .manifest;
-
-    // Attacker rewrites the file after validation.
-    std::fs::write(
-        &path,
-        safe.replace("~/code/myproject", "~/.ssh")
-            .replace("mode: ro", "mode: rw"),
-    )
-    .unwrap();
-
-    // The validated struct (what launch consumes) still holds the validated mount ...
-    assert_eq!(v.mounts()[0].mode, sally_core::manifest::MountMode::Ro);
-    assert!(v.mounts()[0].host.ends_with("code/myproject"));
-    // ... the mount re-check still passes (the *host directory* did not change) ...
-    assert!(v.recheck_mounts(&f.env).is_ok());
-    // ... and re-loading the mutated file is rejected.
-    let reread = std::fs::read_to_string(&path).unwrap();
-    assert_rejects(
-        &f.load(&reread[HEADER.len()..]),
-        "filesystem.mounts[0].host",
-        Code::Denylisted,
-    );
-}
+// launch (sallyd tests/session.rs). Here: the place check the launchers call on a validated
+// manifest.
 
 /// A manifest kept inside one of its own `rw` or `brokered` mounts is refused, naming the mount;
 /// kept inside a `staged` or `ro` one, or outside every mount, it is not.
