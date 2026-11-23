@@ -94,6 +94,13 @@ sally manifest summary m.yaml
 ```
 
 It names the folder, says shell commands need your approval and that there is no network.
+Its last line is `sha256 <hex>`, the hash of the text it read.
+
+Every launch from a manifest needs your consent. In a terminal, `sally session start` and
+`sally sandbox run` print the summary again and ask
+`Start a session with this manifest? Type yes to start:`; type `yes` (each launch below asks).
+Off a terminal (input piped in, a script) pass `--accept-manifest <hex>` with that hash
+instead; a hash of any other text refuses. Never use a hash that came with a manifest.
 
 ## 5. Drive it with nobody to approve
 
@@ -194,10 +201,11 @@ hello
 exit: 0
 ```
 
-Stdin reaches the command as UTF-8 text, and its exit code is yours:
+Stdin reaches the command as UTF-8 text, and its exit code is yours. Piped input is not a
+terminal, so this launch takes the hash `sally manifest summary m.yaml` printed:
 
 ```sh
-printf 'one\ntwo\n' | sally sandbox run --manifest m.yaml -- sh -c 'cat; exit 3'
+printf 'one\ntwo\n' | sally sandbox run --manifest m.yaml --accept-manifest <hex> -- sh -c 'cat; exit 3'
 echo "exit: $?"
 ```
 

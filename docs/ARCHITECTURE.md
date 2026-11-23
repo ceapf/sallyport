@@ -635,8 +635,9 @@ peer to be its own uid (architect Q78), and it reads replies under the same 1 Mi
 In M1 the CLI runs `doctor` (host facts only; container checks are #119), `manifest
 validate|summary` (an advisory verdict: `sallyd` validates again at `sessions.create`; at
 launch, `sally session start` and `sally sandbox run` run the same validation as a refusing
-gate, check where the manifest file is kept, show what it grants and, for a manifest with a
-warning or an acknowledged risk, ask for consent before they send it, MANIFEST_SPEC §1.2),
+gate, check where the manifest file is kept, show what it grants and need consent for every
+launch, a typed `yes` or the hash of the exact text read, before they send it, MANIFEST_SPEC
+§1.2),
 `audit verify|tail` (read-only, no `audit.lock`) and `secrets set|list|rm` itself, without
 `sallyd` (architect Q52, Q106–Q110). Paths come from `sally_core::paths`, as `sallyd`'s do.
 `secrets set|rm` write the store directly under its writers' lock: an exclusive `flock` on a
