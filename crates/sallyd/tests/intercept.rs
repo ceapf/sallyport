@@ -19,7 +19,9 @@ use std::time::Duration;
 
 use common::container::{Lx, SHIM_LOG, exec, net_image, rt};
 use common::egress::tls_upstream;
-use common::forms::{ALPHABETS, PCTS, b64, basic_blob, basic_forms, core_range, forms_of, pct};
+use common::forms::{
+    ALPHABETS, PCTS, b64, basic_blob, basic_forms, core_range, forms_of, json_str, pct,
+};
 use common::intercept::{
     allow_routes, body_and_length, check_echo_forms, connect, credential_in, filled, get_req, gh,
     git, header_values, mock3, over, rendered, responses, session_ca, test_ca, tls, upstream_reply,
@@ -305,14 +307,20 @@ fn the_test_encoders_match_published_vectors() {
     assert_eq!(pct("a/b c", PCTS[1]), "a%2fb%20c");
     assert_eq!(pct("a/b c", PCTS[2]), "a%2Fb+c");
     assert_eq!(pct("a/b c", PCTS[3]), "a/b%20c");
+    assert_eq!(pct("a/b c!", PCTS[7]), "a/b+c%21");
+    assert_eq!(pct("a/b c!", PCTS[11]), "a%2fb+c!");
+    assert_eq!(pct("(x)'*", PCTS[8]), "(x)'*");
+    assert_eq!(json_str("a\"b\\c\n\u{1}"), "a\\\"b\\\\c\\n\\u0001");
     // The secret's core of base64("A" ‖ "foo" ‖ …): bits 8..32 give characters 2..5.
     assert_eq!(core_range(1, 3), 2..5);
-    // Each percent spelling of GIT_TOKEN's canary differs from the raw value and the others.
+    // Each percent spelling of GIT_TOKEN's canary, and its JSON-string spelling, differs from
+    // the raw value and from the others.
     let mut spellings: Vec<String> = PCTS.iter().map(|p| pct(&git(), *p)).collect();
+    spellings.push(json_str(&git()));
     spellings.push(git());
     spellings.sort();
     spellings.dedup();
-    assert_eq!(spellings.len(), PCTS.len() + 1);
+    assert_eq!(spellings.len(), PCTS.len() + 2);
 }
 
 /// RT-SEC-03: injection scope. Controls: `Credentials::prepare`, called with the tunnel's own host
@@ -811,12 +819,14 @@ fn rt_sec_11_the_workspace_holds_only_the_placeholder() {
 }
 
 /// RT-SEC-12: encoded echoes split across chunks. Each `{basic}` grant host answers
-/// `/echo-forms` with `GIT_TOKEN`'s raw value, every percent spelling, base64 of
+/// `/echo-forms` with `GIT_TOKEN`'s raw value, every percent spelling (three keep-sets, with and
+/// without `+` for a space, both hex cases), its JSON-string spelling, base64 of
 /// prefix‖secret‖suffix at all three alignments in both alphabets, the padded and the unpadded
 /// blob, and the request it got, in 5-byte HTTP chunks; and `/echo-headers` with the rendered
 /// value in a header. The three users put the secret at all three alignments inside the blob.
 /// Controls: the held-back overlap of `redact::Stream` (without it, a form split across chunks
-/// passes); the forms `Credentials::new` builds: the secret's own (raw, percent, base64 cores),
+/// passes); the forms `Credentials::new` builds: the secret's own (raw, percent with each
+/// keep-set, JSON-string, base64 cores),
 /// and the grant's rendered value and blobs (`render`; without them the `Basic ` prefix and
 /// the blob's edge characters pass); `redact::headers` for the header echo.
 #[test]
