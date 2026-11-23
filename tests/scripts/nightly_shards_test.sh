@@ -215,6 +215,13 @@ names "a missing Makefile" "$tmp/gone.mk is missing or unreadable"
 # With no target to expect and no row to check, only this check can fail the run.
 expect 1 "a Makefile with no mutation target" "$(workflow empty "")" "$(makefile none lint)"
 names "a Makefile with no mutation target" "no mutants targets"
+# Keys ahead of `jobs:` are no jobs: an indented `workflow_dispatch:` under `on:` must not take a
+# SHARD env as its own.
+f="$tmp/before-jobs.yml"
+printf 'on:\n  workflow_dispatch:\nenv:\n  SHARD: ${{ matrix.shard }}\n' >"$f"
+cat "$good" >>"$f"
+expect 1 "a SHARD env ahead of jobs:" "$f" "$mk"
+names "a SHARD env ahead of jobs:" "'SHARD: \${{ matrix.shard }}' is outside any job"
 outside="$(workflow outside "$deny"$'\n'"$wide")"
 sed -i '1i - { shard: 0/1 }' "$outside"
 expect 1 "a row outside any job" "$outside" "$mk"

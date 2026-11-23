@@ -69,8 +69,8 @@ jobs:
   # run per mutant, so no podman is needed. Each mutant rebuilds the crate and reruns its whole
   # test set. Sized as the deny paths are (above), from run 45048224610: core 1619 mutants, 204
   # minutes of work, its slowest shard about 39 minutes at 6 shards (both of its 2 shards hit the
-  # 90-minute limit); sallyd 3746 mutants, 2044 minutes, about 68 at 36 shards (117 at 24); cli 21
-  # and shim 2 unsharded. The counts leave room for the round-robin split to shift by a third as
+  # 90-minute limit); sallyd 3746 mutants, 2044 minutes, about 68 at 36 shards (at 24 its slowest
+  # job took 117, the mutant phase about 110); cli 21 and shim 2 unsharded. The counts leave room for the round-robin split to shift by a third as
   # mutants are added. Mutant TIMEOUTs (#82) need the 150-minute sallyd limit. Some shards queue
   # behind the concurrent-job limit; that is fine for a nightly. Tests run under nextest's
   # `mutants` profile, whose 30 s per-test limit ends a hung test long before the whole-mutant
