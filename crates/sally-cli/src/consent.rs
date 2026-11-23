@@ -202,8 +202,9 @@ pub fn besides_summary(v: &Validated) -> Vec<String> {
 
 /// The lines shown before a launch of `v`: the summary's, then [`besides_summary`].
 ///
-/// TODO(#257): a manifest whose shown lines hold non-ASCII text, which the spec accepts, cannot
-/// be launched from the CLI.
+/// TODO(#257): the summary's lines are printable ASCII, but the data-can-leave warning shown
+/// after it shows realpaths raw, so a manifest with a mount whose realpath holds non-ASCII text,
+/// which the spec accepts, cannot be launched from the CLI.
 ///
 /// # Errors
 /// The first line that fails the clean-check, escaped (printable ASCII): such a manifest starts

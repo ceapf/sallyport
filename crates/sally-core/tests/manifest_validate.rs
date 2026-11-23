@@ -948,15 +948,18 @@ fn summary_of_coding_agent() {
          - uses the model qwen2.5-coder-7b-instruct-q4_k_m.\n\
          - can change files in $ROOT/home/code/myproject (at /workspace/myproject) only inside the sandbox; your folder is not changed. The changes are kept apart (`sally session changes` lists them; this version cannot apply them), and commits made in the session are never applied.\n\
          - can reach pypi.org on port 443, files.pythonhosted.org on port 443, api.github.com on port 443, github.com on port 443 (through the Sallyport proxy only).\n\
-         - uses your GITHUB_TOKEN secret only toward api.github.com (the agent never sees the value).\n\
+         - can receive up to 256MiB in one response body the proxy reads, for fetch and at hosts with a credential grant (default 64MiB).\n\
+         - uses your GITHUB_TOKEN secret only toward api.github.com, sent as the header \"Authorization\" in the form \"Bearer {value}\" (the agent never sees the value).\n\
          - sees GH_TOKEN set to a placeholder, never the real value.\n\
-         - uses your GITHUB_TOKEN secret only toward github.com (the agent never sees the value).\n\
+         - uses your GITHUB_TOKEN secret only toward github.com, sent as the header \"Authorization\" in the form \"Basic {basic}\" (the agent never sees the value).\n\
          - can run shell commands with your approval.\n\
-         - fetch can only read (GET/HEAD) without your approval.\n\
+         - fetch sends GET and HEAD requests without asking you. A GET can still change things at a host. At a host with a credential grant it carries that credential.\n\
          - may call: fs_read, fs_list, fetch.\n\
+         - an approval request waits up to 10m for your answer, then is denied (default 5m).\n\
          - runs tools in a custom workspace image: ghcr.io/ceapf/sallyport-workspace-python@sha256:0000000000000000000000000000000000000000000000000000000000000000.\n\
          - can execute files it writes to /tmp.\n\
-         - is limited to 6 CPUs, 12GiB memory, 1024 processes, and 4h of wall time.\n"
+         - is limited to 6 CPUs, 12GiB memory, 1024 processes, and 4h of wall time.\n\
+         - can write up to 4GiB to /tmp, counted against its memory (default 1GiB).\n"
     );
 }
 

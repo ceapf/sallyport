@@ -214,6 +214,10 @@ pub fn check_glob(g: &str) -> Result<(), GlobError> {
     if g.chars().any(char::is_control) {
         return Err(GlobError::Control(own()));
     }
+    // RT-MAN-05: a space at either end is invisible in the summary's quoted glob too.
+    if g.starts_with(char::is_whitespace) || g.ends_with(char::is_whitespace) {
+        return Err(GlobError::EdgeSpace);
+    }
     if g.ends_with('/') {
         return Err(GlobError::TrailingSlash(own()));
     }
@@ -250,6 +254,10 @@ pub enum GlobError {
     /// Contains a control character.
     #[error("{0:?} contains a control character")]
     Control(String),
+    /// Starts or ends with a whitespace character. The glob is not echoed: manifest text that
+    /// failed its own check is named by field and reason only (#195).
+    #[error("glob starts or ends with a whitespace character")]
+    EdgeSpace,
     /// Ends with `/`.
     #[error("{0:?} ends with \"/\"; use \"dir/**\" for a directory")]
     TrailingSlash(String),
@@ -391,6 +399,34 @@ fn overlap_message(host: &Path, other: &Path, j: usize, kind: Overlap) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RT-MAN-05: a glob whose first or last character is whitespace (a space, a tab is already
+    /// a control, a no-break space) is refused without echoing it; a space inside is a literal.
+    #[test]
+    fn a_glob_with_whitespace_at_either_end_is_refused_and_inside_is_kept() {
+        for bad in [
+            " a",
+            "a ",
+            "\u{a0}a",
+            "a\u{a0}",
+            " ",
+            "\u{3000}x/y",
+            "x/y\u{2003}",
+        ] {
+            assert_eq!(check_glob(bad), Err(GlobError::EdgeSpace), "{bad:?}");
+        }
+        assert_eq!(
+            GlobError::EdgeSpace.to_string(),
+            "glob starts or ends with a whitespace character"
+        );
+        for good in ["a b", "a\u{a0}b", "drafts/*.md, notes/*", "a/ b/c"] {
+            assert_eq!(check_glob(good), Ok(()), "{good:?}");
+        }
+        // A zero-width character is not whitespace: accepted at an edge, shown escaped.
+        assert_eq!(check_glob("\u{200b}a"), Ok(()));
+        // The control check runs first.
+        assert!(matches!(check_glob(" \u{1b}"), Err(GlobError::Control(_))));
+    }
 
     /// Pinned on short paths: through the validator, a long checkout path can push the index
     /// past the diagnostic cut.

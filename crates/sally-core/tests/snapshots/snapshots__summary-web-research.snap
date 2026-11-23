@@ -7,8 +7,12 @@ This agent:
 - uses a model you pick at launch.
 - can read $ROOT/home/Documents/research (at /workspace/research); can write there with your approval; cannot delete there.
 - can reach api.search.brave.com on port 443, any public hostname on port 443 (through the Sallyport proxy only).
-- uses your BRAVE_SEARCH_KEY secret only toward api.search.brave.com (the agent never sees the value).
+- can send up to 1MiB in one request body the proxy reads, for fetch and at hosts with a credential grant (default 8MiB).
+- can receive up to 16MiB in one response body the proxy reads, for fetch and at hosts with a credential grant (default 64MiB).
+- can hold up to 16 proxy connections open at once (default 32).
+- uses your BRAVE_SEARCH_KEY secret only toward api.search.brave.com, sent as the header "X-Subscription-Token" in the form "{value}" (the agent never sees the value).
 - cannot run shell commands.
-- fetch can only read (GET/HEAD) without your approval.
+- fetch sends GET and HEAD requests without asking you. A GET can still change things at a host. At a host with a credential grant it carries that credential.
 - may call: fs_read, fs_list, fs_write, fetch.
+- up to 3 approval requests can wait at once; more are denied (default 5).
 - is limited to 2 CPUs, 4GiB memory, 256 processes, and 2h of wall time.

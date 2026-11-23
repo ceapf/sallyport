@@ -253,8 +253,9 @@ fn check_fetch(m: &Manifest, d: &mut Diags) {
     }
 }
 
-/// `fs_read`/`fs_list` act on any mount; `fs_write`/`fs_delete` on `rw` and `brokered` mounts
-/// (`ro` → denied; `staged` → denied: only the sandbox's own commands write there). Enabling them with nothing to act on is a mistake worth a warning.
+/// `fs_read`/`fs_list` act on any mount; `fs_write`/`fs_delete` on `rw`, `staged` and `brokered`
+/// mounts (`ro` → denied; on `staged` the broker runs them without asking, in the session's own
+/// copy). Enabling them with nothing to act on is a mistake worth a warning.
 fn check_fs_tools(m: &Manifest, d: &mut Diags) {
     let has = |tool| m.tools.builtin.contains(&tool);
     let mounts = &m.filesystem.mounts;
@@ -265,14 +266,17 @@ fn check_fs_tools(m: &Manifest, d: &mut Diags) {
             "fs_read/fs_list act on mounts, and there are none",
         );
     }
-    let writable = mounts
-        .iter()
-        .any(|mt| matches!(mt.mode, MountMode::Rw | MountMode::Brokered));
+    let writable = mounts.iter().any(|mt| {
+        matches!(
+            mt.mode,
+            MountMode::Rw | MountMode::Staged | MountMode::Brokered
+        )
+    });
     if (has(BuiltinTool::FsWrite) || has(BuiltinTool::FsDelete)) && !writable {
         d.warn(
             "tools.builtin",
             Code::Inconsistent,
-            "fs_write/fs_delete act on rw or brokered mounts, and there are none",
+            "fs_write/fs_delete act on rw, staged or brokered mounts, and there are none",
         );
     }
 }

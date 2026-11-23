@@ -3,7 +3,7 @@
 //! Covered here: RT-MAN-01, RT-MAN-02, RT-MAN-03 (the place check the launchers call; its red-team
 //! tests run the `sally` binary and a real launch), RT-FS-05 (validate half),
 //! RT-FS-06 (validate + re-check half), RT-FS-11 (the filesystem-kind leg, every host), RT-SEC-08,
-//! RT-MAN-04, RT-FS-19. The launch halves ("no container launched"; a launch from a manifest
+//! RT-MAN-04, RT-MAN-05 (launch summary disguise), RT-FS-19. The launch halves ("no container launched"; a launch from a manifest
 //! needs consent to the text it sends) are asserted by the sandbox, session and CLI tests.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -987,6 +987,449 @@ fn rt_man_04_data_can_leave_flags_coding_agent_and_web_research_but_not_chat_onl
             );
         }
     }
+}
+
+// ---- RT-MAN-05: launch summary disguise -------------------------------------------------------
+
+/// An accepted manifest that writes every setting the table below loosens at its default value,
+/// so each variant differs from it in exactly one value.
+const LOOSEN_BASE: &str = "\
+filesystem:
+  mounts:
+    - host: \"~/code/myproject\"
+      guest: /workspace/p
+      mode: staged
+network:
+  mode: proxy
+  allow:
+    - host: api.github.com
+  max_request_bytes: 8MiB
+  max_response_bytes: 64MiB
+  max_connections: 32
+secrets:
+  - name: GITHUB_TOKEN
+    inject: {host: api.github.com, header: Authorization, format: \"Bearer {value}\"}
+tools:
+  builtin: [fs_read]
+approvals:
+  timeout: 5m
+  max_pending: 5
+audit:
+  level: full
+runtime:
+  tmp_size: 1GiB
+  tmp_exec: false
+  stage_size: 10GiB
+";
+
+/// A pinned image reference for the image rows.
+const PINNED_IMAGE: &str =
+    "ghcr.io/example/image@sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+/// For each setting that loosens a default: `(field, default text, changed text, phrase)`, the
+/// field as the JSON schema names it (`Type.field`). The variant replaces the default text once;
+/// its summary must hold the phrase, the base's must not. Every field `FIELDS` marks
+/// `WhenNotDefault` has a row.
+const LOOSENED: &[(&str, &str, &str, &str)] = &[
+    (
+        "Approvals.timeout",
+        "timeout: 5m",
+        "timeout: 1h",
+        "an approval request waits up to 1h for your answer, then is denied (default 5m).",
+    ),
+    (
+        "Approvals.max_pending",
+        "max_pending: 5",
+        "max_pending: 64",
+        "up to 64 approval requests can wait at once; more are denied (default 5).",
+    ),
+    (
+        "Inject.header",
+        "header: Authorization",
+        "header: X-Api-Key",
+        "sent as the header \"X-Api-Key\"",
+    ),
+    (
+        "Inject.format",
+        "format: \"Bearer {value}\"",
+        "format: \"token {value}\"",
+        "in the form \"token {value}\"",
+    ),
+    (
+        // Write tools on a staged mount.
+        "Tools.builtin",
+        "builtin: [fs_read]",
+        "builtin: [fs_read, fs_write]",
+        "The fs_write tool changes that copy without asking you.",
+    ),
+    (
+        "Runtime.stage_size",
+        "stage_size: 10GiB",
+        "stage_size: 100GiB",
+        "(default 10GiB)",
+    ),
+    (
+        "Runtime.tmp_size",
+        "tmp_size: 1GiB",
+        "tmp_size: 4GiB",
+        "(default 1GiB)",
+    ),
+    (
+        "Network.max_request_bytes",
+        "max_request_bytes: 8MiB",
+        "max_request_bytes: 1GiB",
+        "(default 8MiB)",
+    ),
+    (
+        "Network.max_response_bytes",
+        "max_response_bytes: 64MiB",
+        "max_response_bytes: 16GiB",
+        "(default 64MiB)",
+    ),
+    (
+        "Network.max_connections",
+        "max_connections: 32",
+        "max_connections: 1024",
+        "(default 32)",
+    ),
+    (
+        "Runtime.tmp_exec",
+        "tmp_exec: false",
+        "tmp_exec: true",
+        "can execute files it writes to /tmp.",
+    ),
+    (
+        "Audit.level",
+        "level: full",
+        "level: actions",
+        "is audited at reduced detail",
+    ),
+    (
+        "SecretGrant.expose_env",
+        "format: \"Bearer {value}\"}\n",
+        "format: \"Bearer {value}\"}\n    expose_env: GH_TOKEN\n",
+        "sees GH_TOKEN set to a placeholder, never the real value.",
+    ),
+];
+
+/// The image rows, whose changed text names [`PINNED_IMAGE`]: `(field, default text, changed
+/// text, phrase)` as in [`LOOSENED`].
+fn loosened_images() -> [(&'static str, &'static str, String, String); 2] {
+    [
+        (
+            "Runtime.image",
+            "runtime:\n",
+            format!("runtime:\n  image: {PINNED_IMAGE}\n"),
+            format!("runs tools in a custom workspace image: {PINNED_IMAGE}."),
+        ),
+        (
+            "Manifest.harness",
+            "runtime:\n",
+            format!("harness:\n  image: {PINNED_IMAGE}\nruntime:\n"),
+            format!("runs a custom harness image: {PINNED_IMAGE}."),
+        ),
+    ]
+}
+
+/// Every row of [`LOOSENED`] and [`loosened_images`].
+fn loosened_rows() -> Vec<(&'static str, &'static str, String, String)> {
+    LOOSENED
+        .iter()
+        .map(|&(f, d, c, p)| (f, d, c.to_owned(), p.to_owned()))
+        .chain(loosened_images())
+        .collect()
+}
+
+/// SI-5: a manifest widens only through settings the summary names. Each variant differs from an
+/// accepted base in one value; the control is the base itself, accepted and without the phrase.
+#[test]
+fn rt_man_05_each_setting_that_loosens_a_default_is_named() {
+    let f = Fixture::new();
+    let base = sally_core::manifest::summary(
+        &f.load(LOOSEN_BASE)
+            .unwrap_or_else(|e| panic!("base: {e:#?}"))
+            .manifest,
+    );
+    let mut unnamed = Vec::new();
+    for (field, default, changed, phrase) in loosened_rows() {
+        assert_eq!(LOOSEN_BASE.matches(default).count(), 1, "{field}");
+        assert!(!base.contains(&phrase), "{field}: base names it:\n{base}");
+        let body = LOOSEN_BASE.replacen(default, &changed, 1);
+        let v = f.load(&body).unwrap_or_else(|e| panic!("{field}: {e:#?}"));
+        if !sally_core::manifest::summary(&v.manifest).contains(&phrase) {
+            unnamed.push(field);
+        }
+    }
+    assert!(unnamed.is_empty(), "not named: {unnamed:?}\nbase:\n{base}");
+}
+
+/// A manifest whose text is shown in each kind of summary line: a mount folder name, globs, an
+/// injection format, MCP arguments (the last one long enough to be cut), and a description, so
+/// the printable-ASCII and line-count checks cover it should it ever be shown. `hostile` puts
+/// terminal and line-break controls, a direction override and a
+/// zero-width space where each field accepts them; otherwise the same fields hold plain text.
+fn disguise_body(folder: &str, rw_folder: &str, hostile: bool) -> String {
+    let (globs, format, args, description) = if hostile {
+        (
+            r#"["dr\u202eafts/*.md", "a\", \"b", "\u200bnotes/*"]"#,
+            r#""Bearer\u202e {value}\u200b""#,
+            r#"[srv, "\e[2J", "x\r\nThis agent:\n- has no network access.", "\u202e\u200b", "a`b""#,
+            r#""DESCRIPTION-TEXT\n- cannot run shell commands.\t\u202e\u200b""#,
+        )
+    } else {
+        (
+            r#"["drafts/*.md", "a-b", "notes/*"]"#,
+            r#""Bearer {value}""#,
+            r#"[srv, clear, "x", "y", "a-b""#,
+            r#""DESCRIPTION-TEXT""#,
+        )
+    };
+    let long = "a".repeat(4096);
+    format!(
+        "description: {description}
+filesystem:
+  mounts:
+    - host: \"~/code/{folder}\"
+      guest: /workspace/p
+      mode: brokered
+      approve:
+        writes: {globs}
+    - host: \"~/code/{rw_folder}\"
+      guest: /workspace/q
+      mode: rw
+network:
+  mode: proxy
+  allow:
+    - host: api.github.com
+secrets:
+  - name: GITHUB_TOKEN
+    inject: {{host: api.github.com, header: Authorization, format: {format}}}
+tools:
+  builtin: [fs_write]
+  mcp:
+    - {{name: x, command: {args}, {long}]}}
+"
+    )
+}
+
+/// G5 "disguise", for the launch summary: hostile manifest text is shown escaped to printable
+/// ASCII, one line per item as for plain text, with the cut marked outside the backticks. The
+/// control is the plain twin, accepted, with the same line count; and the escaped forms are
+/// present, so the hostile text was shown and not dropped.
+#[test]
+fn rt_man_05_hostile_manifest_text_is_shown_escaped_on_one_line_each() {
+    let f = Fixture::new();
+    for folder in ["my\u{202e}proj\u{200b}ect", "oth\u{202e}er"] {
+        std::fs::create_dir_all(f.home().join("code").join(folder)).unwrap();
+    }
+    let load = |hostile: bool, folder: &str, rw_folder: &str| {
+        let body = disguise_body(folder, rw_folder, hostile);
+        let v = f
+            .load(&body)
+            .unwrap_or_else(|e| panic!("{hostile}: {e:#?}"));
+        sally_core::manifest::summary(&v.manifest)
+    };
+    let plain = load(false, "myproject", "other");
+    let s = load(true, r"my\u202eproj\u200bect", r"oth\u202eer");
+    assert!(
+        s.bytes().all(|b| b == b'\n' || (0x20..0x7f).contains(&b)),
+        "not printable ASCII:\n{s:?}"
+    );
+    assert_eq!(
+        s.lines().count(),
+        plain.lines().count(),
+        "{s}\n---\n{plain}"
+    );
+    for escaped in [
+        // The folder name, in the data-can-leave line and the mount's line.
+        r"my\u{202e}proj\u{200b}ect",
+        // Each glob quoted on its own; the one holding `", "` stays one glob.
+        r#"only for "dr\u{202e}afts/*.md", "a\", \"b", "\u{200b}notes/*""#,
+        r#"in the form "Bearer\u{202e} {value}\u{200b}""#,
+        r#"`"srv" "\x1b[2J" "x\x0d\x0aThis agent:\x0a- has no network access." "\u{202e}\u{200b}" "a\x60b" "aaa"#,
+    ] {
+        assert!(s.contains(escaped), "{escaped}\n---\n{s}");
+    }
+    assert_eq!(s.matches(r"my\u{202e}proj\u{200b}ect").count(), 2, "{s}");
+    // The rw folder, in the data-can-leave line, the [direct-write] line and the mount's line.
+    assert!(
+        s.contains(r"[direct-write] Changes the agent makes in "),
+        "{s}"
+    );
+    assert_eq!(s.matches(r"oth\u{202e}er").count(), 3, "{s}");
+    // The long argument is cut inside; the marker follows the closing backtick, and the line
+    // holds only the command's own two backticks (an argument's is written \x60).
+    for summary in [&s, &plain] {
+        let line = summary
+            .lines()
+            .find(|l| l.contains("MCP server x"))
+            .unwrap();
+        assert_eq!(line.matches('`').count(), 2, "{line}");
+        let (_, after) = line
+            .split_once("\"` (cut here: inside argument 6 of 6; ")
+            .unwrap();
+        let (n, rest) = after.split_once(" more bytes not shown); ").unwrap();
+        let n: usize = n.parse().unwrap();
+        assert!(n > 0 && n < 4096, "{line}");
+        assert!(rest.starts_with("each of its tool calls"), "{line}");
+    }
+}
+
+/// A glob with whitespace at either end is refused, as `invalid-value` at its own path; the twin
+/// with the space inside is accepted.
+#[test]
+fn rt_man_05_a_glob_with_a_leading_or_trailing_space_is_refused() {
+    let f = Fixture::new();
+    let body = |glob: &str| {
+        format!(
+            "filesystem:\n  mounts:\n    - host: \"~/code/myproject\"\n      guest: /workspace/p\n      mode: brokered\n      approve:\n        writes: [\"{glob}\"]\ntools:\n  builtin: [fs_write]\n"
+        )
+    };
+    for bad in [" drafts/*.md", "drafts/*.md ", "\\u00a0drafts/*.md"] {
+        assert_rejects(
+            &f.load(&body(bad)),
+            "filesystem.mounts[0].approve.writes[0]",
+            Code::InvalidValue,
+        );
+    }
+    twin_ok(&f, &body("drafts/my notes/*.md"));
+}
+
+/// How the summary treats each manifest field (`Type.field` as the JSON schema names it).
+#[derive(Debug, Clone, Copy)]
+enum Shown {
+    /// Always in a line of the summary.
+    Always,
+    /// Named, with its default, when it differs from the default (or when it is set).
+    WhenNotDefault,
+    /// Not a loosening: identity, reserved, model tuning, an acknowledgement, or text that grants
+    /// nothing.
+    NotALoosening,
+    /// A section: its own fields are classified under their type.
+    Section,
+}
+
+/// Every field of the manifest, classified. A new field fails
+/// `rt_man_05_every_manifest_field_is_classified_for_the_summary` until it is added here.
+const FIELDS: &[(&str, Shown)] = &[
+    ("Manifest.apiVersion", Shown::NotALoosening),
+    ("Manifest.kind", Shown::NotALoosening),
+    ("Manifest.name", Shown::NotALoosening),
+    ("Manifest.description", Shown::NotALoosening),
+    ("Manifest.model", Shown::Section),
+    ("Manifest.harness", Shown::WhenNotDefault),
+    ("Manifest.runtime", Shown::Section),
+    ("Manifest.filesystem", Shown::Section),
+    ("Manifest.network", Shown::Section),
+    ("Manifest.secrets", Shown::Section),
+    ("Manifest.tools", Shown::Section),
+    ("Manifest.approvals", Shown::Section),
+    ("Manifest.audit", Shown::Section),
+    ("Manifest.policy", Shown::Section),
+    ("Approvals.timeout", Shown::WhenNotDefault),
+    ("Approvals.max_pending", Shown::WhenNotDefault),
+    ("ApproveGlobs.writes", Shown::Always),
+    ("ApproveGlobs.deletes", Shown::Always),
+    ("Audit.level", Shown::WhenNotDefault),
+    ("Filesystem.mounts", Shown::Always),
+    ("Filesystem.deny", Shown::NotALoosening),
+    ("Harness.image", Shown::Always),
+    ("HostRule.host", Shown::Always),
+    ("HostRule.ports", Shown::Always),
+    ("Inject.host", Shown::Always),
+    ("Inject.header", Shown::Always),
+    ("Inject.format", Shown::Always),
+    ("Inject.basic_user", Shown::NotALoosening),
+    ("McpServer.name", Shown::Always),
+    ("McpServer.command", Shown::Always),
+    // Its keys are shown; its values are not a loosening.
+    ("McpServer.env", Shown::Always),
+    ("McpServer.approve", Shown::Always),
+    ("Model.ref", Shown::Always),
+    ("Model.context", Shown::NotALoosening),
+    ("Model.gpu_layers", Shown::NotALoosening),
+    ("Mount.host", Shown::Always),
+    ("Mount.guest", Shown::Always),
+    ("Mount.mode", Shown::Always),
+    ("Mount.approve", Shown::Always),
+    ("Network.mode", Shown::Always),
+    ("Network.allow", Shown::Always),
+    (
+        "Network.acknowledge_unrestricted_egress",
+        Shown::NotALoosening,
+    ),
+    ("Network.max_request_bytes", Shown::WhenNotDefault),
+    ("Network.max_response_bytes", Shown::WhenNotDefault),
+    ("Network.max_connections", Shown::WhenNotDefault),
+    ("Policy.signed_by", Shown::NotALoosening),
+    ("Policy.signature", Shown::NotALoosening),
+    ("Runtime.image", Shown::WhenNotDefault),
+    ("Runtime.cpus", Shown::Always),
+    ("Runtime.memory", Shown::Always),
+    ("Runtime.pids", Shown::Always),
+    ("Runtime.timeout", Shown::Always),
+    ("Runtime.tmp_size", Shown::WhenNotDefault),
+    ("Runtime.tmp_exec", Shown::WhenNotDefault),
+    ("Runtime.stage_size", Shown::WhenNotDefault),
+    ("SecretGrant.name", Shown::Always),
+    ("SecretGrant.inject", Shown::Section),
+    ("SecretGrant.expose_env", Shown::WhenNotDefault),
+    ("Tools.builtin", Shown::Always),
+    ("Tools.shell", Shown::Always),
+    ("Tools.destructive_requires_approval", Shown::Always),
+    ("Tools.fetch_writes", Shown::Always),
+    ("Tools.acknowledge_unapproved", Shown::NotALoosening),
+    ("Tools.mcp", Shown::Always),
+];
+
+/// A field added to the manifest must be classified for the summary, so a new setting cannot widen
+/// the session without a decision on whether the summary names it, and every field classified as
+/// named when not default has a row in the table that proves it is named. A tripwire on the schema
+/// and the tables, not on summary code: that is what
+/// `rt_man_05_each_setting_that_loosens_a_default_is_named` checks. The schema's field set holds a
+/// known field, so the comparison is not of two empty sets.
+#[test]
+fn rt_man_05_every_manifest_field_is_classified_for_the_summary() {
+    let schema = sally_core::manifest::json_schema();
+    let v = schema.as_value();
+    let mut fields = std::collections::BTreeSet::new();
+    let props = |t: &str, def: &serde_json::Value, out: &mut std::collections::BTreeSet<String>| {
+        for k in def["properties"]
+            .as_object()
+            .into_iter()
+            .flat_map(|p| p.keys())
+        {
+            out.insert(format!("{t}.{k}"));
+        }
+    };
+    props("Manifest", v, &mut fields);
+    for (t, def) in v["$defs"].as_object().unwrap() {
+        props(t, def, &mut fields);
+    }
+    assert!(fields.contains("Approvals.timeout"), "{fields:#?}");
+    let table: std::collections::BTreeSet<String> =
+        FIELDS.iter().map(|(k, _)| (*k).to_owned()).collect();
+    assert_eq!(FIELDS.len(), table.len(), "a field is listed twice");
+    let unclassified: Vec<&String> = fields.difference(&table).collect();
+    let stale: Vec<&String> = table.difference(&fields).collect();
+    assert!(
+        unclassified.is_empty() && stale.is_empty(),
+        "unclassified: {unclassified:#?}\nnot in the schema: {stale:#?}"
+    );
+    let rows: std::collections::BTreeSet<&str> =
+        loosened_rows().into_iter().map(|(f, ..)| f).collect();
+    let untested: Vec<&str> = FIELDS
+        .iter()
+        .filter(|(k, shown)| matches!(shown, Shown::WhenNotDefault) && !rows.contains(k))
+        .map(|(k, _)| *k)
+        .collect();
+    assert!(untested.is_empty(), "no LOOSENED row: {untested:?}");
+    // And every row names a field of the table, so a renamed or misspelled row is not left stale.
+    let unknown: Vec<&&str> = rows.iter().filter(|r| !table.contains(**r)).collect();
+    assert!(
+        unknown.is_empty(),
+        "LOOSENED rows not in FIELDS: {unknown:?}"
+    );
 }
 
 // ---- RT-FS-19: a link out of a protected folder ------------------------------------------------

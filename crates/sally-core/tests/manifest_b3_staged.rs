@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{Fixture, assert_ok, assert_rejects, errors, warnings};
+use common::{Fixture, assert_ok, assert_rejects, errors, rendered_all, warnings};
 use sally_core::manifest::{Code, MountMode, parse, summary};
 
 const PROXY: &str = "network:\n  mode: proxy\n  allow:\n    - host: api.github.com\n";
@@ -273,16 +273,52 @@ fn staged_mounts_reject_approve_globs_like_rw() {
     );
 }
 
+/// The broker runs `fs_write` and `fs_delete` on a staged mount without asking (they land in the
+/// session's own copy), so the validator does not call them inert there, and the summary's staged
+/// line says so, naming only the enabled tools.
 #[test]
-fn broker_write_tools_do_not_act_on_staged_mounts() {
+fn broker_write_tools_act_on_staged_mounts() {
     let f = Fixture::new();
-    let r = f.load(&format!(
-        "{}tools:\n  builtin: [fs_write]\n",
-        mount("staged")
-    ));
+    for (tools, named) in [
+        ("[fs_write]", "The fs_write tool changes"),
+        ("[fs_delete]", "The fs_delete tool changes"),
+        (
+            "[fs_write, fs_delete]",
+            "The fs_write and fs_delete tools change",
+        ),
+    ] {
+        let r = f.load(&format!("{}tools:\n  builtin: {tools}\n", mount("staged")));
+        assert_ok(&r);
+        assert!(
+            !warnings(&r).contains(&("tools.builtin".to_owned(), Code::Inconsistent)),
+            "{tools}: {r:#?}"
+        );
+        let s = summary(&r.unwrap().manifest);
+        assert!(
+            s.contains(&format!("{named} that copy without asking you.")),
+            "{tools}:\n{s}"
+        );
+    }
+    // Without a write tool the staged line says nothing of one.
+    let s = summary(&f.load(&mount("staged")).unwrap().manifest);
+    assert!(!s.contains("without asking you"), "{s}");
+}
+
+/// Deny twin: on read-only mounts the write tools have nothing to act on, and that still warns.
+#[test]
+fn broker_write_tools_on_read_only_mounts_only_warn() {
+    let f = Fixture::new();
+    let r = f.load(&format!("{}tools:\n  builtin: [fs_write]\n", mount("ro")));
     assert!(
         warnings(&r).contains(&("tools.builtin".to_owned(), Code::Inconsistent)),
         "{r:#?}"
+    );
+    let text = rendered_all(&r).join("\n");
+    assert!(
+        text.contains(
+            "fs_write/fs_delete act on rw, staged or brokered mounts, and there are none"
+        ),
+        "{text}"
     );
 }
 

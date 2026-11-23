@@ -247,10 +247,13 @@ an object carrying a POSIX ACL is open to its owner only (architect ruling Q39; 
   asks. The validator refuses (`invalid-value`) anything that would silently match less than it
   seems to: an absolute glob, `..`, `.` or empty segments, a trailing `/` (write `dir/**`),
   `[ ] { } \`, a leading `!`, `**` inside a longer segment (`**.md`: write `**/*.md`), control
-  characters, and more than 256 bytes. The broker denies (`bad-path`) a write or delete whose
-  relative path is not canonical, before any glob is tried. Residual: on a
-  case-folding or normalizing file system a narrowed glob can match less than the file system
-  resolves; the default `["**"]` cannot.
+  characters, a whitespace character (`char::is_whitespace`, a no-break space included) as the
+  first or last character, and more than 256 bytes; the broker's matcher treats a refused glob
+  as `**`, so it asks for every path. A space inside a glob is literal, and `summary()` shows
+  each glob quoted on its own, so one glob holding `, ` cannot read as two. The broker denies
+  (`bad-path`) a write or delete whose relative path is not canonical, before any glob is tried.
+  Residual: on a case-folding or normalizing file system a narrowed glob can match less than the
+  file system resolves; the default `["**"]` cannot.
 - **Git metadata** (AMENDMENTS-02 B2(a), replacing the read-only hooks/config overlays of
   AMENDMENTS-01 §6.3). In an `rw` mount, every `.git` directory found by the launch scan is
   mounted as an overlay whose upper directory is session scratch, discarded at teardown, and
@@ -379,8 +382,28 @@ loads code, finds sockets or verifies TLS, and Sallyport sets the relevant ones 
 (`invalid-value`).
 
 A server's `command` runs at launch, without approval, inside the workspace (its mounts and
-egress); only its tool calls are gated by `approve`. `summary()` therefore shows the command (up to
-200 characters) and its env keys.
+egress); only its tool calls are gated by `approve`. `summary()` therefore shows the command and
+its env keys. Each argument is written between double quotes, escaped to printable ASCII (`"` as
+`\"`, a backtick as `\x60`, so no argument closes the code span), and the arguments are joined by
+one space inside backticks. At most 200 bytes of that text are shown, built left to right and
+never cut inside an escape; an argument starts only when its quotes and its first escape fit, and
+a cut argument keeps its closing quote. A cut is marked after the closing backtick, as
+` (cut here: inside argument K of N; B more bytes not shown)` when argument `K` was cut short, or
+` (cut here: before argument K of N; B more bytes not shown)` when the arguments before `K` are
+whole and `K` did not start. `K` counts from 1, `N` is the number of arguments, and `B` counts the
+argument bytes not shown (at least 1 after `inside`; 0 is possible after `before`, for empty
+arguments). Env values are not shown.
+
+`summary()` escapes every string it takes from the manifest or the host to printable ASCII (the
+alphabet of `sally_core::text`: `\\`, `\xNN` for controls, `\u{…}` beyond ASCII), so no manifest
+text adds a line or drives a terminal; the `[data-can-leave]` line is escaped whole. Mount
+realpaths, hostnames, names and images are shown bare; globs, MCP arguments and the injection
+header and format are quoted. `description` is not shown. Besides the gates above, the summary
+names, with the default, each of `approvals.timeout`, `approvals.max_pending`,
+`runtime.tmp_size` and `runtime.stage_size` that differs from its default, and, while a host is
+reachable, each of `network.max_request_bytes`, `max_response_bytes` and `max_connections`. Each
+secret's line names its injection header and format. A `staged` mount's line says when
+`fs_write`/`fs_delete` change its copy without asking.
 
 ## 2. Built-in mount denylist (not overridable)
 
