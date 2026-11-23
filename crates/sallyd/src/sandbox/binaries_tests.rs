@@ -148,7 +148,9 @@ fn a_helper_search_is_root_only_without_fall_through() {
     assert_eq!(e.to_string(), "t: not found in any of [\"/nonexistent/a\"]");
 }
 
-/// The host facts as `serve` builds them, from a config whose `sandbox.runtime_path` (or
+/// The host facts from `HostEnv::from_process` over the parsed config, as `serve` passes it
+/// (the folders that depend on the caller's environment replaced by the fixture's), from a
+/// config whose `sandbox.runtime_path` (or
 /// `sandbox.podman_path`) is a user-owned executable at `<home>/tools/crun/crun`, which the
 /// runtime check accepts: a mount of `~/tools` or of `~/tools/crun` is refused `denylisted`,
 /// naming the setting. Control: with the runtime at its default path (unset) the same mounts
@@ -175,6 +177,9 @@ fn the_folder_of_a_configured_binary_is_not_mountable() {
         env.other_homes.clear();
         env.xdg_data_home = None;
         env.xdg_state_home = None;
+        env.xdg_config_home = None;
+        env.xdg_runtime_dir = None;
+        env.podman_storage.clear();
         env.env_dirs.clear();
         env
     };

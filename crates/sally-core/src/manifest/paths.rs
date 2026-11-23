@@ -110,6 +110,25 @@ const HOME_SUBTREES: &[(&str, &str)] = &[
 /// history the host loads live there (MANIFEST_SPEC §2).
 const DEFAULT_XDG_HOMES: &[(&str, &str)] = &[(".local/share", CONFIG), (".local/state", STATE)];
 
+/// Folders one level deeper than the link scan reaches from their base, read as scan roots of
+/// their own: user units, session services and completion scripts the host loads. `(base,
+/// subfolder)`: the base is the data home (`.local/share`, `$XDG_DATA_HOME`) or the config home
+/// (`.config`, `$XDG_CONFIG_HOME`), in every form. Not rules: their bases are rules already.
+// TODO(#283): more such folders, each checked against its tool's documentation first.
+const SCAN_ONLY: &[(XdgBase, &str)] = &[
+    (XdgBase::Data, "systemd/user"),
+    (XdgBase::Data, "dbus-1/services"),
+    (XdgBase::Data, "bash-completion/completions"),
+    (XdgBase::Config, "systemd/user"),
+];
+
+/// Which XDG base folder a [`SCAN_ONLY`] entry lies under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XdgBase {
+    Data,
+    Config,
+}
+
 /// System paths. `/tmp` and `/var/tmp` hold other programs' Unix sockets (ssh-agent, X11); a
 /// read-only bind does not stop `connect()` on a socket, so mounting them is a network path
 /// around SI-1.
@@ -403,6 +422,21 @@ fn scan_folders(env: &HostEnv, scan: &mut Scan) -> Result<(), Incomplete> {
     if let Some(dir) = &env.xdg_state_home {
         scan.read(dir, links::DEPTH, STATE)?;
     }
+    for (base, sub) in SCAN_ONLY {
+        let bases: Vec<PathBuf> = match base {
+            XdgBase::Data => homes(env)
+                .map(|h| h.join(".local/share"))
+                .chain(env.xdg_data_home.clone())
+                .collect(),
+            XdgBase::Config => homes(env)
+                .map(|h| h.join(".config"))
+                .chain(env.xdg_config_home.clone())
+                .collect(),
+        };
+        for b in bases {
+            scan.read(&b.join(sub), links::DEPTH, CONFIG)?;
+        }
+    }
     let home_forms: Vec<PathBuf> = homes(env).flat_map(|h| forms_of(h)).collect();
     for d in env_rule_dirs(env) {
         if d.var != "PATH" || under_a_home(&home_forms, &d.path) {
@@ -429,7 +463,8 @@ fn binary_rules(b: &ConfiguredBinary) -> Vec<Rule> {
         let label = format!("{} (the folder of {})", f.display(), b.setting);
         rule(f, Scope::Subtree, Some(&label), Some(BINARY))
     };
-    let written = make(&folder(&normalize(&b.path)));
+    // From the path as given: `rule` resolves it as the kernel does (a `..` after a link).
+    let written = make(&folder(&b.path));
     // The written folder's rule holds its real form too; the file's own target may lie apart.
     let resolved = std::fs::canonicalize(&b.path)
         .ok()
@@ -707,6 +742,8 @@ fn root_kind(real: &Path, id: DirId) -> Result<u64, (Code, String)> {
         ));
     }
     let fs = rustix::fs::fstatfs(&fd).map_err(inspect)?;
+    // `f_type` is a C long: every magic is positive on 64-bit Linux. Where it is 32 bits, a
+    // magic with the top bit set does not convert and the root is refused (closed).
     u64::try_from(fs.f_type).map_err(|_| {
         (
             Code::NotFound,
@@ -1032,6 +1069,36 @@ mod tests {
             at_root.is_some_and(|w| w.contains("/ (the folder of sandbox.podman_path)")),
             "/"
         );
+        assert_eq!(
+            BINARY,
+            "Sallyport runs this binary on every launch, so the folder holding it is never mountable"
+        );
+        // A `..` after a link is resolved as the kernel does: `lnk -> build/out`, so
+        // `tools/lnk/../crun2/crun` is the link `build/crun2/crun`, whose folder is the rule
+        // (its target's folder, `build/out`, is one already).
+        std::fs::create_dir_all(home.join("build/crun2")).unwrap();
+        std::os::unix::fs::symlink(home.join("build/out/crun-1"), home.join("build/crun2/crun"))
+            .unwrap();
+        std::os::unix::fs::symlink(home.join("build/out"), home.join("tools/lnk")).unwrap();
+        e.configured_binaries = vec![ConfiguredBinary {
+            path: home.join("tools/lnk/../crun2/crun"),
+            setting: "sandbox.runtime_path",
+        }];
+        let d = fixed(&e, &[]);
+        assert!(d.refusal(&home.join("build/crun2")).is_some());
+    }
+
+    /// The kind is read only from the root that was identified: another directory's identity
+    /// refuses `mount-changed`.
+    #[test]
+    fn the_kind_is_read_from_the_identified_root_only() {
+        let t = TmpHome::new("kind");
+        let here = t.0.join("home/code/x");
+        assert!(root_kind(&here, t.id("home/code/x")).is_ok());
+        let e = root_kind(&here, t.id("home/.ssh")).unwrap_err();
+        assert_eq!(e.0, Code::MountChanged);
+        let e = root_kind(&t.0.join("home/absent"), t.id("home/.ssh")).unwrap_err();
+        assert_eq!(e.0, Code::NotFound);
     }
 
     /// RT-FS-14: a root with the identity of a protected folder (a bind alias of it) is refused.
@@ -1155,8 +1222,9 @@ mod tests {
         let home = t.home();
         let conf = t.0.join("xdgconf");
         let data = t.0.join("xdgdata");
+        let state = t.0.join("xdgstate");
         let cargo = t.0.join("cargo");
-        for dir in [&conf, &data, &cargo] {
+        for dir in [&conf, &data, &state, &cargo] {
             std::fs::create_dir_all(dir).unwrap();
         }
         let ext = |dir: &Path, name: &str, target: &str| {
@@ -1174,11 +1242,24 @@ mod tests {
             ),
             (ext(&conf, "app", "conft/app"), "conft", CONFIG),
             (ext(&data, "app", "datat/app"), "datat", CONFIG),
+            (ext(&state, "app", "xstatet/app"), "xstatet", STATE),
             (ext(&cargo, "c", "envt/c"), "envt", ENV_DIR),
+            // Directly in the default data and state homes (no folder of the list holds them).
+            (
+                link(&home, ".local/share/app", "dsharet/app"),
+                "dsharet",
+                CONFIG,
+            ),
+            (
+                link(&home, ".local/state/app", "dstatet/app"),
+                "dstatet",
+                STATE,
+            ),
         ];
         let mut e = env(home.to_str().unwrap());
         e.xdg_config_home = Some(conf.clone());
         e.xdg_data_home = Some(data.clone());
+        e.xdg_state_home = Some(state.clone());
         e.env_dirs = vec![env_dir(&cargo, "CARGO_HOME")];
         let d = deny(&e, &[]);
         for (l, target, reason) in &cases {
@@ -1190,9 +1271,54 @@ mod tests {
         }
         // Control: without the XDG and environment folders their links are not found.
         let d = deny(&env(home.to_str().unwrap()), &[]);
-        for target in ["conft", "datat", "envt"] {
+        for target in ["conft", "datat", "xstatet", "envt"] {
             assert_eq!(d.refusal(&home.join(target)), None, "{target}");
         }
+        // Control: the same link in a folder no rule names is not read.
+        link(&home, ".localx/share/app", "unreadt/app");
+        assert_eq!(deny(&e, &[]).refusal(&home.join("unreadt")), None);
+    }
+
+    /// Each scan-only subfolder is read as a root of its own, under the default and the
+    /// exported base: a link in it (one level deeper than its base's scan reaches) makes its
+    /// target a rule, naming the link. Control: the same link at the same depth in a sibling no
+    /// entry names leaves its target free.
+    #[test]
+    fn the_scan_only_subfolders_are_read_for_links() {
+        let t = TmpHome::new("deep");
+        let home = t.home();
+        let data = t.0.join("xdgdata");
+        let mut e = env(home.to_str().unwrap());
+        e.xdg_data_home = Some(data.clone());
+        assert_eq!(SCAN_ONLY.len(), 4);
+        for (i, (base, sub)) in SCAN_ONLY.iter().enumerate() {
+            let dir = match base {
+                XdgBase::Data => ".local/share",
+                XdgBase::Config => ".config",
+            };
+            let l = link(&home, &format!("{dir}/{sub}/x"), &format!("t{i}/x"));
+            let w = why(&deny(&e, &[]), &home, &format!("t{i}"));
+            assert!(
+                w.contains(&format!("which {} points to", l.display())) && w.ends_with(CONFIG),
+                "{sub}: {w}"
+            );
+            let parent = Path::new(sub).parent().unwrap_or(Path::new(""));
+            link(
+                &home,
+                &format!("{dir}/{}/other/x", parent.display()),
+                &format!("o{i}/x"),
+            );
+            assert_eq!(why(&deny(&e, &[]), &home, &format!("o{i}")), "", "{sub}");
+        }
+        // The exported data home's subfolders are read too.
+        let l = data.join("systemd/user/x");
+        std::fs::create_dir_all(l.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(home.join("xt/x"), &l).unwrap();
+        let w = why(&deny(&e, &[]), &home, "xt");
+        assert!(
+            w.contains(&format!("which {} points to", l.display())),
+            "{w}"
+        );
     }
 
     /// Link rules come after every other rule, so a path both refuse keeps the built-in's

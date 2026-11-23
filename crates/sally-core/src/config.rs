@@ -132,7 +132,8 @@ pub struct ReadConfigError {
 
 /// Reads `config.toml` at `path`, or the defaults when it does not exist. Opened without
 /// following a symlink and without blocking (a FIFO would hold the reader), then required to be
-/// a regular file; read through one bounded read and parsed by [`parse_config`]. `sallyd` reads
+/// a regular file; read at most one byte past [`MAX_CONFIG_BYTES`] and parsed by
+/// [`parse_config`]. `sallyd` reads
 /// it once at start; the CLI reads the same file the same way for its host facts.
 ///
 /// # Errors
@@ -156,7 +157,9 @@ pub fn read_config(path: &Path) -> Result<Config, ReadConfigError> {
     }
     let file = std::fs::File::from(fd);
     let mut text = String::new();
-    let cap = u64::try_from(MAX_CONFIG_BYTES).unwrap_or(u64::MAX) + 1;
+    let cap = u64::try_from(MAX_CONFIG_BYTES)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
     std::io::Read::read_to_string(&mut std::io::Read::take(file, cap), &mut text)
         .map_err(|e| fail(e.to_string()))?;
     parse_config(&text).map_err(|e| fail(e.to_string()))

@@ -661,9 +661,9 @@ fn rt_fs_05_denylisted_mounts_rejected() {
 
 /// The default data home (`~/.local/share`) and state home (`~/.local/state`) are rules whether
 /// or not `$XDG_DATA_HOME` or `$XDG_STATE_HOME` is exported: user units, session services and
-/// completion scripts the host runs live there. Controls: the data home refused the same way
-/// when its variable is exported with its default value, and a folder of the same name outside
-/// a home is accepted.
+/// completion scripts the host runs live there. The accepted twin: a folder of the same name
+/// outside a home. Also, the data home is refused the same way when its variable is exported
+/// with its default value.
 #[test]
 fn rt_fs_05_the_default_data_and_state_homes_are_rules_unexported() {
     let mut f = Fixture::new();

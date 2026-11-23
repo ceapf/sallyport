@@ -433,7 +433,9 @@ environment (passwd entry only if `$HOME` is unset or relative).
   gathered, so `sallyd` does not start and the CLI fails (2). The kind is read
   from a handle on the identified root, at validation and at the re-check: "resolves to
   "/data/win/proj", which is on a 9p filesystem (on WSL a Windows drive or share): never
-  mountable". Drives served over virtiofs are not covered (#281).
+  mountable". Drives served over virtiofs are not covered, nor a WSL that neither signal shows
+  (a kernel release without "microsoft" and interop off), where only the `/mnt` rule holds
+  (#281).
 
   The ancestor rule is why `~/.local`, `/var`, `/usr`, and `/home` are refused: they really
   contain protected data. "Each home" is `$HOME` **and** the passwd home when they differ, so a
@@ -446,8 +448,11 @@ what the host runs or loads (`~/.local/bin/t -> ~/tools/t/bin/t`, a stow `~/.con
 manifest has mounts, validation reads, to depth 2 (a folder's entries and its subfolders'
 entries, never entering a linked folder): every home folder of the list above (the default data
 and state homes included), `$XDG_CONFIG_HOME`, `$XDG_DATA_HOME` and `$XDG_STATE_HOME`, every folder the environment names except a `$PATH` entry outside the
-homes, and each home's own entries, of which only dot names (`.bashrc`, …) are followed. A folder
-reached first as a subfolder is read again to depth 2 when it is on that list itself. The rule is
+homes, and each home's own entries, of which only dot names (`.bashrc`, …) are followed. Four
+folders one level deeper than their base's scan reaches are read as roots of their own, under
+the default and the exported base: `systemd/user`, `dbus-1/services` and
+`bash-completion/completions` in the data home, `systemd/user` in the config home (more: #283).
+A folder reached first as a subfolder is read again to depth 2 when it is on that list itself. The rule is
 made from the link's text, joined (when relative) to the real path of the folder holding the link,
 as the kernel resolves it, and also matches where that resolves: through a stow-folded
 `~/.local/bin -> ~/dotfiles/bin` holding `t -> ../tools/t` the rule is `~/dotfiles/tools/t`, both

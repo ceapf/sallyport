@@ -102,7 +102,8 @@ const WSL_INTEROP: &str = "/proc/sys/fs/binfmt_misc/WSLInterop";
 /// The filesystem kinds refused as mount roots, from the kernel release text and whether WSL's
 /// interop entry is present: on WSL (either signal) [`V9FS`], else none. A further signal is
 /// added only once it is probed (docs/dev/PROBE_NOTES.md), and only ever adds refusals.
-// TODO(#281): a WSL that serves Windows drives over virtiofs is not covered.
+// TODO(#281): a WSL that serves Windows drives over virtiofs is not covered, nor one that
+// neither signal shows (a release without "microsoft" and interop off: only the `/mnt` rule).
 #[must_use]
 pub fn refused_fs_kinds(osrelease: &str, interop: bool) -> Vec<FsKind> {
     if interop || osrelease.to_ascii_lowercase().contains("microsoft") {
@@ -112,8 +113,20 @@ pub fn refused_fs_kinds(osrelease: &str, interop: bool) -> Vec<FsKind> {
     }
 }
 
+/// The kernel release text at `path`, at most 4 KiB; any failure is [`HostEnvError::OsRelease`]
+/// with its cause.
+fn read_release(path: &Path) -> Result<String, HostEnvError> {
+    use std::io::Read;
+    let mut s = String::new();
+    std::fs::File::open(path)
+        .and_then(|f| f.take(4096).read_to_string(&mut s))
+        .map_err(|e| HostEnvError::OsRelease(e.to_string()))?;
+    Ok(s)
+}
+
 /// Whether WSL's interop entry is present. Only a clean not-found is absence: any other answer
-/// counts as present (fail closed).
+/// counts as present (fail closed). Where `binfmt_misc` is an automount point (systemd), the
+/// lookup may mount it.
 fn interop_present(path: &Path) -> bool {
     !matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
 }
@@ -190,8 +203,8 @@ pub enum HostEnvError {
     MemInfo(String),
     /// `/proc/sys/kernel/osrelease` was unreadable: whether this is WSL cannot be told, and
     /// it is never assumed not to be.
-    #[error("cannot read the kernel release from /proc/sys/kernel/osrelease")]
-    OsRelease,
+    #[error("cannot read the kernel release from /proc/sys/kernel/osrelease: {0}")]
+    OsRelease(String),
 }
 
 impl HostEnv {
@@ -204,7 +217,8 @@ impl HostEnv {
     /// graphroot from `podman info` should append it.
     ///
     /// # Errors
-    /// [`HostEnvError`] if the home directory or RAM size cannot be determined. Validation must
+    /// [`HostEnvError`] if the home directory, the RAM size or the kernel release (whether this
+    /// is WSL) cannot be determined. Validation must
     /// not proceed with a guessed home: the denylist depends on it.
     pub fn from_process(config: &Config) -> Result<Self, HostEnvError> {
         let abs_var = |name: &str| {
@@ -239,7 +253,7 @@ impl HostEnv {
             env_dirs: env_dirs(|name| std::env::var_os(name)),
             configured_binaries: configured_binaries(config),
             refused_fs_kinds: refused_fs_kinds(
-                &read_bounded(Path::new(OSRELEASE), 4096).ok_or(HostEnvError::OsRelease)?,
+                &read_release(Path::new(OSRELEASE))?,
                 interop_present(Path::new(WSL_INTEROP)),
             ),
             nproc,
@@ -430,15 +444,32 @@ mod tests {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/tmp")
             .join(format!("sp-interop-{}", std::process::id()));
+        struct Gone(PathBuf);
+        impl Drop for Gone {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
+        let _gone = Gone(dir.clone());
         assert!(!interop_present(&dir.join("absent")));
         std::fs::write(dir.join("file"), "").unwrap_or_else(|e| panic!("{e}"));
         assert!(interop_present(&dir.join("file")));
         assert!(interop_present(&dir));
         // A lookup through a file fails with ENOTDIR, not ENOENT: present.
         assert!(interop_present(&dir.join("file/x")));
-        let _ = std::fs::remove_dir_all(&dir);
+        // The release reader names its cause.
+        let e = read_release(&dir.join("absent")).unwrap_err();
+        assert!(
+            matches!(&e, HostEnvError::OsRelease(m) if !m.is_empty()),
+            "{e}"
+        );
+        std::fs::write(dir.join("release"), "6.8.0-generic\n").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            read_release(&dir.join("release")).ok().as_deref(),
+            Some("6.8.0-generic\n")
+        );
     }
 
     #[test]
@@ -496,6 +527,11 @@ mod tests {
             assert_eq!(env.home, PathBuf::from(&want_home));
             assert_eq!(env.other_homes, [passwd]);
         }
+        // The parent sets an absolute state home: the field is that variable.
+        assert_eq!(
+            env.xdg_state_home,
+            Some(PathBuf::from("/sp-elsewhere/state"))
+        );
     }
 
     /// `HOME` wins and the passwd home of this uid is kept as another home; without `HOME` the
@@ -511,7 +547,8 @@ mod tests {
                 "manifest::hostenv::tests::home_and_other_homes_child",
                 "--test-threads=1",
             ])
-            .env(CHILD, home.unwrap_or(""));
+            .env(CHILD, home.unwrap_or(""))
+            .env("XDG_STATE_HOME", "/sp-elsewhere/state");
             match home {
                 Some(h) => cmd.env("HOME", h),
                 None => cmd.env_remove("HOME"),
