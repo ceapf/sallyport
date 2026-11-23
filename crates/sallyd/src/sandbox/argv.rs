@@ -21,7 +21,7 @@ use super::oci::intent::{Built, Intent, Probe, Wanted};
 use super::scan::{GitScan, LaunchScan};
 use super::types::{
     ArgvError, CommonArgs, INSTALLATION_LABEL, ImageRef, InferenceSpec, OverlayDirs, Role,
-    SessionPaths, WORKDIR, input,
+    SessionPaths, WORKDIR, input, nofile_ulimit,
 };
 
 /// The entry point baked into the workspace and harness images.
@@ -168,13 +168,17 @@ impl Argv {
             &format!("{INSTALLATION_LABEL}={}", c.installation.as_str()),
         ]);
         // AMENDMENTS-01 §6.1: never contact a registry, never inherit host proxies, keep no logs,
-        // write no core files.
+        // write no core files. The descriptor limit keeps one sender's descriptors in flight,
+        // counted with the host user's under keep-id, below host programs' soft limit (security
+        // review; `NOFILE_LIMIT`).
         a.push([
             "--pull=never",
             "--http-proxy=false",
             "--log-driver=none",
             "--ulimit",
             "core=0",
+            "--ulimit",
+            &nofile_ulimit(),
         ]);
         a.push([
             "--network=none",

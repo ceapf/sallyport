@@ -435,6 +435,11 @@ fn every_role_starts_with_the_checked_runtime_and_has_the_section_6_1_flags() {
         }
         let pair = |x: &str, y: &str| a.windows(2).filter(|w| w[0] == x && w[1] == y).count();
         assert_eq!(pair("--ulimit", "core=0"), 1, "{a:?}");
+        // Descriptors in flight are counted per kernel user, shared with the host user under
+        // keep-id: every role's limit sits below host programs' usual soft 1024 (security
+        // review). The value is written out, not taken from the constant.
+        assert_eq!(pair("--ulimit", "nofile=512:512"), 1, "{a:?}");
+        assert_eq!(a.iter().filter(|x| *x == "--ulimit").count(), 2, "{a:?}");
         assert_eq!(pair("--security-opt", "no-new-privileges"), 1, "{a:?}");
         // The launcher, not the image, chooses the working directory.
         assert_eq!(pair("--workdir", "/"), 1, "{a:?}");
@@ -1107,6 +1112,64 @@ fn checker_refuses_wrong_values_of_allowed_options() {
         // A second profile is refused even though the first one is right.
         assert_forbidden(&with(&a, &["--security-opt", &bad]), &allowed, &bad);
     }
+}
+
+/// `a` with the option pair `flag value` removed (it must be there exactly once).
+fn without_pair(a: &[String], flag: &str, value: &str) -> Vec<String> {
+    let at: Vec<usize> = (0..a.len().saturating_sub(1))
+        .filter(|&i| a[i] == flag && a[i + 1] == value)
+        .collect();
+    assert_eq!(at.len(), 1, "{flag} {value} once in {a:?}");
+    let mut out = a.to_vec();
+    out.drain(at[0]..at[0] + 2);
+    out
+}
+
+/// `--ulimit` is held per kind, like `--security-opt`: exactly `core=0` and `nofile=512:512`,
+/// each once, both required, nothing else (security review). Control: the builder's argv passes.
+#[test]
+fn checker_holds_ulimit_to_core_zero_and_the_descriptor_limit() {
+    let f = Fx::new();
+    let (a, allowed) = base(&f);
+    check_argv(&a, &allowed).unwrap();
+    let no_nofile = without_pair(&a, "--ulimit", "nofile=512:512");
+    let no_core = without_pair(&a, "--ulimit", "core=0");
+    assert_forbidden(&no_nofile, &allowed, "nofile missing");
+    assert_forbidden(&no_core, &allowed, "core missing");
+    assert_forbidden(
+        &with(&a, &["--ulimit", "nofile=512:512"]),
+        &allowed,
+        "nofile twice",
+    );
+    assert_forbidden(&with(&a, &["--ulimit", "core=0"]), &allowed, "core twice");
+    for bad in [
+        "nofile=1024:1024",
+        "nofile=512:1024",
+        "nofile=513:513",
+        "nofile=511:511",
+        "nofile=512",
+        "512",
+        "nofile=unlimited",
+        "nofile=-1",
+        "unlimited",
+        "host",
+        "nproc=64",
+        "nproc=512:512",
+    ] {
+        assert_forbidden(
+            &with(&no_nofile, &["--ulimit", bad]),
+            &allowed,
+            &format!("--ulimit {bad}"),
+        );
+    }
+    // A third kind beside both right ones.
+    assert_forbidden(&with(&a, &["--ulimit", "nproc=64"]), &allowed, "nproc");
+    // Right value, wrong spelling.
+    assert_forbidden(
+        &with(&no_nofile, &["--ulimit=nofile=512:512"]),
+        &allowed,
+        "--ulimit=",
+    );
 }
 
 #[test]

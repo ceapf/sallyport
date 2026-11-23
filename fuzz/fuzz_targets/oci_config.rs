@@ -64,7 +64,6 @@ fn fixture() -> (Intent, Facts) {
         },
         init: "/usr/bin/catatonit".into(),
         arch: "x86_64",
-        own_nofile: 1_048_576,
         own_nproc: 224_902,
     };
     (i, f)

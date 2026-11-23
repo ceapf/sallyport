@@ -19,6 +19,8 @@ sallyport.installation=00000000-0000-4000-8000-000000000001
 --log-driver=none
 --ulimit
 core=0
+--ulimit
+nofile=512:512
 --network=none
 --no-hosts
 --read-only

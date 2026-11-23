@@ -67,7 +67,6 @@ impl Launcher {
             image,
             init,
             arch: std::env::consts::ARCH,
-            own_nofile: own_hard(Resource::Nofile),
             own_nproc: own_hard(Resource::Nproc),
         };
         verify(&config, intent, &facts).map_err(mismatch)
