@@ -82,7 +82,7 @@ flowchart LR
 | `sally-core::secrets` | Load/store 0600 TOML; `Secret` newtype with redacted `Debug`, `zeroize` on drop; name-only references everywhere else | **yes** |
 | `sally-core::hf` | The HF Hub client's decisions, with no socket: names validated and encoded, the bounded parse of a repository's file list (path, size, LFS sha256 at one commit), each hop's request (host, path, range, whether it carries the token), the decision on each response head (redirect, bounded wait, body, refusal) and the resume rules. Search and the Range fetch of a GGUF header come later (#214) | no (but handles untrusted bytes → bounded, fuzzed) |
 | `sally-core::library` | SQLite index of blobs; content-addressed store; immutability (`chmod 0444`). The SQLite is the bundled one this crate pins; the database is only an index, and the blob directory decides what a model's bytes are. Bytes enter `blobs/` two ways, both ending in one tail (read-only, linked, then the row), and only a file the library created is ever linked: import runs the whole SI-6 chain on its own copy; a download is a partial the library creates and locks, which verify checks against the publisher's SHA-256 before anything else reads it, then magic and parse, without the library's lock; promote takes only a verified download | yes |
-| `sallyd::hf` | The HF client's transport: one lookup on the host, answers the egress proxy's address filter refuses (loopback/private/link-local/own/connected networks) refused, a pinned address dialled on 443, TLS verified against the anchors of a checked CA bundle (`egress::roots::BundleFiles`, the client's only constructor argument for them; production: the system bundle owned by root); requests exactly as `sally-core::hf` plans them, the token only on a hop to `huggingface.co` itself; file bytes only into the library's download. No production caller yet (#209) | yes |
+| `sallyd::hf` | The HF client's transport: one lookup on the host, answers the egress proxy's address filter refuses (loopback/private/link-local/own/connected networks) refused, a pinned address dialled on 443, TLS verified against the anchors of a checked CA bundle (`egress::roots::BundleFiles`, the client's only constructor argument for them; production: the system bundle owned by root); requests exactly as `sally-core::hf` plans them, the token only on a hop to `huggingface.co` itself, never again once a redirect chain has left it; the file list from `huggingface.co` only; file bytes only into the library's download. No production caller yet (#209) | yes |
 | `sallyd::sandbox` | Build `podman run` argv from manifest + profile; mount prep (realpath re-check, socket dirs); launch/exec/kill/wait; image digest check | **yes** |
 | `sallyd::rpc` | `control.sock` (trusted methods, §4.1) and per-session `agent.sock` (the MCP subset, §4.2); bounded NDJSON framing, duplicate-key-refusing JSON, per-session rate and connection caps, `SO_PEERCRED` UID check before a byte is read, an audit entry before every reply | **yes** |
 | `sallyd::llm` | Per-session `llm.sock` (§4.4): HTTP/1.1 through hyper; the broker reads and decides on the head itself and gates hyper's writes; strict body allowlist; the model backend is a constructor argument (M3 wires the engine) | **yes** |
@@ -1014,7 +1014,7 @@ sequenceDiagram
     participant HF as Hugging Face
     participant LIB as library
     UI->>D: hf.files(repo)
-    D->>HF: GET /api/models/{repo}/revision/{rev}?blobs=true (token from store, huggingface.co only)
+    D->>HF: GET /api/models/{repo}/revision/{rev}?blobs=true (token from store, huggingface.co only; a redirect of it off huggingface.co refused)
     HF-->>D: sha (commit), siblings[] {rfilename, size, lfs.sha256}
     D->>HF: GET resolve/{commit}/{file} Range: 0-4194303 (GGUF header only, #214)
     D-->>UI: quants with sizes, metadata, fit badge (VRAM/RAM estimate)
@@ -1022,7 +1022,7 @@ sequenceDiagram
     D->>LIB: lfs.sha256 already stored (row + blob passing its checks)? answer it, no request
     D->>LIB: ext allowlist and name check; free disk ≥ rest + ceil(size/20) + reserve
     LIB-->>D: downloads/<sha256>.part (created or resumed; flock-ed, the lock bound to the name)
-    D->>HF: GET resolve/{commit}/{file} (Range: bytes=n- when resuming; redirects to *.hf.co carry no token)
+    D->>HF: GET resolve/{commit}/{file} (Range: bytes=n- when resuming; redirects to *.hf.co carry no token, nor does any later hop)
     D->>LIB: append the body (never past size; room checked again before each write)
     D->>D: verify, without the library lock: length == size → sha256 of every byte == lfs.sha256 → magic → strict header parse → sync
     D->>LIB: promote the verified file (the tail only)
@@ -1223,7 +1223,11 @@ down meanwhile, the container outlives it with no watchdog until the next start'
 `podman init` (#92): a bound from `init`, not from the stop. A container that cannot be confirmed gone, whether its session started or
 not, also leaves the session listed as stop-failed. It keeps its claims and its disk watchdog
 until a later stop succeeds. At shutdown, which stops every session at once, it makes `sallyd`
-exit non-zero. A failed `session.start` append is followed by a best-effort `session.stop`
+exit non-zero. The exception is a launch that failed and whose cleanup failed: it was never
+registered as a session (a harness launch's session was, but not the harness), so nothing lists
+it stop-failed and no disk watchdog watches it; it keeps its claims (a workspace's until `sallyd`
+exits, so no periodic sweep takes its container), and shutdown reports a clean stop with it left
+(THREAT_MODEL.md §6; TODO(#239)). A failed `session.start` append is followed by a best-effort `session.stop`
 (`start-failed`), since the entry may have reached the log.
 
 ## 6. Repository structure
