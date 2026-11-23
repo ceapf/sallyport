@@ -171,9 +171,9 @@ it only reports). In order:
   refused (exit 1). So a text changed after review (by a session that can write the folder
   that holds it, through this manifest's mounts or another's) launches only with consent given
   for that text; the consent is then the only defence, so a `yes` given without re-reading the
-  summary launches the rewrite (#322, #323 for what the summary can still show ambiguously). A
-  hash that ships with a manifest (a script, a README line) launches it with no question; the
-  summary is still printed; none planned.
+  summary launches the rewrite (#322 for what the summary can still show ambiguously). A hash
+  that ships with a manifest (a script, a README line) launches it with no question; the summary
+  is still printed; none planned.
 
 `sally manifest summary` ends with the line `sha256 <hex>`, the hash a launch's
 `--accept-manifest` names. Its stderr carries the warnings and acknowledged risks a launch shows,
@@ -300,7 +300,8 @@ an object carrying a POSIX ACL is open to its owner only (architect ruling Q39; 
 - A Unix socket anywhere in a mount refuses the launch (`socket-in-mount`, RT-FS-13). Another
   filesystem mounted inside a mount is not visible in the sandbox (RT-FS-16).
 - Host realpaths and guests may not contain `:`, `,` or control characters (they would be
-  parsed as `podman -v`/`--mount` option separators).
+  parsed as `podman -v`/`--mount` option separators). A host realpath that is not UTF-8 is
+  refused (`path-chars`).
 
 ### HostRule
 ```yaml
