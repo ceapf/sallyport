@@ -46,7 +46,7 @@ Acceptance
 - `sally sandbox run --manifest manifests/examples/coding-agent.yaml -- sh` yields a shell that: cannot resolve DNS, cannot open TCP to anything, *can* `curl -x http://127.0.0.1:3128 https://pypi.org/simple/` and gets 403 from the proxy for `https://example.org/`; sees only `/workspace/myproject`; cannot find the canary secret anywhere; `curl -x … http://api.github.com/user` against the mock upstream shows the injected header upstream, any echo of it replaced by filler of the same length, and the response's `egress.response` audit entry naming `secret:GITHUB_TOKEN` and the bytes redacted.
 - `sally audit verify` passes; tampering a byte fails it.
 - Snapshot argv contains none of the forbidden flags.
-- Red-team must pass: RT-FS-01..11, RT-NET-01..11, RT-SEC-01..08, RT-AG-01..06, RT-AG-08, RT-AG-09, RT-AUD-01..02, RT-MAN-01..03, RT-SUP-01.
+- Red-team must pass: every row the suite marks for this milestone (`tests/redteam/REDTEAM_SUITE.md`, its M column; the suite is the only list).
 - CI green including `redteam.yml`. `cargo deny` clean. No `unsafe`.
 
 ---
@@ -64,7 +64,7 @@ Tasks
 6. Fit estimator (`models.fit`) with the formula in ARCHITECTURE §7; detect host VRAM/RAM (`nvidia-smi --query-gpu=memory.total`, `/proc/meminfo`) — main (sonnet); review mle-reviewer (opus)
 7. CLI: `sally models search|files|pull|import|list|inspect|rm|fit` — main (sonnet)
 8. `tests/redteam/corpus/` generators (malicious GGUF variants, pickle-with-canary, renamed pickle, zip-slip zips, safetensors bombs) — main (opus)
-9. Red-team RT-MDL-01..09 and RT-MDL-10 (its M2 half: the template cap); reports — per routing
+9. Red-team: every row the suite marks for this milestone (RT-MDL-10 with its M2 half, the template cap); reports — per routing
 
 Acceptance: pulling a real GGUF from HF ends with a verified blob (hash equals HF `lfs.sha256`) and a correct fit badge on a 16 GB card; every corpus file is refused before any container starts; fuzz targets run 5 minutes locally without crash.
 
@@ -81,7 +81,7 @@ Tasks
 4. `chat.complete` control method + `sally chat` REPL — main (sonnet)
 5. Mock inference backend (`--mock-model <script>`) for CI: deterministic responses incl. attack tool-calls — main (sonnet)
 6. Calibrate fit constants against real `llama-server` VRAM usage on 3 models — main (sonnet), mle-reviewer (opus)
-7. Red-team RT-INF-01..04, RT-INF-05 (its Z2 half), RT-MDL-07 and RT-SUP-03; `make e2e-gpu` with
+7. Red-team: every row the suite marks for this milestone (RT-INF-05 with its Z2 half); `make e2e-gpu` with
    the tiny model; reports
 
 Acceptance: `sally chat --model <name>` streams tokens from GPU; `podman inspect` of Z2 shows `--network=none`, RO weights, GPU device only; a shell exec'd into Z2 cannot write `/models/model.gguf`, cannot reach the network, finds no secrets.
@@ -98,7 +98,7 @@ Tasks
 3. Reference ReAct harness: tool schemas → llama.cpp tool-calling (`--jinja`), loop with max steps, approval-aware UX, MCP stdio spawn from `SALLY_MCP_SERVERS`; the system prompt tells the model not to commit (session commits are discarded in v1, AMENDMENTS-02) — main (sonnet); mle-reviewer (opus) on prompt/tool format
 4. `sallyd::session` full lifecycle (ARCHITECTURE §5.4), `sessions.*`, `ui.*`, `tools.result` notifications, timeout, teardown guard — **main (opus)**; review security-reviewer (opus)
 5. `sally run --manifest m.yaml "task"` interactive CLI (shows tool log, approvals inline) — main (sonnet)
-6. Red-team RT-AG-01..10 end-to-end with the malicious mock model (CI) and once with a real model (local), plus the M4 halves of RT-MDL-10 (a template's injected instructions) and RT-AG-14 (the harness, MCP #68); reports
+6. Red-team: every row the suite marks for this milestone, end-to-end with the malicious mock model (CI) and once with a real model (local), with the M4 halves of RT-MDL-10 (a template's injected instructions) and RT-AG-14 (the harness, MCP #68); reports
 
 Acceptance: `sally run --manifest manifests/examples/coding-agent.yaml "add a README"` edits only `/workspace/myproject`, asks approval for every shell command, and the mock-model run in CI shows every injected attack denied with an audit line.
 
@@ -116,7 +116,7 @@ Tasks
 5. Manifest editor: CodeMirror YAML + JSON Schema validation + live plain-English summary + templates from `manifests/examples` — main (sonnet)
 6. Audit viewer (filter by session/event, verify button), Settings (secrets write-only, Doctor panel) — main (sonnet)
 7. Component tests (Vitest), e2e-runner smoke against `sallyd` with the CPU inference image — e2e-runner (sonnet)
-8. Red-team RT-UI-01..03; reports
+8. Red-team: every row the suite marks for this milestone; reports
 
 Acceptance: fresh user flow (open app → Doctor green → search HF → pull → chat; then Agents → coding-agent template → approve a command) works on WSLg; XSS payloads from the mock model render inert.
 
