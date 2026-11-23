@@ -732,7 +732,14 @@ fn rt_fs_11_wsl_a_windows_executable_does_not_reach_windows() {
         .unwrap();
     assert!(o.status.success(), "findmnt: {o:?}");
     let ty = String::from_utf8(o.stdout).unwrap();
-    let part = ty.trim().split('.').next().unwrap();
+    // With mounts stacked there, the last line is the top one, the one a path reaches.
+    let part = ty
+        .lines()
+        .last()
+        .unwrap_or_default()
+        .split('.')
+        .next()
+        .unwrap();
     assert!(
         env.refused_fs_kinds.iter().any(|k| k.name == part),
         "/mnt/c is of type {part:?}, not refused"

@@ -6,7 +6,8 @@
 //! Input: eight bytes of mount id (little-endian), then the table's bytes.
 //!
 //! Invariants: never panics; an accepted type is non-empty and holds no space, newline or `.`,
-//! and exactly one line of the table begins with the id's decimal and a space; the table with
+//! exactly one line of the table begins with the id's decimal and a space, and the type is that
+//! line's field after the first `-` past the six fixed fields, up to its first `.`; the table with
 //! that line appended again is an error; the table with every trailing newline removed is an
 //! error (one removed may leave a table that ends in a blank line, which is whole).
 #![no_main]
@@ -34,6 +35,11 @@ fuzz_target!(|data: &[u8]| {
         .filter(|l| l.starts_with(head.as_bytes()))
         .collect();
     assert_eq!(matching.len(), 1, "lines with the id");
+    // The type is the field after the first `-` past the six fixed fields, up to its first `.`.
+    let fields: Vec<&[u8]> = matching[0].split(|&b| b == b' ').collect();
+    let sep = 6 + fields[6..].iter().position(|f| *f == b"-").unwrap();
+    let want = fields[sep + 1].split(|&b| b == b'.').next().unwrap();
+    assert_eq!(ty.as_bytes(), want, "another field given");
     let mut twice = table.to_vec();
     twice.extend_from_slice(matching[0]);
     twice.push(b'\n');

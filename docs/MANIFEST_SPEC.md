@@ -436,7 +436,7 @@ environment (passwd entry only if `$HOME` is unset or relative).
   `/proc/sys/fs/binfmt_misc`; with the kernel release unreadable, the host facts cannot be
   gathered, so `sallyd` does not start and the CLI fails (2). Off WSL nothing is listed and the
   table is not read. On WSL a root is also refused when its type cannot be read: a kernel that
-  gives no mount id (WSL1, or older than 5.8), a table that cannot be read, is larger than
+  gives no mount id (one older than 5.8), a table that cannot be read, is larger than
   1 MiB, is empty or cut short, or has no entry, more than one entry or a malformed entry for
   the mount; the message names the cause and never quotes the table. The check runs at
   validation and at the re-check: "resolves to "/data/win/proj", which is on a 9p filesystem

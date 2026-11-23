@@ -735,7 +735,9 @@ pub(crate) fn check_mount_host(
     Ok((real, id))
 }
 
-/// Where the kernel gives this process's mount table (RT-FS-11).
+/// Where the kernel gives this process's mount table (RT-FS-11). It is the thread-group
+/// leader's namespace's; mount ids are unique system-wide, so a thread in another namespace
+/// finds no entry and refuses, as does a table over the cap (a host with thousands of mounts).
 const MOUNT_TABLE: &str = "/proc/self/mountinfo";
 
 /// Which of `refused` the directory at `real` lies on, if any, read from a handle opened
@@ -762,7 +764,7 @@ fn root_kind(
     if refused.is_empty() {
         return Ok(None);
     }
-    let name = mounted_type(&fd, table)?;
+    let name = mounted_type(rustix::fd::AsFd::as_fd(&fd), table)?;
     Ok(refused.iter().copied().find(|k| k.name == name))
 }
 
@@ -772,7 +774,7 @@ fn root_kind(
 /// (not the unique id). `fd` is borrowed for the whole read: an open descriptor holds its mount,
 /// so the id cannot pass to another mount before the table is parsed, and a mount detached
 /// meanwhile has no line and is refused (docs/dev/PROBE_NOTES.md).
-fn mounted_type(fd: &rustix::fd::OwnedFd, table: &Path) -> Result<String, (Code, String)> {
+fn mounted_type(fd: rustix::fd::BorrowedFd<'_>, table: &Path) -> Result<String, (Code, String)> {
     use rustix::fs::{AtFlags, StatxFlags};
     let inspect = |why: String| (Code::NotFound, format!("cannot be inspected: {why}"));
     let st = rustix::fs::statx(fd, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)
@@ -1151,8 +1153,11 @@ mod tests {
         let here = t.0.join("home/code/x");
         let table = Path::new(MOUNT_TABLE);
         let own = [own_type(&here)];
-        for refused in [&[][..], &own[..]] {
-            assert!(root_kind(&here, t.id("home/code/x"), refused, table).is_ok());
+        for (refused, want) in [(&[][..], None), (&own[..], Some(own[0]))] {
+            assert_eq!(
+                root_kind(&here, t.id("home/code/x"), refused, table),
+                Ok(want)
+            );
             let e = root_kind(&here, t.id("home/.ssh"), refused, table).unwrap_err();
             assert_eq!(e.0, Code::MountChanged);
             let e = root_kind(&t.0.join("home/absent"), t.id("home/.ssh"), refused, table);
@@ -1214,6 +1219,28 @@ mod tests {
         assert_eq!(root_kind(&here, id, &[other], table), Ok(None));
         assert_eq!(root_kind(&here, id, &[other, own], table), Ok(Some(own)));
         assert_eq!(root_kind(&here, id, &[own, other], table), Ok(Some(own)));
+    }
+
+    /// RT-FS-11: the type is the root's own mount's, not the mount above it: `/proc` is a mount
+    /// point of type proc on a parent of another type, and is found by its own type only.
+    #[test]
+    fn the_type_is_the_root_s_own_mount_s() {
+        use std::os::unix::fs::MetadataExt;
+        let root = Path::new("/proc");
+        let meta = std::fs::symlink_metadata(root).unwrap();
+        let id = DirId {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        };
+        let parent = own_type(Path::new("/"));
+        assert_ne!(parent.name, "proc", "the test needs / on another type");
+        let proc_kind = FsKind { name: "proc" };
+        let table = Path::new(MOUNT_TABLE);
+        assert_eq!(
+            root_kind(root, id, &[proc_kind], table),
+            Ok(Some(proc_kind))
+        );
+        assert_eq!(root_kind(root, id, &[parent], table), Ok(None));
     }
 
     /// RT-FS-11: the table is read only when a kind is listed: a missing table with nothing

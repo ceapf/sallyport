@@ -32,7 +32,7 @@ pub use hostenv::{
 };
 pub use image::is_pinned_image_ref;
 pub use location::{HostAsWritten, LocationError, ManifestPlace};
-pub use mountinfo::{MAX_MOUNT_TABLE, MountInfoError, mount_fs_type};
+pub use mountinfo::{MountInfoError, mount_fs_type};
 pub use parse::{MAX_MANIFEST_BYTES, parse, parse_bytes, to_yaml};
 pub use summary::summary;
 pub use types::{

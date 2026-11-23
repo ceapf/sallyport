@@ -232,13 +232,14 @@ line per fact, with where it was found. Check a note again before relying on it 
 - `/proc/self/mountinfo` lines are `id parent major:minor root mount-point options [optional
   fields…] - type source super-options`; the optional fields (`shared:N`, `master:N`) may be
   absent. Here the table is 35 lines (~4 KB); `/mnt/c`, `/mnt/e` and `/usr/lib/wsl/drivers` have
-  type `9p`, and the only FUSE entry is `fusectl`. `statx(fd, "", AT_EMPTY_PATH, STATX_MNT_ID)`
-  on an `O_PATH` handle gives the table's first field (the reusable id, not
-  `STATX_MNT_ID_UNIQUE`): sally-core's paths.rs tests find the fixture root's line by it.
-  An open descriptor holds its mount's id: in `unshare -Urm`, a tmpfs with a descriptor held in
-  it (id 507) was lazily unmounted (its line left the table, the descriptor still said 507) and
-  five tmpfs mounted at the same place got 508, 509, 510, 511 and 531; after the descriptor closed, the next mount
-  got 507 again. (Kernel 6.18 WSL2; virtiofs type-name follow-up)
+  type `9p`, and there is no FUSE mount (only `fusectl`, FUSE's control filesystem).
+  `statx(fd, "", AT_EMPTY_PATH, STATX_MNT_ID)` on an `O_PATH` handle gives the table's first
+  field (the reusable id, not `STATX_MNT_ID_UNIQUE`): sally-core's paths.rs tests find the
+  fixture root's line, and `/proc`'s, by it. An open descriptor holds its mount's id: in
+  `unshare -Urm`, a tmpfs with a descriptor held in it (id 507) was lazily unmounted (its line
+  left the table, the descriptor still said 507) and five tmpfs mounted at the same place got
+  508, 509, 510, 511 and 531; after the descriptor closed, the next mount got 507 again.
+  (Kernel 6.18 WSL2; virtiofs type-name follow-up)
 - A non-dumpable process (`PR_SET_DUMPABLE 0`) still binds and chmods a socket through
   `/proc/self/fd/<dirfd>/<name>`. Its `/proc/<pid>` directory keeps its own owner; the entries
   under it (`fd/`, `status`, …) become root's, so other processes of the same user cannot read

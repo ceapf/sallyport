@@ -9,7 +9,7 @@
 #![deny(clippy::indexing_slicing)]
 
 /// The largest mount table read, in bytes; a longer one is refused, never cut (RT-FS-11).
-pub const MAX_MOUNT_TABLE: usize = 1 << 20;
+pub(crate) const MAX_MOUNT_TABLE: usize = 1 << 20;
 
 /// Why the mount table gave no filesystem type for a mount. The messages never quote the
 /// table's bytes.
@@ -24,7 +24,8 @@ pub enum MountInfoError {
     /// More than one line has the mount id.
     #[error("the mount table has more than one entry for the mount")]
     Duplicate,
-    /// The line with the mount id has no separator, no type, or a type that is not text.
+    /// The line with the mount id has fewer than the fixed fields, no separator, no type, an
+    /// empty type part, or a type that is not text.
     #[error("the mount table's entry for the mount is malformed")]
     Malformed,
 }
@@ -38,7 +39,8 @@ pub enum MountInfoError {
 ///
 /// # Errors
 /// [`MountInfoError`]: a table that is empty or does not end in a newline, no line or more than
-/// one line with the id, or a matching line with no separator or no type.
+/// one line with the id, or a matching line with fewer than the fixed fields, no separator, no
+/// type, an empty type part, or a type that is not text.
 pub fn mount_fs_type(table: &[u8], mnt_id: u64) -> Result<&str, MountInfoError> {
     if table.last() != Some(&b'\n') {
         return Err(MountInfoError::Unterminated);
@@ -196,6 +198,16 @@ mod tests {
         t.pop();
         assert_eq!(mount_fs_type(&t, 9), Err(MountInfoError::Unterminated));
         assert_eq!(mount_fs_type(b"\n", 9), Err(MountInfoError::NoEntry));
+        // A table that ends in a blank line is whole.
+        assert_eq!(mount_fs_type(b"9 1 0:1 / /m rw - 9p x rw\n\n", 9), Ok("9p"));
+    }
+
+    /// A malformed first line with the id refuses, whatever follows.
+    #[test]
+    fn a_malformed_first_match_refuses_before_a_good_one() {
+        let mut t = b"9 1 0:1 / /m rw 9p none rw\n".to_vec();
+        t.extend(table(&[line("9", "1", "/n", "", "ext4")]));
+        assert_eq!(mount_fs_type(&t, 9), Err(MountInfoError::Malformed));
     }
 
     #[test]
