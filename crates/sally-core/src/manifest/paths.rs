@@ -1085,7 +1085,8 @@ mod tests {
             setting: "sandbox.runtime_path",
         }];
         let d = fixed(&e, &[]);
-        assert!(d.refusal(&home.join("build/crun2")).is_some());
+        let w = d.refusal(&home.join("build/crun2")).unwrap_or_default();
+        assert!(w.contains("(the folder of sandbox.runtime_path)"), "{w}");
     }
 
     /// The kind is read only from the root that was identified: another directory's identity
@@ -1279,46 +1280,58 @@ mod tests {
         assert_eq!(deny(&e, &[]).refusal(&home.join("unreadt")), None);
     }
 
-    /// Each scan-only subfolder is read as a root of its own, under the default and the
-    /// exported base: a link in it (one level deeper than its base's scan reaches) makes its
-    /// target a rule, naming the link. Control: the same link at the same depth in a sibling no
-    /// entry names leaves its target free.
+    /// Each scan-only subfolder is read as a root of its own, under every form of its base (the
+    /// home's, another home's, the exported one): a link in it (one level deeper than its
+    /// base's scan reaches) makes its target a rule, naming the link, with the config reason.
+    /// Control: the same link at the same depth in a sibling no entry names leaves its target
+    /// free.
     #[test]
     fn the_scan_only_subfolders_are_read_for_links() {
         let t = TmpHome::new("deep");
         let home = t.home();
-        let data = t.0.join("xdgdata");
+        let other = t.0.join("other");
+        let (data, conf) = (t.0.join("xdgdata"), t.0.join("xdgconf"));
         let mut e = env(home.to_str().unwrap());
+        e.other_homes = vec![other.clone()];
         e.xdg_data_home = Some(data.clone());
-        assert_eq!(SCAN_ONLY.len(), 4);
-        for (i, (base, sub)) in SCAN_ONLY.iter().enumerate() {
-            let dir = match base {
-                XdgBase::Data => ".local/share",
-                XdgBase::Config => ".config",
-            };
-            let l = link(&home, &format!("{dir}/{sub}/x"), &format!("t{i}/x"));
+        e.xdg_config_home = Some(conf.clone());
+        // The entries, written out: a typo or a base mixed up in one fails here.
+        assert_eq!(
+            SCAN_ONLY,
+            &[
+                (XdgBase::Data, "systemd/user"),
+                (XdgBase::Data, "dbus-1/services"),
+                (XdgBase::Data, "bash-completion/completions"),
+                (XdgBase::Config, "systemd/user"),
+            ]
+        );
+        let put = |l: &Path, target: &str| {
+            std::fs::create_dir_all(l.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(home.join(target), l).unwrap();
+        };
+        let cases = [
+            (home.join(".local/share"), "dbus-1/services"),
+            (home.join(".local/share"), "systemd/user"),
+            (home.join(".local/share"), "bash-completion/completions"),
+            (home.join(".config"), "systemd/user"),
+            (other.join(".local/share"), "dbus-1/services"),
+            (other.join(".config"), "systemd/user"),
+            (data.clone(), "bash-completion/completions"),
+            (conf.clone(), "systemd/user"),
+        ];
+        for (i, (base, sub)) in cases.iter().enumerate() {
+            let l = base.join(sub).join("x");
+            put(&l, &format!("t{i}/x"));
             let w = why(&deny(&e, &[]), &home, &format!("t{i}"));
             assert!(
                 w.contains(&format!("which {} points to", l.display())) && w.ends_with(CONFIG),
-                "{sub}: {w}"
+                "{}: {w}",
+                l.display()
             );
             let parent = Path::new(sub).parent().unwrap_or(Path::new(""));
-            link(
-                &home,
-                &format!("{dir}/{}/other/x", parent.display()),
-                &format!("o{i}/x"),
-            );
+            put(&base.join(parent).join("other/x"), &format!("o{i}/x"));
             assert_eq!(why(&deny(&e, &[]), &home, &format!("o{i}")), "", "{sub}");
         }
-        // The exported data home's subfolders are read too.
-        let l = data.join("systemd/user/x");
-        std::fs::create_dir_all(l.parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink(home.join("xt/x"), &l).unwrap();
-        let w = why(&deny(&e, &[]), &home, "xt");
-        assert!(
-            w.contains(&format!("which {} points to", l.display())),
-            "{w}"
-        );
     }
 
     /// Link rules come after every other rule, so a path both refuse keeps the built-in's
