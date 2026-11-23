@@ -250,10 +250,10 @@ an object carrying a POSIX ACL is open to its owner only (architect ruling Q39; 
   characters, a whitespace character (`char::is_whitespace`, a no-break space included) as the
   first or last character, and more than 256 bytes; the broker's matcher treats a refused glob
   as `**`, so it asks for every path. A space inside a glob is literal, and `summary()` shows
-  each glob quoted on its own, so one glob holding `, ` cannot read as two. The broker denies (`bad-path`) a write or delete whose
-  relative path is not canonical, before any glob is tried. Residual: on a
-  case-folding or normalizing file system a narrowed glob can match less than the file system
-  resolves; the default `["**"]` cannot.
+  each glob quoted on its own, so one glob holding `, ` cannot read as two. The broker denies
+  (`bad-path`) a write or delete whose relative path is not canonical, before any glob is tried.
+  Residual: on a case-folding or normalizing file system a narrowed glob can match less than the
+  file system resolves; the default `["**"]` cannot.
 - **Git metadata** (AMENDMENTS-02 B2(a), replacing the read-only hooks/config overlays of
   AMENDMENTS-01 §6.3). In an `rw` mount, every `.git` directory found by the launch scan is
   mounted as an overlay whose upper directory is session scratch, discarded at teardown, and
@@ -384,11 +384,15 @@ loads code, finds sockets or verifies TLS, and Sallyport sets the relevant ones 
 A server's `command` runs at launch, without approval, inside the workspace (its mounts and
 egress); only its tool calls are gated by `approve`. `summary()` therefore shows the command and
 its env keys. Each argument is written between double quotes, escaped to printable ASCII (`"` as
-`\"`), and the arguments are joined by one space inside backticks. At most 200 bytes of that text
-are shown, built left to right and never cut inside an escape; an argument starts only when its
-quotes and its first escape fit, and a cut argument keeps its closing quote. A cut is marked after
-the closing backtick, as ` (cut here: N more bytes not shown)`, `N` counting the argument bytes
-not shown. Env values are not shown.
+`\"`, a backtick as `\x60`, so no argument closes the code span), and the arguments are joined by
+one space inside backticks. At most 200 bytes of that text are shown, built left to right and
+never cut inside an escape; an argument starts only when its quotes and its first escape fit, and
+a cut argument keeps its closing quote. A cut is marked after the closing backtick, as
+` (cut here: inside argument K of N; B more bytes not shown)` when argument `K` was cut short, or
+` (cut here: before argument K of N; B more bytes not shown)` when the arguments before `K` are
+whole and `K` did not start. `K` counts from 1, `N` is the number of arguments, and `B` counts the
+argument bytes not shown (at least 1 after `inside`; 0 is possible after `before`, for empty
+arguments). Env values are not shown.
 
 `summary()` escapes every string it takes from the manifest or the host to printable ASCII (the
 alphabet of `sally_core::text`: `\\`, `\xNN` for controls, `\u{…}` beyond ASCII), so no manifest
