@@ -20,6 +20,7 @@
 #   failed in the fork-bomb test; otherwise 1, with the verdict (red or incomplete) on the totals
 #   line. Usage errors exit 2.
 # Environment (defaults in brackets): LOADED_REPEAT_LIMIT, seconds per repeat [600];
+# LOADED_REPEAT_KILL_AFTER, seconds from a repeat's TERM to its KILL [180];
 # LOADED_REPEAT_RESTART [1]; LOADED_REPEAT_START_LIMIT [0]; LOADED_REPEAT_PREBUILD,
 # LOADED_REPEAT_LOAD and LOADED_REPEAT_RUN, the three commands (tests/scripts/loaded_repeat_test.sh
 # replaces them with stubs). Tested by that file, via `make test-scripts`.
@@ -31,6 +32,7 @@ if [ "$#" -ne 2 ] || [[ ! "$1" =~ ^[1-9][0-9]*$ ]]; then
 fi
 count="$1" out="$2"
 limit="${LOADED_REPEAT_LIMIT:-600}"
+kill_after="${LOADED_REPEAT_KILL_AFTER:-180}"
 restart="${LOADED_REPEAT_RESTART:-1}"
 start_limit="${LOADED_REPEAT_START_LIMIT:-0}"
 prebuild="${LOADED_REPEAT_PREBUILD:-cargo test -q --workspace --no-run && cargo test -q -p sallyd --test bombs --no-run}"
@@ -38,7 +40,7 @@ load_cmd="${LOADED_REPEAT_LOAD:-make test}"
 run_cmd="${LOADED_REPEAT_RUN:-bash scripts/test-run.sh cargo test -p sallyd --test bombs -- --nocapture}"
 fork=rt_ag_09_a_fork_bomb_is_held_by_the_pids_limit
 prefix='rt_ag_09 fork-bomb figures:'
-for v in "$limit" "$start_limit"; do
+for v in "$limit" "$start_limit" "$kill_after"; do
   [[ "$v" =~ ^[0-9]+$ ]] || { echo "loaded-repeat: a limit is not a number: $v" >&2; exit 2; }
 done
 [ "$restart" = 0 ] || [ "$restart" = 1 ] || { echo "loaded-repeat: LOADED_REPEAT_RESTART is 0 or 1" >&2; exit 2; }
@@ -86,15 +88,23 @@ load_end() {
 alive() {
   [ -n "$load_pid" ] && kill -0 "$load_pid" 2>/dev/null
 }
-# A load still running when this script ends early (an error, INT, TERM) gets TERM too: it runs
-# in its own session, so nothing else would stop it.
-stop_load() {
+# A repeat or load still running when this script ends early (an error, INT, TERM) gets TERM
+# and is waited for, so each test-run.sh sweeps its own containers. Neither is in this script's
+# process group (timeout makes its own; the load runs in its own session), so a Ctrl-C reaches
+# neither directly. The repeat runs in the background and is waited for, so a trapped signal
+# interrupts the wait at once instead of after the repeat's limit.
+rep_pid=""
+stop_all() {
+  if [ -n "$rep_pid" ] && kill -0 "$rep_pid" 2>/dev/null; then
+    kill -TERM "$rep_pid" 2>/dev/null || true
+    wait "$rep_pid" 2>/dev/null || true
+  fi
   if alive; then
     kill -TERM -- "-$load_pid" 2>/dev/null || true
     wait "$load_pid" 2>/dev/null || true
   fi
 }
-trap stop_load EXIT
+trap stop_all EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 field() {
@@ -121,7 +131,12 @@ while [ "$loaded" -lt "$count" ]; do
   at_start=no
   alive && at_start=yes
   s=0
-  timeout --signal=TERM --kill-after=30 "$limit" bash -c "$run_cmd" >"$log" 2>&1 || s=$?
+  # TERM at the limit; KILL only kill_after seconds later, so test-run.sh has time to stop the
+  # test binary and sweep its containers (a KILL before that leaves them behind).
+  timeout --signal=TERM --kill-after="$kill_after" "$limit" bash -c "$run_cmd" >"$log" 2>&1 &
+  rep_pid=$!
+  wait "$rep_pid" || s=$?
+  rep_pid=""
   at_end=no
   alive && at_end=yes
   secs=$(($(date +%s) - now))
@@ -159,7 +174,7 @@ if alive; then
 elif [ -n "$load_pid" ]; then
   load_end
 fi
-echo "test containers after the run (another worktree): $(others)" >>"$results"
+echo "test containers after the run (another worktree's, or left by this run): $(others)" >>"$results"
 
 verdict=pass
 if [ "$red" -gt 0 ] || [ "$load_red" -eq 1 ]; then

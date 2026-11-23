@@ -30,6 +30,8 @@ case "${modes[$i]}" in
   three) printf 'test %s ... ok\n%s\ntest result: ok. 3 passed; 0 failed\n' "$fork" "$figures" ;;
   slow) sleep 2; printf 'test %s ... ok\n%s\ntest result: ok. 4 passed; 0 failed\n' "$fork" "$figures" ;;
   hang) sleep 30 ;;
+  # Records the TERM it gets (as test-run.sh would sweep on it) in <counter file>.term.
+  trapped) sleep 30 & trap 'kill $!; echo term >"$1.term"; exit 143' TERM; wait ;;
 esac
 EOF
 
@@ -102,14 +104,14 @@ has unloaded "run=1 unloaded pass"
 has unloaded "load pass 1: exit 0, fork-bomb test failed: no"
 has unloaded "planned 1, loaded 0, unloaded 1, passed 1, red 0, load passes 1, verdict incomplete"
 
-# A 1 s load under 0.4 s repeats ends mid-run: it is started again until 5 loaded repeats ran.
-run restarted 5 0 pass LOADED_REPEAT_LOAD="sleep 1" \
-  LOADED_REPEAT_RUN="sleep 0.4; bash $tmp/run.sh $tmp/restarted.count pass"
+# A 2 s load under 0.3 s repeats ends mid-run: it is started again until 10 loaded repeats ran.
+run restarted 10 0 pass LOADED_REPEAT_LOAD="sleep 2" \
+  LOADED_REPEAT_RUN="sleep 0.3; bash $tmp/run.sh $tmp/restarted.count pass"
 has restarted "load pass 1: exit 0"
 has restarted "load pass 2"
-has restarted "planned 5, loaded 5,"
+has restarted "planned 10, loaded 10,"
 
-run time-out 1 1 hang LOADED_REPEAT_LIMIT=1
+run time-out 1 1 hang LOADED_REPEAT_LIMIT=1 LOADED_REPEAT_KILL_AFTER=5
 has time-out "run=1 loaded red fork-bomb=unknown"
 has time-out "exit=124"
 
@@ -127,6 +129,28 @@ has idle-load "loaded 0, unloaded 2, passed 2, red 0, load passes 2, verdict inc
 run start-limit 5 1 slow LOADED_REPEAT_START_LIMIT=1
 lines start-limit 1
 has start-limit "loaded 1, unloaded 0, passed 1, red 0, load passes 1, verdict incomplete"
+
+# TERM to the script mid-repeat: the repeat and the load each get TERM at once (each would
+# sweep its containers) and the script exits 143, well before the repeat's 600 s limit.
+case_n=$((case_n + 1))
+began=$(date +%s)
+LOADED_REPEAT_PREBUILD=true \
+  LOADED_REPEAT_LOAD="sleep 30 & trap 'kill \$!; echo term >$tmp/stopped.load; exit 143' TERM; wait" \
+  LOADED_REPEAT_RUN="bash $tmp/run.sh $tmp/stopped.count trapped" \
+  bash "$script" 1 "$tmp/stopped" >"$tmp/stopped.out" 2>&1 &
+pid=$!
+for _ in $(seq 50); do
+  [ -e "$tmp/stopped.count" ] && break
+  sleep 0.1
+done
+sleep 0.5
+kill -TERM "$pid"
+got=0
+wait "$pid" || got=$?
+[ "$got" = 143 ] || { echo "FAIL stopped: exit $got, want 143"; cat "$tmp/stopped.out"; fail=1; }
+[ -e "$tmp/stopped.count.term" ] || { echo "FAIL stopped: the repeat got no TERM"; fail=1; }
+[ -e "$tmp/stopped.load" ] || { echo "FAIL stopped: the load got no TERM"; fail=1; }
+[ $(($(date +%s) - began)) -lt 20 ] || { echo "FAIL stopped: the script did not stop at once"; fail=1; }
 
 for args in "0 $tmp/u" "x $tmp/u" "1"; do
   got=0
