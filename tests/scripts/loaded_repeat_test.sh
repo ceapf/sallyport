@@ -16,7 +16,7 @@ trap 'rm -rf "$tmp"' EXIT
 # Stubs on PATH. podman, for the whole file: the script's container count reads it (one sp-
 # name), never the real podman. setsid, per case: late-group execs the real one after 2 s, so
 # the load leads its own process group only then; no-group never makes one.
-real_setsid="$(command -v setsid)"
+real_setsid="$(command -v setsid)" || { echo "FAIL: no setsid on PATH"; exit 1; }
 mkdir -p "$tmp/bin" "$tmp/late" "$tmp/nogroup"
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" other-1 sp-left-1\n' >"$tmp/bin/podman"
 printf '#!/usr/bin/env bash\nsleep 2\nexec %q "$@"\n' "$real_setsid" >"$tmp/late/setsid"
@@ -111,10 +111,12 @@ has all "planned 3, loaded 3, unloaded 0, passed 3, red 0, load passes 1, memory
 has all "test containers before the run (another worktree): 1"
 quick all "$started"
 
-# The load gets its own process group 2 s after its start: the script waits for it, so the
-# stop at the end reaches the load at once.
+# The load gets its own process group 2 s after its start: the script waits for it, so the load
+# really runs (its marker) and the stop at the end reaches it at once.
 began=$(date +%s)
-run late-group 3 0 pass PATH="$tmp/late:$PATH"
+run late-group 3 0 pass PATH="$tmp/late:$PATH" \
+  LOADED_REPEAT_LOAD="echo ran >$tmp/late-group.load; sleep 30"
+[ -e "$tmp/late-group.load" ] || { echo "FAIL late-group: the load never ran"; fail=1; }
 lines late-group 3
 has late-group "load pass 1: stopped (TERM)"
 has late-group "planned 3, loaded 3,"

@@ -24,9 +24,9 @@
 # - When the repeats end, the load gets TERM (its test-run.sh sweeps its own containers) and is
 #   waited for. A load pass starts only once it leads its own process group (at most 5 s, else
 #   exit 1 with no repeat), and the stop falls back to the load's own pid if the group is gone.
-#   Exit 0 only when every repeat passed, <count> loaded repeats ran and no load pass
-#   failed in the fork-bomb test; otherwise 1, with the verdict (red or incomplete) on the totals
-#   line. Usage errors exit 2.
+#   Exit 0 only when every repeat passed, <count> loaded repeats ran and no load pass failed in
+#   the fork-bomb test; otherwise 1, with the verdict (red or incomplete) on the totals line.
+#   Usage errors exit 2.
 # Environment (defaults in brackets): LOADED_REPEAT_LIMIT, seconds per repeat [600];
 # LOADED_REPEAT_KILL_AFTER, seconds from a repeat's TERM to its KILL [180];
 # LOADED_REPEAT_RESTART [1]; LOADED_REPEAT_START_LIMIT [0]; LOADED_REPEAT_PREBUILD,
@@ -74,12 +74,13 @@ bash -c "$prebuild" >"$out/prebuild.log" 2>&1 || {
   exit 1
 }
 
-# How often load_start checks, every 0.05 s, for the load's process group: 100 is 5 s.
+# load_start checks for the load's process group every 0.05 s, at most GROUP_TRIES times (5 s).
 GROUP_TRIES=100
 load_pid="" passes=0 load_red=0 idle=0 loaded=0 at_load=0
 load_start() {
   passes=$((passes + 1))
   at_load="$loaded"
+  # TODO(#321): a signal between this fork and the next line leaves the load running.
   setsid env --default-signal=INT,QUIT bash -c "$load_cmd" >"$out/load-$passes.log" 2>&1 &
   load_pid=$!
   # The load's process group exists only once the child has called setsid(); a stop before that
@@ -88,7 +89,7 @@ load_start() {
   until kill -0 -- "-$load_pid" 2>/dev/null; do
     kill -0 "$load_pid" 2>/dev/null || return 0
     if [ "$tries" -ge "$GROUP_TRIES" ]; then
-      echo "loaded-repeat: the load did not get its own process group within 5 s" >&2
+      echo "loaded-repeat: the load did not get its own process group within $((GROUP_TRIES / 20)) s" >&2
       exit 1
     fi
     tries=$((tries + 1))
