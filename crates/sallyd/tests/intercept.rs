@@ -26,7 +26,9 @@ use common::intercept::{
     allow_routes, body_and_length, check_echo_forms, connect, credential_in, filled, get_req, gh,
     git, header_values, mock3, over, rendered, responses, session_ca, test_ca, tls, upstream_reply,
 };
-use sallyd::sandbox::{Running, WorkspaceRequest};
+use sally_core::audit::{Actor, NewEntry};
+use sally_core::manifest::AuditLevel;
+use sallyd::sandbox::{AuditSink, Running, WorkspaceRequest};
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -787,8 +789,12 @@ const HOST_MANIFEST: &str = "network:\n  mode: proxy\n  allow:\n    - host: mock
 /// forms. Only the raw form can stand in a host (a lower-case DNS label); this test proves
 /// nothing about the other forms. The test sink never redacts, so the per-session redaction is
 /// the only one it shows; `egress.allow`, written while the session is live, is checked too,
-/// as an extra. Control (hand-checked once, uncommitted): the launcher passing the session's
-/// unwrapped sink to its egress fails it, the raw value in the host.
+/// as an extra. Control: in-test, the session's own redaction left out. The same host, appended
+/// to the launcher's sink while the session is live under a test-only event, is recorded with
+/// the value and found by the same two checks; and the logs' redactor masks the host while the
+/// session is live and no longer after the release, so only the session's own forms can have
+/// masked the late entry. The session sink's wrap in the launcher (`start_egress`) is held by
+/// this test alone: without it the late entry's host holds the raw value.
 #[test]
 fn rt_sec_07_an_entry_written_after_the_release_holds_no_credential_in_its_host() {
     rt().block_on(async {
@@ -798,6 +804,24 @@ fn rt_sec_07_an_entry_written_after_the_release_holds_no_credential_in_its_host(
         assert_eq!(lx.redactors.sessions(), std::slice::from_ref(&id));
         let value = common::egress::canary("HOST_TOKEN");
         let host = format!("{value}.mock.test");
+        // The two absence checks of this test, as (raw text, any computed form).
+        let checks = |event: &str, entry: &serde_json::Value| {
+            (
+                entry.to_string().contains(&value),
+                credential_in(event, entry, &forms_of(&value)).is_some(),
+            )
+        };
+        // Control, while the session is live: the host appended to the launcher's own sink under
+        // a test-only event, with no session redaction around it, is recorded as given; and the
+        // logs' redactor masks it while the session's forms are registered.
+        let planted = NewEntry::new(Actor::Sallyd, "test.planted")
+            .session(id.clone())
+            .args(json!({ "host": host }));
+        lx.events.append(planted, AuditLevel::Actions).unwrap();
+        assert!(
+            !lx.redacted.redact(&host).contains(&value),
+            "control: the logs' redactor masks the host while the session is live"
+        );
         lx.egress.resolver.set(&host, vec![vec![tls_upstream()]]);
         let sock = lx.paths("sec07h").workspace_sockets().join("net.sock");
         // Held before the tunnel exists, so it cannot close unheld in between.
@@ -818,6 +842,11 @@ fn rt_sec_07_an_entry_written_after_the_release_holds_no_credential_in_its_host(
         .await
         .expect("session.closed waited for the held append");
         assert!(lx.redactors.sessions().is_empty(), "the forms stayed");
+        assert_eq!(
+            lx.redacted.redact(&host),
+            host,
+            "control: after the release the logs' redactor no longer masks the host"
+        );
         drop(unhold);
         let mut close = None;
         for _ in 0..200 {
@@ -839,15 +868,25 @@ fn rt_sec_07_an_entry_written_after_the_release_holds_no_credential_in_its_host(
             .find(|(e, a)| e == "egress.allow" && a["intercept"] == json!(false))
             .expect("the tunnel's egress.allow")
             .1;
+        let planted = lx
+            .events
+            .all()
+            .into_iter()
+            .find(|(e, _)| e == "test.planted")
+            .expect("control: the planted entry was recorded")
+            .1;
+        assert_eq!(
+            checks("test.planted", &planted),
+            (true, true),
+            "control: both checks find the value in {planted}"
+        );
         for (event, entry) in [("egress.close", &close), ("egress.allow", &allow)] {
             assert_eq!(
                 entry["host"],
                 json!("[REDACTED:HOST_TOKEN].mock.test"),
                 "{event}: {entry}"
             );
-            assert!(!entry.to_string().contains(&value), "{event}: {entry}");
-            let found = credential_in(event, entry, &forms_of(&value));
-            assert!(found.is_none(), "{found:?}");
+            assert_eq!(checks(event, entry), (false, false), "{event}: {entry}");
         }
         drop(tunnel);
     });
@@ -856,8 +895,8 @@ fn rt_sec_07_an_entry_written_after_the_release_holds_no_credential_in_its_host(
 /// RT-SEC-07: after injected and echoed exchanges on every grant host (`Bearer`, a bare value,
 /// three `{basic}` grants, the encoded echoes of `/echo-forms`), no audit entry holds any form
 /// of any canary (each independently computed: raw, percent, JSON-string, base64 cores,
-/// rendered values, blobs; searched in every decoded string, key and number, so JSON escaping cannot hide one),
-/// and each `egress.request` names its grant. Control: `request_args` builds `injected` from
+/// rendered values, blobs; searched in every decoded string, key and number, so JSON escaping
+/// cannot hide one), and each `egress.request` names its grant. Control: `request_args` builds `injected` from
 /// grant names (`Prepared::names`), and no entry is built from a header map or a body. In-test
 /// control of the search (#122): [`credential_in`] finds every form planted in an entry.
 #[test]
