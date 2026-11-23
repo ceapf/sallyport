@@ -202,7 +202,8 @@ fn peak(x: &Lx, r: &Running, cg: &std::path::Path, file: &str) -> String {
     }
 }
 
-/// The `name` counter of an events file's `text` for printing, or `absent` (an older kernel).
+/// The `name` counter of an events file's `text` for printing, or `absent` (an older kernel
+/// without it, or a value that is not a number).
 fn counter(text: &str, name: &str) -> String {
     text.lines()
         .find_map(|l| l.strip_prefix(name)?.trim().parse::<u64>().ok())
