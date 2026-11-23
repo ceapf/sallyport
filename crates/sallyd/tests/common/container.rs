@@ -482,6 +482,22 @@ impl Swapped {
     }
 }
 
+/// What a fixture's launcher varies from production.
+#[derive(Clone, Copy)]
+struct Knobs {
+    /// The failed-launch cleanup's pauses.
+    cleanup: CleanupSchedule,
+    /// The uid the trust roots file must have (`None`: the test's own).
+    roots_owner: Option<u32>,
+}
+
+impl Knobs {
+    const PRODUCTION: Self = Self {
+        cleanup: CleanupSchedule::PRODUCTION,
+        roots_owner: None,
+    };
+}
+
 pub struct Lx {
     pub f: Fx,
     pub launcher: Arc<Launcher>,
@@ -563,7 +579,10 @@ impl Lx {
             DiskFloor::default(),
             Some(io_lock(false)),
             None,
-            cleanup,
+            Knobs {
+                cleanup,
+                ..Knobs::PRODUCTION
+            },
         )
     }
 
@@ -589,6 +608,24 @@ impl Lx {
         Self::build(None, None, None, floor, None)
     }
 
+    /// The egress starter requires the trust roots file to be owned by `owner` instead of the
+    /// test's own uid (RT-SEC-16's owner case).
+    #[allow(dead_code)] // Only RT-SEC-16 changes the required owner.
+    pub fn with_roots_owner(owner: u32) -> Self {
+        Self::build_as(
+            None,
+            None,
+            None,
+            DiskFloor::default(),
+            Some(io_lock(false)),
+            None,
+            Knobs {
+                roots_owner: Some(owner),
+                ..Knobs::PRODUCTION
+            },
+        )
+    }
+
     /// The next `sallyd` of this fixture's installation (same id, so the same label): a new
     /// launcher with no live sessions, as after a crash (architect Q64).
     #[allow(dead_code)] // Only the orphan tests play a second sallyd.
@@ -600,7 +637,7 @@ impl Lx {
             DiskFloor::default(),
             Some(io_lock(false)),
             Some(self.installation.clone()),
-            CleanupSchedule::PRODUCTION,
+            Knobs::PRODUCTION,
         )
     }
 
@@ -617,7 +654,7 @@ impl Lx {
             DiskFloor::default(),
             Some(io_lock(false)),
             Some(self.installation.clone()),
-            CleanupSchedule::PRODUCTION,
+            Knobs::PRODUCTION,
         )
     }
 
@@ -635,7 +672,7 @@ impl Lx {
             floor,
             io,
             None,
-            CleanupSchedule::PRODUCTION,
+            Knobs::PRODUCTION,
         )
     }
 
@@ -647,7 +684,7 @@ impl Lx {
         floor: DiskFloor,
         io: Option<std::fs::File>,
         installation: Option<Installation>,
-        cleanup: CleanupSchedule,
+        knobs: Knobs,
     ) -> Self {
         let installation =
             installation.unwrap_or_else(|| Installation::fresh().expect("an installation id"));
@@ -670,7 +707,10 @@ impl Lx {
         let bin = resolve_podman(podman_bin.as_deref()).unwrap();
         let podman = Podman::setup(bin, &runtime, &state, &host).unwrap();
         let events = Arc::new(Events::default());
-        let egress = super::egress::fake_egress(&f.root);
+        let egress = match knobs.roots_owner {
+            Some(owner) => super::egress::fake_egress_owned(&f.root, owner),
+            None => super::egress::fake_egress(&f.root),
+        };
         let redacted = Arc::new(Swapped::default());
         let oplog_lines = super::Lines::default();
         let oplog = sallyd::oplog::Oplog::new(oplog_lines.clone());
@@ -701,7 +741,7 @@ impl Lx {
             oplog: oplog.clone(),
             installation: installation.clone(),
             crash,
-            cleanup,
+            cleanup: knobs.cleanup,
         });
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

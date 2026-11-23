@@ -356,6 +356,12 @@ pub fn canary_store(dir: &Path) -> std::path::PathBuf {
 /// starter is built to require; production passes the system bundle and uid 0), and as secrets
 /// source the production store file at [`canary_store`].
 pub fn fake_egress(dir: &Path) -> Arc<FakeEgress> {
+    fake_egress_owned(dir, rustix::process::getuid().as_raw())
+}
+
+/// [`fake_egress`], with the trust roots file required to be owned by `owner` (RT-SEC-16: a
+/// file owned by another user than the one required is refused).
+pub fn fake_egress_owned(dir: &Path, owner: u32) -> Arc<FakeEgress> {
     let pki = Pki::new();
     let roots = dir.join("upstream-ca.pem");
     std::fs::write(&roots, &pki.ca_pem).unwrap();
@@ -371,7 +377,7 @@ pub fn fake_egress(dir: &Path) -> Arc<FakeEgress> {
         host: Arc::new(Owned::default()),
         roots: sallyd::egress::roots::BundleFiles {
             paths: vec![roots],
-            owner: rustix::process::getuid().as_raw(),
+            owner,
         },
         secrets: Arc::new(sallyd::egress::inject::StoreFile { path: secrets }),
     })

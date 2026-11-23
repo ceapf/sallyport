@@ -139,7 +139,7 @@ impl BundleFiles {
 /// Opens `path` without blocking (a FIFO must not hang the launch), checks the opened file, and
 /// reads it within the cap. The open precedes the type check, so a device node at a candidate
 /// path would be opened (security review L3, accepted): placing one there takes root, which
-/// already controls the roots.
+/// already controls the roots. Every check here is held through a session launch by RT-SEC-16.
 fn read(path: &Path, owner: u32) -> Result<Vec<u8>, RootsError> {
     let io = |err: io::Error| RootsError::Io {
         path: path.to_owned(),

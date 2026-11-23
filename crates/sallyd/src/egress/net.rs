@@ -631,6 +631,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> EgressStarter for Egress<R, D, H> {
         }
         let values = self.secrets.load(&names).map_err(EgressError::Store)?;
         let credentials = Credentials::new(&s.grants, values)?;
+        // A file that fails the roots checks refuses the launch here (RT-SEC-16).
         let roots = self.roots.load()?;
         let validity = Validity::for_session(SystemTime::now(), s.timeout)?;
         let tls = SessionTls::mint(&s.policy.grant_hosts(), validity)?;

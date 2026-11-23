@@ -14,6 +14,7 @@
 
 mod common;
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -764,6 +765,189 @@ fn rt_net_09_body_caps_hold_inside_an_intercepted_tunnel() {
                 (json!("request-too-large"), json!("mock.test")),
                 (json!("response-too-large"), json!("mock.test")),
             ]
+        );
+    });
+}
+
+/// RT-SEC-16, a session's launch against the trust roots file `fake_egress` wrote, `None` when
+/// it was not refused within the bound. A FIFO that blocked the launch is opened for writing
+/// first, so the stuck read ends and the test fails instead of hanging.
+async fn launch_against_roots(lx: &Lx, tag: &str) -> Option<sallyd::sandbox::LaunchError> {
+    let req = WorkspaceRequest {
+        paths: lx.paths(tag),
+        manifest: Arc::new(lx.f.load(MANIFEST)),
+        default_image: Some(net_image()),
+        crash: sallyd::daemon::crash::CrashReporter::channel().0,
+    };
+    match tokio::time::timeout(Duration::from_secs(20), lx.launcher.launch_workspace(req)).await {
+        Ok(Ok(r)) => {
+            lx.stop(r).await;
+            None
+        }
+        Ok(Err(e)) => Some(e),
+        Err(_) => {
+            let roots = lx.f.root.join("upstream-ca.pem");
+            let _unstick = std::fs::OpenOptions::new().write(true).open(&roots);
+            None
+        }
+    }
+}
+
+/// RT-SEC-16's checks of one refused launch: the reason the file checks give, the
+/// `sandbox.refuse` entry, and nothing of the session left (no socket, no CA file, no container,
+/// no registered forms).
+fn assert_roots_refused(
+    lx: &Lx,
+    tag: &str,
+    e: Option<sallyd::sandbox::LaunchError>,
+    want: &str,
+    refusals: &mut usize,
+) {
+    use sallyd::egress::net::EgressError;
+    use sallyd::egress::roots::RootsError;
+    use sallyd::sandbox::LaunchError;
+    let e = e.unwrap_or_else(|| panic!("{tag}: the launch was not refused"));
+    match &e {
+        LaunchError::Egress(EgressError::Roots(RootsError::Untrusted { why, .. })) => {
+            assert_eq!(*why, want, "{tag}: {e}");
+        }
+        other => panic!("{tag}: {other}"),
+    }
+    let refuses: Vec<_> = lx
+        .events
+        .all()
+        .into_iter()
+        .filter(|(n, _)| n == "sandbox.refuse")
+        .map(|(_, a)| a)
+        .collect();
+    *refusals += 1;
+    assert_eq!(refuses.len(), *refusals, "{tag}: {refuses:?}");
+    assert_eq!(
+        refuses[*refusals - 1]["reason"],
+        json!("trust-roots"),
+        "{tag}"
+    );
+    let sockets = lx.paths(tag).workspace_sockets();
+    for f in ["net.sock", "ca-bundle.pem", "session-ca.pem"] {
+        assert!(!sockets.join(f).exists(), "{tag}: {f} exists");
+    }
+    assert!(!lx.listed(), "{tag}: a container was created");
+    let id = lx.paths(tag).id().as_str().to_owned();
+    assert!(
+        !lx.redactors.sessions().contains(&id),
+        "{tag}: its forms were registered"
+    );
+}
+
+/// RT-SEC-16: a session with a secret grant takes its upstream trust roots only from a file the
+/// user's own processes cannot have rewritten. Launched against a roots file that is group- or
+/// other-writable, a directory, a FIFO, over 4 MiB, or owned by another user than the one
+/// required, the launch is refused `trust-roots` before `net.sock`, the CA files or the
+/// container exist; a FIFO does not block it. Controls: each check of `egress::roots::read`
+/// (the file type, the owner, the write bits, the size cap, the non-blocking open); the exact
+/// reason is asserted, since a directory or a FIFO with the type check gone still refuses, for
+/// another reason. In-test control, first: the same session against the intact file launches,
+/// intercepts one exchange and is listed. Not covered here: the `fetch`-only session's roots and
+/// the Hugging Face client's (unit tests), and the 4 MiB boundary itself (unit test).
+#[test]
+fn rt_sec_16_a_tampered_trust_roots_file_refuses_the_launch() {
+    use std::os::unix::fs::PermissionsExt;
+    rt().block_on(async {
+        let lx = Lx::new();
+        let roots = lx.f.root.join("upstream-ca.pem");
+        let original = std::fs::read(&roots).unwrap();
+        let restore = |roots: &Path| {
+            if roots.is_dir() {
+                std::fs::remove_dir(roots).unwrap();
+            } else {
+                std::fs::remove_file(roots).unwrap();
+            }
+            std::fs::write(roots, &original).unwrap();
+            std::fs::set_permissions(roots, std::fs::Permissions::from_mode(0o644)).unwrap();
+        };
+
+        let r = session(&lx, "sec16ok").await;
+        let back = over(
+            &lx,
+            "sec16ok",
+            "mock.test",
+            &get_req("mock.test", "/echo-headers", ""),
+        )
+        .await;
+        assert!(back.starts_with("HTTP/1.1 200 "), "control: {back}");
+        assert!(lx.listed(), "control: the session's container is listed");
+        let sockets = lx.paths("sec16ok").workspace_sockets();
+        for f in ["net.sock", "ca-bundle.pem", "session-ca.pem"] {
+            assert!(sockets.join(f).exists(), "control: {f}");
+        }
+        lx.stop(r).await;
+        assert!(!lx.listed(), "control: listed after its stop");
+        let (dials, seen) = (
+            lx.egress.dialer.dials().len(),
+            lx.egress.dialer.seen().len(),
+        );
+        assert_eq!((dials, seen), (1, 1), "control: one exchange");
+
+        let mut refusals = 0;
+        let mode = |m: u32| {
+            move |p: &Path| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap()
+        };
+        let group = mode(0o664);
+        let other = mode(0o646);
+        let directory = |p: &Path| {
+            std::fs::remove_file(p).unwrap();
+            std::fs::create_dir(p).unwrap();
+        };
+        let fifo = |p: &Path| {
+            std::fs::remove_file(p).unwrap();
+            rustix::fs::mknodat(
+                rustix::fs::CWD,
+                p,
+                rustix::fs::FileType::Fifo,
+                rustix::fs::Mode::from_raw_mode(0o644),
+                0,
+            )
+            .unwrap();
+        };
+        let large = |p: &Path| {
+            let mut big = original.clone();
+            big.resize(4 * 1024 * 1024 + 1, b'\n');
+            std::fs::write(p, big).unwrap();
+        };
+        // (tag, how the file is spoiled, the reason the check gives)
+        type Case<'a> = (&'a str, &'a dyn Fn(&Path), &'a str);
+        let cases: [Case; 5] = [
+            ("sec16g", &group, "group- or other-writable"),
+            ("sec16o", &other, "group- or other-writable"),
+            ("sec16d", &directory, "not a regular file"),
+            ("sec16f", &fifo, "not a regular file"),
+            ("sec16l", &large, "larger than 4 MiB"),
+        ];
+        for (tag, spoil, want) in cases {
+            spoil(&roots);
+            let e = launch_against_roots(&lx, tag).await;
+            restore(&roots);
+            assert_roots_refused(&lx, tag, e, want, &mut refusals);
+        }
+        assert_eq!(
+            lx.egress.dialer.dials().len(),
+            dials,
+            "a refused launch dialled"
+        );
+        assert_eq!(lx.egress.dialer.seen().len(), seen);
+
+        let me = rustix::process::getuid().as_raw();
+        let owner = if me == 0 { 1 } else { 0 };
+        assert_ne!(owner, me, "control: another user than the test's");
+        let lx2 = Lx::with_roots_owner(owner);
+        let e = launch_against_roots(&lx2, "sec16u").await;
+        let mut refusals2 = 0;
+        assert_roots_refused(
+            &lx2,
+            "sec16u",
+            e,
+            "not owned by the expected user",
+            &mut refusals2,
         );
     });
 }
