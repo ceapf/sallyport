@@ -162,7 +162,11 @@ fn redirects_are_bounded_and_checked() {
         Err(HfError::TooManyRedirects)
     );
     let mut t = Tries::default();
-    let h308 = Head { status: 308, ..h };
+    let h308 = Head {
+        status: 308,
+        location: Some("/api/models/a/b/revision/main?blobs=true"),
+        ..h
+    };
     assert!(matches!(
         decide_list(&h308, &list(), &mut t),
         Ok(Step::Redirect(_))
@@ -188,6 +192,58 @@ fn redirects_are_bounded_and_checked() {
         decide_list(&other3xx, &list(), &mut t),
         Err(HfError::UpstreamStatus(300))
     );
+}
+
+/// The file list, which carries the publisher's hashes, is read from the API host only: a
+/// redirect of the list call to any other Hub host is refused. Control: a relative Location and
+/// an absolute one on the API host are followed, with the token.
+#[test]
+fn a_list_redirect_off_the_api_host_is_refused() {
+    for off in [
+        "https://cdn-lfs.hf.co/api/models/a/b/revision/main?blobs=true",
+        "https://hf.co/x",
+        "https://cdn-lfs.huggingface.co/x",
+    ] {
+        let h = Head {
+            location: Some(off),
+            ..head(308)
+        };
+        let mut t = Tries::default();
+        assert_eq!(
+            decide_list(&h, &list(), &mut t),
+            Err(HfError::RedirectRefused),
+            "{off}"
+        );
+    }
+    // The API host only, not the same host only: a list call already off it is refused even
+    // when the next Location stays on its host.
+    let off_host = crate::hf::plan::redirect(&list(), "https://cdn-lfs.hf.co/x").unwrap();
+    let relative = Head {
+        location: Some("/y"),
+        ..head(302)
+    };
+    let mut t = Tries::default();
+    assert_eq!(
+        decide_list(&relative, &off_host, &mut t),
+        Err(HfError::RedirectRefused)
+    );
+    for on in [
+        "/api/models/a/b/revision/main?blobs=true",
+        "https://huggingface.co/x",
+    ] {
+        let h = Head {
+            location: Some(on),
+            ..head(302)
+        };
+        let mut t = Tries::default();
+        match decide_list(&h, &list(), &mut t) {
+            Ok(Step::Redirect(next)) => {
+                assert_eq!(next.host(), "huggingface.co", "{on}");
+                assert!(next.carries_auth(), "{on}");
+            }
+            other => panic!("{on}: {other:?}"),
+        }
+    }
 }
 
 /// 429, or 503 with Retry-After, waits at most 60 s, at most three times, then is refused.
