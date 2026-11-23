@@ -90,7 +90,8 @@ coverage:
 # ruling Q26) and tools (Task 11 decision 8, ruling Q38; tools/exec.rs stays with the rt_ tests).
 MUTANTS_FILES := crates/sally-core/src/manifest/validate/*.rs crates/sally-core/src/manifest/paths.rs \
                  crates/sally-core/src/manifest/links.rs crates/sally-core/src/manifest/location.rs \
-                 crates/sally-core/src/manifest/host.rs crates/sally-core/src/config.rs
+                 crates/sally-core/src/manifest/host.rs crates/sally-core/src/config.rs \
+                 crates/sally-core/src/manifest/mountinfo.rs
 # cargo-mutants copies the tree to $$TMPDIR; /tmp is denylisted for mounts, so the copy (and the
 # test fixtures under its target dir) must live elsewhere. Move the fixtures, not the wall.
 # Every mutation run holds the per-user `disk-free` lock shared (scripts/disk-lock.sh, architect
@@ -225,7 +226,7 @@ zizmor:
 # Fuzz smoke: 60 s per target (needs nightly + cargo-fuzz; CI pins both).
 FUZZ_TARGETS := manifest secrets audit_line egress_head egress_rewrite egress_redact \
                 jsonrpc_message llm_request tool_path tool_args proc_stat fetch_url cli_frame \
-                oci_config oci_facts model_script gguf hf host_tables
+                oci_config oci_facts model_script gguf hf host_tables mountinfo
 FUZZ_SECS ?= 60
 CARGO_FUZZ_TOOLCHAIN ?= +nightly
 fuzz:

@@ -713,20 +713,35 @@ fn rt_fs_11_wsl_a_windows_executable_does_not_reach_windows() {
         assert_ne!(code, 0, "{out}");
         x.stop(r).await;
     });
-    // A Windows drive is on a filesystem kind this host refuses as a mount root, wherever the
-    // drive is mounted (the seam leg in sally-core's rt_manifest.rs shows a listed kind is
-    // refused). The drive's kind only is read, nothing on it is opened.
+    // A Windows drive is on a filesystem type this host refuses as a mount root, wherever the
+    // drive is mounted (the seam leg in sally-core's rt_manifest.rs shows a listed type is
+    // refused). Only the mount table's entry for the drive is read (`findmnt --mountpoint`),
+    // nothing on the drive is opened.
     let config = sally_core::config::Config::default();
     let env = sally_core::manifest::HostEnv::from_process(&config).unwrap();
+    for listed in [sally_core::manifest::V9FS, sally_core::manifest::VIRTIOFS] {
+        assert!(
+            env.refused_fs_kinds.contains(&listed),
+            "{:?}",
+            env.refused_fs_kinds
+        );
+    }
+    let o = std::process::Command::new("findmnt")
+        .args(["-n", "-o", "FSTYPE", "--mountpoint", "/mnt/c"])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "findmnt: {o:?}");
+    let ty = String::from_utf8(o.stdout).unwrap();
+    // With mounts stacked there, the last line is the top one, the one a path reaches.
+    let part = ty
+        .lines()
+        .last()
+        .unwrap_or_default()
+        .split('.')
+        .next()
+        .unwrap();
     assert!(
-        env.refused_fs_kinds.contains(&sally_core::manifest::V9FS),
-        "{:?}",
-        env.refused_fs_kinds
-    );
-    let drive = rustix::fs::statfs("/mnt/c").unwrap();
-    let kind = u64::try_from(drive.f_type).unwrap();
-    assert!(
-        env.refused_fs_kinds.iter().any(|k| k.magic == kind),
-        "/mnt/c is on kind {kind:#x}, not refused"
+        env.refused_fs_kinds.iter().any(|k| k.name == part),
+        "/mnt/c is of type {part:?}, not refused"
     );
 }

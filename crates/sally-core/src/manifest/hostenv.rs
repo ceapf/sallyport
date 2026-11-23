@@ -32,8 +32,8 @@ pub struct HostEnv {
     /// The binaries `config.toml` names (the runtime, podman). The folder each is in, as written
     /// and as resolved, is denylisted: the host runs it on every launch (MANIFEST_SPEC §2).
     pub configured_binaries: Vec<ConfiguredBinary>,
-    /// Filesystem kinds a mount root may not lie on, wherever they are mounted: on WSL, 9p
-    /// (Windows drives and the WSL driver share; [`refused_fs_kinds`]). Empty elsewhere.
+    /// Filesystem kinds a mount root may not lie on, wherever they are mounted: on WSL, 9p and
+    /// virtiofs (Windows drives and the WSL driver share; [`refused_fs_kinds`]). Empty elsewhere.
     pub refused_fs_kinds: Vec<FsKind>,
     /// Logical CPUs available to the user.
     pub nproc: u32,
@@ -78,21 +78,21 @@ pub fn configured_binaries(config: &Config) -> Vec<ConfiguredBinary> {
     .collect()
 }
 
-/// A filesystem kind: the `f_type` that `statfs` reports, and a name for messages.
+/// A filesystem kind: the type name the mount table gives it (its part before any `.`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FsKind {
-    /// The kernel's magic number for the filesystem (`f_type`).
-    pub magic: u64,
-    /// Its name, as `stat -f` prints it.
-    pub label: &'static str,
+    /// The type, as `/proc/self/mountinfo` writes it (`9p`, `virtiofs`).
+    pub name: &'static str,
 }
 
-/// 9p (`V9FS_MAGIC`). On WSL, Windows drives are 9p mounts, and so is the driver share
-/// (docs/dev/PROBE_NOTES.md); the kind alone does not tell them apart, so every 9p is refused.
-pub const V9FS: FsKind = FsKind {
-    magic: 0x0102_1997,
-    label: "9p",
-};
+/// 9p. On WSL, Windows drives are 9p mounts, and so is the driver share
+/// (docs/dev/PROBE_NOTES.md); the type alone does not tell them apart, so every 9p is refused.
+pub const V9FS: FsKind = FsKind { name: "9p" };
+
+/// virtiofs, which newer WSL builds can serve Windows drives over. Its statfs number is FUSE's,
+/// shared by every FUSE filesystem; its type name is its own, and other FUSE types are not
+/// refused.
+pub const VIRTIOFS: FsKind = FsKind { name: "virtiofs" };
 
 /// Where the kernel names its release; on WSL it contains `microsoft`.
 const OSRELEASE: &str = "/proc/sys/kernel/osrelease";
@@ -100,15 +100,16 @@ const OSRELEASE: &str = "/proc/sys/kernel/osrelease";
 const WSL_INTEROP: &str = "/proc/sys/fs/binfmt_misc/WSLInterop";
 
 /// The filesystem kinds refused as mount roots, from the kernel release text and whether WSL's
-/// interop entry is present: on WSL (either signal) [`V9FS`], else none. A further signal is
-/// added only once it is probed (docs/dev/PROBE_NOTES.md), and only ever adds refusals
-/// (RT-FS-11: Windows drives refused by kind wherever they are mounted).
-// TODO(#281): a WSL that serves Windows drives over virtiofs is not covered, nor one that
-// neither signal shows (a release without "microsoft" and interop off: only the `/mnt` rule).
+/// interop entry is present: on WSL (either signal) [`V9FS`] and [`VIRTIOFS`], else none. A
+/// further signal is added only once it is probed (docs/dev/PROBE_NOTES.md), and only ever adds
+/// refusals (RT-FS-11: Windows drives refused by type name wherever they are mounted).
+// TODO(#281): not probed on a WSL that serves Windows drives over virtiofs, nor on WSL1, whose
+// drives are type `drvfs`, not listed; a WSL that neither signal shows (a release without
+// "microsoft" and interop off) keeps only the `/mnt` rule.
 #[must_use]
 pub fn refused_fs_kinds(osrelease: &str, interop: bool) -> Vec<FsKind> {
     if interop || osrelease.to_ascii_lowercase().contains("microsoft") {
-        vec![V9FS]
+        vec![V9FS, VIRTIOFS]
     } else {
         Vec::new()
     }
@@ -416,24 +417,25 @@ mod tests {
         assert_eq!(env.configured_binaries, configured_binaries(&c));
     }
 
-    /// 9p's magic, pinned against the literal the kernel's `magic.h` gives.
+    /// The two type names, pinned against the names the kernel registers (`9p`, `virtiofs`).
     #[test]
-    fn the_9p_kind_is_pinned() {
-        assert_eq!(V9FS.magic, 0x0102_1997);
-        assert_eq!(V9FS.label, "9p");
+    fn the_refused_type_names_are_pinned() {
+        assert_eq!(V9FS.name, "9p");
+        assert_eq!(VIRTIOFS.name, "virtiofs");
         assert_eq!(OSRELEASE, "/proc/sys/kernel/osrelease");
         assert_eq!(WSL_INTEROP, "/proc/sys/fs/binfmt_misc/WSLInterop");
     }
 
-    /// WSL when the kernel release says so (any case) or the interop entry is present; 9p is
-    /// then refused. Neither: nothing.
+    /// WSL when the kernel release says so (any case) or the interop entry is present; 9p and
+    /// virtiofs are then refused. Neither: nothing.
     #[test]
     fn wsl_is_told_by_its_release_or_its_interop_entry() {
         let release = "6.18.0-microsoft-standard-WSL2\n";
-        assert_eq!(refused_fs_kinds(release, false), [V9FS]);
-        assert_eq!(refused_fs_kinds("6.18.0-Microsoft\n", false), [V9FS]);
-        assert_eq!(refused_fs_kinds("6.8.0-45-generic\n", true), [V9FS]);
-        assert_eq!(refused_fs_kinds(release, true), [V9FS]);
+        let wsl = [V9FS, VIRTIOFS];
+        assert_eq!(refused_fs_kinds(release, false), wsl);
+        assert_eq!(refused_fs_kinds("6.18.0-Microsoft\n", false), wsl);
+        assert_eq!(refused_fs_kinds("6.8.0-45-generic\n", true), wsl);
+        assert_eq!(refused_fs_kinds(release, true), wsl);
         assert_eq!(refused_fs_kinds("6.8.0-45-generic\n", false), Vec::new());
         assert_eq!(refused_fs_kinds("", false), Vec::new());
     }
@@ -487,11 +489,13 @@ mod tests {
             .map(PathBuf::from)
             .filter(|p| p.is_absolute());
         assert_eq!(env.xdg_state_home, state);
-        // The kinds, from an independent read of this host's two signals.
+        // The kinds, from an independent read of this host's two signals. The entry is read
+        // without following a link, as the product does: only a clean not-found is absence.
         let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
-        let interop = Path::new("/proc/sys/fs/binfmt_misc/WSLInterop")
-            .try_exists()
-            .unwrap_or(true);
+        let interop = !matches!(
+            std::fs::symlink_metadata("/proc/sys/fs/binfmt_misc/WSLInterop"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+        );
         assert_eq!(env.refused_fs_kinds, refused_fs_kinds(&release, interop));
         assert!(
             env.env_dirs.iter().any(|d| d.var == "PATH"),

@@ -16,6 +16,7 @@ mod hostenv;
 mod image;
 mod links;
 mod location;
+mod mountinfo;
 mod parse;
 mod paths;
 mod summary;
@@ -26,11 +27,12 @@ mod validate;
 pub use diag::{Code, Diagnostic, Rejected, Severity};
 pub use host::{HostError, HostPattern, parse_host_pattern, parse_hostname};
 pub use hostenv::{
-    ConfiguredBinary, EnvDir, FsKind, HostEnv, HostEnvError, V9FS, configured_binaries,
+    ConfiguredBinary, EnvDir, FsKind, HostEnv, HostEnvError, V9FS, VIRTIOFS, configured_binaries,
     refused_fs_kinds,
 };
 pub use image::is_pinned_image_ref;
 pub use location::{HostAsWritten, LocationError, ManifestPlace};
+pub use mountinfo::{MountInfoError, mount_fs_type};
 pub use parse::{MAX_MANIFEST_BYTES, parse, parse_bytes, to_yaml};
 pub use summary::summary;
 pub use types::{
