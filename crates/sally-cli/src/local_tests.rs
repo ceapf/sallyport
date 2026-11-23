@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use sally_core::audit::{Actor, AuditWriter, NewEntry, SystemClock};
 use sally_core::manifest::{AuditLevel, MAX_MANIFEST_BYTES};
@@ -10,6 +10,11 @@ use serde_json::json;
 use super::*;
 
 const VALID: &str = "apiVersion: sallyport/v1\nkind: Manifest\nname: t\nmodel:\n  ref: any\n";
+
+/// The files a validation reads besides the manifest.
+fn files<'a>(store: &'a Path, config: &'a Path) -> Files<'a> {
+    Files { store, config }
+}
 
 struct Scratch(PathBuf);
 
@@ -35,6 +40,11 @@ impl Scratch {
     /// The secrets store's path (no file: an empty store).
     fn store(&self) -> PathBuf {
         self.0.join("secrets.toml")
+    }
+
+    /// The `config.toml` path (no file: the defaults).
+    fn config(&self) -> PathBuf {
+        self.0.join("config.toml")
     }
 
     /// A log with `n` entries whose `args.note` is `note`.
@@ -70,13 +80,13 @@ fn run(f: impl FnOnce(&mut Out<'_>) -> u8) -> (u8, String, String) {
 fn a_valid_manifest_is_valid_and_summarized() {
     let s = Scratch::new("valid");
     let m = s.file("m.yaml", VALID);
-    let (code, out, err) = run(|o| manifest_validate(&m, &s.store(), o));
+    let (code, out, err) = run(|o| manifest_validate(&m, files(&s.store(), &s.config()), o));
     assert_eq!(code, EXIT_OK, "{err}");
     assert!(
         out.ends_with("valid (sallyd checks again when a session starts)\n"),
         "{out}"
     );
-    let (code, out, err) = run(|o| manifest_summary(&m, &s.store(), o));
+    let (code, out, err) = run(|o| manifest_summary(&m, files(&s.store(), &s.config()), o));
     assert_eq!((code, err.as_str()), (EXIT_OK, ""));
     assert!(!out.is_empty() && out.ends_with('\n'));
 }
@@ -85,10 +95,10 @@ fn a_valid_manifest_is_valid_and_summarized() {
 fn a_rejected_manifest_prints_its_errors_and_no_summary() {
     let s = Scratch::new("reject");
     let m = s.file("m.yaml", &format!("{VALID}bogus: 1\n"));
-    let (code, out, err) = run(|o| manifest_validate(&m, &s.store(), o));
+    let (code, out, err) = run(|o| manifest_validate(&m, files(&s.store(), &s.config()), o));
     assert_eq!((code, out.as_str()), (EXIT_REFUSED, ""));
     assert!(err.starts_with("error: "), "{err}");
-    let (code, out, _) = run(|o| manifest_summary(&m, &s.store(), o));
+    let (code, out, _) = run(|o| manifest_summary(&m, files(&s.store(), &s.config()), o));
     assert_eq!((code, out.as_str()), (EXIT_REFUSED, ""));
 }
 
@@ -133,13 +143,13 @@ impl Drop for Gone {
 fn a_secret_grant_needs_the_name_in_the_store() {
     let s = Scratch::new("secret");
     let m = granting(&s);
-    let (code, _, err) = run(|o| manifest_validate(&m, &s.store(), o));
+    let (code, _, err) = run(|o| manifest_validate(&m, files(&s.store(), &s.config()), o));
     assert_eq!(code, EXIT_REFUSED, "{err}");
     assert!(err.contains("[secret-missing]"), "{err}");
     assert!(err.contains("sally secrets set \"GH\""), "{err}");
     store_gh(&s);
     // Architect Q226: its `[data-can-leave]` warning is plain ASCII, so the run is clean (0).
-    let (code, out, err) = run(|o| manifest_validate(&m, &s.store(), o));
+    let (code, out, err) = run(|o| manifest_validate(&m, files(&s.store(), &s.config()), o));
     assert_eq!((code, err.as_str()), (EXIT_OK, ""), "{out}");
     assert!(
         out.contains("[data-can-leave]")
@@ -148,7 +158,7 @@ fn a_secret_grant_needs_the_name_in_the_store() {
         "{out}"
     );
     // Its summary ends with the hash of the text read, which a launch's flag names (0).
-    let (code, out, _) = run(|o| manifest_summary(&m, &s.store(), o));
+    let (code, out, _) = run(|o| manifest_summary(&m, files(&s.store(), &s.config()), o));
     assert_eq!(code, EXIT_OK, "{out}");
     let text = std::fs::read_to_string(&m).unwrap();
     assert!(
@@ -179,7 +189,7 @@ fn a_non_ascii_mount_path_is_escaped_and_the_run_exits_1() {
         ),
     );
     store_gh(&s);
-    let (code, out, err) = run(|o| manifest_validate(&m, &s.store(), o));
+    let (code, out, err) = run(|o| manifest_validate(&m, files(&s.store(), &s.config()), o));
     assert_eq!((code, err.as_str()), (EXIT_REFUSED, ""), "{out}");
     assert!(
         out.contains("[data-can-leave]")
@@ -188,7 +198,7 @@ fn a_non_ascii_mount_path_is_escaped_and_the_run_exits_1() {
             && out.ends_with("valid (sallyd checks again when a session starts)\n"),
         "{out}"
     );
-    let (code, out, err) = run(|o| manifest_summary(&m, &s.store(), o));
+    let (code, out, err) = run(|o| manifest_summary(&m, files(&s.store(), &s.config()), o));
     // The summary on stdout; the warning a launch shows, on stderr (escaped too).
     assert_eq!(code, EXIT_REFUSED, "{out}");
     assert!(
@@ -217,7 +227,7 @@ fn an_unreadable_store_fails_a_grant_and_is_not_opened_without_one() {
     let path = s.file("secrets.toml", "GH = \"sp-store-text\"\nnot a store\n");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     let m = granting(&s);
-    let (code, out, err) = run(|o| manifest_validate(&m, &s.store(), o));
+    let (code, out, err) = run(|o| manifest_validate(&m, files(&s.store(), &s.config()), o));
     assert_eq!((code, out.as_str()), (EXIT_FAILED, ""), "{err}");
     assert!(
         err.starts_with("sally: ") && err.contains("secrets.toml"),
@@ -227,20 +237,21 @@ fn an_unreadable_store_fails_a_grant_and_is_not_opened_without_one() {
         !err.contains("sp-store-text") && !err.contains("secret-missing"),
         "{err}"
     );
-    let (code, _, err) = run(|o| manifest_summary(&m, &s.store(), o));
+    let (code, _, err) = run(|o| manifest_summary(&m, files(&s.store(), &s.config()), o));
     assert_eq!(code, EXIT_FAILED, "{err}");
     let plain = s.file("plain.yaml", VALID);
-    let (code, _, err) = run(|o| manifest_validate(&plain, &s.store(), o));
+    let (code, _, err) = run(|o| manifest_validate(&plain, files(&s.store(), &s.config()), o));
     assert_eq!(code, EXIT_OK, "no secret named: {err}");
 }
 
 #[test]
 fn an_unreadable_or_oversized_manifest_fails() {
     let s = Scratch::new("unread");
-    let (code, _, err) = run(|o| manifest_validate(&s.0.join("absent.yaml"), &s.store(), o));
+    let (code, _, err) =
+        run(|o| manifest_validate(&s.0.join("absent.yaml"), files(&s.store(), &s.config()), o));
     assert_eq!(code, EXIT_FAILED, "{err}");
     let big = s.file("big.yaml", &"#".repeat(MAX_MANIFEST_BYTES + 1));
-    let (code, _, err) = run(|o| manifest_summary(&big, &s.store(), o));
+    let (code, _, err) = run(|o| manifest_summary(&big, files(&s.store(), &s.config()), o));
     assert_eq!(code, EXIT_FAILED);
     assert!(err.contains("larger than"), "{err}");
 }

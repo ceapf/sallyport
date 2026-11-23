@@ -5,6 +5,8 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use crate::config::{Config, PODMAN_PATH_FIELD, RUNTIME_PATH_FIELD};
+
 /// Host facts used by the validator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostEnv {
@@ -27,6 +29,9 @@ pub struct HostEnv {
     /// `$GNUPGHOME`, every absolute `$PATH` entry, …). Each is denylisted like
     /// a home folder of the built-in list (MANIFEST_SPEC §2).
     pub env_dirs: Vec<EnvDir>,
+    /// The binaries `config.toml` names (the runtime, podman). The folder each is in, as written
+    /// and as resolved, is denylisted: the host runs it on every launch (MANIFEST_SPEC §2).
+    pub configured_binaries: Vec<ConfiguredBinary>,
     /// Logical CPUs available to the user.
     pub nproc: u32,
     /// Total host RAM in bytes.
@@ -40,6 +45,34 @@ pub struct EnvDir {
     pub path: PathBuf,
     /// The variable's name, without `$` (`PATH`, `CARGO_HOME`, …).
     pub var: &'static str,
+}
+
+/// A binary a `config.toml` setting names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfiguredBinary {
+    /// The path as the setting gives it (absolute: `parse_config` refuses a relative one).
+    pub path: PathBuf,
+    /// The setting's dotted name (`sandbox.runtime_path`, `sandbox.podman_path`).
+    pub setting: &'static str,
+}
+
+/// The binaries `config` names, in a fixed order: the runtime, then podman. A setting left to
+/// its default names none: the default runtime lies under the data home's `sallyport/` folder,
+/// already a rule, and the default podman is a root-owned system binary.
+#[must_use]
+pub fn configured_binaries(config: &Config) -> Vec<ConfiguredBinary> {
+    [
+        (&config.sandbox.runtime_path, RUNTIME_PATH_FIELD),
+        (&config.sandbox.podman_path, PODMAN_PATH_FIELD),
+    ]
+    .into_iter()
+    .filter_map(|(path, setting)| {
+        path.as_ref().map(|p| ConfiguredBinary {
+            path: p.clone(),
+            setting,
+        })
+    })
+    .collect()
 }
 
 /// Variables whose value is one folder the host runs or loads code from, or keeps credentials
@@ -115,7 +148,9 @@ pub enum HostEnvError {
 }
 
 impl HostEnv {
-    /// Reads the current process environment and `/proc`.
+    /// Reads the current process environment and `/proc`, and takes the binaries `config` names
+    /// ([`configured_binaries`]). The caller passes the `config.toml` it read
+    /// (`crate::config::read_config`), so `sallyd` and the CLI derive the same facts.
     ///
     /// Podman storage defaults to the rootless graphroot (`$XDG_DATA_HOME/containers/storage`)
     /// plus the rootful one (`/var/lib/containers/storage`); callers that know the real
@@ -124,7 +159,7 @@ impl HostEnv {
     /// # Errors
     /// [`HostEnvError`] if the home directory or RAM size cannot be determined. Validation must
     /// not proceed with a guessed home: the denylist depends on it.
-    pub fn from_process() -> Result<Self, HostEnvError> {
+    pub fn from_process(config: &Config) -> Result<Self, HostEnvError> {
         let abs_var = |name: &str| {
             std::env::var_os(name)
                 .map(PathBuf::from)
@@ -155,6 +190,7 @@ impl HostEnv {
             xdg_state_home: abs_var("XDG_STATE_HOME"),
             podman_storage,
             env_dirs: env_dirs(|name| std::env::var_os(name)),
+            configured_binaries: configured_binaries(config),
             nproc,
             mem_bytes: mem_total()?,
         })
@@ -293,9 +329,30 @@ mod tests {
         assert_eq!(dirs(&[]), Vec::new());
     }
 
+    /// Each binary setting that is set, in order, with its name; unset settings name none.
+    #[test]
+    fn the_configured_binaries_come_from_their_settings() {
+        let mut c = Config::default();
+        assert_eq!(configured_binaries(&c), Vec::new());
+        c.sandbox.podman_path = Some("/opt/p/podman".into());
+        let podman = ConfiguredBinary {
+            path: "/opt/p/podman".into(),
+            setting: "sandbox.podman_path",
+        };
+        assert_eq!(configured_binaries(&c), std::slice::from_ref(&podman));
+        c.sandbox.runtime_path = Some("/opt/r/crun".into());
+        let runtime = ConfiguredBinary {
+            path: "/opt/r/crun".into(),
+            setting: "sandbox.runtime_path",
+        };
+        assert_eq!(configured_binaries(&c), [runtime, podman]);
+        let env = HostEnv::from_process(&c).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(env.configured_binaries, configured_binaries(&c));
+    }
+
     #[test]
     fn from_process_works_on_this_host() {
-        let env = HostEnv::from_process();
+        let env = HostEnv::from_process(&Config::default());
         assert!(env.is_ok(), "{env:?}");
         let env = env.unwrap_or_else(|_| unreachable!());
         assert!(env.home.is_absolute());
@@ -333,7 +390,7 @@ mod tests {
             return;
         };
         let passwd = getent_home();
-        let env = HostEnv::from_process().unwrap_or_else(|e| panic!("{e}"));
+        let env = HostEnv::from_process(&Config::default()).unwrap_or_else(|e| panic!("{e}"));
         if want_home.is_empty() {
             // No HOME: the passwd home is the home, and not also "another" home.
             assert_eq!(env.home, passwd);

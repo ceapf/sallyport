@@ -17,6 +17,8 @@ use serde::Deserialize;
 pub const MAX_CONFIG_BYTES: usize = 64 * 1024;
 /// The field an error about the runtime binary names.
 pub const RUNTIME_PATH_FIELD: &str = "sandbox.runtime_path";
+/// The field an error about the configured podman binary names.
+pub const PODMAN_PATH_FIELD: &str = "sandbox.podman_path";
 
 /// Mode bits that let someone other than the owner change a file or directory.
 const GROUP_OTHER_WRITE: u32 = 0o022;
@@ -106,7 +108,7 @@ pub fn parse_config(text: &str) -> Result<Config, ConfigError> {
     }
     for (field, path) in [
         (RUNTIME_PATH_FIELD, &config.sandbox.runtime_path),
-        ("sandbox.podman_path", &config.sandbox.podman_path),
+        (PODMAN_PATH_FIELD, &config.sandbox.podman_path),
     ] {
         if path.as_ref().is_some_and(|p| !p.is_absolute()) {
             return Err(ConfigError::Invalid {
@@ -116,6 +118,48 @@ pub fn parse_config(text: &str) -> Result<Config, ConfigError> {
         }
     }
     Ok(config)
+}
+
+/// Why `config.toml` could not be read: the file and what is wrong.
+#[derive(Debug, thiserror::Error)]
+#[error("{path}: {msg}")]
+pub struct ReadConfigError {
+    /// The file, as given.
+    pub path: String,
+    /// What is wrong.
+    pub msg: String,
+}
+
+/// Reads `config.toml` at `path`, or the defaults when it does not exist. Opened without
+/// following a symlink and without blocking (a FIFO would hold the reader), then required to be
+/// a regular file; read through one bounded read and parsed by [`parse_config`]. `sallyd` reads
+/// it once at start; the CLI reads the same file the same way for its host facts.
+///
+/// # Errors
+/// [`ReadConfigError`]: a symlink, not a regular file, an I/O error, or a [`ConfigError`].
+pub fn read_config(path: &Path) -> Result<Config, ReadConfigError> {
+    use rustix::fs::{FileType, Mode, OFlags};
+    let fail = |msg: String| ReadConfigError {
+        path: path.display().to_string(),
+        msg,
+    };
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let fd = match crate::fd::open(path, flags, Mode::empty()) {
+        Ok(f) => f,
+        Err(rustix::io::Errno::NOENT) => return Ok(Config::default()),
+        Err(rustix::io::Errno::LOOP) => return Err(fail("a symlink is not followed".into())),
+        Err(e) => return Err(fail(e.to_string())),
+    };
+    let st = rustix::fs::fstat(&fd).map_err(|e| fail(e.to_string()))?;
+    if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
+        return Err(fail("not a regular file".into()));
+    }
+    let file = std::fs::File::from(fd);
+    let mut text = String::new();
+    let cap = u64::try_from(MAX_CONFIG_BYTES).unwrap_or(u64::MAX) + 1;
+    std::io::Read::read_to_string(&mut std::io::Read::take(file, cap), &mut text)
+        .map_err(|e| fail(e.to_string()))?;
+    parse_config(&text).map_err(|e| fail(e.to_string()))
 }
 
 /// Where `install.sh` puts the pinned upstream runtime: `<data_home>/sallyport/bin/crun`.

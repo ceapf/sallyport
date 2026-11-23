@@ -29,9 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use sally_core::audit::{AuditError, AuditWriter, SystemClock};
-use sally_core::config::{
-    Config, MAX_CONFIG_BYTES, RUNTIME_PATH_FIELD, default_runtime_path, parse_config,
-};
+use sally_core::config::{Config, RUNTIME_PATH_FIELD, default_runtime_path};
 use sally_core::manifest::{AuditLevel, HostEnv, HostEnvError};
 use sally_core::paths::{Paths, PathsError};
 use tokio::net::UnixListener;
@@ -233,7 +231,8 @@ pub fn run(log: &Oplog) -> Result<(), DaemonError> {
     let prepared = Prepared {
         installation,
         sessions: open_sessions(&dirs.state()).map_err(DaemonError::SessionsDir)?,
-        env: HostEnv::from_process()?,
+        // The config read above, never a second read: the folders of its binaries are rules.
+        env: HostEnv::from_process(&config)?,
         redactors,
     };
     let nofile = process::raise_nofile()?;
@@ -275,32 +274,14 @@ fn panic_hook(log: Oplog) {
     }));
 }
 
-/// `config.toml`, or the defaults when it does not exist. Opened without following a symlink and
-/// without blocking (a FIFO would hold startup), then required to be a regular file; read
-/// through one bounded read (security review L2).
+/// `config.toml`, or the defaults when it does not exist, through the reader the CLI shares
+/// (`sally_core::config::read_config`: no symlink, no FIFO, one bounded read; security review
+/// L2).
 fn read_config(path: &Path) -> Result<Config, DaemonError> {
-    use rustix::fs::{FileType, Mode, OFlags};
-    let fail = |msg: String| DaemonError::Config {
-        path: path.display().to_string(),
-        msg,
-    };
-    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-    let fd = match sally_core::fd::open(path, flags, Mode::empty()) {
-        Ok(f) => f,
-        Err(rustix::io::Errno::NOENT) => return Ok(Config::default()),
-        Err(rustix::io::Errno::LOOP) => return Err(fail("a symlink is not followed".into())),
-        Err(e) => return Err(fail(e.to_string())),
-    };
-    let st = rustix::fs::fstat(&fd).map_err(|e| fail(e.to_string()))?;
-    if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
-        return Err(fail("not a regular file".into()));
-    }
-    let file = std::fs::File::from(fd);
-    let mut text = String::new();
-    let cap = u64::try_from(MAX_CONFIG_BYTES).unwrap_or(u64::MAX) + 1;
-    std::io::Read::read_to_string(&mut std::io::Read::take(file, cap), &mut text)
-        .map_err(|e| fail(e.to_string()))?;
-    parse_config(&text).map_err(|e| fail(e.to_string()))
+    sally_core::config::read_config(path).map_err(|e| DaemonError::Config {
+        path: e.path,
+        msg: e.msg,
+    })
 }
 
 /// What `run` reads before the runtime starts (blocking), for `serve`.
@@ -593,24 +574,12 @@ mod tests {
         d
     }
 
-    fn refusal(path: &Path) -> String {
-        match read_config(path) {
-            Err(DaemonError::Config { msg, .. }) => msg,
-            other => panic!("{other:?}"),
-        }
-    }
-
-    /// Security review L2: only a regular file is read; a FIFO is refused at once instead of
-    /// blocking startup, and neither a symlink nor a directory is read.
+    /// The shared reader's verdicts reach startup unchanged (its own tests are in sally-core's
+    /// `tests/config.rs`): the file read, and a refusal naming the file.
     #[test]
-    fn the_config_is_a_regular_file_never_a_fifo_or_a_symlink() {
+    fn startup_reads_the_config_through_the_shared_reader() {
         let d = scratch("config");
         let file = d.join("config.toml");
-        assert_eq!(
-            read_config(&file).unwrap().sandbox.podman_path,
-            Config::default().sandbox.podman_path,
-            "missing: the defaults"
-        );
         std::fs::write(&file, "[sandbox]\nruntime_path = \"/opt/crun\"\n").unwrap();
         assert_eq!(
             read_config(&file).unwrap().sandbox.runtime_path,
@@ -618,22 +587,13 @@ mod tests {
         );
         let link = d.join("link.toml");
         std::os::unix::fs::symlink(&file, &link).unwrap();
-        assert_eq!(refusal(&link), "a symlink is not followed");
-        assert_eq!(refusal(&d), "not a regular file");
-        let fifo = d.join("fifo.toml");
-        assert!(
-            std::process::Command::new("mkfifo")
-                .arg(&fifo)
-                .status()
-                .unwrap()
-                .success()
-        );
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || tx.send(refusal(&fifo)));
-        let got = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("reading a FIFO config blocked");
-        assert_eq!(got, "not a regular file");
+        match read_config(&link) {
+            Err(DaemonError::Config { path, msg }) => {
+                assert_eq!(path, link.display().to_string());
+                assert_eq!(msg, "a symlink is not followed");
+            }
+            other => panic!("{other:?}"),
+        }
         std::fs::remove_dir_all(&d).unwrap();
     }
 }

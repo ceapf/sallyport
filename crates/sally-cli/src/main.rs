@@ -224,10 +224,14 @@ fn local(cmd: Cmd, paths: &Paths) -> Result<u8, Remote> {
                 let _ = writeln!(o.err, "sally: core dumps could not be turned off: {e}");
                 return Ok(EXIT_FAILED);
             }
-            let store = paths.secrets_file();
+            let (store, config) = (paths.secrets_file(), paths.config_file());
+            let files = local::Files {
+                store: &store,
+                config: &config,
+            };
             match cmd {
-                ManifestCmd::Validate { file } => local::manifest_validate(&file, &store, &mut o),
-                ManifestCmd::Summary { file } => local::manifest_summary(&file, &store, &mut o),
+                ManifestCmd::Validate { file } => local::manifest_validate(&file, files, &mut o),
+                ManifestCmd::Summary { file } => local::manifest_summary(&file, files, &mut o),
             }
         }
         Cmd::Audit { cmd } => match cmd {
@@ -340,11 +344,15 @@ fn gated(
         let _ = writeln!(err, "sally: core dumps could not be turned off: {e}");
         return Err(EXIT_FAILED);
     }
-    let store = paths.secrets_file();
+    let (store, config) = (paths.secrets_file(), paths.config_file());
+    let files = local::Files {
+        store: &store,
+        config: &config,
+    };
     let ask = accept.is_none() && rustix::termios::isatty(std::io::stdin());
     let Some(tty) = ask.then(open_tty).and_then(Result::ok) else {
         let g = consent::Gate {
-            store: &store,
+            files,
             accept,
             terminal: None,
         };
@@ -369,7 +377,7 @@ fn gated(
         flush: &mut flush,
     };
     let g = consent::Gate {
-        store: &store,
+        files,
         accept,
         terminal: Some(&mut t),
     };

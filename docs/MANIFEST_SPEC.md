@@ -177,8 +177,9 @@ cannot be shown prints no hash and exits 1.
 Not covered (#255): what is shown, and what a typed `yes` or a hash accepts, comes from the CLI's
 own validation under its own host facts. `sallyd` validates the text it is sent again under its
 own and resolves the mount hosts again after the CLI's check, so a folder replaced at the same
-path after that check, or a `HOME` that differs between the CLI and `sallyd`, is not seen by the
-consent.
+path after that check, a `HOME` that differs between the CLI and `sallyd`, or a `config.toml`
+read at a different time or place (its binaries' folders are rules, §2), is not seen by the
+consent. A `config.toml` the CLI cannot read fails the launch (2) before anything is shown.
 
 ### Ranges and formats (checked by the validator)
 | Field | Rule |
@@ -414,6 +415,13 @@ environment (passwd entry only if `$HOME` is unset or relative).
   - `/etc`, `/proc`, `/sys`, `/dev`, `/run`, `/var/run`, `/boot`, `/root`, `/mnt`,
     `/usr/lib/wsl`, `/tmp`, `/var/tmp` (`/tmp` holds other programs' Unix sockets — ssh-agent,
     X11 — and a read-only bind does not stop `connect()`, so it would be a path around SI-1);
+  - the folder of each binary `config.toml` names (`sandbox.runtime_path`,
+    `sandbox.podman_path`), as written and the folder of the file it resolves to: the host runs
+    it on every launch. Messages name the setting ("is inside /home/u/tools/crun (the folder of
+    sandbox.runtime_path)"). These folders are not read for links, and a folder that is `/`, a
+    home or an ancestor of one is kept as a rule. `sallyd` takes them from the `config.toml` it
+    read at start, the CLI from its own read of the same file. The folders of the links in the
+    middle of a chain of two or more are not rules yet (#280);
   - the Podman storage dirs (rootless graphroot and `/var/lib/containers/storage`) and every
     `filesystem.deny` entry.
 
@@ -606,6 +614,9 @@ See `manifests/examples/`:
   (the default is the same place). Such a variable's folder is also read whole, every entry and
   not only dot names, so a large home can use up the budget and refuse mounts outside it too
   (`denylist-incomplete`).
+- **A binary `config.toml` names directly under `/` or a home refuses every mount under it**
+  (`runtime_path = "/crun"` makes `/` a rule); the message names the setting. Keep a configured
+  runtime or podman in a folder of its own (the default runtime's folder is already a rule).
 - **A folder the user can enter but not list (mode `--x`) inside a listed folder refuses every
   manifest with mounts** (`denylist-incomplete`, naming it), since its files still run by name
   and its links cannot be read. Make it listable, or remove it.

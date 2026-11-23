@@ -669,6 +669,65 @@ fn on_a_terminal_needs_a_typed_yes_or_the_hash(l: Launch, tag: &str) {
     );
 }
 
+/// The CLI reads `config.toml` as `sallyd` does: a binary it names makes that binary's folder a
+/// denylist rule, and the refusal names the setting. Control: with no `config.toml` the same
+/// manifest is valid and its hash starts it. A `config.toml` that cannot be read fails (2),
+/// naming it, before anything is shown or sent, on the hash path too.
+#[test]
+fn the_cli_refuses_the_folder_of_a_binary_its_config_names() {
+    let f = daemon("binf", || {});
+    let h = Home::new("binf");
+    std::fs::create_dir_all(h.join("tools/crun")).unwrap();
+    let crun = h.write("tools/crun/crun", "#!/bin/sh\n");
+    std::fs::set_permissions(&crun, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let text = format!(
+        "{HEAD}filesystem:\n  mounts:\n    - {{host: \"~/tools\", guest: /workspace/t, mode: rw}}\n"
+    );
+    let m = h.write("m.yaml", &text);
+    let validate = || {
+        h.apply(&mut f.command(&["manifest", "validate", m.to_str().unwrap()]))
+            .output()
+            .unwrap()
+    };
+    let (_, hash) = reviewed(&f, &h, &m);
+    let o = validate();
+    assert_eq!(o.status.code(), Some(0), "control: {}", stderr(&o));
+    std::fs::create_dir_all(h.join(".config/sallyport")).unwrap();
+    let config = h.write(
+        ".config/sallyport/config.toml",
+        &format!("[sandbox]\nruntime_path = \"{}\"\n", crun.display()),
+    );
+    let o = validate();
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    let err = stderr(&o);
+    assert!(
+        err.contains("filesystem.mounts[0].host")
+            && err.contains("(the folder of sandbox.runtime_path)")
+            && err.contains("denylisted"),
+        "{err}"
+    );
+    // Unreadable: a symlink is never followed.
+    std::fs::remove_file(&config).unwrap();
+    std::os::unix::fs::symlink(&crun, &config).unwrap();
+    let o = validate();
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    assert!(stderr(&o).contains("config.toml: a symlink is not followed"));
+    let o = launch(&f, &h, Launch::Start, &m, &["--accept-manifest", &hash]);
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    let err = stderr(&o);
+    assert_eq!(err.lines().count(), 1, "nothing shown before: {err}");
+    assert!(
+        err.contains("config.toml: a symlink is not followed"),
+        "{err}"
+    );
+    assert_eq!(created(&f), Vec::<String>::new());
+    // Control: the config gone, the same hash starts the same text.
+    std::fs::remove_file(&config).unwrap();
+    let o = launch(&f, &h, Launch::Start, &m, &["--accept-manifest", &hash]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(created(&f), [text]);
+}
+
 #[test]
 fn rt_man_03_session_start_on_a_terminal_needs_a_typed_yes_or_the_hash() {
     on_a_terminal_needs_a_typed_yes_or_the_hash(Launch::Start, "tty-s");

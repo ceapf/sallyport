@@ -12,7 +12,7 @@ use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
 use super::diag::Code;
-use super::hostenv::{EnvDir, HostEnv};
+use super::hostenv::{ConfiguredBinary, EnvDir, HostEnv};
 use super::links::{self, Incomplete, Link, Scan};
 
 /// Longest accepted host or guest path.
@@ -27,6 +27,8 @@ const SYSTEM: &str = "system folders are never mountable";
 const SHARED_TMP: &str = "shared temp folders hold other programs' sockets (a network path), so they are never mountable";
 const RUNTIME: &str = "the runtime folder holds your session's sockets, so it is never mountable";
 const STORAGE: &str = "container storage is never mountable";
+const BINARY: &str =
+    "Sallyport runs this binary on every launch, so the folder holding it is never mountable";
 const STATE: &str =
     "the state folder holds history and state your tools load, so it is never mountable";
 const USER_DENY: &str = "listed in filesystem.deny";
@@ -238,6 +240,7 @@ impl Denylist {
             let label = format!("{} (from ${})", normalize(&d.path).display(), d.var);
             rule(&d.path, Scope::Subtree, Some(&label), Some(ENV_DIR))
         }));
+        rules.extend(env.configured_binaries.iter().flat_map(binary_rules));
         rules.extend(extra.iter().map(|p| subtree_rule(p, USER_DENY)));
         // Last, so a folder inside them that has its own rule is named by that rule.
         for h in homes(env) {
@@ -404,6 +407,30 @@ fn scan_folders(env: &HostEnv, scan: &mut Scan) -> Result<(), Incomplete> {
         scan.read_dotfiles(h, DOTFILES)?;
     }
     Ok(())
+}
+
+/// The rules for a binary `config.toml` names: the folder of its path as written and the folder
+/// of the file it resolves to (a link's target), each a subtree rule labelled with the setting.
+/// Not read for links. A folder that is `/`, a home or an ancestor of one stays a rule.
+// TODO(#280): in a chain of two or more links, the folders of the links between the first and
+// the file are not rules.
+fn binary_rules(b: &ConfiguredBinary) -> Vec<Rule> {
+    let folder = |p: &Path| {
+        p.parent()
+            .map_or_else(|| PathBuf::from("/"), Path::to_path_buf)
+    };
+    let make = |f: &Path| {
+        let label = format!("{} (the folder of {})", f.display(), b.setting);
+        rule(f, Scope::Subtree, Some(&label), Some(BINARY))
+    };
+    let written = make(&folder(&normalize(&b.path)));
+    // The written folder's rule holds its real form too; the file's own target may lie apart.
+    let resolved = std::fs::canonicalize(&b.path)
+        .ok()
+        .map(|r| folder(&r))
+        .filter(|r| !written.forms.contains(r))
+        .map(|r| make(&r));
+    std::iter::once(written).chain(resolved).collect()
 }
 
 /// The identity of the directory at `p` (symlinks followed), if it exists.
@@ -694,6 +721,7 @@ mod tests {
             xdg_config_home: None,
             xdg_data_home: None,
             xdg_state_home: None,
+            configured_binaries: Vec::new(),
             other_homes: Vec::new(),
             xdg_runtime_dir: Some("/run/user/1000".into()),
             podman_storage: vec![format!("{home}/.local/share/containers/storage").into()],
@@ -909,6 +937,59 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// The folder of a binary `config.toml` names is a rule naming the setting, and so is the
+    /// folder its link resolves to. Controls: without the setting both folders are free, and so
+    /// is a sibling. A binary directly under `/` makes `/` a rule.
+    #[test]
+    fn the_folder_of_a_configured_binary_is_a_rule() {
+        let t = TmpHome::new("bin");
+        let home = t.home();
+        std::fs::create_dir_all(home.join("tools/crun")).unwrap();
+        std::fs::create_dir_all(home.join("build/out")).unwrap();
+        std::fs::write(home.join("build/out/crun-1"), "x").unwrap();
+        std::os::unix::fs::symlink(home.join("build/out/crun-1"), home.join("tools/crun/crun"))
+            .unwrap();
+        let mut e = env(home.to_str().unwrap());
+        let free = fixed(&e, &[]);
+        for p in ["tools/crun", "build/out", "tools", "build/other"] {
+            assert_eq!(free.refusal(&home.join(p)), None, "{p}");
+        }
+        e.configured_binaries = vec![ConfiguredBinary {
+            path: home.join("tools/crun/crun"),
+            setting: "sandbox.runtime_path",
+        }];
+        let d = fixed(&e, &[]);
+        let inside = |p: &str| {
+            format!(
+                "is inside {} (the folder of sandbox.runtime_path): {BINARY}",
+                home.join(p).display()
+            )
+        };
+        assert_eq!(
+            d.refusal(&home.join("tools/crun/x")),
+            Some(inside("tools/crun"))
+        );
+        assert_eq!(
+            d.refusal(&home.join("build/out")),
+            Some(inside("build/out"))
+        );
+        let contains = d.refusal(&home.join("tools")).unwrap_or_default();
+        assert!(
+            contains.starts_with("contains ") && contains.contains("sandbox.runtime_path"),
+            "{contains}"
+        );
+        assert_eq!(d.refusal(&home.join("build/other")), None);
+        e.configured_binaries = vec![ConfiguredBinary {
+            path: "/podman".into(),
+            setting: "sandbox.podman_path",
+        }];
+        let at_root = fixed(&e, &[]).refusal(Path::new("/opt/data"));
+        assert!(
+            at_root.is_some_and(|w| w.contains("/ (the folder of sandbox.podman_path)")),
+            "/"
+        );
     }
 
     /// RT-FS-14: a root with the identity of a protected folder (a bind alias of it) is refused.
