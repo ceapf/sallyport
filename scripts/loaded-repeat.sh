@@ -8,7 +8,10 @@
 #   bombs binary, so the fork-bomb test keeps its in-process neighbours of a suite run.
 # - A repeat passes only when the command exits 0, its log says "test result: ok. 4 passed" and
 #   holds the fork-bomb test's diagnostic line. Anything else, a time-out included, is red. A red
-#   is never re-run or dropped: every repeat is a line in <results dir>/results.txt.
+#   is never re-run or dropped: every repeat is a line in <results dir>/results.txt. Each line
+#   also gives the test's memory.peak, memory.events max (the memory limit was hit) and oom_kill;
+#   the totals count the runs that hit the limit and the runs with an OOM kill, and give the
+#   highest peak. None of these gates: a pass that hit the limit is reported, not failed.
 # - A repeat counts toward <count> only when the load was alive at its start and its end; the
 #   others are kept and marked unloaded (a red in one is still red). When the load ends, it is
 #   started again if LOADED_REPEAT_RESTART=1 (but not after two passes in a row during which no
@@ -115,7 +118,7 @@ field() {
 }
 
 load_start
-i=0 passed=0 red=0 unloaded=0 first=""
+i=0 passed=0 red=0 unloaded=0 first="" hit_max=0 hit_oom=0 top=""
 while [ "$loaded" -lt "$count" ]; do
   if ! alive; then
     [ -z "$load_pid" ] || load_end
@@ -163,10 +166,15 @@ while [ "$loaded" -lt "$count" ]; do
     unloaded=$((unloaded + 1))
   fi
   if [ "$verdict" = pass ]; then passed=$((passed + 1)); else red=$((red + 1)); fi
-  printf '%s run=%d %s %s fork-bomb=%s memory.peak=%s oom_kill=%s pids.peak=%s secs=%d exit=%d\n' \
+  # Reported, never gating: memory.events max (the limit was hit, reclaim ran), the OOM kills,
+  # and memory.peak. A pass that hit the memory limit is the early sign of #141.
+  mpeak=$(field memory.peak "$line") mmax=$(field max "$line") kills=$(field oom_kill "$line")
+  if [[ "$mmax" =~ ^[0-9]+$ ]] && [ "$mmax" -gt 0 ]; then hit_max=$((hit_max + 1)); fi
+  if [[ "$kills" =~ ^[0-9]+$ ]] && [ "$kills" -gt 0 ]; then hit_oom=$((hit_oom + 1)); fi
+  if [[ "$mpeak" =~ ^[0-9]+$ ]] && { [ -z "$top" ] || [ "$mpeak" -gt "$top" ]; }; then top="$mpeak"; fi
+  printf '%s run=%d %s %s fork-bomb=%s memory.peak=%s max=%s oom_kill=%s pids.peak=%s secs=%d exit=%d\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$i" "$state" "$verdict" "$own" \
-    "$(field memory.peak "$line")" "$(field oom_kill "$line")" "$(field pids.peak "$line")" \
-    "$secs" "$s" >>"$results"
+    "$mpeak" "$mmax" "$kills" "$(field pids.peak "$line")" "$secs" "$s" >>"$results"
 done
 
 if alive; then
@@ -186,6 +194,6 @@ if [ "$red" -gt 0 ] || [ "$load_red" -eq 1 ]; then
 elif [ "$loaded" -lt "$count" ]; then
   verdict=incomplete
 fi
-echo "totals: planned $count, loaded $loaded, unloaded $unloaded, passed $passed, red $red, load passes $passes, verdict $verdict" >>"$results"
+echo "totals: planned $count, loaded $loaded, unloaded $unloaded, passed $passed, red $red, load passes $passes, memory limit hit (max above 0) $hit_max, OOM kills (oom_kill above 0) $hit_oom, highest memory.peak ${top:-none}, verdict $verdict" >>"$results"
 tail -n1 "$results"
 [ "$verdict" = pass ]

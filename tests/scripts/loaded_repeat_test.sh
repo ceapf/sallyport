@@ -26,6 +26,12 @@ case "${modes[$i]}" in
   pass) printf 'test %s ... ok\n%s\ntest result: ok. 4 passed; 0 failed\n' "$fork" "$figures" ;;
   red) printf 'test %s ... FAILED\n%s\ntest result: FAILED. 3 passed; 1 failed\n' "$fork" "$figures"; exit 101 ;;
   nodiag) printf 'test %s ... ok\ntest result: ok. 4 passed; 0 failed\n' "$fork" ;;
+  hit) printf 'test %s ... ok\n%s\ntest result: ok. 4 passed; 0 failed\n' "$fork" \
+    "rt_ag_09 fork-bomb figures: memory.peak=67108864 max=4 oom=0 oom_kill=0 oom_group_kill=0 pids.peak=64 pids.events.max=3" ;;
+  nomax) printf 'test %s ... ok\n%s\ntest result: ok. 4 passed; 0 failed\n' "$fork" \
+    "rt_ag_09 fork-bomb figures: memory.peak=$((1000 + n)) oom_kill=0 pids.peak=64 pids.events.max=7" ;;
+  kill) printf 'test %s ... FAILED\n%s\ntest result: FAILED. 3 passed; 1 failed\n' "$fork" \
+    "rt_ag_09 fork-bomb figures: memory.peak=67108864 max=9 oom=1 oom_kill=1 oom_group_kill=0 pids.peak=64 pids.events.max=3"; exit 101 ;;
   leak) printf 'test %s ... ok\n%s\ntest result: ok. 4 passed; 0 failed\n' "$fork" "$figures"; exit 3 ;;
   three) printf 'test %s ... ok\n%s\ntest result: ok. 3 passed; 0 failed\n' "$fork" "$figures" ;;
   slow) sleep 2; printf 'test %s ... ok\n%s\ntest result: ok. 4 passed; 0 failed\n' "$fork" "$figures" ;;
@@ -74,9 +80,9 @@ lines() {
 started=$(date +%s)
 run all 3 0 pass
 lines all 3
-has all "run=2 loaded pass fork-bomb=ok memory.peak=1002 oom_kill=0 pids.peak=64"
+has all "run=2 loaded pass fork-bomb=ok memory.peak=1002 max=0 oom_kill=0 pids.peak=64"
 has all "load pass 1: stopped (TERM)"
-has all "planned 3, loaded 3, unloaded 0, passed 3, red 0, load passes 1, verdict pass"
+has all "planned 3, loaded 3, unloaded 0, passed 3, red 0, load passes 1, memory limit hit (max above 0) 0, OOM kills (oom_kill above 0) 0, highest memory.peak 1003, verdict pass"
 # The 30 s load was stopped, not waited out.
 [ $(($(date +%s) - started)) -lt 20 ] || { echo "FAIL all: the load was not stopped"; fail=1; }
 
@@ -84,15 +90,16 @@ run one-red 3 1 pass,red,pass
 lines one-red 3
 has one-red "run=2 loaded red fork-bomb=FAILED"
 has one-red "run=3 loaded pass"
-has one-red "passed 2, red 1, load passes 1, verdict red"
+has one-red "passed 2, red 1, load passes 1,"
+has one-red "verdict red"
 
 run no-figures 2 1 pass,nodiag
-has no-figures "run=2 loaded red fork-bomb=ok memory.peak= oom_kill= pids.peak= secs="
+has no-figures "run=2 loaded red fork-bomb=ok memory.peak= max= oom_kill= pids.peak= secs="
 has no-figures "verdict red"
 
 # test-run.sh's own failures (a leaked container, 3) after a passing test binary are red.
 run leaked 1 1 leak
-has leaked "run=1 loaded red fork-bomb=ok memory.peak=1001 oom_kill=0 pids.peak=64"
+has leaked "run=1 loaded red fork-bomb=ok memory.peak=1001 max=0 oom_kill=0 pids.peak=64"
 has leaked "exit=3"
 
 run wrong-count 1 1 three
@@ -102,7 +109,8 @@ run unloaded 1 1 slow LOADED_REPEAT_LOAD="sleep 1" LOADED_REPEAT_RESTART=0
 lines unloaded 1
 has unloaded "run=1 unloaded pass"
 has unloaded "load pass 1: exit 0, fork-bomb test failed: no"
-has unloaded "planned 1, loaded 0, unloaded 1, passed 1, red 0, load passes 1, verdict incomplete"
+has unloaded "planned 1, loaded 0, unloaded 1, passed 1, red 0, load passes 1,"
+has unloaded "verdict incomplete"
 
 # A 2 s load under 0.3 s repeats ends mid-run: it is started again until 10 loaded repeats ran.
 run restarted 10 0 pass LOADED_REPEAT_LOAD="sleep 2" \
@@ -120,15 +128,27 @@ has time-out "exit=124"
 run load-red 1 1 slow \
   LOADED_REPEAT_LOAD="sleep 1; echo '---- rt_ag_09_a_fork_bomb_is_held_by_the_pids_limit stdout ----'; exit 101"
 has load-red "load pass 1: exit 101, fork-bomb test failed: yes"
-has load-red "loaded 0, unloaded 2, passed 2, red 0, load passes 2, verdict red"
+has load-red "loaded 0, unloaded 2, passed 2, red 0, load passes 2,"
+has load-red "verdict red"
 
 run idle-load 1 1 slow LOADED_REPEAT_LOAD="sleep 1; exit 2"
 has idle-load "load pass 2: exit 2, fork-bomb test failed: no"
-has idle-load "loaded 0, unloaded 2, passed 2, red 0, load passes 2, verdict incomplete"
+has idle-load "loaded 0, unloaded 2, passed 2, red 0, load passes 2,"
+has idle-load "verdict incomplete"
 
 run start-limit 5 1 slow LOADED_REPEAT_START_LIMIT=1
 lines start-limit 1
-has start-limit "loaded 1, unloaded 0, passed 1, red 0, load passes 1, verdict incomplete"
+has start-limit "loaded 1, unloaded 0, passed 1, red 0, load passes 1,"
+has start-limit "verdict incomplete"
+
+# A pass that hit the memory limit stays a pass; the hit, the kill count and the highest peak are
+# reported. A figures line without a memory.events max reads max empty, never pids.events.max.
+run limit-hit 3 0 pass,hit,nomax
+has limit-hit "run=2 loaded pass fork-bomb=ok memory.peak=67108864 max=4 oom_kill=0 pids.peak=64"
+has limit-hit "run=3 loaded pass fork-bomb=ok memory.peak=1003 max= oom_kill=0 pids.peak=64"
+has limit-hit "memory limit hit (max above 0) 1, OOM kills (oom_kill above 0) 0, highest memory.peak 67108864, verdict pass"
+run killed 1 1 kill
+has killed "OOM kills (oom_kill above 0) 1,"
 
 # The load and the repeat start with INT and QUIT at their defaults, not ignored as bash leaves
 # them for a background command (test-run.sh's own INT test fails under an ignored INT).
