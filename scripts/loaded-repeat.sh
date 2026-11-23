@@ -22,7 +22,9 @@
 #   INT and QUIT and the ignore survives exec; both start with those signals reset to default,
 #   so test-run.sh and its own tests (an interrupted run, test_run_test.sh) see a normal process.
 # - When the repeats end, the load gets TERM (its test-run.sh sweeps its own containers) and is
-#   waited for. Exit 0 only when every repeat passed, <count> loaded repeats ran and no load pass
+#   waited for. A load pass starts only once it leads its own process group (at most 5 s, else
+#   exit 1 with no repeat), and the stop falls back to the load's own pid if the group is gone.
+#   Exit 0 only when every repeat passed, <count> loaded repeats ran and no load pass
 #   failed in the fork-bomb test; otherwise 1, with the verdict (red or incomplete) on the totals
 #   line. Usage errors exit 2.
 # Environment (defaults in brackets): LOADED_REPEAT_LIMIT, seconds per repeat [600];
@@ -72,12 +74,26 @@ bash -c "$prebuild" >"$out/prebuild.log" 2>&1 || {
   exit 1
 }
 
+# How often load_start checks, every 0.05 s, for the load's process group: 100 is 5 s.
+GROUP_TRIES=100
 load_pid="" passes=0 load_red=0 idle=0 loaded=0 at_load=0
 load_start() {
   passes=$((passes + 1))
   at_load="$loaded"
   setsid env --default-signal=INT,QUIT bash -c "$load_cmd" >"$out/load-$passes.log" 2>&1 &
   load_pid=$!
+  # The load's process group exists only once the child has called setsid(); a stop before that
+  # would miss it. Wait for it (a load that already ended needs none).
+  local tries=0
+  until kill -0 -- "-$load_pid" 2>/dev/null; do
+    kill -0 "$load_pid" 2>/dev/null || return 0
+    if [ "$tries" -ge "$GROUP_TRIES" ]; then
+      echo "loaded-repeat: the load did not get its own process group within 5 s" >&2
+      exit 1
+    fi
+    tries=$((tries + 1))
+    sleep 0.05
+  done
 }
 # Records a finished load pass: its exit status, and whether the fork-bomb test failed in it.
 load_end() {
@@ -96,6 +112,10 @@ load_end() {
 alive() {
   [ -n "$load_pid" ] && kill -0 "$load_pid" 2>/dev/null
 }
+# TERM to the load's process group, or to the load itself when there is no such group.
+stop_load() {
+  kill -TERM -- "-$load_pid" 2>/dev/null || kill -TERM "$load_pid" 2>/dev/null || true
+}
 # A repeat or load still running when this script ends early (an error, INT, TERM) gets TERM
 # and is waited for, so each test-run.sh sweeps its own containers. Neither is in this script's
 # process group (timeout makes its own; the load runs in its own session), so a Ctrl-C reaches
@@ -108,7 +128,7 @@ stop_all() {
     wait "$rep_pid" 2>/dev/null || true
   fi
   if alive; then
-    kill -TERM -- "-$load_pid" 2>/dev/null || true
+    stop_load
     wait "$load_pid" 2>/dev/null || true
   fi
 }
@@ -180,7 +200,7 @@ while [ "$loaded" -lt "$count" ]; do
 done
 
 if alive; then
-  kill -TERM -- "-$load_pid" 2>/dev/null || true
+  stop_load
   s=0
   wait "$load_pid" || s=$?
   echo "load pass $passes: stopped (TERM), exit $s" >>"$results"

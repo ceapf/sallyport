@@ -3,14 +3,26 @@
 # for the pre-build, the load and the repeat (no cargo, no podman). A repeat passes only on exit
 # 0 with "4 passed" and the fork-bomb test's diagnostic line; one red still runs every repeat and
 # fails the run; a repeat without the load at its start and end is not counted; a time-out is red;
-# a load pass that failed in the fork-bomb test fails the run; the load is stopped at the end.
-# Runs via `make test-scripts`.
+# a load pass that failed in the fork-bomb test fails the run; the load is stopped at the end,
+# also when its process group comes late, and a load that never gets one ends the run. podman
+# and setsid are stubs on PATH. Runs via `make test-scripts`.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 script="$root/scripts/loaded-repeat.sh"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
+
+# Stubs on PATH. podman, for the whole file: the script's container count reads it (one sp-
+# name), never the real podman. setsid, per case: late-group execs the real one after 2 s, so
+# the load leads its own process group only then; no-group never makes one.
+real_setsid="$(command -v setsid)"
+mkdir -p "$tmp/bin" "$tmp/late" "$tmp/nogroup"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" other-1 sp-left-1\n' >"$tmp/bin/podman"
+printf '#!/usr/bin/env bash\nsleep 2\nexec %q "$@"\n' "$real_setsid" >"$tmp/late/setsid"
+printf '#!/usr/bin/env bash\nexec "$@"\n' >"$tmp/nogroup/setsid"
+chmod +x "$tmp/bin/podman" "$tmp/late/setsid" "$tmp/nogroup/setsid"
+export PATH="$tmp/bin:$PATH"
 
 # The repeat stub: bash run.sh <counter file> <mode,mode,...> prints the log of the mode at the
 # position of this call (the last mode repeats).
@@ -79,14 +91,43 @@ lines() {
   fi
 }
 
+# quick <name> <began>: the case ended in under 20 s, so its 30 s load was stopped, not waited
+# out.
+quick() {
+  local secs=$(($(date +%s) - $2))
+  if [ "$secs" -ge 20 ]; then
+    echo "FAIL $1: the load was not stopped ($secs s)"
+    cat "$tmp/$1/results.txt" 2>/dev/null
+    fail=1
+  fi
+}
+
 started=$(date +%s)
 run all 3 0 pass
 lines all 3
 has all "run=2 loaded pass fork-bomb=ok memory.peak=1002 max=0 oom_kill=0 pids.peak=64"
 has all "load pass 1: stopped (TERM)"
 has all "planned 3, loaded 3, unloaded 0, passed 3, red 0, load passes 1, memory limit hit (max above 0) 0, OOM kills (oom_kill above 0) 0, highest memory.peak 1003, verdict pass"
-# The 30 s load was stopped, not waited out.
-[ $(($(date +%s) - started)) -lt 20 ] || { echo "FAIL all: the load was not stopped"; fail=1; }
+has all "test containers before the run (another worktree): 1"
+quick all "$started"
+
+# The load gets its own process group 2 s after its start: the script waits for it, so the
+# stop at the end reaches the load at once.
+began=$(date +%s)
+run late-group 3 0 pass PATH="$tmp/late:$PATH"
+lines late-group 3
+has late-group "load pass 1: stopped (TERM)"
+has late-group "planned 3, loaded 3,"
+quick late-group "$began"
+
+# The load never gets its own process group: the script gives up after 5 s, says so and runs
+# no repeat.
+began=$(date +%s)
+run no-group 3 1 pass PATH="$tmp/nogroup:$PATH"
+lines no-group 0
+grep -qF "the load did not get its own process group within 5 s" "$tmp/no-group.out" ||
+  { echo "FAIL no-group: no message"; cat "$tmp/no-group.out"; fail=1; }
+quick no-group "$began"
 
 run one-red 3 1 pass,red,pass
 lines one-red 3
