@@ -321,9 +321,12 @@ fn rt_man_03_sandbox_run_needs_consent_for_a_manifest_with_no_warning() {
 fn refuses_a_manifest_inside_a_folder_it_mounts_writable(l: Launch, tag: &str) {
     let h = Home::new(tag);
     let f = daemon(tag, || {});
+    // Each refusal leg launches with the hash of its own text, so consent is given and the exit
+    // code and the empty create log are the place check's alone.
     for mode in ["rw", "brokered"] {
         let m = h.write("p/m.yaml", &mount(mode));
-        let o = launch(&f, &h, l, &m, &[]);
+        let (_, hash) = reviewed(&f, &h, &m);
+        let o = launch(&f, &h, l, &m, &["--accept-manifest", &hash]);
         assert_eq!(o.status.code(), Some(1), "{l:?} {mode}: {}", stderr(&o));
         assert!(
             stderr(&o).contains("inside filesystem.mounts[0]")
@@ -338,7 +341,8 @@ fn refuses_a_manifest_inside_a_folder_it_mounts_writable(l: Launch, tag: &str) {
         let link = h.join("p/link.yaml");
         let _ = std::fs::remove_file(&link);
         std::os::unix::fs::symlink(&outside, &link).unwrap();
-        let o = launch(&f, &h, l, &link, &[]);
+        let (_, hash) = reviewed(&f, &h, &link);
+        let o = launch(&f, &h, l, &link, &["--accept-manifest", &hash]);
         assert_eq!(
             o.status.code(),
             Some(1),
