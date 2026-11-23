@@ -1,8 +1,9 @@
 //! RT-MAN-03 through the binary, against a fake `sallyd`: a launch (`sally session start`,
 //! `sally sandbox run`) shows what its manifest grants before it asks for anything, refuses a
 //! manifest kept inside a folder that manifest lets the session write, and needs consent bound to
-//! the exact text it sends: a typed `yes` on a terminal, the text's SHA-256 off one. Each property
-//! runs once per command through one helper.
+//! the exact text it sends, whatever its warnings: the text's SHA-256 (`--accept-manifest`), or
+//! with no hash a `yes` typed on a terminal. Each property runs once per command through one
+//! helper.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 mod common;
@@ -128,6 +129,39 @@ fn launch(f: &Fake, h: &Home, l: Launch, manifest: &Path, extra: &[&str]) -> Out
         .unwrap()
 }
 
+/// [`launch`] with its stderr written to the file `err` as it goes, so a fake can read what was
+/// shown when a request arrives.
+fn launch_logged(
+    f: &Fake,
+    h: &Home,
+    l: Launch,
+    manifest: &Path,
+    extra: &[&str],
+    err: &Path,
+) -> Output {
+    let args = l.args(manifest, extra);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    h.apply(&mut f.command(&args))
+        .stdin(Stdio::null())
+        .stderr(std::fs::File::create(err).unwrap())
+        .output()
+        .unwrap()
+}
+
+/// A fake that keeps what the file `err` held when each `sessions.create` arrived: (the fake,
+/// the last such text, taken by the reader).
+fn daemon_seeing(tag: &str, err: &Path) -> (Fake, Arc<Mutex<Option<String>>>) {
+    let seen: Arc<Mutex<Option<String>>> = Arc::default();
+    let (path, at_create) = (err.to_owned(), Arc::clone(&seen));
+    let f = daemon(tag, move || {
+        // Taken and removed, so a later create from a launch whose stderr is not logged reads
+        // no file and keeps an empty text.
+        *at_create.lock().unwrap() = Some(std::fs::read_to_string(&path).unwrap_or_default());
+        let _ = std::fs::remove_file(&path);
+    });
+    (f, seen)
+}
+
 /// `sally manifest summary`'s output for `manifest`: (summary lines, the hash on its last line).
 fn reviewed(f: &Fake, h: &Home, manifest: &Path) -> (String, String) {
     let o = h
@@ -179,21 +213,10 @@ fn shows_the_summary_and_warnings_before_the_create(l: Launch, tag: &str) {
     let text = format!("{HEAD}{RISKY}");
     let m = h.write("m.yaml", &text);
     let err_file = h.join("stderr");
-    let seen: Arc<Mutex<Option<String>>> = Arc::default();
-    let (path, at_create) = (err_file.clone(), Arc::clone(&seen));
-    let f = daemon(tag, move || {
-        *at_create.lock().unwrap() = Some(std::fs::read_to_string(&path).unwrap());
-    });
+    let (f, seen) = daemon_seeing(tag, &err_file);
     let (summary, hash) = reviewed(&f, &h, &m);
     let warned = warnings(&f, &h, &m);
-    let args = l.args(&m, &["--accept-manifest", &hash]);
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let o = h
-        .apply(&mut f.command(&args))
-        .stdin(Stdio::null())
-        .stderr(std::fs::File::create(&err_file).unwrap())
-        .output()
-        .unwrap();
+    let o = launch_logged(&f, &h, l, &m, &["--accept-manifest", &hash], &err_file);
     assert_eq!(created(&f), [text], "{l:?}: {}", stdout(&o));
     // What was on stderr when the create arrived, not after the command ended.
     let shown = seen.lock().unwrap().clone().unwrap();
@@ -216,6 +239,81 @@ fn rt_man_03_session_start_shows_the_summary_and_warnings_before_the_create() {
 #[test]
 fn rt_man_03_sandbox_run_shows_the_summary_and_warnings_before_the_create() {
     shows_the_summary_and_warnings_before_the_create(Launch::Run, "sum-r");
+}
+
+// ---- every launch needs consent, whatever its warnings ------------------------------------------
+
+/// Asserts `sally manifest validate` finds no warning in `manifest` (and accepts it).
+fn assert_no_warning(f: &Fake, h: &Home, manifest: &Path) {
+    let o = h
+        .apply(&mut f.command(&["manifest", "validate", manifest.to_str().unwrap()]))
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(stdout(&o).lines().count(), 1, "a warning: {}", stdout(&o));
+}
+
+/// A manifest with no warning and no acknowledged risk needs consent too. Off a terminal, a
+/// manifest of nothing but its header is sent only with its hash, its summary already on stderr
+/// when the create arrives. The file rewritten after the review into another valid text with no
+/// warning: no hash sends nothing, the reviewed text's hash refuses, the new text's hash sends
+/// exactly the new text.
+fn every_launch_needs_consent(l: Launch, tag: &str) {
+    let h = Home::new(tag);
+    let err_file = h.join("stderr");
+    let (f, seen) = daemon_seeing(tag, &err_file);
+    let m = h.write("m.yaml", HEAD);
+    assert_no_warning(&f, &h, &m);
+    let (summary, reviewed_hash) = reviewed(&f, &h, &m);
+    let o = launch(&f, &h, l, &m, &[]);
+    assert!(f.methods().is_empty(), "{l:?}: {:?}", f.methods());
+    assert_eq!(o.status.code(), Some(1), "{l:?}: {}", stderr(&o));
+    assert!(stderr(&o).contains("--accept-manifest"), "{}", stderr(&o));
+    // Control: the same launch with the text's hash is sent, after its summary was shown.
+    let o = launch_logged(
+        &f,
+        &h,
+        l,
+        &m,
+        &["--accept-manifest", &reviewed_hash],
+        &err_file,
+    );
+    assert_eq!(created(&f), [HEAD], "{l:?}: {}", stdout(&o));
+    let shown = seen.lock().unwrap().take().unwrap();
+    assert!(shown.contains(&summary), "{l:?}: {shown}");
+
+    // Rewritten after the review into another valid text with no warning: a folder mounted.
+    let rewritten = mount("ro");
+    std::fs::write(&m, &rewritten).unwrap();
+    assert_no_warning(&f, &h, &m);
+    let o = launch(&f, &h, l, &m, &[]);
+    assert_eq!(o.status.code(), Some(1), "{l:?}: {}", stderr(&o));
+    let o = launch(&f, &h, l, &m, &["--accept-manifest", &reviewed_hash]);
+    assert_eq!(o.status.code(), Some(1), "{l:?}: {}", stderr(&o));
+    assert!(
+        stderr(&o).contains("not the text --accept-manifest names"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(created(&f), [HEAD], "{l:?}: nothing more sent");
+    let (_, new) = reviewed(&f, &h, &m);
+    let o = launch(&f, &h, l, &m, &["--accept-manifest", &new]);
+    assert_eq!(
+        created(&f),
+        [HEAD.to_owned(), rewritten],
+        "{l:?}: {}",
+        stderr(&o)
+    );
+}
+
+#[test]
+fn rt_man_03_session_start_needs_consent_for_a_manifest_with_no_warning() {
+    every_launch_needs_consent(Launch::Start, "any-s");
+}
+
+#[test]
+fn rt_man_03_sandbox_run_needs_consent_for_a_manifest_with_no_warning() {
+    every_launch_needs_consent(Launch::Run, "any-r");
 }
 
 // ---- a manifest inside a folder it lets the session write ------------------------------------
@@ -255,11 +353,12 @@ fn refuses_a_manifest_inside_a_folder_it_mounts_writable(l: Launch, tag: &str) {
         assert!(f.methods().is_empty(), "{l:?} {mode}: {:?}", f.methods());
         std::fs::remove_file(&link).unwrap();
     }
-    // Control: staged and read-only mounts never refuse; the create is sent.
+    // Control: staged and read-only mounts never refuse; with its hash, the create is sent.
     for mode in ["staged", "ro"] {
         let text = mount(mode);
         let m = h.write("p/m.yaml", &text);
-        let o = launch(&f, &h, l, &m, &[]);
+        let (_, hash) = reviewed(&f, &h, &m);
+        let o = launch(&f, &h, l, &m, &["--accept-manifest", &hash]);
         assert_eq!(
             created(&f).last(),
             Some(&text),
@@ -398,6 +497,9 @@ struct OnTerminal {
     child: Child,
     controller: std::fs::File,
     screen: Arc<Mutex<Vec<u8>>>,
+    /// Copies the terminal's output into `screen`; it ends once the launch's end closes the
+    /// terminal's last descriptor.
+    reader: std::thread::JoinHandle<()>,
 }
 
 impl OnTerminal {
@@ -416,7 +518,7 @@ impl OnTerminal {
         let child = h.apply(&mut c).spawn().unwrap();
         let screen: Arc<Mutex<Vec<u8>>> = Arc::default();
         let (mut reader, shown) = (controller.try_clone().unwrap(), Arc::clone(&screen));
-        std::thread::spawn(move || {
+        let copier = std::thread::spawn(move || {
             let mut buf = [0u8; 512];
             while let Ok(n @ 1..) = reader.read(&mut buf) {
                 shown.lock().unwrap().extend_from_slice(&buf[..n]);
@@ -426,6 +528,7 @@ impl OnTerminal {
             child,
             controller,
             screen,
+            reader: copier,
         }
     }
 
@@ -452,7 +555,13 @@ impl OnTerminal {
     }
 
     /// The exit code and stderr, once the launch ends.
-    fn end(mut self) -> (Option<i32>, String) {
+    fn end(self) -> (Option<i32>, String) {
+        let (code, err, _) = self.end_seen();
+        (code, err)
+    }
+
+    /// [`end`](Self::end), and what the terminal showed by then.
+    fn end_seen(mut self) -> (Option<i32>, String, String) {
         let end = Instant::now() + WAIT;
         while self.child.try_wait().unwrap().is_none() {
             if Instant::now() >= end {
@@ -461,12 +570,19 @@ impl OnTerminal {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+        // Everything the launch wrote is on the screen once the copier has seen the terminal
+        // close (bounded: a copier still running after the wait leaves the screen as read).
+        let end = Instant::now() + WAIT;
+        while !self.reader.is_finished() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let screen = self.screen();
         let o = self.child.wait_with_output().unwrap();
-        (o.status.code(), stderr(&o))
+        (o.status.code(), stderr(&o), screen)
     }
 }
 
-fn on_a_terminal_needs_a_typed_yes(l: Launch, tag: &str) {
+fn on_a_terminal_needs_a_typed_yes_or_the_hash(l: Launch, tag: &str) {
     let h = Home::new(tag);
     let f = daemon(tag, || {});
     let text = format!("{HEAD}{RISKY}");
@@ -492,26 +608,73 @@ fn on_a_terminal_needs_a_typed_yes(l: Launch, tag: &str) {
     let (code, err) = t.end();
     assert_eq!(code, Some(1), "{l:?}: {err}");
     assert!(f.methods().is_empty(), "{l:?}: {:?}", f.methods());
-    // The right hash on a terminal does not replace the yes.
-    let mut t = OnTerminal::spawn(&f, &h, l, &m, &["--accept-manifest", &hash], "");
-    t.asked();
-    t.answer("yes\n");
-    let (_, err) = t.end();
+    // A hash of another text refuses on a terminal too, and nothing is asked.
+    let other = h.write("other.yaml", HEAD);
+    let (_, wrong) = reviewed(&f, &h, &other);
+    let t = OnTerminal::spawn(&f, &h, l, &m, &["--accept-manifest", &wrong], "");
+    let (code, err, screen) = t.end_seen();
+    assert_eq!(code, Some(1), "{l:?}: {err}");
+    assert!(
+        err.contains("not the text --accept-manifest names"),
+        "{l:?}: {err}"
+    );
+    assert!(!screen.contains(QUESTION), "{l:?}: {screen:?}");
+    assert!(f.methods().is_empty(), "{l:?}: {:?}", f.methods());
+    // The right hash replaces the yes: nothing is asked, the block is on stderr, and the text
+    // is sent.
+    let t = OnTerminal::spawn(&f, &h, l, &m, &["--accept-manifest", &hash], "");
+    let (_, err, screen) = t.end_seen();
     assert_eq!(created(&f), std::slice::from_ref(&text), "{l:?}: {err}");
+    assert!(err.contains(ACKNOWLEDGED), "{l:?}: {err}");
+    assert!(!screen.contains(QUESTION), "{l:?}: {screen:?}");
+    // The hash names the text, not the folders: on a terminal too, a host written through a
+    // link refuses the hash, and nothing is asked.
+    std::fs::create_dir_all(h.join("real/sub")).unwrap();
+    std::os::unix::fs::symlink(h.join("real"), h.join("link")).unwrap();
+    let linked = format!(
+        "{HEAD}filesystem:\n  mounts:\n    - {{host: \"~/link/sub\", guest: /workspace/p, \
+         mode: rw}}\n{RISKY}"
+    );
+    let via = h.write("via.yaml", &linked);
+    let (_, via_hash) = reviewed(&f, &h, &via);
+    let t = OnTerminal::spawn(&f, &h, l, &via, &["--accept-manifest", &via_hash], "");
+    let (code, err, screen) = t.end_seen();
+    assert_eq!(code, Some(1), "{l:?}: {err}");
+    assert!(
+        err.contains("filesystem.mounts[0].host is written \"~/link/sub\""),
+        "{l:?}: {err}"
+    );
+    assert!(!screen.contains(QUESTION), "{l:?}: {screen:?}");
+    assert_eq!(
+        created(&f),
+        std::slice::from_ref(&text),
+        "{l:?}: nothing more sent"
+    );
     // Control: yes, typed after the question, starts and sends the text shown.
     let mut t = OnTerminal::spawn(&f, &h, l, &m, &[], "");
     t.asked();
     t.answer("yes\n");
     let (_, err) = t.end();
-    assert_eq!(created(&f), [text.clone(), text], "{l:?}: {err}");
+    assert_eq!(created(&f), [text.clone(), text.clone()], "{l:?}: {err}");
+    // A manifest with no warning is asked too.
+    let mut t = OnTerminal::spawn(&f, &h, l, &other, &[], "");
+    let screen = t.asked();
+    assert!(screen.contains("This agent:"), "{l:?}: {screen:?}");
+    t.answer("yes\n");
+    let (_, err) = t.end();
+    assert_eq!(
+        created(&f),
+        [text.clone(), text, HEAD.to_owned()],
+        "{l:?}: {err}"
+    );
 }
 
 #[test]
-fn rt_man_03_session_start_on_a_terminal_needs_a_typed_yes() {
-    on_a_terminal_needs_a_typed_yes(Launch::Start, "tty-s");
+fn rt_man_03_session_start_on_a_terminal_needs_a_typed_yes_or_the_hash() {
+    on_a_terminal_needs_a_typed_yes_or_the_hash(Launch::Start, "tty-s");
 }
 
 #[test]
-fn rt_man_03_sandbox_run_on_a_terminal_needs_a_typed_yes() {
-    on_a_terminal_needs_a_typed_yes(Launch::Run, "tty-r");
+fn rt_man_03_sandbox_run_on_a_terminal_needs_a_typed_yes_or_the_hash() {
+    on_a_terminal_needs_a_typed_yes_or_the_hash(Launch::Run, "tty-r");
 }

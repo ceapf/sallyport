@@ -1,14 +1,20 @@
 //! The session registry (Task 12, architect Q57): it starts sessions in a fixed order, supervises
 //! each one in its own task ([`super::supervise`]), and ends it exactly once.
 //!
-//! Start: `launch_workspace` (overlap and fd budget reserved, `sandbox.launch` audited) → the
-//! init's exit watch → approvals, tools and the agent server built in memory → audit
+//! Start: the session id minted and its paths made → audit what the validation accepted
+//! ([`super::accepted`]: one `manifest.acknowledged_risk` per acknowledgement in effect, then
+//! `manifest.warn`) → `launch_workspace` (overlap and fd budget reserved, `sandbox.launch`
+//! audited) → the init's exit watch → approvals, tools and the agent server built in memory → audit
 //! `session.start {model:{kind:"none"}}` → bind `agent.sock` (0600) in the session's harness
-//! socket directory → listen. A failed launch is the launcher's `sandbox.refuse` only; a failed
-//! `session.start` append binds nothing, writes a best-effort `session.stop` (`start-failed`: the
-//! entry may have reached the log) and stops the workspace; any failure after it ends the session
-//! with `start-failed`. Every `session.start` gets exactly one `session.stop`. A start runs in its
-//! own task: a caller that goes away mid-start leaves nothing half-made.
+//! socket directory → listen. A failed append of what the validation accepted, or one whose task
+//! failed, launches nothing: the session's log keeps the entries written before it, with no
+//! `sandbox.launch` or `sandbox.refuse` after them, and the caller's error names the session and
+//! the entry (the control log's `session.refuse`, `start-failed`). A failed launch is the
+//! launcher's `sandbox.refuse` only; a failed `session.start` append binds nothing, writes a
+//! best-effort `session.stop` (`start-failed`: the entry may have reached the log) and stops the
+//! workspace; any failure after it ends the session with `start-failed`. Every `session.start`
+//! gets exactly one `session.stop`. A start runs in its own task: a caller that goes away
+//! mid-start leaves nothing half-made.
 //!
 //! A workspace that cannot be confirmed gone, whether its session started or not, stays listed
 //! as stop-failed, keeping its claims and its disk watchdog; a later stop request or

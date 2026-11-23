@@ -92,6 +92,28 @@ fn warnings_are_listed_up_to_the_cap_and_counted_in_full() {
     }
 }
 
+/// `audit.level` sets detail, never coverage (SI-4): under `actions` the writer still writes
+/// both launch entries.
+#[test]
+fn under_audit_level_actions_both_entries_are_written() {
+    use sally_core::audit::{Appended, AuditWriter, SystemClock};
+    use sally_core::manifest::AuditLevel;
+
+    let v = validated(&format!("{RISKY}audit:\n  level: actions\n"));
+    let level = v.manifest.manifest().audit.level;
+    assert_eq!(level, AuditLevel::Actions);
+    // Removed on drop, a failing assertion included.
+    let dir = crate::egress::scratch::scratch("session-accepted-tests", "actions");
+    let mut w = AuditWriter::open(&dir, Box::new(SystemClock)).unwrap();
+    let e = entries("s-1", &v);
+    let events: Vec<String> = e.iter().map(|x| x.event().to_owned()).collect();
+    assert_eq!(events, ["manifest.acknowledged_risk", "manifest.warn"]);
+    for entry in e {
+        let written = w.append(entry, level).unwrap();
+        assert!(matches!(written, Appended::Written { .. }), "{written:?}");
+    }
+}
+
 #[test]
 fn the_cap_is_thirty_two() {
     assert_eq!(MAX_LISTED_WARNINGS, 32);

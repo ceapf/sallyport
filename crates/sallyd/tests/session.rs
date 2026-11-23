@@ -213,38 +213,65 @@ fn a_session_starts_in_order_and_stops_once_on_request() {
 const RISKY_SHELL: &str = "tools:\n  builtin: [shell]\n  shell: allow\n  \
                            destructive_requires_approval: false\n  acknowledge_unapproved: [shell]\n";
 
-/// RT-MAN-03, the launch half: a launch records each acknowledged risk in effect
-/// and the validator's warnings (code and field only) in the session's log before anything is
-/// launched, hence before `session.start`. Control: the same manifest whose shell commands need
-/// approval acknowledges nothing and records neither.
+/// Three acknowledgements in effect: egress to any host, shell commands unapproved, and fetch
+/// writes unapproved while a folder is mounted.
+const THREE_RISKS: &str = "filesystem:\n  mounts:\n    - {host: \"~/code/myproject\", \
+                           guest: /workspace/p, mode: ro}\nnetwork:\n  mode: proxy\n  allow:\n    \
+                           - host: \"*\"\n  acknowledge_unrestricted_egress: true\ntools:\n  \
+                           builtin: [shell, fetch]\n  shell: allow\n  \
+                           destructive_requires_approval: false\n  fetch_writes: allow\n  \
+                           acknowledge_unapproved: [shell, fetch]\n";
+
+/// RT-MAN-03, the launch half: a launch records each acknowledged risk in effect, one entry per
+/// acknowledgement in the validator's order, and the validator's warnings (code and field only)
+/// in the session's log before anything is launched, hence before `session.start`. Control: the
+/// one-risk manifest whose shell commands need approval acknowledges nothing and records neither.
 #[test]
 fn rt_man_03_a_launch_records_each_acknowledged_risk_and_the_warnings_before_session_start() {
     rt().block_on(async {
         let r = registry();
-        let info = r
-            .reg
-            .start(Arc::new(r.x.f.validated(RISKY_SHELL)))
-            .await
-            .unwrap();
+        let v = r.x.f.validated(THREE_RISKS);
+        let order = v.manifest.acknowledged_risks().to_vec();
+        let codes: Vec<Value> = v
+            .warnings
+            .iter()
+            .map(|w| json!({"code": w.code.to_string(), "path": w.path}))
+            .collect();
+        let info = r.reg.start(Arc::new(v)).await.unwrap();
         let all = r.x.events.list();
         let at = |name: &str| {
             all.iter()
                 .position(|e| e == name)
                 .unwrap_or_else(|| panic!("{name} not in {all:?}"))
         };
-        assert!(
-            at("manifest.acknowledged_risk") < at("manifest.warn"),
-            "{all:?}"
+        // One entry per acknowledgement, in the validator's order, all before the warnings.
+        let risks: Vec<Value> =
+            r.x.events
+                .all()
+                .into_iter()
+                .filter(|(event, _)| event == "manifest.acknowledged_risk")
+                .map(|(_, args)| args)
+                .collect();
+        assert_eq!(
+            order,
+            [
+                "network.acknowledge_unrestricted_egress",
+                "tools.acknowledge_unapproved: shell",
+                "tools.acknowledge_unapproved: fetch"
+            ]
         );
+        let want: Vec<Value> = order.iter().map(|risk| json!({ "risk": risk })).collect();
+        assert_eq!(risks, want, "{all:?}");
+        let last_risk = all
+            .iter()
+            .rposition(|e| e == "manifest.acknowledged_risk")
+            .unwrap();
+        assert!(last_risk < at("manifest.warn"), "{all:?}");
         assert!(at("manifest.warn") < at("sandbox.launch"), "{all:?}");
         assert!(at("sandbox.launch") < at("session.start"), "{all:?}");
-        let risk = r.x.events.args("manifest.acknowledged_risk").unwrap();
-        assert_eq!(risk, json!({"risk": "tools.acknowledge_unapproved: shell"}));
         let warn = r.x.events.args("manifest.warn").unwrap();
-        assert_eq!(
-            warn,
-            json!({"count": 1, "warnings": [{"code": "risky", "path": "tools.shell"}]})
-        );
+        assert!(codes.len() > 1, "{codes:?}");
+        assert_eq!(warn, json!({"count": codes.len(), "warnings": codes}));
         assert_eq!(
             r.reg.stop(&info.id, StopReason::Request).await,
             Some(StopOutcome::Stopped)
