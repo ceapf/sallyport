@@ -308,10 +308,11 @@ pub struct Launcher {
     pub(super) installation: Installation,
     crash: CrashReporter,
     cleanup: CleanupSchedule,
-    /// The ids of failed launches whose probe or container is not yet confirmed gone: in
-    /// before the first cleanup try, out only once both are confirmed gone, never at the
-    /// cleanup's cap. Shutdown reads it ([`Self::unfinished_cleanups`]) and waits for none.
-    unfinished: Mutex<BTreeSet<String>>,
+    /// The failed launches, by role and id (a workspace and a harness share their session's
+    /// id), whose probe or container is not yet confirmed gone: in before the first cleanup
+    /// try, out only once both are confirmed gone, never at the cleanup's cap. Shutdown reads
+    /// it ([`Self::unfinished_cleanups`]) and waits for none.
+    unfinished: Mutex<BTreeSet<(&'static str, String)>>,
     /// One stage walk at a time across all sessions, so a sandbox with a huge or deep tree
     /// cannot multiply `sallyd`'s open fds or blocking threads (6c-1 review M2/M3).
     pub(super) walks: Arc<tokio::sync::Semaphore>,
@@ -369,17 +370,21 @@ impl Launcher {
     /// these as not stopped cleanly, without waiting for any (THREAT_MODEL #239 row).
     #[must_use]
     pub fn unfinished_cleanups(&self) -> Vec<String> {
-        lock(&self.unfinished).iter().cloned().collect()
+        let ids: BTreeSet<String> = lock(&self.unfinished)
+            .iter()
+            .map(|(_, id)| id.clone())
+            .collect();
+        ids.into_iter().collect()
     }
 
-    /// A failed launch's cleanup begins: `id` may leave a container behind.
-    fn cleanup_begins(&self, id: &str) {
-        lock(&self.unfinished).insert(id.to_owned());
+    /// A failed `role` launch's cleanup begins: `id` may leave a container behind.
+    fn cleanup_begins(&self, role: Role, id: &str) {
+        lock(&self.unfinished).insert((role.as_str(), id.to_owned()));
     }
 
-    /// A failed launch's probe and container are confirmed gone.
-    fn cleanup_confirmed(&self, id: &str) {
-        lock(&self.unfinished).remove(id);
+    /// A failed `role` launch's probe and container are confirmed gone.
+    fn cleanup_confirmed(&self, role: Role, id: &str) {
+        lock(&self.unfinished).remove(&(role.as_str(), id.to_owned()));
     }
 }
 
@@ -408,9 +413,9 @@ impl Launcher {
 
     /// Drops session `id`'s secrets from the logs' redactors, once its last entry is written:
     /// after `sandbox.refuse` for a refused launch (after `sandbox.cleaned` or
-    /// `sandbox.cleanup_abandoned` when its cleanup was retried), after `session.closed` ([`Self::close`]) for a session (architect Q219). Safe
-    /// to call more than once. Off the runtime: the swap takes the audit writer's lock, which an
-    /// append holds through its fsync.
+    /// `sandbox.cleanup_abandoned` when its cleanup was retried), after `session.closed`
+    /// ([`Self::close`]) for a session (architect Q219). Safe to call more than once. Off the
+    /// runtime: the swap takes the audit writer's lock, which an append holds through its fsync.
     async fn release_secrets(&self, id: &str) {
         let redactors = Arc::clone(&self.redactors);
         let owned = id.to_owned();

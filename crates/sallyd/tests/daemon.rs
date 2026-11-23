@@ -1474,7 +1474,7 @@ fn a_shutdown_with_a_failed_launch_s_container_left_is_not_clean() {
         "failed launches' containers not confirmed gone",
     )
     .unwrap_or_else(|| panic!("{log}"));
-    assert!(line.contains(&format!("sessions=\"{id}\"")), "{line}");
+    assert!(line.contains(&format!("ids=\"{id}\"")), "{line}");
     assert!(oplog_line(&log, "info", "stopped").is_none(), "{log}");
 }
 

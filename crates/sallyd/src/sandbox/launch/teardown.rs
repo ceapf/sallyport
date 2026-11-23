@@ -105,7 +105,7 @@ impl Launcher {
         let removed = self.run("rm", rm_args(id)).await;
         match self.container_exists(id).await? {
             false => Ok(()),
-            true => Err(removed.err().unwrap_or(LaunchError::Command {
+            true => Err(removed.err().unwrap_or_else(|| LaunchError::Command {
                 verb: "rm",
                 msg: format!("{id} still exists"),
             })),
@@ -225,35 +225,51 @@ impl Launcher {
         mut next: NextTry,
         first: LaunchError,
     ) {
-        let subject = &held.subject;
-        let id = (subject.kind(), subject.id().as_str());
+        let who = (held.subject.kind(), held.subject.id().as_str());
         self.oplog.error(
             "sandbox",
             "a failed launch's cleanup is retried",
-            &[id, ("error", &first.to_string())],
+            &[who, ("error", &first.to_string())],
         );
         let mut last = first;
-        let directories = loop {
+        loop {
             let pause = match next {
                 NextTry::Again(pause) => pause,
-                NextTry::Done(d) => break d,
+                NextTry::Done(directories) => {
+                    let attempts = tries.attempts();
+                    return self
+                        .finish_cleaned(&held, &made, attempts, directories, &last)
+                        .await;
+                }
                 NextTry::Abandoned => {
-                    self.abandon(&held, &p, tries.attempts(), &last).await;
-                    return;
+                    return self.abandon(&held, &p, tries.attempts(), &last).await;
                 }
             };
             tokio::time::sleep(pause).await;
             let result = self.clean_failed(&mut p).await;
             let gone = containers_gone(p.probe.as_deref(), p.container.as_deref());
             if gone {
-                self.cleanup_confirmed(subject.id().as_str());
+                self.cleanup_confirmed(held.role, who.1);
             }
             next = tries.record(gone, result.is_ok());
             if let Err(e) = result {
                 last = e;
             }
-        };
-        let role = held.role;
+        }
+    }
+
+    /// A failed launch's retried cleanup ended with its probe and container confirmed gone, in
+    /// this order: an oplog error line when the directories are kept, `sandbox.cleaned` (a
+    /// refused append is the `unaudited` line), the claim freed, the session's forms released.
+    async fn finish_cleaned(
+        &self,
+        held: &Held,
+        made: &Made,
+        attempts: u32,
+        directories: Directories,
+        last: &LaunchError,
+    ) {
+        let subject = &held.subject;
         if directories == Directories::Kept {
             self.oplog.error(
                 "sandbox",
@@ -264,19 +280,12 @@ impl Launcher {
                 ],
             );
         }
-        let entry = cleaned_entry(subject, role, &made, tries.attempts(), directories);
+        let entry = cleaned_entry(subject, held.role, made, attempts, directories);
         if self.audit(entry, held.level).await.is_err() {
-            self.oplog.error(
-                "sandbox",
-                "audit entry not written",
-                &[
-                    ("event", "sandbox.cleaned"),
-                    (subject.kind(), subject.id().as_str()),
-                ],
-            );
+            self.unaudited("sandbox.cleaned", subject.id().as_str());
         }
-        self.unclaim(&held);
-        self.forget(&held).await;
+        self.unclaim(held);
+        self.forget(held).await;
     }
 
     /// A failed launch's cleanup reached its cap with its probe or container not confirmed

@@ -6,8 +6,9 @@
 //! and `{basic}` blob). The launcher registers that same [`Arc`] here right after `prepare`
 //! returns, before `net.sock` is bound or any container exists; whoever writes the session's
 //! last entry unregisters it (the launcher after `sandbox.refuse`, or after `sandbox.cleaned`
-//! or `sandbox.cleanup_abandoned` when a failed launch's cleanup was retried; for a session, `Launcher::close` right after
-//! `session.closed`, which follows `session.stop` and the teardown, #94). Every change rebuilds
+//! or `sandbox.cleanup_abandoned` when a failed launch's cleanup was retried; for a session,
+//! `Launcher::close` right after `session.closed`, which follows `session.stop` and the
+//! teardown, #94). Every change rebuilds
 //! one [`Redactor`] over the union of the registered sets and swaps it into each
 //! [`RedactorTarget`], under one lock, so the audit log and the operational log always redact
 //! the same set. A value two live sessions share stays

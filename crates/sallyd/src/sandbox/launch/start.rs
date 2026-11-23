@@ -330,11 +330,11 @@ impl Launcher {
             container: progress.container.clone(),
         };
         let id = held.subject.id().as_str().to_owned();
-        self.cleanup_begins(&id);
+        self.cleanup_begins(held.role, &id);
         let cleanup = self.clean_failed(&mut progress).await;
         let gone = containers_gone(progress.probe.as_deref(), progress.container.as_deref());
         if gone {
-            self.cleanup_confirmed(&id);
+            self.cleanup_confirmed(held.role, &id);
         }
         let outcome = match &cleanup {
             Ok(()) => format!("{stopped}removed"),
@@ -357,8 +357,9 @@ impl Launcher {
                 // harness's by one per session, and each by its cap. TODO(#134): an inference
                 // instance has no claim, so nothing bounds how many run at once once its launch
                 // is reachable.
+                // Never aborted: the task ends at its cap, and shutdown waits for none.
                 let this = Arc::clone(self);
-                let _ = self.crash.spawn("sandbox.cleanup", async move {
+                self.crash.spawn("sandbox.cleanup", async move {
                     this.finish_failed(held, made, progress, tries, next, first)
                         .await;
                 });
@@ -368,8 +369,9 @@ impl Launcher {
     }
 
     /// After a refused workspace's last entry (`sandbox.refuse`, or `sandbox.cleaned` or
-    /// `sandbox.cleanup_abandoned` after a retried cleanup), its secrets leave the logs' redactors (architect Q219). A harness
-    /// shares its session's id, so only a workspace releases them.
+    /// `sandbox.cleanup_abandoned` after a retried cleanup), its secrets leave the logs'
+    /// redactors (architect Q219). A harness shares its session's id, so only a workspace
+    /// releases them.
     pub(super) async fn forget(&self, held: &Held) {
         if held.role == Role::Workspace {
             self.release_secrets(held.subject.id().as_str()).await;

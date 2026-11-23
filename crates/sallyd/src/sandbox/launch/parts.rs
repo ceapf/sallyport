@@ -75,7 +75,9 @@ pub const CLEANUP_TRIES: usize = 10;
 
 /// The pauses before a failed launch's cleanup tries 2 to [`CLEANUP_TRIES`], in order: the
 /// retries back off and are capped. `sallyd` runs [`CleanupSchedule::PRODUCTION`]; a test may
-/// pass a shorter one through `LauncherParts`.
+/// pass a shorter one through `LauncherParts`. The cap counts tries, not time: each try's
+/// removal is itself up to four `podman rm` attempts, each bounded by podman's command
+/// timeout, so a cleanup can outlast the sum of its pauses (its claim held all the while).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CleanupSchedule {
     pauses: [Duration; CLEANUP_TRIES - 1],

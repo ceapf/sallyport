@@ -25,6 +25,21 @@ const BOUND: Duration = Duration::from_secs(60);
 /// the removal's own attempts, about 6 s.
 const SHORT: CleanupSchedule = CleanupSchedule::with_pauses([Duration::from_millis(100); 9]);
 
+/// [`SHORT`] for the first five pauses, then 30 s: a test that waits for six tries and then
+/// lets the removal work has a whole pause to read the deny leg before the seventh try, and
+/// three more tries after it before the cap.
+const SIX_THEN_SLOW: CleanupSchedule = CleanupSchedule::with_pauses([
+    Duration::from_millis(100),
+    Duration::from_millis(100),
+    Duration::from_millis(100),
+    Duration::from_millis(100),
+    Duration::from_millis(100),
+    Duration::from_secs(30),
+    Duration::from_secs(30),
+    Duration::from_secs(30),
+    Duration::from_secs(30),
+]);
+
 /// `GITHUB_TOKEN` injected on `mock.test`, so a launch registers the session's forms.
 const FORMS: &str = "network:\n  mode: proxy\n  allow:\n    - host: mock.test\n\
                      secrets:\n  - name: GITHUB_TOKEN\n    inject: {host: mock.test, \
@@ -68,9 +83,10 @@ fn refused(at: &Path) -> usize {
         .unwrap_or(0)
 }
 
-/// The longest the deny leg waits for six tries of a cleanup whose `rm` keeps failing (each
-/// try is the removal's four attempts two seconds apart, then the retry pause: about 8–10 s).
-const LONG_BOUND: Duration = Duration::from_secs(180);
+/// The longest a test waits for six, or all ten, tries of a cleanup whose `rm` keeps failing
+/// (each try is the removal's four attempts two seconds apart and about ten podman calls, then
+/// the pause: about 7 s idle, ten tries about 70 s; this leaves room for both lanes' load).
+const LONG_BOUND: Duration = Duration::from_secs(300);
 
 /// Waits within [`BOUND`] until `done`, naming `what` if it never is.
 async fn until(x: &Lx, what: &str, done: impl FnMut() -> bool) {
@@ -102,7 +118,7 @@ async fn until_within(x: &Lx, what: &str, bound: Duration, mut done: impl FnMut(
 fn a_failed_launch_cleanup_is_retried_until_the_container_is_gone() {
     let (dir, _gone) = wrapper_dir("retry");
     rt().block_on(async {
-        let x = Lx::with_podman_and_cleanup(|real| ws_rm_failing_podman(&dir, real), SHORT);
+        let x = Lx::with_podman_and_cleanup(|real| ws_rm_failing_podman(&dir, real), SIX_THEN_SLOW);
         std::fs::write(dir.join("start-fails"), b"").unwrap();
         std::fs::write(dir.join("rm-fails"), b"").unwrap();
         let body = format!(
