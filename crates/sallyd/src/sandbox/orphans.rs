@@ -132,8 +132,8 @@ pub(crate) fn removal_entry(o: &Orphan, sweep: &str) -> NewEntry {
         .args(json!({"container": o.name, "id": o.container, "sweep": sweep}))
 }
 
-/// `sandbox.orphan_remove_failed` (architect Q563): written after a removal that failed, so the
-/// log does not show the attempt as done. As [`removal_entry`], plus the error as a declared
+/// `sandbox.orphan_remove_failed`: written after a removal that failed, so the log does not
+/// show the attempt as done. As [`removal_entry`], plus the error as a declared
 /// text `detail` in the launcher's style (masked whole, then cut).
 #[must_use]
 pub(crate) fn removal_failed_entry(o: &Orphan, sweep: &str, error: String) -> NewEntry {
@@ -143,8 +143,8 @@ pub(crate) fn removal_failed_entry(o: &Orphan, sweep: &str, error: String) -> Ne
         .text("detail", error, DETAIL_STYLE)
 }
 
-/// The error of a sweep that left orphans behind (architect Q563): the counts and the first
-/// name only, never podman's text (each failure's is in its own entry).
+/// The error of a sweep that left orphans behind: the counts and the first name only, never
+/// podman's text (each failure's is in its own entry).
 #[must_use]
 pub(crate) fn not_removed(failed: usize, of: usize, first: &str) -> String {
     format!("{failed} of {of} orphaned containers not removed; first: {first}")
@@ -509,8 +509,8 @@ mod tests {
         }
     }
 
-    /// The entry before each removal: unchanged by Q563 (decision `deny`, the container, its id
-    /// and the sweep).
+    /// The entry before each removal, unchanged: decision `deny`, the container, its id and the
+    /// sweep.
     #[test]
     fn the_entry_before_a_removal_names_the_container_and_the_sweep() {
         let o = an_orphan();
@@ -524,8 +524,7 @@ mod tests {
         assert!(format!("{e:?}").contains("session: None"));
     }
 
-    /// Architect Q563 (i): a failed removal is a second entry, `deny`, with the error as a
-    /// declared text detail.
+    /// A failed removal is a second entry, `deny`, with the error as a declared text detail.
     #[test]
     fn a_failed_removal_entry_carries_the_error_as_a_detail() {
         let o = an_orphan();
@@ -550,7 +549,7 @@ mod tests {
         assert!(detail.len() < long.len(), "{}", detail.len());
     }
 
-    /// Q563 (ii): the sweep's error names the counts and the first name only.
+    /// The sweep's error names the counts and the first name only.
     #[test]
     fn the_sweep_error_names_the_counts_and_the_first_name() {
         assert_eq!(

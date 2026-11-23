@@ -64,8 +64,8 @@ impl Subject {
 }
 
 /// How many more tries a cleanup gets once its containers are confirmed gone, for its
-/// directories, a retry pause apart: a failed launch's (architect Q562) and a stop nobody
-/// received (`stop_role_unreceived`).
+/// directories, a retry pause apart: a failed launch's and a stop nobody received
+/// (`stop_role_unreceived`).
 pub(crate) const STOP_RETRIES_AFTER_REMOVAL: u32 = 3;
 
 /// What became of a failed launch's directories when its cleanup ended.
@@ -88,7 +88,7 @@ impl Directories {
     }
 }
 
-/// What a failed launch's cleanup does after a try (architect Q562).
+/// What a failed launch's cleanup does after a try (ARCHITECTURE §3.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NextTry {
     /// Try again a retry pause later; the claim stays.
@@ -97,8 +97,8 @@ pub(crate) enum NextTry {
     Done(Directories),
 }
 
-/// The tries of one failed launch's cleanup, the first (in the launch) included (Q562): without
-/// bound while a container may exist, then at most [`STOP_RETRIES_AFTER_REMOVAL`] more for the
+/// The tries of one failed launch's cleanup, the first (in the launch) included: without bound
+/// while a container may exist, then at most [`STOP_RETRIES_AFTER_REMOVAL`] more for the
 /// directories.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CleanupTries {
@@ -143,7 +143,7 @@ pub(crate) struct Made {
     pub(crate) container: Option<String>,
 }
 
-/// `sandbox.cleaned` (architect Q559): a failed launch's cleanup, retried after its first try
+/// `sandbox.cleaned`: a failed launch's cleanup, retried after its first try
 /// failed, ended. No decision and no podman text: what it removed, how many tries it took, and
 /// whether the directories went.
 #[must_use]
@@ -339,8 +339,8 @@ mod tests {
         );
     }
 
-    /// Architect Q562: while a container may exist, a failed launch's cleanup tries again
-    /// without bound and keeps its claim.
+    /// While a container may exist, a failed launch's cleanup tries again without bound and
+    /// keeps its claim.
     #[test]
     fn a_cleanup_retries_without_bound_while_a_container_may_exist() {
         let mut t = CleanupTries::default();
@@ -352,7 +352,7 @@ mod tests {
         assert_eq!(t.record(false, true), NextTry::Again);
     }
 
-    /// Q562: once both containers are confirmed gone, the directories get at most
+    /// Once both containers are confirmed gone, the directories get at most
     /// `STOP_RETRIES_AFTER_REMOVAL` more tries, then the cleanup ends with them kept.
     #[test]
     fn once_the_containers_are_gone_the_directories_get_a_bounded_number_of_tries() {
@@ -371,7 +371,7 @@ mod tests {
         assert_eq!(t.attempts(), 5);
     }
 
-    /// Q562: a first cleanup that removed the containers and failed only on the directories
+    /// A first cleanup that removed the containers and failed only on the directories
     /// starts in the bounded phase, counted from that first try.
     #[test]
     fn a_first_try_that_removed_the_containers_starts_in_the_bounded_phase() {
@@ -383,7 +383,7 @@ mod tests {
         assert_eq!(t.attempts(), 1 + STOP_RETRIES_AFTER_REMOVAL);
     }
 
-    /// Q562: the first try that removes everything ends the cleanup, in either phase.
+    /// The first try that removes everything ends the cleanup, in either phase.
     #[test]
     fn a_try_that_removes_everything_ends_the_cleanup() {
         let mut t = CleanupTries::default();
@@ -397,7 +397,7 @@ mod tests {
         assert_eq!(t.attempts(), 3);
     }
 
-    /// Q559: the count saturates, never wraps or panics.
+    /// The count saturates, never wraps or panics.
     #[test]
     fn the_attempt_count_saturates() {
         let mut t = CleanupTries {
@@ -408,13 +408,13 @@ mod tests {
         assert_eq!(t.attempts(), u32::MAX);
     }
 
-    /// The shared bound is three tries (Q562), the one `stop_role_unreceived` already used.
+    /// The shared bound is three tries, the one `stop_role_unreceived` already used.
     #[test]
     fn the_bound_after_removal_is_three() {
         assert_eq!(STOP_RETRIES_AFTER_REMOVAL, 3);
     }
 
-    /// Q559: `sandbox.cleaned` names the role and what the cleanup handled, with no decision
+    /// `sandbox.cleaned` names the role and what the cleanup handled, with no decision
     /// and no podman text; an instance's carries the instance.
     #[test]
     fn the_cleaned_entry_names_what_was_cleaned_and_carries_no_decision() {

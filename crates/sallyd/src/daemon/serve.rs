@@ -318,8 +318,8 @@ async fn serve(
         gid: rustix::process::getegid().as_raw(),
     };
     let (podman, runtime) = podman(log, dirs, config).await?;
-    // Before the launcher, which spawns a failed launch's retried cleanup on it (architect
-    // Q559); its reports wait in the channel until the select below reads them.
+    // Before the launcher, which spawns a failed launch's retried cleanup on it; its reports
+    // wait in the channel until the select below reads them.
     let (crash, mut crashes) = CrashReporter::channel();
     let launcher = Launcher::new(LauncherParts {
         podman: podman.clone(),
@@ -566,7 +566,7 @@ mod tests {
         // The hint spells the label as a literal: it must be the label the launcher sets.
         let filter = format!("label={}=<id>", crate::sandbox::INSTALLATION_LABEL);
         assert!(e.to_string().contains(&filter), "{e}");
-        // Architect Q563: a sweep that could not remove every orphan keeps the same hint.
+        // A sweep that could not remove every orphan keeps the same hint.
         let e = DaemonError::Orphans(LaunchError::Command {
             verb: "rm",
             msg: "1 of 2 orphaned containers not removed; first: sp-ws-a".into(),
