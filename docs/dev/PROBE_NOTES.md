@@ -56,6 +56,13 @@ line per fact, with where it was found. Check a note again before relying on it 
   at most 51.0 MiB; `memory.events` `max`, `oom` and `oom_kill` 0, every run passed. Below the
   64 MiB fixture the probe cannot go: the validator refuses `memory: 32MiB` ("32MiB is outside
   64MiB to 12GiB"), so a forced OOM kill of the fork bomb was not observed. (#141, 23 Nov 2026)
+- From PR #282 the fork-bomb test runs with `runtime.memory` 256 MiB (the maintainer's decision
+  on #141); the memory bomb and the `/tmp` filler keep 64 MiB. The first two bullets above
+  describe the fork bomb with 64 MiB, the fixture it had before; the third, a scratch edit at
+  256 MiB, ran it alone and unloaded. With 256 MiB in the committed test,
+  `make loaded-repeat LOADED_REPEATS=10` (23 Nov 2026; 32 cores, 54 GiB, kernel 6.18 WSL2, no
+  other worktree testing): 10 loaded, 10 passed; `memory.peak` min 14.4, median 48.9, max
+  57.4 MiB; `memory.events` `max` and `oom_kill` 0 and `pids.peak` 64 in every run. (#141)
 - `userdata/config.json` (`podman inspect --format '{{.OCIConfigPath}}'`) is subuid-owned under
   keep-id: read it with `podman unshare cat`. (6c-2)
 - Correction to 6b: hermetic podman (CONTAINERS_CONF, empty XDG_CONFIG_HOME,
