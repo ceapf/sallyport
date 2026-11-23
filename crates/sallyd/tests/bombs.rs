@@ -2,9 +2,10 @@
 //! session's limits (`runtime.pids`, `runtime.memory`, `runtime.tmp_size`). The fork bomb and
 //! the memory bomb are also audited: the watchdog's cgroup observer writes
 //! `session.resource_limit` (`pids-max`, `oom-kill`) and the session runs on (#27, architect
-//! Q48). The `/tmp` filler is contained only: a tmpfs has no kernel event. The stage-size and
-//! floor parts of the row are in `disk.rs` and `launch.rs`. The fixture is `common::container`;
-//! these tests never skip.
+//! Q48). The fork bomb runs with `runtime.memory` 256 MiB, memory to spare; the memory bomb and
+//! the `/tmp` filler run with 64 MiB (#141). The `/tmp` filler is contained only: a tmpfs has no
+//! kernel event. The stage-size and floor parts of the row are in `disk.rs` and `launch.rs`. The
+//! fixture is `common::container`; these tests never skip.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::time::Duration;
@@ -17,10 +18,16 @@ use common::*;
 
 const PIDS: u32 = 64;
 const TMP_MIB: u64 = 8;
+/// `runtime.memory` of the memory bomb and the `/tmp` filler.
+const MEMORY_MIB: u64 = 64;
+/// `runtime.memory` of the fork bomb alone, the maintainer's decision on #141: under a full
+/// suite run its `memory.peak` reached the 64 MiB limit in 2 of 50 runs (PROBE_NOTES), so it
+/// runs with memory to spare and `runtime.pids` is the limit it is there to reach.
+const FORK_MEMORY_MIB: u64 = 256;
 
-async fn launch_small(x: &Lx, tag: &str) -> Running {
+async fn launch_small(x: &Lx, tag: &str, memory_mib: u64) -> Running {
     let v = x.f.load(&format!(
-        "{}runtime:\n  memory: 64MiB\n  pids: {PIDS}\n  tmp_size: {TMP_MIB}MiB\n",
+        "{}runtime:\n  memory: {memory_mib}MiB\n  pids: {PIDS}\n  tmp_size: {TMP_MIB}MiB\n",
         mounts(&[mount("~/code/myproject", "/workspace/p", "ro")])
     ));
     x.launch(&v, tag).await.unwrap()
@@ -240,9 +247,13 @@ fn rt_ag_09_a_fork_bomb_is_held_by_the_pids_limit() {
         let x = Lx::new();
         // Before the launch: the observer's first tick fires as soon as it is spawned.
         let started = std::time::Instant::now();
-        let r = launch_small(&x, "fork").await;
+        let r = launch_small(&x, "fork", FORK_MEMORY_MIB).await;
         let cg = cgroup(&x, &r).await;
         assert_eq!(read(&x, &r, &cg, "pids.max").trim(), PIDS.to_string());
+        assert_eq!(
+            read(&x, &r, &cg, "memory.max").trim(),
+            (256u64 << 20).to_string()
+        );
         let (code, out) = exec(&r, "(b() { b | b & }; b) >/dev/null 2>&1 & echo started").await;
         assert_eq!((code, out.trim()), (0, "started"));
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -297,7 +308,7 @@ fn rt_ag_09_a_fork_bomb_is_held_by_the_pids_limit() {
 fn rt_ag_09_a_memory_bomb_is_oom_killed_inside_the_container() {
     rt().block_on(async {
         let x = Lx::new();
-        let r = launch_small(&x, "oom").await;
+        let r = launch_small(&x, "oom", MEMORY_MIB).await;
         let cg = cgroup(&x, &r).await;
         assert_eq!(
             read(&x, &r, &cg, "memory.max").trim(),
@@ -340,7 +351,7 @@ fn rt_ag_09_a_memory_bomb_is_oom_killed_inside_the_container() {
 fn rt_ag_09_a_tmp_filler_stops_at_the_tmpfs_size() {
     rt().block_on(async {
         let x = Lx::new();
-        let r = launch_small(&x, "tmpfs").await;
+        let r = launch_small(&x, "tmpfs", MEMORY_MIB).await;
         let (_, out) = exec(
             &r,
             "yes > /tmp/f; echo \"rc=$?\"; echo \"size=$(stat -c %s /tmp/f)\"; \
