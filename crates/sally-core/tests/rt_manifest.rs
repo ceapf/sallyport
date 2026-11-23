@@ -738,42 +738,41 @@ fn rt_fs_05_xdg_dirs_are_denylisted_when_set() {
 
 // ---- RT-FS-11: a root on a refused filesystem kind (Windows drives on WSL) -----------------------
 
-/// The production reader (`statfs` of the identified root) through a seam that runs on every
-/// host: listing the kind the fixture's own folder is on refuses its mount `denylisted`, naming
-/// the kind, at validation and at the re-check. Controls: no kind listed accepts it, and so does
-/// a list holding only another kind. On WSL, `rt_fs_11_wsl_…` shows a real drive is on a kind
+/// The production reader (the type the mount table gives the identified root's mount id)
+/// through a seam that runs on every host: listing the type the fixture's own folder is on
+/// (read here by `findmnt`, not by the reader under test) refuses its mount `denylisted`, naming
+/// the type, at validation and at the re-check. Controls: no kind listed accepts it, and so does
+/// a list holding only another type. On WSL, `rt_fs_11_wsl_…` shows a real drive is on a type
 /// this host lists.
 #[test]
 fn rt_fs_11_a_root_on_a_refused_filesystem_kind_is_refused() {
     let mut f = Fixture::new();
-    let here = rustix::fs::statfs(f.home().join("code/myproject")).unwrap();
-    let magic = u64::try_from(here.f_type).unwrap();
+    let o = std::process::Command::new("findmnt")
+        .args(["-n", "-o", "FSTYPE", "-T"])
+        .arg(f.home().join("code/myproject"))
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "findmnt: {o:?}");
+    let ty = String::from_utf8(o.stdout).unwrap();
+    let own: &'static str = Box::leak(ty.trim().split('.').next().unwrap().into());
+    assert!(!own.is_empty(), "{ty:?}");
     let body = mount("~/code/myproject", "rw");
     twin_ok(&f, &body);
-    let other = magic.wrapping_add(1);
-    f.env.refused_fs_kinds = vec![FsKind {
-        magic: other,
-        label: "other",
-    }];
+    let other = FsKind {
+        name: "no-such-type",
+    };
+    f.env.refused_fs_kinds = vec![other];
     twin_ok(&f, &body);
     let v = f.load(&body).unwrap().manifest;
-    let listed = FsKind {
-        magic,
-        label: "test-kind",
-    };
-    f.env.refused_fs_kinds = vec![
-        FsKind {
-            magic: other,
-            label: "other",
-        },
-        listed,
-    ];
+    f.env.refused_fs_kinds = vec![other, FsKind { name: own }];
     let r = f.load(&body);
     assert_rejects(&r, "filesystem.mounts[0].host", Code::Denylisted);
     let msg = &r.unwrap_err().errors[0].message;
-    let want = "which is on a test-kind filesystem (on WSL a Windows drive or share): never \
-                mountable (denylisted)";
-    assert!(msg.contains(want), "{msg}");
+    let want = format!(
+        "which is on a {own} filesystem (on WSL a Windows drive or share): never mountable \
+         (denylisted)"
+    );
+    assert!(msg.contains(&want), "{msg}");
     let e = v.recheck_mounts(&f.env).unwrap_err();
     assert_eq!(e.errors[0].code, Code::Denylisted);
 }

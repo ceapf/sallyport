@@ -27,7 +27,7 @@ mod validate;
 pub use diag::{Code, Diagnostic, Rejected, Severity};
 pub use host::{HostError, HostPattern, parse_host_pattern, parse_hostname};
 pub use hostenv::{
-    ConfiguredBinary, EnvDir, FsKind, HostEnv, HostEnvError, V9FS, configured_binaries,
+    ConfiguredBinary, EnvDir, FsKind, HostEnv, HostEnvError, V9FS, VIRTIOFS, configured_binaries,
     refused_fs_kinds,
 };
 pub use image::is_pinned_image_ref;

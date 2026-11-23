@@ -14,6 +14,7 @@ use std::path::{Component, Path, PathBuf};
 use super::diag::Code;
 use super::hostenv::{ConfiguredBinary, EnvDir, FsKind, HostEnv};
 use super::links::{self, Incomplete, Link, Scan};
+use super::mountinfo;
 
 /// Longest accepted host or guest path.
 const MAX_PATH_LEN: usize = 4096;
@@ -657,7 +658,8 @@ fn climb(
 /// Order matters: a lexical denylist check first (so `/mnt/c` is `denylisted` even where it
 /// does not exist), then the root's own type via `lstat` (symlink / not-dir / missing), then the
 /// authoritative denylist check on the realpath and on the identity, and last the filesystem
-/// kind, read from a handle on the identified root (on WSL, 9p is refused wherever mounted).
+/// type, which the mount table gives a handle on the identified root (on WSL, 9p and virtiofs
+/// are refused wherever mounted).
 // TODO(#195): these errors quote the host as written, or its realpath (of `expand`'s errors, the
 // `~user` and not-absolute ones quote it as written). One holding a backslash, space, slash or
 // any character `{:?}` escapes (such as a quote, a control or a non-printable character) is not
@@ -717,26 +719,36 @@ pub(crate) fn check_mount_host(
     if let Some(why) = deny.refusal_by_id(id) {
         return Err((Code::Denylisted, format!("{raw:?} {why} (denylisted)")));
     }
-    // RT-FS-11: on WSL a root on a Windows drive's filesystem kind is refused, wherever mounted.
-    let magic = root_kind(&real, id).map_err(|(code, why)| (code, format!("{raw:?} {why}")))?;
-    if let Some(kind) = deny.refused_kinds.iter().find(|k| k.magic == magic) {
+    // RT-FS-11: on WSL a root on a Windows drive's filesystem type is refused, wherever mounted.
+    let kind = root_kind(&real, id, &deny.refused_kinds, Path::new(MOUNT_TABLE))
+        .map_err(|(code, why)| (code, format!("{raw:?} {why}")))?;
+    if let Some(kind) = kind {
         return Err((
             Code::Denylisted,
             format!(
                 "{raw:?} resolves to {real_str:?}, which is on a {} filesystem {WINDOWS_KIND} \
                  (denylisted)",
-                kind.label
+                kind.name
             ),
         ));
     }
     Ok((real, id))
 }
 
-/// The filesystem kind (`f_type`) of the directory at `real`, read from a handle opened without
-/// following a link, which must be the directory identified as `id`: the kind then belongs to
-/// the root that is pinned (the same device is the same filesystem). Every failure refuses
-/// (RT-FS-11).
-fn root_kind(real: &Path, id: DirId) -> Result<u64, (Code, String)> {
+/// Where the kernel gives this process's mount table (RT-FS-11).
+const MOUNT_TABLE: &str = "/proc/self/mountinfo";
+
+/// Which of `refused` the directory at `real` lies on, if any, read from a handle opened
+/// without following a link, which must be the directory identified as `id`. The handle is
+/// opened and compared on every host; with nothing refused, nothing more is read. Otherwise the
+/// type is the one the mount table at `table` gives the handle's mount id, read while the
+/// handle is open. Every failure refuses (RT-FS-11).
+fn root_kind(
+    real: &Path,
+    id: DirId,
+    refused: &[FsKind],
+    table: &Path,
+) -> Result<Option<FsKind>, (Code, String)> {
     use rustix::fs::{Mode, OFlags};
     let inspect = |e: rustix::io::Errno| (Code::NotFound, format!("cannot be inspected: {e}"));
     let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW;
@@ -747,15 +759,50 @@ fn root_kind(real: &Path, id: DirId) -> Result<u64, (Code, String)> {
             "changed while it was checked".to_owned(),
         ));
     }
-    let fs = rustix::fs::fstatfs(&fd).map_err(inspect)?;
-    // `f_type` is a C long: every magic is positive on 64-bit Linux. Where it is 32 bits, a
-    // magic with the top bit set does not convert and the root is refused (closed).
-    u64::try_from(fs.f_type).map_err(|_| {
-        (
-            Code::NotFound,
-            format!("cannot be inspected: filesystem kind {}", fs.f_type),
-        )
-    })
+    if refused.is_empty() {
+        return Ok(None);
+    }
+    let name = mounted_type(&fd, table)?;
+    Ok(refused.iter().copied().find(|k| k.name == name))
+}
+
+/// The filesystem type the mount table at `table` gives the mount `fd` is on.
+///
+/// RT-FS-11: the mount id is `statx`'s `STATX_MNT_ID`, the id the table's first field gives
+/// (not the unique id). `fd` is borrowed for the whole read: an open descriptor holds its mount,
+/// so the id cannot pass to another mount before the table is parsed, and a mount detached
+/// meanwhile has no line and is refused (docs/dev/PROBE_NOTES.md).
+fn mounted_type(fd: &rustix::fd::OwnedFd, table: &Path) -> Result<String, (Code, String)> {
+    use rustix::fs::{AtFlags, StatxFlags};
+    let inspect = |why: String| (Code::NotFound, format!("cannot be inspected: {why}"));
+    let st = rustix::fs::statx(fd, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)
+        .map_err(|e| inspect(e.to_string()))?;
+    let mnt = mount_id(st.stx_mask, st.stx_mnt_id)
+        .ok_or_else(|| inspect("the kernel gives no mount id".to_owned()))?;
+    let bytes = read_mount_table(table).map_err(inspect)?;
+    let name = mountinfo::mount_fs_type(&bytes, mnt).map_err(|e| inspect(e.to_string()))?;
+    Ok(name.to_owned())
+}
+
+/// The mount id `statx` gave, when its mask says it gave one (RT-FS-11: a kernel without
+/// `STATX_MNT_ID` refuses every root where a kind is refused).
+fn mount_id(mask: u32, mnt_id: u64) -> Option<u64> {
+    (mask & rustix::fs::StatxFlags::MNT_ID.bits() != 0).then_some(mnt_id)
+}
+
+/// The mount table at `path`, at most [`mountinfo::MAX_MOUNT_TABLE`] bytes: a longer one is
+/// refused, never cut (RT-FS-11). The error names the cause, never the table's bytes.
+fn read_mount_table(path: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let cap = mountinfo::MAX_MOUNT_TABLE;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|f| f.take(cap as u64 + 1).read_to_end(&mut bytes))
+        .map_err(|e| format!("the mount table is unreadable: {e}"))?;
+    if bytes.len() > cap {
+        return Err(format!("the mount table is larger than {cap} bytes"));
+    }
+    Ok(bytes)
 }
 
 /// Guest paths: `/workspace/<seg>(/<seg>)*`, each segment `[A-Za-z0-9._-]`, not `.`/`..`.
@@ -1102,28 +1149,123 @@ mod tests {
     fn the_kind_is_read_from_the_identified_root_only() {
         let t = TmpHome::new("kind");
         let here = t.0.join("home/code/x");
-        assert!(root_kind(&here, t.id("home/code/x")).is_ok());
-        let e = root_kind(&here, t.id("home/.ssh")).unwrap_err();
-        assert_eq!(e.0, Code::MountChanged);
-        let e = root_kind(&t.0.join("home/absent"), t.id("home/.ssh")).unwrap_err();
-        assert_eq!(e.0, Code::NotFound);
-        let link = t.0.join("home/code/lnk");
-        std::os::unix::fs::symlink(&here, &link).unwrap();
-        let e = root_kind(&link, t.id("home/code/x")).unwrap_err();
-        assert_eq!(e.0, Code::NotFound);
+        let table = Path::new(MOUNT_TABLE);
+        let own = [own_type(&here)];
+        for refused in [&[][..], &own[..]] {
+            assert!(root_kind(&here, t.id("home/code/x"), refused, table).is_ok());
+            let e = root_kind(&here, t.id("home/.ssh"), refused, table).unwrap_err();
+            assert_eq!(e.0, Code::MountChanged);
+            let e = root_kind(&t.0.join("home/absent"), t.id("home/.ssh"), refused, table);
+            assert_eq!(e.unwrap_err().0, Code::NotFound);
+            let link = t.0.join("home/code/lnk");
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&here, &link).unwrap();
+            let e = root_kind(&link, t.id("home/code/x"), refused, table).unwrap_err();
+            assert_eq!(e.0, Code::NotFound);
+        }
     }
 
-    /// The kind is read through an `O_PATH` handle: a search-only root needs no read permission.
+    /// The kind is read through an `O_PATH` handle: a search-only root needs no read permission,
+    /// and its type is still read from the mount table.
     #[test]
     fn the_kind_of_a_search_only_root_is_read() {
         use std::os::unix::fs::PermissionsExt;
         let t = TmpHome::new("kindperm");
         let here = t.0.join("home/code/x");
         let id = t.id("home/code/x");
+        let own = own_type(&here);
         std::fs::set_permissions(&here, std::fs::Permissions::from_mode(0o100)).unwrap();
-        let kind = root_kind(&here, id);
+        let none = root_kind(&here, id, &[], Path::new(MOUNT_TABLE));
+        let kind = root_kind(&here, id, &[own], Path::new(MOUNT_TABLE));
         std::fs::set_permissions(&here, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(kind.is_ok(), "search-only root: {kind:?}");
+        assert_eq!(none, Ok(None), "search-only root");
+        assert_eq!(kind, Ok(Some(own)), "search-only root");
+    }
+
+    /// The type part of the filesystem `path` is on, as `findmnt` gives it (not the parser
+    /// under test), as a kind.
+    fn own_type(path: &Path) -> FsKind {
+        let o = std::process::Command::new("findmnt")
+            .args(["-n", "-o", "FSTYPE", "-T"])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "findmnt: {o:?}");
+        let ty = String::from_utf8(o.stdout).unwrap();
+        let part = ty.trim().split('.').next().unwrap().to_owned();
+        assert!(!part.is_empty(), "{ty:?}");
+        FsKind {
+            name: Box::leak(part.into_boxed_str()),
+        }
+    }
+
+    /// RT-FS-11: the root's own type, listed, is the kind it lies on; a list without it gives
+    /// none, and a list holding it among others gives it.
+    #[test]
+    fn the_listed_type_of_the_root_is_its_kind() {
+        let t = TmpHome::new("kindlist");
+        let here = t.0.join("home/code/x");
+        let id = t.id("home/code/x");
+        let own = own_type(&here);
+        let other = FsKind {
+            name: "no-such-type",
+        };
+        let table = Path::new(MOUNT_TABLE);
+        assert_eq!(root_kind(&here, id, &[other], table), Ok(None));
+        assert_eq!(root_kind(&here, id, &[other, own], table), Ok(Some(own)));
+        assert_eq!(root_kind(&here, id, &[own, other], table), Ok(Some(own)));
+    }
+
+    /// RT-FS-11: the table is read only when a kind is listed: a missing table with nothing
+    /// listed accepts the root, and with a kind listed refuses it, naming the cause.
+    #[test]
+    fn the_table_is_read_only_when_a_kind_is_listed() {
+        let t = TmpHome::new("kindtable");
+        let here = t.0.join("home/code/x");
+        let id = t.id("home/code/x");
+        let absent = t.0.join("no-table");
+        assert_eq!(root_kind(&here, id, &[], &absent), Ok(None));
+        let e = root_kind(&here, id, &[own_type(&here)], &absent).unwrap_err();
+        assert_eq!(e.0, Code::NotFound);
+        assert!(
+            e.1.starts_with("cannot be inspected: the mount table is unreadable"),
+            "{}",
+            e.1
+        );
+        // A table with no line for the root's mount refuses too.
+        std::fs::write(&absent, "1 0 0:1 / / rw - ext4 none rw\n").unwrap();
+        let e = root_kind(&here, id, &[own_type(&here)], &absent).unwrap_err();
+        assert_eq!(e.0, Code::NotFound);
+        assert!(e.1.ends_with("has no entry for the mount"), "{}", e.1);
+    }
+
+    #[test]
+    fn the_mount_table_is_this_process_s() {
+        assert_eq!(MOUNT_TABLE, "/proc/self/mountinfo");
+    }
+
+    /// The mount id counts only when `statx` says it gave one.
+    #[test]
+    fn the_mount_id_counts_only_with_its_mask_bit() {
+        use rustix::fs::StatxFlags;
+        let bit = StatxFlags::MNT_ID.bits();
+        assert_eq!(mount_id(bit, 7), Some(7));
+        assert_eq!(mount_id(bit | StatxFlags::INO.bits(), 7), Some(7));
+        assert_eq!(mount_id(0, 7), None);
+        assert_eq!(mount_id(StatxFlags::BASIC_STATS.bits(), 7), None);
+    }
+
+    /// A table of exactly the cap is read whole; one byte more is refused, never cut.
+    #[test]
+    fn the_mount_table_is_read_up_to_the_cap() {
+        let t = TmpHome::new("kindcap");
+        let file = t.0.join("table");
+        let cap = mountinfo::MAX_MOUNT_TABLE;
+        std::fs::write(&file, vec![b'\n'; cap]).unwrap();
+        assert_eq!(read_mount_table(&file).map(|b| b.len()), Ok(cap));
+        std::fs::write(&file, vec![b'\n'; cap + 1]).unwrap();
+        let e = read_mount_table(&file).unwrap_err();
+        assert_eq!(e, "the mount table is larger than 1048576 bytes");
     }
 
     /// RT-FS-14: a root with the identity of a protected folder (a bind alias of it) is refused.

@@ -425,17 +425,24 @@ environment (passwd entry only if `$HOME` is unset or relative).
   - the Podman storage dirs (rootless graphroot and `/var/lib/containers/storage`) and every
     `filesystem.deny` entry.
 
-  **Windows drives (WSL).** On WSL a mount root that lies on a 9p filesystem (statfs kind
-  `0x01021997`) is refused `denylisted` wherever it is mounted, not only under `/mnt`: Windows
-  drives and the WSL driver share are 9p there, and the kind alone does not tell them apart.
+  **Windows drives (WSL).** On WSL a mount root that lies on a filesystem of type `9p` or
+  `virtiofs` is refused `denylisted` wherever it is mounted, not only under `/mnt`: Windows
+  drives and the WSL driver share are 9p there, newer WSL builds can serve drives over
+  virtiofs, and the type alone does not tell a drive from another mount of that type. Other
+  FUSE filesystems are not refused. The type is the one `/proc/self/mountinfo` gives the
+  root's mount id (`statx` `STATX_MNT_ID` on a handle on the identified root, held open while
+  the table is read), its part before any `.`, so `fuse.<subtype>` is never 9p or virtiofs.
   WSL is told by the kernel release naming Microsoft or by the `WSLInterop` entry under
   `/proc/sys/fs/binfmt_misc`; with the kernel release unreadable, the host facts cannot be
-  gathered, so `sallyd` does not start and the CLI fails (2). The kind is read
-  from a handle on the identified root, at validation and at the re-check: "resolves to
-  "/data/win/proj", which is on a 9p filesystem (on WSL a Windows drive or share): never
-  mountable". Drives served over virtiofs are not covered, nor a WSL that neither signal shows
-  (a kernel release without "microsoft" and interop off), where only the `/mnt` rule holds
-  (#281).
+  gathered, so `sallyd` does not start and the CLI fails (2). Off WSL nothing is listed and the
+  table is not read. On WSL a root is also refused when its type cannot be read: a kernel that
+  gives no mount id (WSL1, or older than 5.8), a table that cannot be read, is larger than
+  1 MiB, is empty or cut short, or has no entry, more than one entry or a malformed entry for
+  the mount; the message names the cause and never quotes the table. The check runs at
+  validation and at the re-check: "resolves to "/data/win/proj", which is on a 9p filesystem
+  (on WSL a Windows drive or share): never mountable", and the same with `virtiofs`. Not probed
+  on a WSL that serves drives over virtiofs; a WSL that neither signal shows (a kernel release
+  without "microsoft" and interop off) keeps only the `/mnt` rule (#281).
 
   The ancestor rule is why `~/.local`, `/var`, `/usr`, and `/home` are refused: they really
   contain protected data. "Each home" is `$HOME` **and** the passwd home when they differ, so a
