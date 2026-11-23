@@ -39,7 +39,7 @@ Tasks
 10. `sallyd::approvals`: queue, canonical args, sanitized rendering, single-use IDs, timeout=deny, `max_pending` flood control, `deny_all_session`; CLI prompt renderer — main (sonnet) with **review (opus)**
 11. `sallyd::tools::{fs,shell}`: `openat2` confinement for `fs.*` on `brokered` mounts; `shell` via `podman exec` with deny/approve/allow + destructive tagger — **main (opus)**; review security-reviewer (opus)
 12. `sallyd::session` (minimal: no model yet) + `sally` CLI: `doctor`, `manifest validate|summary`, `secrets set|list|rm`, `sandbox run --manifest m.yaml -- <cmd>` (runs a command in Z3 with the manifest's walls, interactive approvals), `approvals`, `audit tail|verify` — main (sonnet)
-13. Red-team suite M1 subset + harness + `redteam.yml` CI (rootless podman on `ubuntu-24.04`) — **main (opus)** authors tests; sonnet does plumbing
+13. Red-team suite M1 subset + harness + the `redteam` CI job in `ci.yml` (rootless podman on `ubuntu-24.04`) — **main (opus)** authors tests; sonnet does plumbing
 14. `/security-scan`; security-reviewer full pass on `crates/`; `/code-review`; doc-updater (haiku) for README quickstart; `docs/reports/M1.md` — per routing
 
 Acceptance
@@ -47,7 +47,7 @@ Acceptance
 - `sally audit verify` passes; tampering a byte fails it.
 - Snapshot argv contains none of the forbidden flags.
 - Red-team must pass: every row the suite marks for this milestone (`tests/redteam/REDTEAM_SUITE.md`, its M column; the suite is the only list).
-- CI green including `redteam.yml`. `cargo deny` clean. No `unsafe`.
+- CI green including the `redteam` job of `ci.yml`. `cargo deny` clean. No `unsafe`.
 
 ---
 
