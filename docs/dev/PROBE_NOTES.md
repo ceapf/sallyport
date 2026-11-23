@@ -50,6 +50,11 @@ line per fact, with where it was found. Check a note again before relying on it 
   these peaks are higher than the probe's above (an unloaded run reached the limit too, so load
   alone does not explain it). The load pass was stopped after the 50th repeat, so it is no
   complete in-suite sample. Not measured: under memory pressure. (#141)
+- The fork-bomb test alone with `runtime.memory` raised to 256 MiB (a scratch edit, reverted):
+  `memory.peak` 40.3, 48.4, 47.0, 16.6, 47.3, 44.5, 14.5, 53.5, 46.3 and 48.1 MiB in 10 runs, so
+  at most 51.0 MiB; `memory.events` `max`, `oom` and `oom_kill` 0, every run passed. Below the
+  64 MiB fixture the probe cannot go: the validator refuses `memory: 32MiB` ("32MiB is outside
+  64MiB to 12GiB"), so a forced OOM kill of the fork bomb was not observed. (#141, 23 Nov 2026)
 - `userdata/config.json` (`podman inspect --format '{{.OCIConfigPath}}'`) is subuid-owned under
   keep-id: read it with `podman unshare cat`. (6c-2)
 - Correction to 6b: hermetic podman (CONTAINERS_CONF, empty XDG_CONFIG_HOME,
