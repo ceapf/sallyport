@@ -103,8 +103,9 @@ const WSL_INTEROP: &str = "/proc/sys/fs/binfmt_misc/WSLInterop";
 /// interop entry is present: on WSL (either signal) [`V9FS`] and [`VIRTIOFS`], else none. A
 /// further signal is added only once it is probed (docs/dev/PROBE_NOTES.md), and only ever adds
 /// refusals (RT-FS-11: Windows drives refused by type name wherever they are mounted).
-// TODO(#281): not probed on a WSL that serves Windows drives over virtiofs; a WSL that neither
-// signal shows (a release without "microsoft" and interop off) keeps only the `/mnt` rule.
+// TODO(#281): not probed on a WSL that serves Windows drives over virtiofs, nor on WSL1, whose
+// drives are type `drvfs`, not listed; a WSL that neither signal shows (a release without
+// "microsoft" and interop off) keeps only the `/mnt` rule.
 #[must_use]
 pub fn refused_fs_kinds(osrelease: &str, interop: bool) -> Vec<FsKind> {
     if interop || osrelease.to_ascii_lowercase().contains("microsoft") {
@@ -488,11 +489,13 @@ mod tests {
             .map(PathBuf::from)
             .filter(|p| p.is_absolute());
         assert_eq!(env.xdg_state_home, state);
-        // The kinds, from an independent read of this host's two signals.
+        // The kinds, from an independent read of this host's two signals. The entry is read
+        // without following a link, as the product does: only a clean not-found is absence.
         let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
-        let interop = Path::new("/proc/sys/fs/binfmt_misc/WSLInterop")
-            .try_exists()
-            .unwrap_or(true);
+        let interop = !matches!(
+            std::fs::symlink_metadata("/proc/sys/fs/binfmt_misc/WSLInterop"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+        );
         assert_eq!(env.refused_fs_kinds, refused_fs_kinds(&release, interop));
         assert!(
             env.env_dirs.iter().any(|d| d.var == "PATH"),

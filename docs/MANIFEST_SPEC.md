@@ -441,8 +441,9 @@ environment (passwd entry only if `$HOME` is unset or relative).
   the mount; the message names the cause and never quotes the table. The check runs at
   validation and at the re-check: "resolves to "/data/win/proj", which is on a 9p filesystem
   (on WSL a Windows drive or share): never mountable", and the same with `virtiofs`. Not probed
-  on a WSL that serves drives over virtiofs; a WSL that neither signal shows (a kernel release
-  without "microsoft" and interop off) keeps only the `/mnt` rule (#281).
+  on a WSL that serves drives over virtiofs, nor on WSL1, whose drives are type `drvfs`, not
+  listed; a WSL that neither signal shows (a kernel release without "microsoft" and interop off)
+  keeps only the `/mnt` rule (#281).
 
   The ancestor rule is why `~/.local`, `/var`, `/usr`, and `/home` are refused: they really
   contain protected data. "Each home" is `$HOME` **and** the passwd home when they differ, so a
