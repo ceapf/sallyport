@@ -7,10 +7,11 @@
 //!   LFS SHA-256 at one commit.
 //! - [`plan`]: the request for each hop. The first goes to `huggingface.co`; a redirect is
 //!   followed only to https on the default port, to `huggingface.co` or `hf.co` or a subdomain
-//!   of either; only a hop to `huggingface.co` itself carries the token; files are fetched at
-//!   the listed commit, never at a branch.
+//!   of either; only a hop to `huggingface.co` itself carries the token, and only while the
+//!   redirect chain has never left it; files are fetched at the listed commit, never at a
+//!   branch.
 //! - [`head`]: the decision on each response head (redirect, bounded wait, body, refusal), and
-//!   the resume rules for a partial download.
+//!   the resume rules for a partial download. The file list is read from `huggingface.co` only.
 //!
 //! The bytes themselves go to a [`crate::library::Download`], and
 //! [`crate::library::Download::verify`] checks the listed SHA-256 before anything else reads

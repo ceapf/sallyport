@@ -4,8 +4,8 @@
 //! on this host, refuse loopback, private, link-local and own addresses, dial a pinned address,
 //! TLS verified against the anchors of a checked CA bundle, [`HfClient::with_roots`]), sent as
 //! [`wire`] builds it (the token only on a hop to `huggingface.co` itself, and never again once
-//! the redirect chain has left it), and its head
-//! decided by the core ([`sally_core::hf::head`]).
+//! the redirect chain has left it), and its head decided by the core
+//! ([`sally_core::hf::head`]; the file list is read from `huggingface.co` only).
 //! File bytes go only into a [`sally_core::library::Download`]; its verify checks the listed
 //! SHA-256 before anything else reads them, on a blocking thread without the library's lock,
 //! and only then does the library promote it. Every connection's task is aborted when its

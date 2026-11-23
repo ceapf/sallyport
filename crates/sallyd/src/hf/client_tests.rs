@@ -386,6 +386,10 @@ async fn a_list_redirected_off_the_api_host_is_refused() {
     let seen = same.seen();
     assert_eq!(seen.len(), 2);
     assert_eq!(seen[1].host, "huggingface.co");
+    assert_eq!(
+        seen[1].path,
+        "/api/models/org/m/revision/main?blobs=true&moved=1"
+    );
     assert_eq!(seen[1].auth, Some(format!("Bearer {}", token())));
 }
 
@@ -647,26 +651,26 @@ async fn an_answer_outside_its_bounds_is_a_failed_lookup() {
     assert_eq!(hub.dialled(), [public_443()]);
 }
 
-/// Only checked answers are dialled, each by address on port 443 whatever port the lookup
-/// answered, in the answer's order, and at most `MAX_DIALS` of them: five public answers on
-/// another port, every dial failing, are the first three on 443, then a failed connect. Control:
-/// the same Hub with dials that succeed dials the first answer on 443 once.
+/// Answers are dialled by address on port 443 whatever port the lookup gave, in the answer's
+/// order, and at most `MAX_DIALS` of them: five public answers on another port, every dial
+/// failing, are the first three on 443, then a failed connect. Control: the same Hub with dials
+/// that succeed dials the first answer on 443 once. (Which answers may be dialled at all is
+/// `denied_addresses_are_never_dialled`.)
 #[tokio::test]
-async fn only_the_checked_answers_are_dialled_on_443_up_to_the_bound() {
+async fn answers_are_dialled_on_443_in_order_up_to_the_bound() {
     use crate::egress::server::MAX_DIALS;
     let body = list_json(&[]);
     let hub = Hub::new(move |_, _| reply("200 OK", &[], &body));
-    let answers: Vec<IpAddr> = (9..14)
-        .map(|last| IpAddr::V4(Ipv4Addr::new(93, 184, 215, last)))
-        .collect();
+    let ip = |last| IpAddr::V4(Ipv4Addr::new(93, 184, 215, last));
+    let on_443 = |last| SocketAddr::new(ip(last), 443);
+    let answers: Vec<IpAddr> = (9..14).map(ip).collect();
     hub.answer_all(&answers);
     hub.answer_port(8443);
     let client = hub.client(None);
     bounded(client.files(&repo(), &Revision::main()))
         .await
         .unwrap();
-    assert_eq!(hub.dialled(), [SocketAddr::new(answers[0], 443)]);
-
+    assert_eq!(hub.dialled(), [on_443(9)]);
     assert_eq!(hub.seen().len(), 1);
 
     hub.dials_fail();
@@ -675,8 +679,10 @@ async fn only_the_checked_answers_are_dialled_on_443_up_to_the_bound() {
         .unwrap_err();
     assert_eq!(err.code(), "hf_connect_failed");
     assert_eq!(MAX_DIALS, 3);
-    let on_443 = |last| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(93, 184, 215, last)), 443);
-    assert_eq!(hub.dialled()[1..], [on_443(9), on_443(10), on_443(11)]);
+    assert_eq!(
+        hub.dialled(),
+        [on_443(9), on_443(9), on_443(10), on_443(11)]
+    );
     assert_eq!(hub.lookups().len(), 2, "one lookup for the failing call");
     assert_eq!(
         hub.seen().len(),
