@@ -103,7 +103,8 @@ async fn session_of(lx: &Lx, tag: &str, manifest: &str) -> Running {
 /// hosts) and the leaf selection (`Interception::server`, by the CONNECT host). Splicing a grant
 /// host fails the session-CA handshake; intercepting the other host fails the byte-equal leaf
 /// assertion; presenting one grant host's leaf for the other (say, the first leaf for every
-/// host) fails that host's own-name handshake.
+/// host) fails that host's own-name handshake. The in-container `CONNECT` through the shim runs
+/// first: splicing grant hosts fails it on its `egress.allow`, before any host-side leg runs.
 #[test]
 fn rt_sec_09_a_grant_host_gets_a_session_ca_leaf_and_any_other_host_its_own_chain() {
     rt().block_on(async {
@@ -111,6 +112,25 @@ fn rt_sec_09_a_grant_host_gets_a_session_ca_leaf_and_any_other_host_its_own_chai
         let r = session(&lx, "sec09").await;
         let sock = lx.paths("sec09").workspace_sockets().join("net.sock");
         let ca = session_ca(&lx, "sec09");
+
+        // From inside the container, through the shim, first: the grant host's CONNECT gets 200
+        // and its `egress.allow` is intercepted. In-test control: the same probe, for a host off
+        // the list, gets the proxy's 403, so the 200 is the proxy's answer to this CONNECT.
+        let probe = |host: &str| {
+            format!(
+                "printf 'CONNECT {host}:443 HTTP/1.1\\r\\nHost: {host}:443\\r\\n\\r\\n' \
+                 | nc -w 2 127.0.0.1 3128"
+            )
+        };
+        let (_, refused) = exec(&r, &probe("off-list.test")).await;
+        assert!(refused.starts_with("HTTP/1.1 403 "), "control: {refused}");
+        let (_, inside) = exec(&r, &probe("mock.test")).await;
+        assert!(inside.starts_with("HTTP/1.1 200 "), "{inside}");
+        assert_eq!(
+            allow_routes(&lx),
+            [("mock.test".to_owned(), true)],
+            "the in-container CONNECT"
+        );
 
         for (grant, other_grant) in [("mock.test", "mock3.test"), ("mock3.test", "mock.test")] {
             let t = tls(connect(&sock, grant).await, grant, &ca)
