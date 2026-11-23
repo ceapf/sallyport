@@ -35,9 +35,7 @@ line per fact, with where it was found. Check a note again before relying on it 
   #141, Nov 2026, kernel 6.18 WSL2)
 - The same figures from the test's own diagnostic line (`make loaded-repeat`, 23 Nov 2026, on
   commit 9cf7989, measured as 36aee12 before its rebases onto dc5a0ac and f90d3b8; 32 cores,
-  54 GiB, kernel 6.18 WSL2,
-  no other worktree testing), read later than
-  the probe above: after the wait for the first `pids` entry, just before the no-memory-entry
+  54 GiB, kernel 6.18 WSL2, no other worktree testing), read later than the probe above: after the wait for the first `pids` entry, just before the no-memory-entry
   assertion. 50 repeats of the bombs binary beside one `make test` pass, all loaded, all passed:
   `memory.peak` min 14.8, median 47.7, max 64.0 MiB; `oom`, `oom_kill` and `oom_group_kill` 0
   and `pids.peak` 64 in every run. `memory.peak` equalled the limit (67108864) in runs 27 and
@@ -61,8 +59,8 @@ line per fact, with where it was found. Check a note again before relying on it 
   describe the fork bomb with 64 MiB, the fixture it had before; the third, a scratch edit at
   256 MiB, ran it alone and unloaded. With 256 MiB in the committed test,
   `make loaded-repeat LOADED_REPEATS=10` (23 Nov 2026; 32 cores, 54 GiB, kernel 6.18 WSL2, no
-  other worktree testing): 10 loaded, 10 passed; `memory.peak` min 14.4, median 48.9, max
-  57.4 MiB; `memory.events` `max` and `oom_kill` 0 and `pids.peak` 64 in every run. (#141)
+  other worktree testing): 10 loaded, 10 passed; `memory.peak` min 14.4, median 48.8, max
+  57.4 MiB; `memory.events` `max`, `oom` and `oom_kill` 0 and `pids.peak` 64 in every run. (#141)
 - `userdata/config.json` (`podman inspect --format '{{.OCIConfigPath}}'`) is subuid-owned under
   keep-id: read it with `podman unshare cat`. (6c-2)
 - Correction to 6b: hermetic podman (CONTAINERS_CONF, empty XDG_CONFIG_HOME,
