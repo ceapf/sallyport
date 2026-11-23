@@ -1220,14 +1220,15 @@ under a mount, or the release of a very large file's blocks, keeps an idle conta
 closed, shells killed, nothing new can start) until that operation returns; if `sallyd` shuts
 down meanwhile, the container outlives it with no watchdog until the next start's sweep
 (TODO(#96), Q66). Either way conmon's backstop ends it `runtime.timeout` + 300 s after its
-`podman init` (#92): a bound from `init`, not from the stop. A container that cannot be confirmed gone, whether its session started or
-not, also leaves the session listed as stop-failed. It keeps its claims and its disk watchdog
-until a later stop succeeds. At shutdown, which stops every session at once, it makes `sallyd`
-exit non-zero. The exception is a launch that failed and whose cleanup failed: it was never
-registered as a session (a harness launch's session was, but not the harness), so nothing lists
-it stop-failed and no disk watchdog watches it; it keeps its claims (a workspace's until `sallyd`
-exits, so no periodic sweep takes its container), and shutdown reports a clean stop with it left
-(THREAT_MODEL.md §6; TODO(#239)). A failed `session.start` append is followed by a best-effort `session.stop`
+`podman init` (#92): a bound from `init`, not from the stop. A container that cannot be
+confirmed gone, whether its session started or not, also leaves the session listed as
+stop-failed. It keeps its claims and its disk watchdog until a later stop succeeds. At
+shutdown, which stops every session at once, it makes `sallyd` exit non-zero. The exception is
+a launch that failed and whose cleanup failed: it was never registered as a session (a harness
+launch's session was, but not the harness), so nothing lists it stop-failed and no disk watchdog
+watches it; it keeps its claims (a workspace's until `sallyd` exits, so no periodic sweep takes
+its container), and shutdown reports a clean stop with it left (THREAT_MODEL.md §6;
+TODO(#239)). A failed `session.start` append is followed by a best-effort `session.stop`
 (`start-failed`), since the entry may have reached the log.
 
 ## 6. Repository structure
