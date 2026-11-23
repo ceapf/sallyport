@@ -291,7 +291,8 @@ masked and read-only `/proc` and `/sys` paths, not the profile.
 
 ### 3.5 Launch (normative, Task 6b)
 `sallyd::sandbox::Launcher::launch_workspace`, in this order. The launch runs in its own task:
-a caller that goes away cannot interrupt it, and a launch nobody receives is stopped again. Any
+a caller that goes away cannot interrupt it, and a launch whose caller has gone before the result
+is sent is stopped again; a result sent but never received is not (open, fix planned, #292). Any
 failure audits `sandbox.refuse` (or `sandbox.mount_mismatch`) with a reason and the cleanup
 outcome. It removes the container by its name `sp-ws-<id>`, even when `create` printed no id,
 and removes only the directories this launch created: an id whose directories exist is refused
@@ -523,8 +524,9 @@ cgroup, is not audited. `runtime.tmp_size` has no kernel event (a tmpfs returns 
 is contained and not audited.
 
 Teardown stays with `Launcher::stop`, which keeps the staged data. Dropping the session's handle
-stops every watchdog task and any walk in progress. A launch nobody received is stopped with retries
-until its container is gone, and keeps its watchdog meanwhile.
+stops every watchdog task and any walk in progress. A launch whose caller had gone before the result
+was sent is stopped with retries until its container is gone, and keeps its watchdog meanwhile.
+A result sent but never received drops the handle with no stop (open, fix planned, #292).
 
 **Teardown** (`Launcher::stop`) audits `sandbox.stop`, then runs
 `podman rm --force --volumes --time 0` (every removal takes the container's anonymous volumes)
@@ -1121,7 +1123,8 @@ TODO(#28): the harness container and `llm.sock` (Task 13, Task 12 PR C).
 **Stop reasons:**
 - `request`: a client asked.
 - `timeout`: `runtime.timeout`; `session.timeout` is audited first.
-- `crash`: a session task panicked; the oplog line comes first, then `session.crash`.
+- `crash`: a session task panicked, including a panic anywhere in a tool call, its prepare and
+  gate half included; the oplog line comes first, then `session.crash`.
 - `shutdown`: SIGTERM, SIGINT, SIGHUP or SIGQUIT (handlers installed before startup work, so a
   signal during it is handled once `control.sock` is bound); `control.sock` is closed first,
   then every session stops at once. A second signal meanwhile exits non-zero at once.
@@ -1151,7 +1154,9 @@ further effect):
    on is denied `session-stopping`.
 2. `session.timeout` or `session.crash`, for those reasons.
 3. Every pending prompt is withdrawn (`approval.withdraw`, `session-stop`); no call queues after
-   it.
+   it. A prompt whose decision entry is still being written is not pending any more: its ticket
+   is issued, and only the executor's own stop check (step 4) stands before the run (open, fix
+   planned, #297).
 4. The stop signal: a running `shell` is killed (`killed: session-stop`, the kill finished before
    its `tool.result`), an attached command likewise (its `sandbox.exec_result` `killed:
    session-stop`, and its attach answered so), and a write or delete that has not begun aborts
@@ -1712,7 +1717,9 @@ sallyport/
     entry. A `deny_all_session` latches first, then writes its entry and denies every other
     shown prompt (maintainer's Task 11 audit): if that write fails, the latch stays and the
     client is told `audit-failed`. A panic under the queue's
-    lock latches the session.
+    lock latches the session. A panic anywhere in a call, its prepare and gate half included,
+    is reported as a session crash (`session.crash`) and the session is taken down, as for any
+    session task.
   - `approval.deny` (sallyd): action fields and `reason` (`approval-flood`, `session-denied`,
     `no-approver`, `id-unavailable`, `session-stopping`).
   - `approval.flood` (sallyd): `{max_pending}`, once per episode.
@@ -1772,7 +1779,10 @@ sallyport/
   same-length filler and no name (Tasks 9a-3, 9b). What the forms do not cover is THREAT_MODEL
   §6 (encodings, gaps of the redaction forms, #249).
   Text the sandbox chose, and any text that can carry it (podman's and the kernel's messages,
-  a panic payload), is never cut or escaped by the code that builds an entry. The entry
+  a panic payload), is never cut or escaped by the code that builds an entry (open, fix planned:
+  several control-socket refusal entries still escape and cut their text first, #293, and
+  validation errors still repeat some manifest values, #195; neither carries sandbox-chosen
+  text today). The entry
   declares it beside its args (`NewEntry::text`, `texts` and `pieces`; sally-core
   `audit::declared`, architect Q276, Q288, Q290, Q291), raw, with a style from sally-core
   `text::Style`: `Hex` and `HexCounted` (a byte cap, `\xNN` for everything outside printable
