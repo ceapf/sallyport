@@ -2,7 +2,7 @@
 CARGO ?= cargo --locked
 MUSL  := x86_64-unknown-linux-musl
 
-.PHONY: lint fmt clippy fuzz-check deny forbid-unsafe test test-scripts nextest coverage mutants mutants-wide-core mutants-wide-sallyd mutants-wide-shim mutants-wide-cli mutants-paths zizmor shim shim-check fuzz redteam redteam-gpu e2e-gpu doctor
+.PHONY: lint fmt clippy fuzz-check deny forbid-unsafe test test-scripts nextest coverage mutants mutants-wide-core mutants-wide-sallyd mutants-wide-shim mutants-wide-cli mutants-paths zizmor shim shim-check fuzz redteam loaded-repeat redteam-gpu e2e-gpu doctor
 
 lint: fmt clippy fuzz-check forbid-unsafe deny mutants-paths
 
@@ -51,7 +51,7 @@ test: test-scripts shim-check
 
 # Shell-script tests (doctor's --redact filter, the commit trailer check, the mutation and
 # coverage gates, the mutation lists' path check, the nightly's shard matrix, the test-run sweep,
-# the CI disk check).
+# the CI disk check, the loaded repeat's verdicts).
 test-scripts:
 	bash tests/scripts/redact_test.sh
 	bash tests/scripts/check_trailers_test.sh
@@ -63,6 +63,7 @@ test-scripts:
 	bash tests/scripts/disk_lock_test.sh
 	bash tests/scripts/disk_check_test.sh
 	bash tests/scripts/redteam_guard_test.sh
+	bash tests/scripts/loaded_repeat_test.sh
 
 # CI runner (AMENDMENTS-01 §15). nextest skips doctests, so they run separately.
 nextest:
@@ -280,6 +281,23 @@ redteam:
 	@if [ -e /proc/sys/fs/binfmt_misc/WSLInterop ]; then \
 	  $(TEST_RUN) $(CARGO) nextest run --workspace --no-tests=fail --run-ignored only -E '$(REDTEAM_WSL_FILTER)'; \
 	else echo "redteam: not WSL: $(REDTEAM_WSL_TEST) skipped (ignored), not passed"; fi
+
+# RT-AG-09's bombs binary repeated under load (#141): LOADED_REPEATS loaded repeats of the whole
+# binary (so the fork-bomb test keeps its in-process neighbours), each its own test-run, while
+# `make test` runs beside them; a repeat counts only with the load alive at its start and end.
+# Not busy loops: CPU load alone did not reproduce #141 (PROBE_NOTES). Results in
+# target/loaded-repeat/<UTC time>/results.txt; exit 1 on any red or fewer loaded repeats than
+# asked. Locally 50 with the load restarted; the nightly runs 10 on one load pass.
+LOADED_REPEATS ?= 50
+LOADED_REPEAT_RESTART ?= 1
+LOADED_REPEAT_START_LIMIT ?= 0
+LOADED_REPEAT_LIMIT ?= 600
+loaded-repeat:
+	@v=$$(podman info --format '{{.Host.CgroupsVersion}}'); \
+	  [ "$$v" = v2 ] || { echo "loaded-repeat: cgroup v2 required (RT-AG-09), podman reports '$$v'"; exit 1; }
+	LOADED_REPEAT_RESTART=$(LOADED_REPEAT_RESTART) LOADED_REPEAT_START_LIMIT=$(LOADED_REPEAT_START_LIMIT) \
+	  LOADED_REPEAT_LIMIT=$(LOADED_REPEAT_LIMIT) \
+	  bash scripts/loaded-repeat.sh $(LOADED_REPEATS) target/loaded-repeat/$$(date -u +%Y%m%dT%H%M%SZ)
 
 # GPU targets arrive with M3; until then they fail loudly rather than pass vacuously.
 redteam-gpu e2e-gpu:

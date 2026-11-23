@@ -144,6 +144,66 @@ wiring "a SHARD env outside any job" "'SHARD: \${{ matrix.shard }}' is outside a
 wiring "a MUTANTS_SHARD outside any job" 'MUTANTS_SHARD="$SHARD" is outside any job' \
   '1i\# make mutants MUTANTS_SHARD="$SHARD"'
 
+# The loaded repeat (#141) reports and does not gate: only its job carries continue-on-error, at
+# job level and true, and no job needs it.
+# repeatjob [extra job-level line]: the repeat job as the nightly wires it.
+repeatjob() {
+  echo "  loaded-repeat:"
+  echo "    runs-on: ubuntu-24.04"
+  echo "    continue-on-error: true"
+  [ -z "${1:-}" ] || echo "    $1"
+  echo "    steps:"
+  echo "      - run: make loaded-repeat"
+}
+# lenient <label> <want exit> <want text or ""> <workflow text>: the deny-path and wide jobs plus
+# the text.
+lenient() {
+  expect "$2" "$1" "$(workflow lenient "$deny"$'\n'"$wide"$'\n'"$4")" "$mk"
+  [ -z "$3" ] || names "$1" "$3"
+}
+lenient "the repeat job with its continue-on-error" 0 "" "$(repeatjob)"
+lenient "the repeat job may need a mutation job" 0 "" "$(repeatjob 'needs: [mutants]')"
+lenient "the repeat job without continue-on-error" 1 \
+  "loaded-repeat: the job must carry 'continue-on-error: true'" "$(repeatjob | grep -v continue-on-error)"
+lenient "the repeat job's continue-on-error false" 1 \
+  "'continue-on-error: false' is not the job-level 'continue-on-error: true'" \
+  "$(repeatjob | sed 's/continue-on-error: true/continue-on-error: false/')"
+lenient "a step-level continue-on-error in the repeat job" 1 "is not the job-level" \
+  "$(repeatjob)"$'\n'"        continue-on-error: true"
+lenient "continue-on-error on a mutation job" 1 \
+  "mutants-wide: continue-on-error is allowed only on the loaded-repeat job" \
+  "$(repeatjob)"$'\n'"$(job mutants-wide | sed '1a\    continue-on-error: true' | head -n 2)"
+lenient "a job that needs the repeat job" 1 "late: no job may need the loaded-repeat job" \
+  "$(repeatjob)"$'\n'"  late:"$'\n'"    needs: [mutants, loaded-repeat]"
+lenient "a job that needs the repeat job in a list" 1 "late: no job may need the loaded-repeat job" \
+  "$(repeatjob)"$'\n'"  late:"$'\n'"    needs:"$'\n'"      - mutants"$'\n'"      - loaded-repeat"
+lenient "a step's continue-on-error on a mutation job" 1 \
+  "mutants-wide: continue-on-error is allowed only on the loaded-repeat job" \
+  "$(repeatjob)"$'\n'"$(job mutants-wide | sed 's/^      - env:$/      - continue-on-error: true\n        env:/' | sed -n '1p;/continue-on-error/p')"
+lenient "a quoted continue-on-error on a mutation job" 1 "mutants-wide: continue-on-error is allowed" \
+  "$(repeatjob)"$'\n'"  mutants-wide:"$'\n'"    \"continue-on-error\": true"
+lenient "a continue-on-error in a flow map on a mutation job" 1 "mutants-wide: continue-on-error is allowed" \
+  "$(repeatjob)"$'\n'"  mutants-wide:"$'\n'"    steps:"$'\n'"      - { run: make mutants, continue-on-error: true }"
+lenient "a SHARD env in the repeat job" 1 "loaded-repeat: no shard settings in the repeat job" \
+  "$(repeatjob)"$'\n'"      - env:"$'\n'"          SHARD: \${{ matrix.shard }}"
+lenient "a MUTANTS_SHARD in the repeat job" 1 "loaded-repeat: no shard settings in the repeat job" \
+  "$(repeatjob)"$'\n'"      - run: make loaded-repeat MUTANTS_SHARD=\"\$SHARD\""
+lenient "a job that needs the repeat job as a scalar" 1 "late: no job may need the loaded-repeat job" \
+  "$(repeatjob)"$'\n'"  late:"$'\n'"    needs: loaded-repeat"
+lenient "a needs list with a blank line and a comment" 1 "late: no job may need the loaded-repeat job" \
+  "$(repeatjob)"$'\n'"  late:"$'\n'"    needs:"$'\n'"      - mutants"$'\n'$'\n'"      # the repeat"$'\n'"      - loaded-repeat"
+lenient "a needs flow list over two lines" 1 "late: no job may need the loaded-repeat job" \
+  "$(repeatjob)"$'\n'"  late:"$'\n'"    needs: [mutants,"$'\n'"      loaded-repeat]"
+lenient "a job may need jobs whose names only contain the repeat's" 0 "" \
+  "$(repeatjob)"$'\n'"  loaded-repeat-2:"$'\n'"    runs-on: ubuntu-24.04"$'\n'"  late:"$'\n'"    needs: [loaded-repeat-2, xloaded-repeat]"$'\n'"    runs-on: ubuntu-24.04"
+lenient "a needs entry ends at the next job-level key" 0 "" \
+  "$(repeatjob)"$'\n'"  late:"$'\n'"    needs: [mutants]"$'\n'"    runs-on: ubuntu-24.04"$'\n'"    steps:"$'\n'"      - run: echo loaded-repeat"
+f="$tmp/lenient-top.yml"
+printf 'continue-on-error: true\n' >"$f"
+cat "$(workflow lenient-body "$deny"$'\n'"$wide")" >>"$f"
+expect 1 "continue-on-error outside any job" "$f" "$mk"
+names "continue-on-error outside any job" "(outside any job): continue-on-error is allowed only"
+
 expect 1 "no Makefile" "$good"
 names "no Makefile" usage
 expect 1 "no arguments"
@@ -155,6 +215,13 @@ names "a missing Makefile" "$tmp/gone.mk is missing or unreadable"
 # With no target to expect and no row to check, only this check can fail the run.
 expect 1 "a Makefile with no mutation target" "$(workflow empty "")" "$(makefile none lint)"
 names "a Makefile with no mutation target" "no mutants targets"
+# Keys ahead of `jobs:` are no jobs: an indented `workflow_dispatch:` under `on:` must not take a
+# SHARD env as its own.
+f="$tmp/before-jobs.yml"
+printf 'on:\n  workflow_dispatch:\nenv:\n  SHARD: ${{ matrix.shard }}\n' >"$f"
+cat "$good" >>"$f"
+expect 1 "a SHARD env ahead of jobs:" "$f" "$mk"
+names "a SHARD env ahead of jobs:" "'SHARD: \${{ matrix.shard }}' is outside any job"
 outside="$(workflow outside "$deny"$'\n'"$wide")"
 sed -i '1i - { shard: 0/1 }' "$outside"
 expect 1 "a row outside any job" "$outside" "$mk"

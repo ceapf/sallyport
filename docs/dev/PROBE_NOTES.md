@@ -31,10 +31,38 @@ line per fact, with where it was found. Check a note again before relying on it 
   `memory.peak` of `<CgroupPath>/container`, read from the host after the bomb's 3 s and before
   the stop, was 20.3, 26.4, 42.5, 45.9 and 49.5 MiB in 5 runs of the test alone, and 37.8, 44.6,
   34.6, 30.8, 45.1, 27.8, 42.8 and 33.1 MiB in 8 runs with 32 busy loops on 32 cores.
-  `memory.events` read all zero every time (`max 0`, `oom 0`, `oom_kill 0`): the limit was never
-  reached. Highest 49.5 MiB, 77 % of the limit; CPU load did not raise it. Not measured: under
-  the full test suite or under memory pressure, so an OOM kill is neither shown nor excluded as
-  the cause of #141. (scratch probe for #141, kernel 6.18 WSL2)
+  `memory.events` read all zero every time (`max 0`, `oom 0`, `oom_kill 0`). (scratch probe for
+  #141, Nov 2026, kernel 6.18 WSL2)
+- The same figures from the test's own diagnostic line (`make loaded-repeat`, 23 Nov 2026, on
+  PR #282's branch before its fixture change, so with `runtime.memory` 64 MiB; 32 cores,
+  54 GiB, kernel 6.18 WSL2, no other worktree testing), read later than the probe above: after
+  the wait for the first `pids` entry, just before the no-memory-entry assertion. 50 repeats of
+  the bombs binary beside one `make test` pass, all loaded, all passed: `memory.peak` min 14.8,
+  median 47.7, max 64.0 MiB; `oom`, `oom_kill` and `oom_group_kill` 0 and `pids.peak` 64 in
+  every run. `memory.peak` equalled the limit (67108864) in runs 27 and
+  34; `memory.events` `max` was 4 in run 34 and 0 in every other run (from the run logs; the
+  results lines of that run have no `max` column). Two single runs without load the same day:
+  55.3 and 64.0 MiB, `max` 0. So the fork bomb's memory use reached `runtime.memory` in 2 of 50
+  loaded runs and 1 of 2 unloaded single runs; in one run the kernel counted 4 limit hits that
+  reclaim resolved; no OOM kill in any run; no #141 signature recurred. An OOM kill of the fork
+  bomb is possible in this fixture and has not been observed. `max` as "the limit was hit and
+  reclaim ran" is read from the cgroup v2 documentation, not observed. Not established: why
+  these peaks are higher than the probe's above (an unloaded run reached the limit too, so load
+  alone does not explain it). The load pass was stopped after the 50th repeat, so it is not a
+  complete in-suite sample. Not measured: under memory pressure. (#141)
+- The fork-bomb test alone with `runtime.memory` raised to 256 MiB (a scratch edit, reverted):
+  `memory.peak` 38.5, 46.2, 44.8, 15.9, 45.1, 42.5, 13.8, 51.0, 44.1 and 45.9 MiB in 10 runs, so
+  at most 51.0 MiB; `memory.events` `max`, `oom` and `oom_kill` 0, every run passed. Below the
+  64 MiB fixture the probe cannot go: the validator refuses `memory: 32MiB` ("32MiB is outside
+  64MiB to 12GiB"), so a forced OOM kill of the fork bomb was not observed. (#141, 23 Nov 2026)
+- From PR #282 the fork-bomb test runs with `runtime.memory` 256 MiB (the maintainer's decision
+  on #141); the memory bomb and the `/tmp` filler keep 64 MiB. The scratch-probe bullet and the
+  `make loaded-repeat` bullet above describe the fork bomb with 64 MiB, the fixture it had
+  before; the 256 MiB probe bullet, a scratch edit, ran it alone and unloaded. With 256 MiB in
+  the committed test,
+  `make loaded-repeat LOADED_REPEATS=10` (23 Nov 2026; 32 cores, 54 GiB, kernel 6.18 WSL2, no
+  other worktree testing): 10 loaded, 10 passed; `memory.peak` min 14.4, median 48.8, max
+  57.4 MiB; `memory.events` `max`, `oom` and `oom_kill` 0 and `pids.peak` 64 in every run. (#141)
 - `userdata/config.json` (`podman inspect --format '{{.OCIConfigPath}}'`) is subuid-owned under
   keep-id: read it with `podman unshare cat`. (6c-2)
 - Correction to 6b: hermetic podman (CONTAINERS_CONF, empty XDG_CONFIG_HOME,

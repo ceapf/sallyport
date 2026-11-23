@@ -6,7 +6,10 @@
 # the Makefile has rows, and every row names a target there. Every line holding `shard:` must be
 # such a row. A job with rows passes `MUTANTS_SHARD="$SHARD"` and sets `SHARD: ${{ matrix.shard }}`,
 # and no other value of either appears. A shard left out of the matrix drops its mutants without
-# any job failing, so this guards "more shards, never fewer mutants". Prints one line per target;
+# any job failing, so this guards "more shards, never fewer mutants". The `loaded-repeat` job (the
+# #141 repeat, which reports and does not gate) alone carries `continue-on-error: true`, at job
+# level, and no job needs it: on a mutation job the key would remove the zero-survivor gate from
+# the run's conclusion. Prints one line per target;
 # names every problem with the workflow file, then exits 1. Tested by
 # tests/scripts/nightly_shards_test.sh, which also checks the real nightly.yml and Makefile.
 set -euo pipefail
@@ -42,7 +45,8 @@ done
 row='^[[:space:]]*- \{ (set: ([a-z][a-z0-9]*), )?shard: (0|[1-9][0-9]*)/(0|[1-9][0-9]*) \}[[:space:]]*$'
 job_line='^  ([A-Za-z0-9_-]+):[[:space:]]*$'
 shard_env='SHARD: ${{ matrix.shard }}'
-in_jobs=0 job=""
+repeat=loaded-repeat
+in_jobs=0 job="" in_needs=0 lenient=0 has_repeat=0
 while IFS= read -r line || [ -n "$line" ]; do
   trimmed="${line#"${line%%[![:space:]]*}"}"
   if [[ "$line" == jobs:* ]]; then
@@ -50,7 +54,8 @@ while IFS= read -r line || [ -n "$line" ]; do
     continue
   fi
   if [ "$in_jobs" -eq 1 ] && [[ "$line" =~ $job_line ]]; then
-    job="${BASH_REMATCH[1]}"
+    job="${BASH_REMATCH[1]}" in_needs=0
+    [ "$job" != "$repeat" ] || has_repeat=1
     continue
   fi
   # Every MUTANTS_SHARD value, wherever it appears, is the step's SHARD variable, quoted, inside a
@@ -72,6 +77,35 @@ while IFS= read -r line || [ -n "$line" ]; do
     else
       bad "$job: '$trimmed' is not '$shard_env'"
     fi
+  fi
+  # The loaded repeat reports and does not gate: it alone may carry continue-on-error, as the one
+  # job-level line `continue-on-error: true`, and no job may need it. On a mutation job the key
+  # would remove the gate. The key is found in any form outside a comment (a step's list item,
+  # quoted, inside a flow map); a mention inside a run line fails too, which is the safe side.
+  if [[ "$trimmed" != "#"* ]] && [[ "$trimmed" =~ (^|[-{,[:space:]])[\"\']?continue-on-error[\"\']?[[:space:]]*: ]]; then
+    if [ "$job" != "$repeat" ]; then
+      bad "${job:-(outside any job)}: continue-on-error is allowed only on the $repeat job"
+    elif [ "$line" = "    continue-on-error: true" ]; then
+      lenient=1
+    else
+      bad "$repeat: '$trimmed' is not the job-level 'continue-on-error: true'"
+    fi
+  fi
+  # The repeat job runs no mutation shard: no SHARD env and no MUTANTS_SHARD (a `shard:` line is
+  # refused below, as a row naming no mutation target).
+  if [ "$job" = "$repeat" ] && [[ "$line" == *SHARD:* || "$line" == *MUTANTS_SHARD=* ]]; then
+    bad "$repeat: no shard settings in the repeat job: $trimmed"
+  fi
+  # A needs entry runs from its `needs:` line to the next job-level key or job; blank lines,
+  # comments, list items and a flow list's continuation lines stay inside it.
+  if [[ "$trimmed" == needs:* ]]; then
+    in_needs=1
+  elif [ "$in_needs" -eq 1 ] && [[ "$line" =~ ^\ {0,4}[^[:space:]#-] ]]; then
+    in_needs=0
+  fi
+  if [ "$in_needs" -eq 1 ] && [[ "$trimmed" != "#"* ]] &&
+    [[ "$trimmed" =~ (^|[^A-Za-z0-9_-])$repeat([^A-Za-z0-9_-]|$) ]]; then
+    bad "${job:-(outside any job)}: no job may need the $repeat job"
   fi
   case "$line" in
     *shard:*) ;;
@@ -101,6 +135,9 @@ while IFS= read -r line || [ -n "$line" ]; do
   fi
   seen[$t/$k/$n]=$((${seen[$t/$k/$n]:-0} + 1))
 done <"$file"
+if [ "$has_repeat" -eq 1 ] && [ "$lenient" -eq 0 ]; then
+  bad "$repeat: the job must carry 'continue-on-error: true' (it reports and does not gate)"
+fi
 
 declare -A checked=()
 for t in "${targets[@]}"; do

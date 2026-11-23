@@ -1,10 +1,11 @@
 //! RT-AG-09, the bombs: a fork bomb, a memory bomb and a `/tmp` filler are each contained by the
 //! session's limits (`runtime.pids`, `runtime.memory`, `runtime.tmp_size`). The fork bomb and
 //! the memory bomb are also audited: the watchdog's cgroup observer writes
-//! `session.resource_limit` (`pids-max`, `oom-kill`) and the session runs on (#27, architect
-//! Q48). The `/tmp` filler is contained only: a tmpfs has no kernel event. The stage-size and
-//! floor parts of the row are in `disk.rs` and `launch.rs`. The fixture is `common::container`;
-//! these tests never skip.
+//! `session.resource_limit` (`pids-max`, `oom-kill`) and the session runs on (#27). The fork
+//! bomb runs with `runtime.memory` 256 MiB, memory to spare; the memory bomb and the `/tmp`
+//! filler run with 64 MiB (#141). The `/tmp` filler is contained only: a tmpfs has no
+//! kernel event. The stage-size and floor parts of the row are in `disk.rs` and `launch.rs`. The
+//! fixture is `common::container`; these tests never skip.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::time::Duration;
@@ -17,10 +18,17 @@ use common::*;
 
 const PIDS: u32 = 64;
 const TMP_MIB: u64 = 8;
+/// `runtime.memory` of the memory bomb and the `/tmp` filler.
+const MEMORY_MIB: u64 = 64;
+/// `runtime.memory` of the fork bomb alone, the maintainer's decision on #141: with 64 MiB its
+/// `memory.peak` reached the limit in 2 of 50 runs beside a `make test` pass and in 1 of 2 runs
+/// without load (PROBE_NOTES), so it runs with memory to spare and `runtime.pids` is the limit
+/// it is there to reach.
+const FORK_MEMORY_MIB: u64 = 256;
 
-async fn launch_small(x: &Lx, tag: &str) -> Running {
+async fn launch_small(x: &Lx, tag: &str, memory_mib: u64) -> Running {
     let v = x.f.load(&format!(
-        "{}runtime:\n  memory: 64MiB\n  pids: {PIDS}\n  tmp_size: {TMP_MIB}MiB\n",
+        "{}runtime:\n  memory: {memory_mib}MiB\n  pids: {PIDS}\n  tmp_size: {TMP_MIB}MiB\n",
         mounts(&[mount("~/code/myproject", "/workspace/p", "ro")])
     ));
     x.launch(&v, tag).await.unwrap()
@@ -169,6 +177,47 @@ fn event(text: &str, name: &str) -> u64 {
         .unwrap_or_else(|| panic!("{name} in {text}"))
 }
 
+/// The prefix of the fork-bomb test's one diagnostic line (#141); `scripts/loaded-repeat.sh` and
+/// its test look for the same text.
+const FIGURES_PREFIX: &str = "rt_ag_09 fork-bomb figures:";
+
+/// The fork-bomb test's diagnostic line: `memory.peak`, the `memory.events` counters, `pids.peak`
+/// and the `pids.events` max counter of the container's cgroup `cg`. A peak file or a counter the
+/// kernel does not have prints `absent`. A failed read of an events file, or of a peak file that
+/// is there, panics as [`read`] does: the cgroup gone at this point means the container ended.
+#[track_caller]
+fn figures(x: &Lx, r: &Running, cg: &std::path::Path) -> String {
+    let mem = read(x, r, cg, "memory.events");
+    let pids = read(x, r, cg, "pids.events");
+    let counters = ["max ", "oom ", "oom_kill ", "oom_group_kill "]
+        .map(|k| format!("{}={}", k.trim(), counter(&mem, k)))
+        .join(" ");
+    format!(
+        "{FIGURES_PREFIX} memory.peak={} {counters} pids.peak={} pids.events.max={}",
+        peak(x, r, cg, "memory.peak"),
+        peak(x, r, cg, "pids.peak"),
+        counter(&pids, "max ")
+    )
+}
+
+/// A peak file of `cg`, trimmed, or `absent` where the kernel has none.
+#[track_caller]
+fn peak(x: &Lx, r: &Running, cg: &std::path::Path, file: &str) -> String {
+    if cg.join(file).exists() {
+        read(x, r, cg, file).trim().to_string()
+    } else {
+        "absent".to_string()
+    }
+}
+
+/// The `name` counter of an events file's `text` for printing, or `absent` (an older kernel
+/// without it, or a value that is not a number).
+fn counter(text: &str, name: &str) -> String {
+    text.lines()
+        .find_map(|l| l.strip_prefix(name)?.trim().parse::<u64>().ok())
+        .map_or_else(|| "absent".to_string(), |n| n.to_string())
+}
+
 /// The `session.resource_limit` entries naming `resource`, in order.
 fn limits(x: &Lx, resource: &str) -> Vec<serde_json::Value> {
     x.events
@@ -199,9 +248,13 @@ fn rt_ag_09_a_fork_bomb_is_held_by_the_pids_limit() {
         let x = Lx::new();
         // Before the launch: the observer's first tick fires as soon as it is spawned.
         let started = std::time::Instant::now();
-        let r = launch_small(&x, "fork").await;
+        let r = launch_small(&x, "fork", FORK_MEMORY_MIB).await;
         let cg = cgroup(&x, &r).await;
         assert_eq!(read(&x, &r, &cg, "pids.max").trim(), PIDS.to_string());
+        assert_eq!(
+            read(&x, &r, &cg, "memory.max").trim(),
+            (256u64 << 20).to_string()
+        );
         let (code, out) = exec(&r, "(b() { b | b & }; b) >/dev/null 2>&1 & echo started").await;
         assert_eq!((code, out.trim()), (0, "started"));
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -228,7 +281,16 @@ fn rt_ag_09_a_fork_bomb_is_held_by_the_pids_limit() {
             "{a}"
         );
         assert!(a["count"].as_u64().unwrap() > 0, "{a}");
-        assert!(limits(&x, "memory").is_empty(), "{:?}", x.events.list());
+        // #141 diagnostics, print-only: the container's memory and pids figures at the moment
+        // the no-memory-entry assertion is checked (figures only: public CI output).
+        eprintln!("{}", figures(&x, &r, &cg));
+        assert!(
+            limits(&x, "memory").is_empty(),
+            "{:?}; memory.events now: {}",
+            x.events.list(),
+            std::fs::read_to_string(cg.join("memory.events"))
+                .map_or_else(|e| format!("unreadable: {e}"), |t| t.replace('\n', " "))
+        );
         x.stop(r).await;
         let polls = started.elapsed().as_secs() + 2;
         let n = limits(&x, "pids").len() as u64;
@@ -247,7 +309,7 @@ fn rt_ag_09_a_fork_bomb_is_held_by_the_pids_limit() {
 fn rt_ag_09_a_memory_bomb_is_oom_killed_inside_the_container() {
     rt().block_on(async {
         let x = Lx::new();
-        let r = launch_small(&x, "oom").await;
+        let r = launch_small(&x, "oom", MEMORY_MIB).await;
         let cg = cgroup(&x, &r).await;
         assert_eq!(
             read(&x, &r, &cg, "memory.max").trim(),
@@ -290,7 +352,7 @@ fn rt_ag_09_a_memory_bomb_is_oom_killed_inside_the_container() {
 fn rt_ag_09_a_tmp_filler_stops_at_the_tmpfs_size() {
     rt().block_on(async {
         let x = Lx::new();
-        let r = launch_small(&x, "tmpfs").await;
+        let r = launch_small(&x, "tmpfs", MEMORY_MIB).await;
         let (_, out) = exec(
             &r,
             "yes > /tmp/f; echo \"rc=$?\"; echo \"size=$(stat -c %s /tmp/f)\"; \

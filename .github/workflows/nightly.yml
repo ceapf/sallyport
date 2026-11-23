@@ -1,6 +1,7 @@
 name: nightly
 # Mutation testing over the deny paths with a zero-survivor gate (AMENDMENTS-01 §15). Nightly
-# because it rebuilds and re-tests once per mutant.
+# because it rebuilds and re-tests once per mutant. One more job, `loaded-repeat`, repeats
+# RT-AG-09's bombs binary beside a full `make test` (#141); it reports and does not gate (below).
 on:
   schedule:
     - cron: "17 9 * * *"
@@ -68,8 +69,8 @@ jobs:
   # run per mutant, so no podman is needed. Each mutant rebuilds the crate and reruns its whole
   # test set. Sized as the deny paths are (above), from run 45048224610: core 1619 mutants, 204
   # minutes of work, its slowest shard about 39 minutes at 6 shards (both of its 2 shards hit the
-  # 90-minute limit); sallyd 3746 mutants, 2044 minutes, about 68 at 36 shards (117 at 24); cli 21
-  # and shim 2 unsharded. The counts leave room for the round-robin split to shift by a third as
+  # 90-minute limit); sallyd 3746 mutants, 2044 minutes, about 68 at 36 shards (at 24 its slowest
+  # job took 117, the mutant phase about 110); cli 21 and shim 2 unsharded. The counts leave room for the round-robin split to shift by a third as
   # mutants are added. Mutant TIMEOUTs (#82) need the 150-minute sallyd limit. Some shards queue
   # behind the concurrent-job limit; that is fine for a nightly. Tests run under nextest's
   # `mutants` profile, whose 30 s per-test limit ends a hung test long before the whole-mutant
@@ -157,4 +158,58 @@ jobs:
         with:
           name: mutants-wide-${{ matrix.set }}-${{ strategy.job-index }}
           path: target/mutants-wide/mutants.out/
+          if-no-files-found: ignore
+  # RT-AG-09's bombs binary under load (#141): 10 repeats beside one `make test` pass, none
+  # started later than 15 minutes after the first, each at most 5 minutes (`make loaded-repeat`,
+  # scripts/loaded-repeat.sh). It reports and does not gate: the job fails on a red repeat or on
+  # fewer than 10 loaded repeats, and its continue-on-error keeps that out of the run's
+  # conclusion, which stays the mutation verdict. No job needs it, and only this job may carry
+  # continue-on-error (scripts/nightly-shards.sh). Its own result:
+  # gh run view <id> --json jobs --jq '.jobs[] | select(.name == "loaded-repeat") | .conclusion'
+  loaded-repeat:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The container tests' disk, prerequisites and base image, as in ci.yml's rust job.
+      - name: free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          df -h /
+      - name: container test prerequisites
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends gnutls-bin golang-go
+          certtool --version | head -n1
+          command -v go && go version
+          openssl version
+          python3 --version
+          podman --version
+          cc --version | head -n1
+          strace -V | head -n1
+          test -n "$XDG_RUNTIME_DIR"
+          podman info --format '{{.Host.CgroupsVersion}} {{.Host.OCIRuntime.Path}}'
+          podman pull docker.io/library/alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+      - name: runner cores and memory
+        run: nproc && free -m
+      - run: cargo test -q --locked --workspace --no-run
+      - name: disk space for container launches
+        run: scripts/disk-check.sh target "$(podman info --format '{{.Store.GraphRoot}}')"
+      - run: make loaded-repeat LOADED_REPEATS=10 LOADED_REPEAT_RESTART=0 LOADED_REPEAT_START_LIMIT=900 LOADED_REPEAT_LIMIT=300
+      - name: results to the job summary
+        if: always()
+        run: |
+          for f in target/loaded-repeat/*/results.txt; do
+            [ -f "$f" ] || continue
+            { echo '```'; cat "$f"; echo '```'; } >>"$GITHUB_STEP_SUMMARY"
+          done
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: loaded-repeat
+          path: target/loaded-repeat/
           if-no-files-found: ignore
