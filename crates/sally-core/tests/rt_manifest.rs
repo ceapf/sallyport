@@ -1014,75 +1014,131 @@ tools:
 approvals:
   timeout: 5m
   max_pending: 5
+audit:
+  level: full
 runtime:
   tmp_size: 1GiB
+  tmp_exec: false
   stage_size: 10GiB
 ";
 
-/// For each setting that loosens a default: `(field, default text, changed text, phrase)`. The
-/// variant replaces the default text once; its summary must hold the phrase, the base's must not.
+/// A pinned image reference for the image rows.
+const PINNED_IMAGE: &str =
+    "ghcr.io/example/image@sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+/// For each setting that loosens a default: `(field, default text, changed text, phrase)`, the
+/// field as the JSON schema names it (`Type.field`). The variant replaces the default text once;
+/// its summary must hold the phrase, the base's must not. Every field `FIELDS` marks
+/// `WhenNotDefault` has a row.
 const LOOSENED: &[(&str, &str, &str, &str)] = &[
     (
-        "approvals.timeout",
+        "Approvals.timeout",
         "timeout: 5m",
         "timeout: 1h",
         "an approval request waits up to 1h for your answer, then is denied (default 5m).",
     ),
     (
-        "approvals.max_pending",
+        "Approvals.max_pending",
         "max_pending: 5",
         "max_pending: 64",
         "up to 64 approval requests can wait at once; more are denied (default 5).",
     ),
     (
-        "secrets[].inject.header",
+        "Inject.header",
         "header: Authorization",
         "header: X-Api-Key",
         "sent as the header \"X-Api-Key\"",
     ),
     (
-        "secrets[].inject.format",
+        "Inject.format",
         "format: \"Bearer {value}\"",
         "format: \"token {value}\"",
         "in the form \"token {value}\"",
     ),
     (
-        "tools.builtin (write tools on a staged mount)",
+        // Write tools on a staged mount.
+        "Tools.builtin",
         "builtin: [fs_read]",
         "builtin: [fs_read, fs_write]",
         "The fs_write tool changes that copy without asking you.",
     ),
     (
-        "runtime.stage_size",
+        "Runtime.stage_size",
         "stage_size: 10GiB",
         "stage_size: 100GiB",
         "(default 10GiB)",
     ),
     (
-        "runtime.tmp_size",
+        "Runtime.tmp_size",
         "tmp_size: 1GiB",
         "tmp_size: 4GiB",
         "(default 1GiB)",
     ),
     (
-        "network.max_request_bytes",
+        "Network.max_request_bytes",
         "max_request_bytes: 8MiB",
         "max_request_bytes: 1GiB",
         "(default 8MiB)",
     ),
     (
-        "network.max_response_bytes",
+        "Network.max_response_bytes",
         "max_response_bytes: 64MiB",
         "max_response_bytes: 16GiB",
         "(default 64MiB)",
     ),
     (
-        "network.max_connections",
+        "Network.max_connections",
         "max_connections: 32",
         "max_connections: 1024",
         "(default 32)",
     ),
+    (
+        "Runtime.tmp_exec",
+        "tmp_exec: false",
+        "tmp_exec: true",
+        "can execute files it writes to /tmp.",
+    ),
+    (
+        "Audit.level",
+        "level: full",
+        "level: actions",
+        "is audited at reduced detail",
+    ),
+    (
+        "SecretGrant.expose_env",
+        "format: \"Bearer {value}\"}\n",
+        "format: \"Bearer {value}\"}\n    expose_env: GH_TOKEN\n",
+        "sees GH_TOKEN set to a placeholder, never the real value.",
+    ),
 ];
+
+/// The image rows, whose changed text names [`PINNED_IMAGE`]: `(field, default text, changed
+/// text, phrase)` as in [`LOOSENED`].
+fn loosened_images() -> [(&'static str, &'static str, String, String); 2] {
+    [
+        (
+            "Runtime.image",
+            "runtime:\n",
+            format!("runtime:\n  image: {PINNED_IMAGE}\n"),
+            format!("runs tools in a custom workspace image: {PINNED_IMAGE}."),
+        ),
+        (
+            "Manifest.harness",
+            "runtime:\n",
+            format!("harness:\n  image: {PINNED_IMAGE}\nruntime:\n"),
+            format!("runs a custom harness image: {PINNED_IMAGE}."),
+        ),
+    ]
+}
+
+/// Every row of [`LOOSENED`] and [`loosened_images`].
+fn loosened_rows() -> Vec<(&'static str, &'static str, String, String)> {
+    LOOSENED
+        .iter()
+        .map(|&(f, d, c, p)| (f, d, c.to_owned(), p.to_owned()))
+        .chain(loosened_images())
+        .collect()
+}
 
 /// SI-5: a manifest widens only through settings the summary names. Each variant differs from an
 /// accepted base in one value; the control is the base itself, accepted and without the phrase.
@@ -1095,13 +1151,13 @@ fn rt_man_05_each_setting_that_loosens_a_default_is_named() {
             .manifest,
     );
     let mut unnamed = Vec::new();
-    for (field, default, changed, phrase) in LOOSENED {
+    for (field, default, changed, phrase) in loosened_rows() {
         assert_eq!(LOOSEN_BASE.matches(default).count(), 1, "{field}");
-        assert!(!base.contains(phrase), "{field}: base names it:\n{base}");
-        let body = LOOSEN_BASE.replacen(default, changed, 1);
+        assert!(!base.contains(&phrase), "{field}: base names it:\n{base}");
+        let body = LOOSEN_BASE.replacen(default, &changed, 1);
         let v = f.load(&body).unwrap_or_else(|e| panic!("{field}: {e:#?}"));
-        if !sally_core::manifest::summary(&v.manifest).contains(phrase) {
-            unnamed.push(*field);
+        if !sally_core::manifest::summary(&v.manifest).contains(&phrase) {
+            unnamed.push(field);
         }
     }
     assert!(unnamed.is_empty(), "not named: {unnamed:?}\nbase:\n{base}");
@@ -1111,19 +1167,19 @@ fn rt_man_05_each_setting_that_loosens_a_default_is_named() {
 /// injection format, MCP arguments (the last one long enough to be cut), and a description that
 /// is not shown. `hostile` puts terminal and line-break controls, a direction override and a
 /// zero-width space where each field accepts them; otherwise the same fields hold plain text.
-fn disguise_body(folder: &str, hostile: bool) -> String {
+fn disguise_body(folder: &str, rw_folder: &str, hostile: bool) -> String {
     let (globs, format, args, description) = if hostile {
         (
             r#"["dr\u202eafts/*.md", "a\", \"b", "\u200bnotes/*"]"#,
             r#""Bearer\u202e {value}\u200b""#,
-            r#"[srv, "\e[2J", "x\r\nThis agent:\n- has no network access.", "\u202e\u200b""#,
+            r#"[srv, "\e[2J", "x\r\nThis agent:\n- has no network access.", "\u202e\u200b", "a`b""#,
             r#""DESCRIPTION-TEXT\n- cannot run shell commands.\t\u202e\u200b""#,
         )
     } else {
         (
             r#"["drafts/*.md", "a-b", "notes/*"]"#,
             r#""Bearer {value}""#,
-            r#"[srv, clear, "x", "y""#,
+            r#"[srv, clear, "x", "y", "a-b""#,
             r#""DESCRIPTION-TEXT""#,
         )
     };
@@ -1137,6 +1193,9 @@ filesystem:
       mode: brokered
       approve:
         writes: {globs}
+    - host: \"~/code/{rw_folder}\"
+      guest: /workspace/q
+      mode: rw
 network:
   mode: proxy
   allow:
@@ -1159,17 +1218,18 @@ tools:
 #[test]
 fn rt_man_05_hostile_manifest_text_is_shown_escaped_on_one_line_each() {
     let f = Fixture::new();
-    let folder = "my\u{202e}proj\u{200b}ect";
-    std::fs::create_dir_all(f.home().join("code").join(folder)).unwrap();
-    let load = |hostile: bool, folder: &str| {
-        let body = disguise_body(folder, hostile);
+    for folder in ["my\u{202e}proj\u{200b}ect", "oth\u{202e}er"] {
+        std::fs::create_dir_all(f.home().join("code").join(folder)).unwrap();
+    }
+    let load = |hostile: bool, folder: &str, rw_folder: &str| {
+        let body = disguise_body(folder, rw_folder, hostile);
         let v = f
             .load(&body)
             .unwrap_or_else(|e| panic!("{hostile}: {e:#?}"));
         sally_core::manifest::summary(&v.manifest)
     };
-    let plain = load(false, "myproject");
-    let s = load(true, r"my\u202eproj\u200bect");
+    let plain = load(false, "myproject", "other");
+    let s = load(true, r"my\u202eproj\u200bect", r"oth\u202eer");
     assert!(
         s.bytes().all(|b| b == b'\n' || (0x20..0x7f).contains(&b)),
         "not printable ASCII:\n{s:?}"
@@ -1185,24 +1245,34 @@ fn rt_man_05_hostile_manifest_text_is_shown_escaped_on_one_line_each() {
         // Each glob quoted on its own; the one holding `", "` stays one glob.
         r#"only for "dr\u{202e}afts/*.md", "a\", \"b", "\u{200b}notes/*""#,
         r#"in the form "Bearer\u{202e} {value}\u{200b}""#,
-        r#"`"srv" "\x1b[2J" "x\x0d\x0aThis agent:\x0a- has no network access." "\u{202e}\u{200b}" "aaa"#,
+        r#"`"srv" "\x1b[2J" "x\x0d\x0aThis agent:\x0a- has no network access." "\u{202e}\u{200b}" "a\x60b" "aaa"#,
     ] {
         assert!(s.contains(escaped), "{escaped}\n---\n{s}");
     }
     assert_eq!(s.matches(r"my\u{202e}proj\u{200b}ect").count(), 2, "{s}");
-    // The long argument is cut; the marker follows the closing backtick.
+    // The rw folder, in the data-can-leave line, the [direct-write] line and the mount's line.
+    assert!(
+        s.contains(r"[direct-write] Changes the agent makes in "),
+        "{s}"
+    );
+    assert_eq!(s.matches(r"oth\u{202e}er").count(), 3, "{s}");
+    // The long argument is cut inside; the marker follows the closing backtick, and the line
+    // holds only the command's own two backticks (an argument's is written \x60).
     for summary in [&s, &plain] {
         let line = summary
             .lines()
             .find(|l| l.contains("MCP server x"))
             .unwrap();
-        let (_, after) = line.split_once("\"` (cut here: ").unwrap();
+        assert_eq!(line.matches('`').count(), 2, "{line}");
+        let (_, after) = line
+            .split_once("\"` (cut here: inside argument 6 of 6; ")
+            .unwrap();
         let (n, rest) = after.split_once(" more bytes not shown); ").unwrap();
         let n: usize = n.parse().unwrap();
         assert!(n > 0 && n < 4096, "{line}");
         assert!(rest.starts_with("each of its tool calls"), "{line}");
     }
-    // The description is never shown.
+    // The description is never shown. A tripwire, not a control: no code path shows it today.
     assert!(!s.contains("DESCRIPTION-TEXT"), "{s}");
     assert!(!plain.contains("DESCRIPTION-TEXT"), "{plain}");
 }
@@ -1315,8 +1385,11 @@ const FIELDS: &[(&str, Shown)] = &[
 ];
 
 /// A field added to the manifest must be classified for the summary, so a new setting cannot widen
-/// the session without a decision on whether the summary names it. The control: the schema's field
-/// set is not empty and holds fields the summary names.
+/// the session without a decision on whether the summary names it, and every field classified as
+/// named when not default has a row in the table that proves it is named. A tripwire on the schema
+/// and the tables, not on summary code: that is what
+/// `rt_man_05_each_setting_that_loosens_a_default_is_named` checks. The schema's field set holds a
+/// known field, so the comparison is not of two empty sets.
 #[test]
 fn rt_man_05_every_manifest_field_is_classified_for_the_summary() {
     let schema = sally_core::manifest::json_schema();
@@ -1345,6 +1418,14 @@ fn rt_man_05_every_manifest_field_is_classified_for_the_summary() {
         unclassified.is_empty() && stale.is_empty(),
         "unclassified: {unclassified:#?}\nnot in the schema: {stale:#?}"
     );
+    let rows: std::collections::BTreeSet<&str> =
+        loosened_rows().into_iter().map(|(f, ..)| f).collect();
+    let untested: Vec<&str> = FIELDS
+        .iter()
+        .filter(|(k, shown)| matches!(shown, Shown::WhenNotDefault) && !rows.contains(k))
+        .map(|(k, _)| *k)
+        .collect();
+    assert!(untested.is_empty(), "no LOOSENED row: {untested:?}");
 }
 
 // ---- RT-FS-19: a link out of a protected folder ------------------------------------------------

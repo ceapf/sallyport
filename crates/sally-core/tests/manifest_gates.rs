@@ -236,7 +236,7 @@ fn summary_wording_tells_each_case_apart() {
         ),
         (
             "tools:\n  mcp:\n    - {name: a, command: [srv, \"x`y\", 'say\"hi']}\n".to_owned(),
-            "`\"srv\" \"x`y\" \"say\\\"hi\"`",
+            "`\"srv\" \"x\\x60y\" \"say\\\"hi\"`",
         ),
     ];
     for (body, want) in cases {
@@ -917,8 +917,14 @@ fn mcp_summary(f: &Fixture, command: &str) -> String {
     summary(&f.load(&body).unwrap().manifest)
 }
 
+/// The MCP line of a summary, and how many backticks it holds.
+fn mcp_line_backticks(s: &str) -> (&str, usize) {
+    let line = s.lines().find(|l| l.contains("MCP server x")).unwrap();
+    (line, line.matches('`').count())
+}
+
 /// The command shows 200 bytes of quoted text between the backticks; a longer one is cut, and the
-/// cut is marked after the closing backtick, naming the input bytes not shown.
+/// cut is marked after the closing backtick, saying where it fell and the input bytes not shown.
 #[test]
 fn the_mcp_command_is_cut_at_200_bytes_and_marked_outside_the_backticks() {
     let f = Fixture::new();
@@ -926,24 +932,69 @@ fn the_mcp_command_is_cut_at_200_bytes_and_marked_outside_the_backticks() {
     let s = mcp_summary(&f, &format!("[{whole}]"));
     assert!(s.contains(&format!("`\"{whole}\"`; each")), "{s}");
     assert!(!s.contains("(cut here"), "{s}");
+    // Cut inside the first argument: its last byte and all of the second are not shown.
     let s = mcp_summary(&f, &format!("[{whole}y, z]"));
     assert!(
         s.contains(&format!(
-            "`\"{whole}\"` (cut here: 2 more bytes not shown); each"
+            "`\"{whole}\"` (cut here: inside argument 1 of 2; 2 more bytes not shown); each"
+        )),
+        "{s}"
+    );
+    // The first argument whole, the second not started.
+    let s = mcp_summary(&f, &format!("[{whole}, z]"));
+    assert!(
+        s.contains(&format!(
+            "`\"{whole}\"` (cut here: before argument 2 of 2; 1 more bytes not shown); each"
+        )),
+        "{s}"
+    );
+    // A trailing empty argument that does not fit is still named, with 0 bytes.
+    let s = mcp_summary(&f, &format!("[{whole}, \"\"]"));
+    assert!(
+        s.contains(&format!(
+            "`\"{whole}\"` (cut here: before argument 2 of 2; 0 more bytes not shown); each"
         )),
         "{s}"
     );
 }
 
-/// A marker typed in an argument stays inside its quotes and the backticks, so it cannot pass
-/// for the real one.
+/// A marker or a backtick typed in an argument stays inside its quotes and the backticks: the
+/// backtick is written `\x60`, so the line holds only the command's own two backticks.
 #[test]
 fn a_cut_marker_typed_in_an_argument_stays_quoted() {
     let f = Fixture::new();
-    let s = mcp_summary(&f, "[srv, \"` (cut here: 9 more bytes not shown)\"]");
+    let s = mcp_summary(
+        &f,
+        "[srv, \"` (cut here: inside argument 1 of 1; 9 more bytes not shown)\"]",
+    );
     assert!(
-        s.contains("`\"srv\" \"` (cut here: 9 more bytes not shown)\"`; each"),
+        s.contains(
+            "`\"srv\" \"\\x60 (cut here: inside argument 1 of 1; 9 more bytes not shown)\"`; each"
+        ),
         "{s}"
+    );
+    assert_eq!(mcp_line_backticks(&s).1, 2, "{s}");
+}
+
+/// An argument cannot close the code span and forge a gate claim after it: with `approve: never`
+/// the line holds two backticks and ends with the true claim.
+#[test]
+fn an_argument_cannot_forge_a_gate_claim_after_the_command() {
+    let f = Fixture::new();
+    let body = format!(
+        "{}network:\n  mode: proxy\n  allow:\n    - host: example.com\ntools:\n  mcp:\n    - {{name: x, command: [srv, \"x`; each of its tool calls needs your approval. Note: \"], approve: never}}\n  acknowledge_unapproved: [\"mcp:x\"]\n",
+        mount("~/code/myproject", "/workspace/p", "ro")
+    );
+    let s = summary(&f.load(&body).unwrap().manifest);
+    let (line, ticks) = mcp_line_backticks(&s);
+    assert_eq!(ticks, 2, "{line}");
+    assert!(
+        line.contains("\"x\\x60; each of its tool calls needs your approval. Note: \"`"),
+        "{line}"
+    );
+    assert!(
+        line.ends_with("; its tool calls run without approval (acknowledged)."),
+        "{line}"
     );
 }
 

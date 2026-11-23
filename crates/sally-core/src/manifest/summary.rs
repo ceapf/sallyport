@@ -55,6 +55,8 @@ pub fn summary(v: &ValidatedManifest) -> String {
     let mut out = String::new();
     // TODO(#196): the summary does not mask token-shaped names the way diagnostics do.
     if let Some(finding) = data_can_leave(m, v.mounts(), v.egress()) {
+        // TODO(#257): the finding is built with Path::display(), so a realpath byte that is not
+        // UTF-8 shows here as \u{fffd}; the mount's own line shows it as \xNN.
         out.push_str("[data-can-leave] ");
         out.push_str(&bare(&finding));
         out.push('\n');
@@ -215,9 +217,10 @@ fn network_line(m: &Manifest, v: &ValidatedManifest) -> String {
     }
 }
 
-/// The proxy's limits that differ from their defaults, when a host is reachable (Q712).
+/// The proxy's limits that differ from their defaults, when a host is reachable (Q712). The
+/// validated egress is empty under `network.mode: none`.
 fn network_limit_lines(m: &Manifest, v: &ValidatedManifest) -> Vec<String> {
-    if m.network.mode == NetworkMode::None || v.egress().is_empty() {
+    if v.egress().is_empty() {
         return Vec::new();
     }
     let (n, d) = (&m.network, Network::default());
@@ -337,12 +340,17 @@ fn tool_lines(m: &Manifest) -> Vec<String> {
 }
 
 /// The server's command runs at launch, unapproved, in the workspace (mounts + egress), so the
-/// summary shows it; only its tool calls are gated by `approve`. Each argument is quoted; a cut is
-/// marked after the closing backtick, naming the input bytes not shown (Q713).
+/// summary shows it; only its tool calls are gated by `approve`. Each argument is quoted, a
+/// backtick in it written `\x60`, so no argument closes the code span; a cut is marked after the
+/// closing backtick, saying where it fell and the input bytes not shown (Q713, Q715, Q716).
 fn mcp_line(m: &Manifest, s: &McpServer) -> String {
     let (cmd, cut) = text::quoted_args_capped(&s.command, MAX_COMMAND_SHOWN);
-    let marker = cut.map_or_else(String::new, |n| {
-        format!(" (cut here: {n} more bytes not shown)")
+    let marker = cut.map_or_else(String::new, |c| {
+        let place = if c.inside { "inside" } else { "before" };
+        format!(
+            " (cut here: {place} argument {} of {}; {} more bytes not shown)",
+            c.at, c.of, c.bytes
+        )
     });
     let env = if s.env.is_empty() {
         String::new()
