@@ -244,6 +244,69 @@ fn an_unreadable_store_fails_a_grant_and_is_not_opened_without_one() {
     assert_eq!(code, EXIT_OK, "no secret named: {err}");
 }
 
+/// The unit twin of the CLI test of the same rule: a binary `config.toml` names makes its
+/// folder a denylist rule, and the refusal (1) names the setting. Control: with no
+/// `config.toml` the same manifest is valid (0). A symlinked `config.toml` is never followed:
+/// could not read (2), naming the file, on validate and summary alike.
+#[test]
+fn the_folder_of_a_binary_the_config_names_is_refused() {
+    let s = Scratch::new("binf");
+    // Not below the temp dir: `/tmp` is denylisted as a mount.
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("../../target/sc-loc-binf-{}", std::process::id()));
+    let _gone = Gone(dir.clone());
+    std::fs::create_dir_all(dir.join("tools/crun")).unwrap();
+    let crun = dir.join("tools/crun/crun");
+    std::fs::write(&crun, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&crun, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let m = s.file(
+        "m.yaml",
+        &format!(
+            "{VALID}filesystem:\n  mounts:\n    - host: \"{}\"\n      guest: /workspace/t\n      \
+             mode: ro\n",
+            dir.join("tools").display()
+        ),
+    );
+    let (code, out, err) = run(|o| manifest_validate(&m, files(&s.store(), &s.config()), o));
+    assert_eq!(code, EXIT_OK, "control: {out}{err}");
+    let config = s.file(
+        "config.toml",
+        &format!("[sandbox]\nruntime_path = \"{}\"\n", crun.display()),
+    );
+    for summary in [false, true] {
+        let (code, out, err) = run(|o| {
+            if summary {
+                manifest_summary(&m, files(&s.store(), &config), o)
+            } else {
+                manifest_validate(&m, files(&s.store(), &config), o)
+            }
+        });
+        assert_eq!((code, out.as_str()), (EXIT_REFUSED, ""), "{err}");
+        assert!(
+            err.contains("filesystem.mounts[0].host")
+                && err.contains("(the folder of sandbox.runtime_path)")
+                && err.contains("denylisted"),
+            "{err}"
+        );
+    }
+    std::fs::remove_file(&config).unwrap();
+    std::os::unix::fs::symlink(&crun, &config).unwrap();
+    for summary in [false, true] {
+        let (code, out, err) = run(|o| {
+            if summary {
+                manifest_summary(&m, files(&s.store(), &config), o)
+            } else {
+                manifest_validate(&m, files(&s.store(), &config), o)
+            }
+        });
+        assert_eq!((code, out.as_str()), (EXIT_FAILED, ""), "{err}");
+        assert!(
+            err.starts_with("sally: ") && err.contains("config.toml: a symlink is not followed"),
+            "{err}"
+        );
+    }
+}
+
 #[test]
 fn an_unreadable_or_oversized_manifest_fails() {
     let s = Scratch::new("unread");
