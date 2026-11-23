@@ -18,9 +18,10 @@
    kill sandboxes; CLI and UI coexist; M1 is CLI-only and must not depend on Tauri; one process
    holds secrets, not two.
 2. **"Egress proxy" is not a network proxy the sandbox can route to — the sandbox has no network.**
-   Every container runs `--network=none`. A tiny static binary (`sally-shim`) inside the agent
-   sandbox listens on `127.0.0.1:3128` and forwards each TCP connection over a bind-mounted Unix
-   socket to `sallyd`, which speaks HTTP-proxy (CONNECT / absolute-form) and applies policy. This
+   Every container runs `--network=none`. A tiny static binary (`sally-shim`) inside the
+   workspace sandbox listens on `127.0.0.1:3128` and forwards each TCP connection over a
+   bind-mounted Unix socket to `sallyd`, which accepts HTTP-proxy `CONNECT` only (a proxy-form
+   request is 405) and applies policy. This
    kills DNS exfiltration, raw-socket exfiltration and any "find the gateway" tricks by
    construction, and it needs zero iptables, which rootless Podman can't give us anyway.
 
@@ -91,7 +92,7 @@ flowchart LR
 | `sallyd::infer` | Pool of at most one loaded model (v1); start/stop inference container; forward OpenAI-compatible requests over `infer.sock`; validate request JSON (allowed fields, size caps); stream back | yes |
 | `sallyd::tools` | The built-in tools as the approvals `Executor` (§4.3, Task 11): `path` (guest path → mount + canonical rel), `args`, `fs` (openat2 beneath a checked root: the host pin for `brokered`/`ro`, the workspace's own view through the container init's `/proc/<pid>/root` for `rw`/`staged`), `tag` (destructive tagger), `shell` + `exec` (`podman exec` runner; finds, limits and kills the call's processes through pidfds), `procs`, and `fetch` (`fetch_url` the URL, `fetch` the checks and the reply, `fetch_client` one exchange through the session proxy's `Connector`, §7) | **yes** |
 | `sallyd::approvals` | Queue, canonicalization, rendering sanitization, single-use IDs, timeout, flood control, notifications to UI/CLI | **yes** |
-| `sallyd::egress::{server,policy,addr,net,…}` | Accept streams from `net.sock`; parse the request head (bounded, CONNECT only in v1); policy decision; host addresses → resolve → filter → pinned connect; CONNECT splice. Grant hosts are refused until the token proxy (`inject`, Task 9a) terminates TLS for them | **yes** |
+| `sallyd::egress::{server,policy,addr,net,…}` | Accept streams from `net.sock`; parse the request head (bounded, CONNECT only in v1); policy decision; host addresses → resolve → filter → pinned connect; CONNECT splice for every allowed host without a secret grant. A grant host's tunnel is intercepted: the proxy terminates TLS with a session-CA leaf, injects the grant's header and redacts every response (`intercept`, `rewrite`, `inject`, `redact`; Tasks 9a, 9b; §7) | **yes** |
 | `sally-shim` (separate crate, musl static, std only) | generic relay (AMENDMENTS-01 §3.3): `--listen LOOPBACK_IP:PORT=/abs/sock` (repeatable; `127.0.0.1:3128` → `net.sock`, `127.0.0.1:8080` → `llm.sock`) with one fresh UDS connection per TCP connection, opaque bidirectional copy with fixed 16 KiB buffers, half-close propagated, a read or write error ending only its own direction (after a failed write toward the server the client's bytes are discarded for at most the linger from that write, whether it then sends on, half-closes or goes silent, so a reply in flight is not cut before the linger, #76; a client read error also ends the server-to-client direction), at most `--max-connections` (default 32, shared by all listeners; each costs two threads against the sandbox's `pids` limit) live connections, and a 30 s linger for a client that never closes, or still sends, after the server finished; a write call toward the client that gets no byte accepted within the linger fails, so a client that stops reading is cut some lingers later, the count being the kernel's, and one that reads again then gets the reply cut short and an EOF (a reset if it had sent bytes the relay never read), left to the relayed protocol's framing (#155); `--stdio /abs/sock` for stdio clients. Parses nothing, holds no policy, listens on IPv4 loopback (127/8) only (`::1` too is refused); `make shim-check` keeps it static and dependency-free | low (dumb, inside the sandbox) |
 | `sally-proto` | Shared request/response types; `ts-rs` generates TypeScript for the UI | no |
 | `sally` CLI | `doctor`, `manifest validate`, `models …`, `secrets …`, `sandbox run`, `run`, `chat`, `approvals`, `audit tail\|verify`, `sessions …` | no |
@@ -290,7 +291,8 @@ masked and read-only `/proc` and `/sys` paths, not the profile.
 
 ### 3.5 Launch (normative, Task 6b)
 `sallyd::sandbox::Launcher::launch_workspace`, in this order. The launch runs in its own task:
-a caller that goes away cannot interrupt it, and a launch nobody receives is stopped again. Any
+a caller that goes away cannot interrupt it, and a launch whose caller has gone before the result
+is sent is stopped again; a result sent but never received is not (open, fix planned, #292). Any
 failure audits `sandbox.refuse` (or `sandbox.mount_mismatch`) with a reason and the cleanup
 outcome. It removes the container by its name `sp-ws-<id>`, even when `create` printed no id,
 and removes only the directories this launch created: an id whose directories exist is refused
@@ -452,7 +454,9 @@ refusal audits the real role.
 **Disk watchdog** (#14, Task 6c; maintainer design after the 6c-1 reviews). A sandbox writes to
 the host disk through its `rw` mounts and through the upper directories of its `staged` mounts
 and of its `.git` overlays; the broker's file tools write to the host folder of its `brokered`
-mounts on its behalf. Each session whose sandbox can do any of these gets two tasks:
+mounts on its behalf. Each session whose sandbox can do any of these gets the floor task; a
+session with stage areas (`staged` mounts or `.git` overlays) also gets the stage task
+(`watchdog.rs`):
 
 - **Free-space floor** (the hard, race-free guarantee; `disk.rs`).
   - It watches every filesystem the sandbox can write to: the state filesystem, when the session
@@ -520,8 +524,9 @@ cgroup, is not audited. `runtime.tmp_size` has no kernel event (a tmpfs returns 
 is contained and not audited.
 
 Teardown stays with `Launcher::stop`, which keeps the staged data. Dropping the session's handle
-stops every watchdog task and any walk in progress. A launch nobody received is stopped with retries
-until its container is gone, and keeps its watchdog meanwhile.
+stops every watchdog task and any walk in progress. A launch whose caller had gone before the result
+was sent is stopped with retries until its container is gone, and keeps its watchdog meanwhile.
+A result sent but never received drops the handle with no stop (open, fix planned, #292).
 
 **Teardown** (`Launcher::stop`) audits `sandbox.stop`, then runs
 `podman rm --force --volumes --time 0` (every removal takes the container's anonymous volumes)
@@ -610,7 +615,8 @@ written; nothing was approved and a `deny_all_session` latch stays (the maintain
 audit rule). The
 CLI checks the other way too: before it sends a byte to `control.sock` it requires the socket's
 peer to be its own uid (architect Q78), and it reads replies under the same 1 MiB cap
-(`sally_proto::MAX_FRAME`; a longer frame is fatal).
+(`sally_proto::MAX_FRAME`; a longer frame is fatal). The peer check has unit tests only
+(sally-cli `only_this_users_socket_is_spoken_to`); a red-team leg is planned (no issue yet).
 
 ### 4.1 `control.sock` — trusted clients (CLI, Tauri)
 
@@ -632,15 +638,20 @@ peer to be its own uid (architect Q78), and it reads replies under the same 1 Mi
 In M1 the CLI runs `doctor` (host facts only; container checks are #119), `manifest
 validate|summary` (an advisory verdict: `sallyd` validates again at `sessions.create`; at
 launch, `sally session start` and `sally sandbox run` run the same validation as a refusing
-gate, check where the manifest file is kept, show what it grants and, for a manifest with a
-warning or an acknowledged risk, ask for consent before they send it, MANIFEST_SPEC §1.2),
+gate, check where the manifest file is kept, show what it grants and need consent for every
+launch, a typed `yes` or the hash of the exact text read, before they send it, MANIFEST_SPEC
+§1.2),
 `audit verify|tail` (read-only, no `audit.lock`) and `secrets set|list|rm` itself, without
 `sallyd` (architect Q52, Q106–Q110). Paths come from `sally_core::paths`, as `sallyd`'s do.
 `secrets set|rm` write the store directly under its writers' lock: an exclusive `flock` on a
 separate 0600 `secrets.lock`, given up after 10 s with nothing changed. `save` writes a temp
 file in the same directory, fsyncs and renames, so a reader never sees a partial store. A value
 comes from a no-echo prompt (at most 4094 bytes; Ctrl-C cancels it) or piped stdin, never argv
-or the environment; every secrets command turns core dumps off first. A command line that does
+or the environment (the argv refusal has binary-level tests, no `rt_` test: sally-cli `tests/secrets_argv.rs`
+`set_with_a_value_argument_is_refused_without_echo`,
+`set_after_a_double_dash_is_refused_without_echo`,
+`set_with_an_unknown_option_is_refused_without_echo`; a red-team leg is planned, no issue yet; no
+test names the environment); every secrets command turns core dumps off first. A command line that does
 not parse is refused with a fixed message that repeats no argument (architect Q113); a secrets
 line adds the shell-history warning. `audit verify` exits 0 verified, 1 failed verification, 2
 unreadable (Q115). The `doctor.*`, `manifests.*`, `secrets.*` and `audit.*` methods above stay
@@ -807,7 +818,8 @@ Every session's prompts go to the daemon's one hub; a client is *attached* while
 connection that called `approvals.watch` is open (the watch attaches first, then lists what is
 pending). A watcher that falls 64 notifications behind, or whose write blocks for 10 s, is
 dropped with its connection, so a watching connection should not also create or stop sessions
-(TODO(#110)). The CLI holds at most 8 frames unread (architect Q91): an approver that does not
+(TODO(#110)). The CLI holds at most nine frames unread (`FRAME_QUEUE` 8, plus one in hand;
+architect Q91): an approver that does not
 read is dropped that way, and its prompts end `no-approver` or by timeout (TODO(#112)). `approvals.decide`
 finds the session holding the id; none is `unknown-id` (`approval.decide refuse`). An approve
 must carry the digest of the prompt the client showed (`digest-mismatch`) and, for a cut prompt,
@@ -1065,7 +1077,7 @@ sequenceDiagram
     P->>S: CONNECT api.github.com:443  (HTTPS_PROXY=127.0.0.1:3128)
     S->>E: new UDS connection, bytes copied
     E->>E: authority → policy: allowed, grant host → route Intercept
-    E->>E: resolve → filter (no loopback/private/own) → pin IPs
+    E->>E: resolve → filter (no loopback/private/link-local/own/connected-network) → pin IPs
     E->>E: audit egress.allow {host, port, addresses, intercept: true}
     E->>X: TCP to a pinned IP, TLS (rustls, SNI api.github.com, session trust roots)
     E-->>P: 200 Connection Established (only after upstream verification)
@@ -1090,16 +1102,23 @@ An allowed host without a grant is spliced: after `egress.allow {…, intercept:
 The session registry (`sallyd::session`, Task 12, architect Q57) owns every live session.
 
 **Start**, in this order:
-1. `launch_workspace` (§3.5): the image, the overlap claims and fd budget reserved,
+1. The session id is minted, and what the validation accepted is audited
+   (`sallyd::session::accepted`): one `manifest.acknowledged_risk` per acknowledgement in
+   effect, then `manifest.warn`. A failed append, or one whose task failed, launches nothing:
+   the session's log keeps the entries written before it, with no `sandbox.launch` or
+   `sandbox.refuse` after them, and the caller's error names the session and the entry (the
+   control log's `session.refuse`, `start-failed`).
+2. `launch_workspace` (§3.5): the image, the overlap claims and fd budget reserved,
    `sandbox.launch` audited, the workspace container started. A failed launch is the
    launcher's `sandbox.refuse` only, with no `session.start`, `session.stop` or
    `session.closed`.
-2. The container's init is watched for exit.
-3. Approvals, tools and the agent server are built in memory.
-4. Audit `session.start` (`model: {kind: "none"}` until a session can have a model).
-5. Bind `agent.sock` (0600) in the session's harness socket directory and serve it.
+3. The container's init is watched for exit.
+4. Approvals, tools and the agent server are built in memory.
+5. Audit `session.start` (`model: {kind: "none"}` until a session can have a model).
+6. Bind `agent.sock` (0600) in the session's harness socket directory and serve it.
 
-A failed `session.start` append binds nothing and stops the workspace. Any failure after it
+A failed `session.start` append binds nothing, writes a best-effort `session.stop`
+(`start-failed`: the entry may have reached the log) and stops the workspace. Any failure after it
 ends the session with reason `start-failed`. Every `session.start` gets exactly one
 `session.stop`. Every workspace the registry received gets exactly one `session.closed` once
 its stop is confirmed, including one whose session never started (`start-failed`, Q245).
@@ -1109,7 +1128,8 @@ TODO(#28): the harness container and `llm.sock` (Task 13, Task 12 PR C).
 **Stop reasons:**
 - `request`: a client asked.
 - `timeout`: `runtime.timeout`; `session.timeout` is audited first.
-- `crash`: a session task panicked; the oplog line comes first, then `session.crash`.
+- `crash`: a session task panicked, including a panic anywhere in a tool call, its prepare and
+  gate half included; the oplog line comes first, then `session.crash`.
 - `shutdown`: SIGTERM, SIGINT, SIGHUP or SIGQUIT (handlers installed before startup work, so a
   signal during it is handled once `control.sock` is bound); `control.sock` is closed first,
   then every session stops at once. A second signal meanwhile exits non-zero at once.
@@ -1139,7 +1159,10 @@ further effect):
    on is denied `session-stopping`.
 2. `session.timeout` or `session.crash`, for those reasons.
 3. Every pending prompt is withdrawn (`approval.withdraw`, `session-stop`); no call queues after
-   it.
+   it. A prompt whose decision entry is still being written is not pending any more: its ticket
+   is issued, and only the executor's own stop check (step 4) stands before the run; a cancel
+   or a closed connection in that window does not stop the approved call (open, fix planned,
+   #297).
 4. The stop signal: a running `shell` is killed (`killed: session-stop`, the kill finished before
    its `tool.result`), an attached command likewise (its `sandbox.exec_result` `killed:
    session-stop`, and its attach answered so), and a write or delete that has not begun aborts
@@ -1242,15 +1265,13 @@ sallyport/
 │   ├── src/                         # React
 │   └── src-tauri/                   # thin bridge: spawn sallyd sidecar, forward allowlisted RPC
 ├── tests/
-│   ├── redteam/
+│   ├── redteam/                     # the rt_ tests themselves live in the crates (REDTEAM_SUITE.md, Harness)
 │   │   ├── REDTEAM_SUITE.md
-│   │   ├── harness/                 # Rust integration test runner: launch sandbox from fixture manifest, run attack, assert
-│   │   ├── attacks/                 # shell/python attack scripts executed inside Z3
-│   │   ├── fixtures/manifests/      # manifests per test
-│   │   ├── corpus/                  # malicious GGUF/safetensors/zip generators (python, run on host)
-│   │   └── mock_upstream/           # TLS mock server (echo, gzip echo, redirect) for SEC tests
-│   └── e2e/                         # GPU-local end-to-end (tiny model)
-├── fuzz/                            # cargo-fuzz targets: gguf, safetensors, manifest, proxy request parser
+│   │   ├── attacks/model_scripts/   # scripted-model turns for the RT-DRV and RT-AG tests
+│   │   ├── probe/probe.c            # syscall probe, built into the test image at test time
+│   │   └── tls/                     # verify.go, verify.py: clients that check the session CA
+│   └── scripts/                     # tests of the shell scripts under scripts/ (make test-scripts)
+├── fuzz/fuzz_targets/               # cargo-fuzz targets, one per parser of untrusted bytes (gguf, manifest, egress head, …)
 ├── scripts/
 │   ├── doctor.sh                    # V1–V9 developer preflight (`sally doctor`: host facts, M6: more)
 │   └── install.sh                   # M6
@@ -1258,8 +1279,8 @@ sallyport/
 │   ├── 00_DECISIONS.md  01_SCOPE.md  ARCHITECTURE.md  MANIFEST_SPEC.md  MILESTONES.md
 │   └── reports/M*.md                # written by Claude Code at each milestone end
 └── .github/workflows/
-    ├── ci.yml                       # fmt, clippy -D warnings, test, cargo-deny, python lint/tests, ts lint/tests
-    └── redteam.yml                  # rootless podman on ubuntu-24.04; make redteam; fails on any attack success
+    ├── ci.yml                       # every PR: rust, coverage, deny, fuzz, zizmor, doctor-syntax, redteam (rootless podman on ubuntu-24.04)
+    └── nightly.yml                  # the mutation runs and a loaded repeat that reports only (§8)
 ```
 
 ## 7. Key implementation notes
@@ -1279,8 +1300,8 @@ sallyport/
   upstream crun (1.30.1 on the dev machine, minimum 1.25.1); doctor V1–V5 and V13 run with it,
   V14 reports its provenance. The distro crun 1.14.1 is never used.
 - **Podman invocation**: shell out to the `podman` binary with `tokio::process::Command` and an
-  argv built by a pure function `profile::argv(&Manifest, &SessionPaths) -> Vec<OsString>` that is
-  unit-tested by snapshot (RT-SUP-01 also asserts digest pinning on it). No REST API in v1.
+  argv built by the pure functions `sallyd::sandbox::{workspace,harness,inference}_argv` (§3.2)
+  that are unit-tested by snapshot (RT-SUP-01 also asserts digest pinning on it). No REST API in v1.
 - **Unix socket bidirectionality with `--userns=keep-id`**: host UID == container UID, so
   `llama-server` can create `infer.sock` in a bind-mounted dir and `sallyd` can connect, and vice
   versa for `agent.sock`. Verify in M1 (V5).
@@ -1337,6 +1358,26 @@ sallyport/
   the name; an answer of more than 64 addresses is `resolve-failed`, before duplicates are
   dropped), at most 3 pinned addresses tried (10 s each), `200`, and a tunnel with one 16 KiB
   buffer per direction and a 300 s idle limit shared by both directions.
+- **Address filter classes** (SI-9; `egress::addr`, `egress::hostaddrs`). This is the one full
+  list; other documents point here. A resolved address is refused under the first of three
+  rules that matches, the `rule` its `egress.deny` records:
+  - `reserved-range`: not global unicast. IPv4: `0/8`, `10/8`, `100.64/10` (carrier-grade
+    NAT), `127/8`, `169.254/16`, `172.16/12`, `192.0.0/24`, `192.0.2/24`, `192.88.99/24`,
+    `192.168/16`, `198.18/15`, `198.51.100/24`, `203.0.113/24`, `224/4`, `240/4` (the limited
+    broadcast address included). IPv6: everything outside `2000::/3`, and inside it `2001::/23`
+    (denied whole on purpose), `2001:db8::/32` and `3fff::/20`. A v4-mapped (`::ffff:0:0/96`),
+    NAT64 (`64:ff9b::/96`) or 6to4 (`2002::/16`) address is judged by the IPv4 address it
+    carries.
+  - `own-address`: an address the host owns.
+  - `connected-network`: inside a network the host is directly connected to. IPv4: each
+    `fib_trie` route of length 8 to 32, whatever its scope and whether or not it has a gateway,
+    except routes that only drop traffic and `THROW` lines (lengths 0 to 7 are default-like and
+    ignored). IPv6: each `ipv6_route` route of length 1 or more without the gateway or reject
+    flag, and each own address's prefix.
+
+  The host's addresses and networks are also compared with the IPv4 address an IPv6 form
+  carries. The tables are read on every connection; an unreadable or unparsed table refuses
+  every connection.
 - **Proxy resource bounds** (Task 8). At most 64 `getaddrinfo` calls run at once across every
   session; a lookup that finds no free slot is `resolve-failed` at once (never queued), and a
   slot stays taken until its call returns, even after the 5 s timeout. Lookups and audit appends
@@ -1586,7 +1627,8 @@ sallyport/
   file failure is `session-ca`; the credentials, read first, refuse with `secret-missing`,
   `secret-store`, `secret-grant` or `secret-filler`: Task 9a-3). One load feeds the upstream verifier and `ca-bundle.pem`. The
   file list and owner are constructor arguments of the egress starter (Task 8 decision 10);
-  production passes these. Doctor V17 applies the same checks.
+  production passes these. Doctor V17 applies the same checks. No test is named for the file
+  checks yet (#286).
 - **RPC and LLM audit events** (Task 7). All are written at every `audit.level` except
   `llm.response`, which is detail (`Detail::Full`, dropped at `actions`). Each is appended off the
   runtime before the reply it covers; a failed append means no dispatch, no reply, and the
@@ -1681,7 +1723,9 @@ sallyport/
     entry. A `deny_all_session` latches first, then writes its entry and denies every other
     shown prompt (maintainer's Task 11 audit): if that write fails, the latch stays and the
     client is told `audit-failed`. A panic under the queue's
-    lock latches the session.
+    lock latches the session. A panic anywhere in a call, its prepare and gate half included,
+    is reported as a session crash (`session.crash`) and the session is taken down, as for any
+    session task.
   - `approval.deny` (sallyd): action fields and `reason` (`approval-flood`, `session-denied`,
     `no-approver`, `id-unavailable`, `session-stopping`).
   - `approval.flood` (sallyd): `{max_pending}`, once per episode.
@@ -1722,15 +1766,30 @@ sallyport/
   `append` fsyncs before returning (entry, then head and its directory); on any error the caller
   must not perform the action, and a failed head update stops the writer. `sally audit verify`
   reads the head first and accepts a log that runs past it, so it is safe beside a live writer.
-- **Redaction** (`sally-core::audit::Redactor`): the raw secret, its percent-encoding (both hex
-  cases, and `+` for space), and its base64 in three alignments and both alphabets trimmed to the
-  characters that do not depend on neighbouring bytes (patterns under 12 characters skipped), so
-  the base64 of any string containing the secret is caught. Matches become
-  `[REDACTED:NAME]`. The token proxy's response redaction uses the same forms
-  (`sally-core::audit::secret_forms`, held per session in `SessionForms`) plus each grant's
-  rendered value and `{basic}` blob, with a same-length filler and no name (Tasks 9a-3, 9b).
+- **Redaction** (`sally-core::audit::Redactor`). This is the one full list of the forms; other
+  documents point here. The forms of a secret (`sally-core::audit::secret_forms`):
+  - the raw value;
+  - its percent-encodings: all-upper or all-lower hex digits within one occurrence, the
+    unreserved characters kept plus one of three keep-sets (none, `/`, `!'()*`), a space as
+    `%20` or `+` (twelve spellings, each kept once);
+  - the one JSON-string spelling `serde_json` writes: short escapes for `"`, `\` and the
+    control characters that have one, other control characters as lower-case `\u00XX`, every
+    other character as itself;
+  - its base64 in both alphabets at all three alignments, trimmed to the characters that do not
+    depend on neighbouring bytes, so the base64 of any string containing the secret is caught;
+    a base64 form under 12 characters is left out.
+
+  Matches become `[REDACTED:NAME]`. The token proxy's response redaction uses the same forms
+  (held per session in `SessionForms`) plus, per grant, each rendered header value and, for a
+  `{basic}` grant, its blob padded and unpadded (which skip the 12-character floor), with a
+  same-length filler and no name (Tasks 9a-3, 9b). What the forms do not cover is THREAT_MODEL
+  §6 (encodings, gaps of the redaction forms, #249).
   Text the sandbox chose, and any text that can carry it (podman's and the kernel's messages,
-  a panic payload), is never cut or escaped by the code that builds an entry. The entry
+  a panic payload), is never cut or escaped by the code that builds an entry (open, fix planned:
+  several control-socket refusal entries still escape and cut their text first, #293, and
+  validation errors still repeat some manifest values, #195; the refusal texts carry no
+  sandbox-chosen text today, and a manifest a session wrote reaches `sallyd` only after the
+  CLI's own validation and the user's consent). The entry
   declares it beside its args (`NewEntry::text`, `texts` and `pieces`; sally-core
   `audit::declared`, architect Q276, Q288, Q290, Q291), raw, with a style from sally-core
   `text::Style`: `Hex` and `HexCounted` (a byte cap, `\xNN` for everything outside printable
@@ -1829,6 +1888,15 @@ allocates without end fails its own test instead of exhausting the runner; the g
 too (#82). A run in which no mutant was caught, missed or timed out fails the gate (an unviable
 mutant counts for nothing), and `make mutants-paths` (in `make lint` and the `rust` job) fails
 when an entry of a mutation list matches no Rust file or a list is empty.
+
+The nightly also runs `loaded-repeat` (#141): RT-AG-09's bombs binary, 10 repeats beside one
+`make test` pass (`make loaded-repeat`, `scripts/loaded-repeat.sh`). It reports and does not gate:
+the job fails on a red repeat, on a load pass that fails the fork-bomb test, or on fewer than 10
+loaded repeats, and its job-level
+`continue-on-error: true` keeps that out of the run's conclusion, which stays the mutation verdict.
+`scripts/nightly-shards.sh` allows `continue-on-error` on that job alone, in that one form, and
+fails when any job lists `loaded-repeat` under `needs`; on a mutation job the key would remove
+the gate.
 
 Dev-dependencies: `insta` (summary and diagnostic snapshots; review changes with
 `cargo insta review`) and `proptest` (wildcard matcher, host-pattern round trip; the token

@@ -147,27 +147,32 @@ it only reports). In order:
   folders are checked, the one holding the name as given (a link there can be pointed elsewhere)
   and the one holding the file it resolves to; each is refused when its realpath is, or lies
   under, such a mount's root, or when its chain of directory identities holds that root's
-  identity. `staged` and `ro` mounts never refuse. Only this manifest's own mounts are read
-  (#262). Not covered (#254): a link chain that passes through a writable folder at an
+  identity. `staged` and `ro` mounts never refuse. Only this manifest's own mounts are read, and only
+  in the text being launched: a rewrite that drops the writable mount passes the check. The
+  defence there is that every launch needs consent bound to the text read (below). Not
+  covered (#254): a link chain that passes through a writable folder at an
   intermediate hop, a hard link of the file into a writable folder, and a bind of a
   subdirectory. On every launch the file is read by its resolved path after the inspection,
   with no regular-file check and no identity compare against what was inspected.
 - **What is shown.** Before anything is sent, the launch shows the summary, each warning and each
   acknowledged risk, on the terminal the answer is read from when a question follows and on
   stderr otherwise. A line that fails the CLI's clean-check refuses the launch (exit 1).
-- **Consent.** A manifest with any warning or acknowledged risk needs it. On a terminal (stdin is
-  one and `/dev/tty` opens) it is `yes` typed after the question, with typed-ahead input
-  discarded; `--accept-manifest` does not replace it there. Off a terminal it is
-  `--accept-manifest <sha256>`, the SHA-256 of the exact text read: a malformed value fails
-  (exit 2) before anything is read, a hash of other text refuses (exit 1), and no launch output
-  prints the hash of what was read. With the hash alone as consent, every mount host must be
-  written as the folder it resolves to (exit 1 otherwise): the hash names the text, not the
-  folders. `~` expands against `HOME` as given, so where `HOME`'s own path goes through a link,
-  a `~` host cannot launch by hash alone (#255). A given `--accept-manifest` is checked for
-  every manifest, with or without warnings. Not covered (#262): a manifest with no warning and
-  no acknowledged risk is sent with no question, so one kept in a folder another manifest mounts
-  `rw` or `brokered` can be changed by that other session and launched unasked unless the flag
-  is given. Keep a manifest outside every folder any manifest mounts `rw` or `brokered`.
+  Warnings and acknowledged risks decide only which lines follow the summary.
+- **Consent.** Every launch from a manifest needs it, whatever its warnings. A given
+  `--accept-manifest <sha256>` is the consent, on a terminal too, in place of a typed `yes`: it
+  must be the SHA-256 of the exact text read. A malformed value fails (exit 2) before anything
+  is read; a hash of other text refuses (exit 1), on a terminal too, never a question instead;
+  the summary is still printed; and no launch output prints the hash of what was read. With
+  the hash as consent, every mount host must be written as the folder it resolves to (exit 1
+  otherwise): the hash names the text, not the folders. `~` expands against `HOME` as given,
+  so where `HOME`'s own path goes through a link, a `~` host cannot launch by hash (#255). With
+  no flag, on a terminal (stdin is one and `/dev/tty` opens) the consent is `yes` typed after
+  the question, with typed-ahead input discarded; off a terminal a launch with no flag is
+  refused (exit 1). So a text changed after review (by a session that can write the folder
+  that holds it, through this manifest's mounts or another's) launches only with consent given
+  for that text; the consent is then the only defence, so a `yes` given without re-reading the
+  summary launches the rewrite (#269 for what the summary hides). A hash that ships with a manifest (a script, a README line) launches it with
+  no question; the summary is still printed; none planned.
 
 `sally manifest summary` ends with the line `sha256 <hex>`, the hash a launch's
 `--accept-manifest` names. Its stderr carries the warnings and acknowledged risks a launch shows,
@@ -320,7 +325,8 @@ curated, so a wildcard over a shared-hosting suffix they do not name is an ordin
 stripped; `*.example.com` matches `a.example.com` and `a.b.example.com` but **not**
 `example.com` and **not** `example.com.evil.net`. IP literals in any form are always denied.
 `"*"` matches any hostname but still goes through the IP-range filter (no
-loopback/private/link-local/host-own) and requires `acknowledge_unrestricted_egress: true`.
+loopback/private/link-local/own/connected-network address; the classes in full: ARCHITECTURE
+§7) and requires `acknowledge_unrestricted_egress: true`.
 
 ### SecretGrant
 ```yaml

@@ -39,8 +39,8 @@ line per fact, with where it was found. Check a note again before relying on it 
   the wait for the first `pids` entry, just before the no-memory-entry assertion. 50 repeats of
   the bombs binary beside one `make test` pass, all loaded, all passed: `memory.peak` min 14.8,
   median 47.7, max 64.0 MiB; `oom`, `oom_kill` and `oom_group_kill` 0 and `pids.peak` 64 in
-  every run. `memory.peak` equalled the limit (67108864) in runs 27 and
-  34; `memory.events` `max` was 4 in run 34 and 0 in every other run (from the run logs; the
+  every run. `memory.peak` equalled the limit (67108864) in runs 27 and 34;
+  `memory.events` `max` was 4 in run 34 and 0 in every other run (from the run logs; the
   results lines of that run have no `max` column). Two single runs without load the same day:
   55.3 and 64.0 MiB, `max` 0. So the fork bomb's memory use reached `runtime.memory` in 2 of 50
   loaded runs and 1 of 2 unloaded single runs; in one run the kernel counted 4 limit hits that
