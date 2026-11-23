@@ -562,11 +562,14 @@ fn rt_sec_06_an_echo_in_body_and_header_is_redacted_at_the_same_length() {
 /// RT-SEC-06, a name: the upstream puts the credential it received into a response header's
 /// name, where no filler of the same length can stand. The response is refused with 502
 /// `upstream-echoed-secret` and nothing of it is forwarded; one `egress.deny` names the
-/// reason, without the value. Controls: both header-name checks of `redact::headers` (the
-/// any-case search of the name and separator, and the first covered byte's place in
-/// `redacted_value`; each stands alone, so only both removed let the name through). In-test
-/// control: the mock, asked around the proxy with the same credential, does send that header
-/// and the body the 502 must not carry.
+/// reason, without the value. Control: the any-case search of the name and separator in
+/// `redact::headers` (`in_lead_any_case`). hyper lower-cases the name and this canary is
+/// upper-case, so the case-sensitive scan never covers the name here, and the second check (the
+/// first covered byte's place in `redacted_value`) is held by the unit tests
+/// `a_form_in_a_header_name_or_across_its_separator_is_refused` and
+/// `a_covered_byte_before_the_value_is_refused_and_at_it_redacted`. The absence checks compare
+/// lower-cased, the form a leaked name would take. In-test control: the mock, asked around the
+/// proxy with the same credential, does send that header and the body the 502 must not carry.
 #[test]
 fn rt_sec_06_a_credential_in_a_response_header_name_is_refused_unforwarded() {
     rt().block_on(async {
@@ -585,7 +588,8 @@ fn rt_sec_06_a_credential_in_a_response_header_name_is_refused_unforwarded() {
         assert!(out.starts_with("HTTP/1.1 502 "), "{out}");
         assert!(out.contains("upstream-echoed-secret"), "{out}");
         assert!(!out.contains("NAMED"), "{out}");
-        assert!(!out.contains(&gh()), "{out}");
+        let lower = gh().to_ascii_lowercase();
+        assert!(!out.to_ascii_lowercase().contains(&lower), "{out}");
         // The control of the lines above: asked around the proxy, the mock sends both.
         let auth = format!("Authorization: {}\r\n", rendered());
         let direct =
@@ -604,7 +608,8 @@ fn rt_sec_06_a_credential_in_a_response_header_name_is_refused_unforwarded() {
         assert_eq!(denies.len(), 1, "{denies:?}");
         assert_eq!(denies[0]["reason"], json!("upstream-echoed-secret"));
         assert_eq!(denies[0]["host"], json!("mock.test"));
-        assert!(!denies[0].to_string().contains(&gh()), "{}", denies[0]);
+        let deny = denies[0].to_string().to_ascii_lowercase();
+        assert!(!deny.contains(&lower), "{}", denies[0]);
     });
 }
 
@@ -717,9 +722,11 @@ const CAP_MANIFEST: &str = "network:\n  mode: proxy\n  allow:\n    - host: mock.
                             header: Authorization, format: \"Bearer {value}\"}\n";
 
 /// RT-NET-09, body caps: inside an intercepted tunnel of a real session, the manifest's
-/// `max_request_bytes` and `max_response_bytes` hold. A request body one byte over is 413
-/// `request-too-large` and never reaches the upstream; a response body one byte over is 502
-/// `response-too-large` and none of it is forwarded; each refusal has its `egress.limit` entry.
+/// `max_request_bytes` and `max_response_bytes` hold. A request body whose declared length is
+/// one byte over is 413 `request-too-large` and no complete request reaches the upstream (the
+/// mock logs only complete requests); a response body whose declared length is one byte over
+/// is 502 `response-too-large` and none of it is forwarded; each refusal has its `egress.limit`
+/// entry. The head-length refusal on its own and the streamed caps are unit-tested only.
 /// Controls: the session's `body_caps`, taken from the manifest's `network` in `egress::net` and
 /// handed to `Limits::of_session`; either one left unwired lets its one-over body through.
 /// In-test controls: a body exactly at each cap passes, on the same session.
@@ -786,8 +793,19 @@ async fn launch_against_roots(lx: &Lx, tag: &str) -> Option<sallyd::sandbox::Lau
         }
         Ok(Err(e)) => Some(e),
         Err(_) => {
-            let roots = lx.f.root.join("upstream-ca.pem");
-            let _unstick = std::fs::OpenOptions::new().write(true).open(&roots);
+            // Never a blocking open here: on this one-thread runtime it would stall the launch
+            // it waits for. A FIFO's reader, once blocked, is woken by a writer's open.
+            use rustix::fs::{Mode, OFlags};
+            use std::os::unix::fs::FileTypeExt;
+            let roots = common::egress::roots_path(&lx.f.root);
+            let is_fifo = std::fs::symlink_metadata(&roots).is_ok_and(|m| m.file_type().is_fifo());
+            for _ in 0..50 {
+                let flags = OFlags::WRONLY | OFlags::NONBLOCK;
+                if !is_fifo || sally_core::fd::open(&roots, flags, Mode::empty()).is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
             None
         }
     }
@@ -842,8 +860,8 @@ fn assert_roots_refused(
 /// RT-SEC-16: a session with a secret grant takes its upstream trust roots only from a file the
 /// user's own processes cannot have rewritten. Launched against a roots file that is group- or
 /// other-writable, a directory, a FIFO, over 4 MiB, or owned by another user than the one
-/// required, the launch is refused `trust-roots` before `net.sock`, the CA files or the
-/// container exist; a FIFO does not block it. Controls: each check of `egress::roots::read`
+/// required, the launch is refused `trust-roots` and none of `net.sock`, the CA files or the
+/// container is left; a FIFO does not block it. Controls: each check of `egress::roots::read`
 /// (the file type, the owner, the write bits, the size cap, the non-blocking open); the exact
 /// reason is asserted, since a directory or a FIFO with the type check gone still refuses, for
 /// another reason. In-test control, first: the same session against the intact file launches,
@@ -854,16 +872,16 @@ fn rt_sec_16_a_tampered_trust_roots_file_refuses_the_launch() {
     use std::os::unix::fs::PermissionsExt;
     rt().block_on(async {
         let lx = Lx::new();
-        let roots = lx.f.root.join("upstream-ca.pem");
+        let roots = common::egress::roots_path(&lx.f.root);
         let original = std::fs::read(&roots).unwrap();
-        let restore = |roots: &Path| {
-            if roots.is_dir() {
-                std::fs::remove_dir(roots).unwrap();
+        let restore = |p: &Path| {
+            if p.is_dir() {
+                std::fs::remove_dir(p).unwrap();
             } else {
-                std::fs::remove_file(roots).unwrap();
+                std::fs::remove_file(p).unwrap();
             }
-            std::fs::write(roots, &original).unwrap();
-            std::fs::set_permissions(roots, std::fs::Permissions::from_mode(0o644)).unwrap();
+            std::fs::write(p, &original).unwrap();
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
         };
 
         let r = session(&lx, "sec16ok").await;
@@ -937,18 +955,15 @@ fn rt_sec_16_a_tampered_trust_roots_file_refuses_the_launch() {
         assert_eq!(lx.egress.dialer.seen().len(), seen);
 
         let me = rustix::process::getuid().as_raw();
+        // Another user than the test's: root, or uid 1 when the test runs as root.
         let owner = if me == 0 { 1 } else { 0 };
-        assert_ne!(owner, me, "control: another user than the test's");
         let lx2 = Lx::with_roots_owner(owner);
         let e = launch_against_roots(&lx2, "sec16u").await;
-        let mut refusals2 = 0;
-        assert_roots_refused(
-            &lx2,
-            "sec16u",
-            e,
-            "not owned by the expected user",
-            &mut refusals2,
+        assert!(
+            lx2.egress.dialer.dials().is_empty(),
+            "the owner case dialled"
         );
+        assert_roots_refused(&lx2, "sec16u", e, "not owned by the expected user", &mut 0);
     });
 }
 

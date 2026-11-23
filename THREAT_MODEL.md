@@ -215,8 +215,9 @@ G1 Misuse the Hub token on sallyd's own connection (AT4)
 │                                                    `the_client_takes_its_roots_only_from_a_checked_bundle`,
 │                                                    `the_client_trusts_no_anchor_but_its_bundle`;
 │                                                    red-team leg planned (#285); the bundle's file
-│                                                    checks through a session launch → RT-SEC-16,
-│                                                    for the Hub client unit tests only]
+│                                                    checks (shared with the egress proxy) →
+│                                                    RT-SEC-16 through a session launch; the Hub
+│                                                    client's own use of them: unit tests only]
 └─ Present a certificate for `huggingface.co` from any anchor in the system bundle
                                                     [accepted, none in v1: no pin, no revocation check,
                                                      roots added locally included; §6 (upstream trust)]

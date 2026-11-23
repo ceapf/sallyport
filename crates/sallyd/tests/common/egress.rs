@@ -223,7 +223,11 @@ async fn serve_tls(
                 ("200 OK", format!("X-{token}: 1\r\n"), "NAMED".into())
             }
             p if p.starts_with("/len/") => {
-                let n = p["/len/".len()..].parse::<usize>().unwrap_or(0);
+                let n = p
+                    .strip_prefix("/len/")
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .unwrap_or(0)
+                    .min(1 << 24);
                 ("200 OK", String::new(), "b".repeat(n))
             }
             _ => ("200 OK", String::new(), "ok".into()),
@@ -359,11 +363,16 @@ pub fn fake_egress(dir: &Path) -> Arc<FakeEgress> {
     fake_egress_owned(dir, rustix::process::getuid().as_raw())
 }
 
+/// Where [`fake_egress`] writes the trust roots file under `dir`.
+pub fn roots_path(dir: &Path) -> std::path::PathBuf {
+    dir.join("upstream-ca.pem")
+}
+
 /// [`fake_egress`], with the trust roots file required to be owned by `owner` (RT-SEC-16: a
 /// file owned by another user than the one required is refused).
 pub fn fake_egress_owned(dir: &Path, owner: u32) -> Arc<FakeEgress> {
     let pki = Pki::new();
-    let roots = dir.join("upstream-ca.pem");
+    let roots = roots_path(dir);
     std::fs::write(&roots, &pki.ca_pem).unwrap();
     std::fs::set_permissions(&roots, std::fs::Permissions::from_mode(0o644)).unwrap();
     let secrets = canary_store(dir);
