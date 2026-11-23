@@ -12,10 +12,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use sally_core::audit::{AuditError, NewEntry};
 use sally_core::manifest::{AuditLevel, ValidatedManifest};
 use sallyd::sandbox::{
-    AuditSink, CheckedRuntime, CommonArgs, DiskFloor, HarnessRequest, ImageRef, InferenceRequest,
-    Installation, InstancePaths, LaunchError, Launcher, LauncherParts, Podman, PodmanHost, Running,
-    ScanLimits, SessionDirs, SessionId, SessionPaths, Sessions, UserIds, VerifiedModel,
-    WorkspaceRequest, resolve_podman,
+    AuditSink, CheckedRuntime, CleanupSchedule, CommonArgs, DiskFloor, HarnessRequest, ImageRef,
+    InferenceRequest, Installation, InstancePaths, LaunchError, Launcher, LauncherParts, Podman,
+    PodmanHost, Running, ScanLimits, SessionDirs, SessionId, SessionPaths, Sessions, UserIds,
+    VerifiedModel, WorkspaceRequest, resolve_podman,
 };
 
 use sallyd::session::{Registry, RegistryParts};
@@ -545,6 +545,25 @@ impl Lx {
         Self::with_home_and_podman(None, wrap)
     }
 
+    /// [`with_podman`](Self::with_podman), with `cleanup` as the failed-launch cleanup's
+    /// pauses in place of the production schedule, passed in as `sallyd` passes its own.
+    #[allow(dead_code)] // Only the cleanup tests shorten the schedule.
+    pub fn with_podman_and_cleanup(
+        wrap: impl FnOnce(&Path) -> PathBuf,
+        cleanup: CleanupSchedule,
+    ) -> Self {
+        let real = resolve_podman(None).unwrap().path().to_owned();
+        Self::build_as(
+            None,
+            None,
+            Some(wrap(&real)),
+            DiskFloor::default(),
+            Some(io_lock(false)),
+            None,
+            cleanup,
+        )
+    }
+
     /// [`with_podman`](Self::with_podman), and `podman_home` as the host `$HOME` hermetic podman
     /// is set up from (default: the real one).
     pub fn with_home_and_podman(
@@ -578,6 +597,7 @@ impl Lx {
             DiskFloor::default(),
             Some(io_lock(false)),
             Some(self.installation.clone()),
+            CleanupSchedule::PRODUCTION,
         )
     }
 
@@ -594,6 +614,7 @@ impl Lx {
             DiskFloor::default(),
             Some(io_lock(false)),
             Some(self.installation.clone()),
+            CleanupSchedule::PRODUCTION,
         )
     }
 
@@ -604,7 +625,15 @@ impl Lx {
         floor: DiskFloor,
         io: Option<std::fs::File>,
     ) -> Self {
-        Self::build_as(podman_home, runtime, podman_bin, floor, io, None)
+        Self::build_as(
+            podman_home,
+            runtime,
+            podman_bin,
+            floor,
+            io,
+            None,
+            CleanupSchedule::PRODUCTION,
+        )
     }
 
     /// `installation`: `None` for a fresh one, so no two fixtures sweep each other's containers.
@@ -615,6 +644,7 @@ impl Lx {
         floor: DiskFloor,
         io: Option<std::fs::File>,
         installation: Option<Installation>,
+        cleanup: CleanupSchedule,
     ) -> Self {
         let installation =
             installation.unwrap_or_else(|| Installation::fresh().expect("an installation id"));
@@ -669,6 +699,7 @@ impl Lx {
             // A panic in a retried cleanup is not what these tests watch: a test that waits on
             // the cleanup fails on its own bound. TODO(#239): keep the receiver, fail fast.
             crash: sallyd::daemon::crash::CrashReporter::channel().0,
+            cleanup,
         });
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

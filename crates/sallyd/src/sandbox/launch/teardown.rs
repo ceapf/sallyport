@@ -7,14 +7,15 @@ use sally_core::manifest::AuditLevel;
 use serde_json::json;
 
 use super::parts::{
-    CleanupTries, Directories, Made, NextTry, STOP_RETRIES_AFTER_REMOVAL, cleaned_entry,
-    containers_gone,
+    CleanupTries, Directories, Made, NextTry, STOP_RETRIES_AFTER_REMOVAL, abandoned_entry,
+    cleaned_entry, containers_gone,
 };
 use super::start::Held;
 use super::{
     Confirmed, DETAIL_STYLE, LaunchError, Launcher, Progress, RoleRunning, RoleStopError, Running,
     STOP_RETRY, StopError, blocking,
 };
+use crate::sandbox::commands::rm_args;
 use crate::sandbox::orphans::{
     Orphan, not_removed, orphans, ps_args, removal_entry, removal_failed_entry,
 };
@@ -77,10 +78,10 @@ impl Launcher {
             // Before each removal; one that cannot be written ends the sweep (fail closed).
             self.audit(removal_entry(o, sweep.as_str()), AuditLevel::default())
                 .await?;
-            // By ID: a name re-used since the listing is another container (PS-L5). Through the
-            // removal that thaws and retries: a `sallyd` killed in a stage walk leaves its
-            // container paused. TODO(#239): one whose removal keeps failing is left thawed.
-            match self.remove_container(&o.container).await {
+            // By ID: a name re-used since the listing is another container (PS-L5). A plain
+            // `rm`, never the stop's removal that thaws: an orphan the disk watchdog left
+            // paused stays frozen, so inert, if its removal fails.
+            match self.remove_orphan(&o.container).await {
                 Ok(()) => removed.push(o.name.clone()),
                 Err(e) => {
                     self.orphan_not_removed(o, sweep, &e).await;
@@ -94,6 +95,20 @@ impl Launcher {
                 verb: "rm",
                 msg: not_removed(failed.len(), listed.len(), first),
             }),
+        }
+    }
+
+    /// One orphan's removal: `rm` by its full ID, once, then whether it is gone. An `rm` that
+    /// erred with the container gone counts as removed; one still there, or a check that erred,
+    /// is a failure. Never `unpause`, and no retry here: the periodic sweep comes round again.
+    async fn remove_orphan(&self, id: &str) -> Result<(), LaunchError> {
+        let removed = self.run("rm", rm_args(id)).await;
+        match self.container_exists(id).await? {
+            false => Ok(()),
+            true => Err(removed.err().unwrap_or(LaunchError::Command {
+                verb: "rm",
+                msg: format!("{id} still exists"),
+            })),
         }
     }
 
@@ -189,22 +204,25 @@ impl Launcher {
     }
 
     /// The rest of a failed launch's cleanup, whose first try (in the launch) failed with
-    /// `first`; `tries` holds that try. Runs in its own task on the daemon's crash reporter
-    /// (ARCHITECTURE §3.5). While the probe or the container may exist it retries every
-    /// [`STOP_RETRY`] without bound, holding the claim and auditing nothing; once both are
-    /// confirmed gone the directories get at most [`STOP_RETRIES_AFTER_REMOVAL`] more tries.
-    /// Then, in this order: `sandbox.cleaned` (with an oplog error line first when the
-    /// directories are kept), the claim freed, the session's forms released. The oplog says
-    /// when the retries start, and again every
-    /// [`CLEANUP_REPORT_EVERY`](super::parts::CLEANUP_REPORT_EVERY) tries while a container
-    /// may remain, so a claim held this way is visible. Nothing ends the task but its own end or
-    /// the runtime's. TODO(#239): shutdown does not count a cleanup still retrying.
+    /// `first`; `tries` holds that try and `next` what it decided. Runs in its own task on the
+    /// daemon's crash reporter (ARCHITECTURE §3.5). It retries backed off, as the launcher's
+    /// [`CleanupSchedule`](super::CleanupSchedule) says, at most
+    /// [`CLEANUP_TRIES`](super::CLEANUP_TRIES) tries in all, holding the claim; once the probe
+    /// and the container are confirmed gone the directories get at most
+    /// [`STOP_RETRIES_AFTER_REMOVAL`] more tries. Then, in this order: `sandbox.cleaned` (with
+    /// an oplog error line first when the directories are kept), the claim freed, the session's
+    /// forms released. A last try with the probe or the container not confirmed gone writes an
+    /// oplog error line and `sandbox.cleanup_abandoned` and releases the forms, but keeps the
+    /// claim, the slot and the live id until `sallyd` exits (RT-AG-08b): no overlapping launch
+    /// starts while the container may still run, and the next start's orphan sweep removes
+    /// it. Shutdown waits for none of this ([`Launcher::unfinished_cleanups`]).
     pub(super) async fn finish_failed(
         &self,
         held: Held,
         made: Made,
         mut p: Progress,
         mut tries: CleanupTries,
+        mut next: NextTry,
         first: LaunchError,
     ) {
         let subject = &held.subject;
@@ -216,27 +234,23 @@ impl Launcher {
         );
         let mut last = first;
         let directories = loop {
-            tokio::time::sleep(STOP_RETRY).await;
+            let pause = match next {
+                NextTry::Again(pause) => pause,
+                NextTry::Done(d) => break d,
+                NextTry::Abandoned => {
+                    self.abandon(&held, &p, tries.attempts(), &last).await;
+                    return;
+                }
+            };
+            tokio::time::sleep(pause).await;
             let result = self.clean_failed(&mut p).await;
             let gone = containers_gone(p.probe.as_deref(), p.container.as_deref());
-            let next = tries.record(gone, result.is_ok());
+            if gone {
+                self.cleanup_confirmed(subject.id().as_str());
+            }
+            next = tries.record(gone, result.is_ok());
             if let Err(e) = result {
                 last = e;
-            }
-            match next {
-                NextTry::Again => {}
-                NextTry::Done(d) => break d,
-            }
-            if !gone && tries.worth_reporting() {
-                self.oplog.error(
-                    "sandbox",
-                    "a failed launch's container still not removed",
-                    &[
-                        id,
-                        ("attempts", &tries.attempts().to_string()),
-                        ("error", &last.to_string()),
-                    ],
-                );
             }
         };
         let role = held.role;
@@ -263,6 +277,51 @@ impl Launcher {
         }
         self.unclaim(&held);
         self.forget(&held).await;
+    }
+
+    /// A failed launch's cleanup reached its cap with its probe or container not confirmed
+    /// gone: one oplog error line naming them, then `sandbox.cleanup_abandoned` (a refused
+    /// append is the `unaudited` line), then the forms released. No unclaim: the claim, the
+    /// slot and the live id stay until `sallyd` exits (RT-AG-08b), and the id stays among the
+    /// unfinished cleanups.
+    async fn abandon(&self, held: &Held, p: &Progress, attempts: u32, last: &LaunchError) {
+        let subject = &held.subject;
+        let left = Made {
+            probe: p.probe.clone(),
+            container: p.container.clone(),
+        };
+        let names = [left.probe.as_deref(), left.container.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(",");
+        self.oplog.error(
+            "sandbox",
+            "a failed launch's cleanup abandoned; the next start's sweep removes what is left",
+            &[
+                (subject.kind(), subject.id().as_str()),
+                ("containers", &names),
+                ("attempts", &attempts.to_string()),
+                ("error", &last.to_string()),
+            ],
+        );
+        let directories = if p.dirs.is_empty() {
+            Directories::Removed
+        } else {
+            Directories::Kept
+        };
+        let entry = abandoned_entry(
+            subject,
+            held.role,
+            &left,
+            attempts,
+            directories,
+            last.to_string(),
+        );
+        if self.audit(entry, held.level).await.is_err() {
+            self.unaudited("sandbox.cleanup_abandoned", subject.id().as_str());
+        }
+        self.forget(held).await;
     }
 
     /// Stops and removes a harness or inference container, then the directories its launch

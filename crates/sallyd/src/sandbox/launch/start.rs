@@ -34,7 +34,7 @@ use sally_core::manifest::{AuditLevel, ValidatedManifest};
 use serde_json::Value;
 
 use super::error::{cpu_only, running_as};
-use super::parts::{CleanupTries, HostPin, Made, NextTry, Subject, containers_gone};
+use super::parts::{CleanupTries, HostPin, Made, Subject, containers_gone};
 use super::{
     HarnessRequest, InferenceRequest, LaunchError, Launcher, Progress, Running, START_GRACE,
     WorkspaceRequest, blocking,
@@ -313,9 +313,10 @@ impl Launcher {
     /// `sandbox.refuse` naming the cleanup's outcome after `stopped` (`""`, or `"stopped, "`
     /// when the caller stopped a handle first). When the cleanup removed everything the claim
     /// is freed before the entry and the forms released after it. Otherwise the rest of the
-    /// cleanup goes on in its own task on the daemon's crash reporter, which writes
-    /// `sandbox.cleaned` and only then frees the claim and releases the forms: the session stays
-    /// live while a container may exist (ARCHITECTURE §3.5).
+    /// cleanup goes on in its own task on the daemon's crash reporter, backed off and capped
+    /// (`finish_failed`): the session stays live, its claim held, while a container may exist
+    /// (ARCHITECTURE §3.5, RT-AG-08b). Its id is among [`Launcher::unfinished_cleanups`] from
+    /// before the first try until its probe and container are confirmed gone.
     async fn failed(
         self: &Arc<Self>,
         req: &Request,
@@ -328,7 +329,13 @@ impl Launcher {
             probe: progress.probe.clone(),
             container: progress.container.clone(),
         };
+        let id = held.subject.id().as_str().to_owned();
+        self.cleanup_begins(&id);
         let cleanup = self.clean_failed(&mut progress).await;
+        let gone = containers_gone(progress.probe.as_deref(), progress.container.as_deref());
+        if gone {
+            self.cleanup_confirmed(&id);
+        }
         let outcome = match &cleanup {
             Ok(()) => format!("{stopped}removed"),
             Err(c) => format!("{stopped}incomplete, kept: {c}"),
@@ -342,19 +349,18 @@ impl Launcher {
         match cleanup {
             Ok(()) => self.forget(&held).await,
             Err(first) => {
-                let mut tries = CleanupTries::default();
-                let gone =
-                    containers_gone(progress.probe.as_deref(), progress.container.as_deref());
-                // The first try failed, so it never ends the cleanup here: the bound after the
-                // containers' removal is at least one more try.
+                let mut tries = CleanupTries::start(self.cleanup);
+                // The first try failed, so with nine pauses to come it never ends the cleanup
+                // here; `finish_failed` acts on whatever it says.
                 let next = tries.record(gone, false);
-                debug_assert_eq!(next, NextTry::Again);
                 // A workspace's task is bounded by the session limit (it keeps its claim), a
-                // harness's by one per session. TODO(#134): an inference instance has no claim,
-                // so nothing bounds its tasks once its launch is reachable.
+                // harness's by one per session, and each by its cap. TODO(#134): an inference
+                // instance has no claim, so nothing bounds how many run at once once its launch
+                // is reachable.
                 let this = Arc::clone(self);
                 let _ = self.crash.spawn("sandbox.cleanup", async move {
-                    this.finish_failed(held, made, progress, tries, first).await;
+                    this.finish_failed(held, made, progress, tries, next, first)
+                        .await;
                 });
             }
         }

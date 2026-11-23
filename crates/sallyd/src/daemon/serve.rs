@@ -45,10 +45,10 @@ use crate::oplog::Oplog;
 use crate::rpc::control::{Control, ControlParts};
 use crate::rpc::record::Recorder;
 use crate::sandbox::{
-    AuditSink, CheckedRuntime, DirError, DiskFloor, Installation, LaunchError, Launcher,
-    LauncherParts, PODMAN_PATH_VAR, Podman, PodmanError, PodmanHost, ProbeError, ScanLimits,
-    Sessions, SharedAudit, Sweep, UserIds, VERSION_TIMEOUT, check_runtime_dir, open_sessions,
-    outside_system_rule, probe_version, resolve_podman, version_error,
+    AuditSink, CheckedRuntime, CleanupSchedule, DirError, DiskFloor, Installation, LaunchError,
+    Launcher, LauncherParts, PODMAN_PATH_VAR, Podman, PodmanError, PodmanHost, ProbeError,
+    ScanLimits, Sessions, SharedAudit, Sweep, UserIds, VERSION_TIMEOUT, check_runtime_dir,
+    open_sessions, outside_system_rule, probe_version, resolve_podman, version_error,
 };
 use crate::session::lookup::SharedEgress;
 use crate::session::secrets::Redactors;
@@ -344,6 +344,7 @@ async fn serve(
         oplog: log.clone(),
         installation,
         crash: crash.clone(),
+        cleanup: CleanupSchedule::PRODUCTION,
     });
     let removed = launcher
         .remove_orphans("", Sweep::Startup)

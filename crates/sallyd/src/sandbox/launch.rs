@@ -29,6 +29,7 @@
 //! the directories this launch created, and keeps the session's overlap claims while a container
 //! might still exist.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -69,8 +70,8 @@ pub use error::{LaunchError, RoleStopError, StopError};
 pub(crate) use error::{stderr_text, stdout_text};
 pub use harness::HarnessRequest;
 pub use inference::InferenceRequest;
-pub use parts::PinError;
 use parts::Subject;
+pub use parts::{CLEANUP_TRIES, CleanupSchedule, PinError};
 pub use start::RoleRunning;
 use start::{Extra, Launched, Prepared, Recheck, Request};
 pub use teardown::Sweep;
@@ -285,6 +286,9 @@ pub struct LauncherParts {
     /// reports a panic there, which stops the daemon. Not a session's: a refused session has no
     /// reporter left.
     pub crash: CrashReporter,
+    /// The pauses of a failed launch's cleanup retries: `sallyd` passes
+    /// [`CleanupSchedule::PRODUCTION`].
+    pub cleanup: CleanupSchedule,
 }
 
 /// Launches and tears down sandboxes for one `sallyd`. Shared as `Arc<Launcher>`.
@@ -303,6 +307,11 @@ pub struct Launcher {
     oplog: Oplog,
     pub(super) installation: Installation,
     crash: CrashReporter,
+    cleanup: CleanupSchedule,
+    /// The ids of failed launches whose probe or container is not yet confirmed gone: in
+    /// before the first cleanup try, out only once both are confirmed gone, never at the
+    /// cleanup's cap. Shutdown reads it ([`Self::unfinished_cleanups`]) and waits for none.
+    unfinished: Mutex<BTreeSet<String>>,
     /// One stage walk at a time across all sessions, so a sandbox with a huge or deep tree
     /// cannot multiply `sallyd`'s open fds or blocking threads (6c-1 review M2/M3).
     pub(super) walks: Arc<tokio::sync::Semaphore>,
@@ -349,10 +358,37 @@ impl Launcher {
             oplog: p.oplog,
             installation: p.installation,
             crash: p.crash,
+            cleanup: p.cleanup,
+            unfinished: Mutex::new(BTreeSet::new()),
             walks: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
 
+    /// The ids of failed launches whose mount-link probe or container is not confirmed gone
+    /// now: a cleanup still retrying, or one abandoned at its cap. Sorted. Shutdown reports
+    /// these as not stopped cleanly, without waiting for any (THREAT_MODEL #239 row).
+    #[must_use]
+    pub fn unfinished_cleanups(&self) -> Vec<String> {
+        lock(&self.unfinished).iter().cloned().collect()
+    }
+
+    /// A failed launch's cleanup begins: `id` may leave a container behind.
+    fn cleanup_begins(&self, id: &str) {
+        lock(&self.unfinished).insert(id.to_owned());
+    }
+
+    /// A failed launch's probe and container are confirmed gone.
+    fn cleanup_confirmed(&self, id: &str) {
+        lock(&self.unfinished).remove(id);
+    }
+}
+
+/// A set guarded by a mutex, poisoned or not: a panic elsewhere must not hide what is left.
+fn lock<V>(m: &Mutex<V>) -> std::sync::MutexGuard<'_, V> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl Launcher {
     /// The session's last entry, `session.closed {reason}`, written once its teardown has
     /// finished, which `done` proves (#94, architect Q242, Q245, Q252). Then its secrets leave
     /// the logs' redactors (Q219). The registry calls it once per `Running` it received; a

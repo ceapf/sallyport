@@ -4,11 +4,13 @@
 //! `inference.rs`) only calls these.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use rustix::fs::{Mode, OFlags, ResolveFlags};
 use sally_core::audit::{Actor, NewEntry};
 use serde_json::{Map, Value};
 
+use super::DETAIL_STYLE;
 use crate::sandbox::inside::Expect;
 use crate::sandbox::types::{Role, SessionId, VerifiedModel};
 
@@ -68,9 +70,45 @@ impl Subject {
 /// (`stop_role_unreceived`).
 pub(crate) const STOP_RETRIES_AFTER_REMOVAL: u32 = 3;
 
-/// Every how many tries a failed launch's cleanup, while a container may remain, says so again
-/// in the oplog (about once a minute at the retry pause).
-pub(crate) const CLEANUP_REPORT_EVERY: u32 = 30;
+/// How many tries a failed launch's cleanup gets in all, the first (in the launch) included.
+pub const CLEANUP_TRIES: usize = 10;
+
+/// The pauses before a failed launch's cleanup tries 2 to [`CLEANUP_TRIES`], in order: the
+/// retries back off and are capped. `sallyd` runs [`CleanupSchedule::PRODUCTION`]; a test may
+/// pass a shorter one through `LauncherParts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CleanupSchedule {
+    pauses: [Duration; CLEANUP_TRIES - 1],
+}
+
+impl CleanupSchedule {
+    /// 2, 4, 8, 16 and 32 s, then 60 s four times: 302 s of pauses in all.
+    pub const PRODUCTION: Self = Self {
+        pauses: [
+            Duration::from_secs(2),
+            Duration::from_secs(4),
+            Duration::from_secs(8),
+            Duration::from_secs(16),
+            Duration::from_secs(32),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        ],
+    };
+
+    /// A schedule with these pauses.
+    #[must_use]
+    pub const fn with_pauses(pauses: [Duration; CLEANUP_TRIES - 1]) -> Self {
+        Self { pauses }
+    }
+
+    /// The pause after try `attempts` (1-based), or `None` when it was the last try.
+    fn pause_after(&self, attempts: u32) -> Option<Duration> {
+        let i = usize::try_from(attempts).ok()?.checked_sub(1)?;
+        self.pauses.get(i).copied()
+    }
+}
 
 /// What became of a failed launch's directories when its cleanup ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,39 +133,56 @@ impl Directories {
 /// What a failed launch's cleanup does after a try (ARCHITECTURE §3.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NextTry {
-    /// Try again a retry pause later; the claim stays.
-    Again,
+    /// Try again after this pause; the claim stays.
+    Again(Duration),
     /// Write `sandbox.cleaned`, free the claim, end.
     Done(Directories),
+    /// The last try ended with the probe or the container not confirmed gone: write
+    /// `sandbox.cleanup_abandoned` and end, keeping the claim until `sallyd` exits (RT-AG-08b).
+    /// The next start's orphan sweep removes what is left.
+    Abandoned,
 }
 
-/// The tries of one failed launch's cleanup, the first (in the launch) included: without bound
-/// while a container may exist, then at most [`STOP_RETRIES_AFTER_REMOVAL`] more for the
-/// directories.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// The tries of one failed launch's cleanup, the first (in the launch) included: at most
+/// [`CLEANUP_TRIES`], backed off as its [`CleanupSchedule`] says; once both containers are
+/// confirmed gone, at most [`STOP_RETRIES_AFTER_REMOVAL`] more for the directories.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CleanupTries {
+    schedule: CleanupSchedule,
     attempts: u32,
     /// `attempts` at the try that first confirmed both containers gone.
     gone_at: Option<u32>,
 }
 
 impl CleanupTries {
+    /// No try recorded yet.
+    #[must_use]
+    pub(crate) fn start(schedule: CleanupSchedule) -> Self {
+        Self {
+            schedule,
+            attempts: 0,
+            gone_at: None,
+        }
+    }
+
     /// Records one try: whether its mount-link probe and container are confirmed gone, and
     /// whether everything it set out to remove was removed. Then what comes next.
     #[must_use]
     pub(crate) fn record(&mut self, containers_gone: bool, all_removed: bool) -> NextTry {
         self.attempts = self.attempts.saturating_add(1);
+        let pause = self.schedule.pause_after(self.attempts);
         if !containers_gone {
-            return NextTry::Again;
+            return pause.map_or(NextTry::Abandoned, NextTry::Again);
         }
         if all_removed {
             return NextTry::Done(Directories::Removed);
         }
         let gone_at = *self.gone_at.get_or_insert(self.attempts);
-        if self.attempts.saturating_sub(gone_at) < STOP_RETRIES_AFTER_REMOVAL {
-            NextTry::Again
-        } else {
-            NextTry::Done(Directories::Kept)
+        match pause {
+            Some(p) if self.attempts.saturating_sub(gone_at) < STOP_RETRIES_AFTER_REMOVAL => {
+                NextTry::Again(p)
+            }
+            _ => NextTry::Done(Directories::Kept),
         }
     }
 
@@ -135,13 +190,6 @@ impl CleanupTries {
     #[must_use]
     pub(crate) fn attempts(&self) -> u32 {
         self.attempts
-    }
-
-    /// Whether the try just recorded is one the oplog hears of again: every
-    /// [`CLEANUP_REPORT_EVERY`]th.
-    #[must_use]
-    pub(crate) fn worth_reporting(&self) -> bool {
-        self.attempts.is_multiple_of(CLEANUP_REPORT_EVERY)
     }
 }
 
@@ -183,6 +231,34 @@ pub(crate) fn cleaned_entry(
             ("directories", directories.as_str().into()),
         ],
     )
+}
+
+/// `sandbox.cleanup_abandoned`: a failed launch's cleanup reached its last try with its
+/// mount-link probe or container not confirmed gone. Denied: `left` names only what may still
+/// exist; the claim stays held until `sallyd` exits, and the next start's orphan sweep removes
+/// it. `last` is the last try's error, declared raw text as every teardown `detail`.
+#[must_use]
+pub(crate) fn abandoned_entry(
+    subject: &Subject,
+    role: Role,
+    left: &Made,
+    attempts: u32,
+    directories: Directories,
+    last: String,
+) -> NewEntry {
+    subject
+        .entry(
+            "sandbox.cleanup_abandoned",
+            role,
+            [
+                ("container", left.container.clone().into()),
+                ("probe", left.probe.clone().into()),
+                ("attempts", attempts.into()),
+                ("directories", directories.as_str().into()),
+            ],
+        )
+        .decision("deny")
+        .text("detail", last, DETAIL_STYLE)
 }
 
 /// A host object a harness or inference launch binds, pinned by identity: re-checked on the
@@ -361,25 +437,72 @@ mod tests {
     /// While a container may exist, a failed launch's cleanup tries again without bound and
     /// keeps its claim.
     #[test]
-    fn a_cleanup_retries_without_bound_while_a_container_may_exist() {
-        let mut t = CleanupTries::default();
-        for n in 1..=50_u32 {
-            assert_eq!(t.record(false, false), NextTry::Again, "try {n}");
+    fn a_cleanup_whose_container_stays_backs_off_and_is_abandoned_at_the_tenth_try() {
+        let mut t = CleanupTries::start(CleanupSchedule::PRODUCTION);
+        let mut pauses = Vec::new();
+        for n in 1..=9_u32 {
+            match t.record(false, false) {
+                NextTry::Again(p) => pauses.push(p.as_secs()),
+                other => panic!("try {n}: {other:?}"),
+            }
             assert_eq!(t.attempts(), n);
         }
+        assert_eq!(pauses, [2, 4, 8, 16, 32, 60, 60, 60, 60]);
         // Even with the directories reported removed: the containers decide first.
-        assert_eq!(t.record(false, true), NextTry::Again);
+        assert_eq!(t.record(false, true), NextTry::Abandoned);
+        assert_eq!(t.attempts(), 10);
+    }
+
+    /// The production schedule, as ruled: ten tries in all, 302 s of pauses.
+    #[test]
+    fn the_production_schedule_is_ten_tries_over_302_seconds() {
+        assert_eq!(CLEANUP_TRIES, 10);
+        let p = CleanupSchedule::PRODUCTION;
+        let secs: Vec<u64> = (1..=10)
+            .map_while(|n| p.pause_after(n))
+            .map(|d| d.as_secs())
+            .collect();
+        assert_eq!(secs, [2, 4, 8, 16, 32, 60, 60, 60, 60]);
+        assert_eq!(secs.iter().sum::<u64>(), 302);
+        assert_eq!(p.pause_after(0), None, "there is no try 0");
+        assert_eq!(p.pause_after(10), None, "try 10 is the last");
+        assert_eq!(p.pause_after(u32::MAX), None);
+    }
+
+    /// A schedule passed in is the one used, pause for pause.
+    #[test]
+    fn a_given_schedule_is_followed() {
+        let ms = |n: u64| Duration::from_millis(n);
+        let s = CleanupSchedule::with_pauses([
+            ms(1),
+            ms(2),
+            ms(3),
+            ms(4),
+            ms(5),
+            ms(6),
+            ms(7),
+            ms(8),
+            ms(9),
+        ]);
+        let mut t = CleanupTries::start(s);
+        for n in 1..=9 {
+            assert_eq!(t.record(false, false), NextTry::Again(ms(n)));
+        }
+        assert_eq!(t.record(false, false), NextTry::Abandoned);
     }
 
     /// Once both containers are confirmed gone, the directories get at most
     /// `STOP_RETRIES_AFTER_REMOVAL` more tries, then the cleanup ends with them kept.
     #[test]
     fn once_the_containers_are_gone_the_directories_get_a_bounded_number_of_tries() {
-        let mut t = CleanupTries::default();
-        assert_eq!(t.record(false, false), NextTry::Again);
+        let mut t = CleanupTries::start(CleanupSchedule::PRODUCTION);
+        assert_eq!(
+            t.record(false, false),
+            NextTry::Again(Duration::from_secs(2))
+        );
         // Gone at try 2; tries 3, 4 and 5 are the bounded ones.
         for _ in 0..STOP_RETRIES_AFTER_REMOVAL {
-            assert_eq!(t.record(true, false), NextTry::Again);
+            assert!(matches!(t.record(true, false), NextTry::Again(_)));
         }
         assert_eq!(
             t.record(true, false),
@@ -394,41 +517,69 @@ mod tests {
     /// starts in the bounded phase, counted from that first try.
     #[test]
     fn a_first_try_that_removed_the_containers_starts_in_the_bounded_phase() {
-        let mut t = CleanupTries::default();
-        assert_eq!(t.record(true, false), NextTry::Again);
-        assert_eq!(t.record(true, false), NextTry::Again);
-        assert_eq!(t.record(true, false), NextTry::Again);
+        let mut t = CleanupTries::start(CleanupSchedule::PRODUCTION);
+        assert!(matches!(t.record(true, false), NextTry::Again(_)));
+        assert!(matches!(t.record(true, false), NextTry::Again(_)));
+        assert!(matches!(t.record(true, false), NextTry::Again(_)));
         assert_eq!(t.record(true, false), NextTry::Done(Directories::Kept));
         assert_eq!(t.attempts(), 1 + STOP_RETRIES_AFTER_REMOVAL);
     }
 
-    /// The first try that removes everything ends the cleanup, in either phase.
+    /// The directories' tries never run past the last try: containers gone at try 9 leave
+    /// one more, the tenth, which ends the cleanup with the directories kept.
     #[test]
-    fn a_try_that_removes_everything_ends_the_cleanup() {
-        let mut t = CleanupTries::default();
-        assert_eq!(t.record(false, false), NextTry::Again);
-        assert_eq!(t.record(true, true), NextTry::Done(Directories::Removed));
-        assert_eq!(t.attempts(), 2);
-        let mut t = CleanupTries::default();
-        assert_eq!(t.record(true, false), NextTry::Again);
-        assert_eq!(t.record(true, false), NextTry::Again);
-        assert_eq!(t.record(true, true), NextTry::Done(Directories::Removed));
-        assert_eq!(t.attempts(), 3);
+    fn the_directories_tries_end_at_the_tenth_try() {
+        let mut t = CleanupTries::start(CleanupSchedule::PRODUCTION);
+        for _ in 1..=8 {
+            assert!(matches!(t.record(false, false), NextTry::Again(_)));
+        }
+        assert_eq!(
+            t.record(true, false),
+            NextTry::Again(Duration::from_secs(60))
+        );
+        assert_eq!(t.record(true, false), NextTry::Done(Directories::Kept));
+        assert_eq!(t.attempts(), 10);
+        // Gone only at the tenth: kept, never abandoned (the claim may go).
+        let mut t = CleanupTries::start(CleanupSchedule::PRODUCTION);
+        for _ in 1..=9 {
+            assert!(matches!(t.record(false, false), NextTry::Again(_)));
+        }
+        assert_eq!(t.record(true, false), NextTry::Done(Directories::Kept));
     }
 
-    /// The count saturates, never wraps or panics.
+    /// The first try that removes everything ends the cleanup, in either phase, the last
+    /// try included.
+    #[test]
+    fn a_try_that_removes_everything_ends_the_cleanup() {
+        let mut t = CleanupTries::start(CleanupSchedule::PRODUCTION);
+        assert!(matches!(t.record(false, false), NextTry::Again(_)));
+        assert_eq!(t.record(true, true), NextTry::Done(Directories::Removed));
+        assert_eq!(t.attempts(), 2);
+        let mut t = CleanupTries::start(CleanupSchedule::PRODUCTION);
+        assert!(matches!(t.record(true, false), NextTry::Again(_)));
+        assert!(matches!(t.record(true, false), NextTry::Again(_)));
+        assert_eq!(t.record(true, true), NextTry::Done(Directories::Removed));
+        assert_eq!(t.attempts(), 3);
+        let mut t = CleanupTries::start(CleanupSchedule::PRODUCTION);
+        for _ in 1..=9 {
+            assert!(matches!(t.record(false, false), NextTry::Again(_)));
+        }
+        assert_eq!(t.record(true, true), NextTry::Done(Directories::Removed));
+    }
+
+    /// The count saturates, never wraps or panics, and a saturated count is past the cap.
     #[test]
     fn the_attempt_count_saturates() {
         let mut t = CleanupTries {
             attempts: u32::MAX,
-            gone_at: None,
+            ..CleanupTries::start(CleanupSchedule::PRODUCTION)
         };
-        assert_eq!(t.record(false, false), NextTry::Again);
+        assert_eq!(t.record(false, false), NextTry::Abandoned);
         assert_eq!(t.attempts(), u32::MAX);
     }
 
     /// Both containers must be gone: a probe or a container still to be removed keeps the
-    /// cleanup in its unbounded phase, holding the claim.
+    /// cleanup holding the claim.
     #[test]
     fn the_containers_are_gone_only_when_neither_is_left() {
         assert!(containers_gone(None, None));
@@ -437,20 +588,63 @@ mod tests {
         assert!(!containers_gone(Some("sp-probe-ws-a"), Some("sp-ws-a")));
     }
 
-    /// A held claim is reported every thirtieth try, about once a minute: not at the tries
-    /// between, and never at the first (which the task's start line already reports).
+    /// `sandbox.cleanup_abandoned` is denied, names only what may still exist, the tries and
+    /// the directories, and carries the last error as its detail; an instance's names the
+    /// instance.
     #[test]
-    fn a_long_retry_is_reported_every_thirty_tries() {
-        assert_eq!(CLEANUP_REPORT_EVERY, 30);
-        let mut t = CleanupTries::default();
-        let mut reported = Vec::new();
-        for _ in 0..90 {
-            let _ = t.record(false, false);
-            if t.worth_reporting() {
-                reported.push(t.attempts());
-            }
-        }
-        assert_eq!(reported, [30, 60, 90]);
+    fn the_abandoned_entry_is_denied_and_names_what_is_left() {
+        let s = Subject::Session(sid("s-4"));
+        let left = Made {
+            probe: None,
+            container: Some("sp-ws-s-4".into()),
+        };
+        let e = abandoned_entry(
+            &s,
+            Role::Workspace,
+            &left,
+            10,
+            Directories::Kept,
+            "podman rm: refused".into(),
+        );
+        assert_eq!(e.event(), "sandbox.cleanup_abandoned");
+        assert_eq!(e.decision_value(), Some("deny"));
+        assert_eq!(
+            e.resolved(&sally_core::audit::Redactor::default()),
+            serde_json::json!({
+                "role": "workspace",
+                "container": "sp-ws-s-4",
+                "probe": null,
+                "attempts": 10,
+                "directories": "kept",
+                "detail": "podman rm: refused",
+            })
+        );
+        assert!(format!("{e:?}").contains("\"s-4\""));
+        let i = Subject::Instance(sid("i-4"));
+        let left = Made {
+            probe: Some("sp-probe-infer-i-4".into()),
+            container: None,
+        };
+        let e = abandoned_entry(
+            &i,
+            Role::Inference,
+            &left,
+            10,
+            Directories::Removed,
+            "x".into(),
+        );
+        assert_eq!(
+            e.resolved(&sally_core::audit::Redactor::default()),
+            serde_json::json!({
+                "role": "inference",
+                "instance": "i-4",
+                "container": null,
+                "probe": "sp-probe-infer-i-4",
+                "attempts": 10,
+                "directories": "removed",
+                "detail": "x",
+            })
+        );
     }
 
     /// The shared bound is three tries, the one `stop_role_unreceived` already used.

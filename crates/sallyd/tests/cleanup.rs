@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use sallyd::sandbox::{LaunchError, Sweep};
+use sallyd::sandbox::{CLEANUP_TRIES, CleanupSchedule, LaunchError, Sweep};
 
 mod common;
 use common::container::*;
@@ -19,6 +19,11 @@ use common::*;
 
 /// The longest a test waits for a retry it caused.
 const BOUND: Duration = Duration::from_secs(60);
+
+/// A failed launch's cleanup schedule for the tests that wait through its tries: the
+/// production one's ten tries, with 100 ms pauses. A try whose `rm` keeps failing still takes
+/// the removal's own attempts, about 6 s.
+const SHORT: CleanupSchedule = CleanupSchedule::with_pauses([Duration::from_millis(100); 9]);
 
 /// `GITHUB_TOKEN` injected on `mock.test`, so a launch registers the session's forms.
 const FORMS: &str = "network:\n  mode: proxy\n  allow:\n    - host: mock.test\n\
@@ -95,7 +100,7 @@ async fn until_within(what: &str, bound: Duration, mut done: impl FnMut() -> boo
 fn a_failed_launch_cleanup_is_retried_until_the_container_is_gone() {
     let (dir, _gone) = wrapper_dir("retry");
     rt().block_on(async {
-        let x = Lx::with_podman(|real| ws_rm_failing_podman(&dir, real));
+        let x = Lx::with_podman_and_cleanup(|real| ws_rm_failing_podman(&dir, real), SHORT);
         std::fs::write(dir.join("start-fails"), b"").unwrap();
         std::fs::write(dir.join("rm-fails"), b"").unwrap();
         let body = format!(
@@ -137,6 +142,7 @@ fn a_failed_launch_cleanup_is_retried_until_the_container_is_gone() {
         let e = x.launch(&v, "while-kept").await.unwrap_err();
         assert!(matches!(e, LaunchError::Overlap(_)), "{e}");
         assert!(!x.events.list().iter().any(|e| e == "sandbox.cleaned"));
+        assert_eq!(x.launcher.unfinished_cleanups(), std::slice::from_ref(&id));
         assert_eq!(x.redactors.sessions(), std::slice::from_ref(&id));
         assert_eq!(x.redacted.redact(&gh), "[REDACTED:GITHUB_TOKEN]");
 
@@ -166,9 +172,10 @@ fn a_failed_launch_cleanup_is_retried_until_the_container_is_gone() {
         assert!(cleaned["probe"].is_null(), "{cleaned}");
         assert_eq!(cleaned["directories"], "removed", "{cleaned}");
         // At least the six tries the deny leg waited for (its wait may end inside the sixth,
-        // which then removes it).
+        // which then removes it), and within the cap.
         let attempts = cleaned["attempts"].as_u64().unwrap_or_default();
-        assert!(attempts >= 6, "{cleaned}");
+        assert!((6..=CLEANUP_TRIES as u64).contains(&attempts), "{cleaned}");
+        assert!(x.launcher.unfinished_cleanups().is_empty());
         assert_eq!(
             all.iter().filter(|(e, _)| e == "sandbox.cleaned").count(),
             1
@@ -177,6 +184,104 @@ fn a_failed_launch_cleanup_is_retried_until_the_container_is_gone() {
 
         let r = x.launch(&v, "after-cleaned").await.unwrap();
         x.stop(r).await;
+    });
+}
+
+/// RT-AG-08b, a failed launch's leftover: a launch that fails after `podman create` and whose
+/// container cannot be removed keeps its folder claimed for as long as that container may
+/// run, while its cleanup backs off and stops at its cap.
+///
+/// Control (its messages start `control:`): a removal that fails once and then works is
+/// followed by `sandbox.cleaned`, and the same folder then launches.
+///
+/// Product: the removal keeps failing. The same folder is refused `overlap` during the retries
+/// and after `sandbox.cleanup_abandoned` (denied, naming the container, ten tries, the
+/// directories kept, the last error); no `sandbox.cleaned` follows; the session is still live
+/// (the periodic sweep leaves its container) and among the unfinished cleanups; no try comes
+/// after the cap. Hand check: an unclaim added at the cap fails the "after" leg.
+#[test]
+fn rt_ag_08b_a_failed_launch_keeps_its_claim_through_the_capped_cleanup() {
+    let (dir, _gone) = wrapper_dir("rt08b");
+    rt().block_on(async {
+        let x = Lx::with_podman_and_cleanup(|real| ws_rm_failing_podman(&dir, real), SHORT);
+        let v =
+            x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "rw")]));
+        let mark = |m: &str| std::fs::write(dir.join(m), b"").unwrap();
+        let unmark = |m: &str| std::fs::remove_file(dir.join(m)).unwrap();
+        let cleaned = || {
+            x.events
+                .list()
+                .iter()
+                .filter(|e| *e == "sandbox.cleaned")
+                .count()
+        };
+
+        mark("start-fails");
+        mark("rm-fails");
+        let e = x.launch(&v, "control").await.unwrap_err();
+        assert!(e.to_string().contains("start refused"), "control: {e}");
+        assert!(
+            refused(&dir) > 0,
+            "control: the first cleanup never tried rm"
+        );
+        unmark("rm-fails");
+        until("control: sandbox.cleaned", || cleaned() == 1).await;
+        unmark("start-fails");
+        let r = x.launch(&v, "control-after").await;
+        let r = r.unwrap_or_else(|e| panic!("control: the folder is still refused: {e}"));
+        x.stop(r).await;
+
+        mark("start-fails");
+        mark("rm-fails");
+        let req = x.request(&v, "capped");
+        let id = req.paths.id().as_str().to_owned();
+        let name = format!("sp-ws-{id}");
+        let e = x.launcher.launch_workspace(req).await.unwrap_err();
+        assert!(e.to_string().contains("start refused"), "{e}");
+        unmark("start-fails");
+        let e = x.launch(&v, "during").await.unwrap_err();
+        assert!(
+            matches!(e, LaunchError::Overlap(_)),
+            "during the retries: {e}"
+        );
+        until_within("sandbox.cleanup_abandoned", LONG_BOUND, || {
+            x.events
+                .list()
+                .iter()
+                .any(|e| e == "sandbox.cleanup_abandoned")
+        })
+        .await;
+        let abandoned = x.events.args("sandbox.cleanup_abandoned").unwrap();
+        assert_eq!(abandoned["container"], name.as_str(), "{abandoned}");
+        assert!(abandoned["probe"].is_null(), "{abandoned}");
+        assert_eq!(abandoned["attempts"], CLEANUP_TRIES, "{abandoned}");
+        assert_eq!(abandoned["directories"], "kept", "{abandoned}");
+        let detail = abandoned["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("rm refused by the test"), "{abandoned}");
+        let debug = x.events.debug();
+        let entry = debug
+            .iter()
+            .find(|d| d.contains("\"sandbox.cleanup_abandoned\""))
+            .unwrap();
+        assert!(entry.contains("decision: Some(\"deny\")"), "{entry}");
+        assert!(entry.contains(&format!("\"{id}\"")), "{entry}");
+
+        let e = x.launch(&v, "after").await.unwrap_err();
+        assert!(matches!(e, LaunchError::Overlap(_)), "after the cap: {e}");
+        assert!(exists(&name), "the container went while rm failed");
+        let swept = x
+            .launcher
+            .remove_orphans(&x.scope, Sweep::Periodic)
+            .await
+            .unwrap();
+        assert!(swept.is_empty(), "the session is no longer live: {swept:?}");
+        assert!(exists(&name));
+        assert_eq!(x.launcher.unfinished_cleanups(), std::slice::from_ref(&id));
+        assert_eq!(cleaned(), 1, "a sandbox.cleaned for the abandoned launch");
+        let at_cap = refused(&dir);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(refused(&dir), at_cap, "a try after the cap");
+        unmark("rm-fails");
     });
 }
 
@@ -291,15 +396,17 @@ fn a_failed_launch_gives_up_its_directories_after_three_more_tries() {
 
 /// A podman whose `rm` fails while the container it names (its last argument) is paused, as
 /// the real one asks: `inspect` through the real podman prints `paused`. Each refusal adds a
-/// line to `<at>/rm-refused`; the message is the test's own. Anything else passes through,
-/// including an `inspect` that fails or prints another state. It models a removal that fails on
-/// a frozen container: on a loaded host a process can outlive podman's wait ("given PID did not
-/// die within timeout"). On an idle host (podman 4.9.3, rootless, cgroup v2) a plain
+/// line to `<at>/rm-refused`; the message is the test's own. Every call's verb (its first
+/// argument) is added to `<at>/calls`. Anything else passes through, including an `inspect`
+/// that fails or prints another state. It models a removal that fails on a frozen container:
+/// on a loaded host a process can outlive podman's wait ("given PID did not die within
+/// timeout"). On an idle host (podman 4.9.3, rootless, cgroup v2) a plain
 /// `rm --force --time 0` was measured to remove a paused container, so the failure is injected.
 fn paused_rm_failing_podman(at: &Path, real: &Path) -> PathBuf {
     wrap_podman(at, real, |at, real| {
         format!(
             "#!/bin/sh\n\
+             echo \"$1\" >> '{at}/calls'\n\
              for a in \"$@\"; do last=\"$a\"; done\n\
              if [ \"$1\" = rm ] && [ \"$('{real}' inspect --format '{{{{.State.Status}}}}' \
              \"$last\" 2>/dev/null)\" = paused ]; then\n\
@@ -311,13 +418,15 @@ fn paused_rm_failing_podman(at: &Path, real: &Path) -> PathBuf {
     })
 }
 
-/// A sweep removes an orphan the disk watchdog left paused (a `sallyd` killed in the middle
-/// of a stage walk), as a stop does: through the removal that thaws and retries. The container
-/// is really paused; the failure of `rm` on it is injected by the wrapper. Controls: on the
-/// code before this change (a plain `rm`) the startup sweep fails with the wrapper's error;
-/// without the thaw in the removal every `rm` is refused and the orphan stays.
+/// A sweep never thaws an orphan the disk watchdog left paused (a `sallyd` killed in the middle
+/// of a stage walk): when its removal fails, it stays paused, so inert, until a later sweep
+/// removes it. The container is really paused; the failure of `rm` on it is injected by the
+/// wrapper. The sweep fails naming it, `sandbox.orphan_remove_failed` follows its
+/// `sandbox.orphan_removed`, and the wrapper saw no `unpause`. Control, run by hand: routing
+/// the sweep through the stop's removal (which thaws and retries) removes the orphan, so the
+/// sweep succeeds and the test fails at its first assertion.
 #[test]
-fn a_paused_orphan_is_removed() {
+fn a_paused_orphan_whose_removal_fails_stays_paused() {
     let (dir, _gone) = wrapper_dir("paused");
     rt().block_on(async {
         let x = Lx::new();
@@ -348,15 +457,37 @@ fn a_paused_orphan_is_removed() {
             ])
             .await;
         assert_eq!(status, "paused", "thawed before the sweep");
-        let removed = next
+        let e = next
             .launcher
             .remove_orphans(&x.scope, Sweep::Startup)
             .await
-            .unwrap();
-        assert_eq!(removed, std::slice::from_ref(&name));
-        assert!(!exists(&name));
-        assert_eq!(refused(&dir), 1, "the wrapper refused the paused rm once");
-        assert_eq!(next.events.list(), ["sandbox.orphan_removed"]);
+            .unwrap_err();
+        match &e {
+            LaunchError::Command { verb: "rm", msg } => assert_eq!(
+                msg,
+                &format!("1 of 1 orphaned containers not removed; first: {name}")
+            ),
+            other => panic!("{other}"),
+        }
+        assert_eq!(refused(&dir), 1, "one plain rm, no retry inside the sweep");
+        let calls = std::fs::read_to_string(dir.join("calls")).unwrap_or_default();
+        assert!(!calls.lines().any(|c| c == "unpause"), "{calls}");
+        let status = x
+            .hermetic(&[
+                "inspect".into(),
+                "--format".into(),
+                "{{.State.Status}}".into(),
+                name.clone(),
+            ])
+            .await;
+        assert_eq!(status, "paused", "the sweep thawed it");
+        assert_eq!(
+            next.events.list(),
+            ["sandbox.orphan_removed", "sandbox.orphan_remove_failed"]
+        );
+        let failed = next.events.args("sandbox.orphan_remove_failed").unwrap();
+        assert_eq!(failed["container"], name.as_str(), "{failed}");
+        assert_eq!(failed["sweep"], "startup", "{failed}");
     });
 }
 
