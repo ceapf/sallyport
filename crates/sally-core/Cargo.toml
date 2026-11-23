@@ -12,7 +12,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-jiff = { version = "0.2.42", default-features = false, features = ["std"] }
+jiff = { version = "1.0.1", default-features = false, features = ["std"] }
 # The model library's index (ARCHITECTURE §2.1). `bundled` compiles the SQLite this crate pins,
 # so its version and build options are reviewed here, not the host's (the build environment is
 # trusted like the rest of the toolchain). No other feature: no user functions, no hooks, and no
