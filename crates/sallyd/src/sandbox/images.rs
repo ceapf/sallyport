@@ -202,6 +202,7 @@ mod tests {
             other_homes: Vec::new(),
             xdg_config_home: None,
             xdg_data_home: None,
+            xdg_state_home: None,
             xdg_runtime_dir: None,
             podman_storage: Vec::new(),
             env_dirs: Vec::new(),

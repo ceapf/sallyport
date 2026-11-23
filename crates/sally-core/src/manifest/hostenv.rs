@@ -17,6 +17,8 @@ pub struct HostEnv {
     pub xdg_config_home: Option<PathBuf>,
     /// `$XDG_DATA_HOME`, if set to an absolute path.
     pub xdg_data_home: Option<PathBuf>,
+    /// `$XDG_STATE_HOME`, if set to an absolute path.
+    pub xdg_state_home: Option<PathBuf>,
     /// `$XDG_RUNTIME_DIR`, if set to an absolute path.
     pub xdg_runtime_dir: Option<PathBuf>,
     /// Podman storage roots (graphroot). Mounting these or any ancestor is refused.
@@ -150,6 +152,7 @@ impl HostEnv {
             other_homes,
             xdg_config_home,
             xdg_data_home,
+            xdg_state_home: abs_var("XDG_STATE_HOME"),
             podman_storage,
             env_dirs: env_dirs(|name| std::env::var_os(name)),
             nproc,
@@ -300,6 +303,10 @@ mod tests {
         let info = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
         assert_eq!(Some(env.mem_bytes), parse_meminfo(&info));
         assert_eq!(env.env_dirs, env_dirs(|n| std::env::var_os(n)));
+        let state = std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute());
+        assert_eq!(env.xdg_state_home, state);
         assert!(
             env.env_dirs.iter().any(|d| d.var == "PATH"),
             "this host has a PATH"

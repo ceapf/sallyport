@@ -397,8 +397,12 @@ environment (passwd entry only if `$HOME` is unset or relative).
     `.cargo`, `.rustup`, `.vscode-server`, `.gradle`, `.nvm`, `.pyenv`, `.vscode`, `.vim`,
     `.emacs.d`, `.ipython`, `.oh-my-zsh`, `.bun`, `.deno`, `.volta`, `go/bin`, `go/pkg`,
     `.local/share/{pipx,uv,nvim,mise,pnpm}`) — a writable mount there is host code execution
-    (THREAT_MODEL G4);
-  - `$XDG_CONFIG_HOME`, `$XDG_DATA_HOME`, `$XDG_RUNTIME_DIR` (each when set, plus `sallyport/`);
+    (THREAT_MODEL G4); and the default data and state homes, `.local/share` (user units, session
+    services, completion scripts) and `.local/state`, whether or not `$XDG_DATA_HOME` or
+    `$XDG_STATE_HOME` is exported. They come after every other rule, so a folder inside them
+    with its own rule above is named by that rule;
+  - `$XDG_CONFIG_HOME`, `$XDG_DATA_HOME`, `$XDG_RUNTIME_DIR` (each when set, plus `sallyport/`),
+    and `$XDG_STATE_HOME` when set (no `sallyport/` rule under it);
   - the folders the environment names, each when absolute: `$CARGO_HOME`, `$RUSTUP_HOME`,
     `$GNUPGHOME`, `$NVM_DIR`, `$PYENV_ROOT`, `$XDG_CACHE_HOME`, `$GOBIN`, `$DOCKER_CONFIG`,
     `$ZDOTDIR`, `$PNPM_HOME`, `$VOLTA_HOME`, `$BUN_INSTALL`, `$PYTHONUSERBASE`, `$PIPX_HOME`,
@@ -422,8 +426,8 @@ what the host runs or loads (`~/.local/bin/t -> ~/tools/t/bin/t`, a stow `~/.con
 ~/dotfiles/gh`), so its target becomes a subtree rule too: "contains /home/u/tools/t/bin/t, which
 /home/u/.local/bin/t points to", with the reason of the folder that holds the link. When a
 manifest has mounts, validation reads, to depth 2 (a folder's entries and its subfolders'
-entries, never entering a linked folder): every home folder of the list above, `$XDG_CONFIG_HOME`
-and `$XDG_DATA_HOME`, every folder the environment names except a `$PATH` entry outside the
+entries, never entering a linked folder): every home folder of the list above (the default data
+and state homes included), `$XDG_CONFIG_HOME`, `$XDG_DATA_HOME` and `$XDG_STATE_HOME`, every folder the environment names except a `$PATH` entry outside the
 homes, and each home's own entries, of which only dot names (`.bashrc`, …) are followed. A folder
 reached first as a subfolder is read again to depth 2 when it is on that list itself. The rule is
 made from the link's text, joined (when relative) to the real path of the folder holding the link,
@@ -444,7 +448,10 @@ never gets this error.
 never mountable"). There is no `cfg(test)` or feature-gated bypass of the denylist: tests move
 their fixtures (under `target/`), never the wall.
 
-Candidates whose root is a symlink, a file, or missing are refused. A candidate that contains a
+Candidates whose root is a symlink, a file, or missing are refused. The root is judged as written
+without a trailing `/`, repeated `/` or `.` components (`~/proj/` and `~/proj/.` are `~/proj`), at
+validation and at the re-check: the kernel follows a final symlink of `x/` or `x/.`, so a linked
+root written that way is still refused `is-symlink`. A candidate that contains a
 *symlink to* a denylisted path (e.g. mounting `~/code` when `~/code/.ssh -> ~/.ssh`) is allowed:
 symlinks inside a mount resolve inside the container rootfs, which is the point of RT-FS-03.
 

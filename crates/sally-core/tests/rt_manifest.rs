@@ -659,16 +659,67 @@ fn rt_fs_05_denylisted_mounts_rejected() {
     }
 }
 
+/// The default data home (`~/.local/share`) and state home (`~/.local/state`) are rules whether
+/// or not `$XDG_DATA_HOME` or `$XDG_STATE_HOME` is exported: user units, session services and
+/// completion scripts the host runs live there. Controls: the data home refused the same way
+/// when its variable is exported with its default value, and a folder of the same name outside
+/// a home is accepted.
+#[test]
+fn rt_fs_05_the_default_data_and_state_homes_are_rules_unexported() {
+    let mut f = Fixture::new();
+    let home = f.home().to_owned();
+    for d in [
+        ".local/share/systemd/user",
+        ".local/share/dbus-1/services",
+        ".local/share/bash-completion",
+        ".local/state/app",
+        "code/myproject/.local/share/systemd",
+    ] {
+        std::fs::create_dir_all(home.join(d)).unwrap();
+    }
+    assert_eq!(f.env.xdg_data_home, None);
+    assert_eq!(f.env.xdg_state_home, None);
+    let refused = [
+        "~/.local/share/systemd",
+        "~/.local/share/dbus-1",
+        "~/.local/share/bash-completion",
+        "~/.local/share",
+        "~/.local/state",
+        "~/.local/state/app",
+    ];
+    for host in refused {
+        let r = f.load(&mount(host, "rw"));
+        assert_rejects(&r, "filesystem.mounts[0].host", Code::Denylisted);
+    }
+    twin_ok(&f, &mount("~/code/myproject/.local/share/systemd", "rw"));
+    f.env.xdg_data_home = Some(home.join(".local/share"));
+    assert_rejects(
+        &f.load(&mount("~/.local/share/systemd", "rw")),
+        "filesystem.mounts[0].host",
+        Code::Denylisted,
+    );
+}
+
 #[test]
 fn rt_fs_05_xdg_dirs_are_denylisted_when_set() {
     let mut f = Fixture::new();
     let cfg = f.root.join("xdg-config");
     let data = f.root.join("xdg-data");
+    let state = f.root.join("xdg-state");
     std::fs::create_dir_all(cfg.join("tool")).unwrap();
     std::fs::create_dir_all(data.join("app")).unwrap();
+    std::fs::create_dir_all(state.join("app")).unwrap();
     f.env.xdg_config_home = Some(cfg.clone());
     f.env.xdg_data_home = Some(data.clone());
-    for host in [cfg.join("tool"), data.join("app"), cfg, data] {
+    f.env.xdg_state_home = Some(state.clone());
+    for host in [
+        cfg.join("tool"),
+        data.join("app"),
+        state.join("app"),
+        cfg,
+        data,
+        state,
+    ] {
         let body = format!(
             "filesystem:\n  mounts:\n    - {{host: \"{}\", guest: /workspace/x, mode: ro}}\n",
             host.display()

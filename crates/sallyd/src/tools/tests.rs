@@ -1238,6 +1238,7 @@ fn the_session_mounts_take_their_roots_by_mode() {
         other_homes: Vec::new(),
         xdg_config_home: None,
         xdg_data_home: None,
+        xdg_state_home: None,
         xdg_runtime_dir: None,
         podman_storage: Vec::new(),
         env_dirs: Vec::new(),

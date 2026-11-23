@@ -27,6 +27,8 @@ const SYSTEM: &str = "system folders are never mountable";
 const SHARED_TMP: &str = "shared temp folders hold other programs' sockets (a network path), so they are never mountable";
 const RUNTIME: &str = "the runtime folder holds your session's sockets, so it is never mountable";
 const STORAGE: &str = "container storage is never mountable";
+const STATE: &str =
+    "the state folder holds history and state your tools load, so it is never mountable";
 const USER_DENY: &str = "listed in filesystem.deny";
 const DOTFILES: &str =
     "your shell and tools load your home's dotfiles, so their targets are never mountable";
@@ -99,6 +101,11 @@ const HOME_SUBTREES: &[(&str, &str)] = &[
     (".local/share/mise", EXECUTED),
     (".local/share/pnpm", EXECUTED),
 ];
+
+/// The default data and state homes under each home, rules whether or not `$XDG_DATA_HOME` or
+/// `$XDG_STATE_HOME` is exported: user units, session services, completion scripts and shell
+/// history the host loads live there (MANIFEST_SPEC §2).
+const DEFAULT_XDG_HOMES: &[(&str, &str)] = &[(".local/share", CONFIG), (".local/state", STATE)];
 
 /// System paths. `/tmp` and `/var/tmp` hold other programs' Unix sockets (ssh-agent, X11); a
 /// read-only bind does not stop `connect()` on a socket, so mounting them is a network path
@@ -215,6 +222,9 @@ impl Denylist {
         {
             rules.push(subtree_rule(dir, CONFIG));
         }
+        if let Some(dir) = &env.xdg_state_home {
+            rules.push(subtree_rule(dir, STATE));
+        }
         let xdg = [
             &env.xdg_runtime_dir,
             &env.xdg_config_home,
@@ -229,6 +239,14 @@ impl Denylist {
             rule(&d.path, Scope::Subtree, Some(&label), Some(ENV_DIR))
         }));
         rules.extend(extra.iter().map(|p| subtree_rule(p, USER_DENY)));
+        // Last, so a folder inside them that has its own rule is named by that rule.
+        for h in homes(env) {
+            rules.extend(
+                DEFAULT_XDG_HOMES
+                    .iter()
+                    .map(|(p, why)| subtree_rule(&h.join(p), why)),
+            );
+        }
         Self { rules }
     }
 
@@ -355,11 +373,15 @@ fn under_a_home(homes: &[PathBuf], p: &Path) -> bool {
 }
 
 /// Reads the folders whose links become rules (MANIFEST_SPEC §2), each to [`links::DEPTH`]:
-/// every home folder of the built-in list, the XDG config and data folders, the environment's
+/// every home folder of the built-in list and each home's default data and state folders, the
+/// XDG config, data and state folders, the environment's
 /// folders (a `$PATH` entry only when it lies under a home), then each home's dotfiles.
 fn scan_folders(env: &HostEnv, scan: &mut Scan) -> Result<(), Incomplete> {
     for h in homes(env) {
         for (p, why) in HOME_SUBTREES {
+            scan.read(&h.join(p), links::DEPTH, why)?;
+        }
+        for (p, why) in DEFAULT_XDG_HOMES {
             scan.read(&h.join(p), links::DEPTH, why)?;
         }
     }
@@ -368,6 +390,9 @@ fn scan_folders(env: &HostEnv, scan: &mut Scan) -> Result<(), Incomplete> {
         .flatten()
     {
         scan.read(dir, links::DEPTH, CONFIG)?;
+    }
+    if let Some(dir) = &env.xdg_state_home {
+        scan.read(dir, links::DEPTH, STATE)?;
     }
     let home_forms: Vec<PathBuf> = homes(env).flat_map(|h| forms_of(h)).collect();
     for d in env_rule_dirs(env) {
@@ -668,6 +693,7 @@ mod tests {
             home: home.into(),
             xdg_config_home: None,
             xdg_data_home: None,
+            xdg_state_home: None,
             other_homes: Vec::new(),
             xdg_runtime_dir: Some("/run/user/1000".into()),
             podman_storage: vec![format!("{home}/.local/share/containers/storage").into()],
@@ -743,6 +769,14 @@ mod tests {
             ".local/share/nvim",
             ".local/share/mise",
             ".local/share/pnpm",
+            // Under the default data and state homes, which are rules unexported.
+            ".local/share/systemd",
+            ".local/share/dbus-1",
+            ".local/share/bash-completion",
+            ".local/share/direnv",
+            ".local/share/kwalletd",
+            ".local/share",
+            ".local/state",
         ] {
             let why = d.refusal(&Path::new("/home/u").join(p).join("x"));
             assert!(
@@ -751,6 +785,42 @@ mod tests {
             );
         }
         assert_eq!(d.refusal(Path::new("/home/u/go/src")), None);
+    }
+
+    /// The default data home carries the exported data home's reason and the state home its
+    /// own, in every home; a folder inside them with its own rule is named by that rule (it
+    /// comes first). An exported state home elsewhere is a rule with the same reason.
+    #[test]
+    fn the_default_data_and_state_homes_name_their_reasons() {
+        let mut e = env("/home/u");
+        e.other_homes.push("/home/user".into());
+        e.xdg_state_home = Some("/srv/state".into());
+        let d = fixed(&e, &[]);
+        let why = |p: &str| d.refusal(Path::new(p)).unwrap_or_default();
+        assert_eq!(
+            STATE,
+            "the state folder holds history and state your tools load, so it is never mountable"
+        );
+        for h in ["/home/u", "/home/user"] {
+            assert_eq!(
+                why(&format!("{h}/.local/share/systemd")),
+                format!("is inside {h}/.local/share: {CONFIG}")
+            );
+            assert_eq!(
+                why(&format!("{h}/.local/state/app")),
+                format!("is inside {h}/.local/state: {STATE}")
+            );
+            assert_eq!(
+                why(&format!("{h}/.local/share/nvim/x")),
+                format!("is inside {h}/.local/share/nvim: {EXECUTED}")
+            );
+        }
+        assert_eq!(
+            why("/srv/state/app"),
+            format!("is inside /srv/state: {STATE}")
+        );
+        assert_eq!(why("/srv/other"), "");
+        assert_eq!(why("/home/u/.localx/share"), "");
     }
 
     #[test]
@@ -853,6 +923,12 @@ mod tests {
         );
         let why = d.refusal_by_id(t.id("home")).unwrap();
         assert!(why.contains("the home directory root"), "{why}");
+        // The default data home is a rule of its own.
+        let why = d.refusal_by_id(t.id("home/.local/share")).unwrap();
+        assert!(
+            why.contains("same directory as") && why.ends_with(CONFIG),
+            "{why}"
+        );
     }
 
     /// RT-FS-14: a root with the identity of an ancestor of a subtree rule (an alias of `~`'s
@@ -861,7 +937,7 @@ mod tests {
     fn the_identity_of_an_ancestor_of_a_protected_folder_is_refused() {
         let t = TmpHome::new("anc");
         let d = deny(&env(t.home().to_str().unwrap()), &[]);
-        for rel in ["home/.local", "home/.local/share", ""] {
+        for rel in ["home/.local", ""] {
             let why = d.refusal_by_id(t.id(rel)).unwrap();
             assert!(why.contains("which contains"), "{rel}: {why}");
         }
@@ -1005,7 +1081,10 @@ mod tests {
         let before = deny(&env(home.to_str().unwrap()), &[]).rules.len();
         link(&home, ".local/bin/k", ".ssh/key");
         assert_eq!(deny(&env(home.to_str().unwrap()), &[]).rules.len(), before);
-        link(&home, ".local/bin/x", ".local/share/foo/x");
+        // A target inside the default data home is covered by its rule too.
+        link(&home, ".local/bin/s", ".local/share/foo/x");
+        assert_eq!(deny(&env(home.to_str().unwrap()), &[]).rules.len(), before);
+        link(&home, ".local/bin/x", "foo/x");
         let d = deny(&env(home.to_str().unwrap()), &[]);
         assert_eq!(d.rules.len(), before + 1);
         let w = why(&d, &home, ".local");
@@ -1013,7 +1092,7 @@ mod tests {
             w.starts_with("contains ") && w.ends_with(CREDENTIALS),
             "{w}"
         );
-        let w = why(&d, &home, ".local/share/foo");
+        let w = why(&d, &home, "foo");
         assert!(w.contains(".local/bin/x") && w.ends_with(EXECUTED), "{w}");
     }
 
