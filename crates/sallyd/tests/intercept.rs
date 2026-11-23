@@ -637,6 +637,66 @@ fn rt_sec_06b_range_headers_never_reach_a_grant_host() {
     });
 }
 
+/// `mock.test` with a `GITHUB_TOKEN` grant (so intercepted) and both body caps at the smallest
+/// value the validator takes, 1 KiB (RT-NET-09).
+const CAP_MANIFEST: &str = "network:\n  mode: proxy\n  allow:\n    - host: mock.test\n  \
+                            max_request_bytes: 1KiB\n  max_response_bytes: 1KiB\n\
+                            secrets:\n  - name: GITHUB_TOKEN\n    inject: {host: mock.test, \
+                            header: Authorization, format: \"Bearer {value}\"}\n";
+
+/// RT-NET-09, body caps: inside an intercepted tunnel of a real session, the manifest's
+/// `max_request_bytes` and `max_response_bytes` hold. A request body one byte over is 413
+/// `request-too-large` and never reaches the upstream; a response body one byte over is 502
+/// `response-too-large` and none of it is forwarded; each refusal has its `egress.limit` entry.
+/// Controls: the session's `body_caps`, taken from the manifest's `network` in `egress::net` and
+/// handed to `Limits::of_session`; either one left unwired lets its one-over body through.
+/// In-test controls: a body exactly at each cap passes, on the same session.
+#[test]
+fn rt_net_09_body_caps_hold_inside_an_intercepted_tunnel() {
+    const CAP: usize = 1024;
+    rt().block_on(async {
+        let lx = Lx::new();
+        let r = session_of(&lx, "net09b", CAP_MANIFEST).await;
+        let post = |n: usize| {
+            format!(
+                "POST /sink HTTP/1.1\r\nHost: mock.test\r\nContent-Length: {n}\r\n\r\n{}",
+                "q".repeat(n)
+            )
+        };
+        let at = over(&lx, "net09b", "mock.test", &post(CAP)).await;
+        assert!(at.starts_with("HTTP/1.1 200 OK"), "{at}");
+        let over_req = over(&lx, "net09b", "mock.test", &post(CAP + 1)).await;
+        assert!(over_req.starts_with("HTTP/1.1 413 "), "{over_req}");
+        assert!(over_req.contains("request-too-large"), "{over_req}");
+        let seen = lx.egress.dialer.seen();
+        assert_eq!(seen.len(), 1, "the body over the cap reached the upstream");
+        assert!(seen[0].ends_with(&"q".repeat(CAP)), "{}", seen[0]);
+        let len = |n: usize| get_req("mock.test", &format!("/len/{n}"), "");
+        let at = over(&lx, "net09b", "mock.test", &len(CAP)).await;
+        assert!(at.starts_with("HTTP/1.1 200 OK"), "{at}");
+        assert!(at.ends_with(&"b".repeat(CAP)), "{at}");
+        let over_resp = over(&lx, "net09b", "mock.test", &len(CAP + 1)).await;
+        assert!(over_resp.starts_with("HTTP/1.1 502 "), "{over_resp}");
+        assert!(over_resp.contains("response-too-large"), "{over_resp}");
+        assert!(!over_resp.contains("bbbb"), "{over_resp}");
+        lx.stop(r).await;
+        let limits: Vec<_> = lx
+            .events
+            .all()
+            .into_iter()
+            .filter(|(e, _)| e == "egress.limit")
+            .map(|(_, a)| (a["reason"].clone(), a["host"].clone()))
+            .collect();
+        assert_eq!(
+            limits,
+            [
+                (json!("request-too-large"), json!("mock.test")),
+                (json!("response-too-large"), json!("mock.test")),
+            ]
+        );
+    });
+}
+
 /// `mock.test` (a `GITHUB_TOKEN` grant), `mock3.test` (a `HOST_TOKEN` grant) and any host
 /// under `*.mock.test` (allowed, no grant, so spliced: a grant host must be exact; architect
 /// Q279).

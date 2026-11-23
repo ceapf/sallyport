@@ -168,7 +168,8 @@ impl Pki {
 /// as its body and the request's `Authorization` value in an `X-Echo-Authorization` header
 /// (RT-SEC-06), `/redirect` a 302 to `https://mock2.test/echo-headers`, `/echo-gzip` a
 /// gzip-encoded body, `/echo-forms` the encodings of `GIT_TOKEN` chunked ([`echo_forms`],
-/// RT-SEC-12), anything else `ok`.
+/// RT-SEC-12), `/len/<n>` a body of `n` bytes `b` (RT-NET-09's response cap), anything else
+/// `ok`.
 async fn serve_tls(
     far: DuplexStream,
     cfg: Arc<rustls::ServerConfig>,
@@ -209,6 +210,10 @@ async fn serve_tls(
                 "Content-Encoding: gzip\r\n".into(),
                 "GZIPPED".into(),
             ),
+            p if p.starts_with("/len/") => {
+                let n = p["/len/".len()..].parse::<usize>().unwrap_or(0);
+                ("200 OK", String::new(), "b".repeat(n))
+            }
             _ => ("200 OK", String::new(), "ok".into()),
         };
         let resp = format!(
