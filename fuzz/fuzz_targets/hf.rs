@@ -101,7 +101,11 @@ fn check_text(s: &str) {
     }
 
     if let Ok(p) = RepoPath::parse(s) {
-        assert!(p.as_str().split('/').all(|seg| !seg.is_empty() && seg != "." && seg != ".."));
+        assert!(
+            p.as_str()
+                .split('/')
+                .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+        );
         assert!(
             p.encoded()
                 .bytes()
