@@ -1,7 +1,8 @@
 //! Cleanup that fails the first time, with real containers (rootless Podman): a failed launch
 //! whose cleanup could not remove its container is retried until the container is gone, holding
-//! the session's claim and forms until `sandbox.cleaned` (architect Q559, Q562); an orphan sweep
-//! removes a paused orphan, audits a removal that failed and goes on to the next (Q563).
+//! the session's claim and forms until `sandbox.cleaned`; an orphan sweep removes an orphan
+//! whose first removal failed while it was paused, audits a removal that failed and goes on to
+//! the next. Each failure is injected by a podman wrapper.
 //!
 //! The fixture is `common::container`; these tests never skip.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -71,16 +72,16 @@ async fn until(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
-/// AR1, architect Q559 and Q562. A launch fails after `podman create` (the entry exits at once)
-/// and its cleanup cannot remove the container. Deny leg: while `rm` keeps failing, the
+/// A launch fails after `podman create` (its `start` is refused) and its cleanup cannot remove
+/// the container. Deny leg: while `rm` keeps failing, the
 /// container stays, the session stays live (the periodic sweep leaves it), its folder stays
 /// claimed and its forms stay registered, and no `sandbox.cleaned` is written. Allow leg: once
 /// `rm` works, the retry removes the container and the directories, and `sandbox.cleaned`
 /// follows the launch's `sandbox.refuse`; while that entry waits, the claim and the forms are
 /// still held (entry, then unclaim, then forget); after it both are released and the same folder
-/// launches. Controls: removing the retry task leaves the container (the allow leg's wait fails);
-/// moving the unclaim before the entry lets the held-window launch through; dropping the task's
-/// forget leaves the forms registered.
+/// launches. Controls, each run by hand: without the retry task no retry comes (the deny leg's
+/// wait fails); moving the unclaim before the entry lets the held-window launch through;
+/// dropping the task's forget leaves the forms registered.
 #[test]
 fn a_failed_launch_cleanup_is_retried_until_the_container_is_gone() {
     let (dir, _gone) = wrapper_dir("retry");
@@ -166,11 +167,36 @@ fn a_failed_launch_cleanup_is_retried_until_the_container_is_gone() {
     });
 }
 
-/// AR2, architect Q563: a sweep removes an orphan the disk watchdog left paused (a `sallyd`
-/// killed in the middle of a stage walk), as a stop does: through the removal that thaws and
-/// retries. A plain `rm --force` leaves it, and the startup sweep then refuses the daemon.
+/// A podman whose `rm` fails while the container it names (its last argument) is paused, as
+/// the real one asks: `inspect` through the real podman prints `paused`. Each refusal adds a
+/// line to `<at>/rm-refused`; the message is the test's own. Anything else passes through,
+/// including an `inspect` that fails or prints another state. It models a removal that fails on
+/// a frozen container: on a loaded host a process can outlive podman's wait ("given PID did not
+/// die within timeout"). On an idle host (podman 4.9.3, rootless, cgroup v2) a plain
+/// `rm --force --time 0` was measured to remove a paused container, so the failure is injected.
+fn paused_rm_failing_podman(at: &Path, real: &Path) -> PathBuf {
+    wrap_podman(at, real, |at, real| {
+        format!(
+            "#!/bin/sh\n\
+             for a in \"$@\"; do last=\"$a\"; done\n\
+             if [ \"$1\" = rm ] && [ \"$('{real}' inspect --format '{{{{.State.Status}}}}' \
+             \"$last\" 2>/dev/null)\" = paused ]; then\n\
+             echo x >> '{at}/rm-refused'\n\
+             echo 'rm refused by the test: container is paused' >&2; exit 125\n\
+             fi\n\
+             exec '{real}' \"$@\"\n"
+        )
+    })
+}
+
+/// A sweep removes an orphan the disk watchdog left paused (a `sallyd` killed in the middle
+/// of a stage walk), as a stop does: through the removal that thaws and retries. The container
+/// is really paused; the failure of `rm` on it is injected by the wrapper. Controls: on the
+/// code before this change (a plain `rm`) the startup sweep fails with the wrapper's error;
+/// without the thaw in the removal every `rm` is refused and the orphan stays.
 #[test]
 fn a_paused_orphan_is_removed() {
+    let (dir, _gone) = wrapper_dir("paused");
     rt().block_on(async {
         let x = Lx::new();
         let v =
@@ -188,7 +214,7 @@ fn a_paused_orphan_is_removed() {
             ])
             .await;
         assert_eq!(status, "paused");
-        let next = x.next_sallyd();
+        let next = x.next_sallyd_with_podman(|real| paused_rm_failing_podman(&dir, real));
         let removed = next
             .launcher
             .remove_orphans(&x.scope, Sweep::Startup)
@@ -196,6 +222,7 @@ fn a_paused_orphan_is_removed() {
             .unwrap();
         assert_eq!(removed, std::slice::from_ref(&name));
         assert!(!exists(&name));
+        assert_eq!(refused(&dir), 1, "the wrapper refused the paused rm once");
         assert_eq!(next.events.list(), ["sandbox.orphan_removed"]);
     });
 }
@@ -238,7 +265,7 @@ fn orphan(name: &str, installation: &str) -> String {
     String::from_utf8_lossy(&made.stdout).trim().to_owned()
 }
 
-/// AR2, architect Q563: one orphan's removal fails. The sweep audits it after its
+/// One orphan's removal fails. The sweep audits it after its
 /// `sandbox.orphan_removed` as `sandbox.orphan_remove_failed` (with the error), writes one
 /// oplog error line, removes the other orphan anyway, and then returns one error naming the
 /// counts and the first name. The next sweep, with `rm` working, removes the one left.
