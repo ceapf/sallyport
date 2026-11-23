@@ -449,6 +449,13 @@ pub(crate) fn normalize(p: &Path) -> PathBuf {
     out
 }
 
+/// `p` without a trailing `/`, repeated `/` or `.` components; `..` is kept. The kernel follows
+/// a final symlink of `x/` or `x/.` (for `lstat` too), so a mount root is judged by the path
+/// without them: `x` itself.
+fn without_dot_components(p: &Path) -> PathBuf {
+    p.components().collect()
+}
+
 /// Expands `~` / `~/…` against `home`; requires an absolute result.
 pub(crate) fn expand(raw: &str, home: &Path) -> Result<PathBuf, String> {
     if raw.is_empty() {
@@ -567,7 +574,7 @@ pub(crate) fn check_mount_host(
     deny: &Denylist,
 ) -> Result<(PathBuf, DirId), (Code, String)> {
     use std::os::unix::fs::MetadataExt;
-    let expanded = expand(raw, home).map_err(|m| (Code::InvalidValue, m))?;
+    let expanded = without_dot_components(&expand(raw, home).map_err(|m| (Code::InvalidValue, m))?);
     if let Some(why) = deny.refusal(&normalize(&expanded)) {
         return Err((Code::Denylisted, format!("{raw:?} {why} (denylisted)")));
     }

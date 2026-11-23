@@ -408,6 +408,15 @@ mod tests {
             first(&[("~/code/p", p), ("/srv/q", q), ("/srv/q/", q)], home),
             None
         );
+        // A trailing `/` or `/.` is the same path, as the mount-root check judges it
+        // (`paths::check_mount_host`): a root that is a link is refused there in every spelling.
+        assert_eq!(
+            first(
+                &[("~/code/p/.", p), ("/srv/q/.", q), ("~/code/p/./", p)],
+                home
+            ),
+            None
+        );
         assert_eq!(first(&[("~", home)], home), None);
         for written in [
             "~/code/link",

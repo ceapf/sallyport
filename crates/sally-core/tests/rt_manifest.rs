@@ -692,6 +692,24 @@ fn rt_fs_06_symlinked_mount_root_rejected_at_validate() {
     assert_rejects(&r, "filesystem.mounts[0].host", Code::IsSymlink);
 }
 
+/// A trailing `/` or `/.` makes the kernel follow a final symlink, `lstat` included, so the root
+/// is judged as the same path without them. Controls: the bare spelling is refused the same way,
+/// and an ordinary folder written with a trailing `/` or `/.` is accepted.
+#[test]
+fn rt_fs_06_a_symlinked_root_with_a_trailing_slash_or_dot_is_refused() {
+    let f = Fixture::new();
+    std::fs::create_dir(f.home().join("real")).unwrap();
+    std::os::unix::fs::symlink(f.home().join("real"), f.home().join("proj")).unwrap();
+    for host in ["~/proj", "~/proj/", "~/proj/.", "~/proj//", "~/proj/./"] {
+        let r = f.load(&mount(host, "rw"));
+        assert_rejects(&r, "filesystem.mounts[0].host", Code::IsSymlink);
+        assert_eq!(r.as_ref().unwrap_err().errors.len(), 1, "{host}");
+    }
+    for host in ["~/real", "~/real/", "~/real/."] {
+        twin_ok(&f, &mount(host, "rw"));
+    }
+}
+
 #[test]
 fn rt_fs_06_swap_after_validation_is_caught_by_recheck() {
     let f = Fixture::new();
@@ -713,6 +731,22 @@ fn rt_fs_06_swap_after_validation_is_caught_by_recheck() {
     std::fs::create_dir(f.home().join("proj")).unwrap();
     let e = v.recheck_mounts(&f.env).unwrap_err();
     assert_eq!(e.errors[0].code, Code::MountChanged);
+
+    // The same swap under the spellings a trailing `/` or `/.` gives (the kernel follows the
+    // link there): the re-check judges them as the bare path. Control: before the swap each
+    // re-check passes.
+    for host in ["~/proj2/", "~/proj2/."] {
+        let dir = f.home().join("proj2");
+        std::fs::create_dir(&dir).unwrap();
+        let v = f.load(&mount(host, "rw")).unwrap().manifest;
+        assert!(v.recheck_mounts(&f.env).is_ok(), "{host}");
+        std::fs::rename(&dir, f.home().join("proj2.orig")).unwrap();
+        std::os::unix::fs::symlink(f.home().join("proj2.orig"), &dir).unwrap();
+        let e = v.recheck_mounts(&f.env).unwrap_err();
+        assert_eq!(e.errors[0].code, Code::IsSymlink, "{host}");
+        std::fs::remove_file(&dir).unwrap();
+        std::fs::remove_dir(f.home().join("proj2.orig")).unwrap();
+    }
 }
 
 // ---- RT-SEC-08: secret via manifest --------------------------------------------------------------
