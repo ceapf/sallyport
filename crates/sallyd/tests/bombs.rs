@@ -169,6 +169,34 @@ fn event(text: &str, name: &str) -> u64 {
         .unwrap_or_else(|| panic!("{name} in {text}"))
 }
 
+/// The prefix of the fork-bomb test's one diagnostic line (#141); `scripts/loaded-repeat.sh`
+/// looks for it.
+const FIGURES: &str = "rt_ag_09 fork-bomb figures:";
+
+/// The fork-bomb test's diagnostic line: `memory.peak`, the `memory.events` counters, `pids.peak`
+/// and the `pids.events` max counter of the container's cgroup `cg`. A peak file the kernel does
+/// not have prints `absent`; a failed read of a file that is there panics as [`read`] does.
+#[track_caller]
+fn figures(x: &Lx, r: &Running, cg: &std::path::Path) -> String {
+    let peak = |file: &str| {
+        if cg.join(file).exists() {
+            read(x, r, cg, file).trim().to_string()
+        } else {
+            "absent".to_string()
+        }
+    };
+    let mem = read(x, r, cg, "memory.events");
+    let counters = ["max ", "oom ", "oom_kill ", "oom_group_kill "]
+        .map(|k| format!("{}={}", k.trim(), event(&mem, k)))
+        .join(" ");
+    format!(
+        "{FIGURES} memory.peak={} {counters} pids.peak={} pids.events.max={}",
+        peak("memory.peak"),
+        peak("pids.peak"),
+        event(&read(x, r, cg, "pids.events"), "max ")
+    )
+}
+
 /// The `session.resource_limit` entries naming `resource`, in order.
 fn limits(x: &Lx, resource: &str) -> Vec<serde_json::Value> {
     x.events
@@ -228,7 +256,16 @@ fn rt_ag_09_a_fork_bomb_is_held_by_the_pids_limit() {
             "{a}"
         );
         assert!(a["count"].as_u64().unwrap() > 0, "{a}");
-        assert!(limits(&x, "memory").is_empty(), "{:?}", x.events.list());
+        // #141 diagnostics, print-only: the container's memory and pids figures at the moment
+        // the no-memory-entry assertion is checked (figures only: public CI output).
+        eprintln!("{}", figures(&x, &r, &cg));
+        assert!(
+            limits(&x, "memory").is_empty(),
+            "{:?}; memory.events now: {}",
+            x.events.list(),
+            std::fs::read_to_string(cg.join("memory.events"))
+                .map_or_else(|e| format!("unreadable: {e}"), |t| t.replace('\n', " "))
+        );
         x.stop(r).await;
         let polls = started.elapsed().as_secs() + 2;
         let n = limits(&x, "pids").len() as u64;
