@@ -434,8 +434,8 @@ mod tests {
         );
     }
 
-    /// While a container may exist, a failed launch's cleanup tries again without bound and
-    /// keeps its claim.
+    /// While a container may exist, a failed launch's cleanup tries again after each pause of
+    /// the schedule, then, at the tenth try, is abandoned (keeping its claim).
     #[test]
     fn a_cleanup_whose_container_stays_backs_off_and_is_abandoned_at_the_tenth_try() {
         let mut t = CleanupTries::start(CleanupSchedule::PRODUCTION);

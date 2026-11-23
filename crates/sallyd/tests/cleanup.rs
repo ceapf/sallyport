@@ -1,8 +1,8 @@
 //! Cleanup that fails the first time, with real containers (rootless Podman): a failed launch
-//! whose cleanup could not remove its container is retried until the container is gone, holding
-//! the session's claim and forms until `sandbox.cleaned`; an orphan sweep removes an orphan
-//! whose first removal failed while it was paused, audits a removal that failed and goes on to
-//! the next. Each failure is injected by a podman wrapper.
+//! whose cleanup could not remove its container is retried, backed off and capped, holding the
+//! session's claim and forms until `sandbox.cleaned`, and its claim past the cap
+//! (`sandbox.cleanup_abandoned`); an orphan sweep never thaws a paused orphan, audits a
+//! removal that failed and goes on to the next. Each failure is injected by a podman wrapper.
 //!
 //! The fixture is `common::container`; these tests never skip.
 #![allow(clippy::unwrap_used, clippy::expect_used)]

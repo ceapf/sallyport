@@ -407,8 +407,8 @@ impl Launcher {
     }
 
     /// Drops session `id`'s secrets from the logs' redactors, once its last entry is written:
-    /// after `sandbox.refuse` for a refused launch (after `sandbox.cleaned` when its cleanup was
-    /// retried), after `session.closed` ([`Self::close`]) for a session (architect Q219). Safe
+    /// after `sandbox.refuse` for a refused launch (after `sandbox.cleaned` or
+    /// `sandbox.cleanup_abandoned` when its cleanup was retried), after `session.closed` ([`Self::close`]) for a session (architect Q219). Safe
     /// to call more than once. Off the runtime: the swap takes the audit writer's lock, which an
     /// append holds through its fsync.
     async fn release_secrets(&self, id: &str) {

@@ -367,8 +367,8 @@ impl Launcher {
         refused
     }
 
-    /// After a refused workspace's last entry (`sandbox.refuse`, or `sandbox.cleaned` after a
-    /// retried cleanup), its secrets leave the logs' redactors (architect Q219). A harness
+    /// After a refused workspace's last entry (`sandbox.refuse`, or `sandbox.cleaned` or
+    /// `sandbox.cleanup_abandoned` after a retried cleanup), its secrets leave the logs' redactors (architect Q219). A harness
     /// shares its session's id, so only a workspace releases them.
     pub(super) async fn forget(&self, held: &Held) {
         if held.role == Role::Workspace {
