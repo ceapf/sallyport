@@ -245,9 +245,12 @@ fn an_unreadable_store_fails_a_grant_and_is_not_opened_without_one() {
 }
 
 /// The unit twin of the CLI test of the same rule: a binary `config.toml` names makes its
-/// folder a denylist rule, and the refusal (1) names the setting. Control: with no
-/// `config.toml` the same manifest is valid (0). A symlinked `config.toml` is never followed:
-/// could not read (2), naming the file, on validate and summary alike.
+/// folder a denylist rule (1, `denylisted` at the mount). Control: with no `config.toml` the
+/// same manifest is valid (0), so the config is what refuses it. A symlinked `config.toml` is
+/// never followed: could not read (2), naming the file, on validate and summary alike. The
+/// setting's name is pinned by the CLI test and `paths.rs`, not here: a diagnostic is cut at
+/// 300 characters, and in a long checkout (a mutation run's copy) the two paths before the
+/// name fill them.
 #[test]
 fn the_folder_of_a_binary_the_config_names_is_refused() {
     let s = Scratch::new("binf");
@@ -283,9 +286,8 @@ fn the_folder_of_a_binary_the_config_names_is_refused() {
         });
         assert_eq!((code, out.as_str()), (EXIT_REFUSED, ""), "{err}");
         assert!(
-            err.contains("filesystem.mounts[0].host")
-                && err.contains("(the folder of sandbox.runtime_path)")
-                && err.contains("denylisted"),
+            err.starts_with("error: filesystem.mounts[0].host: ")
+                && err.trim_end().ends_with("[denylisted]"),
             "{err}"
         );
     }
