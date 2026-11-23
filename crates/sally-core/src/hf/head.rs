@@ -70,13 +70,17 @@ pub enum Body {
     FromStart,
 }
 
-/// The decision on the head of a file-list request.
+/// The decision on the head of a file-list request. The list carries the publisher's hashes, so
+/// it is read from the API host only: a list request to any other host, and a redirect of the
+/// list call to any other host, are refused.
 ///
 /// # Errors
 /// The refusal.
 pub fn decide_list(head: &Head<'_>, req: &Request, tries: &mut Tries) -> Result<Step, HfError> {
+    if req.host() != API_HOST {
+        return Err(HfError::RedirectRefused);
+    }
     match common(head, req, tries)? {
-        // The list carries the publisher's hashes: it is read from the API host only.
         Some(Step::Redirect(next)) if next.host() != API_HOST => {
             return Err(HfError::RedirectRefused);
         }

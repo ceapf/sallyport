@@ -195,8 +195,9 @@ fn redirects_are_bounded_and_checked() {
 }
 
 /// The file list, which carries the publisher's hashes, is read from the API host only: a
-/// redirect of the list call to any other Hub host is refused. Control: a relative Location and
-/// an absolute one on the API host are followed, with the token.
+/// redirect of the list call to any other Hub host is refused, and so is a list request already
+/// off the API host, whether its answer is a redirect on its own host or a body. Control: a
+/// relative Location and an absolute one on the API host (any case) are followed, with the token.
 #[test]
 fn a_list_redirect_off_the_api_host_is_refused() {
     for off in [
@@ -216,8 +217,8 @@ fn a_list_redirect_off_the_api_host_is_refused() {
         );
     }
     // The API host only, not the same host only: a list call already off it is refused even
-    // when the next Location stays on its host.
-    let off_host = crate::hf::plan::redirect(&list(), "https://cdn-lfs.hf.co/x").unwrap();
+    // when the next Location stays on its host, and its body is never read.
+    let off_host = redirect(&list(), "https://cdn-lfs.hf.co/x").unwrap();
     let relative = Head {
         location: Some("/y"),
         ..head(302)
@@ -227,9 +228,23 @@ fn a_list_redirect_off_the_api_host_is_refused() {
         decide_list(&relative, &off_host, &mut t),
         Err(HfError::RedirectRefused)
     );
+    let body = Head {
+        content_length: Some("10"),
+        ..head(200)
+    };
+    assert_eq!(
+        decide_list(&body, &off_host, &mut t),
+        Err(HfError::RedirectRefused)
+    );
+    assert_eq!(
+        decide_list(&body, &list(), &mut t),
+        Ok(Step::Body(Body::List)),
+        "control: the same head on the API host is the list"
+    );
     for on in [
         "/api/models/a/b/revision/main?blobs=true",
         "https://huggingface.co/x",
+        "https://HUGGINGFACE.CO/x",
     ] {
         let h = Head {
             location: Some(on),
