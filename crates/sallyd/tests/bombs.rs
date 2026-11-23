@@ -1,9 +1,9 @@
 //! RT-AG-09, the bombs: a fork bomb, a memory bomb and a `/tmp` filler are each contained by the
 //! session's limits (`runtime.pids`, `runtime.memory`, `runtime.tmp_size`). The fork bomb and
 //! the memory bomb are also audited: the watchdog's cgroup observer writes
-//! `session.resource_limit` (`pids-max`, `oom-kill`) and the session runs on (#27, architect
-//! Q48). The fork bomb runs with `runtime.memory` 256 MiB, memory to spare; the memory bomb and
-//! the `/tmp` filler run with 64 MiB (#141). The `/tmp` filler is contained only: a tmpfs has no
+//! `session.resource_limit` (`pids-max`, `oom-kill`) and the session runs on (#27). The fork
+//! bomb runs with `runtime.memory` 256 MiB, memory to spare; the memory bomb and the `/tmp`
+//! filler run with 64 MiB (#141). The `/tmp` filler is contained only: a tmpfs has no
 //! kernel event. The stage-size and floor parts of the row are in `disk.rs` and `launch.rs`. The
 //! fixture is `common::container`; these tests never skip.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -20,9 +20,10 @@ const PIDS: u32 = 64;
 const TMP_MIB: u64 = 8;
 /// `runtime.memory` of the memory bomb and the `/tmp` filler.
 const MEMORY_MIB: u64 = 64;
-/// `runtime.memory` of the fork bomb alone, the maintainer's decision on #141: under a full
-/// suite run its `memory.peak` reached the 64 MiB limit in 2 of 50 runs (PROBE_NOTES), so it
-/// runs with memory to spare and `runtime.pids` is the limit it is there to reach.
+/// `runtime.memory` of the fork bomb alone, the maintainer's decision on #141: with 64 MiB its
+/// `memory.peak` reached the limit in 2 of 50 runs beside a `make test` pass and in 1 of 2 runs
+/// without load (PROBE_NOTES), so it runs with memory to spare and `runtime.pids` is the limit
+/// it is there to reach.
 const FORK_MEMORY_MIB: u64 = 256;
 
 async fn launch_small(x: &Lx, tag: &str, memory_mib: u64) -> Running {
