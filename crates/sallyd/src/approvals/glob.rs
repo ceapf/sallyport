@@ -217,6 +217,19 @@ mod tests {
         }
     }
 
+    /// RT-MAN-05: the validator refuses a glob with whitespace at either end, so the matcher takes
+    /// it as `**` and every path asks; the same glob without the space matches only its own path.
+    #[test]
+    fn a_glob_with_a_leading_or_trailing_space_matches_every_path() {
+        for bad in [" drafts/*.md", "drafts/*.md "] {
+            assert!(check_glob(bad).is_err(), "{bad:?}");
+            assert!(matches(bad, "anything/at/all"), "{bad:?}");
+            assert!(matches(bad, "drafts/a.md"), "{bad:?}");
+        }
+        assert!(!matches("drafts/*.md", "anything/at/all"));
+        assert!(matches("drafts/*.md", "drafts/a.md"));
+    }
+
     #[test]
     fn bang_and_dots_inside_a_segment_are_literal() {
         assert!(matches("a!", "a!"));
