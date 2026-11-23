@@ -320,7 +320,8 @@ curated, so a wildcard over a shared-hosting suffix they do not name is an ordin
 stripped; `*.example.com` matches `a.example.com` and `a.b.example.com` but **not**
 `example.com` and **not** `example.com.evil.net`. IP literals in any form are always denied.
 `"*"` matches any hostname but still goes through the IP-range filter (no
-loopback/private/link-local/host-own) and requires `acknowledge_unrestricted_egress: true`.
+loopback/private/link-local/own/connected-network address; the classes in full: ARCHITECTURE
+§7) and requires `acknowledge_unrestricted_egress: true`.
 
 ### SecretGrant
 ```yaml
