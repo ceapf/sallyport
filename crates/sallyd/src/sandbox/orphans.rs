@@ -519,7 +519,11 @@ mod tests {
         assert_eq!(e.decision_value(), Some("deny"));
         assert_eq!(
             e.resolved(&sally_core::audit::Redactor::default()),
-            serde_json::json!({"container": "sp-ws-t-1", "id": cid("sp-ws-t-1"), "sweep": "startup"})
+            serde_json::json!({
+                "container": "sp-ws-t-1",
+                "id": cid("sp-ws-t-1"),
+                "sweep": "startup",
+            })
         );
         assert!(format!("{e:?}").contains("session: None"));
     }

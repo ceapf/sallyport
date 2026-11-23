@@ -63,9 +63,9 @@ fn refused(at: &Path) -> usize {
         .unwrap_or(0)
 }
 
-/// The longest the deny leg waits for five tries of a cleanup whose `rm` keeps failing (each
-/// try is the removal's four attempts two seconds apart, then the retry pause).
-const LONG_BOUND: Duration = Duration::from_secs(120);
+/// The longest the deny leg waits for six tries of a cleanup whose `rm` keeps failing (each
+/// try is the removal's four attempts two seconds apart, then the retry pause: about 8–10 s).
+const LONG_BOUND: Duration = Duration::from_secs(180);
 
 /// Waits within [`BOUND`] until `done`, naming `what` if it never is.
 async fn until(what: &str, done: impl FnMut() -> bool) {
@@ -116,13 +116,14 @@ fn a_failed_launch_cleanup_is_retried_until_the_container_is_gone() {
         let cleanup = refuse["cleanup"].as_str().unwrap_or_default();
         assert!(cleanup.starts_with("incomplete, kept: "), "{refuse}");
 
-        // Deny leg, past the try at which a cleanup that took the container for gone would end
-        // (the first try and the three bounded ones): each try refuses `first` removals, so a
-        // refusal beyond `first * 4` is a fifth try, and the claim is still held after it.
+        // Deny leg, past the last try a cleanup that took the container for gone could make:
+        // three bounded tries after the first try that saw it "gone", which is try 4 when both
+        // checks misjudge and try 5 when only the retry task's does. Each try refuses `first`
+        // removals, so a refusal beyond `first * 5` is a sixth try, and the claim is still held.
         let first = refused(&dir);
         assert!(first > 0, "the first cleanup never tried rm");
-        let past_the_bound = first * 4;
-        until_within("a fifth try", LONG_BOUND, || refused(&dir) > past_the_bound).await;
+        let past_the_bound = first * 5;
+        until_within("a sixth try", LONG_BOUND, || refused(&dir) > past_the_bound).await;
         assert!(exists(&name), "the container went while rm failed");
         assert!(
             x.launcher
@@ -164,10 +165,10 @@ fn a_failed_launch_cleanup_is_retried_until_the_container_is_gone() {
         assert_eq!(cleaned["container"], name.as_str(), "{cleaned}");
         assert!(cleaned["probe"].is_null(), "{cleaned}");
         assert_eq!(cleaned["directories"], "removed", "{cleaned}");
-        // At least the five tries the deny leg waited for (its wait may end inside the fifth,
+        // At least the six tries the deny leg waited for (its wait may end inside the sixth,
         // which then removes it).
         let attempts = cleaned["attempts"].as_u64().unwrap_or_default();
-        assert!(attempts >= 5, "{cleaned}");
+        assert!(attempts >= 6, "{cleaned}");
         assert_eq!(
             all.iter().filter(|(e, _)| e == "sandbox.cleaned").count(),
             1
@@ -230,13 +231,28 @@ fn a_failed_launch_gives_up_its_directories_after_three_more_tries() {
         assert_eq!(cleaned["attempts"], 4, "{cleaned}");
         assert_eq!(cleaned["container"], name.as_str(), "{cleaned}");
         assert!(!exists(&name));
+        // The oplog is written by its own thread: wait for the line, then read it exactly.
+        until("the kept line", || {
+            x.oplog_lines
+                .text()
+                .lines()
+                .any(|l| l.contains("directories not removed"))
+        })
+        .await;
         let log = x.oplog_lines.text();
-        let kept: Vec<_> = log
-            .lines()
-            .filter(|l| l.contains("directories not removed"))
-            .collect();
+        let lines = |what: &str| -> Vec<String> {
+            log.lines()
+                .filter(|l| l.contains(what))
+                .map(str::to_owned)
+                .collect()
+        };
+        let kept = lines("directories not removed");
         assert_eq!(kept.len(), 1, "{log}");
         assert!(kept.iter().all(|l| l.contains("try 4")), "{log}");
+        // When the retries started, with the first try's error.
+        let started = lines("cleanup is retried");
+        assert_eq!(started.len(), 1, "{log}");
+        assert!(started.iter().all(|l| l.contains("try 1")), "{log}");
         let e = x.launch(&v, "while-unshare-fails").await.unwrap_err();
         assert!(
             e.to_string().contains("start refused"),
@@ -386,18 +402,19 @@ fn orphan(name: &str, installation: &str) -> String {
 /// `sandbox.orphan_removed` as `sandbox.orphan_remove_failed` (with the error), writes one
 /// oplog error line, removes the other orphans anyway, and then returns one error naming the
 /// counts and the first name. The next sweep, with `rm` working, removes the one left.
-/// Controls: the other orphans' removal (the sweep went on: one was created before the stuck
-/// one and one after, so whichever order podman lists them in, one comes after it); the second
-/// sweep (the failure was the wrapper's, not the container's).
+/// Controls: the other orphans' removal (the sweep went on: one was created and named before the
+/// stuck one and one after, so whether podman lists them by creation time or by name, either
+/// way round, one comes after it); the second sweep (the failure was the wrapper's, not the
+/// container's).
 #[test]
 fn a_failed_orphan_removal_is_audited_and_the_sweep_goes_on() {
     let (dir, _gone) = wrapper_dir("orphans");
     rt().block_on(async {
         let x = Lx::with_podman(|real| id_rm_failing_podman(&dir, real));
         let (before_it, stuck, after_it) = (
-            format!("sp-ws-{}-before", x.scope),
-            format!("sp-ws-{}-stuck", x.scope),
-            format!("sp-ws-{}-after", x.scope),
+            format!("sp-ws-{}-a", x.scope),
+            format!("sp-ws-{}-b-stuck", x.scope),
+            format!("sp-ws-{}-c", x.scope),
         );
         orphan(&before_it, x.installation.as_str());
         let stuck_id = orphan(&stuck, x.installation.as_str());
