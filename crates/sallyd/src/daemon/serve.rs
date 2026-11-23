@@ -14,10 +14,13 @@
 //!
 //! Shutdown (SIGTERM, SIGINT, SIGHUP, SIGQUIT, or a panic in a task that is not a session's;
 //! a signal that arrives during startup is handled once it is done): `control.sock` is closed
-//! first, then every session is stopped `shutdown`, all at once. A container not confirmed gone,
-//! or a panic, makes `sallyd` exit non-zero; so does a second signal during the shutdown, at
-//! once. A session's workspace or harness container that `sallyd` cannot stop because it was
-//! killed outright is bounded by conmon's `--timeout` backstop (#92, architect Q60): it ends
+//! first, then every session is stopped `shutdown`, all at once, and then the launcher is asked
+//! once which failed launches have a container not confirmed gone (a cleanup still retrying, or
+//! one abandoned at its cap); shutdown waits for none of them. A container not confirmed gone,
+//! a session's or a failed launch's, or a panic, makes `sallyd` exit non-zero; so does a second
+//! signal during the shutdown, at once. A session's workspace or harness container that
+//! `sallyd` cannot stop because it was killed outright is bounded by conmon's `--timeout`
+//! backstop (#92, architect Q60): it ends
 //! `runtime.timeout` + 300 s after its `podman init`; the next start's orphan sweep removes the
 //! workspace and harness containers and probes still left. An inference container has no
 //! backstop and no sweep yet, and step 4 removes only `sessions/` and `control.sock`, so the
@@ -118,7 +121,7 @@ pub enum DaemonError {
         /// The task.
         task: &'static str,
     },
-    /// Sessions whose containers could not be confirmed gone at shutdown.
+    /// Sessions, or failed launches, whose containers could not be confirmed gone at shutdown.
     #[error("containers of sessions {0:?} could not be confirmed gone")]
     Unconfirmed(Vec<String>),
     /// A second signal arrived while sessions were being stopped.
@@ -396,7 +399,12 @@ async fn serve(
     log.info(LOG, "serving", &[("socket", CONTROL_SOCK)]);
     let sweeping = crash.spawn(
         "sweep",
-        sweep::every(launcher, String::new(), sweep::ORPHAN_SWEEP, log.clone()),
+        sweep::every(
+            Arc::clone(&launcher),
+            String::new(),
+            sweep::ORPHAN_SWEEP,
+            log.clone(),
+        ),
     );
 
     let crashed = tokio::select! {
@@ -428,7 +436,20 @@ async fn serve(
             "containers not confirmed gone",
             &[("sessions", &unconfirmed.join(","))],
         );
-        return Err(DaemonError::Unconfirmed(unconfirmed));
+    }
+    // One look, after the sessions' stops: a failed launch's cleanup still retrying, or
+    // abandoned at its cap, may have left a container. Nothing waits for it (#239).
+    let cleanups = launcher.unfinished_cleanups();
+    if !cleanups.is_empty() {
+        log.error(
+            LOG,
+            "failed launches' containers not confirmed gone",
+            &[("sessions", &cleanups.join(","))],
+        );
+    }
+    let unclean = super::not_stopped_cleanly(unconfirmed, cleanups);
+    if !unclean.is_empty() {
+        return Err(DaemonError::Unconfirmed(unclean));
     }
     match crashed {
         Some(c) => Err(DaemonError::Crash { task: c.task }),

@@ -1386,6 +1386,144 @@ fn the_daemon_validates_and_injects_from_the_store_the_cli_writes() {
     assert!(!String::from_utf8_lossy(&out.stderr).contains(&value));
 }
 
+/// A private environment whose `sallyd` runs a podman wrapper named by `sandbox.podman_path`:
+/// `start` fails while `<root>/start-fails` exists (a launch fails with its container
+/// created), and `rm` of a workspace container (its last argument `sp-ws-…`) fails while
+/// `<root>/rm-fails` exists. Anything else runs the trusted podman. Returns the environment and
+/// a manifest for the test image.
+fn failing_launch_env() -> (Env, String) {
+    let env = Env::new();
+    let bus = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap()).join("bus");
+    std::os::unix::fs::symlink(bus, env.root.join("run/bus")).unwrap();
+    let image = load_test_image(&env);
+    let bin = env.root.join("wrap-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (root, real) = (env.root.display().to_string(), trusted_podman());
+    assert!(!root.contains('\''), "single-quoted in the script");
+    let script = format!(
+        "#!/bin/sh\n\
+         for a in \"$@\"; do last=\"$a\"; done\n\
+         if [ \"$3\" = start ] && [ -e '{root}/start-fails' ]; then\n\
+         echo 'start refused by the test' >&2; exit 125\n\
+         fi\n\
+         if [ \"$1\" = rm ] && [ -e '{root}/rm-fails' ]; then\n\
+         case \"$last\" in sp-ws-*) echo 'rm refused by the test' >&2; exit 125;; esac\n\
+         fi\n\
+         exec '{}' \"$@\"\n",
+        real.display()
+    );
+    let wrapper = bin.join("podman");
+    std::fs::write(&wrapper, script).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        env.root.join("config/sallyport/config.toml"),
+        format!(
+            "[sandbox]\nruntime_path = \"{}\"\npodman_path = \"{}\"\n",
+            test_runtime().display(),
+            std::fs::canonicalize(&wrapper).unwrap().display()
+        ),
+    )
+    .unwrap();
+    let manifest = format!(
+        "apiVersion: sallyport/v1\nkind: Manifest\nname: t\nmodel:\n  ref: any\n\
+         runtime:\n  image: {image}\n"
+    );
+    (env, manifest)
+}
+
+/// The failed launch's session id, from the oplog line its retried cleanup writes, in `log`
+/// (`sallyd`'s stderr, read once it has exited).
+fn retried_id(log: &str) -> String {
+    let line = oplog_line(log, "error", "a failed launch's cleanup is retried")
+        .unwrap_or_else(|| panic!("no retried cleanup: {log}"));
+    let at = line.find("session=\"").unwrap() + "session=\"".len();
+    line[at..].split('"').next().unwrap().to_owned()
+}
+
+/// #239, Q760's case: a launch fails, its cleanup cannot remove its container, then `sallyd`
+/// is stopped. Shutdown does not report a clean stop: it exits non-zero, and one oplog line
+/// names the failed launch. It waits for no retry: the exit comes within a few seconds, while
+/// the cleanup still has minutes of pauses ahead. The twin below is the allow case. Control,
+/// by hand: without the launcher's set of unfinished cleanups (or without shutdown reading it),
+/// this exits 0 with "stopped".
+#[test]
+fn a_shutdown_with_a_failed_launch_s_container_left_is_not_clean() {
+    let (env, manifest) = failing_launch_env();
+    std::fs::write(env.root.join("start-fails"), b"").unwrap();
+    std::fs::write(env.root.join("rm-fails"), b"").unwrap();
+    let mut d = env.start();
+    let mut c = sally_cli::client::Client::connect(&env.state().join("control.sock")).unwrap();
+    let r = c.call("sessions.create", serde_json::json!({"manifest": manifest}));
+    assert!(r.is_err(), "the launch was meant to fail: {r:?}");
+    drop(c);
+    let asked = Instant::now();
+    terminate(&mut d);
+    let out = d.finish();
+    let took = asked.elapsed();
+    let log = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "a clean stop reported: {log}");
+    assert!(
+        took < Duration::from_secs(15),
+        "shutdown waited {took:?}: {log}"
+    );
+    let id = retried_id(&log);
+    let line = oplog_line(
+        &log,
+        "error",
+        "failed launches' containers not confirmed gone",
+    )
+    .unwrap_or_else(|| panic!("{log}"));
+    assert!(line.contains(&format!("sessions=\"{id}\"")), "{line}");
+    assert!(oplog_line(&log, "info", "stopped").is_none(), "{log}");
+}
+
+/// The allow twin: the failed launch's cleanup succeeds at its first retry (its
+/// `sandbox.cleaned` is in the audit log) before `sallyd` is stopped, so shutdown is clean:
+/// exit 0 and "stopped", with no failed-launch line.
+#[test]
+fn a_shutdown_after_a_failed_launch_s_cleanup_finished_is_clean() {
+    let (env, manifest) = failing_launch_env();
+    let paths = sally_core::paths::Paths::from_lookup(|k| {
+        let sub = match k {
+            "HOME" => "home",
+            "XDG_RUNTIME_DIR" => "run",
+            "XDG_DATA_HOME" => "data",
+            "XDG_CONFIG_HOME" => "config",
+            _ => return None,
+        };
+        Some(env.root.join(sub).into_os_string())
+    })
+    .unwrap();
+    std::fs::write(env.root.join("start-fails"), b"").unwrap();
+    std::fs::write(env.root.join("rm-fails"), b"").unwrap();
+    let mut d = env.start();
+    let mut c = sally_cli::client::Client::connect(&env.state().join("control.sock")).unwrap();
+    let r = c.call("sessions.create", serde_json::json!({"manifest": manifest}));
+    assert!(r.is_err(), "the launch was meant to fail: {r:?}");
+    drop(c);
+    std::fs::remove_file(env.root.join("rm-fails")).unwrap();
+    let end = Instant::now() + Duration::from_secs(60);
+    while files_holding(&paths.audit(), b"sandbox.cleaned").is_empty() {
+        assert!(Instant::now() < end, "no sandbox.cleaned");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    terminate(&mut d);
+    let out = d.finish();
+    let log = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{log}");
+    assert!(oplog_line(&log, "info", "stopped").is_some(), "{log}");
+    assert!(
+        oplog_line(
+            &log,
+            "error",
+            "failed launches' containers not confirmed gone"
+        )
+        .is_none(),
+        "{log}"
+    );
+}
+
 /// Every regular file under `dir` (symlinks not followed) whose bytes hold `needle`. A
 /// directory or file it cannot read fails the test, naming it: unread is not clean.
 fn files_holding(dir: &Path, needle: &[u8]) -> Vec<PathBuf> {
