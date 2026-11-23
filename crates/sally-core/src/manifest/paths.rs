@@ -1102,6 +1102,19 @@ mod tests {
         assert_eq!(e.0, Code::NotFound);
     }
 
+    /// The kind is read through an `O_PATH` handle: a search-only root needs no read permission.
+    #[test]
+    fn the_kind_of_a_search_only_root_is_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = TmpHome::new("kindperm");
+        let here = t.0.join("home/code/x");
+        let id = t.id("home/code/x");
+        std::fs::set_permissions(&here, std::fs::Permissions::from_mode(0o100)).unwrap();
+        let kind = root_kind(&here, id);
+        std::fs::set_permissions(&here, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(kind.is_ok(), "search-only root: {kind:?}");
+    }
+
     /// RT-FS-14: a root with the identity of a protected folder (a bind alias of it) is refused.
     #[test]
     fn the_identity_of_a_protected_folder_is_refused() {
