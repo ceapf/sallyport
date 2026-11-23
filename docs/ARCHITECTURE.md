@@ -615,7 +615,8 @@ written; nothing was approved and a `deny_all_session` latch stays (the maintain
 audit rule). The
 CLI checks the other way too: before it sends a byte to `control.sock` it requires the socket's
 peer to be its own uid (architect Q78), and it reads replies under the same 1 MiB cap
-(`sally_proto::MAX_FRAME`; a longer frame is fatal).
+(`sally_proto::MAX_FRAME`; a longer frame is fatal). The peer check has unit tests only
+(sally-cli `only_this_users_socket_is_spoken_to`); a red-team leg is planned (no issue yet).
 
 ### 4.1 `control.sock` — trusted clients (CLI, Tauri)
 
@@ -646,7 +647,11 @@ launch, a typed `yes` or the hash of the exact text read, before they send it, M
 separate 0600 `secrets.lock`, given up after 10 s with nothing changed. `save` writes a temp
 file in the same directory, fsyncs and renames, so a reader never sees a partial store. A value
 comes from a no-echo prompt (at most 4094 bytes; Ctrl-C cancels it) or piped stdin, never argv
-or the environment; every secrets command turns core dumps off first. A command line that does
+or the environment (the argv refusal has binary-level tests, no `rt_` test: sally-cli `tests/secrets_argv.rs`
+`set_with_a_value_argument_is_refused_without_echo`,
+`set_after_a_double_dash_is_refused_without_echo`,
+`set_with_an_unknown_option_is_refused_without_echo`; a red-team leg is planned, no issue yet; no
+test names the environment); every secrets command turns core dumps off first. A command line that does
 not parse is refused with a fixed message that repeats no argument (architect Q113); a secrets
 line adds the shell-history warning. `audit verify` exits 0 verified, 1 failed verification, 2
 unreadable (Q115). The `doctor.*`, `manifests.*`, `secrets.*` and `audit.*` methods above stay
