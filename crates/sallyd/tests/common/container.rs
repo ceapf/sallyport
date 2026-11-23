@@ -507,6 +507,9 @@ pub struct Lx {
     pub scope: String,
     /// This fixture's installation id: the label of every container its launcher creates.
     pub installation: Installation,
+    /// The launcher's crash receiver: a panic in a task it spawns (a failed launch's retried
+    /// cleanup) is read here ([`Lx::assert_no_crash`]), as `sallyd` reads its own.
+    crashes: Mutex<sallyd::daemon::crash::CrashReceiver>,
     /// The shared I/O lock ([`io_lock`]); released after `Drop` has removed the containers.
     _io: Option<std::fs::File>,
 }
@@ -675,6 +678,7 @@ impl Lx {
             Arc::clone(&redacted) as Arc<dyn sallyd::session::secrets::RedactorTarget>,
             Arc::new(oplog.clone()) as Arc<dyn sallyd::session::secrets::RedactorTarget>,
         ]));
+        let (crash, crashes) = sallyd::daemon::crash::CrashReporter::channel();
         let launcher = Launcher::new(LauncherParts {
             podman: podman.clone(),
             runtime: runtime.clone(),
@@ -696,9 +700,7 @@ impl Lx {
             // launcher's lines too (`session.closed` not audited, for one).
             oplog: oplog.clone(),
             installation: installation.clone(),
-            // A panic in a retried cleanup is not what these tests watch: a test that waits on
-            // the cleanup fails on its own bound. TODO(#239): keep the receiver, fail fast.
-            crash: sallyd::daemon::crash::CrashReporter::channel().0,
+            crash,
             cleanup,
         });
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -717,7 +719,22 @@ impl Lx {
             oplog_lines,
             scope: format!("t{}-{}-{n}", run_id(), std::process::id()),
             installation,
+            crashes: Mutex::new(crashes),
             _io: io,
+        }
+    }
+
+    /// Fails the test with the panic's task and text if a task the launcher spawned (a failed
+    /// launch's retried cleanup) has panicked, so a test waiting on that task fails at once
+    /// rather than at its bound. `Drop` checks it too.
+    pub fn assert_no_crash(&self) {
+        let got = self
+            .crashes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .try_recv();
+        if let Ok(c) = got {
+            panic!("task {} panicked: {}", c.task, c.payload);
         }
     }
 
@@ -1165,6 +1182,10 @@ impl Drop for Lx {
             }
         }
         let _ = podman(&["unshare", "rm", "-rf", "--", self.f.root.to_str().unwrap()]);
+        // A panic a test never waited on still fails it, after the cleanup above.
+        if !std::thread::panicking() {
+            self.assert_no_crash();
+        }
     }
 }
 

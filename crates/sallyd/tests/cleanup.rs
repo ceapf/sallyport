@@ -73,14 +73,16 @@ fn refused(at: &Path) -> usize {
 const LONG_BOUND: Duration = Duration::from_secs(180);
 
 /// Waits within [`BOUND`] until `done`, naming `what` if it never is.
-async fn until(what: &str, done: impl FnMut() -> bool) {
-    until_within(what, BOUND, done).await;
+async fn until(x: &Lx, what: &str, done: impl FnMut() -> bool) {
+    until_within(x, what, BOUND, done).await;
 }
 
-/// Waits within `bound` until `done`, naming `what` if it never is.
-async fn until_within(what: &str, bound: Duration, mut done: impl FnMut() -> bool) {
+/// Waits within `bound` until `done`, naming `what` if it never is. A panic in a task `x`'s
+/// launcher spawned (the retried cleanup) fails the wait at once, with its text.
+async fn until_within(x: &Lx, what: &str, bound: Duration, mut done: impl FnMut() -> bool) {
     let end = Instant::now() + bound;
     while !done() {
+        x.assert_no_crash();
         assert!(Instant::now() < end, "{what}: not within {bound:?}");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -128,7 +130,10 @@ fn a_failed_launch_cleanup_is_retried_until_the_container_is_gone() {
         let first = refused(&dir);
         assert!(first > 0, "the first cleanup never tried rm");
         let past_the_bound = first * 5;
-        until_within("a sixth try", LONG_BOUND, || refused(&dir) > past_the_bound).await;
+        until_within(&x, "a sixth try", LONG_BOUND, || {
+            refused(&dir) > past_the_bound
+        })
+        .await;
         assert!(exists(&name), "the container went while rm failed");
         assert!(
             x.launcher
@@ -149,7 +154,7 @@ fn a_failed_launch_cleanup_is_retried_until_the_container_is_gone() {
         // Allow leg: rm works again; `sandbox.cleaned` is held so the window can be read.
         let unhold = x.events.held(&["sandbox.cleaned"]);
         std::fs::remove_file(dir.join("rm-fails")).unwrap();
-        until("the container removed", || !exists(&name)).await;
+        until(&x, "the container removed", || !exists(&name)).await;
         x.events.until_parked("sandbox.cleaned", 1).await;
         let e = x.launch(&v, "while-held").await.unwrap_err();
         assert!(
@@ -159,7 +164,10 @@ fn a_failed_launch_cleanup_is_retried_until_the_container_is_gone() {
         assert_eq!(x.redactors.sessions(), std::slice::from_ref(&id));
         assert_eq!(x.redacted.redact(&gh), "[REDACTED:GITHUB_TOKEN]");
         drop(unhold);
-        until("the forms released", || x.redactors.sessions().is_empty()).await;
+        until(&x, "the forms released", || {
+            x.redactors.sessions().is_empty()
+        })
+        .await;
         assert_eq!(x.redacted.redact(&gh), gh);
 
         let all = x.events.all();
@@ -225,7 +233,7 @@ fn rt_ag_08b_a_failed_launch_keeps_its_claim_through_the_capped_cleanup() {
             "control: the first cleanup never tried rm"
         );
         unmark("rm-fails");
-        until("control: sandbox.cleaned", || cleaned() == 1).await;
+        until(&x, "control: sandbox.cleaned", || cleaned() == 1).await;
         unmark("start-fails");
         let r = x.launch(&v, "control-after").await;
         let r = r.unwrap_or_else(|e| panic!("control: the folder is still refused: {e}"));
@@ -244,7 +252,7 @@ fn rt_ag_08b_a_failed_launch_keeps_its_claim_through_the_capped_cleanup() {
             matches!(e, LaunchError::Overlap(_)),
             "during the retries: {e}"
         );
-        until_within("sandbox.cleanup_abandoned", LONG_BOUND, || {
+        until_within(&x, "sandbox.cleanup_abandoned", LONG_BOUND, || {
             x.events
                 .list()
                 .iter()
@@ -327,7 +335,7 @@ fn a_failed_launch_gives_up_its_directories_after_three_more_tries() {
         let name = format!("sp-ws-{}", req.paths.id().as_str());
         let e = x.launcher.launch_workspace(req).await.unwrap_err();
         assert!(e.to_string().contains("start refused by the test"), "{e}");
-        until("sandbox.cleaned", || {
+        until(&x, "sandbox.cleaned", || {
             x.events.list().iter().any(|e| e == "sandbox.cleaned")
         })
         .await;
@@ -337,7 +345,7 @@ fn a_failed_launch_gives_up_its_directories_after_three_more_tries() {
         assert_eq!(cleaned["container"], name.as_str(), "{cleaned}");
         assert!(!exists(&name));
         // The oplog is written by its own thread: wait for the line, then read it exactly.
-        until("the kept line", || {
+        until(&x, "the kept line", || {
             x.oplog_lines
                 .text()
                 .lines()
@@ -366,7 +374,7 @@ fn a_failed_launch_gives_up_its_directories_after_three_more_tries() {
 
         // The same with the entry's append refused: the claim is freed all the same.
         x.events.fail(&["sandbox.cleaned"]);
-        until("the second sandbox.cleaned attempt", || {
+        until(&x, "the second sandbox.cleaned attempt", || {
             x.oplog_lines
                 .text()
                 .lines()
