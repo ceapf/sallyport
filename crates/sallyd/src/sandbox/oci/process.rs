@@ -7,7 +7,7 @@ use super::config::{Capabilities, Process, Rlimit, User};
 use super::facts::Facts;
 use super::intent::Intent;
 use super::{Mismatch, ensure};
-use crate::sandbox::types::WORKDIR;
+use crate::sandbox::types::{NOFILE_LIMIT, WORKDIR};
 
 /// `--init`: podman runs the checked catatonit at this path, then the command.
 pub const INIT_GUEST: &str = "/run/podman-init";
@@ -134,8 +134,10 @@ fn check_caps(c: &Capabilities) -> Result<(), Mismatch> {
     Ok(())
 }
 
-/// Exactly `RLIMIT_CORE` 0/0 (`--ulimit core=0`) and podman's inherited `RLIMIT_NOFILE` and
-/// `RLIMIT_NPROC`, each with soft ≤ hard ≤ `sallyd`'s own hard limit (architect Q103).
+/// Exactly `RLIMIT_CORE` 0/0 (`--ulimit core=0`), `RLIMIT_NOFILE` at the launcher's
+/// [`NOFILE_LIMIT`] soft and hard (`--ulimit nofile=…`; a sandbox's descriptor limit also bounds
+/// what it can hold in flight, so a lower or higher value is refused alike), and podman's
+/// inherited `RLIMIT_NPROC` with soft ≤ hard ≤ `sallyd`'s own hard limit (architect Q103).
 fn check_rlimits(limits: &[Rlimit], f: &Facts) -> Result<(), Mismatch> {
     let mut seen = Vec::new();
     for r in limits {
@@ -147,7 +149,14 @@ fn check_rlimits(limits: &[Rlimit], f: &Facts) -> Result<(), Mismatch> {
                 ensure(r.hard == 0 && r.soft == 0, &field, "not 0")?;
                 continue;
             }
-            "RLIMIT_NOFILE" => f.own_nofile,
+            "RLIMIT_NOFILE" => {
+                ensure(
+                    r.hard == NOFILE_LIMIT && r.soft == NOFILE_LIMIT,
+                    &field,
+                    "not the launcher's descriptor limit",
+                )?;
+                continue;
+            }
             "RLIMIT_NPROC" => f.own_nproc,
             _ => return Err(Mismatch::new(field, "not a limit podman sets")),
         };

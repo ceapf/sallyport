@@ -202,9 +202,7 @@ pub struct Facts {
     pub init: String,
     /// `std::env::consts::ARCH`.
     pub arch: &'static str,
-    /// `sallyd`'s own hard `RLIMIT_NOFILE` and `RLIMIT_NPROC` (`u64::MAX` for unlimited).
-    pub own_nofile: u64,
-    /// See `own_nofile`.
+    /// `sallyd`'s own hard `RLIMIT_NPROC` (`u64::MAX` for unlimited).
     pub own_nproc: u64,
 }
 

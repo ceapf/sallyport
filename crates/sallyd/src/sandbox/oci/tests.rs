@@ -16,6 +16,8 @@ use crate::sandbox::types::{Role, UserIds};
 
 const G: &str = "/h/.local/share/containers/storage";
 const R: &str = "/run/user/1000/containers";
+/// A typical `sallyd` hard descriptor limit: only a refused value now (the verifier holds NOFILE
+/// to the launcher's limit, not to `sallyd`'s own).
 const OWN_NOFILE: u64 = 1_048_576;
 const OWN_NPROC: u64 = 224_902;
 const MEM: u64 = 8 * 1024 * 1024 * 1024;
@@ -45,7 +47,6 @@ fn facts() -> Facts {
         },
         init: "/usr/bin/catatonit".into(),
         arch: "x86_64",
-        own_nofile: OWN_NOFILE,
         own_nproc: OWN_NPROC,
     }
 }
@@ -268,7 +269,7 @@ fn good(i: &Intent, f: &Facts) -> Value {
             "capabilities": {},
             "rlimits": [
                 {"type": "RLIMIT_CORE", "hard": 0, "soft": 0},
-                {"type": "RLIMIT_NOFILE", "hard": OWN_NOFILE, "soft": OWN_NOFILE},
+                {"type": "RLIMIT_NOFILE", "hard": SANDBOX_NOFILE, "soft": SANDBOX_NOFILE},
                 {"type": "RLIMIT_NPROC", "hard": OWN_NPROC, "soft": OWN_NPROC}
             ],
             "noNewPrivileges": true
@@ -606,8 +607,12 @@ fn rlimits(v: &mut Value) -> &mut Vec<Value> {
     v["process"]["rlimits"].as_array_mut().unwrap()
 }
 
+/// The launcher's descriptor limit (`--ulimit nofile=512:512`), written out so the test pins the
+/// value, not the constant.
+const SANDBOX_NOFILE: u64 = 512;
+
 #[test]
-fn rlimits_are_core_zero_and_podman_s_two_within_sallyd_s_own() {
+fn rlimits_are_core_zero_the_launcher_s_nofile_and_podman_s_nproc_within_sallyd_s_own() {
     let set = |k: usize, hard: u64, soft: u64| {
         move |v: &mut Value| {
             rlimits(v)[k]["hard"] = json!(hard);
@@ -616,14 +621,26 @@ fn rlimits_are_core_zero_and_podman_s_two_within_sallyd_s_own() {
     };
     refused("process.rlimits.RLIMIT_CORE", set(0, 1, 0));
     refused("process.rlimits.RLIMIT_CORE", set(0, 0, 1));
-    refused("process.rlimits.RLIMIT_NOFILE", set(1, OWN_NOFILE + 1, 1));
     refused("process.rlimits.RLIMIT_NPROC", set(2, OWN_NPROC + 1, 1));
-    refused("process.rlimits.RLIMIT_NOFILE", set(1, 10, 11));
+    // RLIMIT_NOFILE is exactly the launcher's 512/512: soft and hard each, either way, and a
+    // value that would pass a "within sallyd's own" rule (security review).
+    for (hard, soft) in [
+        (SANDBOX_NOFILE, SANDBOX_NOFILE - 1),
+        (SANDBOX_NOFILE + 1, SANDBOX_NOFILE),
+        (SANDBOX_NOFILE - 1, SANDBOX_NOFILE - 1),
+        (SANDBOX_NOFILE + 1, SANDBOX_NOFILE + 1),
+        (1024, 1024),
+        (OWN_NOFILE, OWN_NOFILE),
+        (SANDBOX_NOFILE, SANDBOX_NOFILE + 1),
+    ] {
+        refused("process.rlimits.RLIMIT_NOFILE", set(1, hard, soft));
+    }
     let (i, f) = (intent(), facts());
     let mut v = good(&i, &f);
-    set(1, OWN_NOFILE, 10)(&mut v);
-    set(2, OWN_NPROC, OWN_NPROC)(&mut v);
+    set(1, SANDBOX_NOFILE, SANDBOX_NOFILE)(&mut v);
+    set(2, OWN_NPROC, 10)(&mut v);
     check(&v, &i, &f).unwrap();
+    refused("process.rlimits.RLIMIT_NPROC", set(2, 10, 11));
     refused("process.rlimits.RLIMIT_AS", |v| {
         rlimits(v).push(json!({"type": "RLIMIT_AS", "hard": 1, "soft": 1}));
     });

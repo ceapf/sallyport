@@ -1,9 +1,11 @@
 //! The argv gate (CLAUDE.md hard rules; THREAT_MODEL SI-1, SI-2, SI-11). An **allowlist** per
 //! role: every podman option must be one that role's builder emits, with a value of the exact
-//! expected shape, at most once unless it is a mount or an environment variable; every hardening
-//! option must be present; every `-v` source must be a declared [`Source`] with a grant that
-//! covers the requested access; overlay scratch must lie in the session's scratch directory; the
-//! image must be digest-pinned; the command after the image must be the role's fixed command; and
+//! expected shape, at most once unless it is a mount or an environment variable
+//! (`--security-opt` and `--ulimit`: at most once per kind); every hardening option must be
+//! present, `--ulimit` as exactly `core=0` and the descriptor limit; every `-v` source must be
+//! a declared [`Source`] with a grant that covers the requested access; overlay scratch must lie
+//! in the session's scratch directory; the image must be digest-pinned; the command after the
+//! image must be the role's fixed command; and
 //! a session's container (workspace, harness) carries exactly the conmon backstop `--timeout` its
 //! policy names, an inference container none (#92, RT-AG-16). An unforeseen flag fails closed
 //! instead of slipping past a denylist. The red-team harness also
@@ -17,7 +19,9 @@ use super::argv::{
     OPENAI_BASE_URL, PLACEHOLDER, PROXY_URL, PROXY_VARS, SESSION_CA,
 };
 use super::mount_probe::probe_prefix;
-use super::types::{ArgvError, INSTALLATION_LABEL, ImageRef, Installation, Role, UserIds, WORKDIR};
+use super::types::{
+    ArgvError, INSTALLATION_LABEL, ImageRef, Installation, Role, UserIds, WORKDIR, nofile_ulimit,
+};
 
 /// Options written `--flag value`, as two tokens; `--flag=value` is refused, so the argv has one
 /// spelling and does not depend on how podman parses either form.
@@ -59,11 +63,12 @@ const BARE_FLAGS: [&str; 5] = [
     "--init",
     "--no-healthcheck",
 ];
-/// Options that may appear more than once (with distinct values).
-const REPEATABLE: [&str; 3] = ["-v", "--env", "--security-opt"];
-/// Options every role must carry exactly once (`--security-opt` is counted per kind in
-/// [`require`]).
-const REQUIRED: [&str; 22] = [
+/// Options that may appear more than once (with distinct values). `--security-opt` and `--ulimit`
+/// repeat too, once per kind: `Seen::note` counts them before this list is read.
+const REPEATABLE: [&str; 2] = ["-v", "--env"];
+/// Options every role must carry exactly once (`--security-opt` and `--ulimit` are counted per
+/// kind in [`require`]).
+const REQUIRED: [&str; 21] = [
     "--rm",
     "--workdir",
     "--image-volume",
@@ -73,7 +78,6 @@ const REQUIRED: [&str; 22] = [
     "--pull",
     "--http-proxy",
     "--log-driver",
-    "--ulimit",
     "--network",
     "--no-hosts",
     "--read-only",
@@ -293,6 +297,8 @@ fn split_options(args: &[String]) -> Result<(Options, usize), ArgvError> {
 struct Seen {
     flags: Vec<String>,
     security: HashSet<String>,
+    /// The `--ulimit` kinds so far (`core`, `nofile`): each at most once.
+    ulimit: HashSet<String>,
     dests: HashSet<String>,
     env: HashSet<String>,
     /// Overlay upper and work directories so far: no two may be equal or nested.
@@ -304,11 +310,16 @@ struct Seen {
 
 impl Seen {
     fn note(&mut self, flag: &str, value: Option<&str>) -> Result<(), ArgvError> {
-        if flag == "--security-opt" {
+        let per_kind = match flag {
+            "--security-opt" => Some(&mut self.security),
+            "--ulimit" => Some(&mut self.ulimit),
+            _ => None,
+        };
+        if let Some(kinds) = per_kind {
             let key = value.unwrap_or_default();
             let kind = key.split_once('=').map_or(key, |(k, _)| k);
-            if !self.security.insert(kind.to_owned()) {
-                return forbid(format!("--security-opt {kind} appears twice"));
+            if !kinds.insert(kind.to_owned()) {
+                return forbid(format!("{flag} {kind} appears twice"));
             }
         } else if !REPEATABLE.contains(&flag) && self.count(flag) > 0 {
             return forbid(format!("{flag} appears twice"));
@@ -349,7 +360,8 @@ fn check_option(
         ("--log-driver" | "--network", _) => fixed("none"),
         ("--cap-drop", _) => fixed("ALL"),
         ("--userns", _) => fixed("keep-id"),
-        ("--ulimit", _) => fixed("core=0"),
+        // No core files; the descriptor limit (security review). Each kind once, in `note`.
+        ("--ulimit", Some(v)) => ok(v == "core=0" || v == nofile_ulimit()),
         ("--hostname", _) if a.role != Role::Inference => fixed("sandbox"),
         ("--user", _) => fixed(&format!("{}:{}", a.ids.uid, a.ids.gid)),
         ("--workdir", _) => fixed(WORKDIR),
@@ -600,6 +612,11 @@ fn require(seen: &Seen, role: Role) -> Result<(), ArgvError> {
     for kind in ["no-new-privileges", "seccomp", "label"] {
         if !seen.security.contains(kind) {
             return forbid(format!("--security-opt {kind} is required"));
+        }
+    }
+    for kind in ["core", "nofile"] {
+        if !seen.ulimit.contains(kind) {
+            return forbid(format!("--ulimit {kind} is required"));
         }
     }
     if role != Role::Inference {
