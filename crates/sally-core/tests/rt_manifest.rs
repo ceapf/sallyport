@@ -641,6 +641,9 @@ fn rt_fs_05_denylisted_mounts_rejected() {
         "~/bin".to_owned(),
         "~/.cargo".to_owned(),
         "~/.local/share/applications".to_owned(),
+        // The default data and state homes, their variables unset in the fixture.
+        "~/.local/share/systemd".to_owned(),
+        "~/.local/state".to_owned(),
         // Credentials.
         "~/.claude".to_owned(),
         "~/.kube".to_owned(),
