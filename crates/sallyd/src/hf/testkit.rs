@@ -60,11 +60,13 @@ pub(super) struct Hub {
     bundles: Arc<Bundles>,
     handler: Handler,
     answer: Arc<Mutex<Vec<IpAddr>>>,
+    answer_port: Arc<Mutex<Option<u16>>>,
+    dials_fail: Arc<Mutex<bool>>,
     own: Arc<Mutex<Vec<IpAddr>>>,
     connected: Arc<Mutex<Vec<Net>>>,
     tables_unreadable: Arc<Mutex<bool>>,
     lookups: Arc<Mutex<Vec<String>>>,
-    dials: Arc<Mutex<usize>>,
+    dialled: Arc<Mutex<Vec<SocketAddr>>>,
     closed: Arc<Mutex<usize>>,
     seen: Arc<Mutex<Vec<Seen>>>,
 }
@@ -80,11 +82,13 @@ impl Hub {
             bundles: Arc::new(bundles),
             handler: Arc::new(handler),
             answer: Arc::new(Mutex::new(vec![PUBLIC])),
+            answer_port: Arc::new(Mutex::new(None)),
+            dials_fail: Arc::new(Mutex::new(false)),
             own: Arc::new(Mutex::new(Vec::new())),
             connected: Arc::new(Mutex::new(Vec::new())),
             tables_unreadable: Arc::new(Mutex::new(false)),
             lookups: Arc::new(Mutex::new(Vec::new())),
-            dials: Arc::new(Mutex::new(0)),
+            dialled: Arc::new(Mutex::new(Vec::new())),
             closed: Arc::new(Mutex::new(0)),
             seen: Arc::new(Mutex::new(Vec::new())),
         }
@@ -122,6 +126,16 @@ impl Hub {
         *self.answer.lock().unwrap() = ips.to_vec();
     }
 
+    /// Every lookup answers on `port` instead of the port asked for, from now on.
+    pub(super) fn answer_port(&self, port: u16) {
+        *self.answer_port.lock().unwrap() = Some(port);
+    }
+
+    /// Every dial fails from now on (after it is recorded).
+    pub(super) fn dials_fail(&self) {
+        *self.dials_fail.lock().unwrap() = true;
+    }
+
     /// This host owns `ip` from now on.
     pub(super) fn own(&self, ip: IpAddr) {
         self.own.lock().unwrap().push(ip);
@@ -141,8 +155,9 @@ impl Hub {
         self.lookups.lock().unwrap().clone()
     }
 
-    pub(super) fn dials(&self) -> usize {
-        *self.dials.lock().unwrap()
+    /// Every address dialled, in order.
+    pub(super) fn dialled(&self) -> Vec<SocketAddr> {
+        self.dialled.lock().unwrap().clone()
     }
 
     pub(super) fn seen(&self) -> Vec<Seen> {
@@ -199,6 +214,7 @@ impl Resolver for Hub {
     async fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         self.lookups.lock().unwrap().push(host.to_owned());
         let ips = self.answer.lock().unwrap().clone();
+        let port = self.answer_port.lock().unwrap().unwrap_or(port);
         Ok(ips
             .into_iter()
             .map(|ip| SocketAddr::new(ip, port))
@@ -208,8 +224,11 @@ impl Resolver for Hub {
 
 impl Dialer for Hub {
     type Stream = DuplexStream;
-    async fn dial(&self, _: SocketAddr) -> io::Result<DuplexStream> {
-        *self.dials.lock().unwrap() += 1;
+    async fn dial(&self, addr: SocketAddr) -> io::Result<DuplexStream> {
+        self.dialled.lock().unwrap().push(addr);
+        if *self.dials_fail.lock().unwrap() {
+            return Err(io::Error::from(io::ErrorKind::ConnectionRefused));
+        }
         let (near, far) = duplex(1 << 20);
         let hub = self.clone();
         tokio::spawn(async move { hub.serve(far).await });
