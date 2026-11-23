@@ -536,6 +536,55 @@ fn rt_sec_06_an_echo_in_body_and_header_is_redacted_at_the_same_length() {
     });
 }
 
+/// RT-SEC-06, a name: the upstream puts the credential it received into a response header's
+/// name, where no filler of the same length can stand. The response is refused with 502
+/// `upstream-echoed-secret` and nothing of it is forwarded; one `egress.deny` names the
+/// reason, without the value. Controls: both header-name checks of `redact::headers` (the
+/// any-case search of the name and separator, and the first covered byte's place in
+/// `redacted_value`; each stands alone, so only both removed let the name through). In-test
+/// control: the mock, asked around the proxy with the same credential, does send that header
+/// and the body the 502 must not carry.
+#[test]
+fn rt_sec_06_a_credential_in_a_response_header_name_is_refused_unforwarded() {
+    rt().block_on(async {
+        let lx = Lx::new();
+        let r = session(&lx, "sec06n").await;
+        let out = over(
+            &lx,
+            "sec06n",
+            "mock.test",
+            &get_req("mock.test", "/echo-name", ""),
+        )
+        .await;
+        let seen = lx.egress.dialer.seen();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(seen[0].contains(&gh()), "{}", seen[0]);
+        assert!(out.starts_with("HTTP/1.1 502 "), "{out}");
+        assert!(out.contains("upstream-echoed-secret"), "{out}");
+        assert!(!out.contains("NAMED"), "{out}");
+        assert!(!out.contains(&gh()), "{out}");
+        // The control of the lines above: asked around the proxy, the mock sends both.
+        let auth = format!("Authorization: {}\r\n", rendered());
+        let direct =
+            upstream_reply(&lx, "mock.test", &get_req("mock.test", "/echo-name", &auth)).await;
+        assert!(direct.starts_with("HTTP/1.1 200 OK"), "{direct}");
+        assert_eq!(header_values(&direct, &format!("x-{}", gh())), ["1"]);
+        assert!(direct.ends_with("NAMED"), "{direct}");
+        lx.stop(r).await;
+        let denies: Vec<_> = lx
+            .events
+            .all()
+            .into_iter()
+            .filter(|(e, _)| e == "egress.deny")
+            .map(|(_, a)| a)
+            .collect();
+        assert_eq!(denies.len(), 1, "{denies:?}");
+        assert_eq!(denies[0]["reason"], json!("upstream-echoed-secret"));
+        assert_eq!(denies[0]["host"], json!("mock.test"));
+        assert!(!denies[0].to_string().contains(&gh()), "{}", denies[0]);
+    });
+}
+
 /// RT-SEC-06b: compressed echoes. `Accept-Encoding` never reaches the grant host, so its echo
 /// comes back uncompressed and redacted; a response encoded anyway is refused with 502
 /// `upstream-encoded` and never forwarded (decision 1). Controls: `Accept-Encoding` in
