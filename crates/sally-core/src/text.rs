@@ -54,6 +54,52 @@ pub fn escape_backslash_quoted(raw: &[u8]) -> String {
     out
 }
 
+/// `args` each written `"…"` by [`escape_backslash_quoted`] and joined by one space, in at most
+/// `max` bytes (architect Q713, the launch summary's command line). Built left to right, never
+/// cutting inside an escape: an argument starts only when the space before it, both its quotes and
+/// its first escape fit, and an argument cut short still gets its closing quote. Returns the text
+/// and, when it was cut, the count of input bytes of the arguments not shown.
+#[must_use]
+pub fn quoted_args_capped(args: &[String], max: usize) -> (String, Option<usize>) {
+    let mut out = String::new();
+    for (i, arg) in args.iter().enumerate() {
+        let raw = arg.as_bytes();
+        let later = || {
+            args.iter()
+                .skip(i.saturating_add(1))
+                .fold(0usize, |n, a| n.saturating_add(a.len()))
+        };
+        let gap = usize::from(i > 0);
+        let mut arg_pieces = pieces(raw, Quote::Backslash).peekable();
+        let first = arg_pieces.peek().map_or(0, |p| p.text.len());
+        if out
+            .len()
+            .saturating_add(gap)
+            .saturating_add(2)
+            .saturating_add(first)
+            > max
+        {
+            return (out, Some(raw.len().saturating_add(later())));
+        }
+        if gap == 1 {
+            out.push(' ');
+        }
+        out.push('"');
+        let mut shown = 0usize;
+        for piece in arg_pieces {
+            if out.len().saturating_add(piece.text.len()).saturating_add(1) > max {
+                out.push('"');
+                let rest = raw.len().saturating_sub(shown);
+                return (out, Some(rest.saturating_add(later())));
+            }
+            out.push_str(&piece.text);
+            shown = shown.saturating_add(piece.input);
+        }
+        out.push('"');
+    }
+    (out, None)
+}
+
 /// The hex format (architect Q288): printable ASCII other than `\` and `"` as is, every other
 /// byte `\xNN`, of the first `max` bytes of `raw`; and whether `raw` was longer.
 #[must_use]
@@ -348,6 +394,77 @@ fn push_unquoted(c: char, out: &mut String) {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|a| (*a).to_owned()).collect()
+    }
+
+    /// Every argument is quoted and escaped, an empty one too, and a whole list is not cut.
+    #[test]
+    fn quoted_args_are_each_quoted_escaped_and_joined_by_one_space() {
+        let (text, cut) =
+            quoted_args_capped(&args(&["run", "", "a\"b", "\u{1b}[2J", "\u{e9}"]), 200);
+        assert_eq!(text, r#""run" "" "a\"b" "\x1b[2J" "\u{e9}""#);
+        assert_eq!(cut, None);
+        assert_eq!(quoted_args_capped(&[], 0), (String::new(), None));
+    }
+
+    /// The limit is inclusive: a rendering of exactly `max` bytes is whole, one byte more is cut,
+    /// and the cut argument keeps its closing quote within `max`.
+    #[test]
+    fn quoted_args_fit_at_exactly_max_and_are_cut_one_byte_later() {
+        let a = "x".repeat(198);
+        let (text, cut) = quoted_args_capped(&args(&[&a]), 200);
+        assert_eq!((text.len(), cut), (200, None));
+        let b = "x".repeat(199);
+        let (text, cut) = quoted_args_capped(&args(&[&b]), 200);
+        assert_eq!(text, format!("\"{}\"", "x".repeat(198)));
+        assert_eq!(cut, Some(1));
+    }
+
+    /// An argument starts only when the space, both quotes and its first escape fit; the count
+    /// covers the argument and every later one, in input bytes.
+    #[test]
+    fn an_argument_starts_only_when_its_quotes_and_first_escape_fit() {
+        // "aa" = 4 bytes; then " " + "\"" + "\\x1b" + "\"" needs 7 more.
+        let list = args(&["aa", "\u{1b}b", "cd"]);
+        assert_eq!(
+            quoted_args_capped(&list, 10),
+            ("\"aa\"".to_owned(), Some(4))
+        );
+        assert_eq!(
+            quoted_args_capped(&list, 11),
+            ("\"aa\" \"\\x1b\"".to_owned(), Some(3))
+        );
+        // An empty argument needs only its quotes; a cut one never shows as "".
+        let list = args(&["aa", "", "b"]);
+        assert_eq!(
+            quoted_args_capped(&list, 7),
+            ("\"aa\" \"\"".to_owned(), Some(1))
+        );
+        assert_eq!(quoted_args_capped(&list, 6), ("\"aa\"".to_owned(), Some(1)));
+        let list = args(&["aa", "b"]);
+        assert_eq!(quoted_args_capped(&list, 7), ("\"aa\"".to_owned(), Some(1)));
+        assert_eq!(
+            quoted_args_capped(&list, 8),
+            ("\"aa\" \"b\"".to_owned(), None)
+        );
+    }
+
+    /// A cut never splits an escape, and the count is of input bytes, not escaped ones.
+    #[test]
+    fn a_cut_never_splits_an_escape_and_counts_input_bytes() {
+        let list = args(&["\u{e9}\u{e9}\u{e9}"]);
+        // "\u{e9}" is 6 bytes: two fit in 1 + 12 + 1 = 14, not three.
+        assert_eq!(
+            quoted_args_capped(&list, 15),
+            ("\"\\u{e9}\\u{e9}\"".to_owned(), Some(2))
+        );
+        assert_eq!(
+            quoted_args_capped(&list, 20),
+            ("\"\\u{e9}\\u{e9}\\u{e9}\"".to_owned(), None)
+        );
+    }
 
     /// A cut escaped text names the bytes cut and the SHA-256 of the whole text.
     #[test]
