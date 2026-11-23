@@ -159,3 +159,10 @@ path = "fuzz_targets/host_tables.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "mountinfo"
+path = "fuzz_targets/mountinfo.rs"
+test = false
+doc = false
+bench = false

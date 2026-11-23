@@ -1,0 +1,3 @@
+9       21 1 0:20 / / rw,relatime shared:1 - ext4 /dev/sdx rw
+2314885530818453561 21 0:61 / /mnt/x rw,noatime - 9p drive rw,aname=drvfs
+40 21 0:62 / /srv/remote rw,nosuid shared:7 - fuse.sshfs host:/ rw

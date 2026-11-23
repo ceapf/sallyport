@@ -1,0 +1,3 @@
+1       21 1 0:20 / / rw,relatime shared:1 - ext4 /dev/sdx rw
+2314885530818453553 21 0:63 / /mnt/y rw master:2 shared:3 - virtiofs drives rw
+231488553081845355 21 0:64 / /mnt/z rw - 9p.x none rw

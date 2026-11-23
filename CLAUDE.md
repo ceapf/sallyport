@@ -87,7 +87,8 @@ Orchestration that only container tests can prove (`sandbox/launch.rs`, `launch/
 container-free tests run: unit tests, all of sally-core's `tests/`, `sallyd` `argv` + `scan`,
 `sally-shim` `relay` + `relay_bin` + `relay_write_errors`. A new file that fits the rule joins its list in the same PR. Nightly, two jobs:
 - `make mutants` (deny paths): sally-core `manifest/validate/*.rs`, `manifest/paths.rs`,
-  `manifest/links.rs`, `manifest/location.rs`, `manifest/host.rs`, `config.rs`.
+  `manifest/links.rs`, `manifest/location.rs`, `manifest/host.rs`, `manifest/mountinfo.rs`,
+  `config.rs`.
 - `make mutants-wide-{core,sallyd,shim,cli}` (sharded): sally-core `manifest/{image,hostenv,parse,
   summary,types,units,diag}.rs`, `secrets/{store,secret,names}.rs`,
   `audit/{entry,redact,verify,writer,declared,layout,tail}.rs`, `fsutil.rs`, `fd.rs`, `text.rs`,
