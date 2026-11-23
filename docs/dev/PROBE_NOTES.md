@@ -34,7 +34,8 @@ line per fact, with where it was found. Check a note again before relying on it 
   `memory.events` read all zero every time (`max 0`, `oom 0`, `oom_kill 0`). (scratch probe for
   #141, Nov 2026, kernel 6.18 WSL2)
 - The same figures from the test's own diagnostic line (`make loaded-repeat`, 23 Nov 2026, on
-  commit 36aee12 as it was before its rebase onto dc5a0ac; 32 cores, 54 GiB, kernel 6.18 WSL2,
+  commit 9cf7989, measured as 36aee12 before its rebases onto dc5a0ac and f90d3b8; 32 cores,
+  54 GiB, kernel 6.18 WSL2,
   no other worktree testing), read later than
   the probe above: after the wait for the first `pids` entry, just before the no-memory-entry
   assertion. 50 repeats of the bombs binary beside one `make test` pass, all loaded, all passed:
