@@ -222,6 +222,13 @@ line per fact, with where it was found. Check a note again before relying on it 
 - `pids.peak` is not on every kernel; fall back to `pids.current`. (6c-2 review)
 - WSL: `/proc/sys/fs/binfmt_misc/WSLInterop` (flags `PF`, interpreter `/init`) marks interop;
   the host's `cmd.exe` is `/mnt/c/Windows/System32/cmd.exe`. (6c-2a, FS-11)
+- WSL: a Windows drive is a 9p mount. `statfs` gives `f_type` `0x01021997` (`V9FS_MAGIC`, `stat
+  -f` prints `v9fs`) for the drive root and for a folder under it; `/proc/self/mountinfo` names
+  the type `9p` with the drive as the source (`C:\`). The WSL driver share `/usr/lib/wsl/drivers`
+  is 9p too (source `drivers`), so the kind alone does not tell a drive from that share or from
+  any other 9p mount. `/mnt/wsl` and `/mnt/wslg` are tmpfs; `/` is ext4 (`0xef53`). Read with
+  `stat -f` and mountinfo only, nothing on the drives opened. (Kernel 6.18 WSL2; Windows-drive
+  denylist probe)
 - A non-dumpable process (`PR_SET_DUMPABLE 0`) still binds and chmods a socket through
   `/proc/self/fd/<dirfd>/<name>`. Its `/proc/<pid>` directory keeps its own owner; the entries
   under it (`fd/`, `status`, …) become root's, so other processes of the same user cannot read

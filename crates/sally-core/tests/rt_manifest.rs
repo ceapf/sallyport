@@ -2,8 +2,9 @@
 //!
 //! Covered here: RT-MAN-01, RT-MAN-02, RT-MAN-03 (the place check the launchers call; its red-team
 //! tests run the `sally` binary and a real launch), RT-FS-05 (validate half),
-//! RT-FS-06 (validate + re-check half), RT-SEC-08, RT-MAN-04, RT-FS-19. The launch halves ("no container launched",
-//! "launch uses the stored struct") are asserted again by the sandbox/session tests (tasks 6, 12).
+//! RT-FS-06 (validate + re-check half), RT-FS-11 (the filesystem-kind leg, every host), RT-SEC-08,
+//! RT-MAN-04, RT-FS-19. The launch halves ("no container launched"; a launch from a manifest
+//! needs consent to the text it sends) are asserted by the sandbox, session and CLI tests.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;
@@ -13,8 +14,8 @@ use std::time::{Duration, Instant};
 use common::rendered_all;
 use common::{Fixture, HEADER, assert_rejects, fake_token, rendered};
 use sally_core::manifest::{
-    Code, EnvDir, LocationError, MAX_MANIFEST_BYTES, ManifestPlace, parse, parse_bytes, to_yaml,
-    validate,
+    Code, EnvDir, FsKind, LocationError, MAX_MANIFEST_BYTES, ManifestPlace, parse, parse_bytes,
+    to_yaml, validate,
 };
 
 /// The control of a return-value refusal (#122): `body`, which differs from the refused case
@@ -641,6 +642,9 @@ fn rt_fs_05_denylisted_mounts_rejected() {
         "~/bin".to_owned(),
         "~/.cargo".to_owned(),
         "~/.local/share/applications".to_owned(),
+        // The default data and state homes, their variables unset in the fixture.
+        "~/.local/share/systemd".to_owned(),
+        "~/.local/state".to_owned(),
         // Credentials.
         "~/.claude".to_owned(),
         "~/.kube".to_owned(),
@@ -659,16 +663,67 @@ fn rt_fs_05_denylisted_mounts_rejected() {
     }
 }
 
+/// The default data home (`~/.local/share`) and state home (`~/.local/state`) are rules whether
+/// or not `$XDG_DATA_HOME` or `$XDG_STATE_HOME` is exported: user units, session services and
+/// completion scripts the host runs live there. The accepted twin: a folder of the same name
+/// outside a home. Also, the data home is refused the same way when its variable is exported
+/// with its default value.
+#[test]
+fn rt_fs_05_the_default_data_and_state_homes_are_rules_unexported() {
+    let mut f = Fixture::new();
+    let home = f.home().to_owned();
+    for d in [
+        ".local/share/systemd/user",
+        ".local/share/dbus-1/services",
+        ".local/share/bash-completion",
+        ".local/state/app",
+        "code/myproject/.local/share/systemd",
+    ] {
+        std::fs::create_dir_all(home.join(d)).unwrap();
+    }
+    assert_eq!(f.env.xdg_data_home, None);
+    assert_eq!(f.env.xdg_state_home, None);
+    let refused = [
+        "~/.local/share/systemd",
+        "~/.local/share/dbus-1",
+        "~/.local/share/bash-completion",
+        "~/.local/share",
+        "~/.local/state",
+        "~/.local/state/app",
+    ];
+    for host in refused {
+        let r = f.load(&mount(host, "rw"));
+        assert_rejects(&r, "filesystem.mounts[0].host", Code::Denylisted);
+    }
+    twin_ok(&f, &mount("~/code/myproject/.local/share/systemd", "rw"));
+    f.env.xdg_data_home = Some(home.join(".local/share"));
+    assert_rejects(
+        &f.load(&mount("~/.local/share/systemd", "rw")),
+        "filesystem.mounts[0].host",
+        Code::Denylisted,
+    );
+}
+
 #[test]
 fn rt_fs_05_xdg_dirs_are_denylisted_when_set() {
     let mut f = Fixture::new();
     let cfg = f.root.join("xdg-config");
     let data = f.root.join("xdg-data");
+    let state = f.root.join("xdg-state");
     std::fs::create_dir_all(cfg.join("tool")).unwrap();
     std::fs::create_dir_all(data.join("app")).unwrap();
+    std::fs::create_dir_all(state.join("app")).unwrap();
     f.env.xdg_config_home = Some(cfg.clone());
     f.env.xdg_data_home = Some(data.clone());
-    for host in [cfg.join("tool"), data.join("app"), cfg, data] {
+    f.env.xdg_state_home = Some(state.clone());
+    for host in [
+        cfg.join("tool"),
+        data.join("app"),
+        state.join("app"),
+        cfg,
+        data,
+        state,
+    ] {
         let body = format!(
             "filesystem:\n  mounts:\n    - {{host: \"{}\", guest: /workspace/x, mode: ro}}\n",
             host.display()
@@ -681,6 +736,48 @@ fn rt_fs_05_xdg_dirs_are_denylisted_when_set() {
     }
 }
 
+// ---- RT-FS-11: a root on a refused filesystem kind (Windows drives on WSL) -----------------------
+
+/// The production reader (`statfs` of the identified root) through a seam that runs on every
+/// host: listing the kind the fixture's own folder is on refuses its mount `denylisted`, naming
+/// the kind, at validation and at the re-check. Controls: no kind listed accepts it, and so does
+/// a list holding only another kind. On WSL, `rt_fs_11_wsl_…` shows a real drive is on a kind
+/// this host lists.
+#[test]
+fn rt_fs_11_a_root_on_a_refused_filesystem_kind_is_refused() {
+    let mut f = Fixture::new();
+    let here = rustix::fs::statfs(f.home().join("code/myproject")).unwrap();
+    let magic = u64::try_from(here.f_type).unwrap();
+    let body = mount("~/code/myproject", "rw");
+    twin_ok(&f, &body);
+    let other = magic.wrapping_add(1);
+    f.env.refused_fs_kinds = vec![FsKind {
+        magic: other,
+        label: "other",
+    }];
+    twin_ok(&f, &body);
+    let v = f.load(&body).unwrap().manifest;
+    let listed = FsKind {
+        magic,
+        label: "test-kind",
+    };
+    f.env.refused_fs_kinds = vec![
+        FsKind {
+            magic: other,
+            label: "other",
+        },
+        listed,
+    ];
+    let r = f.load(&body);
+    assert_rejects(&r, "filesystem.mounts[0].host", Code::Denylisted);
+    let msg = &r.unwrap_err().errors[0].message;
+    let want = "which is on a test-kind filesystem (on WSL a Windows drive or share): never \
+                mountable (denylisted)";
+    assert!(msg.contains(want), "{msg}");
+    let e = v.recheck_mounts(&f.env).unwrap_err();
+    assert_eq!(e.errors[0].code, Code::Denylisted);
+}
+
 // ---- RT-FS-06: mount root is a symlink -----------------------------------------------------------
 
 #[test]
@@ -690,6 +787,24 @@ fn rt_fs_06_symlinked_mount_root_rejected_at_validate() {
     let r =
         f.load("filesystem:\n  mounts:\n    - {host: \"~/proj\", guest: /workspace/p, mode: rw}\n");
     assert_rejects(&r, "filesystem.mounts[0].host", Code::IsSymlink);
+}
+
+/// A trailing `/` or `/.` makes the kernel follow a final symlink, `lstat` included, so the root
+/// is judged as the same path without them. Controls: the bare spelling is refused the same way,
+/// and an ordinary folder written with a trailing `/` or `/.` is accepted.
+#[test]
+fn rt_fs_06_a_symlinked_root_with_a_trailing_slash_or_dot_is_refused() {
+    let f = Fixture::new();
+    std::fs::create_dir(f.home().join("real")).unwrap();
+    std::os::unix::fs::symlink(f.home().join("real"), f.home().join("proj")).unwrap();
+    for host in ["~/proj", "~/proj/", "~/proj/.", "~/proj//", "~/proj/./"] {
+        let r = f.load(&mount(host, "rw"));
+        assert_rejects(&r, "filesystem.mounts[0].host", Code::IsSymlink);
+        assert_eq!(r.as_ref().unwrap_err().errors.len(), 1, "{host}");
+    }
+    for host in ["~/real", "~/real/", "~/real/."] {
+        twin_ok(&f, &mount(host, "rw"));
+    }
 }
 
 #[test]
@@ -713,6 +828,22 @@ fn rt_fs_06_swap_after_validation_is_caught_by_recheck() {
     std::fs::create_dir(f.home().join("proj")).unwrap();
     let e = v.recheck_mounts(&f.env).unwrap_err();
     assert_eq!(e.errors[0].code, Code::MountChanged);
+
+    // The same swap under the spellings a trailing `/` or `/.` gives (the kernel follows the
+    // link there): the re-check judges them as the bare path. Control: before the swap each
+    // re-check passes.
+    for host in ["~/proj2/", "~/proj2/."] {
+        let dir = f.home().join("proj2");
+        std::fs::create_dir(&dir).unwrap();
+        let v = f.load(&mount(host, "rw")).unwrap().manifest;
+        assert!(v.recheck_mounts(&f.env).is_ok(), "{host}");
+        std::fs::rename(&dir, f.home().join("proj2.orig")).unwrap();
+        std::os::unix::fs::symlink(f.home().join("proj2.orig"), &dir).unwrap();
+        let e = v.recheck_mounts(&f.env).unwrap_err();
+        assert_eq!(e.errors[0].code, Code::IsSymlink, "{host}");
+        std::fs::remove_file(&dir).unwrap();
+        std::fs::remove_dir(f.home().join("proj2.orig")).unwrap();
+    }
 }
 
 // ---- RT-SEC-08: secret via manifest --------------------------------------------------------------

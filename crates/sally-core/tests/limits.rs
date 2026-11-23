@@ -383,16 +383,18 @@ fn mcp_count_argv_and_value_limits() {
 fn recheck_distinguishes_a_replaced_directory_from_a_moved_path() {
     let f = Fixture::new();
     let home = f.home().to_path_buf();
-    std::fs::create_dir_all(home.join("code/x")).unwrap();
-    std::fs::create_dir_all(home.join("code/y")).unwrap();
+    std::fs::create_dir_all(home.join("code/x/d")).unwrap();
+    std::fs::create_dir_all(home.join("code/y/d")).unwrap();
+    // A link on the way to the root, not the root itself (a linked root is refused in every
+    // spelling, a trailing `/` included).
     std::os::unix::fs::symlink(home.join("code/x"), home.join("code/cur")).unwrap();
-    let body = mounts(&mount("~/code/cur/", "/workspace/c", "ro"));
+    let body = mounts(&mount("~/code/cur/d", "/workspace/c", "ro"));
     let v = f.load(&body).unwrap().manifest;
     let env: &HostEnv = &f.env;
 
     // Same path, different directory.
-    std::fs::rename(home.join("code/x"), home.join("code/x-old")).unwrap();
-    std::fs::create_dir_all(home.join("code/x")).unwrap();
+    std::fs::rename(home.join("code/x/d"), home.join("code/x/d-old")).unwrap();
+    std::fs::create_dir_all(home.join("code/x/d")).unwrap();
     let e = v.recheck_mounts(env).unwrap_err();
     assert!(
         e.errors[0]

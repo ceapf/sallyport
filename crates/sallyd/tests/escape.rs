@@ -713,4 +713,20 @@ fn rt_fs_11_wsl_a_windows_executable_does_not_reach_windows() {
         assert_ne!(code, 0, "{out}");
         x.stop(r).await;
     });
+    // A Windows drive is on a filesystem kind this host refuses as a mount root, wherever the
+    // drive is mounted (the seam leg in sally-core's rt_manifest.rs shows a listed kind is
+    // refused). The drive's kind only is read, nothing on it is opened.
+    let config = sally_core::config::Config::default();
+    let env = sally_core::manifest::HostEnv::from_process(&config).unwrap();
+    assert!(
+        env.refused_fs_kinds.contains(&sally_core::manifest::V9FS),
+        "{:?}",
+        env.refused_fs_kinds
+    );
+    let drive = rustix::fs::statfs("/mnt/c").unwrap();
+    let kind = u64::try_from(drive.f_type).unwrap();
+    assert!(
+        env.refused_fs_kinds.iter().any(|k| k.magic == kind),
+        "/mnt/c is on kind {kind:#x}, not refused"
+    );
 }

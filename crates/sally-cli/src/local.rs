@@ -9,6 +9,7 @@
 use std::path::Path;
 
 use sally_core::audit::{HeadStatus, VerifyErrorKind, VerifyReport, tail, verify};
+use sally_core::config::read_config;
 use sally_core::manifest::{HostEnv, Rejected, Validated, load, summary};
 use sally_core::secrets::StoreNames;
 
@@ -19,37 +20,54 @@ use crate::{EXIT_FAILED, EXIT_OK, EXIT_REFUSED, clean};
 /// The default and the most entries `audit tail` prints.
 pub const TAIL_DEFAULT: usize = 20;
 
-/// Loads `path` as `sallyd` does: the CLI's host facts and the names in the secrets store at
-/// `store`, read through the same catalog type, only if the manifest names a secret (architect
-/// Q221). A store that cannot be read is a failure to read (2), never a missing name.
-fn validated(path: &Path, store: &Path, o: &mut Out<'_>) -> Result<(String, Validated), u8> {
+/// The user's own files a local validation reads besides the manifest.
+#[derive(Debug, Clone, Copy)]
+pub struct Files<'a> {
+    /// The secrets store, for its names.
+    pub store: &'a Path,
+    /// `config.toml`, for the binaries it names (their folders are denylist rules).
+    pub config: &'a Path,
+}
+
+/// Loads `path` as `sallyd` does: the CLI's host facts and the names in the secrets store,
+/// read through the same catalog type, only if the manifest names a secret (architect Q221). A
+/// store that cannot be read is a failure to read (2), never a missing name.
+fn validated(
+    path: &Path,
+    files: Files<'_>,
+    o: &mut Out<'_>,
+) -> Result<(String, Validated, HostEnv), u8> {
     let text = read_manifest(path).map_err(|e| {
         let msg = clean::line(&format!("{}: {e}", path.display())).text;
         let _ = writeln!(o.err, "sally: {msg}");
         EXIT_FAILED
     })?;
-    let v = validated_text(&text, store, o.err)?;
-    Ok((text, v))
+    let (v, env) = validated_text(&text, files, o.err)?;
+    Ok((text, v, env))
 }
 
-/// Validates `text` as [`validated`] does, its reasons on `err`: rejected 1, the host facts or
-/// the store unreadable 2. A launch calls it on the text it read once.
+/// Validates `text` as [`validated`] does, its reasons on `err`: rejected 1; the host facts,
+/// `config.toml` or the store unreadable 2. Returns the host facts it validated under, read
+/// once. A launch calls it on the text it read once, before anything is shown.
 pub(crate) fn validated_text(
     text: &str,
-    store: &Path,
+    files: Files<'_>,
     err: &mut dyn std::io::Write,
-) -> Result<Validated, u8> {
-    let env = HostEnv::from_process().map_err(|e| {
+) -> Result<(Validated, HostEnv), u8> {
+    let fail = |e: &dyn std::fmt::Display, err: &mut dyn std::io::Write| {
         let _ = writeln!(err, "sally: {}", clean::line(&e.to_string()).text);
         EXIT_FAILED
-    })?;
-    let names = StoreNames::new(store.to_owned());
+    };
+    // The file sallyd reads at its start, through the same reader. TODO(#255): sallyd's copy
+    // is read at another time, so a folder rule may differ (it only ever adds a refusal).
+    let config = read_config(files.config).map_err(|e| fail(&e, err))?;
+    let env = HostEnv::from_process(&config).map_err(|e| fail(&e, err))?;
+    let names = StoreNames::new(files.store.to_owned());
     let verdict = load(text, &env, &names);
     if let Some(e) = names.failed() {
-        let _ = writeln!(err, "sally: {}", clean::line(&e.to_string()).text);
-        return Err(EXIT_FAILED);
+        return Err(fail(&e, err));
     }
-    verdict.map_err(|r| rejected(&r, err))
+    verdict.map(|v| (v, env)).map_err(|r| rejected(&r, err))
 }
 
 /// Prints every error and warning of a rejected manifest (checked) to `err`. A missing secret's
@@ -63,10 +81,10 @@ fn rejected(r: &Rejected, err: &mut dyn std::io::Write) -> u8 {
 
 /// `sally manifest validate FILE`: 0 valid (its warnings, then the `valid` line, on `out`; 1
 /// instead when one of them fails the clean-check), 1 rejected (errors and warnings on `err`), 2
-/// unreadable (the manifest, the host facts, or the secrets store at `store` when the manifest
-/// names a secret).
-pub fn manifest_validate(path: &Path, store: &Path, o: &mut Out<'_>) -> u8 {
-    let (_, v) = match validated(path, store, o) {
+/// unreadable (the manifest, the host facts, `config.toml`, or the secrets store when the
+/// manifest names a secret).
+pub fn manifest_validate(path: &Path, files: Files<'_>, o: &mut Out<'_>) -> u8 {
+    let (_, v, _) = match validated(path, files, o) {
         Ok(v) => v,
         Err(code) => return code,
     };
@@ -79,29 +97,22 @@ pub fn manifest_validate(path: &Path, store: &Path, o: &mut Out<'_>) -> u8 {
 }
 
 /// `sally manifest summary FILE`: the plain-English summary of a valid manifest only, validated
-/// against the secrets store at `store` as `manifest validate` is, then a last line
+/// against the same files as `manifest validate` is, then a last line
 /// `sha256 <hex>`: the hash of the text read, which a launch's `--accept-manifest` names. The
 /// warnings and acknowledged risks a launch shows go to `err`, so a review sees everything the
 /// hash accepts, and so does a mount host not written as the folder it is (a launch accepted by
 /// the hash alone refuses it). A manifest whose launch block holds a line that cannot be shown
 /// starts nothing: no hash for it, and 1.
-pub fn manifest_summary(path: &Path, store: &Path, o: &mut Out<'_>) -> u8 {
-    let (text, v) = match validated(path, store, o) {
+pub fn manifest_summary(path: &Path, files: Files<'_>, o: &mut Out<'_>) -> u8 {
+    let (text, v, env) = match validated(path, files, o) {
         Ok(v) => v,
         Err(code) => return code,
     };
     for l in consent::besides_summary(&v) {
         let _ = writeln!(o.err, "{}", clean::line(&l).text);
     }
-    if let Err(e) = HostEnv::from_process()
-        .map_err(|e| e.to_string())
-        .and_then(|env| {
-            v.manifest
-                .check_hosts_as_written(&env.home)
-                .map_err(|e| e.to_string())
-        })
-    {
-        let _ = writeln!(o.err, "{}", clean::line(&e).text);
+    if let Err(e) = v.manifest.check_hosts_as_written(&env.home) {
+        let _ = writeln!(o.err, "{}", clean::line(&e.to_string()).text);
     }
     let shown = consent::block(&v);
     let mut p = Printer::new(o);

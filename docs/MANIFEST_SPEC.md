@@ -177,8 +177,9 @@ cannot be shown prints no hash and exits 1.
 Not covered (#255): what is shown, and what a typed `yes` or a hash accepts, comes from the CLI's
 own validation under its own host facts. `sallyd` validates the text it is sent again under its
 own and resolves the mount hosts again after the CLI's check, so a folder replaced at the same
-path after that check, or a `HOME` that differs between the CLI and `sallyd`, is not seen by the
-consent.
+path after that check, a `HOME` that differs between the CLI and `sallyd`, or a `config.toml`
+read at a different time or place (its binaries' folders are rules, §2), is not seen by the
+consent. A `config.toml` the CLI cannot read fails the launch (2) before anything is shown.
 
 ### Ranges and formats (checked by the validator)
 | Field | Rule |
@@ -397,8 +398,12 @@ environment (passwd entry only if `$HOME` is unset or relative).
     `.cargo`, `.rustup`, `.vscode-server`, `.gradle`, `.nvm`, `.pyenv`, `.vscode`, `.vim`,
     `.emacs.d`, `.ipython`, `.oh-my-zsh`, `.bun`, `.deno`, `.volta`, `go/bin`, `go/pkg`,
     `.local/share/{pipx,uv,nvim,mise,pnpm}`) — a writable mount there is host code execution
-    (THREAT_MODEL G4);
-  - `$XDG_CONFIG_HOME`, `$XDG_DATA_HOME`, `$XDG_RUNTIME_DIR` (each when set, plus `sallyport/`);
+    (THREAT_MODEL G4); and the default data and state homes, `.local/share` (user units, session
+    services, completion scripts) and `.local/state`, whether or not `$XDG_DATA_HOME` or
+    `$XDG_STATE_HOME` is exported. They come after every other rule, so a folder inside them
+    with its own rule above is named by that rule;
+  - `$XDG_CONFIG_HOME`, `$XDG_DATA_HOME`, `$XDG_RUNTIME_DIR` (each when set, plus `sallyport/`),
+    and `$XDG_STATE_HOME` when set (no `sallyport/` rule under it);
   - the folders the environment names, each when absolute: `$CARGO_HOME`, `$RUSTUP_HOME`,
     `$GNUPGHOME`, `$NVM_DIR`, `$PYENV_ROOT`, `$XDG_CACHE_HOME`, `$GOBIN`, `$DOCKER_CONFIG`,
     `$ZDOTDIR`, `$PNPM_HOME`, `$VOLTA_HOME`, `$BUN_INSTALL`, `$PYTHONUSERBASE`, `$PIPX_HOME`,
@@ -410,8 +415,27 @@ environment (passwd entry only if `$HOME` is unset or relative).
   - `/etc`, `/proc`, `/sys`, `/dev`, `/run`, `/var/run`, `/boot`, `/root`, `/mnt`,
     `/usr/lib/wsl`, `/tmp`, `/var/tmp` (`/tmp` holds other programs' Unix sockets — ssh-agent,
     X11 — and a read-only bind does not stop `connect()`, so it would be a path around SI-1);
+  - the folder of each binary `config.toml` names (`sandbox.runtime_path`,
+    `sandbox.podman_path`), as written and the folder of the file it resolves to: the host runs
+    it on every launch. Messages name the setting ("is inside /home/u/tools/crun (the folder of
+    sandbox.runtime_path)"). These folders are not read for links, and a folder that is `/`, a
+    home or an ancestor of one is kept as a rule. `sallyd` takes them from the `config.toml` it
+    read at start, the CLI from its own read of the same file. The folders of the links in the
+    middle of a chain of two or more are not rules yet (#280);
   - the Podman storage dirs (rootless graphroot and `/var/lib/containers/storage`) and every
     `filesystem.deny` entry.
+
+  **Windows drives (WSL).** On WSL a mount root that lies on a 9p filesystem (statfs kind
+  `0x01021997`) is refused `denylisted` wherever it is mounted, not only under `/mnt`: Windows
+  drives and the WSL driver share are 9p there, and the kind alone does not tell them apart.
+  WSL is told by the kernel release naming Microsoft or by the `WSLInterop` entry under
+  `/proc/sys/fs/binfmt_misc`; with the kernel release unreadable, the host facts cannot be
+  gathered, so `sallyd` does not start and the CLI fails (2). The kind is read
+  from a handle on the identified root, at validation and at the re-check: "resolves to
+  "/data/win/proj", which is on a 9p filesystem (on WSL a Windows drive or share): never
+  mountable". Drives served over virtiofs are not covered, nor a WSL that neither signal shows
+  (a kernel release without "microsoft" and interop off), where only the `/mnt` rule holds
+  (#281).
 
   The ancestor rule is why `~/.local`, `/var`, `/usr`, and `/home` are refused: they really
   contain protected data. "Each home" is `$HOME` **and** the passwd home when they differ, so a
@@ -422,10 +446,13 @@ what the host runs or loads (`~/.local/bin/t -> ~/tools/t/bin/t`, a stow `~/.con
 ~/dotfiles/gh`), so its target becomes a subtree rule too: "contains /home/u/tools/t/bin/t, which
 /home/u/.local/bin/t points to", with the reason of the folder that holds the link. When a
 manifest has mounts, validation reads, to depth 2 (a folder's entries and its subfolders'
-entries, never entering a linked folder): every home folder of the list above, `$XDG_CONFIG_HOME`
-and `$XDG_DATA_HOME`, every folder the environment names except a `$PATH` entry outside the
-homes, and each home's own entries, of which only dot names (`.bashrc`, …) are followed. A folder
-reached first as a subfolder is read again to depth 2 when it is on that list itself. The rule is
+entries, never entering a linked folder): every home folder of the list above (the default data
+and state homes included), `$XDG_CONFIG_HOME`, `$XDG_DATA_HOME` and `$XDG_STATE_HOME`, every folder the environment names except a `$PATH` entry outside the
+homes, and each home's own entries, of which only dot names (`.bashrc`, …) are followed. Four
+folders one level deeper than their base's scan reaches are read as roots of their own, under
+the default and the exported base: `systemd/user`, `dbus-1/services` and
+`bash-completion/completions` in the data home, `systemd/user` in the config home (more: #283).
+A folder reached first as a subfolder is read again to depth 2 when it is on that list itself. The rule is
 made from the link's text, joined (when relative) to the real path of the folder holding the link,
 as the kernel resolves it, and also matches where that resolves: through a stow-folded
 `~/.local/bin -> ~/dotfiles/bin` holding `t -> ../tools/t` the rule is `~/dotfiles/tools/t`, both
@@ -444,7 +471,10 @@ never gets this error.
 never mountable"). There is no `cfg(test)` or feature-gated bypass of the denylist: tests move
 their fixtures (under `target/`), never the wall.
 
-Candidates whose root is a symlink, a file, or missing are refused. A candidate that contains a
+Candidates whose root is a symlink, a file, or missing are refused. The root is judged as written
+without a trailing `/`, repeated `/` or `.` components (`~/proj/` and `~/proj/.` are `~/proj`), at
+validation and at the re-check: the kernel follows a final symlink of `x/` or `x/.`, so a linked
+root written that way is still refused `is-symlink`. A candidate that contains a
 *symlink to* a denylisted path (e.g. mounting `~/code` when `~/code/.ssh -> ~/.ssh`) is allowed:
 symlinks inside a mount resolve inside the container rootfs, which is the point of RT-FS-03.
 
@@ -479,7 +509,7 @@ yet (TODO(#231)).
 | `model.ref` | `sallyd::infer` resolves in library; refuses unverified/unknown | session start | error to UI |
 | `model.context/gpu_layers` | `sallyd::infer` → llama-server args, clamped by fit estimator | load | clamped, warning |
 | `model.context` (token limit) | `sallyd::llm` (`body::check`): a request's `max_tokens` / `max_completion_tokens` above it is refused (and 0 always is); absent, the backend is given `model.context` as the bound. The M3 fit estimator clamps further | each `llm.sock` request | 400 `token-limit` (0: `bad-value`) + audit `llm.deny` |
-| `filesystem.mounts[].host` | validator (realpath, denylist, is-dir, not-symlink) **and again** at launch: the launch scan re-opens the root without following symlinks and compares `st_dev:st_ino`, pins are re-checked before `podman init`, and bind mounts are compared inside the container after `init` (ARCHITECTURE §3.5). Validation only: the mounts of one manifest may not overlap, by path or by directory identity (§1, Mount); the launch re-checks each root's identity, not the overlap | validate + launch | reject / `sandbox.refuse` / `sandbox.mount_mismatch` |
+| `filesystem.mounts[].host` | validator (realpath, denylist, is-dir, not-symlink, filesystem kind on WSL) **and again** at launch: the launch scan re-opens the root without following symlinks and compares `st_dev:st_ino`, pins are re-checked before `podman init`, and bind mounts are compared inside the container after `init` (ARCHITECTURE §3.5). Validation only: the mounts of one manifest may not overlap, by path or by directory identity (§1, Mount); the launch re-checks each root's identity, not the overlap | validate + launch | reject / `sandbox.refuse` / `sandbox.mount_mismatch` |
 | `filesystem.mounts[].guest` | validator (`/workspace/…`, no `..`, unique) | validate | reject |
 | `filesystem.mounts[].mode` | workspace `podman create` (`sallyd::sandbox::workspace_argv`): bind `ro`/`rw` with `nosuid,nodev,bind` (non-recursive); `brokered` → `ro` + broker `fs_*`; `staged` → `:O` overlay with upper/work in session scratch | launch + each `fs_*` call | EROFS in workspace; `fs_write`/`fs_delete` denied on `ro` (`read-only`); on `staged` they land in the overlay's upper directory; in every mode a call the sandbox's `uid:gid` could not make by mode bits is `permission` (Q39) |
 | `filesystem.mounts[].approve` | validator (glob syntax, §1 Mount) + `sallyd::approvals` glob match on canonical relative path; omitted = `["**"]` | validate + each brokered write/delete | reject; pending → approve/deny |
@@ -599,6 +629,9 @@ See `manifests/examples/`:
   (the default is the same place). Such a variable's folder is also read whole, every entry and
   not only dot names, so a large home can use up the budget and refuse mounts outside it too
   (`denylist-incomplete`).
+- **A binary `config.toml` names directly under `/` or a home refuses every mount under it**
+  (`runtime_path = "/crun"` makes `/` a rule); the message names the setting. Keep a configured
+  runtime or podman in a folder of its own (the default runtime's folder is already a rule).
 - **A folder the user can enter but not list (mode `--x`) inside a listed folder refuses every
   manifest with mounts** (`denylist-incomplete`, naming it), since its files still run by name
   and its links cannot be read. Make it listable, or remove it.

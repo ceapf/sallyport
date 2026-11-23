@@ -29,7 +29,7 @@ use sally_core::model::hash::{Digest, Hasher};
 
 use crate::approve::Tty;
 use crate::commands::read_manifest;
-use crate::local::validated_text;
+use crate::local::{Files, validated_text};
 use crate::{EXIT_FAILED, EXIT_REFUSED, clean};
 
 /// The question asked on a terminal.
@@ -40,8 +40,8 @@ pub const MAX_ANSWER: u64 = 64;
 
 /// What a launch was given besides the manifest's name.
 pub struct Gate<'a, 't> {
-    /// The secrets store whose names the validation reads.
-    pub store: &'a Path,
+    /// The secrets store whose names the validation reads, and `config.toml`.
+    pub files: Files<'a>,
     /// `--accept-manifest`, as typed.
     pub accept: Option<&'a str>,
     /// The terminal, when stdin is one and `/dev/tty` opened.
@@ -56,7 +56,7 @@ pub struct Gate<'a, 't> {
 /// a refusal.
 pub fn launch_text(manifest: &Path, g: Gate<'_, '_>, err: &mut dyn Write) -> Result<String, u8> {
     let accept = parse_accept(g.accept, err)?;
-    let (text, v) = read_checked(manifest, g.store, err)?;
+    let (text, v, env) = read_checked(manifest, g.files, err)?;
     let lines = block(&v).map_err(|dirty| {
         let _ = writeln!(
             err,
@@ -80,22 +80,17 @@ pub fn launch_text(manifest: &Path, g: Gate<'_, '_>, err: &mut dyn Write) -> Res
     let matches = accept.map(|d| d == digest(&text));
     match decide(terminal.is_some(), matches) {
         // TODO(#255): sallyd resolves the hosts again after this check, `~` follows this
-        // process's HOME, and a folder replaced at the same path is not seen here. HOME is
-        // taken as given: where its own path goes through a link, every `~` host is refused
-        // here (write the realpath, or answer on a terminal).
-        Verdict::ByHash => {
-            let home = HostEnv::from_process().map(|env| env.home).map_err(|e| {
+        // process's HOME, a folder replaced at the same path is not seen here, and sallyd reads
+        // its own config.toml at its start. HOME is taken as given: where its own path goes
+        // through a link, every `~` host is refused here (write the realpath, or answer on a
+        // terminal). The host facts are the ones the validation used, read before the block.
+        Verdict::ByHash => match v.manifest.check_hosts_as_written(&env.home) {
+            Ok(()) => Ok(text),
+            Err(e) => {
                 let _ = writeln!(err, "sally: {}", clean::line(&e.to_string()).text);
-                EXIT_FAILED
-            })?;
-            match v.manifest.check_hosts_as_written(&home) {
-                Ok(()) => Ok(text),
-                Err(e) => {
-                    let _ = writeln!(err, "sally: {}", clean::line(&e.to_string()).text);
-                    Err(EXIT_REFUSED)
-                }
+                Err(EXIT_REFUSED)
             }
-        }
+        },
         Verdict::Ask => {
             if terminal.is_some_and(asked_yes) {
                 Ok(text)
@@ -171,9 +166,9 @@ fn parse_accept(accept: Option<&str>, err: &mut dyn Write) -> Result<Option<Dige
 /// checked: the text and its verdict, or the exit code with its reason on `err`.
 fn read_checked(
     manifest: &Path,
-    store: &Path,
+    files: Files<'_>,
     err: &mut dyn Write,
-) -> Result<(String, Validated), u8> {
+) -> Result<(String, Validated, HostEnv), u8> {
     let place = ManifestPlace::inspect(manifest).map_err(|e| {
         let _ = writeln!(err, "sally: {}", clean::line(&e.to_string()).text);
         EXIT_FAILED
@@ -185,12 +180,12 @@ fn read_checked(
         let _ = writeln!(err, "sally: {msg}");
         EXIT_FAILED
     })?;
-    let v = validated_text(&text, store, err)?;
+    let (v, env) = validated_text(&text, files, err)?;
     if let Err(e) = v.manifest.check_place(&place) {
         let _ = writeln!(err, "sally: {}", clean::line(&e.to_string()).text);
         return Err(EXIT_REFUSED);
     }
-    Ok((text, v))
+    Ok((text, v, env))
 }
 
 /// The lines shown after the summary: each warning, then each acknowledged risk.

@@ -5,8 +5,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use sally_core::config::{
-    Config, ConfigError, Owner, RuntimeKind, check_binary, check_runtime_binary,
-    check_trusted_binary, default_runtime_path, parse_config,
+    Config, ConfigError, MAX_CONFIG_BYTES, Owner, ReadConfigError, RuntimeKind, check_binary,
+    check_runtime_binary, check_trusted_binary, default_runtime_path, parse_config, read_config,
 };
 
 /// A scratch dir under the target dir (not /tmp: its ancestors must pass the runtime checks),
@@ -240,4 +240,68 @@ fn the_root_policy_accepts_a_root_owned_binary_through_a_link() {
     std::os::unix::fs::symlink("/bin/sh", &link).unwrap();
     let real = check_binary(&link, "f", Owner::Root).unwrap();
     assert_eq!(real, std::fs::canonicalize("/bin/sh").unwrap());
+}
+
+// ---- reading config.toml (sallyd at start, the CLI for its host facts) -------------------------
+
+fn refusal(path: &Path) -> String {
+    match read_config(path) {
+        Err(ReadConfigError { msg, path: shown }) => {
+            assert_eq!(shown, path.display().to_string());
+            msg
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Security review L2: only a regular file is read; a FIFO is refused at once instead of
+/// blocking the reader, and neither a symlink nor a directory is read. A missing file is the
+/// defaults.
+#[test]
+fn the_config_is_a_regular_file_never_a_fifo_or_a_symlink() {
+    let s = Scratch::new("read");
+    let d = s.0.clone();
+    let file = d.join("config.toml");
+    assert_eq!(read_config(&file).unwrap(), Config::default(), "missing");
+    std::fs::write(&file, "[sandbox]\nruntime_path = \"/opt/crun\"\n").unwrap();
+    assert_eq!(
+        read_config(&file).unwrap().sandbox.runtime_path,
+        Some(PathBuf::from("/opt/crun"))
+    );
+    let link = d.join("link.toml");
+    std::os::unix::fs::symlink(&file, &link).unwrap();
+    assert_eq!(refusal(&link), "a symlink is not followed");
+    assert_eq!(refusal(&d), "not a regular file");
+    let fifo = d.join("fifo.toml");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || tx.send(refusal(&fifo)));
+    let got = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("reading a FIFO config blocked");
+    assert_eq!(got, "not a regular file");
+}
+
+/// The read is bounded one byte past the cap, so a file of exactly the cap parses and one byte
+/// more is refused as too large; a parse error names the file.
+#[test]
+fn the_config_read_is_bounded_at_the_cap() {
+    let s = Scratch::new("cap");
+    let file = s.0.join("config.toml");
+    let at_cap = format!("#{}\n", "x".repeat(MAX_CONFIG_BYTES - 2));
+    assert_eq!(at_cap.len(), MAX_CONFIG_BYTES);
+    std::fs::write(&file, &at_cap).unwrap();
+    assert_eq!(read_config(&file).unwrap(), Config::default());
+    std::fs::write(&file, format!("{at_cap} ")).unwrap();
+    assert_eq!(refusal(&file), ConfigError::TooLarge.to_string());
+    std::fs::write(&file, "[nope]\n").unwrap();
+    assert!(refusal(&file).starts_with("config.toml: "), "parse");
+    let unreadable = s.0.join("missing-dir/config.toml");
+    assert_eq!(read_config(&unreadable).unwrap(), Config::default());
 }

@@ -18,6 +18,9 @@ fn validated(body: &str) -> Validated {
         other_homes: Vec::new(),
         xdg_config_home: None,
         xdg_data_home: None,
+        xdg_state_home: None,
+        configured_binaries: Vec::new(),
+        refused_fs_kinds: Vec::new(),
         xdg_runtime_dir: None,
         podman_storage: Vec::new(),
         env_dirs: Vec::new(),
@@ -183,9 +186,13 @@ impl Drop for Gone {
 /// [`launch_text`] off a terminal: the result and what `err` holds.
 fn launch_off(path: &Path, accept: Option<&str>) -> (Result<String, u8>, String) {
     let store = path.with_file_name("no-store");
+    let config = path.with_file_name("no-config.toml");
     let mut err = Vec::new();
     let g = Gate {
-        store: &store,
+        files: Files {
+            store: &store,
+            config: &config,
+        },
         accept,
         terminal: None,
     };
@@ -248,6 +255,7 @@ fn launch_on(
     typed: &[u8],
 ) -> (Result<String, u8>, String, usize) {
     let store = path.with_file_name("no-store");
+    let config = path.with_file_name("no-config.toml");
     let mut input = Cursor::new(typed.to_vec());
     let mut output = Vec::new();
     let flushes = Cell::new(0);
@@ -263,7 +271,10 @@ fn launch_on(
             flush: &mut flush,
         };
         let g = Gate {
-            store: &store,
+            files: Files {
+                store: &store,
+                config: &config,
+            },
             accept,
             terminal: Some(&mut t),
         };

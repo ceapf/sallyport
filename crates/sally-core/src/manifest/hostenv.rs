@@ -5,6 +5,8 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use crate::config::{Config, PODMAN_PATH_FIELD, RUNTIME_PATH_FIELD};
+
 /// Host facts used by the validator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostEnv {
@@ -17,6 +19,8 @@ pub struct HostEnv {
     pub xdg_config_home: Option<PathBuf>,
     /// `$XDG_DATA_HOME`, if set to an absolute path.
     pub xdg_data_home: Option<PathBuf>,
+    /// `$XDG_STATE_HOME`, if set to an absolute path.
+    pub xdg_state_home: Option<PathBuf>,
     /// `$XDG_RUNTIME_DIR`, if set to an absolute path.
     pub xdg_runtime_dir: Option<PathBuf>,
     /// Podman storage roots (graphroot). Mounting these or any ancestor is refused.
@@ -25,6 +29,12 @@ pub struct HostEnv {
     /// `$GNUPGHOME`, every absolute `$PATH` entry, …). Each is denylisted like
     /// a home folder of the built-in list (MANIFEST_SPEC §2).
     pub env_dirs: Vec<EnvDir>,
+    /// The binaries `config.toml` names (the runtime, podman). The folder each is in, as written
+    /// and as resolved, is denylisted: the host runs it on every launch (MANIFEST_SPEC §2).
+    pub configured_binaries: Vec<ConfiguredBinary>,
+    /// Filesystem kinds a mount root may not lie on, wherever they are mounted: on WSL, 9p
+    /// (Windows drives and the WSL driver share; [`refused_fs_kinds`]). Empty elsewhere.
+    pub refused_fs_kinds: Vec<FsKind>,
     /// Logical CPUs available to the user.
     pub nproc: u32,
     /// Total host RAM in bytes.
@@ -38,6 +48,88 @@ pub struct EnvDir {
     pub path: PathBuf,
     /// The variable's name, without `$` (`PATH`, `CARGO_HOME`, …).
     pub var: &'static str,
+}
+
+/// A binary a `config.toml` setting names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfiguredBinary {
+    /// The path as the setting gives it (absolute: `parse_config` refuses a relative one).
+    pub path: PathBuf,
+    /// The setting's dotted name (`sandbox.runtime_path`, `sandbox.podman_path`).
+    pub setting: &'static str,
+}
+
+/// The binaries `config` names, in a fixed order: the runtime, then podman. A setting left to
+/// its default names none: the default runtime lies under the data home's `sallyport/` folder,
+/// already a rule, and the default podman is a root-owned system binary.
+#[must_use]
+pub fn configured_binaries(config: &Config) -> Vec<ConfiguredBinary> {
+    [
+        (&config.sandbox.runtime_path, RUNTIME_PATH_FIELD),
+        (&config.sandbox.podman_path, PODMAN_PATH_FIELD),
+    ]
+    .into_iter()
+    .filter_map(|(path, setting)| {
+        path.as_ref().map(|p| ConfiguredBinary {
+            path: p.clone(),
+            setting,
+        })
+    })
+    .collect()
+}
+
+/// A filesystem kind: the `f_type` that `statfs` reports, and a name for messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FsKind {
+    /// The kernel's magic number for the filesystem (`f_type`).
+    pub magic: u64,
+    /// Its name, as `stat -f` prints it.
+    pub label: &'static str,
+}
+
+/// 9p (`V9FS_MAGIC`). On WSL, Windows drives are 9p mounts, and so is the driver share
+/// (docs/dev/PROBE_NOTES.md); the kind alone does not tell them apart, so every 9p is refused.
+pub const V9FS: FsKind = FsKind {
+    magic: 0x0102_1997,
+    label: "9p",
+};
+
+/// Where the kernel names its release; on WSL it contains `microsoft`.
+const OSRELEASE: &str = "/proc/sys/kernel/osrelease";
+/// Present when WSL's Windows interop is registered.
+const WSL_INTEROP: &str = "/proc/sys/fs/binfmt_misc/WSLInterop";
+
+/// The filesystem kinds refused as mount roots, from the kernel release text and whether WSL's
+/// interop entry is present: on WSL (either signal) [`V9FS`], else none. A further signal is
+/// added only once it is probed (docs/dev/PROBE_NOTES.md), and only ever adds refusals
+/// (RT-FS-11: Windows drives refused by kind wherever they are mounted).
+// TODO(#281): a WSL that serves Windows drives over virtiofs is not covered, nor one that
+// neither signal shows (a release without "microsoft" and interop off: only the `/mnt` rule).
+#[must_use]
+pub fn refused_fs_kinds(osrelease: &str, interop: bool) -> Vec<FsKind> {
+    if interop || osrelease.to_ascii_lowercase().contains("microsoft") {
+        vec![V9FS]
+    } else {
+        Vec::new()
+    }
+}
+
+/// The kernel release text at `path`, at most 4 KiB; any failure is [`HostEnvError::OsRelease`]
+/// with its cause.
+fn read_release(path: &Path) -> Result<String, HostEnvError> {
+    use std::io::Read;
+    let mut s = String::new();
+    std::fs::File::open(path)
+        .and_then(|f| f.take(4096).read_to_string(&mut s))
+        .map_err(|e| HostEnvError::OsRelease(e.to_string()))?;
+    Ok(s)
+}
+
+/// Whether WSL's interop entry is present. Only a clean not-found is absence: any other answer
+/// counts as present (fail closed). Where `binfmt_misc` is an automount point (systemd), the
+/// lookup may mount it.
+fn interop_present(path: &Path) -> bool {
+    !matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// Variables whose value is one folder the host runs or loads code from, or keeps credentials
@@ -110,19 +202,26 @@ pub enum HostEnvError {
     /// `/proc/meminfo` was unreadable or lacked `MemTotal`.
     #[error("cannot read total memory from /proc/meminfo: {0}")]
     MemInfo(String),
+    /// `/proc/sys/kernel/osrelease` was unreadable: whether this is WSL cannot be told, and
+    /// it is never assumed not to be.
+    #[error("cannot read the kernel release from /proc/sys/kernel/osrelease: {0}")]
+    OsRelease(String),
 }
 
 impl HostEnv {
-    /// Reads the current process environment and `/proc`.
+    /// Reads the current process environment and `/proc`, and takes the binaries `config` names
+    /// ([`configured_binaries`]). The caller passes the `config.toml` it read
+    /// (`crate::config::read_config`), so `sallyd` and the CLI derive the same facts.
     ///
     /// Podman storage defaults to the rootless graphroot (`$XDG_DATA_HOME/containers/storage`)
     /// plus the rootful one (`/var/lib/containers/storage`); callers that know the real
     /// graphroot from `podman info` should append it.
     ///
     /// # Errors
-    /// [`HostEnvError`] if the home directory or RAM size cannot be determined. Validation must
+    /// [`HostEnvError`] if the home directory, the RAM size or the kernel release (whether this
+    /// is WSL) cannot be determined. Validation must
     /// not proceed with a guessed home: the denylist depends on it.
-    pub fn from_process() -> Result<Self, HostEnvError> {
+    pub fn from_process(config: &Config) -> Result<Self, HostEnvError> {
         let abs_var = |name: &str| {
             std::env::var_os(name)
                 .map(PathBuf::from)
@@ -150,8 +249,14 @@ impl HostEnv {
             other_homes,
             xdg_config_home,
             xdg_data_home,
+            xdg_state_home: abs_var("XDG_STATE_HOME"),
             podman_storage,
             env_dirs: env_dirs(|name| std::env::var_os(name)),
+            configured_binaries: configured_binaries(config),
+            refused_fs_kinds: refused_fs_kinds(
+                &read_release(Path::new(OSRELEASE))?,
+                interop_present(Path::new(WSL_INTEROP)),
+            ),
             nproc,
             mem_bytes: mem_total()?,
         })
@@ -290,9 +395,87 @@ mod tests {
         assert_eq!(dirs(&[]), Vec::new());
     }
 
+    /// Each binary setting that is set, in order, with its name; unset settings name none.
+    #[test]
+    fn the_configured_binaries_come_from_their_settings() {
+        let mut c = Config::default();
+        assert_eq!(configured_binaries(&c), Vec::new());
+        c.sandbox.podman_path = Some("/opt/p/podman".into());
+        let podman = ConfiguredBinary {
+            path: "/opt/p/podman".into(),
+            setting: "sandbox.podman_path",
+        };
+        assert_eq!(configured_binaries(&c), std::slice::from_ref(&podman));
+        c.sandbox.runtime_path = Some("/opt/r/crun".into());
+        let runtime = ConfiguredBinary {
+            path: "/opt/r/crun".into(),
+            setting: "sandbox.runtime_path",
+        };
+        assert_eq!(configured_binaries(&c), [runtime, podman]);
+        let env = HostEnv::from_process(&c).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(env.configured_binaries, configured_binaries(&c));
+    }
+
+    /// 9p's magic, pinned against the literal the kernel's `magic.h` gives.
+    #[test]
+    fn the_9p_kind_is_pinned() {
+        assert_eq!(V9FS.magic, 0x0102_1997);
+        assert_eq!(V9FS.label, "9p");
+        assert_eq!(OSRELEASE, "/proc/sys/kernel/osrelease");
+        assert_eq!(WSL_INTEROP, "/proc/sys/fs/binfmt_misc/WSLInterop");
+    }
+
+    /// WSL when the kernel release says so (any case) or the interop entry is present; 9p is
+    /// then refused. Neither: nothing.
+    #[test]
+    fn wsl_is_told_by_its_release_or_its_interop_entry() {
+        let release = "6.18.0-microsoft-standard-WSL2\n";
+        assert_eq!(refused_fs_kinds(release, false), [V9FS]);
+        assert_eq!(refused_fs_kinds("6.18.0-Microsoft\n", false), [V9FS]);
+        assert_eq!(refused_fs_kinds("6.8.0-45-generic\n", true), [V9FS]);
+        assert_eq!(refused_fs_kinds(release, true), [V9FS]);
+        assert_eq!(refused_fs_kinds("6.8.0-45-generic\n", false), Vec::new());
+        assert_eq!(refused_fs_kinds("", false), Vec::new());
+    }
+
+    /// Only a clean not-found is absence; an entry of any type, or one that cannot be looked
+    /// at, is presence.
+    #[test]
+    fn the_interop_entry_is_absent_only_when_not_found() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/tmp")
+            .join(format!("sp-interop-{}", std::process::id()));
+        struct Gone(PathBuf);
+        impl Drop for Gone {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
+        let _gone = Gone(dir.clone());
+        assert!(!interop_present(&dir.join("absent")));
+        std::fs::write(dir.join("file"), "").unwrap_or_else(|e| panic!("{e}"));
+        assert!(interop_present(&dir.join("file")));
+        assert!(interop_present(&dir));
+        // A lookup through a file fails with ENOTDIR, not ENOENT: present.
+        assert!(interop_present(&dir.join("file/x")));
+        // The release reader names its cause.
+        let e = read_release(&dir.join("absent")).unwrap_err();
+        assert!(
+            matches!(&e, HostEnvError::OsRelease(m) if !m.is_empty()),
+            "{e}"
+        );
+        std::fs::write(dir.join("release"), "6.8.0-generic\n").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            read_release(&dir.join("release")).ok().as_deref(),
+            Some("6.8.0-generic\n")
+        );
+    }
+
     #[test]
     fn from_process_works_on_this_host() {
-        let env = HostEnv::from_process();
+        let env = HostEnv::from_process(&Config::default());
         assert!(env.is_ok(), "{env:?}");
         let env = env.unwrap_or_else(|_| unreachable!());
         assert!(env.home.is_absolute());
@@ -300,6 +483,16 @@ mod tests {
         let info = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
         assert_eq!(Some(env.mem_bytes), parse_meminfo(&info));
         assert_eq!(env.env_dirs, env_dirs(|n| std::env::var_os(n)));
+        let state = std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute());
+        assert_eq!(env.xdg_state_home, state);
+        // The kinds, from an independent read of this host's two signals.
+        let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+        let interop = Path::new("/proc/sys/fs/binfmt_misc/WSLInterop")
+            .try_exists()
+            .unwrap_or(true);
+        assert_eq!(env.refused_fs_kinds, refused_fs_kinds(&release, interop));
         assert!(
             env.env_dirs.iter().any(|d| d.var == "PATH"),
             "this host has a PATH"
@@ -326,7 +519,7 @@ mod tests {
             return;
         };
         let passwd = getent_home();
-        let env = HostEnv::from_process().unwrap_or_else(|e| panic!("{e}"));
+        let env = HostEnv::from_process(&Config::default()).unwrap_or_else(|e| panic!("{e}"));
         if want_home.is_empty() {
             // No HOME: the passwd home is the home, and not also "another" home.
             assert_eq!(env.home, passwd);
@@ -335,6 +528,11 @@ mod tests {
             assert_eq!(env.home, PathBuf::from(&want_home));
             assert_eq!(env.other_homes, [passwd]);
         }
+        // The parent sets an absolute state home: the field is that variable.
+        assert_eq!(
+            env.xdg_state_home,
+            Some(PathBuf::from("/sp-elsewhere/state"))
+        );
     }
 
     /// `HOME` wins and the passwd home of this uid is kept as another home; without `HOME` the
@@ -350,7 +548,8 @@ mod tests {
                 "manifest::hostenv::tests::home_and_other_homes_child",
                 "--test-threads=1",
             ])
-            .env(CHILD, home.unwrap_or(""));
+            .env(CHILD, home.unwrap_or(""))
+            .env("XDG_STATE_HOME", "/sp-elsewhere/state");
             match home {
                 Some(h) => cmd.env("HOME", h),
                 None => cmd.env_remove("HOME"),

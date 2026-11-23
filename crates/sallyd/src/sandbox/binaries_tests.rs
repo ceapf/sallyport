@@ -148,6 +148,59 @@ fn a_helper_search_is_root_only_without_fall_through() {
     assert_eq!(e.to_string(), "t: not found in any of [\"/nonexistent/a\"]");
 }
 
+/// The host facts from `HostEnv::from_process` over the parsed config, as `serve` passes it
+/// (the folders that depend on the caller's environment replaced by the fixture's), from a
+/// config whose `sandbox.runtime_path` (or
+/// `sandbox.podman_path`) is a user-owned executable at `<home>/tools/crun/crun`, which the
+/// runtime check accepts: a mount of `~/tools` or of `~/tools/crun` is refused `denylisted`,
+/// naming the setting. Control: with the runtime at its default path (unset) the same mounts
+/// load.
+#[test]
+fn the_folder_of_a_configured_binary_is_not_mountable() {
+    let s = Scratch::new("binfolder");
+    let home = s.0.join("home");
+    std::fs::create_dir_all(home.join("tools/crun")).unwrap();
+    let crun = home.join("tools/crun/crun");
+    std::fs::write(&crun, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&crun, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(crate::sandbox::CheckedRuntime::check(&crun).is_ok());
+    let text = |host: &str| {
+        format!(
+            "apiVersion: sallyport/v1\nkind: Manifest\nname: t\nmodel:\n  ref: any\nfilesystem:\n  \
+             mounts:\n    - {{host: \"{host}\", guest: /workspace/x, mode: rw}}\n"
+        )
+    };
+    let facts = |config: &str| {
+        let config = sally_core::config::parse_config(config).unwrap();
+        let mut env = sally_core::manifest::HostEnv::from_process(&config).unwrap();
+        env.home.clone_from(&home);
+        env.other_homes.clear();
+        env.xdg_data_home = None;
+        env.xdg_state_home = None;
+        env.xdg_config_home = None;
+        env.xdg_runtime_dir = None;
+        env.podman_storage.clear();
+        env.env_dirs.clear();
+        env
+    };
+    let none = std::collections::BTreeSet::new();
+    let defaults = facts("");
+    for host in ["~/tools", "~/tools/crun"] {
+        let r = sally_core::manifest::load(&text(host), &defaults, &none);
+        assert!(r.is_ok(), "control: {host}: {r:?}");
+    }
+    for setting in ["runtime_path", "podman_path"] {
+        let env = facts(&format!("[sandbox]\n{setting} = \"{}\"\n", crun.display()));
+        for host in ["~/tools", "~/tools/crun"] {
+            let e = sally_core::manifest::load(&text(host), &env, &none).unwrap_err();
+            let d = e.errors.first().unwrap();
+            assert_eq!(d.code, sally_core::manifest::Code::Denylisted, "{host}");
+            assert_eq!(d.path, "filesystem.mounts[0].host");
+            assert!(d.message.contains(&format!("sandbox.{setting}")), "{d:?}");
+        }
+    }
+}
+
 /// A configured podman may be the user's own (the runtime's rule), the system list is not
 /// looked at, and its errors name the setting.
 #[test]

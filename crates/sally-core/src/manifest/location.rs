@@ -408,6 +408,15 @@ mod tests {
             first(&[("~/code/p", p), ("/srv/q", q), ("/srv/q/", q)], home),
             None
         );
+        // A trailing `/` or `/.` is the same path, as the mount-root check judges it
+        // (`paths::check_mount_host`): a root that is a link is refused there in every spelling.
+        assert_eq!(
+            first(
+                &[("~/code/p/.", p), ("/srv/q/.", q), ("~/code/p/./", p)],
+                home
+            ),
+            None
+        );
         assert_eq!(first(&[("~", home)], home), None);
         for written in [
             "~/code/link",
@@ -457,6 +466,9 @@ mod tests {
             other_homes: Vec::new(),
             xdg_config_home: None,
             xdg_data_home: None,
+            xdg_state_home: None,
+            configured_binaries: Vec::new(),
+            refused_fs_kinds: Vec::new(),
             xdg_runtime_dir: None,
             podman_storage: Vec::new(),
             env_dirs: Vec::new(),
