@@ -1884,6 +1884,15 @@ too (#82). A run in which no mutant was caught, missed or timed out fails the ga
 mutant counts for nothing), and `make mutants-paths` (in `make lint` and the `rust` job) fails
 when an entry of a mutation list matches no Rust file or a list is empty.
 
+The nightly also runs `loaded-repeat` (#141): RT-AG-09's bombs binary, 10 repeats beside one
+`make test` pass (`make loaded-repeat`, `scripts/loaded-repeat.sh`). It reports and does not gate:
+the job fails on a red repeat, on a load pass that fails the fork-bomb test, or on fewer than 10
+loaded repeats, and its job-level
+`continue-on-error: true` keeps that out of the run's conclusion, which stays the mutation verdict.
+`scripts/nightly-shards.sh` allows `continue-on-error` on that job alone, in that one form, and
+fails when any job lists `loaded-repeat` under `needs`; on a mutation job the key would remove
+the gate.
+
 Dev-dependencies: `insta` (summary and diagnostic snapshots; review changes with
 `cargo insta review`) and `proptest` (wildcard matcher, host-pattern round trip; the token
 proxy's streaming redaction under any split, Task 9a-3). Dependabot opens weekly PRs for cargo (workspace and `fuzz/`) and GitHub
