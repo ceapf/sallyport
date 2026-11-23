@@ -15,6 +15,9 @@
 #   repeat counted: such a load cannot carry one); otherwise no further repeat starts. With
 #   LOADED_REPEAT_START_LIMIT=<s> (0: none) no repeat starts later than s seconds after the first.
 #   Each load pass keeps its log (load-<k>.log): it ran bombs.rs too, an in-suite sample.
+# - The load and each repeat run in the background, where bash (without job control) ignores
+#   INT and QUIT and the ignore survives exec; both start with those signals reset to default,
+#   so test-run.sh and its own tests (an interrupted run, test_run_test.sh) see a normal process.
 # - When the repeats end, the load gets TERM (its test-run.sh sweeps its own containers) and is
 #   waited for. Exit 0 only when every repeat passed, <count> loaded repeats ran and no load pass
 #   failed in the fork-bomb test; otherwise 1, with the verdict (red or incomplete) on the totals
@@ -68,7 +71,7 @@ load_pid="" passes=0 load_red=0 idle=0 loaded=0 at_load=0
 load_start() {
   passes=$((passes + 1))
   at_load="$loaded"
-  setsid bash -c "$load_cmd" >"$out/load-$passes.log" 2>&1 &
+  setsid env --default-signal=INT,QUIT bash -c "$load_cmd" >"$out/load-$passes.log" 2>&1 &
   load_pid=$!
 }
 # Records a finished load pass: its exit status, and whether the fork-bomb test failed in it.
@@ -133,7 +136,8 @@ while [ "$loaded" -lt "$count" ]; do
   s=0
   # TERM at the limit; KILL only kill_after seconds later, so test-run.sh has time to stop the
   # test binary and sweep its containers (a KILL before that leaves them behind).
-  timeout --signal=TERM --kill-after="$kill_after" "$limit" bash -c "$run_cmd" >"$log" 2>&1 &
+  timeout --signal=TERM --kill-after="$kill_after" "$limit" \
+    env --default-signal=INT,QUIT bash -c "$run_cmd" >"$log" 2>&1 &
   rep_pid=$!
   wait "$rep_pid" || s=$?
   rep_pid=""

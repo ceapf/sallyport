@@ -130,6 +130,17 @@ run start-limit 5 1 slow LOADED_REPEAT_START_LIMIT=1
 lines start-limit 1
 has start-limit "loaded 1, unloaded 0, passed 1, red 0, load passes 1, verdict incomplete"
 
+# The load and the repeat start with INT and QUIT at their defaults, not ignored as bash leaves
+# them for a background command (test-run.sh's own INT test fails under an ignored INT).
+run signals 1 0 pass LOADED_REPEAT_LOAD="trap -p INT QUIT >$tmp/signals.load; sleep 30" \
+  LOADED_REPEAT_RUN="trap -p INT QUIT >$tmp/signals.run; bash $tmp/run.sh $tmp/signals.count pass"
+for f in load run; do
+  if [ ! -e "$tmp/signals.$f" ] || [ -s "$tmp/signals.$f" ]; then
+    echo "FAIL signals: the $f's INT/QUIT dispositions: $(cat "$tmp/signals.$f" 2>/dev/null || echo none)"
+    fail=1
+  fi
+done
+
 # TERM to the script mid-repeat: the repeat and the load each get TERM at once (each would
 # sweep its containers) and the script exits 143, well before the repeat's 600 s limit.
 case_n=$((case_n + 1))
