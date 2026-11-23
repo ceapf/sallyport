@@ -154,7 +154,7 @@ G1 Obtain GITHUB_TOKEN value from inside Z3
 │  ├─ Trick Host header / absolute-URI mismatch
 │  │  ├─ On CONNECT                                 [authority from request-target only → RT-NET-05]
 │  │  └─ Inside an intercepted tunnel               [other Host 421 `host-mismatch`, unforwardable target 400 →
-│  │                                                 sallyd intercept_tests `a_host_header_naming_another_authority_is_421`,
+│  │                                                 unit tests only: sallyd intercept_tests `a_host_header_naming_another_authority_is_421`,
 │  │                                                 `heads_the_proxy_cannot_forward_as_they_are_are_400`, rewrite_tests;
 │  │                                                 red-team leg planned (#218)]
 │  └─ Redirect from api.github.com to attacker     [proxy never follows redirects → RT-SEC-05]
@@ -180,21 +180,26 @@ caller yet (#209), so nothing sends it today.
 G1 Misuse the Hub token on sallyd's own connection (AT4)
 ├─ Redirect a request to another host               [redirects only https, port 443, no userinfo, to Hub
 │                                                    hosts on a label boundary; the token only on a hop to
-│                                                    `huggingface.co` → sally-core hf::plan
+│                                                    `huggingface.co` → unit tests only: sally-core hf::plan
 │                                                    `redirect_hosts_are_hub_domains_on_a_label_boundary`,
 │                                                    `other_redirects_are_refused`; sallyd hf
 │                                                    `a_redirect_off_the_hub_is_not_followed`,
-│                                                    `a_pull_follows_the_cdn_redirect_without_the_token`]
+│                                                    `a_pull_follows_the_cdn_redirect_without_the_token`;
+│                                                    red-team leg planned (#285)]
 ├─ Redirect a chain back to the API host after it left it
 │                                                   [OPEN, fix planned, #266: that hop carries the token; §6]
 ├─ Serve the file list from a host a redirect named [OPEN, fix planned, #266: the list is read there; §6]
 ├─ Answer the lookup with an address of the user's network
 │                                                   [the egress proxy's address filter, a pinned address
-│                                                    dialled → sallyd hf `denied_addresses_are_never_dialled`]
+│                                                    dialled → unit tests only: sallyd hf
+│                                                    `denied_addresses_are_never_dialled`; red-team leg
+│                                                    planned (#285)]
 └─ Choose the trust anchors through the environment [roots only from a checked bundle, never chosen by
-                                                     the environment → sallyd hf
+                                                     the environment → unit tests only: sallyd hf
                                                      `the_client_takes_its_roots_only_from_a_checked_bundle`,
-                                                     `the_client_trusts_no_anchor_but_its_bundle`]
+                                                     `the_client_trusts_no_anchor_but_its_bundle`;
+                                                     red-team leg planned (#285); the bundle's file
+                                                     checks: no test named yet (#286)]
 ```
 
 ### G2. Read or modify host files outside granted mounts (A1)
@@ -210,21 +215,23 @@ G2 Access ~/.ssh/id_ed25519 from Z3
 │                                                   [resolves inside container rootfs → RT-FS-03]
 ├─ Path traversal via brokered fs tool              [openat2 RESOLVE_BENEATH → RT-FS-04]
 ├─ Write through a hard link in a `brokered` mount to a file outside it
-│                                                   [refused `hard-link` → sallyd tools::fs::tests
+│                                                   [refused `hard-link` → unit tests only: sallyd tools::fs::tests
 │                                                    `a_brokered_write_refuses_a_hard_link_and_leaves_its_other_name_untouched`,
-│                                                    tools::tests `only_a_brokered_write_refuses_a_hard_link`]
+│                                                    tools::tests `only_a_brokered_write_refuses_a_hard_link`;
+│                                                    red-team leg planned (#285)]
 ├─ Have the broker open a non-regular object (device, FIFO) with host privileges
 │                                                   [regular files and empty directories only: a read or
 │                                                    write types its target on an `O_PATH` fd before
 │                                                    anything is opened; a delete types its target by
 │                                                    name and removes it by name (§6, the file tools'
-│                                                    row) → sallyd
+│                                                    row) → unit tests only: sallyd
 │                                                    tools::fs::tests `only_regular_files_are_read`,
 │                                                    `a_write_creates_or_replaces_a_regular_file_only`,
 │                                                    `a_delete_takes_a_file_or_an_empty_directory_only`
-│                                                    (tested with a FIFO and a directory; that a refused
-│                                                    object is never opened is tested for a permission
-│                                                    refusal only → RT-FS-18)]
+│                                                    (tested with a FIFO and a directory); red-team leg
+│                                                    planned (#285); that a refused object is never
+│                                                    opened is tested for a permission refusal only →
+│                                                    RT-FS-18]
 ├─ Reach a host process through an object in a mount
 │  ├─ A Unix socket                                 [launch refused `socket-in-mount` → RT-FS-13;
 │  │                                                 one created after the scan: RESIDUAL; §6]
@@ -370,11 +377,11 @@ G5 Get a denied action executed
 │                                                   [the launch gate refuses a shown line that is not
 │                                                    printable ASCII (control characters, bidi
 │                                                    overrides, any other non-ASCII), summary lines
-│                                                    included (`consent.rs` `block`) → sally-cli
-│                                                    `consent_tests.rs`
+│                                                    included (`consent.rs` `block`) → unit tests only:
+│                                                    sally-cli `consent_tests.rs`
 │                                                    `a_line_that_cannot_be_shown_withholds_the_block_and_is_named`
-│                                                    (a warning line; a test with a summary line
-│                                                    rides #269);
+│                                                    (a warning line); red-team leg planned, with a
+│                                                    summary line (#269);
 │                                                    OPEN, fix planned, #269: globs quoted, manifest
 │                                                    text escaped, non-default approval settings and
 │                                                    the injection header and format named; §6]
@@ -396,10 +403,10 @@ G5 Get a denied action executed
 ├─ TOCTOU: change what an approved path names before it runs
 │                                                   [re-resolved from the mount root, opened and checked
 │                                                    again (SI-8), escapes refused →
-│                                                    sallyd tools::fs::tests
+│                                                    unit tests only: sallyd tools::fs::tests
 │                                                    `a_directory_swapped_for_a_symlink_after_prepare_is_refused_at_run`,
 │                                                    `a_symlink_target_escapes_and_a_lost_create_race_is_refused`;
-│                                                    RESIDUAL: whether a write creates or replaces is decided
+│                                                    red-team leg planned (#285); RESIDUAL: whether a write creates or replaces is decided
 │                                                    at run]
 ├─ Replay an approval id                            [single-use → RT-AG-02]
 ├─ Let it time out                                  [default deny → RT-AG-02]
@@ -506,9 +513,10 @@ G7 Make the machine unusable
 ├─ Stall or outrun the broker's own file operation
 │  ├─ A lease or a non-regular object in a brokered mount
 │  │                                                [a leased file fails at once, non-regular objects are
-│  │                                                 refused → sallyd tools::fs::tests
+│  │                                                 refused → unit tests only: sallyd tools::fs::tests
 │  │                                                 `a_leased_file_fails_at_once_instead_of_stalling_the_broker`,
-│  │                                                 `only_regular_files_are_read`]
+│  │                                                 `only_regular_files_are_read`; red-team leg planned
+│  │                                                 (#285)]
 │  └─ A broker file write the session kill does not reach (on an `rw` or `staged` mount, holding
 │     the exec gate the walk and the stop need)     [RESIDUAL: bounded in data, not in time; §6]
 ├─ Push a slow approver off the approval hub, so every prompt of every session is denied
@@ -556,7 +564,7 @@ G7 Make the machine unusable
 ├─ Panic a daemon-scoped task (a start task, a supervisor, the sweep, a control connection),
 │  which stops every session                        [RESIDUAL by design: fails closed, `sallyd` exits
 │                                                    non-zero; no sandbox-reachable panic is known; §6]
-├─ Sessions enough to fail the orphan sweep         [64 live at most, refused `session-limit` at reservation → sallyd unit tests sandbox::budget, overlap, orphans; RESIDUAL §6]
+├─ Sessions enough to fail the orphan sweep         [64 live at most, refused `session-limit` at reservation → unit tests only: sallyd sandbox::budget, overlap, orphans; red-team leg planned (#285); RESIDUAL §6]
 └─ VRAM never released after crash                  [container exit → sallyd reaps; RESIDUAL: driver bugs]
 ```
 
@@ -573,19 +581,19 @@ G7 Make the machine unusable
 | Manifest strict schema + denylist + realpath checks | `sally-core::manifest` | RT-MAN-01..03, RT-FS-05, 06, 19 |
 | `--cap-drop=ALL --security-opt no-new-privileges --read-only --userns=keep-id`, `nosuid,nodev` mounts, custom seccomp | `sallyd::sandbox::argv` (seccomp profiles from `sandbox::profiles`), checked by `sandbox::check` | RT-FS-07, 08, 09, 17, RT-NET-12 |
 | `openat2` confinement for brokered fs | `sallyd::tools::fs` | RT-FS-04 |
-| Brokered file operations take regular files and empty directories only (a read or write types its target on an `O_PATH` fd before anything is opened; a delete types its target by name and removes it by name), refuse a hard link, fail at once on a lease, and re-resolve an approved path from the mount root, opened and checked again (SI-8) | `sallyd::tools::fs` | sallyd `tools::fs::tests` `a_brokered_write_refuses_a_hard_link_and_leaves_its_other_name_untouched`, `only_regular_files_are_read`, `a_write_creates_or_replaces_a_regular_file_only`, `a_delete_takes_a_file_or_an_empty_directory_only`, `a_leased_file_fails_at_once_instead_of_stalling_the_broker`, `a_directory_swapped_for_a_symlink_after_prepare_is_refused_at_run`, `a_symlink_target_escapes_and_a_lost_create_race_is_refused`; `tools::tests` `only_a_brokered_write_refuses_a_hard_link`. For a read or write, typed on the `O_PATH` fd first, a refused object is never opened for I/O by construction; RT-FS-18 proves that for a file refused by mode bits |
+| Brokered file operations take regular files and empty directories only (a read or write types its target on an `O_PATH` fd before anything is opened; a delete types its target by name and removes it by name), refuse a hard link, fail at once on a lease, and re-resolve an approved path from the mount root, opened and checked again (SI-8) | `sallyd::tools::fs` | unit tests only (red-team legs planned, #285): sallyd `tools::fs::tests` `a_brokered_write_refuses_a_hard_link_and_leaves_its_other_name_untouched`, `only_regular_files_are_read`, `a_write_creates_or_replaces_a_regular_file_only`, `a_delete_takes_a_file_or_an_empty_directory_only`, `a_leased_file_fails_at_once_instead_of_stalling_the_broker`, `a_directory_swapped_for_a_symlink_after_prepare_is_refused_at_run`, `a_symlink_target_escapes_and_a_lost_create_race_is_refused`; `tools::tests` `only_a_brokered_write_refuses_a_hard_link`. For a read or write, typed on the `O_PATH` fd first, a refused object is never opened for I/O by construction; RT-FS-18 proves that for a file refused by mode bits |
 | Tool allowlist per manifest; shell modes; destructive tags | `sallyd::tools` | RT-AG-01, 02, 07 |
 | Approval queue: canonical args, single-use, timeout-deny, flood control, escaped rendering | `sallyd::approvals` | RT-AG-02..05 |
 | Separate control vs session sockets; method tables | `sallyd::rpc` | RT-AG-06, 08 |
 | Session socket memory: finished calls reaped while their connection is open; a call holds its slot until its reply is written or dropped, so at most `MAX_IN_FLIGHT` calls, their replies included, per session | `sallyd::rpc::agent` | RT-AG-17 |
-| Peer-UID check at accept, before a byte is read (`SO_PEERCRED`): refuses a peer of another UID. It does not tell a sandbox from the user (sandboxes run with the user's own UID under `keep-id`), so only the socket directory not being mounted keeps Z3 off `control.sock` (SI-2; RT-FS-10) | `sallyd::rpc::listen` (`spawn`) | sallyd `rpc::listen` `another_uid_is_refused_before_a_byte_is_read`, `rpc::agent`, `rpc::control` and `llm::server` `a_peer_with_another_uid_is_refused_and_recorded`: each gives the listener an expected UID that is not the test's own, so the test's own connection is the refused peer; none connects as another UID |
+| Peer-UID check at accept, before a byte is read (`SO_PEERCRED`): refuses a peer of another UID. It does not tell a sandbox from the user (sandboxes run with the user's own UID under `keep-id`), so only the socket directory not being mounted keeps Z3 off `control.sock` (SI-2; RT-FS-10) | `sallyd::rpc::listen` (`spawn`) | unit tests only (red-team leg planned, #285): sallyd `rpc::listen` `another_uid_is_refused_before_a_byte_is_read`, `rpc::agent`, `rpc::control` and `llm::server` `a_peer_with_another_uid_is_refused_and_recorded`: each gives the listener an expected UID that is not the test's own, so the test's own connection is the refused peer; none connects as another UID |
 | Line-mode output neutralization: one escaper per stream of an attached command, to printable ASCII and `\n`, before `session.output` leaves; the CLI's clean-check as a second layer | `sally-core::text` (`StreamEscaper`), applied in `sallyd::tools::pipe`; `sally-cli` (`sally sandbox run`) | RT-CLI-01 (the escaper); the clean-check: sally-cli `run_tests.rs` |
 | Resource limits (`--pids-limit`, `--memory`, `--cpus`, timeout) | `sallyd::sandbox` | RT-AG-09 |
 | Extension allowlist (`.gguf` only: `.safetensors` and archives are refused by name, `format_not_allowed`, until M2 Tasks 2 and 3), magic bytes, strict GGUF parser, SHA-256, immutability; the safetensors check is M2 Task 2, not built | `sally-core::model` | RT-MDL-01..04, 06, 07 when they land; RT-MDL-08 with the safetensors check |
 | Zip import hardening (M2 Task 3, not built: archives are refused by name today) | `sally-core::model::import` (planned; no such module yet) | RT-MDL-05 when it lands |
 | Disk-space check before pull | `sally-core::library` (download admission: rest + a twentieth above the reserve, before the partial exists and again before every write) | RT-MDL-09 (row lands with the model red-team rows; filesystem half: `sallyd::hf` unit test `a_file_that_does_not_fit_sends_no_request`) |
-| HF client: first hop only to `huggingface.co`, redirects only https/443/no userinfo to `huggingface.co`, `hf.co` or their subdomains; the token only on a hop to `huggingface.co` itself, inside TLS verified against the anchors of a checked CA bundle (the egress proxy's `BundleFiles` checks; production: the system bundle owned by root, never chosen by the environment); one lookup on the host, answers the egress proxy's address filter refuses (loopback/private/link-local/own/connected networks) never dialled, a pinned address dialled; files at the listed commit; the publisher's SHA-256 checked before anything else reads the bytes. No production caller yet (#209), so SI-12 is unchanged | `sally-core::hf`, `sallyd::hf`, `sally-core::library` | unit tests: `sally-core` `hf::plan` (`redirect_hosts_are_hub_domains_on_a_label_boundary`, `other_redirects_are_refused`), `library::download` (`the_hash_is_checked_before_the_magic`); `sallyd` `hf` (`a_pull_follows_the_cdn_redirect_without_the_token`, `denied_addresses_are_never_dialled`, `a_redirect_off_the_hub_is_not_followed`, `a_certificate_for_another_name_is_refused`, `a_hash_mismatch_stores_nothing`) |
-| Image digest pinning; refuse unpinned | `sallyd::sandbox::images` | RT-SUP-01 |
+| HF client: first hop only to `huggingface.co`, redirects only https/443/no userinfo to `huggingface.co`, `hf.co` or their subdomains; the token only on a hop to `huggingface.co` itself, inside TLS verified against the anchors of a checked CA bundle (the egress proxy's `BundleFiles` checks; production: the system bundle owned by root, never chosen by the environment); one lookup on the host, answers the egress proxy's address filter refuses (loopback/private/link-local/own/connected networks) never dialled, a pinned address dialled; files at the listed commit; the publisher's SHA-256 checked before anything else reads the bytes. No production caller yet (#209), so SI-12 is unchanged | `sally-core::hf`, `sallyd::hf`, `sally-core::library` | unit tests only (red-team legs planned, #285; the bundle's file checks, #286): `sally-core` `hf::plan` (`redirect_hosts_are_hub_domains_on_a_label_boundary`, `other_redirects_are_refused`), `library::download` (`the_hash_is_checked_before_the_magic`); `sallyd` `hf` (`a_pull_follows_the_cdn_redirect_without_the_token`, `denied_addresses_are_never_dialled`, `a_redirect_off_the_hub_is_not_followed`, `a_certificate_for_another_name_is_refused`, `a_hash_mismatch_stores_nothing`) |
+| Image digest pinning; refuse unpinned | `sallyd::sandbox::images`; the validator (sally-core `manifest`) refuses an unpinned image | RT-SUP-01; RT-MAN-02 for the validator's refusal |
 | Image fields reach the container only through `config.json` (extra mounts and unknown keys refused); image-declared volumes ignored at `create` (`--image-volume=ignore`); the image's health check disabled (`--no-healthcheck`), both required by the argv check, and a health check Podman recorded anyway refused by the verifier; containers removed with their anonymous volumes (`rm --volumes`) | `sallyd::sandbox::argv`, `sandbox::check`, `sandbox::oci` (`facts`, the verifier), `sandbox::commands` | RT-SUP-04, 05 |
 | Hash-chained audit, verify command, redaction (an entry over the 4 KiB cap keeps none of its arguments: open, fix planned, #267) | `sally-core::audit` | RT-AUD-01, 02, RT-SEC-15; RT-SEC-07 (post-release clause: `NewEntry::redacted`) |
 | Sanitized Markdown, CSP, minimal Tauri capabilities, https-only opener with confirm | `app/` | RT-UI-01..03 |

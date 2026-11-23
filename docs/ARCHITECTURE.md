@@ -1616,7 +1616,8 @@ sallyport/
   file failure is `session-ca`; the credentials, read first, refuse with `secret-missing`,
   `secret-store`, `secret-grant` or `secret-filler`: Task 9a-3). One load feeds the upstream verifier and `ca-bundle.pem`. The
   file list and owner are constructor arguments of the egress starter (Task 8 decision 10);
-  production passes these. Doctor V17 applies the same checks.
+  production passes these. Doctor V17 applies the same checks. No test is named for the file
+  checks yet (#286).
 - **RPC and LLM audit events** (Task 7). All are written at every `audit.level` except
   `llm.response`, which is detail (`Detail::Full`, dropped at `actions`). Each is appended off the
   runtime before the reply it covers; a failed append means no dispatch, no reply, and the
