@@ -25,8 +25,10 @@
 
 use std::ffi::OsString;
 
-use serde_json::Value;
+use sally_core::audit::{Actor, NewEntry};
+use serde_json::{Value, json};
 
+use super::launch::DETAIL_STYLE;
 use super::types::{INSTALLATION_LABEL, Installation};
 
 /// The name prefixes of session containers, and of their mount-link probes (security review): a
@@ -119,6 +121,33 @@ pub fn orphans(
         });
     }
     Ok(out)
+}
+
+/// `sandbox.orphan_removed`, written before each removal (architect Q61): `deny`, the
+/// container's name and full ID, and the sweep (`startup`, `periodic`).
+#[must_use]
+pub(crate) fn removal_entry(o: &Orphan, sweep: &str) -> NewEntry {
+    NewEntry::new(Actor::Sallyd, "sandbox.orphan_removed")
+        .decision("deny")
+        .args(json!({"container": o.name, "id": o.container, "sweep": sweep}))
+}
+
+/// `sandbox.orphan_remove_failed` (architect Q563): written after a removal that failed, so the
+/// log does not show the attempt as done. As [`removal_entry`], plus the error as a declared
+/// text `detail` in the launcher's style (masked whole, then cut).
+#[must_use]
+pub(crate) fn removal_failed_entry(o: &Orphan, sweep: &str, error: String) -> NewEntry {
+    NewEntry::new(Actor::Sallyd, "sandbox.orphan_remove_failed")
+        .decision("deny")
+        .args(json!({"container": o.name, "id": o.container, "sweep": sweep}))
+        .text("detail", error, DETAIL_STYLE)
+}
+
+/// The error of a sweep that left orphans behind (architect Q563): the counts and the first
+/// name only, never podman's text (each failure's is in its own entry).
+#[must_use]
+pub(crate) fn not_removed(failed: usize, of: usize, first: &str) -> String {
+    format!("{failed} of {of} orphaned containers not removed; first: {first}")
 }
 
 /// `<string: full ID> <string: name> <string: label>` and nothing else.
@@ -470,5 +499,67 @@ mod tests {
         assert!(MAX_LIVE_SESSIONS < fits, "{MAX_LIVE_SESSIONS} >= {fits}");
         assert!(stdout_text("ps", listing(fits).as_bytes(), OUTPUT_CAP).is_ok());
         assert!(stdout_text("ps", listing(fits + 1).as_bytes(), OUTPUT_CAP).is_err());
+    }
+
+    fn an_orphan() -> Orphan {
+        Orphan {
+            container: cid("sp-ws-t-1"),
+            name: "sp-ws-t-1".into(),
+            id: "t-1".into(),
+        }
+    }
+
+    /// The entry before each removal: unchanged by Q563 (decision `deny`, the container, its id
+    /// and the sweep).
+    #[test]
+    fn the_entry_before_a_removal_names_the_container_and_the_sweep() {
+        let o = an_orphan();
+        let e = removal_entry(&o, "startup");
+        assert_eq!(e.event(), "sandbox.orphan_removed");
+        assert_eq!(e.decision_value(), Some("deny"));
+        assert_eq!(
+            e.resolved(&sally_core::audit::Redactor::default()),
+            serde_json::json!({"container": "sp-ws-t-1", "id": cid("sp-ws-t-1"), "sweep": "startup"})
+        );
+        assert!(format!("{e:?}").contains("session: None"));
+    }
+
+    /// Architect Q563 (i): a failed removal is a second entry, `deny`, with the error as a
+    /// declared text detail.
+    #[test]
+    fn a_failed_removal_entry_carries_the_error_as_a_detail() {
+        let o = an_orphan();
+        let e = removal_failed_entry(&o, "periodic", "rm: it is stuck".into());
+        assert_eq!(e.event(), "sandbox.orphan_remove_failed");
+        assert_eq!(e.decision_value(), Some("deny"));
+        assert_eq!(
+            e.resolved(&sally_core::audit::Redactor::default()),
+            serde_json::json!({
+                "container": "sp-ws-t-1",
+                "id": cid("sp-ws-t-1"),
+                "sweep": "periodic",
+                "detail": "rm: it is stuck",
+            })
+        );
+        // A detail past the cap is cut, as every launcher detail (DETAIL_STYLE).
+        let long = "x".repeat(5000);
+        let e = removal_failed_entry(&o, "periodic", long.clone());
+        let args = e.resolved(&sally_core::audit::Redactor::default());
+        let detail = args["detail"].as_str().unwrap();
+        assert_eq!(detail, sally_core::text::plain_capped(&long, 4096));
+        assert!(detail.len() < long.len(), "{}", detail.len());
+    }
+
+    /// Q563 (ii): the sweep's error names the counts and the first name only.
+    #[test]
+    fn the_sweep_error_names_the_counts_and_the_first_name() {
+        assert_eq!(
+            not_removed(1, 2, "sp-ws-t-1"),
+            "1 of 2 orphaned containers not removed; first: sp-ws-t-1"
+        );
+        assert_eq!(
+            not_removed(3, 7, "sp-h-t-9"),
+            "3 of 7 orphaned containers not removed; first: sp-h-t-9"
+        );
     }
 }

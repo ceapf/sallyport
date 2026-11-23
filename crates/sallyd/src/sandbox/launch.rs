@@ -281,6 +281,10 @@ pub struct LauncherParts {
     /// This installation's id (`daemon::install`): the label of every container this launcher
     /// creates, and the only one its orphan sweeps remove (Q64).
     pub installation: Installation,
+    /// The daemon's crash reporter: a failed launch whose cleanup is retried in its own task
+    /// (architect Q559) reports a panic there, which stops the daemon. Not a session's: a
+    /// refused session has no reporter left.
+    pub crash: CrashReporter,
 }
 
 /// Launches and tears down sandboxes for one `sallyd`. Shared as `Arc<Launcher>`.
@@ -298,6 +302,7 @@ pub struct Launcher {
     redactors: Arc<Redactors>,
     oplog: Oplog,
     pub(super) installation: Installation,
+    crash: CrashReporter,
     /// One stage walk at a time across all sessions, so a sandbox with a huge or deep tree
     /// cannot multiply `sallyd`'s open fds or blocking threads (6c-1 review M2/M3).
     pub(super) walks: Arc<tokio::sync::Semaphore>,
@@ -343,6 +348,7 @@ impl Launcher {
             redactors: p.redactors,
             oplog: p.oplog,
             installation: p.installation,
+            crash: p.crash,
             walks: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }

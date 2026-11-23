@@ -318,6 +318,9 @@ async fn serve(
         gid: rustix::process::getegid().as_raw(),
     };
     let (podman, runtime) = podman(log, dirs, config).await?;
+    // Before the launcher, which spawns a failed launch's retried cleanup on it (architect
+    // Q559); its reports wait in the channel until the select below reads them.
+    let (crash, mut crashes) = CrashReporter::channel();
     let launcher = Launcher::new(LauncherParts {
         podman: podman.clone(),
         runtime,
@@ -340,6 +343,7 @@ async fn serve(
         redactors,
         oplog: log.clone(),
         installation,
+        crash: crash.clone(),
     });
     let removed = launcher
         .remove_orphans("", Sweep::Startup)
@@ -359,7 +363,6 @@ async fn serve(
             source: std::io::Error::other(super::crash::join_text(&e)),
         })?
         .map_err(io("removing stale sockets"))?;
-    let (crash, mut crashes) = CrashReporter::channel();
     // The one approver: every session's desk tells it, control watchers hear it (Q73).
     let hub = Arc::new(Hub::default());
     let registry = Registry::new(RegistryParts {
@@ -563,6 +566,18 @@ mod tests {
         // The hint spells the label as a literal: it must be the label the launcher sets.
         let filter = format!("label={}=<id>", crate::sandbox::INSTALLATION_LABEL);
         assert!(e.to_string().contains(&filter), "{e}");
+        // Architect Q563: a sweep that could not remove every orphan keeps the same hint.
+        let e = DaemonError::Orphans(LaunchError::Command {
+            verb: "rm",
+            msg: "1 of 2 orphaned containers not removed; first: sp-ws-a".into(),
+        });
+        assert_eq!(
+            e.to_string(),
+            "removing orphaned containers: podman rm: 1 of 2 orphaned containers not removed; \
+             first: sp-ws-a (list them with `podman ps --all --filter \
+             label=sallyport.installation=<id>`; the id is the `installation` file in sallyd's \
+             state directory)"
+        );
     }
 
     fn scratch(name: &str) -> PathBuf {
