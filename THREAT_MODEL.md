@@ -164,7 +164,8 @@ G1 Obtain GITHUB_TOKEN value from inside Z3
 │  ├─ Encoded echo (base64, percent-encoding)      [the forms §6 lists → RT-SEC-12; other JSON and percent
 │  │                                                 spellings OPEN, fix planned, #249; §6]
 │  ├─ Time the redaction scan                       [RESIDUAL: not constant-time, not measured; §6]
-│  ├─ Fetch it in pieces with Range                 [Range and If-Range dropped (decision 4)]
+│  ├─ Fetch it in pieces with Range                 [Range, If-Range, Request-Range dropped
+│  │                                                 (decision 4) → RT-SEC-06b]
 │  ├─ Ask for a delta-encoded reply (`A-IM`)        [OPEN, fix planned, #294: `A-IM` is forwarded and a
 │  │                                                 `226 IM Used` reply is not refused; §6]
 │  └─ Compressed body hides it from the scanner    [Accept-Encoding stripped; a Content-Encoding other than one `identity` refused → RT-SEC-06b]

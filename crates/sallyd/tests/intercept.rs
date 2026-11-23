@@ -586,6 +586,57 @@ fn rt_sec_06b_compression_is_stripped_and_an_encoded_echo_is_refused() {
     });
 }
 
+/// RT-SEC-06b, ranges: `Range`, `If-Range` and `Request-Range` never reach a grant host, so an
+/// echo cannot be fetched in pieces the redaction sees only one at a time. Controls: the three
+/// entries of `rewrite::REQUEST_DROPPED` (each removed on its own lets its header through). In-test
+/// controls: an `X-Kept` header on the same request reaches the grant host, and the same request
+/// to `mock2.test` (spliced, never rewritten) arrives with all three.
+#[test]
+fn rt_sec_06b_range_headers_never_reach_a_grant_host() {
+    const RANGED: [&str; 3] = ["range", "if-range", "request-range"];
+    rt().block_on(async {
+        let lx = Lx::new();
+        let r = session(&lx, "sec06r").await;
+        let extra = "Range: bytes=0-3\r\nIf-Range: \"v1\"\r\nRequest-Range: bytes=0-3\r\n\
+                     X-Kept: yes\r\n";
+        let granted = over(
+            &lx,
+            "sec06r",
+            "mock.test",
+            &get_req("mock.test", "/echo-headers", extra),
+        )
+        .await;
+        let spliced = over(
+            &lx,
+            "sec06r",
+            "mock2.test",
+            &get_req("mock2.test", "/echo-headers", extra),
+        )
+        .await;
+        let seen = lx.egress.dialer.seen();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(granted.starts_with("HTTP/1.1 200 OK"), "{granted}");
+        assert!(spliced.starts_with("HTTP/1.1 200 OK"), "{spliced}");
+        assert!(seen[0].contains(&gh()), "{}", seen[0]);
+        for name in RANGED {
+            assert!(
+                header_values(&seen[0], name).is_empty(),
+                "{name}: {}",
+                seen[0]
+            );
+            assert_eq!(
+                header_values(&seen[1], name).len(),
+                1,
+                "{name}: {}",
+                seen[1]
+            );
+        }
+        assert_eq!(header_values(&seen[0], "x-kept"), ["yes"], "{}", seen[0]);
+        assert_eq!(header_values(&seen[1], "x-kept"), ["yes"], "{}", seen[1]);
+        lx.stop(r).await;
+    });
+}
+
 /// `mock.test` (a `GITHUB_TOKEN` grant), `mock3.test` (a `HOST_TOKEN` grant) and any host
 /// under `*.mock.test` (allowed, no grant, so spliced: a grant host must be exact; architect
 /// Q279).
