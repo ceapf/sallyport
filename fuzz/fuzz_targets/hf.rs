@@ -10,8 +10,10 @@
 //! - an accepted Content-Range is canonical (formatting it back gives the input) with
 //!   first <= last < total;
 //! - a followed redirect is to a Hub host (or the current one), its target starts with `/` and
-//!   holds no space, control or `#`, it carries the token exactly when its host is
-//!   huggingface.co, and it keeps the range;
+//!   holds no space, control or `#`, and it keeps the range; from a hop that carries the token
+//!   it carries the token exactly when its host is huggingface.co; from a hop of a chain that
+//!   has left huggingface.co it never carries the token, and nor does a later return to
+//!   huggingface.co;
 //! - Retry-After never waits past MAX_RETRY_WAIT_SECS;
 //! - an accepted path has no empty, `.` or `..` segment, and its encoding holds only unreserved
 //!   bytes, `%` and `/`;
@@ -73,6 +75,15 @@ fn check_text(s: &str) {
         );
         assert_eq!(next.carries_auth(), next.host() == API_HOST);
         assert_eq!(next.range_from(), Some(7));
+    }
+    let left = redirect(&current, "https://cdn-lfs.hf.co/x").expect("a Hub host is followed");
+    assert!(!left.carries_auth());
+    if let Ok(next) = redirect(&left, s) {
+        assert!(!next.carries_auth());
+        assert!(redirect_host_ok(next.host()) || next.host() == left.host());
+        assert_eq!(next.range_from(), Some(7));
+        let back = redirect(&next, "https://huggingface.co/y").expect("the API host is followed");
+        assert!(!back.carries_auth());
     }
 
     if let Ok(p) = RepoPath::parse(s) {
