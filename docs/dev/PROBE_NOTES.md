@@ -33,8 +33,9 @@ line per fact, with where it was found. Check a note again before relying on it 
   34.6, 30.8, 45.1, 27.8, 42.8 and 33.1 MiB in 8 runs with 32 busy loops on 32 cores.
   `memory.events` read all zero every time (`max 0`, `oom 0`, `oom_kill 0`). (scratch probe for
   #141, Nov 2026, kernel 6.18 WSL2)
-- The same figures from the test's own diagnostic line (`make loaded-repeat`, 23 Nov 2026,
-  commit 02bc479; 32 cores, 54 GiB, kernel 6.18 WSL2, no other worktree testing), read later than
+- The same figures from the test's own diagnostic line (`make loaded-repeat`, 23 Nov 2026, on
+  commit 36aee12 as it was before its rebase onto dc5a0ac; 32 cores, 54 GiB, kernel 6.18 WSL2,
+  no other worktree testing), read later than
   the probe above: after the wait for the first `pids` entry, just before the no-memory-entry
   assertion. 50 repeats of the bombs binary beside one `make test` pass, all loaded, all passed:
   `memory.peak` min 14.8, median 47.7, max 64.0 MiB; `oom`, `oom_kill` and `oom_group_kill` 0
