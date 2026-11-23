@@ -7,9 +7,12 @@
 //! the range asked for (`bytes n-(size-1)/size`) and is appended. Anything that makes the bytes
 //! on disk untrustworthy as a prefix (another range, a 416, an encoding) refuses and deletes
 //! the partial ([`HfError::discards_partial`]).
+//!
+//! The file list, which carries the publisher's hashes, is read from the API host only: a
+//! redirect of the list call to any other host is refused.
 #![deny(clippy::indexing_slicing)]
 
-use super::plan::{Request, redirect};
+use super::plan::{API_HOST, Request, redirect};
 use super::{
     DEFAULT_RETRY_WAIT_SECS, HfError, MAX_LIST_BYTES, MAX_REDIRECTS, MAX_RETRIES,
     MAX_RETRY_WAIT_SECS,
@@ -67,13 +70,22 @@ pub enum Body {
     FromStart,
 }
 
-/// The decision on the head of a file-list request.
+/// The decision on the head of a file-list request. The list carries the publisher's hashes, so
+/// it is read from the API host only: a list request to any other host, and a redirect of the
+/// list call to any other host, are refused.
 ///
 /// # Errors
 /// The refusal.
 pub fn decide_list(head: &Head<'_>, req: &Request, tries: &mut Tries) -> Result<Step, HfError> {
-    if let Some(step) = common(head, req, tries)? {
-        return Ok(step);
+    if req.host() != API_HOST {
+        return Err(HfError::RedirectRefused);
+    }
+    match common(head, req, tries)? {
+        Some(Step::Redirect(next)) if next.host() != API_HOST => {
+            return Err(HfError::RedirectRefused);
+        }
+        Some(step) => return Ok(step),
+        None => {}
     }
     if head.status != 200 {
         return Err(HfError::UpstreamStatus(head.status));

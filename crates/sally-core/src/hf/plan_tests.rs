@@ -95,8 +95,28 @@ fn absolute_redirects_to_hub_hosts_are_followed() {
     assert_eq!(next.path(), "/repos/x/y?X-Amz=1&sig=a%2Fb");
     assert_eq!(next.range_from(), Some(5));
     assert!(!next.carries_auth());
+    // A chain that has left the API host never carries the token again: a return to it is
+    // followed without the token, and so is every hop after that.
     let back = redirect(&next, "https://huggingface.co/other").unwrap();
-    assert!(back.carries_auth());
+    assert_eq!(back.host(), "huggingface.co");
+    assert_eq!(back.path(), "/other");
+    assert!(
+        !back.carries_auth(),
+        "a return to the API host carried the token"
+    );
+    let same = redirect(&back, "/again").unwrap();
+    assert_eq!(same.host(), "huggingface.co");
+    assert!(
+        !same.carries_auth(),
+        "a relative hop after a return carried the token"
+    );
+    let away = redirect(&same, "https://cdn-lfs.hf.co/b").unwrap();
+    let again = redirect(&away, "https://huggingface.co/third").unwrap();
+    assert!(!away.carries_auth() && !again.carries_auth());
+    // Control: a chain that stays on the API host keeps the token on every hop.
+    let stay = redirect(&file(0), "https://huggingface.co/moved").unwrap();
+    assert!(stay.carries_auth());
+    assert!(redirect(&stay, "/moved/again").unwrap().carries_auth());
     let upper = redirect(&file(0), "https://CDN-LFS.HF.CO/a").unwrap();
     assert_eq!(upper.host(), "cdn-lfs.hf.co");
     assert!(!upper.carries_auth());

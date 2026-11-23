@@ -3,8 +3,10 @@
 //!
 //! The first hop of every request goes to [`API_HOST`]. A redirect is followed only to https
 //! on the default port, with no userinfo, to [`API_HOST`] or `hf.co` or a subdomain of either on
-//! a label boundary ([`REDIRECT_DOMAINS`]). Every hop is planned again from the Location alone;
-//! the token rule is decided per hop: only a hop whose host is exactly [`API_HOST`] carries it.
+//! a label boundary ([`REDIRECT_DOMAINS`]). Every hop's host and path are planned again from the
+//! Location alone. The token goes only to a hop whose host is exactly [`API_HOST`], and only
+//! while the chain has never left it: once one hop has gone to another host, no later hop of
+//! that chain carries the token, a return to [`API_HOST`] included (it is followed without it).
 #![deny(clippy::indexing_slicing)]
 
 use super::HfError;
@@ -50,7 +52,8 @@ impl Request {
         self.range_from
     }
 
-    /// Whether this hop carries the token: only when its host is exactly [`API_HOST`].
+    /// Whether this hop carries the token: only when its host is exactly [`API_HOST`] and no
+    /// earlier hop of its chain went to another host.
     #[must_use]
     pub const fn carries_auth(&self) -> bool {
         self.auth
@@ -95,7 +98,9 @@ pub const fn next_fetch(written: u64, size: u64) -> Option<u64> {
 }
 
 /// The next hop after a redirect from `current` to `location`: an absolute `https://host/…`
-/// or a path on the current host. The range is kept; the token rule is decided again.
+/// or a path on the current host. The range is kept. The next hop carries the token only if
+/// `current` carried it and the next host is exactly [`API_HOST`]: a chain that has left the API
+/// host never carries it again.
 ///
 /// # Errors
 /// [`HfError::RedirectRefused`].
@@ -118,7 +123,7 @@ pub fn redirect(current: &Request, location: &str) -> Result<Request, HfError> {
         return Err(HfError::RedirectRefused);
     };
     Ok(Request {
-        auth: host == API_HOST,
+        auth: current.auth && host == API_HOST,
         host,
         path,
         range_from: current.range_from,

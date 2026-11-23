@@ -3,8 +3,9 @@
 //! Every hop is planned by the core ([`sally_core::hf::plan`]), connected by [`conn`] (resolve
 //! on this host, refuse loopback, private, link-local and own addresses, dial a pinned address,
 //! TLS verified against the anchors of a checked CA bundle, [`HfClient::with_roots`]), sent as
-//! [`wire`] builds it (the token only on a hop to `huggingface.co` itself), and its head
-//! decided by the core ([`sally_core::hf::head`]).
+//! [`wire`] builds it (the token only on a hop to `huggingface.co` itself, and never again once
+//! the redirect chain has left it), and its head decided by the core
+//! ([`sally_core::hf::head`]; the file list is read from `huggingface.co` only).
 //! File bytes go only into a [`sally_core::library::Download`]; its verify checks the listed
 //! SHA-256 before anything else reads them, on a blocking thread without the library's lock,
 //! and only then does the library promote it. Every connection's task is aborted when its
@@ -107,7 +108,8 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> HfClient<R, D, H> {
         }
     }
 
-    /// The file list of `repo` at `rev`.
+    /// The file list of `repo` at `rev`, read from the API host only (a redirect of the list
+    /// call to any other host is refused).
     ///
     /// # Errors
     /// The first refusal or failure.

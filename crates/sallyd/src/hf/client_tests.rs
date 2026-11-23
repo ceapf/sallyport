@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use std::future::Future;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use sally_core::hf::list::{FileList, parse_list};
@@ -37,6 +37,11 @@ async fn bounded<F: Future>(f: F) -> F::Output {
         .expect("the test hung")
 }
 
+/// The mock's default answer, on the only port the client dials.
+fn public_443() -> SocketAddr {
+    SocketAddr::new(PUBLIC, 443)
+}
+
 /// The file at `seen.path` from `files` as a full 200.
 fn serve(files: &'static [(&'static str, Vec<u8>)], seen: &testkit::Seen) -> Vec<u8> {
     for (p, b) in files {
@@ -66,7 +71,7 @@ async fn files_asks_the_api_host_with_the_token() {
     assert_eq!(seen[0].auth, Some(format!("Bearer {}", token())));
     assert_eq!(seen[0].accept_encoding.as_deref(), Some("identity"));
     assert_eq!(hub.lookups(), ["huggingface.co"]);
-    assert_eq!(hub.dials(), 1);
+    assert_eq!(hub.dialled(), [public_443()]);
 }
 
 /// A pull follows the redirect to the CDN host, which gets no token, and the library stores
@@ -102,6 +107,42 @@ async fn a_pull_follows_the_cdn_redirect_without_the_token() {
     assert_eq!(hub.lookups(), ["huggingface.co", "cdn-lfs.hf.co"]);
     assert_eq!(lib.names("blobs/sha256"), [sha(&g).as_hex()]);
     assert!(lib.names("downloads").is_empty());
+}
+
+/// Once a redirect chain has left the API host, no later request in it carries the token: the
+/// redirect host answers with a redirect back to another repository's path on the API host,
+/// which is followed without the token (and answers 404 here). Control: the first request, to
+/// the API host before the chain left it, carries `Authorization`.
+#[tokio::test]
+async fn a_chain_that_left_the_api_host_never_carries_the_token_again() {
+    let g = gguf("bounce");
+    let hub = Hub::new(move |s, i| match (i, s.host.as_str()) {
+        (0, "huggingface.co") => found("https://cdn-lfs.hf.co/blobs/x"),
+        (1, "cdn-lfs.hf.co") => found("https://huggingface.co/other/repo/resolve/main/secret.gguf"),
+        _ => reply("404 Not Found", &[], b""),
+    });
+    let lib = TmpLib::open("bounce", 0);
+    let err = bounded(hub.client(Some(&token())).pull(
+        &lib.lib,
+        &repo(),
+        &list(&[("m.gguf", &g)]),
+        &path("m.gguf"),
+    ))
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), "hf_not_found");
+    let seen = hub.seen();
+    assert_eq!(seen.len(), 3);
+    assert_eq!(seen[0].host, "huggingface.co");
+    assert_eq!(seen[0].auth, Some(format!("Bearer {}", token())));
+    assert_eq!(seen[1].host, "cdn-lfs.hf.co");
+    assert_eq!(seen[1].auth, None, "the token went to the redirect host");
+    assert_eq!(seen[2].host, "huggingface.co");
+    assert_eq!(seen[2].path, "/other/repo/resolve/main/secret.gguf");
+    assert_eq!(
+        seen[2].auth, None,
+        "the token went back to the API host after the chain left it"
+    );
 }
 
 /// A partial on disk is resumed with a range request, and a 206 for exactly the rest is
@@ -191,7 +232,7 @@ async fn a_file_that_does_not_fit_sends_no_request() {
         .unwrap_err();
     assert_eq!(err.code(), "insufficient_disk");
     assert_eq!(hub.seen().len(), 1, "a request was sent");
-    assert_eq!(hub.dials(), 1);
+    assert_eq!(hub.dialled(), [public_443()]);
     assert_eq!(hub.lookups().len(), 1);
     assert!(full.names("downloads").is_empty());
 }
@@ -207,7 +248,8 @@ async fn denied_addresses_are_never_dialled() {
     bounded(client.files(&repo(), &Revision::main()))
         .await
         .unwrap();
-    assert_eq!((hub.lookups().len(), hub.dials()), (1, 1));
+    assert_eq!(hub.lookups().len(), 1);
+    assert_eq!(hub.dialled(), [public_443()]);
 
     let denied = [
         IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -221,7 +263,7 @@ async fn denied_addresses_are_never_dialled() {
             .unwrap_err();
         assert_eq!(err.code(), "hf_address_denied", "{ip}");
         assert_eq!(hub.lookups().len(), 2 + i);
-        assert_eq!(hub.dials(), 1, "{ip} was dialled");
+        assert_eq!(hub.dialled(), [public_443()], "{ip} was dialled");
     }
     hub.answer(PUBLIC);
     hub.own(PUBLIC);
@@ -229,7 +271,7 @@ async fn denied_addresses_are_never_dialled() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), "hf_address_denied");
-    assert_eq!(hub.dials(), 1, "an own address was dialled");
+    assert_eq!(hub.dialled(), [public_443()], "an own address was dialled");
 
     // A public answer inside a network this host is directly connected to is refused, as the
     // egress proxy refuses it. Control: the same answer is dialled before the network is listed.
@@ -239,21 +281,26 @@ async fn denied_addresses_are_never_dialled() {
     bounded(near.client(None).files(&repo(), &Revision::main()))
         .await
         .unwrap();
-    assert_eq!(near.dials(), 1, "control: the public answer is dialled");
+    assert_eq!(
+        near.dialled(),
+        [public_443()],
+        "control: the public answer is dialled"
+    );
     near.connected(Net::prefix(PUBLIC, 24).unwrap());
     let err = bounded(near.client(None).files(&repo(), &Revision::main()))
         .await
         .unwrap_err();
     assert_eq!(err.code(), "hf_address_denied");
     assert_eq!(
-        near.dials(),
-        1,
+        near.dialled(),
+        [public_443()],
         "an address on a connected network was dialled"
     );
 
     // Host tables that cannot be read refuse the host before any lookup or dial. Control: the
     // same Hub looked up and dialled with readable tables above.
     let lookups = near.lookups().len();
+    let dialled = near.dialled();
     near.tables_unreadable();
     let err = bounded(near.client(None).files(&repo(), &Revision::main()))
         .await
@@ -264,7 +311,7 @@ async fn denied_addresses_are_never_dialled() {
         lookups,
         "looked up without host tables"
     );
-    assert_eq!(near.dials(), 1, "dialled without host tables");
+    assert_eq!(near.dialled(), dialled, "dialled without host tables");
 
     // One denied answer among public ones refuses the host: nothing is dialled, not even the
     // public answer listed first.
@@ -276,7 +323,7 @@ async fn denied_addresses_are_never_dialled() {
             .await
             .unwrap_err();
         assert_eq!(err.code(), "hf_address_denied", "{mixed:?}");
-        assert_eq!(hub.dials(), 0, "{mixed:?} was dialled");
+        assert!(hub.dialled().is_empty(), "{mixed:?} was dialled");
     }
 }
 
@@ -296,7 +343,54 @@ async fn a_redirect_off_the_hub_is_not_followed() {
     .unwrap_err();
     assert_eq!(err.code(), "hf_redirect_refused");
     assert_eq!(hub.lookups(), ["huggingface.co"]);
-    assert_eq!(hub.dials(), 1);
+    assert_eq!(hub.dialled(), [public_443()]);
+}
+
+/// The file list is read from the API host only: a redirect of the list call to another Hub
+/// host is refused, and that host is never looked up or dialled. Control: a relative redirect
+/// on the API host is followed, with the token, and the list is read.
+#[tokio::test]
+async fn a_list_redirected_off_the_api_host_is_refused() {
+    let body = list_json(&[]);
+    let hub = Hub::new(move |s, _| {
+        if s.host == "huggingface.co" {
+            found("https://cdn-lfs.hf.co/api/models/org/m/revision/main?blobs=true")
+        } else {
+            reply("200 OK", &[], &body)
+        }
+    });
+    let err = bounded(hub.client(Some(&token())).files(&repo(), &Revision::main()))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "hf_redirect_refused");
+    let seen = hub.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].auth, Some(format!("Bearer {}", token())));
+    assert_eq!(hub.lookups(), ["huggingface.co"]);
+    assert_eq!(hub.dialled(), [public_443()]);
+
+    let body = list_json(&[]);
+    let same = Hub::new(move |_, i| {
+        if i == 0 {
+            found("/api/models/org/m/revision/main?blobs=true&moved=1")
+        } else {
+            reply("200 OK", &[], &body)
+        }
+    });
+    bounded(
+        same.client(Some(&token()))
+            .files(&repo(), &Revision::main()),
+    )
+    .await
+    .unwrap();
+    let seen = same.seen();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[1].host, "huggingface.co");
+    assert_eq!(
+        seen[1].path,
+        "/api/models/org/m/revision/main?blobs=true&moved=1"
+    );
+    assert_eq!(seen[1].auth, Some(format!("Bearer {}", token())));
 }
 
 /// A Hub host whose certificate does not name it is refused at the TLS step.
@@ -427,7 +521,8 @@ async fn a_stored_digest_sends_no_request() {
         .await
         .unwrap();
     assert_eq!(again, first);
-    assert_eq!((hub.seen().len(), hub.dials()), (1, 1));
+    assert_eq!(hub.seen().len(), 1);
+    assert_eq!(hub.dialled(), [public_443()]);
 
     let blob = lib.path(&format!("blobs/sha256/{}", sha(&g).as_hex()));
     let chmod = |m| std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(m)).unwrap();
@@ -442,7 +537,8 @@ async fn a_stored_digest_sends_no_request() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), "blob_mismatch");
-    assert_eq!((hub.seen().len(), hub.dials()), (1, 1));
+    assert_eq!(hub.seen().len(), 1);
+    assert_eq!(hub.dialled(), [public_443()]);
     assert!(lib.names("downloads").is_empty());
     assert!(lib.names("blobs/sha256").is_empty());
 }
@@ -546,13 +642,53 @@ async fn an_answer_outside_its_bounds_is_a_failed_lookup() {
             .await
             .unwrap_err();
         assert_eq!(err.code(), "hf_resolve_failed", "{what}");
-        assert_eq!(hub.dials(), 0, "{what}");
+        assert!(hub.dialled().is_empty(), "{what}");
     }
     hub.answer_all(&at_bound);
     bounded(client.files(&repo(), &Revision::main()))
         .await
         .unwrap();
-    assert_eq!(hub.dials(), 1);
+    assert_eq!(hub.dialled(), [public_443()]);
+}
+
+/// Answers are dialled by address on port 443 whatever port the lookup gave, in the answer's
+/// order, and at most `MAX_DIALS` of them: five public answers on another port, every dial
+/// failing, are the first three on 443, then a failed connect. Control: the same Hub with dials
+/// that succeed dials the first answer on 443 once. (Which answers may be dialled at all is
+/// `denied_addresses_are_never_dialled`.)
+#[tokio::test]
+async fn answers_are_dialled_on_443_in_order_up_to_the_bound() {
+    use crate::egress::server::MAX_DIALS;
+    let body = list_json(&[]);
+    let hub = Hub::new(move |_, _| reply("200 OK", &[], &body));
+    let ip = |last| IpAddr::V4(Ipv4Addr::new(93, 184, 215, last));
+    let on_443 = |last| SocketAddr::new(ip(last), 443);
+    let answers: Vec<IpAddr> = (9..14).map(ip).collect();
+    hub.answer_all(&answers);
+    hub.answer_port(8443);
+    let client = hub.client(None);
+    bounded(client.files(&repo(), &Revision::main()))
+        .await
+        .unwrap();
+    assert_eq!(hub.dialled(), [on_443(9)]);
+    assert_eq!(hub.seen().len(), 1);
+
+    hub.dials_fail();
+    let err = bounded(client.files(&repo(), &Revision::main()))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "hf_connect_failed");
+    assert_eq!(MAX_DIALS, 3);
+    assert_eq!(
+        hub.dialled(),
+        [on_443(9), on_443(9), on_443(10), on_443(11)]
+    );
+    assert_eq!(hub.lookups().len(), 2, "one lookup for the failing call");
+    assert_eq!(
+        hub.seen().len(),
+        1,
+        "a request was sent without a connection"
+    );
 }
 
 /// Every transport variant has its own stable code; wrapped core and library errors keep
