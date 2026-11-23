@@ -2,9 +2,9 @@
 # scripts/loaded-repeat.sh <count> <results dir> — repeats RT-AG-09's bombs binary under load
 # (#141: its fork-bomb test once saw a memory entry in a full `make test`).
 #
-# - First builds both commands' tests, so neither side waits on cargo's build lock. Then starts
-#   the load, `make test`, in its own process group, and runs the repeat command <count> times
-#   while the load is alive. Each repeat is one scripts/test-run.sh invocation of the whole
+# - First builds both commands' tests and the load's shim, so neither side waits on cargo's build
+#   lock. Then starts the load, `make test`, in its own session, and runs the repeat command
+#   <count> times while the load is alive. Each repeat is one scripts/test-run.sh invocation of the whole
 #   bombs binary, so the fork-bomb test keeps its in-process neighbours of a suite run.
 # - A repeat passes only when the command exits 0, its log says "test result: ok. 4 passed" and
 #   holds the fork-bomb test's diagnostic line. Anything else, a time-out included, is red. A red
@@ -41,7 +41,9 @@ limit="${LOADED_REPEAT_LIMIT:-600}"
 kill_after="${LOADED_REPEAT_KILL_AFTER:-180}"
 restart="${LOADED_REPEAT_RESTART:-1}"
 start_limit="${LOADED_REPEAT_START_LIMIT:-0}"
-prebuild="${LOADED_REPEAT_PREBUILD:-cargo test -q --workspace --no-run && cargo test -q -p sallyd --test bombs --no-run}"
+# The load's own builds too (its shim-check builds the release shim), so no repeat waits on
+# cargo's build lock while the load builds.
+prebuild="${LOADED_REPEAT_PREBUILD:-cargo test -q --workspace --no-run && cargo test -q -p sallyd --test bombs --no-run && make -s shim}"
 load_cmd="${LOADED_REPEAT_LOAD:-make test}"
 run_cmd="${LOADED_REPEAT_RUN:-bash scripts/test-run.sh cargo test -p sallyd --test bombs -- --nocapture}"
 fork=rt_ag_09_a_fork_bomb_is_held_by_the_pids_limit
