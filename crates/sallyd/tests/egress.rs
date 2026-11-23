@@ -364,12 +364,18 @@ fn rt_net_07_names_that_resolve_to_internal_or_own_addresses_are_refused() {
             "mix.mock.test",
             vec![vec![public(1), IpAddr::V4(Ipv4Addr::LOCALHOST)]],
         );
-        // This host's real tables (whatever they are; never printed): its non-loopback addresses
-        // answer `lan`. The fake host-address source then serves those tables plus a public
-        // address it claims as the host's own and two public networks it claims the host is
-        // directly connected to (an IPv4 /24 and an IPv6 /64).
+        // This host's real tables (whatever they are; never printed): read alone, their connected
+        // networks hold the loopback /8 (the kernel's local route for `lo`), and its non-loopback
+        // addresses answer `lan`. The fake host-address source then serves those tables plus a
+        // public address it claims as the host's own and two public networks it claims the host
+        // is directly connected to (an IPv4 /24 and an IPv6 /64).
         let real = sallyd::egress::net::ProcHostAddrs::default();
         let mut tables = sallyd::egress::server::HostAddrs::own(&real).await.unwrap();
+        let loopback = Net::prefix(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0)), 8).unwrap();
+        assert!(
+            tables.connected.contains(&loopback),
+            "the host's real connected networks lack the loopback /8"
+        );
         let own_real: Vec<IpAddr> = tables
             .own
             .iter()
