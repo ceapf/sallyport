@@ -12,7 +12,7 @@ use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
 use super::diag::Code;
-use super::hostenv::{ConfiguredBinary, EnvDir, HostEnv};
+use super::hostenv::{ConfiguredBinary, EnvDir, FsKind, HostEnv};
 use super::links::{self, Incomplete, Link, Scan};
 
 /// Longest accepted host or guest path.
@@ -29,6 +29,7 @@ const RUNTIME: &str = "the runtime folder holds your session's sockets, so it is
 const STORAGE: &str = "container storage is never mountable";
 const BINARY: &str =
     "Sallyport runs this binary on every launch, so the folder holding it is never mountable";
+const WINDOWS_KIND: &str = "(on WSL a Windows drive or share): never mountable";
 const STATE: &str =
     "the state folder holds history and state your tools load, so it is never mountable";
 const USER_DENY: &str = "listed in filesystem.deny";
@@ -155,6 +156,8 @@ struct Rule {
 #[derive(Debug, Clone)]
 pub(crate) struct Denylist {
     rules: Vec<Rule>,
+    /// Filesystem kinds a mount root may not lie on ([`HostEnv::refused_fs_kinds`]).
+    refused_kinds: Vec<FsKind>,
 }
 
 impl Denylist {
@@ -250,7 +253,10 @@ impl Denylist {
                     .map(|(p, why)| subtree_rule(&h.join(p), why)),
             );
         }
-        Self { rules }
+        Self {
+            rules,
+            refused_kinds: env.refused_fs_kinds.clone(),
+        }
     }
 
     /// Appends a rule for each link's target, labelled with the link and carrying the reason of
@@ -612,7 +618,8 @@ fn climb(
 ///
 /// Order matters: a lexical denylist check first (so `/mnt/c` is `denylisted` even where it
 /// does not exist), then the root's own type via `lstat` (symlink / not-dir / missing), then the
-/// authoritative denylist check on the realpath.
+/// authoritative denylist check on the realpath and on the identity, and last the filesystem
+/// kind, read from a handle on the identified root (on WSL, 9p is refused wherever mounted).
 // TODO(#195): these errors quote the host as written, or its realpath (of `expand`'s errors, the
 // `~user` and not-absolute ones quote it as written). One holding a backslash, space, slash or
 // any character `{:?}` escapes (such as a quote, a control or a non-printable character) is not
@@ -671,7 +678,41 @@ pub(crate) fn check_mount_host(
     if let Some(why) = deny.refusal_by_id(id) {
         return Err((Code::Denylisted, format!("{raw:?} {why} (denylisted)")));
     }
+    let magic = root_kind(&real, id).map_err(|(code, why)| (code, format!("{raw:?} {why}")))?;
+    if let Some(kind) = deny.refused_kinds.iter().find(|k| k.magic == magic) {
+        return Err((
+            Code::Denylisted,
+            format!(
+                "{raw:?} resolves to {real_str:?}, which is on a {} filesystem {WINDOWS_KIND} \
+                 (denylisted)",
+                kind.label
+            ),
+        ));
+    }
     Ok((real, id))
+}
+
+/// The filesystem kind (`f_type`) of the directory at `real`, read from a handle opened without
+/// following a link, which must be the directory identified as `id`: the kind then belongs to
+/// the root that is pinned (the same device is the same filesystem). Every failure refuses.
+fn root_kind(real: &Path, id: DirId) -> Result<u64, (Code, String)> {
+    use rustix::fs::{Mode, OFlags};
+    let inspect = |e: rustix::io::Errno| (Code::NotFound, format!("cannot be inspected: {e}"));
+    let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW;
+    let fd = crate::fd::open(real, flags, Mode::empty()).map_err(inspect)?;
+    if fd_id(&fd).map_err(|e| (Code::NotFound, format!("cannot be inspected: {e}")))? != id {
+        return Err((
+            Code::MountChanged,
+            "changed while it was checked".to_owned(),
+        ));
+    }
+    let fs = rustix::fs::fstatfs(&fd).map_err(inspect)?;
+    u64::try_from(fs.f_type).map_err(|_| {
+        (
+            Code::NotFound,
+            format!("cannot be inspected: filesystem kind {}", fs.f_type),
+        )
+    })
 }
 
 /// Guest paths: `/workspace/<seg>(/<seg>)*`, each segment `[A-Za-z0-9._-]`, not `.`/`..`.
@@ -722,6 +763,7 @@ mod tests {
             xdg_data_home: None,
             xdg_state_home: None,
             configured_binaries: Vec::new(),
+            refused_fs_kinds: Vec::new(),
             other_homes: Vec::new(),
             xdg_runtime_dir: Some("/run/user/1000".into()),
             podman_storage: vec![format!("{home}/.local/share/containers/storage").into()],

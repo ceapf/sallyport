@@ -425,6 +425,16 @@ environment (passwd entry only if `$HOME` is unset or relative).
   - the Podman storage dirs (rootless graphroot and `/var/lib/containers/storage`) and every
     `filesystem.deny` entry.
 
+  **Windows drives (WSL).** On WSL a mount root that lies on a 9p filesystem (statfs kind
+  `0x01021997`) is refused `denylisted` wherever it is mounted, not only under `/mnt`: Windows
+  drives and the WSL driver share are 9p there, and the kind alone does not tell them apart.
+  WSL is told by the kernel release naming Microsoft or by the `WSLInterop` entry under
+  `/proc/sys/fs/binfmt_misc`; with the kernel release unreadable, the host facts cannot be
+  gathered, so `sallyd` does not start and the CLI fails (2). The kind is read
+  from a handle on the identified root, at validation and at the re-check: "resolves to
+  "/data/win/proj", which is on a 9p filesystem (on WSL a Windows drive or share): never
+  mountable". Drives served over virtiofs are not covered (#281).
+
   The ancestor rule is why `~/.local`, `/var`, `/usr`, and `/home` are refused: they really
   contain protected data. "Each home" is `$HOME` **and** the passwd home when they differ, so a
   wrapper that sets `HOME=/tmp/x` does not unprotect the real one.
@@ -494,7 +504,7 @@ yet (TODO(#231)).
 | `model.ref` | `sallyd::infer` resolves in library; refuses unverified/unknown | session start | error to UI |
 | `model.context/gpu_layers` | `sallyd::infer` → llama-server args, clamped by fit estimator | load | clamped, warning |
 | `model.context` (token limit) | `sallyd::llm` (`body::check`): a request's `max_tokens` / `max_completion_tokens` above it is refused (and 0 always is); absent, the backend is given `model.context` as the bound. The M3 fit estimator clamps further | each `llm.sock` request | 400 `token-limit` (0: `bad-value`) + audit `llm.deny` |
-| `filesystem.mounts[].host` | validator (realpath, denylist, is-dir, not-symlink) **and again** at launch: the launch scan re-opens the root without following symlinks and compares `st_dev:st_ino`, pins are re-checked before `podman init`, and bind mounts are compared inside the container after `init` (ARCHITECTURE §3.5). Validation only: the mounts of one manifest may not overlap, by path or by directory identity (§1, Mount); the launch re-checks each root's identity, not the overlap | validate + launch | reject / `sandbox.refuse` / `sandbox.mount_mismatch` |
+| `filesystem.mounts[].host` | validator (realpath, denylist, is-dir, not-symlink, filesystem kind on WSL) **and again** at launch: the launch scan re-opens the root without following symlinks and compares `st_dev:st_ino`, pins are re-checked before `podman init`, and bind mounts are compared inside the container after `init` (ARCHITECTURE §3.5). Validation only: the mounts of one manifest may not overlap, by path or by directory identity (§1, Mount); the launch re-checks each root's identity, not the overlap | validate + launch | reject / `sandbox.refuse` / `sandbox.mount_mismatch` |
 | `filesystem.mounts[].guest` | validator (`/workspace/…`, no `..`, unique) | validate | reject |
 | `filesystem.mounts[].mode` | workspace `podman create` (`sallyd::sandbox::workspace_argv`): bind `ro`/`rw` with `nosuid,nodev,bind` (non-recursive); `brokered` → `ro` + broker `fs_*`; `staged` → `:O` overlay with upper/work in session scratch | launch + each `fs_*` call | EROFS in workspace; `fs_write`/`fs_delete` denied on `ro` (`read-only`); on `staged` they land in the overlay's upper directory; in every mode a call the sandbox's `uid:gid` could not make by mode bits is `permission` (Q39) |
 | `filesystem.mounts[].approve` | validator (glob syntax, §1 Mount) + `sallyd::approvals` glob match on canonical relative path; omitted = `["**"]` | validate + each brokered write/delete | reject; pending → approve/deny |

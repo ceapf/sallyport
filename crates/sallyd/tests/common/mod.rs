@@ -84,6 +84,7 @@ impl Fx {
             xdg_data_home: None,
             xdg_state_home: None,
             configured_binaries: Vec::new(),
+            refused_fs_kinds: Vec::new(),
             xdg_runtime_dir: Some(root.join("run")),
             podman_storage: vec![home.join(".local/share/containers/storage")],
             env_dirs: Vec::new(),

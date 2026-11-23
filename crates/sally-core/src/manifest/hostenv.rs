@@ -32,6 +32,9 @@ pub struct HostEnv {
     /// The binaries `config.toml` names (the runtime, podman). The folder each is in, as written
     /// and as resolved, is denylisted: the host runs it on every launch (MANIFEST_SPEC §2).
     pub configured_binaries: Vec<ConfiguredBinary>,
+    /// Filesystem kinds a mount root may not lie on, wherever they are mounted: on WSL, 9p
+    /// (Windows drives and the WSL driver share; [`refused_fs_kinds`]). Empty elsewhere.
+    pub refused_fs_kinds: Vec<FsKind>,
     /// Logical CPUs available to the user.
     pub nproc: u32,
     /// Total host RAM in bytes.
@@ -73,6 +76,46 @@ pub fn configured_binaries(config: &Config) -> Vec<ConfiguredBinary> {
         })
     })
     .collect()
+}
+
+/// A filesystem kind: the `f_type` that `statfs` reports, and a name for messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FsKind {
+    /// The kernel's magic number for the filesystem (`f_type`).
+    pub magic: u64,
+    /// Its name, as `stat -f` prints it.
+    pub label: &'static str,
+}
+
+/// 9p (`V9FS_MAGIC`). On WSL, Windows drives are 9p mounts, and so is the driver share
+/// (docs/dev/PROBE_NOTES.md); the kind alone does not tell them apart, so every 9p is refused.
+pub const V9FS: FsKind = FsKind {
+    magic: 0x0102_1997,
+    label: "9p",
+};
+
+/// Where the kernel names its release; on WSL it contains `microsoft`.
+const OSRELEASE: &str = "/proc/sys/kernel/osrelease";
+/// Present when WSL's Windows interop is registered.
+const WSL_INTEROP: &str = "/proc/sys/fs/binfmt_misc/WSLInterop";
+
+/// The filesystem kinds refused as mount roots, from the kernel release text and whether WSL's
+/// interop entry is present: on WSL (either signal) [`V9FS`], else none. A further signal is
+/// added only once it is probed (docs/dev/PROBE_NOTES.md), and only ever adds refusals.
+// TODO(#281): a WSL that serves Windows drives over virtiofs is not covered.
+#[must_use]
+pub fn refused_fs_kinds(osrelease: &str, interop: bool) -> Vec<FsKind> {
+    if interop || osrelease.to_ascii_lowercase().contains("microsoft") {
+        vec![V9FS]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Whether WSL's interop entry is present. Only a clean not-found is absence: any other answer
+/// counts as present (fail closed).
+fn interop_present(path: &Path) -> bool {
+    !matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// Variables whose value is one folder the host runs or loads code from, or keeps credentials
@@ -145,6 +188,10 @@ pub enum HostEnvError {
     /// `/proc/meminfo` was unreadable or lacked `MemTotal`.
     #[error("cannot read total memory from /proc/meminfo: {0}")]
     MemInfo(String),
+    /// `/proc/sys/kernel/osrelease` was unreadable: whether this is WSL cannot be told, and
+    /// it is never assumed not to be.
+    #[error("cannot read the kernel release from /proc/sys/kernel/osrelease")]
+    OsRelease,
 }
 
 impl HostEnv {
@@ -191,6 +238,10 @@ impl HostEnv {
             podman_storage,
             env_dirs: env_dirs(|name| std::env::var_os(name)),
             configured_binaries: configured_binaries(config),
+            refused_fs_kinds: refused_fs_kinds(
+                &read_bounded(Path::new(OSRELEASE), 4096).ok_or(HostEnvError::OsRelease)?,
+                interop_present(Path::new(WSL_INTEROP)),
+            ),
             nproc,
             mem_bytes: mem_total()?,
         })
@@ -350,6 +401,46 @@ mod tests {
         assert_eq!(env.configured_binaries, configured_binaries(&c));
     }
 
+    /// 9p's magic, pinned against the literal the kernel's `magic.h` gives.
+    #[test]
+    fn the_9p_kind_is_pinned() {
+        assert_eq!(V9FS.magic, 0x0102_1997);
+        assert_eq!(V9FS.label, "9p");
+        assert_eq!(OSRELEASE, "/proc/sys/kernel/osrelease");
+        assert_eq!(WSL_INTEROP, "/proc/sys/fs/binfmt_misc/WSLInterop");
+    }
+
+    /// WSL when the kernel release says so (any case) or the interop entry is present; 9p is
+    /// then refused. Neither: nothing.
+    #[test]
+    fn wsl_is_told_by_its_release_or_its_interop_entry() {
+        let release = "6.18.0-microsoft-standard-WSL2\n";
+        assert_eq!(refused_fs_kinds(release, false), [V9FS]);
+        assert_eq!(refused_fs_kinds("6.18.0-Microsoft\n", false), [V9FS]);
+        assert_eq!(refused_fs_kinds("6.8.0-45-generic\n", true), [V9FS]);
+        assert_eq!(refused_fs_kinds(release, true), [V9FS]);
+        assert_eq!(refused_fs_kinds("6.8.0-45-generic\n", false), Vec::new());
+        assert_eq!(refused_fs_kinds("", false), Vec::new());
+    }
+
+    /// Only a clean not-found is absence; an entry of any type, or one that cannot be looked
+    /// at, is presence.
+    #[test]
+    fn the_interop_entry_is_absent_only_when_not_found() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/tmp")
+            .join(format!("sp-interop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
+        assert!(!interop_present(&dir.join("absent")));
+        std::fs::write(dir.join("file"), "").unwrap_or_else(|e| panic!("{e}"));
+        assert!(interop_present(&dir.join("file")));
+        assert!(interop_present(&dir));
+        // A lookup through a file fails with ENOTDIR, not ENOENT: present.
+        assert!(interop_present(&dir.join("file/x")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn from_process_works_on_this_host() {
         let env = HostEnv::from_process(&Config::default());
@@ -364,6 +455,12 @@ mod tests {
             .map(PathBuf::from)
             .filter(|p| p.is_absolute());
         assert_eq!(env.xdg_state_home, state);
+        // The kinds, from an independent read of this host's two signals.
+        let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+        let interop = Path::new("/proc/sys/fs/binfmt_misc/WSLInterop")
+            .try_exists()
+            .unwrap_or(true);
+        assert_eq!(env.refused_fs_kinds, refused_fs_kinds(&release, interop));
         assert!(
             env.env_dirs.iter().any(|d| d.var == "PATH"),
             "this host has a PATH"
