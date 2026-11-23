@@ -8,8 +8,8 @@
 //! escapes `"`, for a value written between quotes. [`quoted_args_capped`] writes a list of
 //! arguments each between quotes, a backtick as `\x60` too, within a size bound, and says where a
 //! cut fell ([`ArgsCut`]), for the launch summary's command line (architect Q713, Q715, Q716).
-//! [`StreamEscaper`] is the line-mode form
-//! (architect Q100): the same alphabet plus `\n`, for output that arrives in chunks.
+//! [`StreamEscaper`] is the line-mode form (architect Q100): the same alphabet plus `\n`, for
+//! output that arrives in chunks.
 //!
 //! Every cut and escape of sandbox-chosen audit text lives here too (architect Q276, Q288), as
 //! the closed set [`Style`]: the hex formats ([`hex_capped`], [`hex_counted`]), the text format

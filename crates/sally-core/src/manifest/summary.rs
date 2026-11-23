@@ -55,7 +55,7 @@ pub fn summary(v: &ValidatedManifest) -> String {
     let mut out = String::new();
     // TODO(#196): the summary does not mask token-shaped names the way diagnostics do.
     if let Some(finding) = data_can_leave(m, v.mounts(), v.egress()) {
-        // TODO(#257): the finding is built with Path::display(), so a realpath byte that is not
+        // TODO(#323): the finding is built with Path::display(), so a realpath byte that is not
         // UTF-8 shows here as \u{fffd}; the mount's own line shows it as \xNN.
         out.push_str("[data-can-leave] ");
         out.push_str(&bare(&finding));

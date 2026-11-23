@@ -1426,6 +1426,12 @@ fn rt_man_05_every_manifest_field_is_classified_for_the_summary() {
         .map(|(k, _)| *k)
         .collect();
     assert!(untested.is_empty(), "no LOOSENED row: {untested:?}");
+    // And every row names a field of the table, so a renamed or misspelled row is not left stale.
+    let unknown: Vec<&&str> = rows.iter().filter(|r| !table.contains(**r)).collect();
+    assert!(
+        unknown.is_empty(),
+        "LOOSENED rows not in FIELDS: {unknown:?}"
+    );
 }
 
 // ---- RT-FS-19: a link out of a protected folder ------------------------------------------------
