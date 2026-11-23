@@ -169,32 +169,44 @@ fn event(text: &str, name: &str) -> u64 {
         .unwrap_or_else(|| panic!("{name} in {text}"))
 }
 
-/// The prefix of the fork-bomb test's one diagnostic line (#141); `scripts/loaded-repeat.sh`
-/// looks for it.
-const FIGURES: &str = "rt_ag_09 fork-bomb figures:";
+/// The prefix of the fork-bomb test's one diagnostic line (#141); `scripts/loaded-repeat.sh` and
+/// its test look for the same text.
+const FIGURES_PREFIX: &str = "rt_ag_09 fork-bomb figures:";
 
 /// The fork-bomb test's diagnostic line: `memory.peak`, the `memory.events` counters, `pids.peak`
-/// and the `pids.events` max counter of the container's cgroup `cg`. A peak file the kernel does
-/// not have prints `absent`; a failed read of a file that is there panics as [`read`] does.
+/// and the `pids.events` max counter of the container's cgroup `cg`. A peak file or a counter the
+/// kernel does not have prints `absent`. A failed read of an events file, or of a peak file that
+/// is there, panics as [`read`] does: the cgroup gone at this point means the container ended.
 #[track_caller]
 fn figures(x: &Lx, r: &Running, cg: &std::path::Path) -> String {
-    let peak = |file: &str| {
-        if cg.join(file).exists() {
-            read(x, r, cg, file).trim().to_string()
-        } else {
-            "absent".to_string()
-        }
-    };
     let mem = read(x, r, cg, "memory.events");
+    let pids = read(x, r, cg, "pids.events");
     let counters = ["max ", "oom ", "oom_kill ", "oom_group_kill "]
-        .map(|k| format!("{}={}", k.trim(), event(&mem, k)))
+        .map(|k| format!("{}={}", k.trim(), counter(&mem, k)))
         .join(" ");
     format!(
-        "{FIGURES} memory.peak={} {counters} pids.peak={} pids.events.max={}",
-        peak("memory.peak"),
-        peak("pids.peak"),
-        event(&read(x, r, cg, "pids.events"), "max ")
+        "{FIGURES_PREFIX} memory.peak={} {counters} pids.peak={} pids.events.max={}",
+        peak(x, r, cg, "memory.peak"),
+        peak(x, r, cg, "pids.peak"),
+        counter(&pids, "max ")
     )
+}
+
+/// A peak file of `cg`, trimmed, or `absent` where the kernel has none.
+#[track_caller]
+fn peak(x: &Lx, r: &Running, cg: &std::path::Path, file: &str) -> String {
+    if cg.join(file).exists() {
+        read(x, r, cg, file).trim().to_string()
+    } else {
+        "absent".to_string()
+    }
+}
+
+/// The `name` counter of an events file's `text` for printing, or `absent` (an older kernel).
+fn counter(text: &str, name: &str) -> String {
+    text.lines()
+        .find_map(|l| l.strip_prefix(name)?.trim().parse::<u64>().ok())
+        .map_or_else(|| "absent".to_string(), |n| n.to_string())
 }
 
 /// The `session.resource_limit` entries naming `resource`, in order.
