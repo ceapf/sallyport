@@ -8,6 +8,11 @@
 # and setsid are stubs on PATH. Runs via `make test-scripts`.
 set -euo pipefail
 
+# Each case sets the LOADED_REPEAT_* settings it needs; none comes from the caller. The nightly's
+# `make loaded-repeat` passes LOADED_REPEAT_RESTART=0 and its limits to the script, whose load,
+# `make test`, runs this file: inherited, they changed what the restart cases saw.
+for v in $(compgen -v LOADED_REPEAT_ || true); do unset "$v"; done
+
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 script="$root/scripts/loaded-repeat.sh"
 tmp="$(mktemp -d)"
