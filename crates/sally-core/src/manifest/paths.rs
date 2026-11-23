@@ -1090,7 +1090,8 @@ mod tests {
     }
 
     /// The kind is read only from the root that was identified: another directory's identity
-    /// refuses `mount-changed`.
+    /// refuses `mount-changed`. A link put in the root's place is never followed, even to the
+    /// identified directory.
     #[test]
     fn the_kind_is_read_from_the_identified_root_only() {
         let t = TmpHome::new("kind");
@@ -1099,6 +1100,10 @@ mod tests {
         let e = root_kind(&here, t.id("home/.ssh")).unwrap_err();
         assert_eq!(e.0, Code::MountChanged);
         let e = root_kind(&t.0.join("home/absent"), t.id("home/.ssh")).unwrap_err();
+        assert_eq!(e.0, Code::NotFound);
+        let link = t.0.join("home/code/lnk");
+        std::os::unix::fs::symlink(&here, &link).unwrap();
+        let e = root_kind(&link, t.id("home/code/x")).unwrap_err();
         assert_eq!(e.0, Code::NotFound);
     }
 
