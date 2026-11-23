@@ -7,7 +7,8 @@
 //! store, as in `intercept.rs`), and a harness of the same session, then runs the shared search
 //! (`common::search`, RT-SEC-10's) in both. The patterns are the `SALLY_CANARY` marker and every
 //! independently computed form of every canary (`common::forms`): the raw values, their
-//! percent spellings and base64 cores, the rendered `Bearer` value, and the `{basic}` rendered
+//! percent spellings, JSON-string spellings and base64 cores, the rendered `Bearer` value, and
+//! the `{basic}` rendered
 //! value and blobs. A planted throwaway value (`SALLY_CANARY_PLANTED_…`, never a store value) is
 //! found in each place searched: the positive control. A search that outlives its bound fails,
 //! naming the bound.

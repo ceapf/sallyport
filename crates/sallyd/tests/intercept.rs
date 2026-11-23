@@ -291,7 +291,10 @@ fn every_form() -> Vec<String> {
 }
 
 /// The encoders RT-SEC-12 and RT-SEC-07 compute their forms with, against published vectors:
-/// RFC 4648 §10 (base64), RFC 7617 §2 (Basic), and the URL-safe alphabet's two characters.
+/// RFC 4648 §10 (base64), RFC 7617 §2 (Basic), and the URL-safe alphabet's two characters; the
+/// percent encoder against hand-built vectors for each flag; the JSON-string encoder against
+/// `serde_json` (a third-party encoder, not the code under test) for every ASCII character and
+/// two others.
 #[test]
 fn the_test_encoders_match_published_vectors() {
     assert_eq!(b64(b"foobar", ALPHABETS[0]), "Zm9vYmFy");
@@ -307,10 +310,19 @@ fn the_test_encoders_match_published_vectors() {
     assert_eq!(pct("a/b c", PCTS[1]), "a%2fb%20c");
     assert_eq!(pct("a/b c", PCTS[2]), "a%2Fb+c");
     assert_eq!(pct("a/b c", PCTS[3]), "a/b%20c");
-    assert_eq!(pct("a/b c!", PCTS[7]), "a/b+c%21");
+    assert_eq!(pct("a/b c?", PCTS[7]), "a/b+c%3f");
     assert_eq!(pct("a/b c!", PCTS[11]), "a%2fb+c!");
     assert_eq!(pct("(x)'*", PCTS[8]), "(x)'*");
     assert_eq!(json_str("a\"b\\c\n\u{1}"), "a\\\"b\\\\c\\n\\u0001");
+    assert_eq!(
+        json_str("\u{8}\u{c}\r\t\u{1f}/\u{7f}é"),
+        "\\b\\f\\r\\t\\u001f/\u{7f}é"
+    );
+    for c in (0u8..=0x7f).map(char::from).chain(['é', '\u{2028}']) {
+        let one = c.to_string();
+        let quoted = serde_json::to_string(&one).unwrap();
+        assert_eq!(json_str(&one), quoted[1..quoted.len() - 1], "{c:?}");
+    }
     // The secret's core of base64("A" ‖ "foo" ‖ …): bits 8..32 give characters 2..5.
     assert_eq!(core_range(1, 3), 2..5);
     // Each percent spelling of GIT_TOKEN's canary, and its JSON-string spelling, differs from
@@ -663,8 +675,8 @@ fn rt_sec_07_an_entry_written_after_the_release_holds_no_credential_in_its_host(
 
 /// RT-SEC-07: after injected and echoed exchanges on every grant host (`Bearer`, a bare value,
 /// three `{basic}` grants, the encoded echoes of `/echo-forms`), no audit entry holds any form
-/// of any canary (each independently computed: raw, percent, base64 cores, rendered values,
-/// blobs; searched in every decoded string, key and number, so JSON escaping cannot hide one),
+/// of any canary (each independently computed: raw, percent, JSON-string, base64 cores,
+/// rendered values, blobs; searched in every decoded string, key and number, so JSON escaping cannot hide one),
 /// and each `egress.request` names its grant. Control: `request_args` builds `injected` from
 /// grant names (`Prepared::names`), and no entry is built from a header map or a body. In-test
 /// control of the search (#122): [`credential_in`] finds every form planted in an entry.

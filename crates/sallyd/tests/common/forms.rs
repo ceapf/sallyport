@@ -49,7 +49,9 @@ const fn p(upper: bool, plus_space: bool, keep: &'static str) -> Pct {
 
 /// Every percent-encoder spelling RT-SEC-12 echoes: each of three keep-sets (nothing besides
 /// the unreserved characters; `/`, as Python's `quote` keeps it; `!'()*`, as
-/// `encodeURIComponent` keeps them), with and without `+` for a space, in both hex cases.
+/// `encodeURIComponent` keeps them), with and without `+` for a space, in both hex cases. The
+/// first four are the spellings this list held before it was widened, kept in their places so
+/// the vectors that index them still mean the same spellings; do not reorder.
 pub const PCTS: [Pct; 12] = [
     p(true, false, ""),
     p(false, false, ""),
@@ -82,9 +84,11 @@ pub fn pct(s: &str, p: Pct) -> String {
     out
 }
 
-/// `s` as it stands inside a JSON string (RFC 8259 §7): `"` and `\` escaped with a backslash,
-/// the short escapes for the controls that have one, `\u00XX` (lower-case hex) for the other
-/// controls; every other character as it is.
+/// `s` as `serde_json` writes it inside a JSON string: `"` and `\` escaped with a backslash, the
+/// short escapes for the controls that have one, `\u00XX` (lower-case hex) for the other
+/// controls; every other character as it is. RFC 8259 §7 allows other spellings (`\/`,
+/// upper-case hex, `\u` for any character); the redaction covers only this one (THREAT_MODEL,
+/// #249).
 pub fn json_str(s: &str) -> String {
     let mut out = String::new();
     for c in s.chars() {
