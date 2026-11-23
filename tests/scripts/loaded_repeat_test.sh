@@ -28,6 +28,8 @@ case "${modes[$i]}" in
   nodiag) printf 'test %s ... ok\ntest result: ok. 4 passed; 0 failed\n' "$fork" ;;
   hit) printf 'test %s ... ok\n%s\ntest result: ok. 4 passed; 0 failed\n' "$fork" \
     "rt_ag_09 fork-bomb figures: memory.peak=67108864 max=4 oom=0 oom_kill=0 oom_group_kill=0 pids.peak=64 pids.events.max=3" ;;
+  nopeak) printf 'test %s ... ok\n%s\ntest result: ok. 4 passed; 0 failed\n' "$fork" \
+    "rt_ag_09 fork-bomb figures: memory.peak=absent max=0 oom=0 oom_kill=0 oom_group_kill=0 pids.peak=absent pids.events.max=3" ;;
   nomax) printf 'test %s ... ok\n%s\ntest result: ok. 4 passed; 0 failed\n' "$fork" \
     "rt_ag_09 fork-bomb figures: memory.peak=$((1000 + n)) oom_kill=0 pids.peak=64 pids.events.max=7" ;;
   kill) printf 'test %s ... FAILED\n%s\ntest result: FAILED. 3 passed; 1 failed\n' "$fork" \
@@ -147,6 +149,10 @@ run limit-hit 3 0 pass,hit,nomax
 has limit-hit "run=2 loaded pass fork-bomb=ok memory.peak=67108864 max=4 oom_kill=0 pids.peak=64"
 has limit-hit "run=3 loaded pass fork-bomb=ok memory.peak=1003 max= oom_kill=0 pids.peak=64"
 has limit-hit "memory limit hit (max above 0) 1, OOM kills (oom_kill above 0) 0, highest memory.peak 67108864, verdict pass"
+# A kernel without memory.peak prints absent: never the highest peak.
+run no-peak 2 0 nopeak,pass
+has no-peak "run=1 loaded pass fork-bomb=ok memory.peak=absent max=0"
+has no-peak "highest memory.peak 1002, verdict pass"
 run killed 1 1 kill
 has killed "OOM kills (oom_kill above 0) 1,"
 

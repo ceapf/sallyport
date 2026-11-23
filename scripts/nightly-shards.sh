@@ -78,9 +78,11 @@ while IFS= read -r line || [ -n "$line" ]; do
       bad "$job: '$trimmed' is not '$shard_env'"
     fi
   fi
-  # The loaded repeat reports and does not gate: it alone may carry continue-on-error, at job
-  # level and true, and no job may need it. On a mutation job the key would remove the gate.
-  if [[ "$trimmed" == continue-on-error:* ]]; then
+  # The loaded repeat reports and does not gate: it alone may carry continue-on-error, as the one
+  # job-level line `continue-on-error: true`, and no job may need it. On a mutation job the key
+  # would remove the gate. The key is found in any form outside a comment (a step's list item,
+  # quoted, inside a flow map); a mention inside a run line fails too, which is the safe side.
+  if [[ "$trimmed" != "#"* ]] && [[ "$trimmed" =~ (^|[-{,[:space:]])[\"\']?continue-on-error[\"\']?[[:space:]]*: ]]; then
     if [ "$job" != "$repeat" ]; then
       bad "${job:-(outside any job)}: continue-on-error is allowed only on the $repeat job"
     elif [ "$line" = "    continue-on-error: true" ]; then
@@ -89,12 +91,20 @@ while IFS= read -r line || [ -n "$line" ]; do
       bad "$repeat: '$trimmed' is not the job-level 'continue-on-error: true'"
     fi
   fi
+  # The repeat job runs no mutation shard: no SHARD env and no MUTANTS_SHARD (a `shard:` line is
+  # refused below, as a row naming no mutation target).
+  if [ "$job" = "$repeat" ] && [[ "$line" == *SHARD:* || "$line" == *MUTANTS_SHARD=* ]]; then
+    bad "$repeat: no shard settings in the repeat job: $trimmed"
+  fi
+  # A needs entry runs from its `needs:` line to the next job-level key or job; blank lines,
+  # comments, list items and a flow list's continuation lines stay inside it.
   if [[ "$trimmed" == needs:* ]]; then
     in_needs=1
-  elif [ "$in_needs" -eq 1 ] && [[ "$trimmed" != "- "* ]]; then
+  elif [ "$in_needs" -eq 1 ] && [[ "$line" =~ ^\ {0,4}[^[:space:]#-] ]]; then
     in_needs=0
   fi
-  if [ "$in_needs" -eq 1 ] && [[ "$trimmed" =~ (^|[^A-Za-z0-9_-])$repeat([^A-Za-z0-9_-]|$) ]]; then
+  if [ "$in_needs" -eq 1 ] && [[ "$trimmed" != "#"* ]] &&
+    [[ "$trimmed" =~ (^|[^A-Za-z0-9_-])$repeat([^A-Za-z0-9_-]|$) ]]; then
     bad "${job:-(outside any job)}: no job may need the $repeat job"
   fi
   case "$line" in

@@ -177,6 +177,27 @@ lenient "a job that needs the repeat job" 1 "late: no job may need the loaded-re
   "$(repeatjob)"$'\n'"  late:"$'\n'"    needs: [mutants, loaded-repeat]"
 lenient "a job that needs the repeat job in a list" 1 "late: no job may need the loaded-repeat job" \
   "$(repeatjob)"$'\n'"  late:"$'\n'"    needs:"$'\n'"      - mutants"$'\n'"      - loaded-repeat"
+lenient "a step's continue-on-error on a mutation job" 1 \
+  "mutants-wide: continue-on-error is allowed only on the loaded-repeat job" \
+  "$(repeatjob)"$'\n'"$(job mutants-wide | sed 's/^      - env:$/      - continue-on-error: true\n        env:/' | sed -n '1p;/continue-on-error/p')"
+lenient "a quoted continue-on-error on a mutation job" 1 "mutants-wide: continue-on-error is allowed" \
+  "$(repeatjob)"$'\n'"  mutants-wide:"$'\n'"    \"continue-on-error\": true"
+lenient "a continue-on-error in a flow map on a mutation job" 1 "mutants-wide: continue-on-error is allowed" \
+  "$(repeatjob)"$'\n'"  mutants-wide:"$'\n'"    steps:"$'\n'"      - { run: make mutants, continue-on-error: true }"
+lenient "a SHARD env in the repeat job" 1 "loaded-repeat: no shard settings in the repeat job" \
+  "$(repeatjob)"$'\n'"      - env:"$'\n'"          SHARD: \${{ matrix.shard }}"
+lenient "a MUTANTS_SHARD in the repeat job" 1 "loaded-repeat: no shard settings in the repeat job" \
+  "$(repeatjob)"$'\n'"      - run: make loaded-repeat MUTANTS_SHARD=\"\$SHARD\""
+lenient "a job that needs the repeat job as a scalar" 1 "late: no job may need the loaded-repeat job" \
+  "$(repeatjob)"$'\n'"  late:"$'\n'"    needs: loaded-repeat"
+lenient "a needs list with a blank line and a comment" 1 "late: no job may need the loaded-repeat job" \
+  "$(repeatjob)"$'\n'"  late:"$'\n'"    needs:"$'\n'"      - mutants"$'\n'$'\n'"      # the repeat"$'\n'"      - loaded-repeat"
+lenient "a needs flow list over two lines" 1 "late: no job may need the loaded-repeat job" \
+  "$(repeatjob)"$'\n'"  late:"$'\n'"    needs: [mutants,"$'\n'"      loaded-repeat]"
+lenient "a job may need jobs whose names only contain the repeat's" 0 "" \
+  "$(repeatjob)"$'\n'"  loaded-repeat-2:"$'\n'"    runs-on: ubuntu-24.04"$'\n'"  late:"$'\n'"    needs: [loaded-repeat-2, xloaded-repeat]"$'\n'"    runs-on: ubuntu-24.04"
+lenient "a needs entry ends at the next job-level key" 0 "" \
+  "$(repeatjob)"$'\n'"  late:"$'\n'"    needs: [mutants]"$'\n'"    runs-on: ubuntu-24.04"$'\n'"    steps:"$'\n'"      - run: echo loaded-repeat"
 f="$tmp/lenient-top.yml"
 printf 'continue-on-error: true\n' >"$f"
 cat "$(workflow lenient-body "$deny"$'\n'"$wide")" >>"$f"
