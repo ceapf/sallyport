@@ -107,13 +107,14 @@ const HOME_SUBTREES: &[(&str, &str)] = &[
 
 /// The default data and state homes under each home, rules whether or not `$XDG_DATA_HOME` or
 /// `$XDG_STATE_HOME` is exported: user units, session services, completion scripts and shell
-/// history the host loads live there (MANIFEST_SPEC §2).
+/// history the host loads live there (MANIFEST_SPEC §2; RT-FS-05).
 const DEFAULT_XDG_HOMES: &[(&str, &str)] = &[(".local/share", CONFIG), (".local/state", STATE)];
 
 /// Folders one level deeper than the link scan reaches from their base, read as scan roots of
 /// their own: user units, session services and completion scripts the host loads. `(base,
 /// subfolder)`: the base is the data home (`.local/share`, `$XDG_DATA_HOME`) or the config home
-/// (`.config`, `$XDG_CONFIG_HOME`), in every form. Not rules: their bases are rules already.
+/// (`.config`, `$XDG_CONFIG_HOME`), in every form. Not rules: their bases are rules already
+/// (RT-FS-05: a link in one makes its target a rule).
 // TODO(#283): more such folders, each checked against its tool's documentation first.
 const SCAN_ONLY: &[(XdgBase, &str)] = &[
     (XdgBase::Data, "systemd/user"),
@@ -246,6 +247,7 @@ impl Denylist {
         {
             rules.push(subtree_rule(dir, CONFIG));
         }
+        // RT-FS-05: an exported state home is a rule too, wherever it points.
         if let Some(dir) = &env.xdg_state_home {
             rules.push(subtree_rule(dir, STATE));
         }
@@ -451,7 +453,8 @@ fn scan_folders(env: &HostEnv, scan: &mut Scan) -> Result<(), Incomplete> {
 
 /// The rules for a binary `config.toml` names: the folder of its path as written and the folder
 /// of the file it resolves to (a link's target), each a subtree rule labelled with the setting.
-/// Not read for links. A folder that is `/`, a home or an ancestor of one stays a rule.
+/// Not read for links. A folder that is `/`, a home or an ancestor of one stays a rule
+/// (RT-FS-05: the host runs the binary on every launch).
 // TODO(#280): in a chain of two or more links, the folders of the links between the first and
 // the file are not rules.
 fn binary_rules(b: &ConfiguredBinary) -> Vec<Rule> {
@@ -544,7 +547,7 @@ pub(crate) fn normalize(p: &Path) -> PathBuf {
 
 /// `p` without a trailing `/`, repeated `/` or `.` components; `..` is kept. The kernel follows
 /// a final symlink of `x/` or `x/.` (for `lstat` too), so a mount root is judged by the path
-/// without them: `x` itself.
+/// without them: `x` itself (RT-FS-06: a symlinked root is refused in every spelling).
 fn without_dot_components(p: &Path) -> PathBuf {
     p.components().collect()
 }
@@ -668,6 +671,7 @@ pub(crate) fn check_mount_host(
     deny: &Denylist,
 ) -> Result<(PathBuf, DirId), (Code, String)> {
     use std::os::unix::fs::MetadataExt;
+    // RT-FS-06: `x/` and `x/.` are judged as `x`, so a link there is still a link.
     let expanded = without_dot_components(&expand(raw, home).map_err(|m| (Code::InvalidValue, m))?);
     if let Some(why) = deny.refusal(&normalize(&expanded)) {
         return Err((Code::Denylisted, format!("{raw:?} {why} (denylisted)")));
@@ -713,6 +717,7 @@ pub(crate) fn check_mount_host(
     if let Some(why) = deny.refusal_by_id(id) {
         return Err((Code::Denylisted, format!("{raw:?} {why} (denylisted)")));
     }
+    // RT-FS-11: on WSL a root on a Windows drive's filesystem kind is refused, wherever mounted.
     let magic = root_kind(&real, id).map_err(|(code, why)| (code, format!("{raw:?} {why}")))?;
     if let Some(kind) = deny.refused_kinds.iter().find(|k| k.magic == magic) {
         return Err((
@@ -729,7 +734,8 @@ pub(crate) fn check_mount_host(
 
 /// The filesystem kind (`f_type`) of the directory at `real`, read from a handle opened without
 /// following a link, which must be the directory identified as `id`: the kind then belongs to
-/// the root that is pinned (the same device is the same filesystem). Every failure refuses.
+/// the root that is pinned (the same device is the same filesystem). Every failure refuses
+/// (RT-FS-11).
 fn root_kind(real: &Path, id: DirId) -> Result<u64, (Code, String)> {
     use rustix::fs::{Mode, OFlags};
     let inspect = |e: rustix::io::Errno| (Code::NotFound, format!("cannot be inspected: {e}"));

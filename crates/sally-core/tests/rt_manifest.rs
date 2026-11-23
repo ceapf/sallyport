@@ -2,8 +2,9 @@
 //!
 //! Covered here: RT-MAN-01, RT-MAN-02, RT-MAN-03 (the place check the launchers call; its red-team
 //! tests run the `sally` binary and a real launch), RT-FS-05 (validate half),
-//! RT-FS-06 (validate + re-check half), RT-SEC-08, RT-MAN-04, RT-FS-19. The launch halves ("no container launched",
-//! "launch uses the stored struct") are asserted again by the sandbox/session tests (tasks 6, 12).
+//! RT-FS-06 (validate + re-check half), RT-FS-11 (the filesystem-kind leg, every host), RT-SEC-08,
+//! RT-MAN-04, RT-FS-19. The launch halves ("no container launched"; a launch from a manifest
+//! needs consent to the text it sends) are asserted by the sandbox, session and CLI tests.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;

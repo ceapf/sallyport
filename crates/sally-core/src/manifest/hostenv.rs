@@ -101,7 +101,8 @@ const WSL_INTEROP: &str = "/proc/sys/fs/binfmt_misc/WSLInterop";
 
 /// The filesystem kinds refused as mount roots, from the kernel release text and whether WSL's
 /// interop entry is present: on WSL (either signal) [`V9FS`], else none. A further signal is
-/// added only once it is probed (docs/dev/PROBE_NOTES.md), and only ever adds refusals.
+/// added only once it is probed (docs/dev/PROBE_NOTES.md), and only ever adds refusals
+/// (RT-FS-11: Windows drives refused by kind wherever they are mounted).
 // TODO(#281): a WSL that serves Windows drives over virtiofs is not covered, nor one that
 // neither signal shows (a release without "microsoft" and interop off: only the `/mnt` rule).
 #[must_use]
