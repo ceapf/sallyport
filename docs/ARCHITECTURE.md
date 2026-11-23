@@ -1155,8 +1155,9 @@ further effect):
 2. `session.timeout` or `session.crash`, for those reasons.
 3. Every pending prompt is withdrawn (`approval.withdraw`, `session-stop`); no call queues after
    it. A prompt whose decision entry is still being written is not pending any more: its ticket
-   is issued, and only the executor's own stop check (step 4) stands before the run (open, fix
-   planned, #297).
+   is issued, and only the executor's own stop check (step 4) stands before the run; a cancel
+   or a closed connection in that window does not stop the approved call (open, fix planned,
+   #297).
 4. The stop signal: a running `shell` is killed (`killed: session-stop`, the kill finished before
    its `tool.result`), an attached command likewise (its `sandbox.exec_result` `killed:
    session-stop`, and its attach answered so), and a write or delete that has not begun aborts
@@ -1781,8 +1782,9 @@ sallyport/
   Text the sandbox chose, and any text that can carry it (podman's and the kernel's messages,
   a panic payload), is never cut or escaped by the code that builds an entry (open, fix planned:
   several control-socket refusal entries still escape and cut their text first, #293, and
-  validation errors still repeat some manifest values, #195; neither carries sandbox-chosen
-  text today). The entry
+  validation errors still repeat some manifest values, #195; the refusal texts carry no
+  sandbox-chosen text today, and a manifest a session wrote reaches `sallyd` only after the
+  CLI's own validation and the user's consent). The entry
   declares it beside its args (`NewEntry::text`, `texts` and `pieces`; sally-core
   `audit::declared`, architect Q276, Q288, Q290, Q291), raw, with a style from sally-core
   `text::Style`: `Hex` and `HexCounted` (a byte cap, `\xNN` for everything outside printable

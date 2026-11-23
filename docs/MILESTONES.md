@@ -98,7 +98,7 @@ Tasks
 3. Reference ReAct harness: tool schemas → llama.cpp tool-calling (`--jinja`), loop with max steps, approval-aware UX, MCP stdio spawn from `SALLY_MCP_SERVERS`; the system prompt tells the model not to commit (session commits are discarded in v1, AMENDMENTS-02) — main (sonnet); mle-reviewer (opus) on prompt/tool format
 4. `sallyd::session` full lifecycle (ARCHITECTURE §5.4), `sessions.*`, `ui.*`, `tools.result` notifications, timeout, teardown guard — **main (opus)**; review security-reviewer (opus)
 5. `sally run --manifest m.yaml "task"` interactive CLI (shows tool log, approvals inline) — main (sonnet)
-6. Red-team: every row the suite marks for this milestone, end-to-end with the malicious mock model (CI) and once with a real model (local), with the M4 halves of RT-MDL-10 (a template's injected instructions) and RT-AG-14 (the harness, MCP #68); reports
+6. Red-team: every row the suite marks for this milestone, and RT-AG-01..10 run again end-to-end through the reference harness, with the malicious mock model (CI) and once with a real model (local), with the M4 halves of RT-MDL-10 (a template's injected instructions) and RT-AG-14 (the harness, MCP #68); reports
 
 Acceptance: `sally run --manifest manifests/examples/coding-agent.yaml "add a README"` edits only `/workspace/myproject`, asks approval for every shell command, and the mock-model run in CI shows every injected attack denied with an audit line.
 

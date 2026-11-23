@@ -170,7 +170,8 @@ it only reports). In order:
   the question, with typed-ahead input discarded; off a terminal a launch with no flag is
   refused (exit 1). So a text changed after review (by a session that can write the folder
   that holds it, through this manifest's mounts or another's) launches only with consent given
-  for that text. A hash that ships with a manifest (a script, a README line) launches it with
+  for that text; the consent is then the only defence, so a `yes` given without re-reading the
+  summary launches the rewrite (#269 for what the summary hides). A hash that ships with a manifest (a script, a README line) launches it with
   no question; the summary is still printed; none planned.
 
 `sally manifest summary` ends with the line `sha256 <hex>`, the hash a launch's
