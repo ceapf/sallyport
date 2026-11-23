@@ -6,11 +6,11 @@
 //! conventions).
 //!
 //! RT-MAN-05 (launch summary disguise): every string that comes from the manifest or the host is
-//! escaped to printable ASCII by the shared [`crate::text`] alphabet before it is placed in a line
-//! (architect Q710), so no text can add a line, drive a terminal or hide behind a direction mark.
-//! A list a reader could misjoin is quoted item by item (globs, MCP arguments, the injection header
-//! and format), and a cut is marked outside the quoted text. Each setting that differs from its
-//! default, where that can widen what the session may do, gets a line naming the default (Q712).
+//! escaped to printable ASCII by the shared [`crate::text`] alphabet before it is placed in a line,
+//! so no text can add a line, drive a terminal or hide behind a direction mark. A list a reader
+//! could misjoin is quoted item by item (globs, MCP arguments, the injection header and format),
+//! and a cut is marked outside the quoted text. Each setting that differs from its default, where
+//! that can widen what the session may do, gets a line naming the default.
 //! The manifest's `description` is not shown; if it ever is, it is one line through the same
 //! escape, its newlines and tabs included.
 
@@ -33,7 +33,7 @@ const UNPROTECTED_HOST_FILES: &str = "Makefile, package.json scripts, .vscode/ta
      a .git folder created during the session, or a git repository not named .git, such as a \
      bare project.git";
 /// Longest rendering of an MCP server's command in the summary: bytes of the escaped, quoted
-/// arguments between the backticks (architect Q713).
+/// arguments between the backticks (RT-MAN-05).
 const MAX_COMMAND_SHOWN: usize = 200;
 
 /// An optional `[data-can-leave]` line, an optional `[direct-write]` line (any `rw` mount; the
@@ -160,7 +160,7 @@ fn file_lines(m: &Manifest, mounts: &[ResolvedMount]) -> Vec<String> {
 }
 
 /// The broker runs `fs_write` and `fs_delete` on a staged mount without asking: they change the
-/// session's own copy (architect Q711). Names only the enabled tools.
+/// session's own copy (RT-MAN-05). Names only the enabled tools.
 fn staged_tools(write: bool, delete: bool) -> &'static str {
     match (write, delete) {
         (true, true) => " The fs_write and fs_delete tools change that copy without asking you.",
@@ -217,7 +217,7 @@ fn network_line(m: &Manifest, v: &ValidatedManifest) -> String {
     }
 }
 
-/// The proxy's limits that differ from their defaults, when a host is reachable (Q712). The
+/// The proxy's limits that differ from their defaults, when a host is reachable (RT-MAN-05). The
 /// validated egress is empty under `network.mode: none`.
 fn network_limit_lines(m: &Manifest, v: &ValidatedManifest) -> Vec<String> {
     if v.egress().is_empty() {
@@ -342,7 +342,7 @@ fn tool_lines(m: &Manifest) -> Vec<String> {
 /// The server's command runs at launch, unapproved, in the workspace (mounts + egress), so the
 /// summary shows it; only its tool calls are gated by `approve`. Each argument is quoted, a
 /// backtick in it written `\x60`, so no argument closes the code span; a cut is marked after the
-/// closing backtick, saying where it fell and the input bytes not shown (Q713, Q715, Q716).
+/// closing backtick, saying where it fell and the input bytes not shown (RT-MAN-05).
 fn mcp_line(m: &Manifest, s: &McpServer) -> String {
     let (cmd, cut) = text::quoted_args_capped(&s.command, MAX_COMMAND_SHOWN);
     let marker = cut.map_or_else(String::new, |c| {
@@ -372,7 +372,7 @@ fn mcp_line(m: &Manifest, s: &McpServer) -> String {
     )
 }
 
-/// `approvals` settings that differ from their defaults, in either direction (Q713).
+/// `approvals` settings that differ from their defaults, in either direction (RT-MAN-05).
 fn approval_lines(m: &Manifest) -> Vec<String> {
     let (a, d) = (&m.approvals, Approvals::default());
     let mut lines = Vec::new();

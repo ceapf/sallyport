@@ -7,7 +7,7 @@
 //! bound and names what it cut; it never cuts inside an escape. [`escape_quoted_capped`] also
 //! escapes `"`, for a value written between quotes. [`quoted_args_capped`] writes a list of
 //! arguments each between quotes, a backtick as `\x60` too, within a size bound, and says where a
-//! cut fell ([`ArgsCut`]), for the launch summary's command line (architect Q713, Q715, Q716).
+//! cut fell ([`ArgsCut`]), for the launch summary's command line (RT-MAN-05).
 //! [`StreamEscaper`] is the line-mode form (architect Q100): the same alphabet plus `\n`, for
 //! output that arrives in chunks.
 //!
@@ -57,7 +57,7 @@ pub fn escape_backslash_quoted(raw: &[u8]) -> String {
     out
 }
 
-/// Where [`quoted_args_capped`] cut a list of arguments (architect Q716).
+/// Where [`quoted_args_capped`] cut a list of arguments (RT-MAN-05).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArgsCut {
     /// `true` when argument [`at`](Self::at) was shown in part, its closing quote written;
@@ -73,7 +73,7 @@ pub struct ArgsCut {
 }
 
 /// `args` each written `"…"` by [`escape_backslash_quoted`], a backtick as `\x60` too, joined by
-/// one space, in at most `max` bytes (architect Q713, Q715, Q716: the launch summary's command
+/// one space, in at most `max` bytes (RT-MAN-05: the launch summary's command
 /// line, shown between backticks, which no argument can then close). Built left to right, never
 /// cutting inside an escape: an argument starts only when the space before it, both its quotes and
 /// its first escape fit, and an argument cut short still gets its closing quote. Returns the text
@@ -125,7 +125,7 @@ pub fn quoted_args_capped(args: &[String], max: usize) -> (String, Option<ArgsCu
     (out, None)
 }
 
-/// A backtick piece written `\x60`, so text shown between backticks cannot close them (Q715).
+/// A backtick piece written `\x60`, so text shown between backticks cannot close them (RT-MAN-05).
 fn backtick_escaped(piece: Piece) -> Piece {
     if piece.text == "`" {
         Piece {

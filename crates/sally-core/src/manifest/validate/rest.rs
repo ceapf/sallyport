@@ -255,7 +255,7 @@ fn check_fetch(m: &Manifest, d: &mut Diags) {
 
 /// `fs_read`/`fs_list` act on any mount; `fs_write`/`fs_delete` on `rw`, `staged` and `brokered`
 /// mounts (`ro` → denied; on `staged` the broker runs them without asking, in the session's own
-/// copy: architect Q711). Enabling them with nothing to act on is a mistake worth a warning.
+/// copy). Enabling them with nothing to act on is a mistake worth a warning.
 fn check_fs_tools(m: &Manifest, d: &mut Diags) {
     let has = |tool| m.tools.builtin.contains(&tool);
     let mounts = &m.filesystem.mounts;

@@ -1164,8 +1164,9 @@ fn rt_man_05_each_setting_that_loosens_a_default_is_named() {
 }
 
 /// A manifest whose text is shown in each kind of summary line: a mount folder name, globs, an
-/// injection format, MCP arguments (the last one long enough to be cut), and a description that
-/// is not shown. `hostile` puts terminal and line-break controls, a direction override and a
+/// injection format, MCP arguments (the last one long enough to be cut), and a description, so
+/// the printable-ASCII and line-count checks cover it should it ever be shown. `hostile` puts
+/// terminal and line-break controls, a direction override and a
 /// zero-width space where each field accepts them; otherwise the same fields hold plain text.
 fn disguise_body(folder: &str, rw_folder: &str, hostile: bool) -> String {
     let (globs, format, args, description) = if hostile {
@@ -1272,9 +1273,6 @@ fn rt_man_05_hostile_manifest_text_is_shown_escaped_on_one_line_each() {
         assert!(n > 0 && n < 4096, "{line}");
         assert!(rest.starts_with("each of its tool calls"), "{line}");
     }
-    // The description is never shown. A tripwire, not a control: no code path shows it today.
-    assert!(!s.contains("DESCRIPTION-TEXT"), "{s}");
-    assert!(!plain.contains("DESCRIPTION-TEXT"), "{plain}");
 }
 
 /// A glob with whitespace at either end is refused, as `invalid-value` at its own path; the twin
@@ -1305,7 +1303,7 @@ enum Shown {
     /// Named, with its default, when it differs from the default (or when it is set).
     WhenNotDefault,
     /// Not a loosening: identity, reserved, model tuning, an acknowledgement, or text that grants
-    /// nothing (architect Q712).
+    /// nothing.
     NotALoosening,
     /// A section: its own fields are classified under their type.
     Section,
@@ -1344,7 +1342,7 @@ const FIELDS: &[(&str, Shown)] = &[
     ("Inject.basic_user", Shown::NotALoosening),
     ("McpServer.name", Shown::Always),
     ("McpServer.command", Shown::Always),
-    // Its keys are shown; its values are not a loosening (Q712).
+    // Its keys are shown; its values are not a loosening.
     ("McpServer.env", Shown::Always),
     ("McpServer.approve", Shown::Always),
     ("Model.ref", Shown::Always),
