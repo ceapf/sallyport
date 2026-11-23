@@ -34,11 +34,12 @@ line per fact, with where it was found. Check a note again before relying on it 
   `memory.events` read all zero every time (`max 0`, `oom 0`, `oom_kill 0`). (scratch probe for
   #141, Nov 2026, kernel 6.18 WSL2)
 - The same figures from the test's own diagnostic line (`make loaded-repeat`, 23 Nov 2026, on
-  commit 9cf7989, measured as 36aee12 before its rebases onto dc5a0ac and f90d3b8; 32 cores,
-  54 GiB, kernel 6.18 WSL2, no other worktree testing), read later than the probe above: after the wait for the first `pids` entry, just before the no-memory-entry
-  assertion. 50 repeats of the bombs binary beside one `make test` pass, all loaded, all passed:
-  `memory.peak` min 14.8, median 47.7, max 64.0 MiB; `oom`, `oom_kill` and `oom_group_kill` 0
-  and `pids.peak` 64 in every run. `memory.peak` equalled the limit (67108864) in runs 27 and
+  PR #282's branch before its fixture change, so with `runtime.memory` 64 MiB; 32 cores,
+  54 GiB, kernel 6.18 WSL2, no other worktree testing), read later than the probe above: after
+  the wait for the first `pids` entry, just before the no-memory-entry assertion. 50 repeats of
+  the bombs binary beside one `make test` pass, all loaded, all passed: `memory.peak` min 14.8,
+  median 47.7, max 64.0 MiB; `oom`, `oom_kill` and `oom_group_kill` 0 and `pids.peak` 64 in
+  every run. `memory.peak` equalled the limit (67108864) in runs 27 and
   34; `memory.events` `max` was 4 in run 34 and 0 in every other run (from the run logs; the
   results lines of that run have no `max` column). Two single runs without load the same day:
   55.3 and 64.0 MiB, `max` 0. So the fork bomb's memory use reached `runtime.memory` in 2 of 50
@@ -55,9 +56,10 @@ line per fact, with where it was found. Check a note again before relying on it 
   64 MiB fixture the probe cannot go: the validator refuses `memory: 32MiB` ("32MiB is outside
   64MiB to 12GiB"), so a forced OOM kill of the fork bomb was not observed. (#141, 23 Nov 2026)
 - From PR #282 the fork-bomb test runs with `runtime.memory` 256 MiB (the maintainer's decision
-  on #141); the memory bomb and the `/tmp` filler keep 64 MiB. The first two bullets above
-  describe the fork bomb with 64 MiB, the fixture it had before; the third, a scratch edit at
-  256 MiB, ran it alone and unloaded. With 256 MiB in the committed test,
+  on #141); the memory bomb and the `/tmp` filler keep 64 MiB. The scratch-probe bullet and the
+  `make loaded-repeat` bullet above describe the fork bomb with 64 MiB, the fixture it had
+  before; the 256 MiB probe bullet, a scratch edit, ran it alone and unloaded. With 256 MiB in
+  the committed test,
   `make loaded-repeat LOADED_REPEATS=10` (23 Nov 2026; 32 cores, 54 GiB, kernel 6.18 WSL2, no
   other worktree testing): 10 loaded, 10 passed; `memory.peak` min 14.4, median 48.8, max
   57.4 MiB; `memory.events` `max`, `oom` and `oom_kill` 0 and `pids.peak` 64 in every run. (#141)
