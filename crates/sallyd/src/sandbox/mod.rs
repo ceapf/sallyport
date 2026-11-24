@@ -46,8 +46,9 @@ pub use inside::Mismatch;
 #[doc(hidden)]
 pub use inside::{Expect, check_in_container};
 pub use launch::{
-    AuditSink, Confirmed, HarnessRequest, InferenceRequest, LaunchError, Launcher, LauncherParts,
-    PinError, RoleRunning, RoleStopError, Running, SharedAudit, StopError, Sweep, WorkspaceRequest,
+    AuditSink, CLEANUP_TRIES, CleanupSchedule, Confirmed, HarnessRequest, InferenceRequest,
+    LaunchError, Launcher, LauncherParts, PinError, RoleRunning, RoleStopError, Running,
+    SharedAudit, StopError, Sweep, WorkspaceRequest,
 };
 pub use overlap::{Claim, Conflict, HarnessClaimError, ReserveError, Sessions, claims};
 pub use podman::{PODMAN_PATH_VAR, Podman, PodmanError, PodmanHost};

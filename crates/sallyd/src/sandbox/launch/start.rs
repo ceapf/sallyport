@@ -34,7 +34,7 @@ use sally_core::manifest::{AuditLevel, ValidatedManifest};
 use serde_json::Value;
 
 use super::error::{cpu_only, running_as};
-use super::parts::{HostPin, Subject};
+use super::parts::{CleanupTries, HostPin, Made, Subject, containers_gone};
 use super::{
     HarnessRequest, InferenceRequest, LaunchError, Launcher, Progress, Running, START_GRACE,
     WorkspaceRequest, blocking,
@@ -184,7 +184,27 @@ pub(super) enum Launched {
     Role(RoleRunning),
 }
 
+/// What a failed launch holds until its cleanup ends (its claim; a workspace's forms too), and
+/// how its entries name it: owned, so a cleanup retried in its own task outlives the request.
+#[derive(Debug)]
+pub(super) struct Held {
+    /// Who the launch was for.
+    pub(super) subject: Subject,
+    /// Its role.
+    pub(super) role: Role,
+    /// Its session's (or instance's) audit level.
+    pub(super) level: AuditLevel,
+}
+
 impl Request {
+    fn held(&self) -> Held {
+        Held {
+            subject: self.subject(),
+            role: self.role(),
+            level: self.level(),
+        }
+    }
+
     fn subject(&self) -> Subject {
         match self {
             Self::Workspace(r) => Subject::Session(r.paths.id().clone()),
@@ -253,36 +273,27 @@ impl Launcher {
     /// until the container is gone. What the request itself made is then cleaned up as after
     /// any failed launch (its directories, then its claim), and the launch is refused
     /// `internal`.
-    pub(super) async fn wrong_handle(&self, req: &Request) -> LaunchError {
+    pub(super) async fn wrong_handle(self: &Arc<Self>, req: &Request) -> LaunchError {
         let owned = req.owned();
         let progress = Progress {
             dirs: owned.clone(),
             owned,
             ..Progress::default()
         };
-        let cleanup = self.clean_failed(&progress).await;
-        let outcome = match &cleanup {
-            Ok(()) => "stopped, removed".to_owned(),
-            Err(c) => format!("stopped, incomplete, kept: {c}"),
-        };
-        if cleanup.is_ok() {
-            self.unclaim(req);
-        }
         let e = LaunchError::Internal("the launch made another role's handle".into());
-        let refused = self
-            .refused(&req.subject(), req.role(), e, req.level(), outcome)
-            .await;
-        self.forget(req).await;
-        refused
+        self.failed(req, progress, e, "stopped, ").await
     }
 
     /// The one launch path (architect Q129). Every `Err` it returns went through `refused()`:
     /// audited, or `Unaudited` (architect Q98).
-    pub(super) async fn launch_role(&self, req: &Request) -> Result<Launched, LaunchError> {
-        let (subject, role, level) = (req.subject(), req.role(), req.level());
+    pub(super) async fn launch_role(
+        self: &Arc<Self>,
+        req: &Request,
+    ) -> Result<Launched, LaunchError> {
         let image = match self.admit(req).await {
             Ok(i) => i,
             Err(e) => {
+                let (subject, role, level) = (req.subject(), req.role(), req.level());
                 return Err(self
                     .refused(&subject, role, e, level, "nothing to clean up".into())
                     .await);
@@ -294,28 +305,76 @@ impl Launcher {
         };
         match self.prepare_and_start(req, &image, &mut progress).await {
             Ok(l) => Ok(l),
-            Err(e) => {
-                let cleanup = self.clean_failed(&progress).await;
-                let outcome = match &cleanup {
-                    Ok(()) => "removed".to_owned(),
-                    Err(c) => format!("incomplete, kept: {c}"),
-                };
-                if cleanup.is_ok() {
-                    self.unclaim(req);
-                }
-                let refused = self.refused(&subject, role, e, level, outcome).await;
-                self.forget(req).await;
-                Err(refused)
-            }
+            Err(e) => Err(self.failed(req, progress, e, "").await),
         }
     }
 
-    /// After a refused workspace's `sandbox.refuse`, its last entry: its secrets leave the logs'
+    /// A failed launch (or one that made another role's handle): its cleanup, then
+    /// `sandbox.refuse` naming the cleanup's outcome after `stopped` (`""`, or `"stopped, "`
+    /// when the caller stopped a handle first). When the cleanup removed everything the claim
+    /// is freed before the entry and the forms released after it. Otherwise the rest of the
+    /// cleanup goes on in its own task on the daemon's crash reporter, backed off and capped
+    /// (`finish_failed`): the session stays live, its claim held, while a container may exist
+    /// (ARCHITECTURE §3.5, RT-AG-08b). Its id is among [`Launcher::unfinished_cleanups`] from
+    /// before the first try until its probe and container are confirmed gone.
+    async fn failed(
+        self: &Arc<Self>,
+        req: &Request,
+        mut progress: Progress,
+        e: LaunchError,
+        stopped: &str,
+    ) -> LaunchError {
+        let held = req.held();
+        let made = Made {
+            probe: progress.probe.clone(),
+            container: progress.container.clone(),
+        };
+        let id = held.subject.id().as_str().to_owned();
+        self.cleanup_begins(held.role, &id);
+        let cleanup = self.clean_failed(&mut progress).await;
+        let gone = containers_gone(progress.probe.as_deref(), progress.container.as_deref());
+        if gone {
+            self.cleanup_confirmed(held.role, &id);
+        }
+        let outcome = match &cleanup {
+            Ok(()) => format!("{stopped}removed"),
+            Err(c) => format!("{stopped}incomplete, kept: {c}"),
+        };
+        if cleanup.is_ok() {
+            self.unclaim(&held);
+        }
+        let refused = self
+            .refused(&held.subject, held.role, e, held.level, outcome)
+            .await;
+        match cleanup {
+            Ok(()) => self.forget(&held).await,
+            Err(first) => {
+                let mut tries = CleanupTries::start(self.cleanup);
+                // The first try failed, so with nine pauses to come it never ends the cleanup
+                // here; `finish_failed` acts on whatever it says.
+                let next = tries.record(gone, false);
+                // A workspace's task is bounded by the session limit (it keeps its claim), a
+                // harness's by one per session, and each by its cap. TODO(#134): an inference
+                // instance has no claim, so nothing bounds how many run at once once its launch
+                // is reachable.
+                // Never aborted: the task ends at its cap, and shutdown waits for none.
+                let this = Arc::clone(self);
+                self.crash.spawn("sandbox.cleanup", async move {
+                    this.finish_failed(held, made, progress, tries, next, first)
+                        .await;
+                });
+            }
+        }
+        refused
+    }
+
+    /// After a refused workspace's last entry (`sandbox.refuse`, or `sandbox.cleaned` or
+    /// `sandbox.cleanup_abandoned` after a retried cleanup), its secrets leave the logs'
     /// redactors (architect Q219). A harness shares its session's id, so only a workspace
-    /// request releases them.
-    async fn forget(&self, req: &Request) {
-        if let Request::Workspace(r) = req {
-            self.release_secrets(r.paths.id().as_str()).await;
+    /// releases them.
+    pub(super) async fn forget(&self, held: &Held) {
+        if held.role == Role::Workspace {
+            self.release_secrets(held.subject.id().as_str()).await;
         }
     }
 
@@ -332,12 +391,13 @@ impl Launcher {
     }
 
     /// Frees what [`Self::admit`] claimed, once a failed launch's cleanup removed everything.
-    fn unclaim(&self, req: &Request) {
-        match req {
-            Request::Workspace(r) => self.sessions.release(r.paths.id().as_str()),
-            Request::Harness(r) => self.sessions.free_harness(r.paths.id().as_str()),
-            // Its fresh directories were its claim, and the cleanup removed them.
-            Request::Inference(..) => {}
+    pub(super) fn unclaim(&self, held: &Held) {
+        let id = held.subject.id().as_str();
+        match held.role {
+            Role::Workspace => self.sessions.release(id),
+            Role::Harness => self.sessions.free_harness(id),
+            // Its fresh directories were its claim, and the cleanup removed or gave them up.
+            Role::Inference => {}
         }
     }
 

@@ -14,12 +14,15 @@
 //!
 //! Shutdown (SIGTERM, SIGINT, SIGHUP, SIGQUIT, or a panic in a task that is not a session's;
 //! a signal that arrives during startup is handled once it is done): `control.sock` is closed
-//! first, then every session is stopped `shutdown`, all at once. A container not confirmed gone,
-//! or a panic, makes `sallyd` exit non-zero; so does a second signal during the shutdown, at
-//! once. A session's workspace or harness container that `sallyd` cannot stop because it was
-//! killed outright is bounded by conmon's `--timeout` backstop (#92, architect Q60): it ends
-//! `runtime.timeout` + 300 s after its `podman init`; the next start's orphan sweep removes the
-//! workspace and harness containers and probes still left. An inference container has no
+//! first, then every session is stopped `shutdown`, all at once, and then the launcher is asked
+//! once which failed launches have a container not confirmed gone (a cleanup still retrying, or
+//! one abandoned at its cap); shutdown waits for none of them. A container not confirmed gone,
+//! a session's or a failed launch's, or a panic, makes `sallyd` exit non-zero; so does a second
+//! signal during the shutdown, at once. A session's workspace or harness container that
+//! `sallyd` cannot stop because it was killed outright is bounded by conmon's `--timeout`
+//! backstop (#92, architect Q60): it ends `runtime.timeout` + 300 s after its `podman init`;
+//! the next start's orphan sweep removes the workspace and harness containers and probes
+//! still left. An inference container has no
 //! backstop and no sweep yet, and step 4 removes only `sessions/` and `control.sock`, so the
 //! container, its probe and `infer/<id>` (under both the runtime and the data directory) stay
 //! until removed by hand (TODO(#134)).
@@ -45,10 +48,10 @@ use crate::oplog::Oplog;
 use crate::rpc::control::{Control, ControlParts};
 use crate::rpc::record::Recorder;
 use crate::sandbox::{
-    AuditSink, CheckedRuntime, DirError, DiskFloor, Installation, LaunchError, Launcher,
-    LauncherParts, PODMAN_PATH_VAR, Podman, PodmanError, PodmanHost, ProbeError, ScanLimits,
-    Sessions, SharedAudit, Sweep, UserIds, VERSION_TIMEOUT, check_runtime_dir, open_sessions,
-    outside_system_rule, probe_version, resolve_podman, version_error,
+    AuditSink, CheckedRuntime, CleanupSchedule, DirError, DiskFloor, Installation, LaunchError,
+    Launcher, LauncherParts, PODMAN_PATH_VAR, Podman, PodmanError, PodmanHost, ProbeError,
+    ScanLimits, Sessions, SharedAudit, Sweep, UserIds, VERSION_TIMEOUT, check_runtime_dir,
+    open_sessions, outside_system_rule, probe_version, resolve_podman, version_error,
 };
 use crate::session::lookup::SharedEgress;
 use crate::session::secrets::Redactors;
@@ -118,7 +121,7 @@ pub enum DaemonError {
         /// The task.
         task: &'static str,
     },
-    /// Sessions whose containers could not be confirmed gone at shutdown.
+    /// Sessions, or failed launches, whose containers could not be confirmed gone at shutdown.
     #[error("containers of sessions {0:?} could not be confirmed gone")]
     Unconfirmed(Vec<String>),
     /// A second signal arrived while sessions were being stopped.
@@ -318,6 +321,9 @@ async fn serve(
         gid: rustix::process::getegid().as_raw(),
     };
     let (podman, runtime) = podman(log, dirs, config).await?;
+    // Before the launcher, which spawns a failed launch's retried cleanup on it; its reports
+    // wait in the channel until the select below reads them.
+    let (crash, mut crashes) = CrashReporter::channel();
     let launcher = Launcher::new(LauncherParts {
         podman: podman.clone(),
         runtime,
@@ -340,6 +346,8 @@ async fn serve(
         redactors,
         oplog: log.clone(),
         installation,
+        crash: crash.clone(),
+        cleanup: CleanupSchedule::PRODUCTION,
     });
     let removed = launcher
         .remove_orphans("", Sweep::Startup)
@@ -359,7 +367,6 @@ async fn serve(
             source: std::io::Error::other(super::crash::join_text(&e)),
         })?
         .map_err(io("removing stale sockets"))?;
-    let (crash, mut crashes) = CrashReporter::channel();
     // The one approver: every session's desk tells it, control watchers hear it (Q73).
     let hub = Arc::new(Hub::default());
     let registry = Registry::new(RegistryParts {
@@ -392,7 +399,12 @@ async fn serve(
     log.info(LOG, "serving", &[("socket", CONTROL_SOCK)]);
     let sweeping = crash.spawn(
         "sweep",
-        sweep::every(launcher, String::new(), sweep::ORPHAN_SWEEP, log.clone()),
+        sweep::every(
+            Arc::clone(&launcher),
+            String::new(),
+            sweep::ORPHAN_SWEEP,
+            log.clone(),
+        ),
     );
 
     let crashed = tokio::select! {
@@ -424,7 +436,21 @@ async fn serve(
             "containers not confirmed gone",
             &[("sessions", &unconfirmed.join(","))],
         );
-        return Err(DaemonError::Unconfirmed(unconfirmed));
+    }
+    // One look, after the sessions' stops: a failed launch's cleanup still retrying, or
+    // abandoned at its cap, may have left a container. Nothing waits for it (#239).
+    let cleanups = launcher.unfinished_cleanups();
+    if !cleanups.is_empty() {
+        log.error(
+            LOG,
+            "failed launches' containers not confirmed gone",
+            // Session ids, or an inference instance's once one can be launched (#134).
+            &[("ids", &cleanups.join(","))],
+        );
+    }
+    let unclean = super::not_stopped_cleanly(unconfirmed, cleanups);
+    if !unclean.is_empty() {
+        return Err(DaemonError::Unconfirmed(unclean));
     }
     match crashed {
         Some(c) => Err(DaemonError::Crash { task: c.task }),
@@ -563,6 +589,18 @@ mod tests {
         // The hint spells the label as a literal: it must be the label the launcher sets.
         let filter = format!("label={}=<id>", crate::sandbox::INSTALLATION_LABEL);
         assert!(e.to_string().contains(&filter), "{e}");
+        // A sweep that could not remove every orphan keeps the same hint.
+        let e = DaemonError::Orphans(LaunchError::Command {
+            verb: "rm",
+            msg: "1 of 2 orphaned containers not removed; first: sp-ws-a".into(),
+        });
+        assert_eq!(
+            e.to_string(),
+            "removing orphaned containers: podman rm: 1 of 2 orphaned containers not removed; \
+             first: sp-ws-a (list them with `podman ps --all --filter \
+             label=sallyport.installation=<id>`; the id is the `installation` file in sallyd's \
+             state directory)"
+        );
     }
 
     fn scratch(name: &str) -> PathBuf {

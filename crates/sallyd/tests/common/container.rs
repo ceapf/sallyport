@@ -12,10 +12,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use sally_core::audit::{AuditError, NewEntry};
 use sally_core::manifest::{AuditLevel, ValidatedManifest};
 use sallyd::sandbox::{
-    AuditSink, CheckedRuntime, CommonArgs, DiskFloor, HarnessRequest, ImageRef, InferenceRequest,
-    Installation, InstancePaths, LaunchError, Launcher, LauncherParts, Podman, PodmanHost, Running,
-    ScanLimits, SessionDirs, SessionId, SessionPaths, Sessions, UserIds, VerifiedModel,
-    WorkspaceRequest, resolve_podman,
+    AuditSink, CheckedRuntime, CleanupSchedule, CommonArgs, DiskFloor, HarnessRequest, ImageRef,
+    InferenceRequest, Installation, InstancePaths, LaunchError, Launcher, LauncherParts, Podman,
+    PodmanHost, Running, ScanLimits, SessionDirs, SessionId, SessionPaths, Sessions, UserIds,
+    VerifiedModel, WorkspaceRequest, resolve_podman,
 };
 
 use sallyd::session::{Registry, RegistryParts};
@@ -507,6 +507,9 @@ pub struct Lx {
     pub scope: String,
     /// This fixture's installation id: the label of every container its launcher creates.
     pub installation: Installation,
+    /// The launcher's crash receiver: a panic in a task it spawns (a failed launch's retried
+    /// cleanup) is read here ([`Lx::assert_no_crash`]), as `sallyd` reads its own.
+    crashes: Mutex<sallyd::daemon::crash::CrashReceiver>,
     /// The shared I/O lock ([`io_lock`]); released after `Drop` has removed the containers.
     _io: Option<std::fs::File>,
 }
@@ -545,6 +548,25 @@ impl Lx {
         Self::with_home_and_podman(None, wrap)
     }
 
+    /// [`with_podman`](Self::with_podman), with `cleanup` as the failed-launch cleanup's
+    /// pauses in place of the production schedule, passed in as `sallyd` passes its own.
+    #[allow(dead_code)] // Only the cleanup tests shorten the schedule.
+    pub fn with_podman_and_cleanup(
+        wrap: impl FnOnce(&Path) -> PathBuf,
+        cleanup: CleanupSchedule,
+    ) -> Self {
+        let real = resolve_podman(None).unwrap().path().to_owned();
+        Self::build_as(
+            None,
+            None,
+            Some(wrap(&real)),
+            DiskFloor::default(),
+            Some(io_lock(false)),
+            None,
+            cleanup,
+        )
+    }
+
     /// [`with_podman`](Self::with_podman), and `podman_home` as the host `$HOME` hermetic podman
     /// is set up from (default: the real one).
     pub fn with_home_and_podman(
@@ -578,6 +600,24 @@ impl Lx {
             DiskFloor::default(),
             Some(io_lock(false)),
             Some(self.installation.clone()),
+            CleanupSchedule::PRODUCTION,
+        )
+    }
+
+    /// [`next_sallyd`](Self::next_sallyd) over a podman wrapper, as
+    /// [`with_podman`](Self::with_podman). Its `Drop` still removes leftovers through the real
+    /// podman, never the wrapper.
+    #[allow(dead_code)] // Only the orphan tests play a second sallyd over a wrapper.
+    pub fn next_sallyd_with_podman(&self, wrap: impl FnOnce(&Path) -> PathBuf) -> Self {
+        let real = resolve_podman(None).unwrap().path().to_owned();
+        Self::build_as(
+            None,
+            None,
+            Some(wrap(&real)),
+            DiskFloor::default(),
+            Some(io_lock(false)),
+            Some(self.installation.clone()),
+            CleanupSchedule::PRODUCTION,
         )
     }
 
@@ -588,7 +628,15 @@ impl Lx {
         floor: DiskFloor,
         io: Option<std::fs::File>,
     ) -> Self {
-        Self::build_as(podman_home, runtime, podman_bin, floor, io, None)
+        Self::build_as(
+            podman_home,
+            runtime,
+            podman_bin,
+            floor,
+            io,
+            None,
+            CleanupSchedule::PRODUCTION,
+        )
     }
 
     /// `installation`: `None` for a fresh one, so no two fixtures sweep each other's containers.
@@ -599,6 +647,7 @@ impl Lx {
         floor: DiskFloor,
         io: Option<std::fs::File>,
         installation: Option<Installation>,
+        cleanup: CleanupSchedule,
     ) -> Self {
         let installation =
             installation.unwrap_or_else(|| Installation::fresh().expect("an installation id"));
@@ -629,6 +678,7 @@ impl Lx {
             Arc::clone(&redacted) as Arc<dyn sallyd::session::secrets::RedactorTarget>,
             Arc::new(oplog.clone()) as Arc<dyn sallyd::session::secrets::RedactorTarget>,
         ]));
+        let (crash, crashes) = sallyd::daemon::crash::CrashReporter::channel();
         let launcher = Launcher::new(LauncherParts {
             podman: podman.clone(),
             runtime: runtime.clone(),
@@ -650,6 +700,8 @@ impl Lx {
             // launcher's lines too (`session.closed` not audited, for one).
             oplog: oplog.clone(),
             installation: installation.clone(),
+            crash,
+            cleanup,
         });
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -667,7 +719,22 @@ impl Lx {
             oplog_lines,
             scope: format!("t{}-{}-{n}", run_id(), std::process::id()),
             installation,
+            crashes: Mutex::new(crashes),
             _io: io,
+        }
+    }
+
+    /// Fails the test with the panic's task and text if a task the launcher spawned (a failed
+    /// launch's retried cleanup) has panicked, so a test waiting on that task fails at once
+    /// rather than at its bound. `Drop` checks it too.
+    pub fn assert_no_crash(&self) {
+        let got = self
+            .crashes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .try_recv();
+        if let Ok(c) = got {
+            panic!("task {} panicked: {}", c.task, c.payload);
         }
     }
 
@@ -1115,6 +1182,10 @@ impl Drop for Lx {
             }
         }
         let _ = podman(&["unshare", "rm", "-rf", "--", self.f.root.to_str().unwrap()]);
+        // A panic a test never waited on still fails it, after the cleanup above.
+        if !std::thread::panicking() {
+            self.assert_no_crash();
+        }
     }
 }
 

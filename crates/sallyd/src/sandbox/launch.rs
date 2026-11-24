@@ -29,6 +29,7 @@
 //! the directories this launch created, and keeps the session's overlap claims while a container
 //! might still exist.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -69,8 +70,8 @@ pub use error::{LaunchError, RoleStopError, StopError};
 pub(crate) use error::{stderr_text, stdout_text};
 pub use harness::HarnessRequest;
 pub use inference::InferenceRequest;
-pub use parts::PinError;
 use parts::Subject;
+pub use parts::{CLEANUP_TRIES, CleanupSchedule, PinError};
 pub use start::RoleRunning;
 use start::{Extra, Launched, Prepared, Recheck, Request};
 pub use teardown::Sweep;
@@ -281,6 +282,13 @@ pub struct LauncherParts {
     /// This installation's id (`daemon::install`): the label of every container this launcher
     /// creates, and the only one its orphan sweeps remove (Q64).
     pub installation: Installation,
+    /// The daemon's crash reporter: a failed launch whose cleanup is retried in its own task
+    /// reports a panic there, which stops the daemon. Not a session's: a refused session has no
+    /// reporter left.
+    pub crash: CrashReporter,
+    /// The pauses of a failed launch's cleanup retries: `sallyd` passes
+    /// [`CleanupSchedule::PRODUCTION`].
+    pub cleanup: CleanupSchedule,
 }
 
 /// Launches and tears down sandboxes for one `sallyd`. Shared as `Arc<Launcher>`.
@@ -298,6 +306,13 @@ pub struct Launcher {
     redactors: Arc<Redactors>,
     oplog: Oplog,
     pub(super) installation: Installation,
+    crash: CrashReporter,
+    cleanup: CleanupSchedule,
+    /// The failed launches, by role and id (a workspace and a harness share their session's
+    /// id), whose probe or container is not yet confirmed gone: in before the first cleanup
+    /// try, out only once both are confirmed gone, never at the cleanup's cap. Shutdown reads
+    /// it ([`Self::unfinished_cleanups`]) and waits for none.
+    unfinished: Mutex<BTreeSet<(&'static str, String)>>,
     /// One stage walk at a time across all sessions, so a sandbox with a huge or deep tree
     /// cannot multiply `sallyd`'s open fds or blocking threads (6c-1 review M2/M3).
     pub(super) walks: Arc<tokio::sync::Semaphore>,
@@ -343,10 +358,42 @@ impl Launcher {
             redactors: p.redactors,
             oplog: p.oplog,
             installation: p.installation,
+            crash: p.crash,
+            cleanup: p.cleanup,
+            unfinished: Mutex::new(BTreeSet::new()),
             walks: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
 
+    /// The ids of failed launches whose mount-link probe or container is not confirmed gone
+    /// now: a cleanup still retrying, or one abandoned at its cap. Sorted. Shutdown reports
+    /// these as not stopped cleanly, without waiting for any (THREAT_MODEL #239 row).
+    #[must_use]
+    pub fn unfinished_cleanups(&self) -> Vec<String> {
+        let ids: BTreeSet<String> = lock(&self.unfinished)
+            .iter()
+            .map(|(_, id)| id.clone())
+            .collect();
+        ids.into_iter().collect()
+    }
+
+    /// A failed `role` launch's cleanup begins: `id` may leave a container behind.
+    fn cleanup_begins(&self, role: Role, id: &str) {
+        lock(&self.unfinished).insert((role.as_str(), id.to_owned()));
+    }
+
+    /// A failed `role` launch's probe and container are confirmed gone.
+    fn cleanup_confirmed(&self, role: Role, id: &str) {
+        lock(&self.unfinished).remove(&(role.as_str(), id.to_owned()));
+    }
+}
+
+/// A set guarded by a mutex, poisoned or not: a panic elsewhere must not hide what is left.
+fn lock<V>(m: &Mutex<V>) -> std::sync::MutexGuard<'_, V> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl Launcher {
     /// The session's last entry, `session.closed {reason}`, written once its teardown has
     /// finished, which `done` proves (#94, architect Q242, Q245, Q252). Then its secrets leave
     /// the logs' redactors (Q219). The registry calls it once per `Running` it received; a
@@ -365,9 +412,10 @@ impl Launcher {
     }
 
     /// Drops session `id`'s secrets from the logs' redactors, once its last entry is written:
-    /// after `sandbox.refuse` for a refused launch, after `session.closed` ([`Self::close`])
-    /// for a session (architect Q219). Safe to call more than once. Off the runtime: the swap
-    /// takes the audit writer's lock, which an append holds through its fsync.
+    /// after `sandbox.refuse` for a refused launch (after `sandbox.cleaned` or
+    /// `sandbox.cleanup_abandoned` when its cleanup was retried), after `session.closed`
+    /// ([`Self::close`]) for a session (architect Q219). Safe to call more than once. Off the
+    /// runtime: the swap takes the audit writer's lock, which an append holds through its fsync.
     async fn release_secrets(&self, id: &str) {
         let redactors = Arc::clone(&self.redactors);
         let owned = id.to_owned();
