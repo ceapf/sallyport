@@ -259,7 +259,7 @@ issues, comments and CI output.
 
 **Task:** failing test written first → passes; `make lint test` green; no new `unsafe`, no new deps without `cargo deny` pass; enforcement points touched have allow+deny tests; relevant RT tests pass locally; review subagent(s) per routing table ran and findings are fixed or explicitly deferred with a TODO(issue#); docs touched if behavior changed; `/save-session`.
 
-**Milestone:** all tasks done; `make redteam` green in CI; `/security-scan` clean or triaged; `/code-review` on the milestone diff; `docs/reports/M<n>.md` written (what shipped, invariants exercised, RT table, open risks, verify-list results); **stop and wait for the maintainer's review** — do not start the next milestone.
+**Milestone:** all tasks done; `make redteam` green in CI; a whole-milestone review pass (it stands in for `/code-review`, which reviews only local changes or one PR); `docs/reports/M<n>.md` written (what shipped, invariants exercised, RT table, open risks, verify-list results); **stop and wait for the maintainer's review** — do not start the next milestone.
 
 ## Conventions
 
