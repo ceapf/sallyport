@@ -100,7 +100,9 @@ struct Lines {
 }
 
 impl Lines {
-    fn new(columns: Option<usize>) -> Self {
+    /// Lines for a screen of `columns` (`None`: not a terminal, rows left whole). Not named `new`:
+    /// it holds logic, and cargo-mutants skips functions named `new` (CLAUDE.md).
+    fn on(columns: Option<usize>) -> Self {
         Self {
             text: String::new(),
             rows: 0,
@@ -154,7 +156,7 @@ impl Lines {
 #[must_use]
 pub fn layout(p: &Prompt, size: Option<Size>) -> Layout {
     let (screen, refusal) = size.map_or(((usize::MAX, usize::MAX), None), screen);
-    let mut l = Lines::new(size.map(|_| screen.0));
+    let mut l = Lines::on(size.map(|_| screen.0));
     l.own("");
     header(&mut l, p, "");
     if let Some(why) = refusal {
@@ -216,10 +218,10 @@ pub fn again(p: &Prompt, size: Size) -> Layout {
 }
 
 fn again_on(p: &Prompt, (columns, rows): (usize, usize)) -> Layout {
-    let mut fixed = Lines::new(Some(columns));
+    let mut fixed = Lines::on(Some(columns));
     header(&mut fixed, p, ": the start of its action again");
     footer(&mut fixed, p);
-    let mut action = Lines::new(Some(columns));
+    let mut action = Lines::on(Some(columns));
     action.guttered(&p.action);
     // The question's row, and the line naming what is left out when not all of it fits.
     let room = rows.saturating_sub(fixed.rows).saturating_sub(1);
@@ -229,7 +231,7 @@ fn again_on(p: &Prompt, (columns, rows): (usize, usize)) -> Layout {
         let head = room.saturating_sub(1);
         (head, action.rows.saturating_sub(head))
     };
-    let mut l = Lines::new(Some(columns));
+    let mut l = Lines::on(Some(columns));
     header(&mut l, p, ": the start of its action again");
     for row in action.text.lines().take(head) {
         l.text.push_str(row);
