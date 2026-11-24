@@ -1085,6 +1085,15 @@ impl Lx {
                 let at = only_flag(&argv, "--no-healthcheck", "--no-healthcheck");
                 argv.remove(at);
             }
+            LeaveOut::Nofile => {
+                let at = ulimit_at(&argv, "nofile=");
+                assert_eq!(
+                    argv[at + 1],
+                    "nofile=512:512",
+                    "the product descriptor limit"
+                );
+                argv.drain(at..at + 2);
+            }
             LeaveOut::Probe => {}
         }
         argv
@@ -1142,6 +1151,9 @@ pub enum LeaveOut<'a> {
     /// Disabled image health checks: `--no-healthcheck` is removed, so the image's health check
     /// applies.
     Healthcheck,
+    /// The descriptor limit: `--ulimit nofile=512:512` is removed, so podman's inherited limit
+    /// applies.
+    Nofile,
     /// The mount-link probe (security review): the argv is unedited. Running it outside the
     /// launcher leaves out every launcher-side check, and of those only the probe runs before
     /// `init`, so it is the one defence left out of what the runtime does at `init`.
@@ -1160,6 +1172,18 @@ fn only_flag(argv: &[String], flag: &str, token: &str) -> usize {
         .collect();
     assert_eq!(at.len(), 1, "exactly one {flag} in {argv:?}");
     assert_eq!(argv[at[0]], token, "{flag} is {token}");
+    at[0]
+}
+
+/// Where the one `--ulimit` whose value starts with `kind` (`nofile=`) is in `argv`.
+fn ulimit_at(argv: &[String], kind: &str) -> usize {
+    let at: Vec<usize> = argv
+        .windows(2)
+        .enumerate()
+        .filter(|(_, w)| w[0] == "--ulimit" && w[1].starts_with(kind))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(at.len(), 1, "exactly one --ulimit {kind}… in {argv:?}");
     at[0]
 }
 
