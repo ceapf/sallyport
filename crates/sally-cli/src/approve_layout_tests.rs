@@ -261,6 +261,87 @@ fn fewer_than_4_rows_of_the_action_start_is_deny_only() {
     assert!(cut.deny_only, "{}", cut.shown);
 }
 
+/// At 80x24 a prompt of 19 action rows (23 rows and the question) fits; one of 20 does not, and
+/// ends with the again-block.
+#[test]
+fn the_again_block_follows_from_the_first_row_too_many() {
+    const AGAIN: &str = "the start of its action again";
+    let fits = layout(&plain(&text(19 * 75)), Some(SCREEN));
+    assert_eq!(fits.shown.lines().count(), 23, "{}", fits.shown);
+    assert!(!fits.shown.contains(AGAIN), "{}", fits.shown);
+    let over = layout(&plain(&text(20 * 75)), Some(SCREEN));
+    assert!(over.shown.contains(AGAIN), "{}", over.shown);
+}
+
+/// A tall prompt whose again-block cannot hold four rows of the action is deny-only, though its
+/// own first rows were fine.
+#[test]
+fn a_tall_prompt_whose_again_block_is_too_short_is_deny_only() {
+    let p = plain(&text(40 * 75));
+    assert!(layout(&p, Some(size(80, 6))).deny_only);
+    assert!(!layout(&p, Some(size(80, 8))).deny_only, "control");
+}
+
+/// Two dirty fields leave the prompt dirty (they do not cancel out), and the again-block says
+/// so too.
+#[test]
+fn two_dirty_fields_keep_the_prompt_dirty() {
+    let mut p = plain("run [\"\x1b\"]");
+    p.note = Some("\x07".to_owned());
+    let l = layout(&p, Some(SCREEN));
+    assert!(l.dirty && l.deny_only);
+    let a = again(&p, SCREEN);
+    assert!(a.dirty && a.deny_only);
+    let clean = again(&plain("run [\"ls\"]"), SCREEN);
+    assert!(!clean.dirty && !clean.deny_only, "control");
+}
+
+/// A cut prompt's again-block says the full action is above it and how many rows it took, or
+/// that it could not be shown; the line counts toward the block's rows.
+#[test]
+fn a_cut_prompts_again_block_says_where_its_full_text_is() {
+    let mut p = plain(&text(100 * 75));
+    p.truncated = true;
+    p.full = Some(text(300 * 75));
+    let a = again(&p, SCREEN);
+    assert!(
+        a.shown
+            .contains("  (cut: the full action, 300 rows, is shown above)\n"),
+        "{}",
+        a.shown
+    );
+    assert_eq!(guttered(&a.shown).len(), 19, "{}", a.shown);
+    assert_eq!(a.shown.lines().count(), 24 - 1);
+    p.full_unavailable = true;
+    let a = again(&p, SCREEN);
+    assert!(
+        a.shown
+            .contains("  (cut: the full action is too long to show)\n"),
+        "{}",
+        a.shown
+    );
+    assert!(
+        !again(&plain(&text(100 * 75)), SCREEN)
+            .shown
+            .contains("(cut:")
+    );
+}
+
+/// A line of the CLI's own is counted as the rows it wraps to on a terminal that wraps on its
+/// last column: 79 characters at 80 columns take one row, 80 take two.
+#[test]
+fn an_own_line_is_counted_as_the_rows_it_wraps_to() {
+    let rows = |session: usize| {
+        let mut p = plain(&text(100 * 75));
+        p.session = "s".repeat(session);
+        guttered(&again(&p, SCREEN).shown).len()
+    };
+    // "approval p1 (session " + session + ", call 3): the start of its action again"
+    let fixed = "approval p1 (session , call 3): the start of its action again".len();
+    assert_eq!(rows(79 - fixed), 20);
+    assert_eq!(rows(80 - fixed), 19);
+}
+
 /// A prompt taller than the screen ends with the again-block, so the action's start is on the
 /// last screen; one that fits does not repeat it.
 #[test]

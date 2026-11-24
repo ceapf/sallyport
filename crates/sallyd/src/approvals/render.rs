@@ -654,7 +654,12 @@ mod tests {
         );
         for (name, action, note) in payloads {
             let p = prompt(action, note.as_deref());
-            let text = laid_out(&p).shown;
+            let laid = laid_out(&p);
+            // The broker escaped every field itself: the CLI's clean-check finds nothing to
+            // escape again, so the escapes below are the broker's (a client that shows the
+            // fields as they come, as the M5 UI will, gets the same text).
+            assert!(!laid.dirty, "{name}: a field reached the client unescaped");
+            let text = laid.shown;
             // One logical line per field: no raw control character survives.
             assert!(!text.chars().any(|c| c.is_control() && c != '\n'), "{name}");
             // All ASCII, the cut's tail included (architect Q74: a client's clean-check passes it).
@@ -782,6 +787,10 @@ mod tests {
                 "{name}: approvable, and the last screen before the question does not hold the \
                  command: ...{tail}"
             );
+            if name == "over the wire cap" {
+                // Its own defence: a full text the wire cannot carry can only be denied.
+                assert!(!approvable, "{name}: approvable");
+            }
             if name == "no run" {
                 // Its own defence: the start of the action is printed again above the question.
                 assert!(

@@ -595,18 +595,18 @@ impl<R: Runner> Core<R> {
         }
         let origin = json!({"tool": "fetch", "call": b.call});
         let cap = fetch::response_cap(f.max_response);
-        let send = fetch_client::send(
-            f.connector.as_ref(),
-            origin,
-            &u,
-            method,
-            headers,
-            body.bytes(),
-            cap,
-        );
         // The credentials shown and bound at the prompt are the ones the proxy adds now, or
         // nothing is sent (RT-AG-04).
         let got = if f.connector.grants(&u.host).names == *credentials {
+            let send = fetch_client::send(
+                f.connector.as_ref(),
+                origin,
+                &u,
+                method,
+                headers,
+                body.bytes(),
+                cap,
+            );
             // Q59: the session's stop ends the exchange at once; dropping it drops the
             // connection, whose end the proxy records itself (security re-review M1).
             tokio::select! {

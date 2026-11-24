@@ -103,8 +103,8 @@ approval ap-1 (session s-0001, call 3): the start of its action again
   | bababababababababababababababababababababababababababababababababababababab
   | abababababababababababababababababababababababababababababababababababababa
   | bababababababababababababababababababababababababababababababababababababab
-  | abababababababababababababababababababababababababababababababababababababa
-  (8 more rows of the action, shown above)
+  (9 more rows of the action, shown above)
+  (cut: the full action, 684 rows, is shown above)
   digest: 5faff2e5a94e386bd01bbbf748c1107f66f9f8976601ea9a848b3fba02974f9a
 
 == quote-break-out
@@ -172,6 +172,6 @@ approval ap-1 (session s-0001, call 3): the start of its action again
   | bababababababababababababababababababababababababababababababababababababab
   | abababababababababababababababababababababababababababababababababababababa
   | bababababababababababababababababababababababababababababababababababababab
-  | abababababababababababababababababababababababababababababababababababababa
-  (8 more rows of the action, shown above)
+  (9 more rows of the action, shown above)
+  (cut: the full action, 27 rows, is shown above)
   digest: 50303239333c5b5edcbf7928e18477971d495503dbc460738e5e69c0726e20e5

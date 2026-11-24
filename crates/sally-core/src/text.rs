@@ -120,19 +120,14 @@ fn marked_pieces(raw: &[u8]) -> impl Iterator<Item = Piece> + '_ {
 }
 
 /// `n` units of `unit`: one piece each when `n` is at most [`RUN_SHOWN_WHOLE`], else one marked
-/// piece.
-fn run_pieces(unit: Piece, n: usize) -> Vec<Piece> {
+/// piece. No collection: the last (or only) copy is the unit itself, moved.
+fn run_pieces(unit: Piece, n: usize) -> std::iter::RepeatN<Piece> {
     if n > RUN_SHOWN_WHOLE {
         let text = format!("{}\\{{{n}}}", unit.text);
         let input = unit.input.saturating_mul(n);
-        return vec![Piece { text, input }];
+        return std::iter::repeat_n(Piece { text, input }, 1);
     }
-    (0..n)
-        .map(|_| Piece {
-            text: unit.text.clone(),
-            input: unit.input,
-        })
-        .collect()
+    std::iter::repeat_n(unit, n)
 }
 
 /// A host path between double quotes, from its bytes: [`escape_backslash_quoted`], so a byte
@@ -454,21 +449,26 @@ fn unit_len(text: &str, i: usize) -> usize {
     let next = i.saturating_add(len);
     match text.get(next..) {
         Some(rest) if rest.starts_with("\\{") => {
-            len.saturating_add(rest.find('}').map_or(rest.len(), |e| e.saturating_add(1)))
+            braced_len(rest, LONGEST_MARK).map_or(len, |m| len.saturating_add(m))
         }
         _ => len,
     }
 }
 
-/// The length of the escape or the character of escaped `text` at byte `i` (at least 1).
+/// The length of the escape or the character of escaped `text` at byte `i` (at least 1). A run
+/// mark read on its own is at most [`LONGEST_MARK`] long.
 fn escape_len(text: &str, i: usize) -> usize {
     let bytes = text.as_bytes();
     match (bytes.get(i), bytes.get(i.saturating_add(1))) {
         (Some(b'\\'), Some(b'x')) => 4,
-        (Some(b'\\'), Some(b'u' | b'{')) => text
+        (Some(b'\\'), Some(b'u')) => text
             .get(i..)
             .and_then(|r| r.find('}'))
             .map_or(1, |e| e.saturating_add(1)),
+        (Some(b'\\'), Some(b'{')) => text
+            .get(i..)
+            .and_then(|r| braced_len(r, LONGEST_MARK))
+            .unwrap_or(2),
         (Some(b'\\'), Some(_)) => 2,
         // One whole character. A literal piece is meant to be printable ASCII but is never
         // escaped, so a stray character outside ASCII is not split here (a `\` just before it
@@ -504,7 +504,20 @@ pub fn escaped_rows(text: &str, width: usize) -> Vec<&str> {
 
 /// The longest unit [`escaped_rows`] keeps whole: `\u{10ffff}` and a run mark of the largest
 /// count, `\{18446744073709551615}`.
-pub const LONGEST_UNIT: usize = LONGEST_ESCAPE + 3 + 20;
+pub const LONGEST_UNIT: usize = LONGEST_ESCAPE + LONGEST_MARK;
+
+/// The longest run mark: `\{`, the 20 digits of `usize::MAX`, `}`.
+const LONGEST_MARK: usize = 3 + 20;
+
+/// The length of the run mark `\{…}` at the start of `rest`: up to its `}` when that is within
+/// `longest` bytes, else `None` (text the escaper does not write; the search stays bounded, so
+/// such text costs linear time and no mark makes a unit longer than [`LONGEST_UNIT`]).
+fn braced_len(rest: &str, longest: usize) -> Option<usize> {
+    rest.bytes()
+        .take(longest)
+        .position(|b| b == b'}')
+        .map(|e| e.saturating_add(1))
+}
 
 fn sha256_hex(data: &[u8]) -> String {
     let mut out = String::with_capacity(64);
@@ -581,6 +594,7 @@ fn capped(raw: &[u8], max: usize, quote: Quote) -> (String, bool) {
 }
 
 /// One unit of output: its escaped text and the input bytes it stands for.
+#[derive(Clone)]
 struct Piece {
     text: String,
     input: usize,

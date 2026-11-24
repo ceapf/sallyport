@@ -55,9 +55,9 @@ pub struct Size {
 pub const GUTTER: &str = "  | ";
 /// Below this many columns a prompt can only be denied: a guttered row must hold
 /// [`sally_core::text::LONGEST_UNIT`].
-pub const MIN_COLUMNS: usize = 40;
+pub(crate) const MIN_COLUMNS: usize = 40;
 /// Below this many rows of the action's start above the question, a prompt can only be denied.
-pub const MIN_HEAD_ROWS: usize = 4;
+pub(crate) const MIN_HEAD_ROWS: usize = 4;
 /// The screen a prompt is laid out on when the terminal's size is not known, or narrower than
 /// [`MIN_COLUMNS`]; such a prompt can only be denied.
 const FALLBACK: (usize, usize) = (80, 24);
@@ -95,7 +95,10 @@ struct Lines {
     rows: usize,
     /// Guttered rows break at this many characters; `None` leaves them whole.
     width: Option<usize>,
-    columns: usize,
+    /// Characters a screen row is counted to hold: one fewer than its columns, as a terminal
+    /// that wraps eagerly moves to the next row on the last column.
+    usable: usize,
+    /// A field failed the clean-check.
     dirty: bool,
 }
 
@@ -103,13 +106,19 @@ impl Lines {
     /// Lines for a screen of `columns` (`None`: not a terminal, rows left whole). Not named `new`:
     /// it holds logic, and cargo-mutants skips functions named `new` (CLAUDE.md).
     fn on(columns: Option<usize>) -> Self {
+        let usable = columns.map(|c| c.saturating_sub(1).max(1));
         Self {
             text: String::new(),
             rows: 0,
-            width: columns.map(|c| c.saturating_sub(1).saturating_sub(GUTTER.len())),
-            columns: columns.unwrap_or(usize::MAX),
+            width: usable.map(|u| u.saturating_sub(GUTTER.len())),
+            usable: usable.unwrap_or(usize::MAX),
             dirty: false,
         }
+    }
+
+    /// The screen rows `len` characters take, at least one.
+    fn rows_for(&self, len: usize) -> usize {
+        len.div_ceil(self.usable).max(1)
     }
 
     /// One of the CLI's lines, at the left edge; its sallyd-sent parts are checked by the
@@ -117,9 +126,7 @@ impl Lines {
     fn own(&mut self, line: &str) {
         self.text.push_str(line);
         self.text.push('\n');
-        self.rows = self
-            .rows
-            .saturating_add(line.len().div_ceil(self.columns).max(1));
+        self.rows = self.rows.saturating_add(self.rows_for(line.len()));
     }
 
     /// `field` from sallyd, checked: its escaped form when it fails the check.
@@ -129,14 +136,17 @@ impl Lines {
         c.text
     }
 
-    /// Request text, checked, in guttered rows.
+    /// Request text, checked, in guttered rows. Every unit sallyd writes, and every run mark
+    /// whatever text it is in, is at most `LONGEST_UNIT`, so at a usable width no row is wider
+    /// than the width; each row is still counted as the screen rows it takes.
     fn guttered(&mut self, field: &str) {
         let text = self.checked(field);
         for row in self.rows_of(&text) {
+            let rows = self.rows_for(GUTTER.len().saturating_add(row.len()));
             self.text.push_str(GUTTER);
             self.text.push_str(row);
             self.text.push('\n');
-            self.rows = self.rows.saturating_add(1);
+            self.rows = self.rows.saturating_add(rows);
         }
     }
 
@@ -206,7 +216,7 @@ pub fn layout(p: &Prompt, size: Option<Size>) -> Layout {
 /// how many rows of it are left out, the risk and the digest. Deny-only when fewer than
 /// [`MIN_HEAD_ROWS`] rows of the action fit (or all of a shorter one), or the size cannot be used.
 #[must_use]
-pub fn again(p: &Prompt, size: Size) -> Layout {
+pub(crate) fn again(p: &Prompt, size: Size) -> Layout {
     let (screen, refusal) = screen(size);
     let mut a = again_on(p, screen);
     if let Some(why) = refusal {
@@ -218,9 +228,10 @@ pub fn again(p: &Prompt, size: Size) -> Layout {
 }
 
 fn again_on(p: &Prompt, (columns, rows): (usize, usize)) -> Layout {
+    let cut = cut_line(p, columns);
     let mut fixed = Lines::on(Some(columns));
     header(&mut fixed, p, ": the start of its action again");
-    footer(&mut fixed, p);
+    tail(&mut fixed, p, cut.as_deref());
     let mut action = Lines::on(Some(columns));
     action.guttered(&p.action);
     // The question's row, and the line naming what is left out when not all of it fits.
@@ -240,13 +251,37 @@ fn again_on(p: &Prompt, (columns, rows): (usize, usize)) -> Layout {
     if left > 0 {
         l.own(&format!("  ({left} more rows of the action, shown above)"));
     }
-    footer(&mut l, p);
+    tail(&mut l, p, cut.as_deref());
     Layout {
         shown: l.text,
         deny_only: head < action.rows.min(MIN_HEAD_ROWS) || l.dirty || action.dirty,
         full_shown: false,
         dirty: l.dirty || action.dirty,
     }
+}
+
+/// For a cut prompt, the again-block's line saying where its full text is, and how long it is:
+/// the start shown again is of the cut action, and what the cut left out may matter most.
+fn cut_line(p: &Prompt, columns: usize) -> Option<String> {
+    if !p.truncated {
+        return None;
+    }
+    Some(match &p.full {
+        Some(full) if !p.full_unavailable => {
+            let mut f = Lines::on(Some(columns));
+            f.guttered(full);
+            format!("  (cut: the full action, {} rows, is shown above)", f.rows)
+        }
+        _ => "  (cut: the full action is too long to show)".to_owned(),
+    })
+}
+
+/// The again-block's lines after the action's rows: the cut line, if any, then [`footer`].
+fn tail(l: &mut Lines, p: &Prompt, cut: Option<&str>) {
+    if let Some(c) = cut {
+        l.own(c);
+    }
+    footer(l, p);
 }
 
 /// The approval's own line: its id, session and call, then `tail`.

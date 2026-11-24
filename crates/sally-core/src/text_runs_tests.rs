@@ -155,9 +155,11 @@ fn a_cut_never_parts_a_unit_from_its_mark() {
 }
 
 #[test]
-fn a_mark_with_no_close_runs_to_the_end() {
-    assert_eq!(unit_len(" \\{17", 0), 5);
+fn a_mark_with_no_close_is_not_part_of_the_unit() {
+    assert_eq!(unit_len(" \\{17", 0), 1);
+    assert_eq!(unit_len(" \\{17}", 0), 6);
     assert_eq!(escape_len("\\{17}x", 0), 5);
+    assert_eq!(escape_len("\\{17", 0), 2);
 }
 
 #[test]
@@ -178,6 +180,37 @@ fn rows_never_part_a_unit_and_put_together_are_the_text() {
     assert_eq!(escaped_rows("abc", 3), ["abc"]);
     // A unit longer than the width is a row of its own.
     assert_eq!(escaped_rows("a\\u{10ffff}b", 4), ["a", "\\u{10ffff}", "b"]);
+}
+
+/// A run mark the escaper never writes (its `}` far away or missing) makes no unit longer than
+/// [`LONGEST_UNIT`]: the mark is not joined to the unit before it, and `\{` read on its own is
+/// two bytes. Text with no `\{` is read as before.
+#[test]
+fn no_mark_makes_a_unit_longer_than_the_longest() {
+    let digits = "9".repeat(100);
+    let marked_far = format!("a\\{{{digits}}}");
+    let alone_far = format!("\\{{{digits}}}");
+    let open = format!("a\\{{{digits}");
+    for text in [
+        marked_far.as_str(),
+        alone_far.as_str(),
+        open.as_str(),
+        "\\{\\{\\{",
+    ] {
+        let rows = escaped_rows(text, LONGEST_UNIT);
+        assert_eq!(rows.concat(), text);
+        assert!(
+            rows.iter()
+                .all(|r| !r.is_empty() && r.len() <= LONGEST_UNIT),
+            "{rows:?}"
+        );
+    }
+    // The longest mark stays whole; one digit more is no longer part of the unit.
+    assert_eq!(unit_len("a\\{18446744073709551615}", 0), 1 + LONGEST_MARK);
+    assert_eq!(unit_len("a\\{184467440737095516150}", 0), 1);
+    assert_eq!(escape_len("\\{18446744073709551615}", 0), LONGEST_MARK);
+    assert_eq!(escape_len("\\{184467440737095516150}", 0), 2);
+    assert_eq!(LONGEST_MARK, "\\{18446744073709551615}".len());
 }
 
 #[test]

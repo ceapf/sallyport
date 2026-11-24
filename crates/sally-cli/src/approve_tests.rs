@@ -560,6 +560,9 @@ fn a_dirty_prompt_is_escaped_and_deny_only() {
     let r = run_with(&f, &["approve", "deny-all"], None);
     assert!(!r.shown.contains('\x1b'));
     assert!(r.shown.contains("\\x1b[2J"), "{}", r.shown);
+    // Approve is offered neither at first nor when the question is asked again.
+    assert!(!r.shown.contains("approve, deny"), "{}", r.shown);
+    assert_eq!(r.shown.matches("deny or deny-all? ").count(), 2);
     assert_eq!(f.decides()[0]["decision"], "deny_all_session");
 }
 
@@ -638,6 +641,25 @@ fn screen_rows(text: &str) -> Vec<String> {
     rows
 }
 
+/// `shown` as a terminal in canonical mode shows it: each answer in `typed` is echoed after the
+/// question it answers, with its newline, so the next output starts on a row of its own.
+fn echoed(shown: &str, typed: &[&str]) -> String {
+    let mut out = String::new();
+    let mut rest = shown;
+    for answer in typed {
+        let Some(at) = rest.find(DENY_QUESTION) else {
+            break;
+        };
+        let end = at + DENY_QUESTION.len();
+        out.push_str(&rest[..end]);
+        out.push_str(answer);
+        out.push('\n');
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// For every question `shown` asks: whether it offers approve, and whether `marker` is in the
 /// rows above it on the last screen (the question's own row is the screen's last).
 fn questions(shown: &str, marker: &str) -> Vec<(bool, bool)> {
@@ -685,9 +707,19 @@ fn rt_ag_04_a_padded_prompt_keeps_its_command_above_every_question() {
     let action = format!("run [\"{marker}\" \"w0 w1 w2\"]");
     let mut plain = prompt("p0");
     plain["action"] = json!(action);
+    // Three answers that are not answers: each question asked again must still have the command
+    // above it, with every typed line echoed (without the start printed again, the command
+    // scrolls off by the third).
+    let typed = ["maybe", "maybe", "maybe", "deny"];
     let f = daemon("padded-control", vec![plain], 1);
-    let r = run_with(&f, &["maybe", "deny"], None);
-    for (approvable, seen) in questions(&r.shown, marker) {
+    let r = run_with(&f, &typed, None);
+    let asked = questions(&echoed(&r.shown, &typed), marker);
+    assert_eq!(
+        asked.len(),
+        4,
+        "control: asked, then asked again three times"
+    );
+    for (approvable, seen) in asked {
         assert!(
             approvable && seen,
             "control: the unpadded twin:\n{}",
@@ -705,9 +737,9 @@ fn rt_ag_04_a_padded_prompt_keeps_its_command_above_every_question() {
     p["action"] = json!(format!("{cut}... (+{} bytes)", full.len() - cut.len()));
     p["full"] = json!(full);
     let f = daemon("padded", vec![p], 1);
-    let r = run_with(&f, &["maybe", "deny"], None);
-    let asked = questions(&r.shown, marker);
-    assert_eq!(asked.len(), 2, "asked, then asked again");
+    let r = run_with(&f, &typed, None);
+    let asked = questions(&echoed(&r.shown, &typed), marker);
+    assert_eq!(asked.len(), 4, "asked, then asked again three times");
     for (approvable, seen) in asked {
         let tail: String = r
             .shown
