@@ -435,11 +435,12 @@ fn every_role_starts_with_the_checked_runtime_and_has_the_section_6_1_flags() {
         }
         let pair = |x: &str, y: &str| a.windows(2).filter(|w| w[0] == x && w[1] == y).count();
         assert_eq!(pair("--ulimit", "core=0"), 1, "{a:?}");
-        // Descriptors in flight are counted per kernel user, shared with the host user under
-        // keep-id: every role's limit sits below host programs' usual soft 1024 (security
-        // review). The value is written out, not taken from the constant.
+        // Every role's open files, soft and hard (RT-AG-09; it does not bound descriptors in
+        // flight, #271), and no message queue, whose bytes count against the host account's
+        // allowance under keep-id. The values are written out, not taken from the constants.
         assert_eq!(pair("--ulimit", "nofile=512:512"), 1, "{a:?}");
-        assert_eq!(a.iter().filter(|x| *x == "--ulimit").count(), 2, "{a:?}");
+        assert_eq!(pair("--ulimit", "msgqueue=0:0"), 1, "{a:?}");
+        assert_eq!(a.iter().filter(|x| *x == "--ulimit").count(), 3, "{a:?}");
         assert_eq!(pair("--security-opt", "no-new-privileges"), 1, "{a:?}");
         // The launcher, not the image, chooses the working directory.
         assert_eq!(pair("--workdir", "/"), 1, "{a:?}");
@@ -605,6 +606,7 @@ fn every_option_value_all_roles_share_is_in_the_architecture_argv_blocks() {
     for (o, v) in [
         ("--ulimit", "core=0"),
         ("--ulimit", "nofile=512:512"),
+        ("--ulimit", "msgqueue=0:0"),
         ("--security-opt", "no-new-privileges"),
     ] {
         assert!(
@@ -1335,8 +1337,9 @@ fn without_pair(a: &[String], flag: &str, value: &str) -> Vec<String> {
     out
 }
 
-/// `--ulimit` is held per kind, like `--security-opt`: exactly `core=0` and `nofile=512:512`,
-/// each once, both required, nothing else (security review). Control: the builder's argv passes.
+/// `--ulimit` is held per kind, like `--security-opt`: exactly `core=0`, `nofile=512:512` and
+/// `msgqueue=0:0`, each once, all required, nothing else (security review; RT-AG-09). Control:
+/// the builder's argv passes.
 #[test]
 fn checker_holds_ulimit_to_core_zero_and_the_descriptor_limit() {
     let f = Fx::new();
@@ -1344,8 +1347,30 @@ fn checker_holds_ulimit_to_core_zero_and_the_descriptor_limit() {
     check_argv(&a, &allowed).unwrap();
     let no_nofile = without_pair(&a, "--ulimit", "nofile=512:512");
     let no_core = without_pair(&a, "--ulimit", "core=0");
+    let no_msgqueue = without_pair(&a, "--ulimit", "msgqueue=0:0");
     assert_forbidden(&no_nofile, &allowed, "nofile missing");
     assert_forbidden(&no_core, &allowed, "core missing");
+    assert_forbidden(&no_msgqueue, &allowed, "msgqueue missing");
+    assert_forbidden(
+        &with(&a, &["--ulimit", "msgqueue=0:0"]),
+        &allowed,
+        "msgqueue twice",
+    );
+    for bad in [
+        "msgqueue=1:1",
+        "msgqueue=0:1",
+        "msgqueue=1:0",
+        "msgqueue=0",
+        "msgqueue=819200:819200",
+        "msgqueue=unlimited",
+        "msgqueue=-1",
+    ] {
+        assert_forbidden(
+            &with(&no_msgqueue, &["--ulimit", bad]),
+            &allowed,
+            &format!("--ulimit {bad}"),
+        );
+    }
     assert_forbidden(
         &with(&a, &["--ulimit", "nofile=512:512"]),
         &allowed,

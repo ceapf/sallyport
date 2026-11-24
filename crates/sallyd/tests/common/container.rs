@@ -1094,6 +1094,15 @@ impl Lx {
                 );
                 argv.drain(at..at + 2);
             }
+            LeaveOut::Msgqueue => {
+                let at = ulimit_at(&argv, "msgqueue=");
+                assert_eq!(
+                    argv[at + 1],
+                    "msgqueue=0:0",
+                    "the product message-queue limit"
+                );
+                argv.drain(at..at + 2);
+            }
             LeaveOut::Probe => {}
         }
         argv
@@ -1154,6 +1163,9 @@ pub enum LeaveOut<'a> {
     /// The descriptor limit: `--ulimit nofile=512:512` is removed, so podman's inherited limit
     /// applies.
     Nofile,
+    /// The message-queue limit: `--ulimit msgqueue=0:0` is removed, so podman's inherited limit
+    /// applies.
+    Msgqueue,
     /// The mount-link probe (security review): the argv is unedited. Running it outside the
     /// launcher leaves out every launcher-side check, and of those only the probe runs before
     /// `init`, so it is the one defence left out of what the runtime does at `init`.

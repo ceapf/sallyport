@@ -1170,3 +1170,24 @@ fn rt_ag_09_the_descriptor_limit_holds_for_init_and_exec() {
         x.stop(r).await;
     });
 }
+
+/// RT-AG-09: a launched workspace creates no POSIX message queue. A queue's bytes are charged to
+/// the kernel user, which `--userns=keep-id` shares with the host account, so every role's limit
+/// is zero and `mq_open` is refused (EMFILE, 24), from a process `podman exec` starts. Control
+/// first: the product argv with the `msgqueue` pair left out creates one through the same probe.
+#[test]
+fn rt_ag_09_a_workspace_creates_no_message_queue() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let v =
+            x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "ro")]));
+        let control = x.control_workspace(&v, "ctl", LeaveOut::Msgqueue).await;
+        let (code, out) = exec_in(&control, &[PROBE, "mqueue"]);
+        assert_eq!((code, out.trim()), (0, "ok"), "control: {out}");
+
+        let r = x.launch(&v, "mqueue").await.unwrap();
+        let (code, out) = exec(&r, &format!("{PROBE} mqueue")).await;
+        assert_eq!((code, out.trim()), (1, "errno=24"), "{out}");
+        x.stop(r).await;
+    });
+}

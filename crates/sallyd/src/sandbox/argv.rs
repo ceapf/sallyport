@@ -21,7 +21,7 @@ use super::oci::intent::{Built, Intent, Probe, Wanted};
 use super::scan::{GitScan, LaunchScan};
 use super::types::{
     ArgvError, CommonArgs, INSTALLATION_LABEL, ImageRef, InferenceSpec, OverlayDirs, Role,
-    SessionPaths, WORKDIR, input, nofile_ulimit,
+    SessionPaths, WORKDIR, input, msgqueue_ulimit, nofile_ulimit,
 };
 
 /// The entry point baked into the workspace and harness images.
@@ -170,6 +170,8 @@ impl Argv {
         // AMENDMENTS-01 §6.1: never contact a registry, never inherit host proxies, keep no logs,
         // write no core files. The descriptor limit (`NOFILE_LIMIT`, RT-AG-09) caps each
         // process's open files, soft and hard; it does not bound descriptors in flight (#271).
+        // No POSIX message queue (`MSGQUEUE_LIMIT`, RT-AG-09): its bytes count against the host
+        // account's allowance under keep-id.
         a.push([
             "--pull=never",
             "--http-proxy=false",
@@ -178,6 +180,8 @@ impl Argv {
             "core=0",
             "--ulimit",
             &nofile_ulimit(),
+            "--ulimit",
+            &msgqueue_ulimit(),
         ]);
         a.push([
             "--network=none",

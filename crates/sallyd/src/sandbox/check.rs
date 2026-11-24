@@ -2,7 +2,8 @@
 //! role: every podman option must be one that role's builder emits, with a value of the exact
 //! expected shape, at most once unless it is a mount or an environment variable
 //! (`--security-opt` and `--ulimit`: at most once per kind); every hardening option must be
-//! present, `--ulimit` as exactly `core=0` and the descriptor limit; every `-v` source must be
+//! present, `--ulimit` as exactly `core=0`, the descriptor limit and the message-queue limit
+//! (RT-AG-09); every `-v` source must be
 //! a declared [`Source`] with a grant that covers the requested access; overlay scratch must lie
 //! in the session's scratch directory; the image must be digest-pinned; the command after the
 //! image must be the role's fixed command; and
@@ -21,7 +22,8 @@ use super::argv::{
 };
 use super::mount_probe::probe_prefix;
 use super::types::{
-    ArgvError, INSTALLATION_LABEL, ImageRef, Installation, Role, UserIds, WORKDIR, nofile_ulimit,
+    ArgvError, INSTALLATION_LABEL, ImageRef, Installation, Role, UserIds, WORKDIR, msgqueue_ulimit,
+    nofile_ulimit,
 };
 
 /// Options written `--flag value`, as two tokens; `--flag=value` is refused, so the argv has one
@@ -298,7 +300,7 @@ fn split_options(args: &[String]) -> Result<(Options, usize), ArgvError> {
 struct Seen {
     flags: Vec<String>,
     security: HashSet<String>,
-    /// The `--ulimit` kinds so far (`core`, `nofile`): each at most once.
+    /// The `--ulimit` kinds so far (`core`, `nofile`, `msgqueue`): each at most once.
     ulimit: HashSet<String>,
     dests: HashSet<String>,
     env: HashSet<String>,
@@ -361,8 +363,11 @@ fn check_option(
         ("--log-driver" | "--network", _) => fixed("none"),
         ("--cap-drop", _) => fixed("ALL"),
         ("--userns", _) => fixed("keep-id"),
-        // No core files; the descriptor limit (security review). Each kind once, in `note`.
-        ("--ulimit", Some(v)) => ok(v == "core=0" || v == nofile_ulimit()),
+        // No core files; the descriptor limit; no message queue (RT-AG-09). Each kind once, in
+        // `note`.
+        ("--ulimit", Some(v)) => {
+            ok(v == "core=0" || v == nofile_ulimit() || v == msgqueue_ulimit())
+        }
         ("--hostname", _) if a.role != Role::Inference => fixed("sandbox"),
         ("--user", _) => fixed(&format!("{}:{}", a.ids.uid, a.ids.gid)),
         ("--workdir", _) => fixed(WORKDIR),
@@ -615,7 +620,7 @@ fn require(seen: &Seen, role: Role) -> Result<(), ArgvError> {
             return forbid(format!("--security-opt {kind} is required"));
         }
     }
-    for kind in ["core", "nofile"] {
+    for kind in ["core", "nofile", "msgqueue"] {
         if !seen.ulimit.contains(kind) {
             return forbid(format!("--ulimit {kind} is required"));
         }

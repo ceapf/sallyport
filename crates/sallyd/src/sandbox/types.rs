@@ -95,6 +95,17 @@ pub fn nofile_ulimit() -> String {
     format!("nofile={NOFILE_LIMIT}:{NOFILE_LIMIT}")
 }
 
+/// Every container's POSIX message-queue limit in bytes, soft and hard (`--ulimit
+/// msgqueue=0:0`, RT-AG-09): none. A queue's bytes are charged to the kernel user, which
+/// `--userns=keep-id` shares with the host account, and no role uses POSIX message queues.
+pub const MSGQUEUE_LIMIT: u64 = 0;
+
+/// The `--ulimit` value that sets [`MSGQUEUE_LIMIT`] (`msgqueue=0:0`).
+#[must_use]
+pub fn msgqueue_ulimit() -> String {
+    format!("msgqueue={MSGQUEUE_LIMIT}:{MSGQUEUE_LIMIT}")
+}
+
 /// The id of one Sallyport installation (one state directory): a random UUID v4 in its
 /// lowercase hyphenated form. Every container the launcher creates carries it as
 /// [`INSTALLATION_LABEL`], and the orphan sweeps remove only containers that carry this
@@ -555,6 +566,13 @@ mod tests {
     fn the_descriptor_limit_is_512_soft_and_hard() {
         assert_eq!(nofile_ulimit(), "nofile=512:512");
         assert_eq!(NOFILE_LIMIT, 512);
+    }
+
+    /// No message-queue bytes, soft and hard (RT-AG-09).
+    #[test]
+    fn the_message_queue_limit_is_zero_soft_and_hard() {
+        assert_eq!(msgqueue_ulimit(), "msgqueue=0:0");
+        assert_eq!(MSGQUEUE_LIMIT, 0);
     }
 
     #[test]
