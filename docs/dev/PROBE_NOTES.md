@@ -116,7 +116,7 @@ line per fact, with where it was found. Check a note again before relying on it 
   were not kept saw 0 in 6 (3 runs) and 2 to 7 in 40. rt_sup_04 counts a split blind exec as
   one exec (Q393).
 - The OCI config, Podman 4.9.3 rootless crun: `capabilities: {}`; rlimits CORE, NOFILE, NPROC
-  (the last two podman's own hard limits); hostname = 12-hex short id without `--hostname`;
+  (NPROC podman's own hard limit; NOFILE the argv's `--ulimit nofile=512:512` since PR #335); hostname = 12-hex short id without `--hostname`;
   `/etc/passwd`, `/etc/group`, `/dev/shm` bind from `<graphroot>/…/userdata`, `/etc/hostname`
   and `/run/.containerenv` from `<runroot>/…/userdata`; `:O` overlays are `type: overlay` with
   source `<graphroot>/…/userdata/overlay/<n>/merge`. The seccomp section is the profile filtered

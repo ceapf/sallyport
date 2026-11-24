@@ -153,8 +153,8 @@ policy (`Allowed`), an **allowlist**:
   name/value pairs plus `expose_env` placeholders); `--workdir /` (that value only, as two
   tokens), `--image-volume=ignore` and a bare `--no-healthcheck` are required, and every other
   health-check option is refused;
-- every option at most once (mounts, variables and `--security-opt` kinds included), every
-  hardening option exactly once;
+- every option at most once (mounts, variables, `--security-opt` and `--ulimit` kinds included),
+  every hardening option exactly once, `--ulimit` as exactly `core=0` and `nofile=512:512`;
 - every `-v` source a declared source of that role at its declared guest path: `ro` grants only a
   read-only bind, `rw` a read-write bind plus binds and overlays of paths inside it at the
   matching guest path, `staged` only an overlay; overlay upper and work directories only inside
@@ -172,6 +172,7 @@ podman --runtime <checked runtime_path>          # AMENDMENTS-02 B5: never the d
   create --rm --name sp-{ws|h|infer}-<id>
   --label sallyport.installation=<installation id>   # Q64: the orphan sweeps match it
   --pull=never --http-proxy=false --log-driver=none --ulimit core=0   # AMENDMENTS-01 §6.1
+  --ulimit nofile=512:512   # descriptor limit, soft = hard, every role; it does not bound descriptors in flight (#271)
   --network=none --no-hosts          # NOT --dns=none: Podman 4.9 rejects it with --network=none (preflight V4)
   --read-only --read-only-tmpfs=false
   --cap-drop=ALL --security-opt no-new-privileges
@@ -413,8 +414,9 @@ and the claims are held until `sallyd` exits.
    keep-id map shape, the seccomp filter by content (the embedded profile converted for the
    native architecture), exactly the mounts with their options (each overlay's `lowerdir`
    included, parents before children), the args and environment as built plus the image's
-   `Env`, the working directory `/` whatever the image declares (`--workdir /`), rlimits,
-   cgroup limits with swap equal to memory, `cgroupsPath` in the systemd form only (doctor
+   `Env`, the working directory `/` whatever the image declares (`--workdir /`), rlimits
+   (exactly these three: CORE 0/0, NOFILE exactly 512/512, NPROC within `sallyd`'s own hard
+   limit), cgroup limits with swap equal to memory, `cgroupsPath` in the systemd form only (doctor
    requires systemd), masked and read-only paths, annotations and hostname. Beside the config,
    podman's `.Config.Timeout` (read by the same `podman inspect`) must equal the argv's
    `--timeout`, and 0 when it has none (#92, Q193), and its
@@ -1239,9 +1241,10 @@ the cleanup finishes. After `sandbox.cleanup_abandoned` a workspace launch's cla
 session stops, and the periodic sweep then takes its container. Shutdown does not wait for such
 a cleanup; while one has not confirmed its container gone (retrying or abandoned), `sallyd`
 exits non-zero naming it. Directories its cleanup could not remove stay: the next start's
-stale-state step removes a workspace launch's socket directory, and nothing removes the rest
-(THREAT_MODEL.md §6; TODO(#239)). A failed `session.start` append is followed by a best-effort
-`session.stop` (`start-failed`), since the entry may have reached the log.
+stale-state step removes a workspace launch's socket directory; the rest are recorded and not
+swept, and the command that will discard kept stages removes them (THREAT_MODEL.md §6;
+TODO(#216)). A failed `session.start` append is followed by a best-effort `session.stop`
+(`start-failed`), since the entry may have reached the log.
 
 ## 6. Repository structure
 
