@@ -141,3 +141,64 @@ fn is_syntax_error(e: &serde_saphyr::Error) -> bool {
 pub fn to_yaml(m: &Manifest) -> Result<String, serde_saphyr::ser::Error> {
     serde_saphyr::to_string(m)
 }
+
+#[cfg(test)]
+mod tests {
+    use serde::Deserialize;
+    use serde::de::IgnoredAny;
+
+    use super::options;
+
+    /// `text` read under the manifest's options into a type that takes any YAML, so only the
+    /// options' own limits can refuse it: through [`super::parse`] a deep or aliased value meets
+    /// the manifest's schema first (an unknown field, or a list where a string goes), which
+    /// would refuse it whatever the limits said. The error's text when refused.
+    fn untyped(text: &str) -> Result<(), String> {
+        serde_saphyr::with_deserializer_from_str_with_options(text, options(), |de| {
+            IgnoredAny::deserialize(de)
+        })
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    }
+
+    /// `n` sequences nested in one mapping value: depth `n + 1`.
+    fn sequences(n: usize) -> String {
+        format!("x: {}{}\n", "[".repeat(n), "]".repeat(n))
+    }
+
+    /// `n` mappings nested by indentation: depth `n`.
+    fn mappings(n: usize) -> String {
+        (0..n).map(|i| format!("{}a:\n", " ".repeat(i))).collect()
+    }
+
+    /// RT-MAN-01, the nesting clause, refused by its own limit: one level past depth 16, in
+    /// sequences or mappings, the options refuse with the depth breach. (Far past it, the
+    /// scanner's own recursion limit may answer first; `rt_man_01_deep_nesting_is_refused`
+    /// holds that case through `parse`.) Control: return value, in-test: the same builders at
+    /// depth 16, through the same read, are accepted.
+    #[test]
+    fn rt_man_01_nesting_past_the_depth_limit_is_refused_by_it() {
+        for (what, text) in [("sequences", sequences(15)), ("mappings", mappings(16))] {
+            assert_eq!(untyped(&text), Ok(()), "control: {what} at depth 16");
+        }
+        for (what, text) in [("sequences", sequences(16)), ("mappings", mappings(17))] {
+            let e = untyped(&text).expect_err(what);
+            assert!(e.contains("budget breached: Depth"), "{what}: {e}");
+        }
+    }
+
+    /// RT-MAN-01, the alias clause, refused by its own limit: a billion-laughs ladder is refused
+    /// at its first anchor. Control: return value, in-test: the same ladder with each alias
+    /// written out as the list it names, through the same read, is accepted.
+    #[test]
+    fn rt_man_01_an_alias_ladder_is_refused_by_the_anchor_limit() {
+        let ten = |item: &str| format!("[{}]", [item; 10].join(", "));
+        let a = ten("x");
+        let b = ten(&a);
+        let written = format!("a: {a}\nb: {b}\nc: {}\n", ten(&b));
+        assert_eq!(untyped(&written), Ok(()), "control: the ladder written out");
+        let ladder = format!("a: &a {a}\nb: &b {}\nc: {}\n", ten("*a"), ten("*b"));
+        let e = untyped(&ladder).expect_err("the ladder");
+        assert!(e.contains("budget breached: Anchors"), "{e}");
+    }
+}
