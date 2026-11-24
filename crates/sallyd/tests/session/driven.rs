@@ -182,6 +182,30 @@ fn rt_drv_02_an_approved_driven_call_runs_once() {
                 .filter(|(e, a)| e == "tool.run" && a["tool"] == "shell")
                 .count();
         assert_eq!(runs, 1);
+        // No entry of the session is the harness's, in either sink: the registry's and the
+        // launcher's (`sandbox.*`, `egress.*`, the tools). Control: the same text holds the
+        // approved run's `tool.run` as the driver's.
+        let needle = format!("session: Some(\"{}\")", s.id);
+        let launcher: Vec<String> =
+            r.x.events
+                .debug()
+                .into_iter()
+                .filter(|d| d.contains(&needle))
+                .collect();
+        let own = entries_of(&r, &s.id);
+        assert!(
+            own.iter()
+                .chain(&launcher)
+                .any(|d| d.contains("actor: Driver") && d.contains("event: \"tool.run\"")),
+            "control: the driver's tool.run: {own:#?} {launcher:#?}"
+        );
+        for (name, sink) in [("registry", &own), ("launcher", &launcher)] {
+            assert!(!sink.is_empty(), "control: {name}: no entry of the session");
+            assert!(
+                !sink.iter().any(|d| d.contains("actor: Harness")),
+                "{name}: {sink:#?}"
+            );
+        }
     });
 }
 
