@@ -213,6 +213,7 @@ fn a_line_that_cannot_be_shown_withholds_the_block_and_is_named() {
         dirty.contains("caf") && dirty.contains(&v.warnings[0].path),
         "{dirty}"
     );
+    assert!(dirty.ends_with(" (not printable ASCII)"), "{dirty}");
     assert!(
         dirty.chars().all(|c| c.is_ascii_graphic() || c == ' '),
         "{dirty:?}"

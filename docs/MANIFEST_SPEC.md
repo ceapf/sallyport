@@ -158,12 +158,13 @@ it only reports). In order:
   with no regular-file check and no identity compare against what was inspected.
 - **What is shown.** Before anything is sent, the launch shows the summary, each warning and each
   acknowledged risk, on the terminal the answer is read from when a question follows and on
-  stderr otherwise. Manifest and host text reaches these lines escaped, so text with letters
-  outside ASCII is shown escaped and can be consented to. A line that fails the CLI's
-  clean-check, or holds an escape of a control character, a direction mark or an invisible
-  character (whitespace other than the space, Unicode's default-ignorable and format
-  characters, noncharacters, a byte that is not UTF-8), refuses the launch (exit 1), naming the
-  line and why. Warnings and acknowledged risks decide only which lines follow the summary.
+  stderr otherwise. Manifest and host text reaches these lines escaped, so text outside ASCII
+  (letters, marks, symbols, private-use and unassigned code points) is shown escaped and can be
+  consented to. A line that fails the CLI's clean-check, or holds an escape of a control
+  character (a tab or a newline included), a direction mark or an invisible character
+  (whitespace other than the space, Unicode's default-ignorable and format characters,
+  noncharacters, a byte that is not UTF-8), refuses the launch (exit 1), naming the line and
+  why. Warnings and acknowledged risks decide only which lines follow the summary.
 - **Consent.** Every launch from a manifest needs it, whatever its warnings. A given
   `--accept-manifest <sha256>` is the consent, on a terminal too, in place of a typed `yes`: it
   must be the SHA-256 of the exact text read. A malformed value fails (exit 2) before anything

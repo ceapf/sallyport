@@ -1373,8 +1373,10 @@ enum Shown {
 /// Each field's class, as `Type.field` names it in the JSON schema.
 type Classed = Vec<(&'static str, Shown)>;
 
-/// Records `name`'s class. `_value` is the field's binding, so a field bound but not passed here
-/// is an unused variable, which each function below refuses (`deny(unused_variables)`).
+/// Records `name`'s class. `_value` is the field's binding, so a field bound but used nowhere is
+/// an unused variable, which each function below refuses (`deny(unused_variables)`). A field
+/// also handed to a nested function or an `if let` (each section, `mounts`, `approve`, `allow`,
+/// `inject`, `mcp`) is used there too; for those the schema comparison is the guard.
 fn class<T: ?Sized>(out: &mut Classed, name: &'static str, _value: &T, shown: Shown) {
     out.push((name, shown));
 }

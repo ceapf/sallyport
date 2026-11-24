@@ -198,8 +198,8 @@ fn flattened(s: &str) -> String {
 ///
 /// The cut never falls inside an escape the text holds (the `[data-can-leave]` finding quotes
 /// realpaths escaped), so what is kept still reads as whole escapes (RT-MAN-05): it backs off to
-/// the escape's start. A back-off of [`LONGEST_ESCAPE`] bytes or more means the `\` there starts
-/// no escape (raw text), and the character cut stands.
+/// the escape's start. A back-off of [`text::LONGEST_ESCAPE`] bytes or more means the `\` there
+/// starts no escape (raw text), and the character cut stands.
 fn bounded(s: String) -> String {
     if s.chars().nth(MAX_TEXT).is_none() {
         return s;
@@ -207,7 +207,8 @@ fn bounded(s: String) -> String {
     let keep = MAX_TEXT.saturating_sub(CUT.chars().count());
     let at = s.char_indices().nth(keep).map_or(s.len(), |(i, _)| i);
     let back = text::escape_boundary(&s, at);
-    let end = if at.saturating_sub(back) < LONGEST_ESCAPE && s.is_char_boundary(back) {
+    // `back` is a character's edge whenever `at` is one; the check is defensive only.
+    let end = if at.saturating_sub(back) < text::LONGEST_ESCAPE && s.is_char_boundary(back) {
         back
     } else {
         at
@@ -216,9 +217,6 @@ fn bounded(s: String) -> String {
     cut.push_str(CUT);
     cut
 }
-
-/// The longest escape the text escapers write: `\u{10ffff}`.
-const LONGEST_ESCAPE: usize = 10;
 
 /// Each dot-separated segment that looks like a token becomes its first 4 characters and
 /// [`CUT`].

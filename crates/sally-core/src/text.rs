@@ -17,7 +17,8 @@
 //! than the space, Unicode's default-ignorable and format characters (direction marks and
 //! invisible characters among them) and noncharacters. [`refused_escape`] reads a line these
 //! escapers wrote and names its first escape of a refused character or of a byte that is not
-//! UTF-8. It fails closed: a backslash that starts no escape an escaper writes refuses too.
+//! UTF-8. It fails closed: a backslash that does not start `\\`, `\"`, `\xHH` or `\u{H…}`
+//! refuses too.
 //!
 //! Every cut and escape of sandbox-chosen audit text lives here too (architect Q276, Q288), as
 //! the closed set [`Style`]: the hex formats ([`hex_capped`], [`hex_counted`]), the text format
@@ -156,8 +157,8 @@ fn is_noncharacter(c: char) -> bool {
     (0xfdd0..=0xfdef).contains(&n) || n & 0xfffe == 0xfffe
 }
 
-/// The longest `\u{…}`: six hex digits.
-const MAX_U_ESCAPE: usize = 10;
+/// The longest escape the escapers here write, `\u{10ffff}`: six hex digits.
+pub(crate) const LONGEST_ESCAPE: usize = 10;
 
 /// The first escape in `line`, text the escapers here wrote, that shows a character
 /// [`is_refused`] takes or a byte that is not UTF-8, as written in the line (RT-MAN-05). Fails
@@ -175,12 +176,14 @@ pub fn refused_escape(line: &str) -> Option<&str> {
         let start = i.saturating_add(off);
         let rest = bytes.get(start..).unwrap_or_default();
         match read_escape(rest) {
-            Ok(len) => i = start.saturating_add(len),
+            // At least one byte, so the reading always moves on.
+            Ok(len) => i = start.saturating_add(len.max(1)),
             Err(len) => {
                 let end = (start.saturating_add(len)..=line.len())
                     .find(|&e| line.is_char_boundary(e))
                     .unwrap_or(line.len());
-                return line.get(start..end);
+                // Refuses even should the slice ever miss a character's edge.
+                return Some(line.get(start..end).unwrap_or("\\"));
             }
         }
     }
@@ -197,8 +200,8 @@ fn read_escape(rest: &[u8]) -> Result<usize, usize> {
             _ => Err(rest.len().min(4)),
         },
         Some(b'u') if rest.get(2) == Some(&b'{') => {
-            let Some(close) = rest.iter().take(MAX_U_ESCAPE).position(|&b| b == b'}') else {
-                return Err(rest.len().min(MAX_U_ESCAPE));
+            let Some(close) = rest.iter().take(LONGEST_ESCAPE).position(|&b| b == b'}') else {
+                return Err(rest.len().min(LONGEST_ESCAPE));
             };
             let shown = rest
                 .get(3..close)

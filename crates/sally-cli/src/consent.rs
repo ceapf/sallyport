@@ -204,9 +204,10 @@ pub fn besides_summary(v: &Validated) -> Vec<String> {
 
 /// The lines shown before a launch of `v`: the summary's, then [`besides_summary`].
 ///
-/// Manifest and host text reaches these lines escaped, so text with letters outside ASCII is
-/// shown escaped and can be consented to. A launch still never shows a control, a direction mark
-/// or an invisible character, escaped or not (RT-MAN-05): each line passes the clean-check, then
+/// Manifest and host text reaches these lines escaped, so text outside ASCII (letters, marks,
+/// symbols, private-use and unassigned code points) is shown escaped and can be consented to. A
+/// launch still never shows a control (a tab or a newline included), a direction mark or an
+/// invisible character, escaped or not (RT-MAN-05): each line passes the clean-check, then
 /// [`text::refused_escape`].
 ///
 /// # Errors

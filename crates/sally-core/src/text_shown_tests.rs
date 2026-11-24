@@ -137,6 +137,18 @@ fn the_reader_refuses_what_no_escaper_writes() {
     }
 }
 
+/// One to six lowercase hex digits, and nothing else; the longest escape holds six.
+#[test]
+fn hex_values_are_one_to_six_lowercase_digits() {
+    assert_eq!(hex_value(b"0"), Some(0));
+    assert_eq!(hex_value(b"10ffff"), Some(0x10_ffff));
+    assert_eq!(hex_value(b"abcdef"), Some(0xab_cdef));
+    for bad in [&b""[..], b"1000000", b"A", b"g", b"-1", b" 1"] {
+        assert_eq!(hex_value(bad), None, "{bad:?}");
+    }
+    assert_eq!("\\u{10ffff}".len(), LONGEST_ESCAPE);
+}
+
 #[test]
 fn a_quoted_path_is_its_bytes_escaped_between_quotes() {
     assert_eq!(quoted_path(b"/home/u/p"), "\"/home/u/p\"");

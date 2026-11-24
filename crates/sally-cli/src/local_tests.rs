@@ -266,9 +266,11 @@ fn a_long_non_ascii_mount_path_is_cut_between_escapes_and_can_be_accepted() {
     let (s, m, _, _gone) = mounting("long", &"\u{4e2d}".repeat(40));
     let (code, out, err) = run(|o| manifest_validate(&m, files(&s.store(), &s.config()), o));
     assert_eq!((code, err.as_str()), (EXIT_OK, ""), "{out}");
+    // The kept part ends on a whole escape, whichever byte the character cut fell on (the back-off
+    // at each offset inside an escape is the diagnostics unit test's).
     assert!(
-        out.contains("... [data-can-leave]"),
-        "the warning is cut: {out}"
+        out.contains("}... [data-can-leave]"),
+        "the warning is cut after a whole escape: {out}"
     );
     let (code, out, err) = run(|o| manifest_summary(&m, files(&s.store(), &s.config()), o));
     assert_eq!(code, EXIT_OK, "{err}");
