@@ -36,7 +36,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::accepted;
 use super::exit::Exit;
-use super::supervise::{Request, Supervised};
+use super::supervise::{Request, Rounds, Supervised};
 use super::types::{StopReason, fresh_id};
 use crate::approvals::Gated;
 use crate::approvals::policy::Policy;
@@ -513,9 +513,9 @@ impl Registry {
     }
 
     /// Stops a workspace whose session never started (no `session.start`, so no
-    /// `session.stop`). One that cannot be confirmed gone writes `sandbox.stop_failed` and stays
-    /// listed as stop-failed, under a supervisor that retries it by itself, backed off and
-    /// capped, and at once on a request (RT-AUD-03).
+    /// `session.stop`). One that cannot be confirmed gone writes `sandbox.stop_failed` (none when
+    /// the probe finds the container gone) and stays listed as stop-failed, under a supervisor
+    /// that retries it by itself, backed off and capped, and at once on a request (RT-AUD-03).
     async fn discard(self: &Arc<Self>, running: Running, manifest: &str) {
         let sid = running.paths().id().as_str().to_owned();
         let e = match self.stop_bounded(running, true).await {
@@ -527,10 +527,11 @@ impl Registry {
             }
             Err(e) => e,
         };
-        // Before the stop-failed state is listed.
-        self.p
+        // Before the stop-failed state is listed; none when the container is gone.
+        let reported = self
+            .p
             .launcher
-            .audit_workspace_stop_failed(&e.running, super::supervise::STOP_ATTEMPTS, &e.error)
+            .report_workspace_stop_failed(&e.running, super::supervise::STOP_ATTEMPTS, &e.error)
             .await;
         let r = e.running;
         self.p.oplog.error(
@@ -558,10 +559,21 @@ impl Registry {
         );
         let this = Arc::clone(self);
         self.p.crash.spawn("session", async move {
-            // Its first round has just failed and written its entry: the next one comes at a
-            // request or after the first pause.
-            this.retry_stop(sid, r, Vec::new(), rx, StopReason::StartFailed, None, 1)
-                .await;
+            // Its first round has just failed (and written its entry unless the container is
+            // gone): the next one comes at a request or after the first pause.
+            this.retry_stop(
+                sid,
+                r,
+                Vec::new(),
+                rx,
+                StopReason::StartFailed,
+                None,
+                Rounds {
+                    failed: 1,
+                    reported,
+                },
+            )
+            .await;
         });
     }
 

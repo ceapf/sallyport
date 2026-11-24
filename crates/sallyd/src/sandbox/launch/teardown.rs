@@ -7,7 +7,7 @@ use sally_core::manifest::AuditLevel;
 use serde_json::json;
 
 use super::parts::{
-    CleanupTries, Directories, Made, NextTry, Owner, STOP_RETRIES_AFTER_REMOVAL, Subject,
+    CleanupTries, Directories, Made, NextTry, Owner, Presence, STOP_RETRIES_AFTER_REMOVAL, Subject,
     abandoned_entry, cleaned_entry, containers_gone, stop_failed_entry,
 };
 use super::start::Held;
@@ -151,7 +151,7 @@ impl Launcher {
     /// until the container is confirmed gone, the pauses backed off and capped, the tries not
     /// (RT-AG-08b). Meanwhile the handle keeps its disk watchdog and egress policy, so the
     /// session stays bounded (RT-AG-09), and its id is among the unconfirmed containers. The
-    /// first failure with the container still there is audited as `sandbox.stop_failed`
+    /// first failure with the container not confirmed gone is audited as `sandbox.stop_failed`
     /// (RT-AUD-03); one with it gone is retried a bounded number of times, which release the
     /// claims and remove the scratch.
     pub(super) async fn stop_unreceived(&self, mut running: Running) {
@@ -173,13 +173,15 @@ impl Launcher {
             // which release the claims and remove the scratch once `stop` gets that far. A retry
             // finds the container by name, which is safe: session ids are fresh random ids minted
             // once, so no other workspace ever carries this name.
-            if matches!(self.container_exists(&e.running.name).await, Ok(false)) {
+            if self.presence(&e.running.name).await == Presence::Absent {
                 if after_removal >= STOP_RETRIES_AFTER_REMOVAL {
                     e.running.owner = Owner::Ended;
                     return self.cleanup_confirmed(Role::Workspace, &id);
                 }
                 after_removal += 1;
             } else if !reported {
+                // Present or unknown: the rule of `Presence::audits_a_failed_stop`, as the
+                // supervisor's `report_workspace_stop_failed` applies it.
                 reported = true;
                 self.audit_workspace_stop_failed(&e.running, tries, &e.error)
                     .await;
@@ -189,15 +191,41 @@ impl Launcher {
         }
     }
 
-    /// `sandbox.stop_failed` for a workspace stop that `attempts` tries could not confirm,
-    /// `error` the last one's: the supervisor's first failed round, a failed start's discard,
-    /// and the launcher's stop of a workspace nobody holds, each once per stop (RT-AUD-03).
-    pub(crate) async fn audit_workspace_stop_failed(
+    /// The strict probe of `container` after a failed stop: present, absent or unknown. An
+    /// unknown answer's error is an oplog warning, since the entry carries the stop's error.
+    async fn presence(&self, container: &str) -> Presence {
+        let probe = self.container_exists(container).await;
+        if let Err(e) = &probe {
+            self.oplog.warn(
+                "sandbox",
+                "container probe failed",
+                &[("container", container), ("error", &e.to_string())],
+            );
+        }
+        Presence::of(&probe)
+    }
+
+    /// [`Self::audit_workspace_stop_failed`] for a failed round of a session's stop (the
+    /// supervisor's, a failed start's discard) unless the probe says the container is gone:
+    /// whether the entry was written (RT-AUD-03).
+    pub(crate) async fn report_workspace_stop_failed(
         &self,
         r: &Running,
         attempts: u32,
         error: &LaunchError,
-    ) {
+    ) -> bool {
+        let due = self.presence(&r.name).await.audits_a_failed_stop();
+        if due {
+            self.audit_workspace_stop_failed(r, attempts, error).await;
+        }
+        due
+    }
+
+    /// `sandbox.stop_failed` for a workspace stop that `attempts` tries could not confirm,
+    /// `error` the last one's, once per stop: through [`Self::report_workspace_stop_failed`]
+    /// (the supervisor, a failed start's discard), and from [`Self::stop_unreceived`] after its
+    /// own probe (RT-AUD-03).
+    async fn audit_workspace_stop_failed(&self, r: &Running, attempts: u32, error: &LaunchError) {
         let subject = Subject::Session(r.paths.id().clone());
         self.audit_stop_failed(&subject, Role::Workspace, &r.name, attempts, error, r.level)
             .await;
@@ -436,8 +464,8 @@ impl Launcher {
     /// [`Self::stop_role`] for a container nobody holds (a launch nobody received, a dropped
     /// handle), retried until the container is confirmed gone, the pauses backed off and
     /// capped (RT-AG-08b); its id is among the unconfirmed containers meanwhile, unless an earlier
-    /// stop already removed the container. The first failure with the container still there is
-    /// audited as `sandbox.stop_failed` (RT-AUD-03). TODO(#135): one loop with
+    /// stop already removed the container. The first failure with the container not confirmed
+    /// gone is audited as `sandbox.stop_failed` (RT-AUD-03). TODO(#135): one loop with
     /// [`Self::stop_unreceived`].
     pub(super) async fn stop_role_unreceived(&self, mut running: RoleRunning) {
         running.owner = Owner::Launcher;
@@ -457,8 +485,8 @@ impl Launcher {
             // container that went by itself): nothing runs any more, so no entry, and only a
             // bounded number of retries remain, for what the retry still does (the claim, an
             // instance's directories, which no sweep removes). Checked by id.
-            let gone = e.running.removed
-                || matches!(self.container_exists(&e.running.container).await, Ok(false));
+            let gone =
+                e.running.removed || self.presence(&e.running.container).await == Presence::Absent;
             if gone {
                 if after_removal >= STOP_RETRIES_AFTER_REMOVAL {
                     e.running.owner = Owner::Ended;

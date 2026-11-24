@@ -37,7 +37,8 @@
 //! answers `Failed`, the session stays stop-failed with its claims and its watchdog, and the
 //! supervisor removes the container by itself once the operation returns (its `tool.result` is
 //! refused by the seal). A container that cannot be confirmed gone also stays stop-failed,
-//! whoever began the stop: `sandbox.stop_failed` is written once, and the supervisor retries by
+//! whoever began the stop: `sandbox.stop_failed` is written at most once, and none when the
+//! strict probe finds the container gone after a failed round; the supervisor retries by
 //! itself, its pauses backed off and capped, its rounds not, until the container is confirmed
 //! gone; a stop request meanwhile retries at once (RT-AUD-03).
 
@@ -61,6 +62,23 @@ use crate::tools::ops::{Ops, STOP_DRAIN};
 pub(super) const STOP_ATTEMPTS: u32 = 3;
 /// Pause between two `Launcher::stop` attempts.
 const STOP_RETRY: Duration = Duration::from_secs(2);
+
+/// Where a stop's rounds stand when a supervisor takes them over (`retry_stop`).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Rounds {
+    /// Rounds that already failed.
+    pub(super) failed: u32,
+    /// Whether this stop's `sandbox.stop_failed` has already been written (RT-AUD-03).
+    pub(super) reported: bool,
+}
+
+impl Rounds {
+    /// A stop none of whose rounds has run.
+    pub(super) const FRESH: Self = Self {
+        failed: 0,
+        reported: false,
+    };
+}
 
 /// A stop request and where to answer it.
 pub(super) type Request = (StopReason, Option<Reply>);
@@ -168,8 +186,16 @@ impl Registry {
         }
         // 7. A crash reported after the reason was chosen is not lost: `retry_stop` logs it
         // before the session's secrets leave the oplog's redactor.
-        self.retry_stop(sid, running, replies, requests, reason, Some(crashes), 0)
-            .await;
+        self.retry_stop(
+            sid,
+            running,
+            replies,
+            requests,
+            reason,
+            Some(crashes),
+            Rounds::FRESH,
+        )
+        .await;
     }
 
     /// The oplog line of each crash reported after the session's reason was chosen. With the
@@ -314,11 +340,12 @@ impl Registry {
     /// [`STOP_ATTEMPTS`] attempts. A round that ends unconfirmed sets the stop-failed state and
     /// answers `Failed`; the next round starts at a stop request or after the launcher's pause
     /// (`Launcher::stop_pause`: backed off and capped), whichever comes first, with no cap on
-    /// rounds. The first such round writes `sandbox.stop_failed`, whoever began the stop, before
-    /// the state is set and before any reply (RT-AUD-03).
-    /// `failed`: rounds that already failed (a failed start's discard ran one and wrote the
-    /// entry). Answers every request it has. `crashes`: a supervised session's crash reports,
-    /// logged before its secrets are released.
+    /// rounds. The first such round whose container the strict probe does not find gone writes
+    /// `sandbox.stop_failed`, whoever began the stop, before the state is set and before any
+    /// reply; a round that failed with the container gone writes none (RT-AUD-03).
+    /// `rounds`: where the stop stands (a failed start's discard ran one round). Answers every
+    /// request it has. `crashes`: a supervised session's crash reports, logged before its
+    /// secrets are released.
     #[expect(
         clippy::too_many_arguments,
         reason = "the supervisor's whole state, handed over once"
@@ -331,10 +358,13 @@ impl Registry {
         mut requests: mpsc::Receiver<Request>,
         reason: StopReason,
         mut crashes: Option<CrashReceiver>,
-        failed: u32,
+        rounds: Rounds,
     ) {
         let mut running = running;
-        let mut failed = failed;
+        let Rounds {
+            mut failed,
+            mut reported,
+        } = rounds;
         let mut open = true;
         loop {
             if failed > 0 {
@@ -393,13 +423,15 @@ impl Registry {
                 }
                 Err(e) => {
                     // No `session.closed` until a retry succeeds. TODO(#157): a stop that failed
-                    // only after the container was removed (the scratch removal) is reported here
-                    // as not confirmed gone.
+                    // only after the container was removed (the scratch removal) writes no
+                    // `sandbox.stop_failed`, but its state, oplog line and reply still say not
+                    // confirmed gone, and its rounds are not bounded.
                     let StopError { running: r, error } = *e;
-                    if failed == 0 {
-                        self.p
+                    if !reported {
+                        reported = self
+                            .p
                             .launcher
-                            .audit_workspace_stop_failed(&r, STOP_ATTEMPTS, &error)
+                            .report_workspace_stop_failed(&r, STOP_ATTEMPTS, &error)
                             .await;
                     }
                     failed = failed.saturating_add(1);

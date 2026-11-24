@@ -189,6 +189,41 @@ pub(crate) fn stop_failed_entry(
         .text("detail", last, DETAIL_STYLE)
 }
 
+/// What the strict probe (`podman container exists`) says of a container after a failed stop:
+/// exit 0 present, exit 1 absent, anything else unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Presence {
+    /// Still there.
+    Present,
+    /// Gone.
+    Absent,
+    /// Neither answer: another exit code, a signal, a timeout.
+    Unknown,
+}
+
+impl Presence {
+    /// The probe's answer: `Ok(true)` present, `Ok(false)` absent, an error unknown.
+    #[must_use]
+    pub(crate) fn of<E>(probe: &Result<bool, E>) -> Self {
+        match probe {
+            Ok(true) => Self::Present,
+            Ok(false) => Self::Absent,
+            Err(_) => Self::Unknown,
+        }
+    }
+
+    /// Whether a failed stop writes [`stop_failed_entry`]: only while the container may still be
+    /// there, so present or unknown; a stop that failed with it gone (at the scratch removal, or
+    /// a container that went by itself) writes nothing (RT-AUD-03).
+    #[must_use]
+    pub(crate) fn audits_a_failed_stop(self) -> bool {
+        match self {
+            Self::Present | Self::Unknown => true,
+            Self::Absent => false,
+        }
+    }
+}
+
 /// What became of a failed launch's directories when its cleanup ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Directories {
@@ -762,6 +797,18 @@ mod tests {
         assert_eq!(on_drop(Owner::Launcher, false), OnDrop::Report);
         assert_eq!(on_drop(Owner::Ended, true), OnDrop::Nothing);
         assert_eq!(on_drop(Owner::Ended, false), OnDrop::Nothing);
+    }
+
+    /// The strict probe: exit 0 present, exit 1 absent, an error unknown; a failed stop is
+    /// audited when present or unknown, never when absent (RT-AUD-03).
+    #[test]
+    fn a_failed_stop_is_audited_unless_the_probe_says_gone() {
+        assert_eq!(Presence::of(&Ok::<_, ()>(true)), Presence::Present);
+        assert_eq!(Presence::of(&Ok::<_, ()>(false)), Presence::Absent);
+        assert_eq!(Presence::of(&Err::<bool, _>(())), Presence::Unknown);
+        assert!(Presence::Present.audits_a_failed_stop());
+        assert!(Presence::Unknown.audits_a_failed_stop());
+        assert!(!Presence::Absent.audits_a_failed_stop());
     }
 
     /// `sandbox.stop_failed` is denied and names the role, the container, the tries and the
