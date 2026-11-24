@@ -602,3 +602,117 @@ fn a_cut_list_is_listed_again_when_empty() {
         ]
     );
 }
+
+/// Columns and rows of the screen RT-AG-04's padded case is judged on.
+const SCREEN: (usize, usize) = (80, 24);
+const APPROVE_QUESTION: &str = "approve, deny or deny-all? ";
+const DENY_QUESTION: &str = "deny or deny-all? ";
+
+/// The rows an 80-column terminal shows for `text`, counted here and by no product code: each
+/// line wraps every 80 characters, an empty line is one row.
+fn screen_rows(text: &str) -> Vec<String> {
+    let mut rows = Vec::new();
+    for line in text.split('\n') {
+        let chars: Vec<char> = line.chars().collect();
+        if chars.is_empty() {
+            rows.push(String::new());
+        }
+        for row in chars.chunks(SCREEN.0) {
+            rows.push(row.iter().collect());
+        }
+    }
+    rows
+}
+
+/// For every question `shown` asks: whether it offers approve, and whether `marker` is in the
+/// rows above it on the last screen (the question's own row is the screen's last).
+fn questions(shown: &str, marker: &str) -> Vec<(bool, bool)> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(at) = shown.get(from..).and_then(|s| s.find(DENY_QUESTION)) {
+        let at = from + at;
+        let approvable = shown
+            .get(..at + DENY_QUESTION.len())
+            .is_some_and(|s| s.ends_with(APPROVE_QUESTION));
+        let start = if approvable {
+            at + DENY_QUESTION.len() - APPROVE_QUESTION.len()
+        } else {
+            at
+        };
+        let rows = screen_rows(shown.get(..start).unwrap_or_default());
+        // The last row is the partial one the question is printed on.
+        let above = rows.len().saturating_sub(SCREEN.1);
+        let seen = rows
+            .get(above..rows.len().saturating_sub(1))
+            .is_some_and(|r| r.concat().contains(marker));
+        out.push((approvable, seen));
+        from = at + DENY_QUESTION.len();
+    }
+    out
+}
+
+/// About 100 KiB of words with no run of one character longer than 16.
+fn unrun_padding() -> String {
+    let mut s = String::new();
+    let mut i = 0u32;
+    while s.len() < 100 * 1024 {
+        s.push_str(&format!("w{i} "));
+        i += 1;
+    }
+    s
+}
+
+/// RT-AG-04, the padded case (#290), as the CLI shows it: a cut prompt whose full text is about
+/// 100 KiB keeps its command in the last screen of 80 columns and 24 rows before every question,
+/// a question asked again included, or the prompt can only be denied.
+#[test]
+fn rt_ag_04_a_padded_prompt_keeps_its_command_above_every_question() {
+    let marker = "marker-cmd";
+    let action = format!("run [\"{marker}\" \"w0 w1 w2\"]");
+    let mut plain = prompt("p0");
+    plain["text"] = json!(format!(
+        "approval p0 (session s-1, call 3)\n  action: {action}\n"
+    ));
+    let f = daemon("padded-control", vec![plain], 1);
+    let r = run_with(&f, &["maybe", "deny"], None);
+    for (approvable, seen) in questions(&r.shown, marker) {
+        assert!(
+            approvable && seen,
+            "control: the unpadded twin:\n{}",
+            r.shown
+        );
+    }
+
+    let full = format!(
+        "run [\"{marker}\" \"{}\" \"tail\"] in \"/workspace/p\"",
+        unrun_padding()
+    );
+    let cut: String = full.chars().take(2000).collect();
+    let mut p = prompt("p1");
+    p["truncated"] = json!(true);
+    p["text"] = json!(format!(
+        "approval p1 (session s-1, call 3)\n  action: {cut}... (+{} bytes)\n  \
+         (cut: the full action must be shown before it can be approved)\n  digest: d-p1\n",
+        full.len() - cut.len()
+    ));
+    p["full"] = json!(full);
+    let f = daemon("padded", vec![p], 1);
+    let r = run_with(&f, &["maybe", "deny"], None);
+    let asked = questions(&r.shown, marker);
+    assert_eq!(asked.len(), 2, "asked, then asked again");
+    for (approvable, seen) in asked {
+        let tail: String = r
+            .shown
+            .chars()
+            .rev()
+            .take(400)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        assert!(
+            !approvable || seen,
+            "approvable, and the last screen before the question does not hold the command: ...{tail}"
+        );
+    }
+}

@@ -628,6 +628,79 @@ mod tests {
         insta::assert_snapshot!(out);
     }
 
+    /// Columns and rows of the screen RT-AG-04's padded case is judged on.
+    const SCREEN: (usize, usize) = (80, 24);
+
+    /// The rows an 80-column terminal shows for `text`, counted here and by no product code:
+    /// each line wraps every 80 characters, an empty line is one row.
+    fn screen_rows(text: &str) -> Vec<String> {
+        let mut rows = Vec::new();
+        for line in text.split('\n') {
+            let chars: Vec<char> = line.chars().collect();
+            if chars.is_empty() {
+                rows.push(String::new());
+            }
+            for row in chars.chunks(SCREEN.0) {
+                rows.push(row.iter().collect());
+            }
+        }
+        rows
+    }
+
+    /// What a client prints for `p` before its question, and whether approve is offered.
+    fn before_the_question(p: &Prompt) -> (String, bool) {
+        let mut shown = terminal(p);
+        let mut approvable = true;
+        if p.truncated {
+            match p.full_on_wire() {
+                Some(full) => {
+                    let _ = writeln!(shown, "  full action:\n{full}");
+                }
+                None => approvable = false,
+            }
+        }
+        (shown, approvable)
+    }
+
+    /// Whether `marker` is within the last screen before the question: the question takes the
+    /// screen's last row, so the marker must be in the rows above it.
+    fn in_the_last_screen(shown: &str, marker: &str) -> bool {
+        let rows = screen_rows(shown);
+        // `shown` ends with a newline: its last row is the empty one the question is printed on.
+        let above = rows.len().saturating_sub(SCREEN.1);
+        rows.get(above..rows.len().saturating_sub(1))
+            .is_some_and(|r| r.concat().contains(marker))
+    }
+
+    /// RT-AG-04, the padded case (#290): a command followed by about 100 KiB of padding keeps its
+    /// command in the last screen of 80 columns and 24 rows before the question, or the prompt
+    /// can only be denied.
+    #[test]
+    fn rt_ag_04_a_padded_action_keeps_its_command_in_the_last_screen() {
+        let marker = "marker-cmd";
+        let (plain, approvable) = before_the_question(&prompt(shell(&[marker, "tail"]), None));
+        assert!(approvable, "control: the unpadded twin is approvable");
+        assert!(
+            in_the_last_screen(&plain, marker),
+            "control: the unpadded twin shows its command:\n{plain}"
+        );
+        let pad = " ".repeat(100 * 1024);
+        let p = prompt(shell(&[marker, &pad, "tail"]), None);
+        let (shown, approvable) = before_the_question(&p);
+        let tail: String = shown
+            .chars()
+            .rev()
+            .take(400)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        assert!(
+            !approvable || in_the_last_screen(&shown, marker),
+            "approvable, and the last screen before the question does not hold the command: ...{tail}"
+        );
+    }
+
     #[test]
     fn the_terminal_shows_risk_cut_and_note_lines_only_when_present() {
         let plain = terminal(&prompt(shell(&["ls"]), None));
