@@ -1440,14 +1440,16 @@ sallyport/
   `egress.response` and `egress.close` are records of what happened, written as below:
   - `egress.resolve` (no decision), right before the one lookup: `{host, port}`; without it
     there is no lookup (RT-AUD-04). An `egress.resolve` followed by neither `egress.allow` nor
-    `egress.deny` for its target means a stop or a failed append ended the request.
+    `egress.deny` for its target, or an `egress.allow` followed by no `egress.close`, means a
+    stop, a failed append or the latch below ended the request.
   - Once any of a session's egress appends has failed (a panic included), its egress is closed
     for the rest of the session (RT-AUD-04): every later connection is closed at once, unread
     and with no reply, after one best-effort `egress.deny {reason: "audit-failed"}` (none once
     the session has stopped); `egress.resolve`,
-    `egress.allow` and an in-tunnel `egress.request` are no longer written, so nothing more is
-    looked up, dialled or forwarded (an open intercepted tunnel ends `error` at its next
-    request; an open spliced tunnel runs on to its end). Not reported beyond the log (#342).
+    `egress.allow` and an in-tunnel `egress.request` are no longer started, and one already
+    being written when the latch set has no effect after it, so nothing more is looked up,
+    dialled or forwarded (an open intercepted tunnel ends `error` at its next request; an open
+    spliced tunnel runs on to its end). Not reported beyond the log (#342).
   - `egress.allow` (decision `allow`), before the first dial and the `200`: `{host, port,
     addresses, intercept}` — the addresses that passed the filter, at most 16, in the order they
     are tried; `intercept` is true for a grant host (Task 9a-2).

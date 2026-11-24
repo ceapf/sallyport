@@ -12,8 +12,8 @@
 //! Latch (RT-AUD-04): once any of the session's egress appends has failed, egress stays
 //! closed. Every later connection is closed unread, without a reply, after one best-effort
 //! `egress.deny` (`audit-failed`), and no entry that would permit an effect (`egress.resolve`,
-//! `egress.allow`, an in-tunnel `egress.request`) is written: no lookup, dial or forwarded
-//! request follows.
+//! `egress.allow`, an in-tunnel `egress.request`) is started; one already being written when
+//! the latch set stands with no effect after it. No lookup, dial or forwarded request follows.
 
 use std::future::Future;
 use std::io;
