@@ -935,8 +935,8 @@ fn rt_sec_08_secret_values_cannot_enter_through_the_manifest() {
 
 /// A token pasted as a secret name that its check refuses, with a slash, a space or a quote in
 /// it, is not echoed by the warnings either: with an allow rule, the `[data-can-leave]` warning
-/// names grants, and only a checked name is masked whole when quoted (architect Q376). Control,
-/// in-test (first): the same body with a name its check accepts, holding the token's upper-case
+/// names grants, and only a checked name is masked whole when quoted (architect Q376). Control:
+/// in-test (first), the same body with a name its check accepts, holding the token's upper-case
 /// run, through the same `load` and `rendered_all`, shows that run in the warning; so the
 /// warning names a grant's secret and only the name guard in `validate/exposure.rs` keeps the
 /// malformed ones out.
