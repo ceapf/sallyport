@@ -132,6 +132,7 @@ fn get(call: u64) -> Bound {
         call,
         action: Action::Fetch {
             method: "GET".to_owned(),
+            credentials: vec![],
             url: "https://h/".to_owned(),
             headers: vec![],
             body: Payload::new(vec![]),
@@ -1207,6 +1208,7 @@ fn shell_with_form_at(at: usize) -> Action {
 fn actions_with_a_form() -> Vec<Action> {
     let fetch = Action::Fetch {
         method: format!("M{FORM}"),
+        credentials: vec!["secret:K".to_owned()],
         url: format!("https://h/?q={FORM}"),
         headers: vec![(format!("x-{FORM}"), format!("Bearer {FORM}"))],
         body: Payload::new(b"b".to_vec()),
@@ -1272,11 +1274,13 @@ fn with_placeholder(action: &Action) -> Action {
         Action::FsDelete { target } => Action::FsDelete { target: t(target) },
         Action::Fetch {
             method,
+            credentials,
             url,
             headers,
             body,
         } => Action::Fetch {
             method: p(method),
+            credentials: credentials.iter().map(|c| p(c)).collect(),
             url: p(url),
             headers: headers.iter().map(|(n, v)| (p(n), p(v))).collect(),
             body: body.clone(),

@@ -55,6 +55,10 @@ use shell::{Output, Runner, Status};
 /// The code of a call refused, or a write aborted, because its session is stopping (Q59).
 pub const STOPPING: &str = "session-stopping";
 
+/// The code of a fetch that sent nothing because the credentials the proxy would add for its
+/// host are no longer the ones its prompt named and its approval bound (RT-AG-04).
+pub const CREDENTIALS_CHANGED: &str = "credentials-changed";
+
 /// Every built-in tool, in `tools/list` order.
 const ALL: [BuiltinTool; 6] = [
     BuiltinTool::FsList,
@@ -526,8 +530,9 @@ impl<R: Runner> Core<R> {
     }
 
     /// `fetch` at prepare: the URL first (its host names the grants), then the checks of
-    /// `fetch.rs`; the action binds the canonical URL (architect ruling Q4) and, for a grant host,
-    /// the note names the credentials the proxy adds, never a value (Q3).
+    /// `fetch.rs`; the action binds the canonical URL (architect ruling Q4) and the credentials
+    /// the proxy adds, by name, never a value (Q3); the prompt shows them before the URL, and a
+    /// fetch has no note.
     fn prepare_fetch(
         &self,
         url: &str,
@@ -542,16 +547,15 @@ impl<R: Runner> Core<R> {
         let g = f.connector.grants(&host);
         let len = u64::try_from(body.len()).unwrap_or(u64::MAX);
         let u = fetch::check(url, &method, &headers, len, f.max_request, &g.headers)?;
-        let note = (!g.names.is_empty())
-            .then(|| format!("the proxy adds {} for {host}", g.names.join(", ")));
         Ok(Prepared {
             action: Action::Fetch {
                 method,
+                credentials: g.names,
                 url: u.canonical(),
                 headers,
                 body: Payload::new(body),
             },
-            note,
+            note: None,
             destructive: None,
         })
     }
@@ -562,6 +566,7 @@ impl<R: Runner> Core<R> {
         let b = ticket.bound();
         let Action::Fetch {
             method,
+            credentials,
             url,
             headers,
             body,
@@ -599,12 +604,18 @@ impl<R: Runner> Core<R> {
             body.bytes(),
             cap,
         );
-        // Q59: the session's stop ends the exchange at once; dropping it drops the connection,
-        // whose end the proxy records itself (security re-review M1).
-        let got = tokio::select! {
-            biased;
-            () = self.ops.stopped() => None,
-            got = send => Some(got),
+        // The credentials shown and bound at the prompt are the ones the proxy adds now, or
+        // nothing is sent (RT-AG-04).
+        let got = if f.connector.grants(&u.host).names == *credentials {
+            // Q59: the session's stop ends the exchange at once; dropping it drops the
+            // connection, whose end the proxy records itself (security re-review M1).
+            tokio::select! {
+                biased;
+                () = self.ops.stopped() => None,
+                got = send => Some(got),
+            }
+        } else {
+            Some(Err(CREDENTIALS_CHANGED))
         };
         let mut r = json!({"call": b.call, "tool": "fetch", "action_sha256": b.digest()});
         let out = match got {

@@ -350,18 +350,21 @@ async fn rt_ag_14_fetch_a_write_reaches_the_upstream_only_once_approved() {
     nothing_sent("pending");
     assert_eq!(bounded("timeout", h).await.unwrap(), "denied: timeout");
     nothing_sent("after the timeout");
-    // Deny. The prompt shows the canonical URL and the harness's header, and names the
-    // credential the proxy adds, never its value (architect rulings Q3, Q4).
+    // Deny. The prompt's action shows the canonical URL and the harness's header, and names
+    // the credential the proxy adds before the URL, never its value (architect rulings Q3, Q4
+    // and the ruling on the credentials a fetch carries); a fetch has no note.
     let h = call(&f, post.clone());
     let p = f.until_shown(1).await;
     assert!(
+        p.action.starts_with(&format!(
+            "fetch \"POST\" with credentials [\"secret:T0\"] from \"https://{HOST}/echo\""
+        )),
+        "{}",
         p.action
-            .starts_with(&format!("fetch \"POST\" \"https://{HOST}/echo\""))
     );
     assert!(p.full.contains("\"X-Trace\": \"t-1\""), "{}", p.full);
-    let note = p.note.clone().unwrap();
-    assert!(note.contains("secret:T0"), "{note}");
-    assert!(!note.contains(&value(0)) && !p.full.contains(&value(0)));
+    assert_eq!(p.note, None);
+    assert!(!p.action.contains(&value(0)) && !p.full.contains(&value(0)));
     nothing_sent("pending again");
     decide(&f.desk, &p.id, Decision::Deny, ME).await.unwrap();
     assert_eq!(bounded("deny", h).await.unwrap(), "denied: denied");

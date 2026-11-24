@@ -107,6 +107,11 @@ pub enum Action {
     Fetch {
         /// HTTP method, as sent.
         method: String,
+        /// The credentials the proxy adds to this request (`secret:NAME`, each once, in manifest
+        /// order; names only, never a value), from the session's grants for the URL's host.
+        /// Bound even when empty; the run sends nothing unless the host's grants still name
+        /// exactly these.
+        credentials: Vec<String>,
         /// The URL, canonical, as requested (`tools::fetch_url`; #75 ruling Q4): what is shown is
         /// what goes on the wire.
         url: String,
@@ -186,12 +191,13 @@ impl Action {
             }
             Self::Fetch {
                 method,
+                credentials,
                 url,
                 headers,
                 body,
             } => json!({
-                "tool": "fetch", "method": method, "url": url, "headers": headers,
-                "body": body.canonical(),
+                "tool": "fetch", "method": method, "credentials": credentials, "url": url,
+                "headers": headers, "body": body.canonical(),
             }),
             Self::Mcp { server, tool, args } => json!({
                 "tool": "mcp", "server": server, "name": tool, "args": args.canonical(),
@@ -380,6 +386,7 @@ mod tests {
         let f = |method: &str, url: &str, hdr: (&str, &str), body: &[u8]| {
             bound(Action::Fetch {
                 method: method.to_owned(),
+                credentials: vec![],
                 url: url.to_owned(),
                 headers: vec![(hdr.0.to_owned(), hdr.1.to_owned())],
                 body: payload(body),
@@ -392,6 +399,35 @@ mod tests {
         assert_ne!(base, f("POST", "https://h/x", ("c", "1"), b"b"));
         assert_ne!(base, f("POST", "https://h/x", ("a", "2"), b"b"));
         assert_ne!(base, f("POST", "https://h/x", ("a", "1"), b"c"));
+    }
+
+    /// The credentials a fetch will carry are part of what an approval binds: another list, a
+    /// list in another order or no list at all is another digest, and the canonical form names
+    /// the list even when it is empty.
+    #[test]
+    fn fetch_binds_the_credentials_it_carries() {
+        let f = |credentials: &[&str]| Action::Fetch {
+            method: "GET".to_owned(),
+            credentials: credentials.iter().map(|s| (*s).to_owned()).collect(),
+            url: "https://h/x".to_owned(),
+            headers: vec![],
+            body: payload(b""),
+        };
+        let digest = |c: &[&str]| bound(f(c)).digest();
+        let base = digest(&["secret:A"]);
+        assert_ne!(base, digest(&[]));
+        assert_ne!(base, digest(&["secret:B"]));
+        assert_ne!(base, digest(&["secret:A", "secret:B"]));
+        assert_ne!(
+            digest(&["secret:A", "secret:B"]),
+            digest(&["secret:B", "secret:A"])
+        );
+        assert_eq!(base, digest(&["secret:A"]));
+        assert_eq!(f(&[]).canonical()["credentials"], json!([]));
+        assert_eq!(
+            f(&["secret:A"]).canonical()["credentials"],
+            json!(["secret:A"])
+        );
     }
 
     #[test]
@@ -459,6 +495,7 @@ mod tests {
         assert_eq!(Action::FsList { target: file }.tool(), "fs_list");
         let f = Action::Fetch {
             method: "GET".to_owned(),
+            credentials: vec![],
             url: String::new(),
             headers: vec![],
             body: payload(b""),

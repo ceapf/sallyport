@@ -294,6 +294,7 @@ mod tests {
     fn fetch(method: &str) -> Action {
         Action::Fetch {
             method: method.to_owned(),
+            credentials: vec![],
             url: "https://h/".to_owned(),
             headers: vec![],
             body: Payload::new(vec![]),
@@ -482,6 +483,7 @@ mod tests {
         for m in ["GET", "HEAD"] {
             let Action::Fetch {
                 method,
+                credentials,
                 url,
                 headers,
                 ..
@@ -491,6 +493,7 @@ mod tests {
             };
             let with_body = Action::Fetch {
                 method,
+                credentials,
                 url,
                 headers,
                 body: Payload::new(b"x".to_vec()),
@@ -505,6 +508,7 @@ mod tests {
         {
             let a = Action::Fetch {
                 method: "GET".to_owned(),
+                credentials: vec![],
                 url: "https://h/".to_owned(),
                 headers: vec![
                     ("Accept".to_owned(), "*/*".to_owned()),
@@ -516,6 +520,7 @@ mod tests {
         }
         let plain = Action::Fetch {
             method: "HEAD".to_owned(),
+            credentials: vec![],
             url: "https://h/".to_owned(),
             headers: vec![("Accept".to_owned(), "*/*".to_owned())],
             body: Payload::new(vec![]),

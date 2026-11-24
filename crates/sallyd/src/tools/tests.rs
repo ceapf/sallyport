@@ -1000,6 +1000,7 @@ async fn a_failure_at_run_time_is_reported_and_audited() {
     // A fetch ticket on tools without a way out (architect ruling Q8).
     let fetch = Action::Fetch {
         method: "GET".into(),
+        credentials: vec![],
         url: "https://x.mock.test/".into(),
         headers: vec![],
         body: Payload::new(vec![]),
@@ -1517,6 +1518,124 @@ async fn a_fetch_in_flight_at_the_stop_ends_killed_inside_the_drain() {
         "the connection outlived the stop"
     );
     assert!(got.starts_with(b"CONNECT example.org:443 "), "{got:?}");
+}
+
+/// A way out whose grants answer from a list, one per call (the last one repeats): the fetch's
+/// prepare reads the first, its run the second. Its streams never answer, like [`Stall`].
+struct Shifting {
+    grants: StdMutex<Vec<Vec<String>>>,
+    opened: Stall,
+}
+
+impl Shifting {
+    fn of(names: &[&[&str]]) -> Arc<Self> {
+        let grants = names
+            .iter()
+            .rev()
+            .map(|n| n.iter().map(|s| (*s).to_owned()).collect())
+            .collect();
+        Arc::new(Self {
+            grants: StdMutex::new(grants),
+            opened: Stall::default(),
+        })
+    }
+
+    fn opened(&self) -> usize {
+        self.opened.0.lock().unwrap().len()
+    }
+}
+
+impl crate::egress::local::Connector for Shifting {
+    fn open(&self, origin: Value) -> std::io::Result<tokio::io::DuplexStream> {
+        self.opened.open(origin)
+    }
+
+    fn client_tls(&self, host: &str) -> Arc<rustls::ClientConfig> {
+        self.opened.client_tls(host)
+    }
+
+    fn grants(&self, _host: &str) -> crate::egress::local::HostGrants {
+        let mut g = self.grants.lock().unwrap();
+        let names = if g.len() > 1 {
+            g.pop().unwrap()
+        } else {
+            g[0].clone()
+        };
+        crate::egress::local::HostGrants {
+            headers: vec!["authorization".to_owned()],
+            names,
+        }
+    }
+}
+
+fn fetching(name: &str, c: &Arc<Shifting>) -> Arc<Fx> {
+    let mut o = opts_without_mounts();
+    o.fetch = Some(FetchParts {
+        connector: Arc::clone(c) as Arc<dyn crate::egress::local::Connector>,
+        max_request: 1 << 20,
+        max_response: 1 << 20,
+    });
+    Arc::new(fx(name, o))
+}
+
+/// Deny: the credentials the proxy would add changed between the prompt and the run. Nothing is
+/// sent: no connection opens, and `tool.result` records the fixed code after `tool.run`.
+#[tokio::test]
+async fn a_fetch_whose_credentials_changed_since_its_prompt_sends_nothing() {
+    let c = Shifting::of(&[&["secret:A"], &["secret:A", "secret:B"]]);
+    let f = fetching("fetch-creds-changed", &c);
+    let out = f
+        .call("fetch", json!({"url": "https://example.org/"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        (out.is_error, out.text.as_str()),
+        (true, "failed: credentials-changed")
+    );
+    assert_eq!(c.opened(), 0, "a connection opened");
+    let r = f.sink.last("tool.result");
+    assert_eq!(
+        (
+            r["outcome"].as_str(),
+            r["code"].as_str(),
+            r["tool"].as_str()
+        ),
+        (Some("failed"), Some("credentials-changed"), Some("fetch"))
+    );
+    assert!(r["action_sha256"].is_string() && r["call"].is_u64(), "{r}");
+    let ev = f.sink.events();
+    let run = ev.iter().position(|e| e == "tool.run");
+    let result = ev.iter().position(|e| e == "tool.result");
+    assert!(run.is_some() && run < result, "{ev:?}");
+    assert_eq!(f.sink.last("tool.run")["action_sha256"], r["action_sha256"]);
+}
+
+/// Allow, the control of the test above: the same credentials at prepare and at run, and the
+/// fetch opens its connection.
+#[tokio::test]
+async fn a_fetch_whose_credentials_held_since_its_prompt_is_sent() {
+    let c = Shifting::of(&[&["secret:A"], &["secret:A"]]);
+    let f = fetching("fetch-creds-held", &c);
+    let f2 = Arc::clone(&f);
+    let h = tokio::spawn(async move {
+        f2.call("fetch", json!({"url": "https://example.org/"}))
+            .await
+    });
+    for _ in 0..200 {
+        if c.opened() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        c.opened(),
+        1,
+        "control: the fetch never opened its connection"
+    );
+    f.ops.stop();
+    assert_eq!(f.ops.drained(Duration::from_secs(5)).await, 0);
+    let out = h.await.unwrap().unwrap();
+    assert_eq!(out.text, "failed: session-stopping");
 }
 
 /// Q59 (b): the last check before the effect. A write that waited at the gate while the session's

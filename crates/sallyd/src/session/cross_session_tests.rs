@@ -106,13 +106,16 @@ fn entries(v: &str, own: Option<&Redaction>) -> Vec<NewEntry> {
     // across AUDIT_ACTION_CHARS.
     let fetch = Action::Fetch {
         method: format!("M{v}"),
+        credentials: vec![],
         url: format!("https://h.test/?q={v}"),
         headers: vec![("x-k".to_owned(), format!("Bearer {v}"))],
         body: Payload::new(Vec::new()),
     };
-    let lead = "fetch \"GET\" \"https://h.test/\" headers [\"x-k\": \"".len();
+    let lead =
+        "fetch \"GET\" with no credentials from \"https://h.test/\" headers [\"x-k\": \"".len();
     let header = placed(v, lead, AUDIT_ACTION_CHARS).map(|s| Action::Fetch {
         method: "GET".to_owned(),
+        credentials: vec![],
         url: "https://h.test/".to_owned(),
         headers: vec![("x-k".to_owned(), s)],
         body: Payload::new(Vec::new()),

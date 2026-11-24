@@ -63,6 +63,7 @@ impl Executor for std::sync::Arc<Recording> {
                     .and_then(Value::as_str)
                     .unwrap_or("GET")
                     .to_owned(),
+                credentials: vec![],
                 url: a
                     .get("url")
                     .and_then(Value::as_str)
@@ -609,7 +610,7 @@ async fn rt_ag_14_a_fetch_write_waits_for_approval_and_is_denied_on_timeout() {
     let p = shown(&f, 1).await;
     assert!(
         p.action
-            .starts_with("fetch \"POST\" \"https://api.mock.test/gists\"")
+            .starts_with("fetch \"POST\" with no credentials from \"https://api.mock.test/gists\"")
     );
     assert!(ran(&f).is_empty());
     decide(&f.desk, &p.id, Decision::Approve, ME).await.unwrap();

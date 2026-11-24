@@ -35,7 +35,8 @@ pub struct Prepared {
 /// - [`run`](Self::run) acts on the ticket only. A file target is re-resolved from the mount's
 ///   pinned fd (`openat2`, SI-8) and refused if it no longer is the ticket's `host`/`rel`; a
 ///   fetch follows no redirect; fetch headers are the harness's, before any injection, so a
-///   secret never reaches a prompt or the audit (SI-3).
+///   secret never reaches a prompt or the audit (SI-3); a fetch sends nothing unless its host's
+///   grants still name exactly the ticket's `credentials` (RT-AG-04).
 pub trait Executor: Send + Sync + 'static {
     /// The session's tools, as `tools/list` returns them.
     fn tools(&self) -> Vec<Tool>;

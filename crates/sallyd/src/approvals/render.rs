@@ -198,13 +198,26 @@ pub fn action_pieces(a: &Action) -> Vec<Piece> {
         }
         Action::Fetch {
             method,
+            credentials,
             url,
             headers,
             body,
         } => {
             p.lit("fetch ");
             p.quoted(method);
-            p.lit(" ");
+            if credentials.is_empty() {
+                p.lit(" with no credentials");
+            } else {
+                p.lit(" with credentials [");
+                for (i, c) in credentials.iter().enumerate() {
+                    if i > 0 {
+                        p.lit(", ");
+                    }
+                    p.quoted(c);
+                }
+                p.lit("]");
+            }
+            p.lit(" from ");
             p.quoted(url);
             p.lit(" headers [");
             for (i, (n, v)) in headers.iter().enumerate() {
@@ -393,6 +406,7 @@ mod tests {
     fn fetch_and_mcp_show_what_is_sent() {
         let f = Action::Fetch {
             method: "POST".to_owned(),
+            credentials: vec![],
             url: "https://api.mock.test/gists".to_owned(),
             headers: vec![("X-A".to_owned(), "1\r\n".to_owned())],
             body: Payload::new(b"{}".to_vec()),
@@ -400,8 +414,8 @@ mod tests {
         let t = action_text(&f);
         assert!(
             t.starts_with(
-                "fetch \"POST\" \"https://api.mock.test/gists\" headers [\"X-A\": \"1\\x0d\\x0a\"] \
-             body 2 bytes (sha256 44136fa3"
+                "fetch \"POST\" with no credentials from \"https://api.mock.test/gists\" \
+                 headers [\"X-A\": \"1\\x0d\\x0a\"] body 2 bytes (sha256 44136fa3"
             ),
             "{t}"
         );
@@ -435,6 +449,7 @@ mod tests {
     fn fetch_headers_are_listed_apart_in_order() {
         let f = Action::Fetch {
             method: "GET".to_owned(),
+            credentials: vec![],
             url: "https://api.mock.test/".to_owned(),
             headers: vec![
                 ("X-A".to_owned(), "1".to_owned()),
@@ -446,6 +461,42 @@ mod tests {
         assert!(
             t.contains(" headers [\"X-A\": \"1\", \"X-B\": \"2\"] body 0 bytes"),
             "{t}"
+        );
+    }
+
+    /// A fetch names the credentials the proxy adds before its URL, each name quoted, in order,
+    /// never a value; with none it says so in fixed words (architect ruling on the credentials
+    /// a fetch carries).
+    #[test]
+    fn a_fetch_names_its_credentials_before_the_url() {
+        let f = |credentials: &[&str]| {
+            action_text(&Action::Fetch {
+                method: "GET".to_owned(),
+                credentials: credentials.iter().map(|s| (*s).to_owned()).collect(),
+                url: "https://api.mock.test/".to_owned(),
+                headers: vec![],
+                body: Payload::new(Vec::new()),
+            })
+        };
+        assert!(
+            f(&["secret:A", "secret:B\x1b"]).starts_with(
+                "fetch \"GET\" with credentials [\"secret:A\", \"secret:B\\x1b\"] \
+                 from \"https://api.mock.test/\" headers []"
+            ),
+            "{}",
+            f(&["secret:A"])
+        );
+        assert!(
+            f(&["secret:A"]).starts_with(
+                "fetch \"GET\" with credentials [\"secret:A\"] from \"https://api.mock.test/\""
+            ),
+            "{}",
+            f(&["secret:A"])
+        );
+        assert!(
+            f(&[]).starts_with("fetch \"GET\" with no credentials from \"https://api.mock.test/\""),
+            "{}",
+            f(&[])
         );
     }
 
@@ -631,9 +682,11 @@ mod tests {
             }
             if in_full {
                 let _ = writeln!(out, "  | ({rows} rows of the full action)");
-                in_full = false;
             }
             in_full = line == "  full action:";
+            if in_full {
+                rows = 0;
+            }
             let _ = writeln!(out, "{line}");
         }
         if in_full {
