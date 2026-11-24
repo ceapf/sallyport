@@ -1441,7 +1441,7 @@ fn retried_id(log: &str) -> String {
     line[at..].split('"').next().unwrap().to_owned()
 }
 
-/// #239, Q760's case: a launch fails, its cleanup cannot remove its container, then `sallyd`
+/// #239, the case its fix must cover: a launch fails, its cleanup cannot remove its container, then `sallyd`
 /// is stopped. Shutdown does not report a clean stop: it exits non-zero, and one oplog line
 /// names the failed launch. It waits for no retry: the exit comes within a few seconds, while
 /// the cleanup still has minutes of pauses ahead. The twin below is the allow case. Control,

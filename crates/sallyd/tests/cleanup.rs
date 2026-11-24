@@ -85,7 +85,7 @@ fn refused(at: &Path) -> usize {
 
 /// The longest a test waits for six, or all ten, tries of a cleanup whose `rm` keeps failing
 /// (each try is the removal's four attempts two seconds apart and about ten podman calls, then
-/// the pause: about 7 s idle, ten tries about 70 s; this leaves room for both lanes' load).
+/// the pause: about 7 s idle, ten tries about 70 s; this leaves room for parallel test runs).
 const LONG_BOUND: Duration = Duration::from_secs(300);
 
 /// Waits within [`BOUND`] until `done`, naming `what` if it never is.
