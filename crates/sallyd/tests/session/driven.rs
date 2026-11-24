@@ -41,11 +41,28 @@ pub(super) fn entries_of(r: &Rx, id: &str) -> Vec<String> {
         .collect()
 }
 
+/// The names in a session's harness socket directory; a listing that fails fails the test.
+fn harness_listing(r: &Rx, id: &str) -> Vec<std::ffi::OsString> {
+    let dir = r.x.session_paths(id).harness_sockets();
+    std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|e| e.unwrap().file_name())
+        .collect()
+}
+
+/// A driven session binds no socket. Control, first: the same listing of an ordinary session's
+/// harness socket directory finds its `agent.sock`.
 #[test]
 fn rt_drv_01_a_driven_session_serves_no_socket_and_says_what_model_it_has() {
     rt().block_on(async {
         let r = registry();
         let v = Arc::new(r.x.f.validated(""));
+        let plain = r.reg.start(Arc::clone(&v)).await.unwrap();
+        let listed = harness_listing(&r, &plain.id);
+        assert!(
+            listed.iter().any(|n| n == "agent.sock"),
+            "control: an ordinary session's harness folder: {listed:?}"
+        );
         let s = r
             .reg
             .start_with(Arc::clone(&v), Some(script("{\"fail\":true}\n")))
@@ -54,28 +71,23 @@ fn rt_drv_01_a_driven_session_serves_no_socket_and_says_what_model_it_has() {
         assert_eq!(s.model.kind, ModelKind::Scripted);
         assert!(s.model.driven);
         assert_eq!(s.model.turns, Some(1));
-        let harness = r.x.session_paths(&s.id).harness_sockets();
-        let socks: Vec<_> = std::fs::read_dir(&harness)
-            .map(|d| d.flatten().map(|e| e.file_name()).collect())
-            .unwrap_or_default();
+        let socks = harness_listing(&r, &s.id);
         assert!(socks.is_empty(), "a driven session binds: {socks:?}");
-        assert!(agent_socks(&r.x.xdg.join("sallyport/sessions")).is_empty());
         assert!(r.reg.driver(&s.id).is_some());
+        // The driven session started second: its `session.start` is the last one.
         let start =
             r.x.events
                 .all()
                 .into_iter()
-                .find(|(e, _)| e == "session.start")
+                .rfind(|(e, _)| e == "session.start")
                 .unwrap()
                 .1;
         assert_eq!(start["model"]["kind"], "scripted");
         assert_eq!(start["model"]["driven"], true);
         assert_eq!(start["model"]["sha256"].as_str().unwrap().len(), 64);
         // An ordinary session has no drive handle and its model is none.
-        let plain = r.reg.start(v).await.unwrap();
         assert!(r.reg.driver(&plain.id).is_none());
         assert_eq!(plain.model.kind, ModelKind::None);
-        assert!(!agent_socks(&r.x.xdg.join("sallyport/sessions")).is_empty());
         assert_eq!(
             r.reg.stop(&s.id, StopReason::Request).await,
             Some(StopOutcome::Stopped)
