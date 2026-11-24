@@ -46,8 +46,9 @@ use crate::sandbox::{AuditSink, SharedAudit};
 /// dropped body's report; Q251, #156); its sandbox-chosen text is still redacted with the
 /// session's forms. A target and a method are declared masked by `own_masked` already (this
 /// pass masks declared texts too, uncut; Q276); this pass is the only one after the release for
-/// the `host` of `egress.allow` and `egress.close` (a host a wildcard rule allowed, which no
-/// builder masks) and for any field a later builder adds without `own_masked` (Q266). The
+/// the `host` of `egress.resolve`, `egress.allow` and `egress.close` (a host a wildcard rule
+/// allowed, which no builder masks) and for any field a later builder adds without
+/// `own_masked` (Q266). The
 /// launcher wraps the session's sink right after its egress
 /// loaded the forms. Append-only: it swaps no redactor.
 pub(crate) struct SessionRedacted {
