@@ -7,13 +7,13 @@ use sally_core::manifest::AuditLevel;
 use serde_json::json;
 
 use super::parts::{
-    CleanupTries, Directories, Made, NextTry, STOP_RETRIES_AFTER_REMOVAL, abandoned_entry,
-    cleaned_entry, containers_gone,
+    CleanupTries, Directories, Made, NextTry, Owner, STOP_RETRIES_AFTER_REMOVAL, Subject,
+    abandoned_entry, cleaned_entry, containers_gone, stop_failed_entry,
 };
 use super::start::Held;
 use super::{
-    Confirmed, DETAIL_STYLE, LaunchError, Launcher, Progress, RoleRunning, RoleStopError, Running,
-    STOP_RETRY, StopError, blocking,
+    Confirmed, LaunchError, Launcher, Progress, RoleRunning, RoleStopError, Running, StopError,
+    blocking,
 };
 use crate::sandbox::commands::rm_args;
 use crate::sandbox::orphans::{
@@ -58,7 +58,10 @@ impl Launcher {
     /// each removal before it.
     ///
     /// # Errors
-    /// [`LaunchError`] if podman cannot list or remove them, or a listing line is malformed.
+    /// [`LaunchError`] if podman cannot list them, a listing line is malformed, or a removal's
+    /// entry cannot be written (the sweep ends: fail closed). A removal that fails is audited
+    /// (`sandbox.orphan_remove_failed`, after an oplog error line) and the sweep goes on to the
+    /// next orphan; the sweep then fails naming the first one not removed.
     pub async fn remove_orphans(
         &self,
         scope: &str,
@@ -144,35 +147,77 @@ impl Launcher {
         .map_err(|msg| LaunchError::Command { verb: "ps", msg })
     }
 
-    /// Stops a launch nobody received, retrying until the container is gone. Meanwhile the
-    /// handle keeps its disk watchdog, so the session stays bounded (6c-1 re-review M2). The
-    /// first failure is audited as `sandbox.stop_failed`.
+    /// Stops a workspace nobody holds (a launch nobody received, a dropped handle), retrying
+    /// until the container is confirmed gone, the pauses backed off and capped, the tries not
+    /// (RT-AG-08b). Meanwhile the handle keeps its disk watchdog and egress policy, so the
+    /// session stays bounded (RT-AG-09), and its id is among the unconfirmed containers. The
+    /// first failure with the container still there is audited as `sandbox.stop_failed`
+    /// (RT-AUD-03); one with it gone is retried a bounded number of times, which release the
+    /// claims and remove the scratch.
     pub(super) async fn stop_unreceived(&self, mut running: Running) {
+        running.owner = Owner::Launcher;
+        let id = running.paths.id().as_str().to_owned();
+        self.cleanup_begins(Role::Workspace, &id);
+        let (mut tries, mut after_removal) = (0_u32, 0_u32);
         let mut reported = false;
         loop {
-            // Nobody received this launch, so it gets no `session.closed` (Q245): the token is
+            tries = tries.saturating_add(1);
+            // Nobody holds this handle, so it gets no `session.closed`: the token is
             // dropped.
-            let e = match self.stop(running).await {
-                Ok(_) => return,
+            let mut e = match self.stop(running).await {
+                Ok(_) => return self.cleanup_confirmed(Role::Workspace, &id),
                 Err(e) => e,
             };
-            if !reported {
-                reported = true;
-                let entry = NewEntry::new(Actor::Sallyd, "sandbox.stop_failed")
-                    .session(e.running.paths.id().as_str())
-                    .decision("deny")
-                    .args(json!({"container": e.running.name}))
-                    .text("detail", e.error.to_string(), DETAIL_STYLE);
-                if self.audit(entry, e.running.level).await.is_err() {
-                    self.unaudited("sandbox.stop_failed", e.running.paths.id().as_str());
-                }
-            }
-            // `stop` also fails after the container is gone (scratch removal): nothing runs.
+            // `stop` also fails with the container gone (scratch removal, or a container that
+            // went by itself): nothing runs, so no entry. A bounded number of retries remain,
+            // which release the claims and remove the scratch once `stop` gets that far. A retry
+            // finds the container by name, which is safe: session ids are fresh random ids minted
+            // once, so no other workspace ever carries this name.
             if matches!(self.container_exists(&e.running.name).await, Ok(false)) {
-                return;
+                if after_removal >= STOP_RETRIES_AFTER_REMOVAL {
+                    e.running.owner = Owner::Ended;
+                    return self.cleanup_confirmed(Role::Workspace, &id);
+                }
+                after_removal += 1;
+            } else if !reported {
+                reported = true;
+                self.audit_workspace_stop_failed(&e.running, tries, &e.error)
+                    .await;
             }
             running = e.running;
-            tokio::time::sleep(STOP_RETRY).await;
+            tokio::time::sleep(self.stop_pause(tries)).await;
+        }
+    }
+
+    /// `sandbox.stop_failed` for a workspace stop that `attempts` tries could not confirm,
+    /// `error` the last one's: the supervisor's first failed round, a failed start's discard,
+    /// and the launcher's stop of a workspace nobody holds, each once per stop (RT-AUD-03).
+    pub(crate) async fn audit_workspace_stop_failed(
+        &self,
+        r: &Running,
+        attempts: u32,
+        error: &LaunchError,
+    ) {
+        let subject = Subject::Session(r.paths.id().clone());
+        self.audit_stop_failed(&subject, Role::Workspace, &r.name, attempts, error, r.level)
+            .await;
+    }
+
+    /// `sandbox.stop_failed` for a stop of `role`'s `container` that `attempts` tries could not
+    /// confirm, `error` the last one's (RT-AUD-03). A refused append is the `unaudited` oplog
+    /// line; the stop goes on either way.
+    async fn audit_stop_failed(
+        &self,
+        subject: &Subject,
+        role: Role,
+        container: &str,
+        attempts: u32,
+        error: &LaunchError,
+        level: AuditLevel,
+    ) {
+        let entry = stop_failed_entry(subject, role, container, attempts, error.to_string());
+        if self.audit(entry, level).await.is_err() {
+            self.unaudited("sandbox.stop_failed", subject.id().as_str());
         }
     }
 
@@ -213,9 +258,10 @@ impl Launcher {
     /// an oplog error line first when the directories are kept), the claim freed, the session's
     /// forms released. A last try with the probe or the container not confirmed gone writes an
     /// oplog error line and `sandbox.cleanup_abandoned` and releases the forms, but keeps the
-    /// claim, the slot and the live id until `sallyd` exits (RT-AG-08b): no overlapping launch
-    /// starts while the container may still run, and the next start's orphan sweep removes
-    /// it. Shutdown waits for none of this ([`Launcher::unfinished_cleanups`]).
+    /// claim until `sallyd` exits (a workspace's: its mounts, slot and live id; a harness's:
+    /// its session's harness claim; RT-AG-08b): no overlapping launch starts while the
+    /// container may still run, and the next start's orphan sweep removes it. Shutdown waits
+    /// for none of this ([`Launcher::unconfirmed_containers`]).
     pub(super) async fn finish_failed(
         &self,
         held: Held,
@@ -290,9 +336,10 @@ impl Launcher {
 
     /// A failed launch's cleanup reached its cap with its probe or container not confirmed
     /// gone: one oplog error line naming them, then `sandbox.cleanup_abandoned` (a refused
-    /// append is the `unaudited` line), then the forms released. No unclaim: the claim, the
-    /// slot and the live id stay until `sallyd` exits (RT-AG-08b), and the id stays among the
-    /// unfinished cleanups.
+    /// append is the `unaudited` line), then the forms released. No unclaim: the claim stays
+    /// until `sallyd` exits (a workspace's: its mounts, slot and live id; a harness's: its
+    /// session's harness claim; an instance has none; RT-AG-08b), and the id stays among the
+    /// unconfirmed containers.
     async fn abandon(&self, held: &Held, p: &Progress, attempts: u32, last: &LaunchError) {
         let subject = &held.subject;
         let left = Made {
@@ -364,6 +411,11 @@ impl Launcher {
                 Role::Harness => self.sessions.free_harness(r.subject.id().as_str()),
                 Role::Workspace | Role::Inference => {}
             }
+            // A stop of a container nobody holds leaves the unconfirmed ones as soon as it is
+            // gone; a caller's stop was never among them.
+            if r.owner == Owner::Launcher {
+                self.cleanup_confirmed(r.role, r.subject.id().as_str());
+            }
         }
         let mut cleaned = Ok(());
         for d in &r.dirs {
@@ -372,84 +424,92 @@ impl Launcher {
                 break;
             }
         }
-        audited
-            .and(cleaned)
-            .map_err(|error| Box::new(RoleStopError { running: r, error }))
+        match audited.and(cleaned) {
+            Ok(()) => {
+                r.owner = Owner::Ended;
+                Ok(())
+            }
+            Err(error) => Err(Box::new(RoleStopError { running: r, error })),
+        }
     }
 
-    /// [`Self::stop_role`] for a launch nobody received, retried until the container is gone;
-    /// the first failure is audited as `sandbox.stop_failed`. TODO(#135): one loop with
+    /// [`Self::stop_role`] for a container nobody holds (a launch nobody received, a dropped
+    /// handle), retried until the container is confirmed gone, the pauses backed off and
+    /// capped (RT-AG-08b); its id is among the unconfirmed containers meanwhile, unless an earlier
+    /// stop already removed the container. The first failure with the container still there is
+    /// audited as `sandbox.stop_failed` (RT-AUD-03). TODO(#135): one loop with
     /// [`Self::stop_unreceived`].
     pub(super) async fn stop_role_unreceived(&self, mut running: RoleRunning) {
+        running.owner = Owner::Launcher;
+        let (role, id) = (running.role, running.subject.id().as_str().to_owned());
+        if !running.removed {
+            self.cleanup_begins(role, &id);
+        }
+        let (mut tries, mut after_removal) = (0_u32, 0_u32);
         let mut reported = false;
-        let mut after_removal = 0_u32;
         loop {
-            let e = match self.stop_role(running).await {
+            tries = tries.saturating_add(1);
+            let mut e = match self.stop_role(running).await {
                 Ok(()) => return,
                 Err(e) => e,
             };
-            if !reported {
-                reported = true;
-                let r = &e.running;
-                let entry = r
-                    .subject
-                    .entry(
-                        "sandbox.stop_failed",
-                        r.role,
-                        [("container", r.name.clone().into())],
-                    )
-                    .text("detail", e.error.to_string(), DETAIL_STYLE)
-                    .decision("deny");
-                if self.audit(entry, r.level).await.is_err() {
-                    self.oplog.error(
-                        "sandbox",
-                        "audit entry not written",
-                        &[
-                            ("event", "sandbox.stop_failed"),
-                            (r.subject.kind(), r.subject.id().as_str()),
-                        ],
-                    );
-                }
-            }
-            // `stop_role` also fails after the container is gone (the entry, the directories):
-            // nothing runs any more, so only a bounded number of retries remain, for what the
-            // retry still does (an instance's directories, which no sweep removes). Checked by
-            // id, as it was removed.
-            if e.running.removed {
+            // `stop_role` also fails with the container gone (the entry, the directories, or a
+            // container that went by itself): nothing runs any more, so no entry, and only a
+            // bounded number of retries remain, for what the retry still does (the claim, an
+            // instance's directories, which no sweep removes). Checked by id.
+            let gone = e.running.removed
+                || matches!(self.container_exists(&e.running.container).await, Ok(false));
+            if gone {
                 if after_removal >= STOP_RETRIES_AFTER_REMOVAL {
+                    e.running.owner = Owner::Ended;
+                    if !e.running.removed {
+                        self.cleanup_confirmed(role, &id);
+                    }
                     return;
                 }
                 after_removal += 1;
-            } else if matches!(self.container_exists(&e.running.container).await, Ok(false)) {
-                return;
+            } else if !reported {
+                reported = true;
+                let r = &e.running;
+                self.audit_stop_failed(&r.subject, r.role, &r.name, tries, &e.error, r.level)
+                    .await;
             }
             running = e.running;
-            tokio::time::sleep(STOP_RETRY).await;
+            tokio::time::sleep(self.stop_pause(tries)).await;
         }
     }
 
     /// Stops and removes the container, discards the `.git` overlays, the profiles and the
     /// socket directory, keeps the `staged` upper directories, and releases the session's
-    /// mounts. Audits `sandbox.stop` first. On success, the [`Confirmed`] token for
-    /// [`Launcher::close`].
+    /// mounts. Audits `sandbox.stop` first, once per stop: a retry with the returned handle
+    /// whose entry was written does not write another (RT-AUD-03). On success, the
+    /// [`Confirmed`] token for [`Launcher::close`], and the handle is ended (its drop does
+    /// nothing).
     ///
     /// # Errors
     /// [`StopError`] when the container cannot be confirmed gone: the session keeps its claims
-    /// and the error carries the handle back for a retry. A failure after that (scratch
-    /// removal) is reported too, but the session is released; it yields no token (#157).
+    /// and the error carries the handle back for a retry, owned as it came in. A failure after
+    /// that (scratch removal) is reported too, but the session is released; it yields no token
+    /// (#157).
     pub async fn stop(&self, mut r: Running) -> Result<Confirmed, Box<StopError>> {
         let sid = r.paths.id().as_str().to_owned();
         if let Some(w) = &r.watchdog {
             w.last_reading().await;
         }
-        let audited = self
-            .audit(
-                NewEntry::new(Actor::Sallyd, "sandbox.stop")
-                    .session(&sid)
-                    .args(json!({"role": "workspace"})),
-                r.level,
-            )
-            .await;
+        let audited = if r.stop_audited {
+            Ok(())
+        } else {
+            let a = self
+                .audit(
+                    NewEntry::new(Actor::Sallyd, "sandbox.stop")
+                        .session(&sid)
+                        .args(json!({"role": "workspace"})),
+                    r.level,
+                )
+                .await;
+            r.stop_audited = a.is_ok();
+            a
+        };
         // Holding the exec gate waits out a walk in progress (which holds it while the container
         // is frozen) and keeps a new one from freezing the container during removal.
         let gate = Arc::clone(&r.exec_gate);
@@ -470,10 +530,13 @@ impl Launcher {
         let cleaned = self.remove_dirs(&r.paths, true).await;
         self.sessions.release(&sid);
         match audited.and(cleaned) {
-            Ok(()) => Ok(Confirmed {
-                id: sid,
-                level: r.level,
-            }),
+            Ok(()) => {
+                r.owner = Owner::Ended;
+                Ok(Confirmed {
+                    id: sid,
+                    level: r.level,
+                })
+            }
             Err(error) => Err(Box::new(StopError { running: r, error })),
         }
     }

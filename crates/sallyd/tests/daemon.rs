@@ -1448,12 +1448,12 @@ fn retried_id(log: &str) -> String {
     line[at..].split('"').next().unwrap().to_owned()
 }
 
-/// #239, the case its fix must cover: a launch fails, its cleanup cannot remove its container, then `sallyd`
-/// is stopped. Shutdown does not report a clean stop: it exits non-zero, and one oplog line
-/// names the failed launch. It waits for no retry: the exit comes within a few seconds, while
-/// the cleanup still has minutes of pauses ahead. The twin below is the allow case. Control,
-/// by hand: without the launcher's set of unfinished cleanups (or without shutdown reading it),
-/// this exits 0 with "stopped".
+/// #239, the case its fix must cover: a launch fails, its cleanup cannot remove its container,
+/// then `sallyd` is stopped. Shutdown does not report a clean stop: it exits non-zero, and one
+/// oplog line names the failed launch. It waits for no retry: the exit comes within a few
+/// seconds, while the cleanup still has minutes of pauses ahead. The twin below is the allow
+/// case. Control, by hand: without the launcher's set of unconfirmed containers (or without
+/// shutdown reading it), this exits 0 with "stopped".
 #[test]
 fn a_shutdown_with_a_failed_launch_s_container_left_is_not_clean() {
     let (env, manifest) = failing_launch_env();
@@ -1475,12 +1475,7 @@ fn a_shutdown_with_a_failed_launch_s_container_left_is_not_clean() {
         "shutdown waited {took:?}: {log}"
     );
     let id = retried_id(&log);
-    let line = oplog_line(
-        &log,
-        "error",
-        "failed launches' containers not confirmed gone",
-    )
-    .unwrap_or_else(|| panic!("{log}"));
+    let line = oplog_line(&log, "error", UNCONFIRMED_LINE).unwrap_or_else(|| panic!("{log}"));
     assert!(line.contains(&format!("ids=\"{id}\"")), "{line}");
     assert!(oplog_line(&log, "info", "stopped").is_none(), "{log}");
 }
@@ -1521,15 +1516,14 @@ fn a_shutdown_after_a_failed_launch_s_cleanup_finished_is_clean() {
     assert!(out.status.success(), "{log}");
     assert!(oplog_line(&log, "info", "stopped").is_some(), "{log}");
     assert!(
-        oplog_line(
-            &log,
-            "error",
-            "failed launches' containers not confirmed gone"
-        )
-        .is_none(),
+        oplog_line(&log, "error", UNCONFIRMED_LINE).is_none(),
         "{log}"
     );
 }
+
+/// Shutdown's oplog line naming the containers the launcher is removing and has not confirmed
+/// gone (a failed launch's, or one nobody holds).
+const UNCONFIRMED_LINE: &str = "containers the launcher is removing not confirmed gone";
 
 /// Every regular file under `dir` (symlinks not followed) whose bytes hold `needle`. A
 /// directory or file it cannot read fails the test, naming it: unread is not clean.

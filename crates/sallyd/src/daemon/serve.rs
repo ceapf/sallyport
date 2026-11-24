@@ -15,9 +15,10 @@
 //! Shutdown (SIGTERM, SIGINT, SIGHUP, SIGQUIT, or a panic in a task that is not a session's;
 //! a signal that arrives during startup is handled once it is done): `control.sock` is closed
 //! first, then every session is stopped `shutdown`, all at once, and then the launcher is asked
-//! once which failed launches have a container not confirmed gone (a cleanup still retrying, or
-//! one abandoned at its cap); shutdown waits for none of them. A container not confirmed gone,
-//! a session's or a failed launch's, or a panic, makes `sallyd` exit non-zero; so does a second
+//! once which containers it is removing and has not confirmed gone (a failed launch's cleanup
+//! still retrying or abandoned at its cap, the stop of a container nobody holds); shutdown
+//! waits for none of them. A container not confirmed gone, a session's or one the launcher is
+//! removing, or a panic, makes `sallyd` exit non-zero; so does a second
 //! signal during the shutdown, at once. A session's workspace or harness container that
 //! `sallyd` cannot stop because it was killed outright is bounded by conmon's `--timeout`
 //! backstop (#92, architect Q60): it ends `runtime.timeout` + 300 s after its `podman init`;
@@ -121,8 +122,12 @@ pub enum DaemonError {
         /// The task.
         task: &'static str,
     },
-    /// Sessions, or failed launches, whose containers could not be confirmed gone at shutdown.
-    #[error("containers of sessions {0:?} could not be confirmed gone")]
+    /// The ids whose containers could not be confirmed gone at shutdown: sessions', failed
+    /// launches', and those of launches nobody holds.
+    #[error(
+        "containers not confirmed gone (sessions, failed launches or launches nobody holds): \
+         {0:?}"
+    )]
     Unconfirmed(Vec<String>),
     /// A second signal arrived while sessions were being stopped.
     #[error("{0} during shutdown: stopped without waiting for the sessions")]
@@ -321,8 +326,9 @@ async fn serve(
         gid: rustix::process::getegid().as_raw(),
     };
     let (podman, runtime) = podman(log, dirs, config).await?;
-    // Before the launcher, which spawns a failed launch's retried cleanup on it; its reports
-    // wait in the channel until the select below reads them.
+    // Before the launcher, which spawns a failed launch's retried cleanup and the stop of a
+    // container nobody holds on it; their reports wait in the channel until the select below
+    // reads them.
     let (crash, mut crashes) = CrashReporter::channel();
     let launcher = Launcher::new(LauncherParts {
         podman: podman.clone(),
@@ -437,13 +443,14 @@ async fn serve(
             &[("sessions", &unconfirmed.join(","))],
         );
     }
-    // One look, after the sessions' stops: a failed launch's cleanup still retrying, or
-    // abandoned at its cap, may have left a container. Nothing waits for it (#239).
-    let cleanups = launcher.unfinished_cleanups();
+    // One look, after the sessions' stops: a failed launch's cleanup still retrying or
+    // abandoned at its cap, or the stop of a container nobody holds (RT-AG-08b), may have left
+    // a container. Nothing waits for it (#239).
+    let cleanups = launcher.unconfirmed_containers();
     if !cleanups.is_empty() {
         log.error(
             LOG,
-            "failed launches' containers not confirmed gone",
+            "containers the launcher is removing not confirmed gone",
             // Session ids, or an inference instance's once one can be launched (#134).
             &[("ids", &cleanups.join(","))],
         );

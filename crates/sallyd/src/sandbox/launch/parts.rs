@@ -74,8 +74,9 @@ pub(crate) const STOP_RETRIES_AFTER_REMOVAL: u32 = 3;
 pub const CLEANUP_TRIES: usize = 10;
 
 /// The pauses before a failed launch's cleanup tries 2 to [`CLEANUP_TRIES`], in order: the
-/// retries back off and are capped. `sallyd` runs [`CleanupSchedule::PRODUCTION`]; a test may
-/// pass a shorter one through `LauncherParts`. The cap counts tries, not time: each try's
+/// retries back off and are capped. A stop that retries until its container is confirmed gone
+/// takes the same pauses, the last one repeating ([`CleanupSchedule::stop_pause`]). `sallyd`
+/// runs [`CleanupSchedule::PRODUCTION`]; a test may pass a shorter one through `LauncherParts`. The cap counts tries, not time: each try's
 /// removal is itself up to four `podman rm` attempts, each bounded by podman's command
 /// timeout, so a cleanup can outlast the sum of its pauses (its claim held all the while).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +111,82 @@ impl CleanupSchedule {
         let i = usize::try_from(attempts).ok()?.checked_sub(1)?;
         self.pauses.get(i).copied()
     }
+
+    /// The pause after failed round `round` (1-based; 0 counts as 1) of a stop that retries
+    /// until its container is confirmed gone: this schedule's pauses in order, the last one
+    /// repeating, with no cap on rounds (RT-AUD-03, RT-AG-08b). The
+    /// supervisor's stop and the stop of a launch nobody holds both use it.
+    #[must_use]
+    pub(crate) fn stop_pause(&self, round: u32) -> Duration {
+        let i = usize::try_from(round)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(1);
+        self.pauses
+            .get(i)
+            .or(self.pauses.last())
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+/// Who holds a started container's handle, so who stops it (RT-AG-08b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Owner {
+    /// Its caller: a drop hands the stop to the launcher.
+    Caller,
+    /// The launcher, stopping it: a drop (a runtime shutting down) leaves the container to the
+    /// next start's orphan sweep.
+    Launcher,
+    /// Stopped and confirmed gone: a drop does nothing.
+    Ended,
+}
+
+/// What dropping a handle does ([`on_drop`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OnDrop {
+    /// Hand the whole handle to a launcher task that stops it until confirmed gone.
+    Stop,
+    /// An oplog error line: the container is left to the next start's orphan sweep.
+    Report,
+    /// Nothing.
+    Nothing,
+}
+
+/// What dropping a handle owned by `owner` does, with or without a runtime to spawn the stop
+/// on. Only a caller's handle is stopped; a launcher's stop that is itself dropped is never
+/// spawned again (no stop chases its own drop).
+#[must_use]
+pub(crate) fn on_drop(owner: Owner, runtime: bool) -> OnDrop {
+    match owner {
+        Owner::Caller if runtime => OnDrop::Stop,
+        Owner::Caller | Owner::Launcher => OnDrop::Report,
+        Owner::Ended => OnDrop::Nothing,
+    }
+}
+
+/// `sandbox.stop_failed`: a stop that cannot confirm its container gone, written once per stop
+/// whoever began it: the supervisor's, and the launcher's stop of a launch nobody holds
+/// (RT-AUD-03). Denied; `attempts` counts the tries so far and
+/// `last` is the last try's error, declared raw text as every teardown `detail`.
+#[must_use]
+pub(crate) fn stop_failed_entry(
+    subject: &Subject,
+    role: Role,
+    container: &str,
+    attempts: u32,
+    last: String,
+) -> NewEntry {
+    subject
+        .entry(
+            "sandbox.stop_failed",
+            role,
+            [
+                ("container", container.into()),
+                ("attempts", attempts.into()),
+            ],
+        )
+        .decision("deny")
+        .text("detail", last, DETAIL_STYLE)
 }
 
 /// What became of a failed launch's directories when its cleanup ended.
@@ -140,7 +217,8 @@ pub(crate) enum NextTry {
     /// Write `sandbox.cleaned`, free the claim, end.
     Done(Directories),
     /// The last try ended with the probe or the container not confirmed gone: write
-    /// `sandbox.cleanup_abandoned` and end, keeping the claim until `sallyd` exits (RT-AG-08b).
+    /// `sandbox.cleanup_abandoned` and end, keeping the claim (a workspace's or a harness's; an
+    /// instance has none) until `sallyd` exits (RT-AG-08b).
     /// The next start's orphan sweep removes what is left.
     Abandoned,
 }
@@ -237,8 +315,9 @@ pub(crate) fn cleaned_entry(
 
 /// `sandbox.cleanup_abandoned`: a failed launch's cleanup reached its last try with its
 /// mount-link probe or container not confirmed gone. Denied: `left` names only what may still
-/// exist; the claim stays held until `sallyd` exits, and the next start's orphan sweep removes
-/// it. `last` is the last try's error, declared raw text as every teardown `detail`.
+/// exist; its claim (a workspace's or a harness's) stays held until `sallyd` exits, and the
+/// next start's orphan sweep removes it. `last` is the last try's error, declared raw text as
+/// every teardown `detail`.
 #[must_use]
 pub(crate) fn abandoned_entry(
     subject: &Subject,
@@ -653,6 +732,78 @@ mod tests {
     #[test]
     fn the_bound_after_removal_is_three() {
         assert_eq!(STOP_RETRIES_AFTER_REMOVAL, 3);
+    }
+
+    /// A stop's pauses follow the schedule in order, then its last pause repeats with no cap;
+    /// round 0 counts as round 1.
+    #[test]
+    fn a_stops_pauses_follow_the_schedule_then_repeat_the_last() {
+        let ms = |n: u64| Duration::from_millis(n);
+        let s = CleanupSchedule::with_pauses([1, 2, 3, 4, 5, 6, 7, 8, 9].map(ms));
+        assert_eq!(s.stop_pause(0), ms(1));
+        for round in 1..=9 {
+            assert_eq!(s.stop_pause(round), ms(u64::from(round)), "round {round}");
+        }
+        for round in [10, 11, 1000, u32::MAX] {
+            assert_eq!(s.stop_pause(round), ms(9), "round {round}");
+        }
+        let p = CleanupSchedule::PRODUCTION;
+        assert_eq!(p.stop_pause(1), Duration::from_secs(2));
+        assert_eq!(p.stop_pause(u32::MAX), Duration::from_secs(60));
+    }
+
+    /// Only a caller's handle is stopped on drop, and only with a runtime; a launcher's stop
+    /// that is dropped, or a caller's with no runtime, is reported; an ended one does nothing.
+    #[test]
+    fn only_a_callers_dropped_handle_is_stopped() {
+        assert_eq!(on_drop(Owner::Caller, true), OnDrop::Stop);
+        assert_eq!(on_drop(Owner::Caller, false), OnDrop::Report);
+        assert_eq!(on_drop(Owner::Launcher, true), OnDrop::Report);
+        assert_eq!(on_drop(Owner::Launcher, false), OnDrop::Report);
+        assert_eq!(on_drop(Owner::Ended, true), OnDrop::Nothing);
+        assert_eq!(on_drop(Owner::Ended, false), OnDrop::Nothing);
+    }
+
+    /// `sandbox.stop_failed` is denied and names the role, the container, the tries and the
+    /// last error; an instance's names the instance.
+    #[test]
+    fn the_stop_failed_entry_is_denied_and_names_the_container() {
+        let e = stop_failed_entry(
+            &Subject::Session(sid("s-5")),
+            Role::Workspace,
+            "sp-ws-s-5",
+            3,
+            "podman rm: refused".into(),
+        );
+        assert_eq!(e.event(), "sandbox.stop_failed");
+        assert_eq!(e.decision_value(), Some("deny"));
+        assert_eq!(
+            e.resolved(&sally_core::audit::Redactor::default()),
+            serde_json::json!({
+                "role": "workspace",
+                "container": "sp-ws-s-5",
+                "attempts": 3,
+                "detail": "podman rm: refused",
+            })
+        );
+        assert!(format!("{e:?}").contains("\"s-5\""));
+        let e = stop_failed_entry(
+            &Subject::Instance(sid("i-5")),
+            Role::Inference,
+            "sp-infer-i-5",
+            1,
+            "x".into(),
+        );
+        assert_eq!(
+            e.resolved(&sally_core::audit::Redactor::default()),
+            serde_json::json!({
+                "role": "inference",
+                "instance": "i-5",
+                "container": "sp-infer-i-5",
+                "attempts": 1,
+                "detail": "x",
+            })
+        );
     }
 
     /// `sandbox.cleaned` names the role and what the cleanup handled, with no decision

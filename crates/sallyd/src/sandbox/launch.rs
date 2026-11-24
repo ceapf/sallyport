@@ -24,7 +24,9 @@
 //! watchdog that kills it when those writes exceed `runtime.stage_size` (#14; `watchdog.rs`).
 //!
 //! The launch runs in its own task: a caller that goes away (a closed connection, an outer
-//! timeout) cannot leave a half-built session, and a finished launch nobody receives is stopped.
+//! timeout) cannot leave a half-built session. A started container always has an owner: a
+//! finished launch nobody receives, and a handle dropped without a stop, are stopped by the
+//! launcher until confirmed gone, their claims held meanwhile (RT-AG-08b).
 //! A failure removes the container by its name (even when `create` printed no id), removes only
 //! the directories this launch created, and keeps the session's overlap claims while a container
 //! might still exist.
@@ -70,8 +72,8 @@ pub use error::{LaunchError, RoleStopError, StopError};
 pub(crate) use error::{stderr_text, stdout_text};
 pub use harness::HarnessRequest;
 pub use inference::InferenceRequest;
-use parts::Subject;
 pub use parts::{CLEANUP_TRIES, CleanupSchedule, PinError};
+use parts::{OnDrop, Owner, Subject, on_drop};
 pub use start::RoleRunning;
 use start::{Extra, Launched, Prepared, Recheck, Request};
 pub use teardown::Sweep;
@@ -91,8 +93,6 @@ pub(crate) const DETAIL_STYLE: Style = Style::Plain {
 /// cannot run (a missing interpreter, a crash at startup) exits well within it; a later exit is
 /// the session's business (Task 12).
 pub(crate) const START_GRACE: Duration = Duration::from_millis(250);
-/// How often a launch nobody received retries its `stop`.
-const STOP_RETRY: Duration = Duration::from_secs(2);
 
 /// Where audit entries go. Appends are blocking file I/O; the launcher calls them from
 /// `spawn_blocking`.
@@ -140,8 +140,10 @@ fn mode_str(m: MountMode) -> &'static str {
     }
 }
 
-/// A started workspace container. Only [`Launcher::launch_workspace`] makes one, and only
-/// [`Launcher::stop`] ends it.
+/// A started workspace container. Only [`Launcher::launch_workspace`] makes one.
+/// [`Launcher::stop`] ends it; a handle dropped without a confirmed stop hands its container,
+/// watchdog and egress listener to the launcher, which stops it in the background until it is
+/// confirmed gone, holding its claims and slot meanwhile (RT-AG-08b).
 #[derive(Debug)]
 pub struct Running {
     container: String,
@@ -161,6 +163,74 @@ pub struct Running {
     init_dir: Arc<rustix::fd::OwnedFd>,
     /// The launcher's free-space floor, which the file tools' own writes are held to.
     disk_floor: DiskFloor,
+    /// A stop wrote its `sandbox.stop` entry: a retry does not write another.
+    stop_audited: bool,
+    /// Who stops it ([`Owner`]): what a drop does.
+    owner: Owner,
+    /// The launcher that stops it when it is dropped.
+    launcher: Stopper,
+}
+
+impl Drop for Running {
+    /// RT-AG-08b: a caller's handle dropped without a
+    /// confirmed stop (a launch result nobody received, a lost owner) is handed whole, its
+    /// watchdog and egress listener still running, to a launcher task that stops it until
+    /// confirmed gone; a launcher's stop that is itself dropped is reported, never spawned
+    /// again. The session's forms are not released here: they stay masked until `sallyd`
+    /// exits, as a received session may still have writers (fails safe).
+    fn drop(&mut self) {
+        let runtime = tokio::runtime::Handle::try_current().is_ok();
+        let id = self.paths.id().as_str().to_owned();
+        let launcher = Arc::clone(&self.launcher.0);
+        // TODO(#157): a handle `stop` handed back after removing its container (its scratch
+        // removal failed) is still recorded as unconfirmed when dropped with no runtime: a
+        // false unclean exit, never a missed one.
+        match on_drop(self.owner, runtime) {
+            OnDrop::Nothing => {}
+            OnDrop::Stop => {
+                let handle = self.hand_over();
+                launcher.dropped(Role::Workspace, &id, &handle.name, true);
+                let stopper = Arc::clone(&launcher);
+                launcher.crash.spawn("sandbox.stop", async move {
+                    stopper.stop_unreceived(handle).await;
+                });
+            }
+            OnDrop::Report => launcher.left_running(Role::Workspace, &id, &self.name, true),
+        }
+    }
+}
+
+impl Running {
+    /// Everything of this handle, moved into a new one the launcher owns; this one is ended
+    /// (documentation only: it is being dropped).
+    fn hand_over(&mut self) -> Self {
+        self.owner = Owner::Ended;
+        Self {
+            container: std::mem::take(&mut self.container),
+            name: std::mem::take(&mut self.name),
+            paths: self.paths.clone(),
+            level: self.level,
+            watchdog: self.watchdog.take(),
+            egress: self.egress.take(),
+            exec_gate: Arc::clone(&self.exec_gate),
+            init_pid: self.init_pid,
+            init_dir: Arc::clone(&self.init_dir),
+            disk_floor: self.disk_floor,
+            stop_audited: self.stop_audited,
+            owner: Owner::Launcher,
+            launcher: Stopper(Arc::clone(&self.launcher.0)),
+        }
+    }
+}
+
+/// A handle's launcher. Its `Debug` names it only: the launcher's own `Debug` holds podman's
+/// configuration text, which has no place in every stop error's `Debug`.
+pub(super) struct Stopper(pub(super) Arc<Launcher>);
+
+impl std::fmt::Debug for Stopper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Launcher")
+    }
 }
 
 impl Running {
@@ -282,12 +352,12 @@ pub struct LauncherParts {
     /// This installation's id (`daemon::install`): the label of every container this launcher
     /// creates, and the only one its orphan sweeps remove (Q64).
     pub installation: Installation,
-    /// The daemon's crash reporter: a failed launch whose cleanup is retried in its own task
-    /// reports a panic there, which stops the daemon. Not a session's: a refused session has no
-    /// reporter left.
+    /// The daemon's crash reporter: a failed launch's cleanup retried in its own task, and the
+    /// stop of a container whose handle was dropped (task `sandbox.stop`), report a panic
+    /// there, which stops the daemon. Not a session's: a refused session has no reporter left.
     pub crash: CrashReporter,
-    /// The pauses of a failed launch's cleanup retries: `sallyd` passes
-    /// [`CleanupSchedule::PRODUCTION`].
+    /// The pauses of a failed launch's cleanup retries, and of the stops that retry until
+    /// confirmed (their last pause repeating): `sallyd` passes [`CleanupSchedule::PRODUCTION`].
     pub cleanup: CleanupSchedule,
 }
 
@@ -308,10 +378,12 @@ pub struct Launcher {
     pub(super) installation: Installation,
     crash: CrashReporter,
     cleanup: CleanupSchedule,
-    /// The failed launches, by role and id (a workspace and a harness share their session's
-    /// id), whose probe or container is not yet confirmed gone: in before the first cleanup
-    /// try, out only once both are confirmed gone, never at the cleanup's cap. Shutdown reads
-    /// it ([`Self::unfinished_cleanups`]) and waits for none.
+    /// By role and id (a workspace and a harness share their session's id), the containers
+    /// this launcher is removing and has not confirmed gone: a failed launch's probe or
+    /// container (in before the first cleanup try, out once both are confirmed gone, never at
+    /// the cleanup's cap), and a started container nobody holds (a dropped handle, a launch
+    /// result nobody received: in before its stop, out once it is confirmed gone). Shutdown
+    /// reads it ([`Self::unconfirmed_containers`]) and waits for none.
     unfinished: Mutex<BTreeSet<(&'static str, String)>>,
     /// One stage walk at a time across all sessions, so a sandbox with a huge or deep tree
     /// cannot multiply `sallyd`'s open fds or blocking threads (6c-1 review M2/M3).
@@ -365,11 +437,12 @@ impl Launcher {
         })
     }
 
-    /// The ids of failed launches whose mount-link probe or container is not confirmed gone
-    /// now: a cleanup still retrying, or one abandoned at its cap. Sorted. Shutdown reports
-    /// these as not stopped cleanly, without waiting for any (THREAT_MODEL #239 row).
+    /// The ids whose containers this launcher is removing and has not confirmed gone now: a
+    /// failed launch's cleanup still retrying or abandoned at its cap, and the stop of a
+    /// started container nobody holds. Sorted. Shutdown reports these as not stopped cleanly,
+    /// without waiting for any (THREAT_MODEL #239 row; RT-AG-08b).
     #[must_use]
-    pub fn unfinished_cleanups(&self) -> Vec<String> {
+    pub fn unconfirmed_containers(&self) -> Vec<String> {
         let ids: BTreeSet<String> = lock(&self.unfinished)
             .iter()
             .map(|(_, id)| id.clone())
@@ -377,14 +450,68 @@ impl Launcher {
         ids.into_iter().collect()
     }
 
-    /// A failed `role` launch's cleanup begins: `id` may leave a container behind.
+    /// The launcher begins removing `role`'s container of `id` (a failed launch's cleanup, or
+    /// the stop of one nobody holds): it may be left behind. Idempotent.
     fn cleanup_begins(&self, role: Role, id: &str) {
         lock(&self.unfinished).insert((role.as_str(), id.to_owned()));
     }
 
-    /// A failed `role` launch's probe and container are confirmed gone.
+    /// `role`'s container of `id` (and a failed launch's probe) is confirmed gone.
     fn cleanup_confirmed(&self, role: Role, id: &str) {
         lock(&self.unfinished).remove(&(role.as_str(), id.to_owned()));
+    }
+
+    /// A caller's handle of `role`'s container of `id` was dropped without a confirmed stop
+    /// (RT-AG-08b): one oplog line, and, while the container `may_exist` (not removed by an
+    /// earlier stop), the id joins the unconfirmed containers before the launcher's stop is
+    /// spawned.
+    fn dropped(&self, role: Role, id: &str, container: &str, may_exist: bool) {
+        self.oplog.warn(
+            "sandbox",
+            "a container's handle was dropped without a stop; the launcher stops it",
+            &[
+                ("role", role.as_str()),
+                ("id", id),
+                ("container", container),
+            ],
+        );
+        if may_exist {
+            self.cleanup_begins(role, id);
+        }
+    }
+
+    /// A handle of `role`'s container of `id` was dropped with no stop to come: no runtime to
+    /// spawn one on, or the launcher's own stop cut short (a runtime shutting down). One oplog
+    /// error line; while the container `may_exist`, the id stays among the unconfirmed
+    /// containers.
+    fn left_running(&self, role: Role, id: &str, container: &str, may_exist: bool) {
+        let fields = [
+            ("role", role.as_str()),
+            ("id", id),
+            ("container", container),
+        ];
+        if may_exist {
+            self.oplog.error(
+                "sandbox",
+                "container not confirmed gone, left to the next start's sweep",
+                &fields,
+            );
+            self.cleanup_begins(role, id);
+        } else {
+            // An earlier stop removed it: only its entry or directories were left to do.
+            self.oplog.warn(
+                "sandbox",
+                "a removed container's stop left unfinished (entry or directories)",
+                &fields,
+            );
+        }
+    }
+
+    /// The pause after failed round `round` of a stop that retries until its container is
+    /// confirmed gone: the launcher's cleanup schedule, its last pause repeating (RT-AUD-03).
+    #[must_use]
+    pub(crate) fn stop_pause(&self, round: u32) -> Duration {
+        self.cleanup.stop_pause(round)
     }
 }
 
@@ -513,7 +640,10 @@ impl Launcher {
                 this.release_secrets(&id).await;
             }
         });
-        // TODO(#113): what a panicked launch task leaves behind.
+        // A result sent but never received is stopped by its handle's drop (RT-AG-08b); its
+        // forms stay registered until `sallyd` exits (fails safe).
+        // TODO(#113): a panic in the launch task before its handle exists (between `podman
+        // create` and the handle) leaves its container, claim and live id to the next start.
         error::received(rx, sid).await
     }
 

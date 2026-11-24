@@ -163,7 +163,10 @@ fn a_failed_launch_cleanup_is_retried_until_the_container_is_gone() {
         let e = x.launch(&v, "while-kept").await.unwrap_err();
         assert!(matches!(e, LaunchError::Overlap(_)), "{e}");
         assert!(!x.events.list().iter().any(|e| e == "sandbox.cleaned"));
-        assert_eq!(x.launcher.unfinished_cleanups(), std::slice::from_ref(&id));
+        assert_eq!(
+            x.launcher.unconfirmed_containers(),
+            std::slice::from_ref(&id)
+        );
         assert_eq!(x.redactors.sessions(), std::slice::from_ref(&id));
         assert_eq!(x.redacted.redact(&gh), "[REDACTED:GITHUB_TOKEN]");
 
@@ -199,7 +202,7 @@ fn a_failed_launch_cleanup_is_retried_until_the_container_is_gone() {
         // which then removes it), and within the cap.
         let attempts = cleaned["attempts"].as_u64().unwrap_or_default();
         assert!((6..=CLEANUP_TRIES as u64).contains(&attempts), "{cleaned}");
-        assert!(x.launcher.unfinished_cleanups().is_empty());
+        assert!(x.launcher.unconfirmed_containers().is_empty());
         assert_eq!(
             all.iter().filter(|(e, _)| e == "sandbox.cleaned").count(),
             1
@@ -215,13 +218,13 @@ fn a_failed_launch_cleanup_is_retried_until_the_container_is_gone() {
 /// container cannot be removed keeps its folder claimed for as long as that container may
 /// run, while its cleanup backs off and stops at its cap.
 ///
-/// Control (its messages start `control:`): a removal that fails once and then works is
-/// followed by `sandbox.cleaned`, and the same folder then launches.
+/// Control (its messages start `control:`): a removal that fails at the launch's own cleanup
+/// try and then works is followed by `sandbox.cleaned`, and the same folder then launches.
 ///
 /// Product: the removal keeps failing. The same folder is refused `overlap` during the retries
 /// and after `sandbox.cleanup_abandoned` (denied, naming the container, ten tries, the
 /// directories kept, the last error); no `sandbox.cleaned` follows; the session is still live
-/// (the periodic sweep leaves its container) and among the unfinished cleanups; no try comes
+/// (the periodic sweep leaves its container) and among the unconfirmed containers; no try comes
 /// after the cap. Hand check: an unclaim added at the cap fails the "after" leg.
 #[test]
 fn rt_ag_08b_a_failed_launch_keeps_its_claim_through_the_capped_cleanup() {
@@ -300,7 +303,10 @@ fn rt_ag_08b_a_failed_launch_keeps_its_claim_through_the_capped_cleanup() {
             .unwrap();
         assert!(swept.is_empty(), "the session is no longer live: {swept:?}");
         assert!(exists(&name));
-        assert_eq!(x.launcher.unfinished_cleanups(), std::slice::from_ref(&id));
+        assert_eq!(
+            x.launcher.unconfirmed_containers(),
+            std::slice::from_ref(&id)
+        );
         assert_eq!(cleaned(), 1, "a sandbox.cleaned for the abandoned launch");
         let at_cap = refused(&dir);
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -458,7 +464,7 @@ fn a_paused_orphan_whose_removal_fails_stays_paused() {
             x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "rw")]));
         let r = x.launch(&v, "paused").await.unwrap();
         let (name, id) = (r.name().to_owned(), r.container().to_owned());
-        drop(r); // the "killed" sallyd's handle; the container keeps running
+        x.drop_as_killed(r); // the "killed" sallyd's handle; the container keeps running
         x.hermetic(&["pause".into(), id.clone()]).await;
         let status = x
             .hermetic(&[

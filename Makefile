@@ -267,7 +267,7 @@ doctor:
 REDTEAM_FILTER := test(/(^|::)rt_/)
 REDTEAM_WSL_TEST := rt_fs_11_wsl_a_windows_executable_does_not_reach_windows
 REDTEAM_WSL_FILTER := test(=$(REDTEAM_WSL_TEST))
-REDTEAM_COUNT := 247
+REDTEAM_COUNT := 250
 REDTEAM_LISTS := target/redteam-lists
 redteam:
 	@v=$$(podman info --format '{{.Host.CgroupsVersion}}'); \

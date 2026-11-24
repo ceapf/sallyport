@@ -821,6 +821,38 @@ impl Lx {
         let _done = self.launcher.stop(r).await.unwrap();
     }
 
+    /// Drops `r` as a `sallyd` killed outright leaves it: on a thread with no runtime, so no
+    /// stop can be spawned and its container keeps running (the product's no-runtime path).
+    /// Asserts the one oplog line that leaves it to the next start's sweep.
+    #[allow(dead_code)] // Only the orphan tests play a killed sallyd.
+    pub fn drop_as_killed(&self, r: Running) {
+        let name = r.name().to_owned();
+        let id = r.paths().id().as_str().to_owned();
+        std::thread::spawn(move || drop(r)).join().unwrap();
+        assert!(
+            self.launcher.unconfirmed_containers().contains(&id),
+            "a shutdown now names it"
+        );
+        let log = self.oplog_text();
+        assert!(
+            log.lines().any(|l| l
+                .contains("container not confirmed gone, left to the next start's sweep")
+                && l.contains(&name)),
+            "{log}"
+        );
+    }
+
+    /// What the operational log holds once every line queued so far is written: its writer is a
+    /// thread of its own, so a line logged a moment ago may not be in [`Lx::oplog_lines`] yet.
+    #[allow(dead_code)] // Only the tests that read the oplog.
+    pub fn oplog_text(&self) -> String {
+        assert!(
+            self.oplog.flush(std::time::Duration::from_secs(10)),
+            "the oplog's queued lines are written within 10s"
+        );
+        String::from_utf8_lossy(&self.oplog_lines.0.lock().unwrap()).into_owned()
+    }
+
     /// Whether `podman ps --all` lists a container of this fixture: its scope is part of every
     /// session id, so of every container name. The probe of the "nothing was created" checks; a
     /// failed `ps` panics at the check itself, so it never reads as "nothing was created".
