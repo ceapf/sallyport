@@ -20,7 +20,7 @@
 //! A reader that stops reading for over 10 s (output piped into a paused pager) gets the
 //! command killed: `sallyd` drops a connection whose write blocks that long (architect Q152).
 //! TODO(#139): binary stdin; invalid UTF-8 on stdin ends the run (`disconnect`), never with an
-//! end of input. TODO(#138): `--tty`, raw terminal passthrough, before M1 exit.
+//! end of input. TODO(#138): `--tty`, raw terminal passthrough, after a threat-model row and a design.
 
 use std::io::Read;
 use std::sync::Arc;

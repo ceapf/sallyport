@@ -70,10 +70,10 @@ exclude_re = [
   # Same outcome: a stale temporary head that cannot be removed still fails the write, because
   # the exclusive create that follows refuses it (EEXIST instead of the removal's errno).
   'crates/sally-core/src/audit/writer\.rs:\d+:\d+: replace match guard e\.kind\(\) == std::io::ErrorKind::NotFound with true in write_head$',
-  # Same value (rule i): `MAX_HEAD_BYTES + 1` as 511 or 512, at both sites. The buffer capacity
-  # is only a hint (the Vec grows). The read cap: fstat has already refused a file over 512
-  # bytes, so 512 reads the same bytes, and 511 differs only for a file of exactly 512, which no
-  # canonical head comes near: the verdict is the same.
+  # Same value (rule i): the read cap's `MAX_HEAD_BYTES + 1` as 511 or 512. (The buffer
+  # capacity's `+ 1` is never mutated: cargo-mutants skips `with_capacity` arguments.) fstat has
+  # already refused a file over 512 bytes, so 512 reads the same bytes, and 511 differs only for
+  # a file of exactly 512, which no canonical head comes near: the verdict is the same.
   # Proof: layout.rs `a_read_cap_at_or_one_below_the_limit_gives_the_same_verdict`.
   'crates/sally-core/src/audit/layout\.rs:\d+:\d+: replace \+ with - in Head::read_owned_by$',
   'crates/sally-core/src/audit/layout\.rs:\d+:\d+: replace \+ with \* in Head::read_owned_by$',

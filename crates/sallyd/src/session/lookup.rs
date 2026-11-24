@@ -19,7 +19,7 @@ use tokio::sync::Semaphore;
 use crate::egress::inject::SecretSource;
 use crate::egress::net::{
     Egress, EgressError, EgressHandle, EgressStarter, Lookup, MAX_LOOKUPS, ProcHostAddrs,
-    SessionEgress, SystemResolver, TcpDialer,
+    SessionEgress, SystemEgress, SystemResolver, TcpDialer,
 };
 use crate::egress::roots::BundleFiles;
 
@@ -84,7 +84,7 @@ impl SharedEgress {
         }
     }
 
-    fn session(&self) -> Egress<SystemResolver, TcpDialer, ProcHostAddrs> {
+    fn session(&self) -> SystemEgress {
         Egress {
             resolver: Arc::new(session_resolver(&self.lookup)),
             dialer: Arc::clone(&self.dialer),

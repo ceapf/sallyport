@@ -270,8 +270,8 @@ pub struct LauncherParts {
     pub limits: ScanLimits,
     /// The free-space floor (`DiskFloor::default()` unless configured).
     pub disk_floor: DiskFloor,
-    /// Starts each proxy-mode session's egress listener ([`crate::egress::net::SystemEgress`] in
-    /// production; tests pass fakes through the same field).
+    /// Starts each proxy-mode session's egress listener ([`crate::session::lookup::SharedEgress`]
+    /// in production; tests pass fakes through the same field).
     pub egress: Arc<dyn EgressStarter>,
     /// The live sessions' secrets, for the audit and operational logs' redactors: a session's
     /// forms are registered as soon as its egress has loaded them (architect Q219).

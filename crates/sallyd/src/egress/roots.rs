@@ -77,7 +77,7 @@ pub struct Roots {
     /// The accepted certificates, PEM (LF line ends), in file order.
     pub pem: String,
     /// Certificates in the file that the verifier could not use.
-    // TODO(#56): audit the path and this count once interception uses the roots (Task 9a-2).
+    // TODO(#56): audit the path, the anchors and this count where a session loads its roots.
     pub skipped: usize,
     /// The file they came from.
     pub path: PathBuf,

@@ -106,6 +106,22 @@ fn bytes_refuses_overflow() {
     assert_eq!(f32_.bytes(&[1 << 30, 1 << 32]), Err(SizeError::Overflow));
 }
 
+/// `SizeError` is a library error: it implements `std::error::Error` and says what went wrong.
+#[test]
+fn size_errors_are_errors_with_their_own_text() {
+    fn as_error(e: &SizeError) -> &dyn std::error::Error {
+        e
+    }
+    assert_eq!(
+        as_error(&SizeError::PartialBlock).to_string(),
+        "the first dimension is not a whole number of blocks"
+    );
+    assert_eq!(
+        as_error(&SizeError::Overflow).to_string(),
+        "the size does not fit in a u64"
+    );
+}
+
 #[test]
 fn no_dimensions_is_one_element() {
     let f32_ = GgmlType::from_id(0).unwrap();

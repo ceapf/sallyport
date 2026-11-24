@@ -2,8 +2,9 @@
 
 Format per task: **task — agent (model)**. Main session is `opusplan`; "(opus)" on an
 implementation task means switch with `/model opus` for that task. Red-team IDs refer to
-`tests/redteam/REDTEAM_SUITE.md`. Each milestone ends with: `make redteam` green in CI,
-`/security-scan`, `/code-review`, `docs/reports/M<n>.md`, **stop for the maintainer's review**.
+`tests/redteam/REDTEAM_SUITE.md`. Each milestone ends with: `make redteam` green in CI, a
+whole-milestone review pass (in place of `/code-review`), `docs/reports/M<n>.md`, **stop for the
+maintainer's review**.
 
 Estimates are in focused work-weeks. Buffer is built in: the plan sums to ~7.5 of 8.
 
@@ -40,7 +41,7 @@ Tasks
 11. `sallyd::tools::{fs,shell}`: `openat2` confinement for `fs.*` on `brokered` mounts; `shell` via `podman exec` with deny/approve/allow + destructive tagger — **main (opus)**; review security-reviewer (opus)
 12. `sallyd::session` (minimal: no model yet) + `sally` CLI: `doctor`, `manifest validate|summary`, `secrets set|list|rm`, `sandbox run --manifest m.yaml -- <cmd>` (runs a command in Z3 with the manifest's walls, interactive approvals), `approvals`, `audit tail|verify` — main (sonnet)
 13. Red-team suite M1 subset + harness + the `redteam` CI job in `ci.yml` (rootless podman on `ubuntu-24.04`) — **main (opus)** authors tests; sonnet does plumbing
-14. `/security-scan`; security-reviewer full pass on `crates/`; `/code-review`; doc-updater (haiku) for README quickstart; `docs/reports/M1.md` — per routing
+14. Whole-milestone review pass, in place of `/code-review` on the milestone diff: security and Rust reviews of `sallyd`, `sally-core` and `sally-shim`, a code review of the CLI, scripts, Makefile and workflows; doc-updater (haiku) for README quickstart; `docs/reports/M1.md` — per routing
 
 Acceptance
 - `sally sandbox run --manifest manifests/examples/coding-agent.yaml -- sh` yields a shell that: cannot resolve DNS, cannot open TCP to anything, *can* `curl -x http://127.0.0.1:3128 https://pypi.org/simple/` and gets 403 from the proxy for `https://example.org/`; sees only `/workspace/myproject`; cannot find the canary secret anywhere; `curl -x … http://api.github.com/user` against the mock upstream shows the injected header upstream, any echo of it replaced by filler of the same length, and the response's `egress.response` audit entry naming `secret:GITHUB_TOKEN` and the bytes redacted.
@@ -131,7 +132,7 @@ Tasks
 4. `install.sh` (installs the crun pinned in `runtime.lock`, checksum and signature verified) + `sally doctor` polish (actionable fix hints per failure) — main (sonnet)
 5. Packaging: `.deb` + AppImage via `tauri build`; checksums; release workflow — main (sonnet); build-error-resolver (haiku)
 6. Docs: README (invariants list, quickstart, "Windows via WSL2"), `SECURITY.md` (disclosure, scope = this threat model), manifest cookbook — doc-updater (haiku) + maintainer
-7. Full red-team + GPU suites; `/security-scan`; final security-reviewer pass; `docs/reports/M6.md`; tag `v1.0.0`
+7. Full red-team + GPU suites; final security-reviewer pass; `docs/reports/M6.md`; tag `v1.0.0`
 
 Acceptance: clean install on a fresh WSL2 Ubuntu 24.04 VM via `install.sh` → Doctor green → pull → chat → agent, in under 15 minutes; CI: lint, test, deny, fuzz-smoke, redteam all green.
 
