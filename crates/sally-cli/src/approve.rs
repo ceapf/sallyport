@@ -5,8 +5,14 @@
 //! - Typed-ahead input is discarded before each question (`flush`, tcflush in the binary).
 //! - An answer is bound to the prompt on screen when the read began (its id and digest); if
 //!   that prompt closed meanwhile, the line is discarded, never applied to the next one.
-//! - A cut prompt shows its full text before the question; one whose full text could not be
-//!   sent, or whose text failed the clean-check, can only be denied.
+//! - A prompt is laid out here ([`layout`], RT-AG-04): the CLI's lines at the left edge, every
+//!   row of request text behind [`GUTTER`], wrapped to the terminal's width. A cut prompt shows
+//!   its full text before the question; one whose full text could not be sent, or whose text
+//!   failed the clean-check, can only be denied.
+//! - When the prompt is taller than the screen, and above every question asked again, the start
+//!   of the action is printed again ([`again`]), so it is in the last screen before the
+//!   question; when fewer than [`MIN_HEAD_ROWS`] rows of it fit, or the terminal's size is not
+//!   known or under [`MIN_COLUMNS`] columns, the prompt can only be denied.
 //! - The terminal closing (end of input) or failing, its typed-ahead input included when it
 //!   cannot be discarded, denies the prompt on screen, and `sally` exits non-zero.
 //! - The connection ending (sallyd stopped, or dropped this approver for falling behind; architect

@@ -1708,19 +1708,41 @@ sallyport/
   ASCII byte is `\xNN` and every other character `\u{…}`, so controls, ESC/CSI/OSC, bidi and
   zero-width marks, combining marks and homoglyphs are all visible. Nothing is stripped or
   normalized: what is shown is what runs (readable non-ASCII is M5, #67). argv elements and paths
-  are quoted (`"` escaped). The action is cut at 2 000 chars, never inside an escape, with an
-  explicit `… (+N bytes, sha256 …)` tail, and travels whole (`full`) for a reveal; a client must
-  not take "approve" on a cut prompt before showing the whole text. Paths are shown as *host
-  realpath* **and** guest path; payloads (write content, fetch body, MCP arguments) also by
-  size and sha256. Model text (a reason) is a separate one-line field: quoted, escaped only up to
-  its 500-char cut (the tail names the raw bytes left and their hash), shown last and labelled
-  untrusted; it is never part of the action.
+  are quoted (`"` escaped). In each value the request chose (never in the broker's own words), a
+  run of one unit (a character, or a byte that is not UTF-8) longer than 16 is shown once,
+  escaped, followed by `\{N}`, N the run's length: padding of one character takes a few bytes
+  and pushes nothing off the screen (RT-AG-04). The run is marked before the cut, so the cut,
+  the wire cap of the full text and the tail's size and hash are of the marked text. The action
+  is cut at 2 000 chars, never inside an escape or a marked run, with an explicit
+  `… (+N bytes, sha256 …)` tail, and travels whole (`full`) for a reveal; a client must not take
+  "approve" on a cut prompt before showing the whole text. Paths are shown as *host realpath*
+  **and** guest path; payloads (write content, fetch body, MCP arguments) also by size and
+  sha256. A fetch names the credentials the proxy will add (`secret:NAME`, names only), before
+  its URL, or says it carries none; they are part of the digest, and the run sends nothing if
+  the host's grants no longer name exactly those (`tool.result` `failed`, code
+  `credentials-changed`). Model text (a reason) is a separate one-line field: quoted, escaped
+  only up to its 500-char cut (the tail names the raw bytes left and their hash), labelled
+  untrusted; it is never part of the action. A prompt goes to a client as fields (`call`,
+  `action`, `note`, `risk_tags`, `full`), never as text laid out by the broker; an older CLI
+  that expects the laid-out text cannot read a prompt, answers none, and its prompts time out,
+  which denies them. `sally approve` lays a prompt out itself (`approve::layout`): its own lines start at
+  the left edge, and every row of request text (the note, then the action, then a cut action's
+  full text) is printed behind a gutter (`  | `), wrapped by the CLI to the terminal's width
+  (one column to spare), never inside an escape or a marked run, so no row of request text
+  starts where a broker line does. When the prompt is taller than the screen, and above every
+  question asked again, the CLI prints the approval line, the first rows of the action that fit,
+  how many rows it left out, the risk and the digest again, so the start of the action is in
+  the last screen before the question. A prompt can only be denied when fewer than 4 rows of the
+  action's start fit, when the terminal's size is not known or is under 40 columns (laid out at
+  80x24 then, with a line saying why), or when a field fails the CLI's clean-check (shown
+  escaped). The audit's action text is not marked: it keeps every run whole and is cut at its
+  own bound.
 - **Approval events** (Task 10; each before the effect, the prompt or the reply it covers; a
   failed append runs nothing and answers nothing). Action fields are `{call, tool, action
   (≤ 1 024 chars), action_sha256}`, where `action_sha256` is the digest the approval binds
   (session, call number and every byte that runs):
   - `tool.pending` (harness, `pending`): action fields, `id`, `note_bytes`/`note_sha256` (never
-    the note).
+    the note; a fetch has no note: the credentials it carries are in its action).
   - `approval.decide` (user, `approve|deny|deny_all_session`): action fields, `id`, `client
     {uid, pid}`, `via` (the id whose `deny_all_session` took it); `refuse` with `reason:
     unknown-id` for an id that is not waiting (written by `control.sock` itself, with no session,
