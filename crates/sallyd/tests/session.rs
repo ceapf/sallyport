@@ -540,19 +540,26 @@ fn a_panicking_session_task_ends_only_its_session() {
     });
 }
 
-/// `runtime.timeout` (1m, the least the manifest allows): `session.timeout` before
-/// `session.stop timeout`, and the container is gone.
+/// RT-AG-09, the live `runtime.timeout` stop (1m, the least the manifest allows):
+/// `session.timeout` before `session.stop timeout`, and the container is gone. Control: the
+/// same session with a 10m timeout, started alongside, is still running at that moment.
 #[test]
-fn a_session_past_its_timeout_is_stopped() {
+fn rt_ag_09_a_session_past_its_timeout_is_stopped() {
     rt().block_on(async {
         let r = registry();
+        let long = Arc::new(r.x.f.validated("runtime:\n  timeout: 10m\n"));
+        let control = r.reg.start(long).await.unwrap();
         let v = Arc::new(r.x.f.validated("runtime:\n  timeout: 1m\n"));
         let info = r.reg.start(v).await.unwrap();
         until("the timeout", Duration::from_secs(90), || {
-            r.reg.list().is_empty()
+            r.reg.list().iter().all(|s| s.id != info.id)
         })
         .await;
         assert!(!exists(&info.container));
+        assert!(
+            r.reg.list().iter().any(|s| s.id == control.id) && exists(&control.container),
+            "control: the 10m session still runs"
+        );
         let all = session_events(&r.x);
         let at = all.iter().position(|e| e == "session.timeout").unwrap();
         assert_eq!(all.get(at + 1).map(String::as_str), Some("session.stop"));
@@ -560,6 +567,10 @@ fn a_session_past_its_timeout_is_stopped() {
         assert_eq!(
             r.x.events.args("session.timeout").unwrap()["timeout_secs"],
             60
+        );
+        assert_eq!(
+            r.reg.stop(&control.id, StopReason::Request).await,
+            Some(StopOutcome::Stopped)
         );
     });
 }
