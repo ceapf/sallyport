@@ -23,7 +23,7 @@ Carry-over into M1: doctor must treat cgroup v1 as FAIL; the agent-profile argv 
 
 ---
 
-## M1 — Security core + minimal CLI (2 weeks)
+## M1 — Security core + minimal CLI (2 weeks) — **DONE 2026-11-24** ([`docs/reports/M1.md`](reports/M1.md))
 
 **Goal:** a manifest can launch a hardened sandbox whose only exits are the broker's sockets; egress and credentials are brokered; approvals and audit work; the red-team CI proves it. No models, no UI.
 
