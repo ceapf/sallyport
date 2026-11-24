@@ -235,8 +235,9 @@ pub struct EgressHandle {
 }
 
 impl EgressHandle {
-    /// The session's [`Connector`] for the `fetch` tool, when the session has upstream trust
-    /// roots (a session with secret grants, or one granting `fetch`; architect ruling Q2).
+    /// The session's [`Connector`] for the `fetch` tool, when the session grants `fetch` (its
+    /// upstream trust roots are then loaded: the interception's with secret grants, its own
+    /// without; architect ruling Q2).
     #[must_use]
     pub fn connector(&self) -> Option<Arc<dyn Connector>> {
         self.connector
@@ -610,9 +611,10 @@ pub struct Egress<R, D, H> {
     pub secrets: Arc<dyn SecretSource>,
 }
 
-/// The production starter. Build it once and share it by every session: each
-/// [`SystemResolver::default`] has its own [`MAX_LOOKUPS`] slots, so the bound is global only
-/// while one resolver serves them all.
+/// The starter over the system resolver, plain TCP and `/proc` host addresses. Production does not
+/// share one: [`crate::session::lookup::SharedEgress`] builds one for each session, with the
+/// session's own resolver ([`crate::session::lookup::SESSION_LOOKUPS`] slots) over one lookup
+/// bounded by [`MAX_LOOKUPS`] across every session.
 pub type SystemEgress = Egress<SystemResolver, TcpDialer, ProcHostAddrs>;
 
 impl<R: Resolver, D: Dialer, H: HostAddrs> EgressStarter for Egress<R, D, H> {
