@@ -9,12 +9,14 @@
 #![deny(clippy::indexing_slicing)]
 
 /// Why [`GgmlType::bytes`] gave no size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SizeError {
     /// The first dimension is not a whole number of blocks.
+    #[error("the first dimension is not a whole number of blocks")]
     PartialBlock,
     /// The size does not fit in a `u64`.
+    #[error("the size does not fit in a u64")]
     Overflow,
 }
 
