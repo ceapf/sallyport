@@ -299,8 +299,11 @@ pub const STORED: [&str; 4] = ["GITHUB_TOKEN", "MOCK3_TOKEN", "GIT_TOKEN", "HOST
 /// credential-shaped literal is in the tree; `CANARY` makes it easy to grep for (RT-SEC-07),
 /// except `HOST_TOKEN`'s, which must be lower-case (below): a search for it names it.
 /// `GIT_TOKEN`'s also holds characters a percent-encoder escapes (`/ + ? & = %` and a space),
-/// so each percent spelling differs from the raw value (architect ruling A4); none of the
-/// canaries holds `*`, so a session's filler is `*`. `HOST_TOKEN`'s is a lower-case DNS label
+/// so each percent spelling differs from the raw value (architect ruling A4); `!()`, which
+/// one keep-set leaves alone, so that spelling differs from the others (not `'`: the
+/// container searches single-quote each form, `search::fixed_patterns`); and `"` and `\`, so its
+/// JSON-string spelling differs from the raw value. None of the canaries holds `*`, so a
+/// session's filler is `*`. `HOST_TOKEN`'s is a lower-case DNS label
 /// (33 bytes of `a-z0-9`, a letter first): the only form that can stand in a CONNECT host,
 /// which `sallyd` logs lower-cased (architect Q279, #160).
 pub fn canary(name: &str) -> String {
@@ -309,7 +312,7 @@ pub fn canary(name: &str) -> String {
     }
     let base = format!("SALLY_CANARY_{name}_{}", "c0ffee".repeat(4));
     if name == "GIT_TOKEN" {
-        format!("{base}/a+b c?d&e=f%g")
+        format!("{base}/a+b c?d&e=f%g!h(i)j\"k\\l")
     } else {
         base
     }

@@ -38,28 +38,33 @@ pub struct Pct {
     pub keep: &'static str,
 }
 
-/// Every percent-encoder spelling RT-SEC-12 echoes: both hex cases, `+` for a space, `/` kept.
-pub const PCTS: [Pct; 4] = [
+/// A [`Pct`] in one line.
+const fn p(upper: bool, plus_space: bool, keep: &'static str) -> Pct {
     Pct {
-        upper: true,
-        plus_space: false,
-        keep: "",
-    },
-    Pct {
-        upper: false,
-        plus_space: false,
-        keep: "",
-    },
-    Pct {
-        upper: true,
-        plus_space: true,
-        keep: "",
-    },
-    Pct {
-        upper: true,
-        plus_space: false,
-        keep: "/",
-    },
+        upper,
+        plus_space,
+        keep,
+    }
+}
+
+/// Every percent-encoder spelling RT-SEC-12 echoes: each of three keep-sets (nothing besides
+/// the unreserved characters; `/`, as Python's `quote` keeps it; `!'()*`, as
+/// `encodeURIComponent` keeps them), with and without `+` for a space, in both hex cases. The
+/// first four are the spellings this list held before it was widened, kept in their places so
+/// the vectors that index them still mean the same spellings; do not reorder.
+pub const PCTS: [Pct; 12] = [
+    p(true, false, ""),
+    p(false, false, ""),
+    p(true, true, ""),
+    p(true, false, "/"),
+    p(false, true, ""),
+    p(false, false, "/"),
+    p(true, true, "/"),
+    p(false, true, "/"),
+    p(true, false, "!'()*"),
+    p(false, false, "!'()*"),
+    p(true, true, "!'()*"),
+    p(false, true, "!'()*"),
 ];
 
 /// `s` percent-encoded as `p` says: RFC 3986 unreserved characters kept, every other byte `%XX`.
@@ -74,6 +79,29 @@ pub fn pct(s: &str, p: Pct) -> String {
             out.push_str(&format!("%{b:02X}"));
         } else {
             out.push_str(&format!("%{b:02x}"));
+        }
+    }
+    out
+}
+
+/// `s` as `serde_json` writes it inside a JSON string: `"` and `\` escaped with a backslash, the
+/// short escapes for the controls that have one, `\u00XX` (lower-case hex) for the other
+/// controls; every other character as it is. RFC 8259 §7 allows other spellings (`\/`,
+/// upper-case hex, `\u` for any character); the redaction covers only this one (THREAT_MODEL,
+/// #249).
+pub fn json_str(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            c if u32::from(c) < 0x20 => out.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c => out.push(c),
         }
     }
     out
@@ -99,11 +127,12 @@ pub fn basic_blob(user: &str, secret: &str) -> String {
     b64(format!("{user}:{secret}").as_bytes(), STANDARD)
 }
 
-/// Every independently computed form of `secret`: the raw value, each [`PCTS`] spelling, and
-/// the base64 core at all three alignments in both alphabets.
+/// Every independently computed form of `secret`: the raw value, each [`PCTS`] spelling, its
+/// JSON-string spelling, and the base64 core at all three alignments in both alphabets.
 pub fn forms_of(secret: &str) -> Vec<String> {
     let mut out = vec![secret.to_owned()];
     out.extend(PCTS.iter().map(|p| pct(secret, *p)));
+    out.push(json_str(secret));
     for alphabet in ALPHABETS {
         for lead in 0..3 {
             out.push(b64_core(secret, lead, alphabet));
@@ -128,7 +157,7 @@ pub fn basic_forms(user: &str, secret: &str) -> Vec<String> {
 /// What one line of the `/echo-forms` body is, and so which of its bytes must be filler.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Line {
-    /// The raw secret or one percent spelling: all of it.
+    /// The raw secret, one percent spelling or its JSON-string spelling: all of it.
     Whole,
     /// `base64(prefix ‖ secret ‖ suffix)`: the bytes in this range (the secret's core).
     Core(std::ops::Range<usize>),
@@ -137,13 +166,14 @@ pub enum Line {
 }
 
 /// The `/echo-forms` lines before the echoed request, for `secret` and the `Basic` credential
-/// `blob` the request carried: the raw secret, each percent spelling, `base64(prefix ‖ secret ‖
-/// suffix)` padded for prefixes of 0, 1 and 2 bytes in both alphabets with a suffix of 1, 2 and
-/// 3 bytes (architect ruling A4 conditions 3, 5), the padded blob, and the unpadded blob before
-/// a `"`. No line holds a `\n`.
+/// `blob` the request carried: the raw secret, each percent spelling, the JSON-string spelling,
+/// `base64(prefix ‖ secret ‖ suffix)` padded for prefixes of 0, 1 and 2 bytes in both alphabets
+/// with a suffix of 1, 2 and 3 bytes (architect ruling A4 conditions 3, 5), the padded blob, and
+/// the unpadded blob before a `"`. No line holds a `\n`.
 pub fn echo_lines(secret: &str, blob: &str) -> Vec<(String, Line)> {
     let mut out = vec![(secret.to_owned(), Line::Whole)];
     out.extend(PCTS.iter().map(|p| (pct(secret, *p), Line::Whole)));
+    out.push((json_str(secret), Line::Whole));
     for alphabet in ALPHABETS {
         for lead in 0..3usize {
             let mut data = "<<".as_bytes()[..lead].to_vec();

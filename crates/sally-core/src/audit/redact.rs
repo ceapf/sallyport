@@ -459,6 +459,20 @@ mod tests {
     }
 
     #[test]
+    fn the_encode_uri_component_keep_set_leaves_each_of_its_characters_alone() {
+        // `encodeURIComponent` (ECMA-262, URI handling) keeps the unreserved characters and
+        // `!'()*`; written out by hand, never computed here. The red-team canaries cannot hold
+        // `'` (the container searches single-quote) or `*` (the filler), so this holds them.
+        let f: Vec<String> = secret_forms("k'*!()v x")
+            .iter()
+            .map(|x| x.expose().clone())
+            .collect();
+        assert!(f.contains(&"k'*!()v%20x".to_owned()), "{f:?}");
+        assert!(f.contains(&"k'*!()v+x".to_owned()), "{f:?}");
+        assert!(f.contains(&"k%27%2A%21%28%29v%20x".to_owned()), "{f:?}");
+    }
+
+    #[test]
     fn session_forms_hold_each_secrets_forms_then_its_extras_once() {
         let a = s("a value/with space");
         let b = s("b-value");
