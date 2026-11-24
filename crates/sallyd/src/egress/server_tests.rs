@@ -11,6 +11,7 @@ use sally_core::manifest::parse_host_pattern;
 use tokio::io::{DuplexStream, duplex};
 
 use super::*;
+use crate::egress::head::MAX_PARSES;
 use crate::egress::hostaddrs::Table;
 use crate::egress::policy::{Grant, Rule};
 
@@ -23,11 +24,13 @@ fn sock(ip: IpAddr, port: u16) -> SocketAddr {
     SocketAddr::new(ip, port)
 }
 
-/// Answers per name, one list per call (the last repeats); counts every lookup.
+/// Answers per name, one list per call (the last repeats); counts every lookup. With `hold`,
+/// each answer waits for a permit.
 #[derive(Default)]
 struct FakeResolver {
     answers: HashMap<String, Vec<io::Result<Vec<IpAddr>>>>,
     hang: bool,
+    hold: Option<Arc<Semaphore>>,
     calls: Arc<Mutex<Vec<String>>>,
 }
 
@@ -48,6 +51,9 @@ impl Resolver for FakeResolver {
         };
         if self.hang {
             std::future::pending::<()>().await;
+        }
+        if let Some(hold) = &self.hold {
+            hold.acquire().await.unwrap().forget();
         }
         let Some(list) = self.answers.get(host) else {
             return Err(io::ErrorKind::NotFound.into());
@@ -107,18 +113,45 @@ impl HostAddrs for FakeHost {
     }
 }
 
-/// Records (event, decision, arguments); `fail` refuses every append. Each entry is resolved
-/// with `redactor` as the writer resolves it (empty by default; architect Q301).
+/// Records (event, decision, arguments); while `fail` holds it refuses every append, and while
+/// `panic` holds it panics. An append of the event `hold_on` names waits until `release`
+/// (counted in `held` while it waits). Each entry is resolved with `redactor` as the writer
+/// resolves it (empty by default; architect Q301).
 #[derive(Default)]
 struct Sink {
     entries: Mutex<Vec<(String, Option<String>, Value)>>,
-    fail: bool,
+    fail: AtomicBool,
+    panic: AtomicBool,
+    hold_on: Option<&'static str>,
+    held: std::sync::atomic::AtomicUsize,
+    gate: (Mutex<bool>, std::sync::Condvar),
     redactor: sally_core::audit::Redactor,
+}
+
+impl Sink {
+    fn release(&self) {
+        *self.gate.0.lock().unwrap() = true;
+        self.gate.1.notify_all();
+    }
 }
 
 impl AuditSink for Sink {
     fn append(&self, e: NewEntry, _: AuditLevel) -> Result<(), AuditError> {
-        if self.fail {
+        if self.hold_on == Some(e.event()) {
+            self.held.fetch_add(1, Ordering::SeqCst);
+            // Bounded in real time, so a test that fails before its release ends instead of
+            // holding the runtime's shutdown on this blocking thread.
+            let open = self.gate.0.lock().unwrap();
+            let limit = std::time::Duration::from_secs(10);
+            let (open, waited) = self
+                .gate
+                .1
+                .wait_timeout_while(open, limit, |o| !*o)
+                .unwrap();
+            assert!(*open && !waited.timed_out(), "never released");
+        }
+        assert!(!self.panic.load(Ordering::SeqCst), "fake panic");
+        if self.fail.load(Ordering::SeqCst) {
             return Err(AuditError::InvalidEntry("fake failure"));
         }
         let row = (
@@ -251,12 +284,13 @@ fn connect(target: &str) -> Vec<u8> {
 
 /// RT-SEC-15, the host case (#162, architect Q289 (2), Q301 (i)): session X, without grants,
 /// CONNECTs under the `*.mock.test` rule to a host whose label is live session Y's value. The
-/// proxy's own `egress.allow` and `egress.close` builders put the host in plain args in its
-/// parsed spelling, and the writer's pass with Y's forms masks it whole. Control: the same
-/// flow without Y's forms logs the label. What it pins: the writer's whole-args pass, and a
-/// builder that keeps the label whole (dropping the host, respelling it, or cutting it short of
-/// the label fails it). A DNS-safe label holds nothing an escape would change, and a cut longer
-/// than the label changes nothing either; neither is something this test can show.
+/// proxy's own `egress.resolve`, `egress.allow` and `egress.close` builders put the host in
+/// plain args in its parsed spelling, and the writer's pass with Y's forms masks it whole.
+/// Control: the same flow without Y's forms logs the label. What it pins: the writer's
+/// whole-args pass, and a builder that keeps the label whole (dropping the host, respelling it,
+/// or cutting it short of the label fails it). A DNS-safe label holds nothing an escape would
+/// change, and a cut longer than the label changes nothing either; neither is something this
+/// test can show.
 #[tokio::test]
 async fn rt_sec_15_a_live_sessions_value_as_a_wildcard_host_is_masked_in_allow_and_close() {
     let label = format!("ylabel{}", "q7".repeat(12));
@@ -277,8 +311,9 @@ async fn rt_sec_15_a_live_sessions_value_as_a_wildcard_host_is_masked_in_allow_a
             .rig();
             let got = rig.send(&connect(&format!("{host}:443"))).await;
             assert!(got.starts_with("HTTP/1.1 200"), "{got}");
-            assert_eq!(rig.sink.events(), ["egress.allow", "egress.close"]);
-            ["egress.allow", "egress.close"].map(|e| rig.sink.args(e))
+            let events = ["egress.resolve", "egress.allow", "egress.close"];
+            assert_eq!(rig.sink.events(), events);
+            events.map(|e| rig.sink.args(e))
         }
     };
     let run = |text: &str| {
@@ -311,8 +346,15 @@ async fn an_allowed_host_is_tunnelled_to_its_pinned_address() {
     let got = rig.send(&req).await;
     assert_eq!(got, "HTTP/1.1 200 Connection Established\r\n\r\nping");
     assert_eq!(rig.dials(), vec![sock(public(1), 443)]);
-    assert_eq!(rig.sink.events(), ["egress.allow", "egress.close"]);
-    assert_eq!(rig.sink.decisions(), [Some("allow".to_owned()), None]);
+    assert_eq!(
+        rig.sink.events(),
+        ["egress.resolve", "egress.allow", "egress.close"]
+    );
+    assert_eq!(rig.sink.decisions(), [None, Some("allow".to_owned()), None]);
+    assert_eq!(
+        rig.sink.args("egress.resolve"),
+        json!({"host": "a.mock.test", "port": 443})
+    );
     assert_eq!(
         rig.sink.args("egress.allow"),
         json!({
@@ -566,7 +608,7 @@ async fn one_denied_address_refuses_the_whole_name() {
         let got = rig.send(&connect("a.mock.test:443")).await;
         assert_eq!(got, reply(Reason::IpRangeDenied), "{bad}");
         assert!(rig.dials().is_empty(), "{bad}");
-        assert_eq!(rig.sink.events(), ["egress.deny"]);
+        assert_eq!(rig.sink.events(), ["egress.resolve", "egress.deny"]);
         // The entry names the refused address and the rule it met, not only the reason.
         let args = rig.sink.args("egress.deny");
         assert_eq!(args.get("address"), Some(&json!(bad.to_string())), "{bad}");
@@ -634,7 +676,7 @@ async fn a_neighbour_on_a_connected_network_is_refused_and_named() {
     let got = rig.send(&connect("a.mock.test:443")).await;
     assert_eq!(got, reply(Reason::IpRangeDenied));
     assert!(rig.dials().is_empty());
-    assert_eq!(rig.sink.events(), ["egress.deny"]);
+    assert_eq!(rig.sink.events(), ["egress.resolve", "egress.deny"]);
     let args = rig.sink.args("egress.deny");
     assert_eq!(args.get("address"), Some(&json!(neighbour.to_string())));
     assert_eq!(args.get("rule"), Some(&json!("connected-network")));
@@ -722,7 +764,10 @@ async fn stopping_ends_checks_without_a_reply_and_tunnels_with_session_stopped()
         rig.sink.args("egress.close")["end"],
         json!("session-stopped")
     );
-    assert_eq!(rig.sink.events(), ["egress.allow", "egress.close"]);
+    assert_eq!(
+        rig.sink.events(),
+        ["egress.resolve", "egress.allow", "egress.close"]
+    );
     let after = rig.send(&connect("a.mock.test:443")).await;
     assert_eq!(after, "");
 }
@@ -741,15 +786,18 @@ async fn stopping_while_dialling_writes_a_close_without_a_reply() {
     let proxy = Arc::clone(&rig.proxy);
     let task = tokio::spawn(async move { proxy.serve(server).await });
     client.write_all(&connect("a.mock.test:443")).await.unwrap();
-    // The dial hangs until the stop, so any entry but `egress.allow`, or a finished task, means
-    // the CONNECT was refused. Not the task alone: a refused connection drains first (#71), and
-    // the paused clock never runs out its drain while this loop keeps the runtime busy. Capped,
-    // so a mutant that never dials fails here instead of hanging.
+    // The dial hangs until the stop, so any entry but `egress.resolve` and `egress.allow`, or a
+    // finished task, means the CONNECT was refused. Not the task alone: a refused connection
+    // drains first (#71), and the paused clock never runs out its drain while this loop keeps
+    // the runtime busy. Capped, so a mutant that never dials fails here instead of hanging.
     for spins in 0.. {
         if !rig.dials().is_empty() {
             break;
         }
-        let refused = rig.sink.events().iter().any(|e| e != "egress.allow");
+        let events = rig.sink.events();
+        let refused = events
+            .iter()
+            .any(|e| e != "egress.resolve" && e != "egress.allow");
         assert!(
             !task.is_finished() && !refused && spins < 100_000,
             "refused before the dial"
@@ -767,6 +815,233 @@ async fn stopping_while_dialling_writes_a_close_without_a_reply() {
             "host": "a.mock.test", "port": 443, "connected": false,
             "bytes_up": 0, "bytes_down": 0, "end": "session-stopped", "intercept": false,
         })
+    );
+}
+
+/// RT-AUD-04, the stop: a stop that ends a request during its lookup leaves the entry that
+/// named the target before the lookup began, and nothing after it. Control: in-test, the
+/// entry is read once the resolver was called and before the stop.
+#[tokio::test(start_paused = true)]
+async fn rt_aud_04_a_stop_during_the_lookup_leaves_the_entry_naming_the_target() {
+    let rig = Setup {
+        resolver: FakeResolver {
+            hang: true,
+            ..FakeResolver::default()
+        },
+        ..Setup::default()
+    }
+    .rig();
+    let (mut client, server) = duplex(4096);
+    let proxy = Arc::clone(&rig.proxy);
+    let task = tokio::spawn(async move { proxy.serve(server).await });
+    client.write_all(&connect("a.mock.test:443")).await.unwrap();
+    // The lookup hangs until the stop. Capped, so a mutant that never looks up fails here
+    // instead of hanging.
+    for spins in 0.. {
+        if rig.lookups() > 0 {
+            break;
+        }
+        assert!(
+            !task.is_finished() && spins < 100_000,
+            "ended before the lookup"
+        );
+        tokio::task::yield_now().await;
+    }
+    let resolve = json!({"host": "a.mock.test", "port": 443});
+    assert_eq!(
+        rig.sink.events(),
+        ["egress.resolve"],
+        "control: before the stop"
+    );
+    assert_eq!(rig.sink.args("egress.resolve"), resolve, "control");
+    rig.proxy.stop();
+    task.await.unwrap();
+    let mut out = Vec::new();
+    client.read_to_end(&mut out).await.unwrap();
+    assert!(out.is_empty());
+    assert_eq!(rig.sink.events(), ["egress.resolve"]);
+    assert_eq!(rig.sink.args("egress.resolve"), resolve);
+}
+
+/// RT-AUD-04, the latch: once an append has failed, egress stays closed for the session. The
+/// allowed CONNECT whose entry failed is never looked up; after the log works again, an allowed
+/// and a denied CONNECT both get no byte (no `200`, no `403`), nothing more is looked up or
+/// dialled, and each leaves only its `egress.deny` `audit-failed`; a silent client is closed
+/// at once, unread. Control: in-test, the same allowed CONNECT with a working sink first, looked
+/// up once, dialled once, answered `200`, with `egress.resolve` before `egress.allow`.
+#[tokio::test(start_paused = true)]
+async fn rt_aud_04_a_failing_audit_log_closes_egress_with_no_lookup() {
+    let rig = Setup::default().rig();
+    let allowed = connect("a.mock.test:443");
+    let got = rig.send(&allowed).await;
+    assert!(got.starts_with("HTTP/1.1 200 "), "control: {got}");
+    assert_eq!((rig.lookups(), rig.dials().len()), (1, 1), "control");
+    let events = rig.sink.events();
+    assert_eq!(
+        events.get(..2),
+        Some(&events_of(&["egress.resolve", "egress.allow"])[..])
+    );
+    let written = events.len();
+    rig.sink.fail.store(true, Ordering::SeqCst);
+    assert_eq!(rig.send(&allowed).await, "");
+    assert_eq!(
+        (rig.lookups(), rig.dials().len()),
+        (1, 1),
+        "looked up or dialled"
+    );
+    rig.sink.fail.store(false, Ordering::SeqCst);
+    for req in [&allowed, &connect("evil.test:443")] {
+        assert_eq!(rig.send(req).await, "", "answered after the latch");
+    }
+    assert_eq!(
+        (rig.lookups(), rig.dials().len()),
+        (1, 1),
+        "looked up or dialled"
+    );
+    let later = rig.sink.entries.lock().unwrap().split_off(written);
+    let denied = ("egress.deny".to_owned(), Some("deny".to_owned()));
+    let reason = json!({"reason": "audit-failed"});
+    assert_eq!(later.len(), 2, "{later:?}");
+    for (event, decision, args) in later {
+        assert_eq!(((event, decision), args), (denied.clone(), reason.clone()));
+    }
+    let (_client, server) = duplex(64);
+    let t0 = tokio::time::Instant::now();
+    rig.proxy.serve(server).await;
+    assert_eq!(
+        t0.elapsed(),
+        Duration::ZERO,
+        "a silent client waited for its head"
+    );
+}
+
+fn events_of(names: &[&str]) -> Vec<String> {
+    names.iter().map(|&n| n.to_owned()).collect()
+}
+
+/// Sends `req` with the log failing for that one append, then lets the log work again.
+async fn latch_with(rig: &Rig, req: &[u8]) {
+    rig.sink.fail.store(true, Ordering::SeqCst);
+    assert_eq!(rig.send(req).await, "");
+    rig.sink.fail.store(false, Ordering::SeqCst);
+}
+
+/// Spins until `done` holds, capped so a mutant that never gets there fails instead of hanging.
+async fn spin_until(what: &str, done: impl Fn() -> bool) {
+    for spins in 0.. {
+        if done() {
+            return;
+        }
+        assert!(spins < 100_000, "{what}");
+        tokio::task::yield_now().await;
+    }
+}
+
+/// RT-AUD-04's gate before the lookup: a request already past the latch check at the start
+/// of its connection when the latch sets is still not looked up, and writes no
+/// `egress.resolve`, though the log works again by then.
+#[tokio::test(start_paused = true)]
+async fn a_request_in_flight_when_the_latch_sets_is_not_looked_up() {
+    let rig = Setup::default().rig();
+    let (mut client, server) = duplex(4096);
+    let proxy = Arc::clone(&rig.proxy);
+    let task = tokio::spawn(async move { proxy.serve(server).await });
+    client
+        .write_all(b"CONNECT a.mock.test:443 HTTP/1.1\r\n")
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+    assert!(!task.is_finished());
+    latch_with(&rig, &connect("evil.test:443")).await;
+    client.write_all(b"\r\n").await.unwrap();
+    client.shutdown().await.unwrap();
+    let mut out = Vec::new();
+    client.read_to_end(&mut out).await.unwrap();
+    task.await.unwrap();
+    assert!(out.is_empty());
+    assert_eq!(rig.lookups(), 0);
+    assert!(rig.sink.events().is_empty(), "{:?}", rig.sink.events());
+}
+
+/// RT-AUD-04's gate before the dial: a lookup that returns after the latch set is not dialled
+/// and writes no `egress.allow`; its `egress.resolve` stays the only entry it has.
+#[tokio::test(start_paused = true)]
+async fn a_lookup_that_returns_after_the_latch_is_not_dialled() {
+    let hold = Arc::new(Semaphore::new(0));
+    let rig = Setup {
+        resolver: FakeResolver {
+            hold: Some(Arc::clone(&hold)),
+            ..Setup::default().resolver
+        },
+        ..Setup::default()
+    }
+    .rig();
+    let (mut client, server) = duplex(4096);
+    let proxy = Arc::clone(&rig.proxy);
+    let task = tokio::spawn(async move { proxy.serve(server).await });
+    client.write_all(&connect("a.mock.test:443")).await.unwrap();
+    spin_until("the lookup to start", || rig.lookups() == 1).await;
+    latch_with(&rig, &connect("evil.test:443")).await;
+    hold.add_permits(1);
+    client.shutdown().await.unwrap();
+    let mut out = Vec::new();
+    client.read_to_end(&mut out).await.unwrap();
+    task.await.unwrap();
+    assert!(out.is_empty());
+    assert!(rig.dials().is_empty());
+    assert_eq!(rig.sink.events(), ["egress.resolve"]);
+}
+
+/// RT-AUD-04's gate after the entry: an `egress.resolve` being written when another
+/// connection's append fails is written, and then nothing follows it, no lookup.
+#[tokio::test(start_paused = true)]
+async fn an_entry_written_while_the_latch_set_is_not_followed_by_a_lookup() {
+    let rig = Setup {
+        sink: Sink {
+            hold_on: Some("egress.resolve"),
+            ..Sink::default()
+        },
+        ..Setup::default()
+    }
+    .rig();
+    let (mut client, server) = duplex(4096);
+    let proxy = Arc::clone(&rig.proxy);
+    let task = tokio::spawn(async move { proxy.serve(server).await });
+    client.write_all(&connect("a.mock.test:443")).await.unwrap();
+    let held = || rig.sink.held.load(Ordering::SeqCst) == 1;
+    spin_until("the entry to be held", held).await;
+    latch_with(&rig, &connect("evil.test:443")).await;
+    rig.sink.release();
+    client.shutdown().await.unwrap();
+    let mut out = Vec::new();
+    client.read_to_end(&mut out).await.unwrap();
+    task.await.unwrap();
+    assert!(out.is_empty());
+    assert_eq!(rig.lookups(), 0);
+    assert_eq!(rig.sink.events(), ["egress.resolve"]);
+}
+
+/// A latched session that has stopped closes a late connection without entering anything.
+#[tokio::test]
+async fn a_stopped_latched_session_enters_nothing_new() {
+    let rig = Setup::default().rig();
+    latch_with(&rig, &connect("evil.test:443")).await;
+    rig.proxy.stop();
+    assert_eq!(rig.send(&connect("evil.test:443")).await, "");
+    assert!(rig.sink.events().is_empty(), "{:?}", rig.sink.events());
+}
+
+/// An append that panics sets the latch as a failed one does.
+#[tokio::test]
+async fn a_panicking_append_closes_egress() {
+    let rig = Setup::default().rig();
+    rig.sink.panic.store(true, Ordering::SeqCst);
+    assert_eq!(rig.send(&connect("evil.test:443")).await, "");
+    rig.sink.panic.store(false, Ordering::SeqCst);
+    assert_eq!(rig.send(&connect("evil.test:443")).await, "");
+    assert_eq!(
+        rig.sink.args("egress.deny"),
+        json!({"reason": "audit-failed"})
     );
 }
 
@@ -880,7 +1155,10 @@ async fn at_most_three_addresses_are_tried_then_502_connect_failed() {
     assert_eq!(got, reply(Reason::ConnectFailed));
     let tried: Vec<SocketAddr> = ips.iter().take(3).map(|ip| sock(*ip, 443)).collect();
     assert_eq!(rig.dials(), tried);
-    assert_eq!(rig.sink.events(), ["egress.allow", "egress.close"]);
+    assert_eq!(
+        rig.sink.events(),
+        ["egress.resolve", "egress.allow", "egress.close"]
+    );
     let all: Vec<String> = ips.iter().map(ToString::to_string).collect();
     assert_eq!(rig.sink.args("egress.allow")["addresses"], json!(all));
     assert_eq!(
@@ -890,7 +1168,7 @@ async fn at_most_three_addresses_are_tried_then_502_connect_failed() {
             "bytes_up": 0, "bytes_down": 0, "end": "connect-failed", "intercept": false,
         })
     );
-    assert_eq!(rig.sink.decisions(), [Some("allow".to_owned()), None]);
+    assert_eq!(rig.sink.decisions(), [None, Some("allow".to_owned()), None]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1065,7 +1343,7 @@ async fn when_the_audit_log_fails_nothing_is_answered_or_dialled() {
     for req in [connect("a.mock.test:443"), connect("evil.test:443")] {
         let rig = Setup {
             sink: Sink {
-                fail: true,
+                fail: true.into(),
                 ..Sink::default()
             },
             ..Setup::default()
@@ -1073,6 +1351,7 @@ async fn when_the_audit_log_fails_nothing_is_answered_or_dialled() {
         .rig();
         assert_eq!(rig.send(&req).await, "");
         assert!(rig.dials().is_empty());
+        assert_eq!(rig.lookups(), 0, "looked up with no entry written");
     }
 }
 

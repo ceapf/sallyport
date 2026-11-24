@@ -4,15 +4,22 @@
 //!
 //! Order (decision 3, architect Q1/Q8): admission (the in-flight slot and the admission rate, in
 //! `net.rs`; a connection over the rate is closed unread and only counted), head, CONNECT only,
-//! authority, policy (host, port, grant), the host's own addresses and connected networks, one
-//! lookup, the address filter over every address, `egress.allow`, connect to the pinned
-//! addresses in order, `200`, tunnel, `egress.close`. Every refusal is audited before its reply;
-//! a failed audit append closes without a reply or a dial.
+//! authority, policy (host, port, grant), the host's own addresses and connected networks,
+//! `egress.resolve`, one lookup, the address filter over every address, `egress.allow`, connect
+//! to the pinned addresses in order, `200`, tunnel, `egress.close`. Every refusal is audited
+//! before its reply; a failed audit append closes without a reply, a lookup or a dial.
+//!
+//! Latch (RT-AUD-04): once any of the session's egress appends has failed, egress stays
+//! closed. Every later connection is closed unread, without a reply, after one best-effort
+//! `egress.deny` (`audit-failed`), and no entry that would permit an effect (`egress.resolve`,
+//! `egress.allow`, an in-tunnel `egress.request`) is started; one already being written when
+//! the latch set stands with no effect after it. No lookup, dial or forwarded request follows.
 
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use sally_core::audit::{Actor, NewEntry, Redactor};
@@ -23,7 +30,7 @@ use tokio::sync::{Semaphore, watch};
 
 use super::addr::{self, HostNets, Rule};
 use super::authority::{self, Authority, AuthorityError};
-use super::head::{self, MAX_HEAD, Parsed};
+use super::head::{self, MAX_HEAD, Parsed, read_head};
 use super::hostaddrs::HostAddrsError;
 use super::policy::{Policy, Reason, Route};
 use super::tunnel::{self, End, IDLE_LIMIT, Totals};
@@ -239,6 +246,30 @@ pub struct Proxy<R, D, H> {
     interception: Option<Interception>,
     slots: Arc<Semaphore>,
     stop: watch::Sender<bool>,
+    /// Set by the first append that fails; never cleared (RT-AUD-04).
+    latch: Arc<AtomicBool>,
+}
+
+/// The `reason` of the `egress.deny` of a connection closed by the latch.
+const AUDIT_FAILED: &str = "audit-failed";
+
+/// Why a request was not cleared: refused (audited, answered), or closed without a reply
+/// because the entry that must precede its lookup was not written.
+enum Stop {
+    Refused(Refusal),
+    Closed,
+}
+
+impl From<Refusal> for Stop {
+    fn from(r: Refusal) -> Self {
+        Self::Refused(r)
+    }
+}
+
+impl From<Reason> for Stop {
+    fn from(reason: Reason) -> Self {
+        Self::Refused(reason.into())
+    }
 }
 
 /// What of a refused request goes into its audit entry.
@@ -304,6 +335,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
             limits: p.limits,
             interception: p.interception,
             stop: watch::Sender::new(false),
+            latch: Arc::default(),
         }
     }
 
@@ -335,6 +367,18 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
     /// Handles one client stream to its end. Client input never panics it; every refusal is
     /// audited before the connection closes.
     pub async fn serve<C: AsyncRead + AsyncWrite + Unpin + Send>(&self, mut client: C) {
+        if self.latched() {
+            // RT-AUD-04: closed unread, no reply; recorded when the log takes it, unless the
+            // session stopped (nothing new is entered then). Before the slot: the accept loop
+            // already holds an in-flight slot for every connection it serves.
+            if !*self.stop.borrow() {
+                let deny = self.entry("egress.deny", Some("deny"));
+                let _ = self
+                    .append(deny.args(json!({"reason": AUDIT_FAILED})))
+                    .await;
+            }
+            return;
+        }
         let Ok(_slot) = Arc::clone(&self.slots).try_acquire_owned() else {
             self.refuse(
                 &mut client,
@@ -384,20 +428,22 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
                 intercept,
                 rest: window.get(h.len..).unwrap_or_default().to_vec(),
             }),
-            Err(refusal) => {
+            Err(Stop::Refused(refusal)) => {
                 self.refuse(client, refusal, target).await;
                 None
             }
+            Err(Stop::Closed) => None,
         }
     }
 
     /// Policy (and, for a grant host, a session-CA leaf to present), the host's own addresses,
-    /// the one lookup, the address filter: the pinned addresses, in order, and for a grant host
-    /// the TLS configurations to intercept it with.
+    /// `egress.resolve`, the one lookup, the address filter: the pinned addresses, in order, and
+    /// for a grant host the TLS configurations to intercept it with. Nothing fallible sits
+    /// between the entry and the lookup; without the entry there is no lookup (RT-AUD-04).
     async fn check(
         &self,
         a: &Authority,
-    ) -> Result<(Vec<SocketAddr>, Option<intercept_tls::HostTls>), Refusal> {
+    ) -> Result<(Vec<SocketAddr>, Option<intercept_tls::HostTls>), Stop> {
         let tls = match self.policy.decide(a)? {
             Route::Splice => None,
             Route::Intercept => Some(
@@ -411,6 +457,12 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
             reason: Reason::IpRangeDenied,
             detail: Detail::Unavailable(e),
         })?;
+        let resolve = self
+            .entry("egress.resolve", None)
+            .args(json!({"host": a.host, "port": a.port}));
+        if !self.gated(resolve).await {
+            return Err(Stop::Closed);
+        }
         let lookup = self.resolver.resolve(&a.host, a.port);
         let found = match tokio::time::timeout(self.limits.resolve, lookup).await {
             Ok(Ok(found)) if !found.is_empty() && found.len() <= MAX_ANSWER => found,
@@ -420,10 +472,10 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
             .iter()
             .find_map(|s| addr::denied_by(s.ip(), &host).map(|rule| (s.ip(), rule)));
         if let Some((ip, rule)) = denied {
-            return Err(Refusal {
+            return Err(Stop::Refused(Refusal {
                 reason: Reason::IpRangeDenied,
                 detail: Detail::Denied(ip, rule),
-            });
+            }));
         }
         Ok((pinned(&found, a.port), tls))
     }
@@ -440,7 +492,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
         let allow = self
             .entry("egress.allow", Some("allow"))
             .args(json!({"host": host, "port": port, "addresses": ips, "intercept": intercept}));
-        if !self.append(allow).await {
+        if !self.gated(allow).await {
             return;
         }
         let dialled = tokio::select! {
@@ -565,7 +617,20 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
     /// The audit sink of the connection on this task: entries of a broker-originated connection
     /// carry its origin (`local.rs`). Taken on the connection's task, before any `spawn_blocking`.
     fn sink(&self) -> Arc<dyn AuditSink> {
-        super::local::sink(&self.audit)
+        super::local::latching(super::local::sink(&self.audit), &self.latch)
+    }
+
+    /// Whether an append of this session has failed (RT-AUD-04).
+    fn latched(&self) -> bool {
+        self.latch.load(Ordering::SeqCst)
+    }
+
+    /// Appends an entry that permits an effect (a lookup, a dial, a forwarded request) unless the
+    /// latch is set; whether the effect may follow (RT-AUD-04). Read again after the append: an
+    /// append of another connection may have failed while this one was being written, and then
+    /// the entry stands with nothing after it.
+    async fn gated(&self, entry: NewEntry) -> bool {
+        !self.latched() && self.append(entry).await && !self.latched()
     }
 
     /// Writes `egress.shed`: `closed` connections over the admission rate were closed unread in
@@ -713,71 +778,6 @@ fn phrase(status: u16) -> &'static str {
         502 => "Bad Gateway",
         _ => "Error",
     }
-}
-
-/// Reads a request head from `client` into `buf`, within `limit`. Returns how many bytes of `buf`
-/// are filled: the complete head, plus any bytes the client sent after it (they belong to the
-/// tunnel).
-///
-/// # Errors
-/// The reason and the bytes received: [`Reason::HeadTooLarge`] past 8 KiB, 100 header lines or
-/// [`MAX_PARSES`] parses,
-/// [`Reason::HeadTimeout`] when `limit` passes first, [`Reason::Malformed`] for a head that is not
-/// HTTP/1.x or a client that closes or fails before completing one.
-pub(crate) async fn read_head<S: AsyncRead + Unpin>(
-    client: &mut S,
-    buf: &mut [u8; MAX_HEAD],
-    limit: Duration,
-) -> Result<usize, (Reason, usize)> {
-    let mut filled = 0;
-    let reading = async {
-        let (mut fresh, mut parses) = (0..0, 0);
-        loop {
-            let window = buf.get(..filled).unwrap_or_default();
-            if worth_parsing(window, &fresh) {
-                parses += 1;
-                if parses > MAX_PARSES {
-                    return Err(Reason::HeadTooLarge);
-                }
-                match head::parse(window) {
-                    Parsed::Complete(_) => return Ok(()),
-                    Parsed::TooLarge => return Err(Reason::HeadTooLarge),
-                    Parsed::Malformed => return Err(Reason::Malformed),
-                    Parsed::Partial => {}
-                }
-            }
-            let free = buf.get_mut(filled..).ok_or(Reason::HeadTooLarge)?;
-            let n = client.read(free).await.map_err(|_| Reason::Malformed)?;
-            if n == 0 {
-                return Err(Reason::Malformed);
-            }
-            fresh = filled..filled + n;
-            filled += n;
-        }
-    };
-    let got = tokio::time::timeout(limit, reading)
-        .await
-        .unwrap_or(Err(Reason::HeadTimeout));
-    got.map(|()| filled).map_err(|r| (r, filled))
-}
-
-/// Parses of one request head at most (Rust review M2). The head is parsed after the first read,
-/// after a read that brought a line end, and when the buffer is full, so parsing costs at most
-/// this many passes over 8 KiB, not one per byte. A head has at most 102 lines (request line, 100
-/// headers, blank line); a client that needs more parses than this is refused as too large.
-pub const MAX_PARSES: usize = 128;
-
-/// Whether the head in `window` could have changed state with the bytes at `fresh`: the first
-/// read (garbage is refused at once), a read with a line end (the head may now be complete), or
-/// a full buffer (it is now too large). Bytes in the middle of a line change nothing.
-fn worth_parsing(window: &[u8], fresh: &std::ops::Range<usize>) -> bool {
-    let first = fresh.start == 0;
-    let full = window.len() >= MAX_HEAD;
-    first
-        || full
-        || window
-            .get(fresh.clone())
-            .is_some_and(|b| b.contains(&b'\n'))
 }
 
 #[cfg(test)]

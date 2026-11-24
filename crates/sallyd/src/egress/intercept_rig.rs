@@ -416,17 +416,29 @@ impl Rig {
         &self,
         port: u16,
     ) -> (String, Option<Client>, tokio::task::JoinHandle<()>) {
-        bounded("CONNECT and the TLS handshake", self.open_unbounded(port)).await
+        let target = format!("{HOST}:{port}");
+        bounded(
+            "CONNECT and the TLS handshake",
+            self.open_unbounded(&target),
+        )
+        .await
+    }
+
+    /// As [`Self::open`], to any `target`.
+    pub(super) async fn open_to(
+        &self,
+        target: &str,
+    ) -> (String, Option<Client>, tokio::task::JoinHandle<()>) {
+        bounded("CONNECT and the TLS handshake", self.open_unbounded(target)).await
     }
 
     async fn open_unbounded(
         &self,
-        port: u16,
+        target: &str,
     ) -> (String, Option<Client>, tokio::task::JoinHandle<()>) {
         let (mut c, s) = duplex(1 << 20);
         let proxy = Arc::clone(&self.proxy);
         let task = tokio::spawn(async move { proxy.serve(s).await });
-        let target = format!("{HOST}:{port}");
         c.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes())
             .await
             .unwrap();

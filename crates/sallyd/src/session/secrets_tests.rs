@@ -254,6 +254,10 @@ fn a_sessions_egress_entries_are_redacted_with_its_own_forms_after_the_release()
         let host = format!("{v}.h.test");
         [
             (
+                "egress.resolve",
+                json!({"host": host, "port": 443, "m": mark}),
+            ),
+            (
                 "egress.allow",
                 json!({"host": host, "intercept": false, "m": mark}),
             ),
@@ -282,18 +286,18 @@ fn a_sessions_egress_entries_are_redacted_with_its_own_forms_after_the_release()
     }
     let text = all_text(&dir.join("audit"));
     let own: Vec<&str> = text.lines().filter(|l| l.contains("mark-own")).collect();
-    assert_eq!(own.len(), 6, "{text}");
+    assert_eq!(own.len(), 7, "{text}");
     for l in &own {
         assert!(!l.contains(&v), "{l}");
         assert!(l.contains("[REDACTED:GITHUB_TOKEN]"), "{l}");
     }
-    for event in ["egress.allow", "egress.close"] {
+    for event in ["egress.resolve", "egress.allow", "egress.close"] {
         let tag = format!("\"event\":\"{event}\"");
         let l = own.iter().find(|l| l.contains(&tag)).unwrap();
         assert!(l.contains("[REDACTED:GITHUB_TOKEN].h.test"), "{l}");
     }
     let raw: Vec<&str> = text.lines().filter(|l| l.contains("mark-raw")).collect();
-    assert_eq!(raw.len(), 6, "{text}");
+    assert_eq!(raw.len(), 7, "{text}");
     assert!(raw.iter().all(|l| l.contains(&v)), "control: {raw:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
