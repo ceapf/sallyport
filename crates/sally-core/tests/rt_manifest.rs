@@ -664,9 +664,22 @@ fn the_place_check_refuses_a_manifest_inside_its_own_writable_mount() {
 
 // ---- RT-FS-05: denylisted mounts ---------------------------------------------------------------
 
+/// Control: return value, in-test (first): the same body, through the same `load`, differing
+/// only in the host (an ordinary folder in the home, and one by absolute path outside it), is
+/// accepted.
 #[test]
 fn rt_fs_05_denylisted_mounts_rejected() {
     let f = Fixture::new();
+    let body = |host: &str| {
+        format!(
+            "filesystem:\n  mounts:\n    - {{host: \"{host}\", guest: /workspace/x, mode: ro}}\n"
+        )
+    };
+    let outside = f.root.join("elsewhere");
+    std::fs::create_dir(&outside).unwrap();
+    for host in ["~/code/myproject".to_owned(), outside.display().to_string()] {
+        twin_ok(&f, &body(&host));
+    }
     let runtime_dir = f.env.xdg_runtime_dir.clone().unwrap();
     for host in [
         "~".to_owned(),
@@ -706,10 +719,7 @@ fn rt_fs_05_denylisted_mounts_rejected() {
         "/tmp/.X11-unix".to_owned(),
         "/var/tmp".to_owned(),
     ] {
-        let body = format!(
-            "filesystem:\n  mounts:\n    - {{host: \"{host}\", guest: /workspace/x, mode: ro}}\n"
-        );
-        let r = f.load(&body);
+        let r = f.load(&body(&host));
         assert_rejects(&r, "filesystem.mounts[0].host", Code::Denylisted);
         assert!(rendered(&r)[0].contains("denylisted"), "{host}");
     }
@@ -925,23 +935,34 @@ fn rt_sec_08_secret_values_cannot_enter_through_the_manifest() {
 
 /// A token pasted as a secret name that its check refuses, with a slash, a space or a quote in
 /// it, is not echoed by the warnings either: with an allow rule, the `[data-can-leave]` warning
-/// names grants, and only a checked name is masked whole when quoted (architect Q376). Control:
-/// the name guard in `validate/exposure.rs` (without it the warning echoes the token).
+/// names grants, and only a checked name is masked whole when quoted (architect Q376). Control,
+/// in-test (first): the same body with a name its check accepts, holding the token's upper-case
+/// run, through the same `load` and `rendered_all`, shows that run in the warning; so the
+/// warning names a grant's secret and only the name guard in `validate/exposure.rs` keeps the
+/// malformed ones out.
 fn rt_sec_08_malformed_names_in_warnings(f: &Fixture) {
     let tok = fake_token(&["gh", "p_"], "0123456789abcdefghijABCDEFGHIJ");
+    let body = |name: &str| {
+        format!(
+            "network:\n  mode: proxy\n  allow:\n    - host: api.github.com\nsecrets:\n  - name: \
+             '{name}'\n    inject: {{host: api.github.com, header: H, format: \"{{value}}\"}}\n"
+        )
+    };
+    let shown = rendered_all(&f.load(&body("T_ABCDEFGHIJ"))).join("\n");
+    assert!(shown.contains("[data-can-leave]"), "control: {shown}");
+    assert!(
+        shown.contains("ABCDEFGHIJ"),
+        "control: a checked name is not shown: {shown}"
+    );
     for name in [
         format!("A/{tok}"),
         format!("Bearer {tok}"),
         format!("X\"{tok}"),
     ] {
-        let body = format!(
-            "network:\n  mode: proxy\n  allow:\n    - host: api.github.com\nsecrets:\n  - name: \
-             '{name}'\n    inject: {{host: api.github.com, header: H, format: \"{{value}}\"}}\n"
-        );
-        let shown = rendered_all(&f.load(&body)).join("\n");
+        let shown = rendered_all(&f.load(&body(&name))).join("\n");
         assert!(shown.contains("[data-can-leave]"), "{shown}");
         assert!(
-            !shown.contains("0123456789abcdefghij"),
+            !shown.contains("0123456789abcdefghij") && !shown.contains("ABCDEFGHIJ"),
             "token echoed: {shown}"
         );
     }
