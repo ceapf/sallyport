@@ -2,8 +2,9 @@
 //! `sally sandbox run`) shows what its manifest grants before it asks for anything, refuses a
 //! manifest kept inside a folder that manifest lets the session write, and needs consent bound to
 //! the exact text it sends, whatever its warnings: the text's SHA-256 (`--accept-manifest`), or
-//! with no hash a `yes` typed on a terminal. Each property runs once per command through one
-//! helper.
+//! with no hash a `yes` typed on a terminal. RT-MAN-05 through the binary: the launch shows a
+//! non-ASCII folder name escaped and can be consented to, and refuses one holding a direction
+//! mark. Each property runs once per command through one helper.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 mod common;
@@ -380,6 +381,84 @@ fn rt_man_03_session_start_refuses_a_manifest_inside_a_folder_it_mounts_writable
 #[test]
 fn rt_man_03_sandbox_run_refuses_a_manifest_inside_a_folder_it_mounts_writable() {
     refuses_a_manifest_inside_a_folder_it_mounts_writable(Launch::Run, "in-r");
+}
+
+// ---- RT-MAN-05: a direction mark in a shown path ------------------------------------------------
+
+/// A read-only mount of `~/<folder>` with a reachable host, so the `[data-can-leave]` finding
+/// names the folder on the summary's first line and in the warning, besides its own mount line.
+fn reading(folder: &str) -> String {
+    format!(
+        "{HEAD}filesystem:\n  mounts:\n    - {{host: \"~/{folder}\", guest: /workspace/p, mode: ro}}\n\
+         network:\n  mode: proxy\n  allow:\n    - host: api.github.com\n"
+    )
+}
+
+/// RT-MAN-05 (G5): the launch gate refuses a shown line holding a direction mark, which the
+/// validator accepts in a mount's folder name; non-ASCII letters are shown escaped and can be
+/// consented to. Control first: a folder named with a letter outside ASCII launches by its hash,
+/// the fake receives exactly its text, and the first line, the mount line and the warning show
+/// the same quoted, escaped realpath. Then U+202E in the folder name: the review gives no hash,
+/// the launch (with the hash of its text) exits 1 naming the line, and nothing is sent.
+fn refuses_a_mount_path_holding_a_direction_mark(l: Launch, tag: &str) {
+    let h = Home::new(tag);
+    let f = daemon(tag, || {});
+    let real = std::fs::canonicalize(&h.0).unwrap();
+    let real = real.to_str().unwrap();
+
+    std::fs::create_dir(h.join("caf\u{e9}")).unwrap();
+    let letters = reading("caf\u{e9}");
+    let m = h.write("m.yaml", &letters);
+    let shown = format!("\"{real}/caf\\u{{e9}}\"");
+    let (summary, hash) = reviewed(&f, &h, &m);
+    let first = summary.lines().next().unwrap();
+    assert!(
+        first.starts_with("[data-can-leave] ") && first.contains(&shown),
+        "{summary}"
+    );
+    assert!(
+        summary.contains(&format!("- can read {shown} (at /workspace/p).")),
+        "{summary}"
+    );
+    let warned = warnings(&f, &h, &m);
+    assert!(warned.iter().any(|w| w.contains(&shown)), "{warned:?}");
+    let o = launch(&f, &h, l, &m, &["--accept-manifest", &hash]);
+    assert_eq!(
+        created(&f),
+        std::slice::from_ref(&letters),
+        "{l:?}: {}",
+        stderr(&o)
+    );
+    assert_eq!(stderr(&o).matches(&shown).count(), 3, "{}", stderr(&o));
+
+    std::fs::create_dir(h.join("a\u{202e}b")).unwrap();
+    let marked = reading("a\u{202e}b");
+    std::fs::write(&m, &marked).unwrap();
+    let o = h
+        .apply(&mut f.command(&["manifest", "summary", m.to_str().unwrap()]))
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(!stdout(&o).contains("sha256 "), "{}", stdout(&o));
+    let hash = sally_cli::consent::digest(&marked);
+    let o = launch(&f, &h, l, &m, &["--accept-manifest", hash.as_hex()]);
+    assert_eq!(o.status.code(), Some(1), "{l:?}: {}", stderr(&o));
+    assert!(
+        stderr(&o).contains("cannot be shown") && stderr(&o).contains("a\\u{202e}b"),
+        "{l:?}: {}",
+        stderr(&o)
+    );
+    assert_eq!(created(&f), [letters], "{l:?}: nothing more sent");
+}
+
+#[test]
+fn rt_man_05_session_start_refuses_a_mount_path_holding_a_direction_mark() {
+    refuses_a_mount_path_holding_a_direction_mark(Launch::Start, "dm-s");
+}
+
+#[test]
+fn rt_man_05_sandbox_run_refuses_a_mount_path_holding_a_direction_mark() {
+    refuses_a_mount_path_holding_a_direction_mark(Launch::Run, "dm-r");
 }
 
 // ---- off a terminal: the hash of the text sent ------------------------------------------------

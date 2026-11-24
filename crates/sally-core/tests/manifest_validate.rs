@@ -283,6 +283,29 @@ fn mount_host_deny_cases() {
     }
 }
 
+/// A manifest's text is UTF-8, but a realpath need not be: a link in an ancestor folder can lead
+/// to a folder whose name is not UTF-8. Such a mount is refused `path-chars`, so no shown line
+/// names a byte that is not UTF-8 (RT-MAN-05). Control: the same link to a UTF-8 name is accepted.
+#[test]
+fn a_mount_whose_realpath_is_not_utf8_is_refused() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let f = Fixture::new();
+    let odd = f
+        .home()
+        .join("code")
+        .join(std::ffi::OsStr::from_bytes(b"caf\xe9"));
+    std::fs::create_dir_all(odd.join("sub")).unwrap();
+    std::fs::create_dir_all(f.home().join("code/plain/sub")).unwrap();
+    std::os::unix::fs::symlink(&odd, f.home().join("odd")).unwrap();
+    std::os::unix::fs::symlink(f.home().join("code/plain"), f.home().join("plain")).unwrap();
+    assert_ok(&f.load(&mount("~/plain/sub", "/workspace/p", "ro")));
+    assert_rejects(
+        &f.load(&mount("~/odd/sub", "/workspace/p", "ro")),
+        "filesystem.mounts[0].host",
+        Code::PathChars,
+    );
+}
+
 #[test]
 fn mount_through_symlinked_parent_into_denylist_is_refused() {
     let f = Fixture::new();
@@ -943,10 +966,10 @@ fn summary_of_coding_agent() {
     let s = s.replace(&real_root, "$ROOT");
     assert_eq!(
         s,
-        "[data-can-leave] Anything this agent reads ($ROOT/home/code/myproject and whatever your \"GITHUB_TOKEN\" unlocks on api.github.com or github.com) can be sent to pypi.org, files.pythonhosted.org, api.github.com (acting as you) and github.com (acting as you). The fetch tool's GET requests are not prompted and can carry data out in the URL.\n\
+        "[data-can-leave] Anything this agent reads (\"$ROOT/home/code/myproject\" and whatever your \"GITHUB_TOKEN\" unlocks on api.github.com or github.com) can be sent to pypi.org, files.pythonhosted.org, api.github.com (acting as you) and github.com (acting as you). The fetch tool's GET requests are not prompted and can carry data out in the URL.\n\
          This agent:\n\
          - uses the model qwen2.5-coder-7b-instruct-q4_k_m.\n\
-         - can change files in $ROOT/home/code/myproject (at /workspace/myproject) only inside the sandbox; your folder is not changed. The changes are kept apart (`sally session changes` lists them; this version cannot apply them), and commits made in the session are never applied.\n\
+         - can change files in \"$ROOT/home/code/myproject\" (at /workspace/myproject) only inside the sandbox; your folder is not changed. The changes are kept apart (`sally session changes` lists them; this version cannot apply them), and commits made in the session are never applied.\n\
          - can reach pypi.org on port 443, files.pythonhosted.org on port 443, api.github.com on port 443, github.com on port 443 (through the Sallyport proxy only).\n\
          - can receive up to 256MiB in one response body the proxy reads, for fetch and at hosts with a credential grant (default 64MiB).\n\
          - uses your GITHUB_TOKEN secret only toward api.github.com, sent as the header \"Authorization\" in the form \"Bearer {value}\" (the agent never sees the value).\n\
@@ -991,7 +1014,7 @@ fn summary_of_web_research_states_writes_and_deletes_separately() {
         std::iter::once("BRAVE_SEARCH_KEY".to_owned()).collect();
     let v = sally_core::manifest::load(&example("web-research.yaml"), &f.env, &secrets).unwrap();
     let s = summary(&v.manifest);
-    assert!(s.contains("home/Documents/research (at /workspace/research); can write there with your approval; cannot delete there."), "{s}");
+    assert!(s.contains("home/Documents/research\" (at /workspace/research); can write there with your approval; cannot delete there."), "{s}");
     assert!(s.contains("any public hostname on port 443"), "{s}");
 }
 

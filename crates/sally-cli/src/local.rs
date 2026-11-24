@@ -80,7 +80,8 @@ fn rejected(r: &Rejected, err: &mut dyn std::io::Write) -> u8 {
 }
 
 /// `sally manifest validate FILE`: 0 valid (its warnings, then the `valid` line, on `out`; 1
-/// instead when one of them fails the clean-check), 1 rejected (errors and warnings on `err`), 2
+/// instead when one of them fails the clean-check, or when a launch could not show its block,
+/// which [`unshowable`] names on `err`), 1 rejected (errors and warnings on `err`), 2
 /// unreadable (the manifest, the host facts, `config.toml`, or the secrets store when the
 /// manifest names a secret).
 pub fn manifest_validate(path: &Path, files: Files<'_>, o: &mut Out<'_>) -> u8 {
@@ -93,7 +94,20 @@ pub fn manifest_validate(path: &Path, files: Files<'_>, o: &mut Out<'_>) -> u8 {
         p.line(&[&w.to_string()]);
     }
     p.line(&["valid (sallyd checks again when a session starts)"]);
-    p.code()
+    match consent::block(&v) {
+        Ok(_) => p.code(),
+        Err(dirty) => unshowable(p.o.err, &dirty),
+    }
+}
+
+/// Says on `err` that a launch cannot show `dirty` (a line of its block, escaped, with the
+/// reason), so it starts nothing; 1.
+fn unshowable(err: &mut dyn std::io::Write, dirty: &str) -> u8 {
+    let _ = writeln!(
+        err,
+        "sally: a launch cannot show this line, so it starts nothing: {dirty}"
+    );
+    EXIT_REFUSED
 }
 
 /// `sally manifest summary FILE`: the plain-English summary of a valid manifest only, validated
@@ -122,13 +136,7 @@ pub fn manifest_summary(path: &Path, files: Files<'_>, o: &mut Out<'_>) -> u8 {
             p.line(&["sha256 ", consent::digest(&text).as_hex()]);
             p.code()
         }
-        Err(dirty) => {
-            let _ = writeln!(
-                p.o.err,
-                "sally: a launch cannot show this line, so it starts nothing: {dirty}"
-            );
-            EXIT_REFUSED
-        }
+        Err(dirty) => unshowable(p.o.err, &dirty),
     }
 }
 

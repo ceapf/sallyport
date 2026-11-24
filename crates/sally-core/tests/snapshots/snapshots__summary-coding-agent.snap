@@ -1,12 +1,11 @@
 ---
 source: crates/sally-core/tests/snapshots.rs
-assertion_line: 33
 expression: "stable(&f, &summary(&v.manifest))"
 ---
-[data-can-leave] Anything this agent reads ($ROOT/home/code/myproject and whatever your "GITHUB_TOKEN" unlocks on api.github.com or github.com) can be sent to pypi.org, files.pythonhosted.org, api.github.com (acting as you) and github.com (acting as you). The fetch tool's GET requests are not prompted and can carry data out in the URL.
+[data-can-leave] Anything this agent reads ("$ROOT/home/code/myproject" and whatever your "GITHUB_TOKEN" unlocks on api.github.com or github.com) can be sent to pypi.org, files.pythonhosted.org, api.github.com (acting as you) and github.com (acting as you). The fetch tool's GET requests are not prompted and can carry data out in the URL.
 This agent:
 - uses the model qwen2.5-coder-7b-instruct-q4_k_m.
-- can change files in $ROOT/home/code/myproject (at /workspace/myproject) only inside the sandbox; your folder is not changed. The changes are kept apart (`sally session changes` lists them; this version cannot apply them), and commits made in the session are never applied.
+- can change files in "$ROOT/home/code/myproject" (at /workspace/myproject) only inside the sandbox; your folder is not changed. The changes are kept apart (`sally session changes` lists them; this version cannot apply them), and commits made in the session are never applied.
 - can reach pypi.org on port 443, files.pythonhosted.org on port 443, api.github.com on port 443, github.com on port 443 (through the Sallyport proxy only).
 - can receive up to 256MiB in one response body the proxy reads, for fetch and at hosts with a credential grant (default 64MiB).
 - uses your GITHUB_TOKEN secret only toward api.github.com, sent as the header "Authorization" in the form "Bearer {value}" (the agent never sees the value).

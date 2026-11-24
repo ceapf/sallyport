@@ -779,7 +779,40 @@ fn data_can_leave_when_private_data_meets_an_allow_rule() {
     let first = s.lines().next().unwrap();
     assert_eq!(
         first,
-        "[data-can-leave] Anything this agent reads ($ROOT/home/code/myproject and whatever your \"GITHUB_TOKEN\" unlocks on api.github.com) can be sent to pypi.org and api.github.com (acting as you)."
+        "[data-can-leave] Anything this agent reads (\"$ROOT/home/code/myproject\" and whatever your \"GITHUB_TOKEN\" unlocks on api.github.com) can be sent to pypi.org and api.github.com (acting as you)."
+    );
+}
+
+/// RT-MAN-05, a known residual: the warning's token mask pairs every `"` it sees, so after an
+/// even number of escaped quotes in a folder name the rest of the name, up to the closing quote,
+/// is a span of its own; with 20 or more characters, a digit and no `/`, space or backslash, the
+/// warning hides it (marked `[N chars hidden]`). The summary's first line shows the path whole,
+/// and the mask never touches a span holding an escape.
+#[test]
+fn a_masked_tail_of_a_quoted_folder_name_is_whole_in_the_summary() {
+    let f = Fixture::new();
+    let tail = "tail2024abcdefghijklmnop";
+    std::fs::create_dir_all(f.home().join(format!("code/a\"b\"{tail}"))).unwrap();
+    let body = format!(
+        "{}{}",
+        mount(&format!("~/code/a\\\"b\\\"{tail}"), "/workspace/p", "ro"),
+        grants(&["pypi.org"], "  []\n").replace("secrets:\n  []\n", "")
+    );
+    let v = f.load(&body).unwrap_or_else(|e| panic!("{e:#?}"));
+    let warned = v
+        .warnings
+        .iter()
+        .find(|d| d.code == Code::DataCanLeave)
+        .unwrap()
+        .to_string();
+    assert!(
+        warned.contains(&format!("a\\\"b\\\"tail...[{} chars hidden]\"", tail.len())),
+        "{warned}"
+    );
+    let first = summary(&v.manifest).lines().next().unwrap().to_owned();
+    assert!(
+        first.contains(&format!("a\\\"b\\\"{tail}\") can be sent to pypi.org")),
+        "{first}"
     );
 }
 
