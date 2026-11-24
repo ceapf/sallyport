@@ -11,6 +11,7 @@ use sally_core::manifest::parse_host_pattern;
 use tokio::io::{DuplexStream, duplex};
 
 use super::*;
+use crate::egress::head::MAX_PARSES;
 use crate::egress::hostaddrs::Table;
 use crate::egress::policy::{Grant, Rule};
 

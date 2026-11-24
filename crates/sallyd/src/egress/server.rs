@@ -29,7 +29,7 @@ use tokio::sync::{Semaphore, watch};
 
 use super::addr::{self, HostNets, Rule};
 use super::authority::{self, Authority, AuthorityError};
-use super::head::{self, MAX_HEAD, Parsed};
+use super::head::{self, MAX_HEAD, Parsed, read_head};
 use super::hostaddrs::HostAddrsError;
 use super::policy::{Policy, Reason, Route};
 use super::tunnel::{self, End, IDLE_LIMIT, Totals};
@@ -771,71 +771,6 @@ fn phrase(status: u16) -> &'static str {
         502 => "Bad Gateway",
         _ => "Error",
     }
-}
-
-/// Reads a request head from `client` into `buf`, within `limit`. Returns how many bytes of `buf`
-/// are filled: the complete head, plus any bytes the client sent after it (they belong to the
-/// tunnel).
-///
-/// # Errors
-/// The reason and the bytes received: [`Reason::HeadTooLarge`] past 8 KiB, 100 header lines or
-/// [`MAX_PARSES`] parses,
-/// [`Reason::HeadTimeout`] when `limit` passes first, [`Reason::Malformed`] for a head that is not
-/// HTTP/1.x or a client that closes or fails before completing one.
-pub(crate) async fn read_head<S: AsyncRead + Unpin>(
-    client: &mut S,
-    buf: &mut [u8; MAX_HEAD],
-    limit: Duration,
-) -> Result<usize, (Reason, usize)> {
-    let mut filled = 0;
-    let reading = async {
-        let (mut fresh, mut parses) = (0..0, 0);
-        loop {
-            let window = buf.get(..filled).unwrap_or_default();
-            if worth_parsing(window, &fresh) {
-                parses += 1;
-                if parses > MAX_PARSES {
-                    return Err(Reason::HeadTooLarge);
-                }
-                match head::parse(window) {
-                    Parsed::Complete(_) => return Ok(()),
-                    Parsed::TooLarge => return Err(Reason::HeadTooLarge),
-                    Parsed::Malformed => return Err(Reason::Malformed),
-                    Parsed::Partial => {}
-                }
-            }
-            let free = buf.get_mut(filled..).ok_or(Reason::HeadTooLarge)?;
-            let n = client.read(free).await.map_err(|_| Reason::Malformed)?;
-            if n == 0 {
-                return Err(Reason::Malformed);
-            }
-            fresh = filled..filled + n;
-            filled += n;
-        }
-    };
-    let got = tokio::time::timeout(limit, reading)
-        .await
-        .unwrap_or(Err(Reason::HeadTimeout));
-    got.map(|()| filled).map_err(|r| (r, filled))
-}
-
-/// Parses of one request head at most (Rust review M2). The head is parsed after the first read,
-/// after a read that brought a line end, and when the buffer is full, so parsing costs at most
-/// this many passes over 8 KiB, not one per byte. A head has at most 102 lines (request line, 100
-/// headers, blank line); a client that needs more parses than this is refused as too large.
-pub const MAX_PARSES: usize = 128;
-
-/// Whether the head in `window` could have changed state with the bytes at `fresh`: the first
-/// read (garbage is refused at once), a read with a line end (the head may now be complete), or
-/// a full buffer (it is now too large). Bytes in the middle of a line change nothing.
-fn worth_parsing(window: &[u8], fresh: &std::ops::Range<usize>) -> bool {
-    let first = fresh.start == 0;
-    let full = window.len() >= MAX_HEAD;
-    first
-        || full
-        || window
-            .get(fresh.clone())
-            .is_some_and(|b| b.contains(&b'\n'))
 }
 
 #[cfg(test)]
