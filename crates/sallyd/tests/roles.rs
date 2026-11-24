@@ -1,15 +1,17 @@
 //! Task 6c red-team rows that hold in every role, with real containers (rootless Podman):
-//! RT-NET-01 (no route out), RT-NET-08 (raw sockets and ICMP), RT-NET-12 (socket families) and
-//! RT-FS-17 (no new namespaces), and the ENOENT half of RT-FS-10 (broker state out of reach).
+//! RT-NET-01 (no route out), RT-NET-08 (raw sockets and ICMP), RT-NET-12 (socket families),
+//! RT-FS-17 (no new namespaces) and RT-FS-24 (removed system calls), and the ENOENT half of
+//! RT-FS-10 (broker state out of reach).
 //!
 //! The workspace comes from the launcher; the harness and inference containers from their argv
 //! builders, created and started with hermetic podman exactly as the argv says (their launchers,
 //! #123, are tested in `tests/oci.rs` and `tests/role_launch.rs`). The probe is
-//! `tests/redteam/probe/probe.c`. Every refusal must be `ENOSYS` (38), the seccomp profiles'
-//! default action: the kernel never returns it for `socket`, `socketpair`, `unshare`, `clone`
-//! or `clone3` itself (an unsupported family or protocol is `EAFNOSUPPORT`, `EPROTONOSUPPORT`
-//! or `EOPNOTSUPP`), so the profile is what refused. That holds for
-//! `clone3` only from kernel 5.3 on, where the syscall exists; [`kernel_has_clone3`] checks it.
+//! `tests/redteam/probe/probe.c`. Every refusal of RT-NET-12 and RT-FS-17 must be `ENOSYS` (38),
+//! the seccomp profiles' default action: the kernel never returns it for `socket`,
+//! `socketpair`, `unshare`, `clone` or `clone3` itself (an unsupported family or protocol is
+//! `EAFNOSUPPORT`, `EPROTONOSUPPORT` or `EOPNOTSUPP`), so the profile is what refused. That holds
+//! for `clone3` only from kernel 5.3 on, where the syscall exists; [`kernel_has_clone3`] checks
+//! it. RT-FS-24's calls answer as the profile says (see its test).
 //! The fixture is `common::container`; these tests never skip.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -327,6 +329,46 @@ fn rt_net_08_raw_sockets_and_icmp_fail() {
             }
             let (code, out) = exec_in(&b.container, &["ping", "-c", "1", "-W", "2", "1.1.1.1"]);
             assert_ne!(code, 0, "{:?}: ping: {out}", b.role);
+        }
+        finish(&x, boxes).await;
+    });
+}
+
+/// The errno of the profiles' explicit `SCMP_ACT_ERRNO` rules that come before their default
+/// (`bpf`, `userfaultfd`, `open_by_handle_at`, among others): EPERM.
+const PROFILE_EPERM: &str = "errno=1";
+
+/// RT-FS-24: one system call of each class the profiles remove (mount, ptrace, bpf, io_uring,
+/// keyring, userfaultfd, handle-based open) answers as the profile says, in every role: the
+/// default's ENOSYS, or EPERM where an explicit rule names the call. Each runs with every
+/// argument 0, except `userfaultfd` with `UFFD_USER_MODE_ONLY` (1), which an unprivileged process
+/// may use. Unfiltered, the kernel runs `ptrace` and that `userfaultfd`, and answers the others
+/// EFAULT or EINVAL: never ENOSYS, and never EPERM for the three EPERM calls, so the profile is
+/// what refused. Control, first in each role: an allowed call (`getpid`) through the same probe
+/// answers `ok`.
+#[test]
+fn rt_fs_24_removed_system_calls_answer_as_the_profile_says() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let mut boxes = Vec::new();
+        for role in ROLES {
+            boxes.push(start(&x, role).await);
+        }
+        for b in &boxes {
+            let control = probe(b, &["syscall getpid"]);
+            assert_eq!(control[0].1, "ok", "control: {:?}: getpid", b.role);
+            check(
+                b,
+                &[
+                    ("syscall mount", SECCOMP),
+                    ("syscall ptrace", SECCOMP),
+                    ("syscall bpf", PROFILE_EPERM),
+                    ("syscall io_uring_setup", SECCOMP),
+                    ("syscall keyctl", SECCOMP),
+                    ("syscall userfaultfd 1", PROFILE_EPERM),
+                    ("syscall open_by_handle_at", PROFILE_EPERM),
+                ],
+            );
         }
         finish(&x, boxes).await;
     });
