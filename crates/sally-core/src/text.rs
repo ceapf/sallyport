@@ -432,7 +432,7 @@ pub fn cut_escaped(text: &str, max: usize) -> (String, bool) {
 pub(crate) fn escape_boundary(text: &str, max: usize) -> usize {
     let mut i = 0usize;
     while i < text.len() {
-        let next = i.saturating_add(unit_len(text, i));
+        let next = i.saturating_add(unit_len(text, i, usize::MAX));
         if next > max {
             break;
         }
@@ -443,9 +443,9 @@ pub(crate) fn escape_boundary(text: &str, max: usize) -> usize {
 
 /// The length of the unit of escaped `text` at byte `i` (at least 1): one escape or one
 /// character, together with the run mark `\{N}` that follows it, if one does, so nothing splits
-/// a unit from its mark.
-fn unit_len(text: &str, i: usize) -> usize {
-    let len = escape_len(text, i);
+/// a unit from its mark. A `\u` reads at most `u_reach` bytes for its `}` (see [`escape_len`]).
+fn unit_len(text: &str, i: usize, u_reach: usize) -> usize {
+    let len = escape_len(text, i, u_reach);
     let next = i.saturating_add(len);
     match text.get(next..) {
         Some(rest) if rest.starts_with("\\{") => {
@@ -456,14 +456,17 @@ fn unit_len(text: &str, i: usize) -> usize {
 }
 
 /// The length of the escape or the character of escaped `text` at byte `i` (at least 1). A run
-/// mark read on its own is at most [`LONGEST_MARK`] long.
-fn escape_len(text: &str, i: usize) -> usize {
+/// mark read on its own is at most [`LONGEST_MARK`] long. A `\u` runs to its `}` when that is
+/// within `u_reach` bytes, else it is one byte: [`escaped_rows`] passes [`LONGEST_ESCAPE`], so
+/// text the escaper did not write costs linear time there; [`escape_boundary`] reads to the `}`
+/// however far it is, so a cut never lands inside what may be one escape.
+fn escape_len(text: &str, i: usize, u_reach: usize) -> usize {
     let bytes = text.as_bytes();
     match (bytes.get(i), bytes.get(i.saturating_add(1))) {
         (Some(b'\\'), Some(b'x')) => 4,
         (Some(b'\\'), Some(b'u')) => text
             .get(i..)
-            .and_then(|r| r.find('}'))
+            .and_then(|r| r.bytes().take(u_reach).position(|b| b == b'}'))
             .map_or(1, |e| e.saturating_add(1)),
         (Some(b'\\'), Some(b'{')) => text
             .get(i..)
@@ -489,7 +492,7 @@ pub fn escaped_rows(text: &str, width: usize) -> Vec<&str> {
     let mut rows = Vec::new();
     let (mut start, mut i) = (0usize, 0usize);
     while i < text.len() {
-        let next = i.saturating_add(unit_len(text, i));
+        let next = i.saturating_add(unit_len(text, i, LONGEST_ESCAPE));
         if next.saturating_sub(start) > width && i > start {
             rows.push(text.get(start..i).unwrap_or_default());
             start = i;

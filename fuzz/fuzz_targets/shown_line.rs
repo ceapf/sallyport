@@ -60,5 +60,14 @@ fuzz_target!(|data: &[u8]| {
     let (capped, shown) = escape_runs_capped(data, first);
     assert!(capped.len() <= first && whole.starts_with(&capped), "{capped:?}");
     assert!(shown <= data.len());
-    assert_eq!(escaped_rows(&whole, LONGEST_UNIT).concat(), whole);
+    // At width 1 every unit is a row of its own, so the rows' ends are the units' ends.
+    let mut end = 0usize;
+    let ends: Vec<usize> = escaped_rows(&whole, 1)
+        .iter()
+        .map(|r| {
+            end += r.len();
+            end
+        })
+        .collect();
+    assert!(capped.is_empty() || ends.contains(&capped.len()), "{capped:?}");
 });

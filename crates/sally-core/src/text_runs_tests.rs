@@ -156,10 +156,22 @@ fn a_cut_never_parts_a_unit_from_its_mark() {
 
 #[test]
 fn a_mark_with_no_close_is_not_part_of_the_unit() {
-    assert_eq!(unit_len(" \\{17", 0), 1);
-    assert_eq!(unit_len(" \\{17}", 0), 6);
-    assert_eq!(escape_len("\\{17}x", 0), 5);
-    assert_eq!(escape_len("\\{17", 0), 2);
+    assert_eq!(unit_len(" \\{17", 0, LONGEST_ESCAPE), 1);
+    assert_eq!(unit_len(" \\{17}", 0, LONGEST_ESCAPE), 6);
+    assert_eq!(escape_len("\\{17}x", 0, LONGEST_ESCAPE), 5);
+    assert_eq!(escape_len("\\{17", 0, LONGEST_ESCAPE), 2);
+}
+
+#[test]
+fn rows_read_a_u_escape_only_as_far_as_the_longest_escape() {
+    let text = format!("\\u{}}}", "c".repeat(100));
+    let rows = escaped_rows(&text, LONGEST_UNIT);
+    assert!(rows.iter().all(|r| r.len() <= LONGEST_UNIT), "{rows:?}");
+    assert_eq!(rows.concat(), text);
+    let whole = escaped_rows("ab\\u{10ffff}", LONGEST_ESCAPE);
+    assert_eq!(whole, ["ab", "\\u{10ffff}"]);
+    // The cut keeps its own reading: an open `\u` reaches its `}` however far it is.
+    assert_eq!(escape_boundary(&text, 50), 0);
 }
 
 #[test]
@@ -206,10 +218,12 @@ fn no_mark_makes_a_unit_longer_than_the_longest() {
         );
     }
     // The longest mark stays whole; one digit more is no longer part of the unit.
-    assert_eq!(unit_len("a\\{18446744073709551615}", 0), 1 + LONGEST_MARK);
-    assert_eq!(unit_len("a\\{184467440737095516150}", 0), 1);
-    assert_eq!(escape_len("\\{18446744073709551615}", 0), LONGEST_MARK);
-    assert_eq!(escape_len("\\{184467440737095516150}", 0), 2);
+    let (longest, one_more) = ("\\{18446744073709551615}", "\\{184467440737095516150}");
+    let reach = LONGEST_ESCAPE;
+    assert_eq!(unit_len(&format!("a{longest}"), 0, reach), 1 + LONGEST_MARK);
+    assert_eq!(unit_len(&format!("a{one_more}"), 0, reach), 1);
+    assert_eq!(escape_len(longest, 0, reach), LONGEST_MARK);
+    assert_eq!(escape_len(one_more, 0, reach), 2);
     assert_eq!(LONGEST_MARK, "\\{18446744073709551615}".len());
 }
 
@@ -217,7 +231,7 @@ fn no_mark_makes_a_unit_longer_than_the_longest() {
 fn the_longest_unit_is_the_longest_escape_with_the_largest_mark() {
     let unit = format!("\\u{{10ffff}}\\{{{}}}", usize::MAX);
     assert_eq!(unit.len(), LONGEST_UNIT);
-    assert_eq!(unit_len(&unit, 0), LONGEST_UNIT);
+    assert_eq!(unit_len(&unit, 0, LONGEST_ESCAPE), LONGEST_UNIT);
 }
 
 proptest! {
