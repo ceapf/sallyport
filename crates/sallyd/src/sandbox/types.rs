@@ -96,8 +96,9 @@ pub fn nofile_ulimit() -> String {
 }
 
 /// Every container's POSIX message-queue limit in bytes, soft and hard (`--ulimit
-/// msgqueue=0:0`, RT-AG-09): none. A queue's bytes are charged to the kernel user, which
-/// `--userns=keep-id` shares with the host account, and no role uses POSIX message queues.
+/// msgqueue=0:0`, RT-AG-09): none. A queue's bytes are charged up to the host account (the
+/// owner of the sandbox's user namespace; under keep-id, the same kernel uid), and no role
+/// uses POSIX message queues.
 pub const MSGQUEUE_LIMIT: u64 = 0;
 
 /// The `--ulimit` value that sets [`MSGQUEUE_LIMIT`] (`msgqueue=0:0`).

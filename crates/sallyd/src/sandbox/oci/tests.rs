@@ -616,7 +616,8 @@ const SANDBOX_NOFILE: u64 = 512;
 const SANDBOX_MSGQUEUE: u64 = 0;
 
 #[test]
-fn rlimits_are_core_zero_the_launcher_s_nofile_and_podman_s_nproc_within_sallyd_s_own() {
+fn rlimits_are_core_zero_the_launcher_s_nofile_and_msgqueue_and_podman_s_nproc_within_sallyd_s_own()
+{
     let set = |k: usize, hard: u64, soft: u64| {
         move |v: &mut Value| {
             rlimits(v)[k]["hard"] = json!(hard);

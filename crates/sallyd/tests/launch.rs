@@ -1115,11 +1115,11 @@ fn a_tampered_podman_state_refuses_the_launch() {
 }
 
 /// The open-file limits, soft and hard, of the container's init and of a process `podman exec`
-/// starts (the path the tools use), then whether setting the limit, soft and hard, to 1024
-/// succeeded (`set`) or not (`refused`).
+/// starts (as a tool's command is started), then whether setting the limit, soft and hard, to
+/// 513 succeeded (`set`) or not (`refused`).
 const NOFILE_PROBE: &str = "grep 'Max open files' /proc/1/limits; \
      grep 'Max open files' /proc/self/limits; \
-     if ulimit -n 1024 2>/dev/null; then echo set; else echo refused; fi";
+     if ulimit -n 513 2>/dev/null; then echo set; else echo refused; fi";
 
 /// Soft and hard, as `/proc/<pid>/limits` prints them.
 type Limit = (String, String);
@@ -1132,7 +1132,8 @@ fn nofile_read(out: &str) -> (Limit, Limit, String) {
         .filter(|l| l.starts_with("Max open files"))
         .map(|l| {
             let t: Vec<&str> = l.split_whitespace().collect();
-            (t[3].to_owned(), t[4].to_owned())
+            let field = |i: usize| (*t.get(i).unwrap_or_else(|| panic!("{l}: {out}"))).to_owned();
+            (field(3), field(4))
         })
         .collect();
     assert_eq!(limits.len(), 2, "{out}");
@@ -1141,9 +1142,9 @@ fn nofile_read(out: &str) -> (Limit, Limit, String) {
 }
 
 /// RT-AG-09: in a launched workspace, the init and a process `podman exec` starts both have 512
-/// open files, soft and hard, and raising the limit to 1024 is refused. Control first: the
-/// product argv with the `nofile` pair left out shows podman's inherited limit, above 1024,
-/// through the same reads, and there the same `ulimit -n 1024` (a lowering) succeeds.
+/// open files, soft and hard, and raising the limit to 513 is refused. Control first: the
+/// product argv with the `nofile` pair left out shows podman's inherited limit, above 512,
+/// through the same reads, and there the same `ulimit -n 513` (no raise) succeeds.
 #[test]
 fn rt_ag_09_the_descriptor_limit_holds_for_init_and_exec() {
     rt().block_on(async {
@@ -1155,9 +1156,12 @@ fn rt_ag_09_the_descriptor_limit_holds_for_init_and_exec() {
         assert_eq!(code, 0, "control: {out}");
         let (init, execd, last) = nofile_read(&out);
         let inherited: u64 = init.1.parse().expect("control: a number");
-        assert!(inherited > 1024, "control: podman's inherited limit: {out}");
+        assert!(inherited > 512, "control: podman's inherited limit: {out}");
         assert_eq!(init, execd, "control: {out}");
-        assert_eq!(last, "set", "control: a lowering is allowed: {out}");
+        assert_eq!(
+            last, "set",
+            "control: 513 is within the inherited limit: {out}"
+        );
 
         let r = x.launch(&v, "nofile").await.unwrap();
         let (code, out) = exec(&r, NOFILE_PROBE).await;
@@ -1171,9 +1175,9 @@ fn rt_ag_09_the_descriptor_limit_holds_for_init_and_exec() {
     });
 }
 
-/// RT-AG-09: a launched workspace creates no POSIX message queue. A queue's bytes are charged to
-/// the kernel user, which `--userns=keep-id` shares with the host account, so every role's limit
-/// is zero and `mq_open` is refused (EMFILE, 24), from a process `podman exec` starts. Control
+/// RT-AG-09: a launched workspace creates no POSIX message queue. A queue's bytes are charged up
+/// to the host account's allowance, so every role's limit is zero and `mq_open` is refused
+/// (EMFILE, 24), from a process `podman exec` starts. Control
 /// first: the product argv with the `msgqueue` pair left out creates one through the same probe.
 #[test]
 fn rt_ag_09_a_workspace_creates_no_message_queue() {

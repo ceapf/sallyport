@@ -3,8 +3,8 @@
 //! expected shape, at most once unless it is a mount or an environment variable
 //! (`--security-opt` and `--ulimit`: at most once per kind); every hardening option must be
 //! present, `--ulimit` as exactly `core=0`, the descriptor limit and the message-queue limit
-//! (RT-AG-09); every `-v` source must be
-//! a declared [`Source`] with a grant that covers the requested access; overlay scratch must lie
+//! (RT-AG-09); every `-v` source must be a declared [`Source`] with a grant that covers the
+//! requested access; overlay scratch must lie
 //! in the session's scratch directory; the image must be digest-pinned; the command after the
 //! image must be the role's fixed command; and
 //! a session's container (workspace, harness) carries exactly the conmon backstop `--timeout` its

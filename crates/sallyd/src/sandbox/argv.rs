@@ -170,8 +170,8 @@ impl Argv {
         // AMENDMENTS-01 §6.1: never contact a registry, never inherit host proxies, keep no logs,
         // write no core files. The descriptor limit (`NOFILE_LIMIT`, RT-AG-09) caps each
         // process's open files, soft and hard; it does not bound descriptors in flight (#271).
-        // No POSIX message queue (`MSGQUEUE_LIMIT`, RT-AG-09): its bytes count against the host
-        // account's allowance under keep-id.
+        // No POSIX message queue (`MSGQUEUE_LIMIT`, RT-AG-09): its bytes are charged up to the
+        // host account's allowance.
         a.push([
             "--pull=never",
             "--http-proxy=false",

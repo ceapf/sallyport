@@ -17,8 +17,8 @@
  *                                             socket(2), then sendto(2) of one ICMP echo request
  *   probe syscall <name> [<first>]            syscall(2) by name (`calls` below): its first
  *                                             argument `first` (default 0), every other 0
- *   probe mqueue                              mq_open(2) of a new POSIX message queue holding
- *                                             one 1-byte message, then mq_unlink(2) (RT-AG-09)
+ *   probe mqueue                              mq_open(2) of a new POSIX message queue with room
+ *                                             for one 1-byte message, then mq_unlink(2) (RT-AG-09)
  *
  * Numbers are decimal or 0x-hex. Prints "ok" or "errno=<n>" (send: "sent", "socket errno=<n>" or
  * "sendto errno=<n>") and exits 0 or 1; usage errors exit 2.
@@ -166,10 +166,8 @@ static long mqueue(void) {
     syscall(SYS_mq_unlink, "sp-probe");
     long fd = syscall(SYS_mq_open, "sp-probe", O_CREAT | O_EXCL | O_RDWR, 0600, &attr);
     if (fd >= 0) {
-        int saved = errno;
         close((int)fd);
         syscall(SYS_mq_unlink, "sp-probe");
-        errno = saved;
     }
     return fd;
 }

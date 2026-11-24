@@ -1341,7 +1341,7 @@ fn without_pair(a: &[String], flag: &str, value: &str) -> Vec<String> {
 /// `msgqueue=0:0`, each once, all required, nothing else (security review; RT-AG-09). Control:
 /// the builder's argv passes.
 #[test]
-fn checker_holds_ulimit_to_core_zero_and_the_descriptor_limit() {
+fn checker_holds_ulimit_to_core_zero_and_both_limits() {
     let f = Fx::new();
     let (a, allowed) = base(&f);
     check_argv(&a, &allowed).unwrap();
