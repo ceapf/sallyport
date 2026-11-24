@@ -171,7 +171,7 @@ impl RedactorTarget for Parked {
     }
 }
 
-/// Architect Q220: the swap runs under the lock. While one `register` is parked in its swap, a
+/// The swap runs under the lock. While one `register` is parked in its swap, a
 /// second on another thread does not reach its own; released, each target's last redactor is
 /// the union of both.
 #[test]

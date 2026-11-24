@@ -172,7 +172,7 @@ fn a_crash_reported_during_a_stop_is_logged_redacted() {
     });
 }
 
-/// Architect Q228: a crash a session task reports after the stop's late-crash check, while
+/// A crash a session task reports after the stop's late-crash check, while
 /// `session.closed` is still being written, is logged only after the session's secrets are
 /// released, so its payload is withheld whole: the oplog line names the task and says
 /// `withheld`, and holds no byte of the message. Control: the session is still registered
