@@ -163,6 +163,16 @@ fn a_mark_with_no_close_is_not_part_of_the_unit() {
 }
 
 #[test]
+fn a_row_holds_exactly_its_width_and_a_bound_past_the_end_is_the_end() {
+    assert_eq!(escaped_rows("abcd", 2), ["ab", "cd"]);
+    assert_eq!(escaped_rows("abcde", 2), ["ab", "cd", "e"]);
+    // A unit wider than the width is a row of its own, with no empty row before it.
+    assert_eq!(escaped_rows("\\u{10ffff}a", 3), ["\\u{10ffff}", "a"]);
+    assert_eq!(escape_boundary("ab", 10), 2);
+    assert_eq!(escape_boundary("ab", 2), 2);
+}
+
+#[test]
 fn rows_read_a_u_escape_only_as_far_as_the_longest_escape() {
     let text = format!("\\u{}}}", "c".repeat(100));
     let rows = escaped_rows(&text, LONGEST_UNIT);

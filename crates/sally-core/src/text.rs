@@ -491,7 +491,7 @@ fn escape_len(text: &str, i: usize, u_reach: usize) -> usize {
 pub fn escaped_rows(text: &str, width: usize) -> Vec<&str> {
     let mut rows = Vec::new();
     let (mut start, mut i) = (0usize, 0usize);
-    while i < text.len() {
+    while text.as_bytes().get(i).is_some() {
         let next = i.saturating_add(unit_len(text, i, LONGEST_ESCAPE));
         if next.saturating_sub(start) > width && i > start {
             rows.push(text.get(start..i).unwrap_or_default());
