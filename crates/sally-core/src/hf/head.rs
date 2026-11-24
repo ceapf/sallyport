@@ -9,7 +9,7 @@
 //! the partial ([`HfError::discards_partial`]).
 //!
 //! The file list, which carries the publisher's hashes, is read from the API host only: a
-//! redirect of the list call to any other host is refused.
+//! redirect of the list call to any other host is refused (RT-MDL-11).
 #![deny(clippy::indexing_slicing)]
 
 use super::plan::{API_HOST, Request, redirect};

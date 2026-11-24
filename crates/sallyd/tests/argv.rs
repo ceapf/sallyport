@@ -949,6 +949,107 @@ fn checker_refuses_every_forbidden_flag() {
     }
 }
 
+// ---- RT-SUP-01: what the product builders give carries none of the row's tokens -------------
+
+/// The row's tokens, each as it would be spliced in after `create`.
+const SUP01_TOKENS: &[&[&str]] = &[
+    &["--privileged"],
+    &["--cap-add=SYS_ADMIN"],
+    &["--cap-add", "NET_RAW"],
+    &["--network=host"],
+    &["--network", "bridge"],
+    &["--network=pasta"],
+    &["--network=slirp4netns"],
+    &["--security-opt", "seccomp=unconfined"],
+    &["--security-opt=seccomp=unconfined"],
+    &["--userns=host"],
+    &["--userns", "host"],
+    &["--device", "/dev/kvm"],
+    &["--device=/dev/fuse"],
+];
+
+/// Whether `a` carries one of the row's tokens, read token by token (`--flag=value` or
+/// `--flag value`).
+fn carries_a_sup01_token(a: &[String]) -> bool {
+    let bad_network = |v: &str| ["host", "bridge", "pasta", "slirp4netns"].contains(&v);
+    a.iter().enumerate().any(|(i, t)| {
+        let next = a.get(i + 1).map_or("", String::as_str);
+        let (flag, value) = t.split_once('=').unwrap_or((t.as_str(), next));
+        match flag {
+            "--privileged" | "--cap-add" => true,
+            "--network" | "--net" => bad_network(value),
+            "--userns" => value == "host",
+            "--device" => !value.starts_with("nvidia.com/gpu="),
+            _ => t.contains("seccomp=unconfined"),
+        }
+    })
+}
+
+/// Each role's product builder output with the policy its launch checks it under: a workspace
+/// with an `ro` mount, the harness, and inference with the GPU.
+fn sup01_argvs(f: &Fx) -> Vec<(Vec<String>, Allowed)> {
+    let (ws, wa) = base(f);
+    let h = harness_argv(&f.common, &f.paths, &f.load(""), &image("harness", D0)).unwrap();
+    let ha = Allowed {
+        role: Role::Harness,
+        sources: vec![Source {
+            path: f.paths.harness_sockets(),
+            guest: "/run/sallyport".into(),
+            grant: Grant::Ro,
+        }],
+        scratch: None,
+        ..wa.clone()
+    };
+    let spec = inference(f, true, None);
+    let i = inference_argv(&f.common, &spec).unwrap();
+    let ia = Allowed {
+        role: Role::Inference,
+        sources: vec![
+            Source {
+                path: spec.model.path().to_owned(),
+                guest: "/models/model.gguf".into(),
+                grant: Grant::Ro,
+            },
+            Source {
+                path: spec.socket_dir.clone(),
+                guest: "/run/sallyport".into(),
+                grant: Grant::Rw,
+            },
+        ],
+        scratch: None,
+        timeout: None,
+        ..wa.clone()
+    };
+    vec![(ws, wa), (h, ha), (i, ia)]
+}
+
+/// RT-SUP-01, the argv clause: the argv each product builder gives carries none of the row's
+/// tokens (`--privileged`, `--cap-add`, `--network=host|bridge|pasta|slirp4netns`,
+/// `seccomp=unconfined`, `--userns=host`, a non-GPU `--device`), the workspace's with every
+/// mount mode too, and `check_argv` refuses each token spliced into each role's argv. Controls,
+/// in-test: each argv passes `check_argv` under its role's policy before the splice, and the
+/// same scan finds each token once it is spliced in.
+#[test]
+fn rt_sup_01_no_builder_argv_carries_a_forbidden_flag() {
+    let f = Fx::new();
+    for a in every_argv(&f) {
+        assert!(!carries_a_sup01_token(&a), "{a:?}");
+    }
+    for (a, policy) in sup01_argvs(&f) {
+        let role = policy.role;
+        check_argv(&a, &policy).unwrap_or_else(|e| panic!("control: {role:?}: {e}: {a:?}"));
+        assert!(!carries_a_sup01_token(&a), "{role:?}: {a:?}");
+        for extra in SUP01_TOKENS {
+            let spliced = with(&a, extra);
+            assert!(
+                carries_a_sup01_token(&spliced),
+                "control: the scan misses {extra:?}"
+            );
+            assert_forbidden(&spliced, &policy, &format!("{role:?} {extra:?}"));
+        }
+    }
+}
+
 /// No swap in any role: `--memory-swap` must equal `--memory`, and appears exactly when it
 /// does (an inference session without a memory limit carries neither).
 #[test]

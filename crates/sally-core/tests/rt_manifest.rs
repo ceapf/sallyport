@@ -232,8 +232,30 @@ fn rt_man_01_the_parts_cover_every_case_once() {
     assert_eq!(PART_INDICES, (0..PARTS).collect::<Vec<_>>());
 }
 
+/// The ladder's top-level keys are unknown fields too, so through `parse` only the in-field
+/// cases show the anchor limit answering; the ladder against the limit alone is
+/// `manifest::parse::tests::rt_man_01_an_alias_ladder_is_refused_by_the_anchor_limit`.
+/// Control: return value, in-test (first): each in-field case without its anchor and aliases,
+/// the values written out, through the same `parse`, is accepted.
 #[test]
 fn rt_man_01_alias_bombs_are_refused() {
+    for twin in [
+        format!("{HEADER}description: hi\nfilesystem:\n  deny: [hi, hi]\n"),
+        format!("{HEADER}description: hi\n"),
+    ] {
+        parse(&twin).unwrap_or_else(|e| panic!("control: {twin:?}: {e:?}"));
+    }
+    for anchored in [
+        format!("{HEADER}description: &x hi\nfilesystem:\n  deny: [*x, *x]\n"),
+        format!("{HEADER}description: &x hi\n"),
+    ] {
+        let e = parse(&anchored).unwrap_err();
+        assert_eq!(e.errors[0].code, Code::Syntax, "{e:?}");
+        assert!(
+            e.errors[0].message.contains("budget breached: Anchors"),
+            "{e:?}"
+        );
+    }
     let laughs = "a: &a [x, x, x, x, x, x, x, x, x, x]\n\
                   b: &b [*a, *a, *a, *a, *a, *a, *a, *a, *a, *a]\n\
                   c: &c [*b, *b, *b, *b, *b, *b, *b, *b, *b, *b]\n\
@@ -284,6 +306,10 @@ fn rt_man_01_the_size_limit_is_inclusive() {
     assert_eq!(e.errors[0].code, Code::TooLarge);
 }
 
+/// Through `parse` these inputs are refused, in time, by whatever answers first: the schema
+/// (a list where `description`'s string goes, an unknown field) or the scanner's recursion
+/// limit. The depth limit with its own error, beside an accepted twin at depth 16, is
+/// `manifest::parse::tests::rt_man_01_nesting_past_the_depth_limit_is_refused_by_it`.
 #[test]
 fn rt_man_01_deep_nesting_is_refused() {
     for text in [
@@ -350,6 +376,32 @@ fn rt_man_01_duplicate_keys_tags_and_documents() {
             (e.errors[0].code, e.errors[0].path.as_str()),
             (*code, *path),
             "{text}"
+        );
+    }
+    // The duplicate-key clause, with its own error. Control: return value, in-test: each twin
+    // differs from its case only in the second key's name, through the same `parse`, and is
+    // accepted.
+    let env = |second: &str| {
+        format!(
+            "{HEADER}tools:\n  mcp:\n    - {{name: a, command: [x], env: {{A: \"1\", {second}: \"2\"}}}}\n"
+        )
+    };
+    for (twin, duplicate) in [
+        (
+            format!("{HEADER}description: other\n"),
+            format!("{HEADER}name: other\n"),
+        ),
+        (
+            format!("{HEADER}runtime:\n  pids: 64\n  cpus: 2\n"),
+            format!("{HEADER}runtime:\n  pids: 64\n  pids: 2\n"),
+        ),
+        (env("B"), env("A")),
+    ] {
+        parse(&twin).unwrap_or_else(|e| panic!("control: {twin:?}: {e:?}"));
+        let e = parse(&duplicate).expect_err(&duplicate);
+        assert!(
+            e.errors[0].message.contains("duplicate mapping key"),
+            "{e:?}"
         );
     }
     // `!!binary` never silently decodes into a string: the literal text is what is validated.
@@ -612,9 +664,22 @@ fn the_place_check_refuses_a_manifest_inside_its_own_writable_mount() {
 
 // ---- RT-FS-05: denylisted mounts ---------------------------------------------------------------
 
+/// Control: return value, in-test (first): the same body, through the same `load`, differing
+/// only in the host (an ordinary folder in the home, and one by absolute path outside it), is
+/// accepted.
 #[test]
 fn rt_fs_05_denylisted_mounts_rejected() {
     let f = Fixture::new();
+    let body = |host: &str| {
+        format!(
+            "filesystem:\n  mounts:\n    - {{host: \"{host}\", guest: /workspace/x, mode: ro}}\n"
+        )
+    };
+    let outside = f.root.join("elsewhere");
+    std::fs::create_dir(&outside).unwrap();
+    for host in ["~/code/myproject".to_owned(), outside.display().to_string()] {
+        twin_ok(&f, &body(&host));
+    }
     let runtime_dir = f.env.xdg_runtime_dir.clone().unwrap();
     for host in [
         "~".to_owned(),
@@ -654,10 +719,7 @@ fn rt_fs_05_denylisted_mounts_rejected() {
         "/tmp/.X11-unix".to_owned(),
         "/var/tmp".to_owned(),
     ] {
-        let body = format!(
-            "filesystem:\n  mounts:\n    - {{host: \"{host}\", guest: /workspace/x, mode: ro}}\n"
-        );
-        let r = f.load(&body);
+        let r = f.load(&body(&host));
         assert_rejects(&r, "filesystem.mounts[0].host", Code::Denylisted);
         assert!(rendered(&r)[0].contains("denylisted"), "{host}");
     }
@@ -874,22 +936,33 @@ fn rt_sec_08_secret_values_cannot_enter_through_the_manifest() {
 /// A token pasted as a secret name that its check refuses, with a slash, a space or a quote in
 /// it, is not echoed by the warnings either: with an allow rule, the `[data-can-leave]` warning
 /// names grants, and only a checked name is masked whole when quoted (architect Q376). Control:
-/// the name guard in `validate/exposure.rs` (without it the warning echoes the token).
+/// in-test (first), the same body with a name its check accepts, holding the token's upper-case
+/// run, through the same `load` and `rendered_all`, shows that run in the warning; so the
+/// warning names a grant's secret and only the name guard in `validate/exposure.rs` keeps the
+/// malformed ones out.
 fn rt_sec_08_malformed_names_in_warnings(f: &Fixture) {
     let tok = fake_token(&["gh", "p_"], "0123456789abcdefghijABCDEFGHIJ");
+    let body = |name: &str| {
+        format!(
+            "network:\n  mode: proxy\n  allow:\n    - host: api.github.com\nsecrets:\n  - name: \
+             '{name}'\n    inject: {{host: api.github.com, header: H, format: \"{{value}}\"}}\n"
+        )
+    };
+    let shown = rendered_all(&f.load(&body("T_ABCDEFGHIJ"))).join("\n");
+    assert!(shown.contains("[data-can-leave]"), "control: {shown}");
+    assert!(
+        shown.contains("ABCDEFGHIJ"),
+        "control: a checked name is not shown: {shown}"
+    );
     for name in [
         format!("A/{tok}"),
         format!("Bearer {tok}"),
         format!("X\"{tok}"),
     ] {
-        let body = format!(
-            "network:\n  mode: proxy\n  allow:\n    - host: api.github.com\nsecrets:\n  - name: \
-             '{name}'\n    inject: {{host: api.github.com, header: H, format: \"{{value}}\"}}\n"
-        );
-        let shown = rendered_all(&f.load(&body)).join("\n");
+        let shown = rendered_all(&f.load(&body(&name))).join("\n");
         assert!(shown.contains("[data-can-leave]"), "{shown}");
         assert!(
-            !shown.contains("0123456789abcdefghij"),
+            !shown.contains("0123456789abcdefghij") && !shown.contains("ABCDEFGHIJ"),
             "token echoed: {shown}"
         );
     }

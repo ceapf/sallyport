@@ -272,6 +272,63 @@ fn assert_one_start_path(x: &Lx, dir: &Path, from: usize, container: &str) {
     assert!(at("init") < read && read < at("start"), "{argv}");
 }
 
+/// The start-path tests' control, in-test (before their assertion): [`assert_one_start_path`]
+/// over copies of the same launch's log, each with one defence taken out, fails: the config
+/// read removed, `init` without the mounts file, the last call under another `HOME`.
+fn the_check_fails_without_each_defence(x: &Lx, dir: &Path, from: usize, container: &str) {
+    let argv = std::fs::read_to_string(dir.join("argv")).unwrap();
+    let homes = std::fs::read_to_string(dir.join("home")).unwrap();
+    let calls: Vec<(String, String)> = argv
+        .lines()
+        .zip(homes.lines())
+        .map(|(a, h)| (a.to_owned(), h.to_owned()))
+        .collect();
+    let init = format!(
+        "--default-mounts-file {} init {container}",
+        x.podman.mounts_file().display()
+    );
+    let no_read: Vec<_> = calls
+        .iter()
+        .filter(|(a, _)| !(a.starts_with("unshare cat -- ") && a.ends_with("/config.json")))
+        .cloned()
+        .collect();
+    let plain_init: Vec<_> = calls
+        .iter()
+        .map(|(a, h)| {
+            let a = if *a == init {
+                format!("init {container}")
+            } else {
+                a.clone()
+            };
+            (a, h.clone())
+        })
+        .collect();
+    let mut other_home = calls.clone();
+    if let Some(last) = other_home.last_mut() {
+        last.1 = "/elsewhere".to_owned();
+    }
+    for (what, log) in [
+        ("no config read", no_read),
+        ("plain init", plain_init),
+        ("another HOME", other_home),
+    ] {
+        assert_ne!(log, calls, "control: {what} changed nothing");
+        let copy = dir.join(format!("control-{}", what.replace(' ', "-")));
+        std::fs::create_dir_all(&copy).unwrap();
+        let lines = |f: fn(&(String, String)) -> &String| {
+            log.iter()
+                .map(|c| format!("{}\n", f(c)))
+                .collect::<String>()
+        };
+        std::fs::write(copy.join("argv"), lines(|c| &c.0)).unwrap();
+        std::fs::write(copy.join("home"), lines(|c| &c.1)).unwrap();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_one_start_path(x, &copy, from, container);
+        }));
+        assert!(r.is_err(), "control: the check passes with {what}");
+    }
+}
+
 /// A logged call of the mount-link probe (it names `sp-probe-…`).
 fn is_probe(line: &str) -> bool {
     line.contains(" sp-probe-")
@@ -292,6 +349,7 @@ fn rt_sup_04_the_workspace_launch_runs_the_one_start_path() {
         let x = Lx::with_podman(|real| wrapper(&dir, real, ""));
         let v = x.f.load("");
         let r = x.launch(&v, "ws-path").await.unwrap();
+        the_check_fails_without_each_defence(&x, &dir, 0, r.container());
         assert_one_start_path(&x, &dir, 0, r.container());
         x.stop(r).await;
     });
@@ -312,6 +370,7 @@ fn rt_sup_04_the_harness_launch_runs_the_one_start_path() {
             .await
             .unwrap();
         assert_eq!(h.name(), format!("sp-h-{}", ws.paths().id().as_str()));
+        the_check_fails_without_each_defence(&x, &dir, from, h.container());
         assert_one_start_path(&x, &dir, from, h.container());
         x.launcher.stop_role(h).await.unwrap();
         x.stop(ws).await;
@@ -330,6 +389,7 @@ fn rt_sup_04_the_cpu_inference_launch_runs_the_one_start_path() {
             .await
             .unwrap();
         assert!(i.name().starts_with("sp-infer-"), "{}", i.name());
+        the_check_fails_without_each_defence(&x, &dir, 0, i.container());
         assert_one_start_path(&x, &dir, 0, i.container());
         x.launcher.stop_role(i).await.unwrap();
     });
