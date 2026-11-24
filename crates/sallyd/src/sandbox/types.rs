@@ -83,13 +83,10 @@ pub const INSTALLATION_LABEL: &str = "sallyport.installation";
 /// image-chosen one below a mount's guest path would land in the host folder (RT-FS-02).
 pub const WORKDIR: &str = "/";
 
-/// Every container's descriptor limit, soft and hard (`--ulimit nofile=512:512`). The kernel
-/// counts descriptors in flight over Unix sockets per kernel user, which `--userns=keep-id`
-/// shares with the host user, and refuses a pass once the sender's user has more in flight
-/// than the sender's own limit. So one sender in a sandbox holds at most this plus one
-/// message's 253, below the 1024 soft limit ordinary host programs get (security review). It
-/// does not bound every way of queueing descriptors (#271). Hard equals soft: every seccomp
-/// profile allows `setrlimit` and `prlimit64`, so a lower soft limit alone could be raised.
+/// Every container's descriptor limit, soft and hard (`--ulimit nofile=512:512`, RT-AG-09): the
+/// most open files one sandbox process has. It does not bound descriptors in flight (#271).
+/// Hard equals soft: every seccomp profile allows `setrlimit` and `prlimit64`, so a lower soft
+/// limit alone could be raised.
 pub const NOFILE_LIMIT: u64 = 512;
 
 /// The `--ulimit` value that sets [`NOFILE_LIMIT`] (`nofile=512:512`).
@@ -552,14 +549,12 @@ mod tests {
         }
     }
 
-    /// The limit is 512, soft and hard, and one sender's most in flight (the limit plus one
-    /// message of 253, the kernel's per-message maximum) stays below host programs' usual soft
-    /// 1024 (security review).
+    /// The limit is 512 open files, soft and hard (RT-AG-09). It bounds no descriptors in flight
+    /// (#271), so the test claims no such bound.
     #[test]
-    fn the_descriptor_limit_stays_below_host_programs_soft_limit() {
+    fn the_descriptor_limit_is_512_soft_and_hard() {
         assert_eq!(nofile_ulimit(), "nofile=512:512");
         assert_eq!(NOFILE_LIMIT, 512);
-        const { assert!(NOFILE_LIMIT + 253 < 1024) };
     }
 
     #[test]

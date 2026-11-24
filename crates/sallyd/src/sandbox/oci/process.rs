@@ -135,8 +135,8 @@ fn check_caps(c: &Capabilities) -> Result<(), Mismatch> {
 }
 
 /// Exactly `RLIMIT_CORE` 0/0 (`--ulimit core=0`), `RLIMIT_NOFILE` at the launcher's
-/// [`NOFILE_LIMIT`] soft and hard (`--ulimit nofile=…`; a sandbox's descriptor limit also bounds
-/// what it can hold in flight, so a lower or higher value is refused alike), and podman's
+/// [`NOFILE_LIMIT`] soft and hard (`--ulimit nofile=…`, a lower or higher value refused alike;
+/// it does not bound descriptors in flight (#271)), and podman's
 /// inherited `RLIMIT_NPROC` with soft ≤ hard ≤ `sallyd`'s own hard limit (architect Q103).
 fn check_rlimits(limits: &[Rlimit], f: &Facts) -> Result<(), Mismatch> {
     let mut seen = Vec::new();
