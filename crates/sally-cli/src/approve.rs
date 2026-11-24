@@ -10,9 +10,9 @@
 //!   its full text before the question; one whose full text could not be sent, or whose text
 //!   failed the clean-check, can only be denied.
 //! - When the prompt is taller than the screen, and above every question asked again, the start
-//!   of the action is printed again ([`again`]), so it is in the last screen before the
-//!   question; when fewer than [`MIN_HEAD_ROWS`] rows of it fit, or the terminal's size is not
-//!   known or under [`MIN_COLUMNS`] columns, the prompt can only be denied.
+//!   of the action is printed again (`again`), so it is in the last screen before the
+//!   question; when fewer than `MIN_HEAD_ROWS` rows of it fit, or the terminal's size is not
+//!   known or under `MIN_COLUMNS` columns, the prompt can only be denied.
 //! - The terminal closing (end of input) or failing, its typed-ahead input included when it
 //!   cannot be discarded, denies the prompt on screen, and `sally` exits non-zero.
 //! - The connection ending (sallyd stopped, or dropped this approver for falling behind; architect
@@ -162,7 +162,7 @@ impl Lines {
 /// everything up to its first question (RT-AG-04): the CLI's lines at the left edge; the note,
 /// the action and a cut prompt's full text each under a label, every row of them behind
 /// [`GUTTER`]; the note before the action. When the prompt is taller than the screen,
-/// [`again`]'s block follows, so the action's start is on the last screen.
+/// `again`'s block follows, so the action's start is on the last screen.
 #[must_use]
 pub fn layout(p: &Prompt, size: Option<Size>) -> Layout {
     let (screen, refusal) = size.map_or(((usize::MAX, usize::MAX), None), screen);
@@ -261,7 +261,9 @@ fn again_on(p: &Prompt, (columns, rows): (usize, usize)) -> Layout {
 }
 
 /// For a cut prompt, the again-block's line saying where its full text is, and how long it is:
-/// the start shown again is of the cut action, and what the cut left out may matter most.
+/// the start shown again is of the cut action, and what the cut left out may matter most. Only
+/// the row count is used: whether the full text is clean was settled by the first layout,
+/// whose `deny_only` the question asked again keeps.
 fn cut_line(p: &Prompt, columns: usize) -> Option<String> {
     if !p.truncated {
         return None;
