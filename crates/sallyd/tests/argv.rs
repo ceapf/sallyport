@@ -529,6 +529,82 @@ fn every_flag_all_roles_carry_is_in_the_architecture_argv_blocks() {
     );
 }
 
+/// The adjacent token pairs of `block`, in order, each line's `#` comment left out, so an option
+/// and the value written after it (on the same line or the next) form one pair.
+fn block_pairs(block: &str) -> std::collections::BTreeSet<(String, String)> {
+    let tokens: Vec<&str> = block
+        .lines()
+        .flat_map(|l| {
+            l.split_once('#')
+                .map_or(l, |(code, _)| code)
+                .split_whitespace()
+        })
+        .collect();
+    tokens
+        .windows(2)
+        .filter_map(|w| match w {
+            [a, b] => Some(((*a).to_owned(), (*b).to_owned())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Security review: the §3.2 block named `--ulimit core=0` but not `--ulimit nofile=512:512`,
+/// which every builder pushes; a flag check alone cannot see a missing value of a repeated
+/// option. Every two-token option (a `--` option without `=`, then a token that is not an option)
+/// whose value is the same in all three roles' argvs is in the §3.2 block as that pair, or in
+/// each of §3.3's role blocks.
+#[test]
+fn every_option_value_all_roles_share_is_in_the_architecture_argv_blocks() {
+    let f = Fx::new();
+    let argvs = every_argv(&f);
+    let pairs = |a: &Vec<String>| -> std::collections::BTreeSet<(String, String)> {
+        a.windows(2)
+            .filter_map(|w| match w {
+                [o, v] if o.starts_with("--") && !o.contains('=') && !v.starts_with('-') => {
+                    Some((o.clone(), v.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let common = argvs
+        .iter()
+        .map(pairs)
+        .reduce(|x, y| x.intersection(&y).cloned().collect())
+        .expect("every_argv builds three roles");
+    assert!(
+        common.contains(&("--ulimit".to_owned(), "core=0".to_owned())),
+        "every role carries --ulimit core=0: {common:?}"
+    );
+    let doc = architecture();
+    let prologue = fenced_blocks(doc_section(&doc, "3.2"));
+    assert_eq!(prologue.len(), 1, "§3.2 has one argv block");
+    let prologue = block_pairs(&prologue[0]);
+    let roles: Vec<_> = fenced_blocks(doc_section(&doc, "3.3"))
+        .iter()
+        .map(|b| block_pairs(b))
+        .collect();
+    assert_eq!(roles.len(), 3, "§3.3 has one argv block per role");
+    // A host- or install-specific value (a path, the uid, the installation id) is written in
+    // the blocks as a `<…>` placeholder; any other value must be written as the argv has it.
+    let covers = |block: &std::collections::BTreeSet<(String, String)>,
+                  (o, v): &(String, String)| {
+        block
+            .iter()
+            .any(|(bo, bv)| bo == o && (bv == v || bv.contains('<')))
+    };
+    let missing: Vec<_> = common
+        .iter()
+        .filter(|p| !covers(&prologue, p) && !roles.iter().all(|r| covers(r, p)))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "option values every role's argv carries, absent from ARCHITECTURE §3.2 and §3.3: \
+         {missing:?}"
+    );
+}
+
 /// Security review: ARCHITECTURE §3.5 step 7 said the OCI config verifier accepts the image's
 /// `WorkingDir`, which it refuses: the process's working directory must be the launcher's `/`
 /// (`sandbox::oci` process check). The step is found first, then its verifier sentence, so a
