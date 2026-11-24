@@ -456,7 +456,10 @@ G5 Get a denied action executed
 │                                                    line that names a mount realpath quotes it from
 │                                                    its bytes (sally-core `manifest_validate.rs`
 │                                                    `summary_of_coding_agent`), the
-│                                                    `[data-can-leave]` line included; the validator
+│                                                    `[data-can-leave]` line included (sally-core
+│                                                    `validate/exposure.rs`
+│                                                    `the_finding_quotes_each_realpath_from_its_bytes`,
+│                                                    a byte that is not UTF-8 among them); the validator
 │                                                    refuses a mount whose realpath is not UTF-8
 │                                                    (`path-chars`; `manifest_validate.rs`
 │                                                    `a_mount_whose_realpath_is_not_utf8_is_refused`);

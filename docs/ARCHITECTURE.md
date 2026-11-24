@@ -1242,8 +1242,9 @@ session stops, and the periodic sweep then takes its container. Shutdown does no
 a cleanup; while one has not confirmed its container gone (retrying or abandoned), `sallyd`
 exits non-zero naming it. Directories its cleanup could not remove stay: the next start's
 stale-state step removes a workspace launch's socket directory; the rest are recorded and not
-swept, and the command that will discard kept stages removes them (THREAT_MODEL.md §6; TODO(#216)). A failed `session.start` append is followed by a best-effort
-`session.stop` (`start-failed`), since the entry may have reached the log.
+swept, and the command that will discard kept stages removes them (THREAT_MODEL.md §6;
+TODO(#216)). A failed `session.start` append is followed by a best-effort `session.stop`
+(`start-failed`), since the entry may have reached the log.
 
 ## 6. Repository structure
 
