@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sally_core::audit::{Actor, NewEntry};
-use sallyd::sandbox::AuditSink;
+use sallyd::sandbox::{AuditSink, CleanupSchedule, LaunchError};
 use sallyd::session::{Registry, StopOutcome, StopReason};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -19,6 +19,7 @@ mod common;
 use common::container::*;
 use common::egress::{canary, public};
 use common::intercept::connect;
+use common::{mount, mounts};
 
 /// A proxy-mode session allowed `mock2.test`, which is spliced (no grant): its tunnel stays open
 /// until the session stops.
@@ -300,4 +301,96 @@ fn an_unconfirmed_container_gets_session_closed_only_once_it_is_gone() {
         assert!(!exists(&s.container));
         assert_closed_last(&x, &s.id, "request");
     });
+}
+
+/// Short pauses between a failed stop's rounds (and a failed launch's cleanup tries), passed in
+/// as `sallyd` passes its own schedule.
+const SHORT: CleanupSchedule = CleanupSchedule::with_pauses([Duration::from_millis(100); 9]);
+
+/// How long the session runs before its timeout begins the stop (the least the manifest allows),
+/// and then at most how long until that stop's first round has failed.
+const TIMEOUT_AND_ROUND: Duration = Duration::from_secs(150);
+
+/// Long enough for several more stop rounds at [`SHORT`] pauses, each round three attempts two
+/// seconds apart.
+const MORE_ROUNDS: Duration = Duration::from_secs(20);
+
+/// The entries named `event`.
+fn count(x: &Lx, event: &str) -> usize {
+    x.events.list().iter().filter(|e| *e == event).count()
+}
+
+/// RT-AUD-03: a stop begun by the session's timeout, with no
+/// requester, whose container cannot be confirmed gone writes one `sandbox.stop_failed`
+/// (denied, naming the role, the container and the attempts) and exactly one `sandbox.stop`,
+/// however many rounds it takes; the session's folder stays refused; and the supervisor
+/// retries by itself, so once the container can be removed `session.closed` follows, last,
+/// with no stop request. Control: the folder launches once the stop is confirmed.
+#[test]
+fn rt_aud_03_a_stop_that_cannot_be_confirmed_is_audited_and_retried_until_it_is() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("closed-stop-failed-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _cleanup = RemoveOnDrop(dir.clone());
+    rt().block_on(async {
+        let x = Lx::with_podman_and_cleanup(|real| rm_failing_podman(&dir, real), SHORT);
+        let reg = registry(&x);
+        let folder = mounts(&[mount("~/code/myproject", "/workspace/p", "rw")]);
+        let timed = format!("{folder}runtime:\n  timeout: 1m\n");
+        let s = reg.start(Arc::new(x.f.validated(&timed))).await.unwrap();
+        std::fs::write(dir.join("fail-rm"), b"").unwrap();
+        until(&x, "sandbox.stop_failed", TIMEOUT_AND_ROUND, || {
+            count(&x, "sandbox.stop_failed") > 0
+        })
+        .await;
+        let failed = x.events.args("sandbox.stop_failed").unwrap();
+        assert_eq!(failed["role"], "workspace", "{failed}");
+        assert_eq!(failed["container"], format!("sp-ws-{}", s.id), "{failed}");
+        assert_eq!(failed["attempts"], 3, "{failed}");
+        let shape = x
+            .events
+            .debug()
+            .into_iter()
+            .find(|d| d.contains("\"sandbox.stop_failed\""))
+            .unwrap();
+        assert!(shape.contains("decision: Some(\"deny\")"), "{shape}");
+        tokio::time::sleep(MORE_ROUNDS).await;
+        assert_eq!(count(&x, "sandbox.stop_failed"), 1, "{:?}", x.events.list());
+        assert_eq!(count(&x, "sandbox.stop"), 1, "{:?}", x.events.list());
+        assert_eq!(count(&x, "session.closed"), 0, "{:?}", x.events.list());
+        assert!(exists(&s.container), "the container is still there");
+        let v = x.f.load(&folder);
+        let refused = x.launch(&v, "while-unconfirmed").await;
+        assert!(
+            matches!(refused, Err(LaunchError::Overlap(_))),
+            "the folder is refused while the stop is unconfirmed: {:?}",
+            refused.map(|r| r.name().to_owned())
+        );
+        std::fs::remove_file(dir.join("fail-rm")).unwrap();
+        until(&x, "session.closed with no stop request", BOUND, || {
+            count(&x, "session.closed") > 0
+        })
+        .await;
+        assert!(!exists(&s.container));
+        assert_closed_last(&x, &s.id, "timeout");
+        let r = x
+            .launch(&v, "after-confirmed")
+            .await
+            .expect("control: the folder launches once the stop is confirmed");
+        x.stop(r).await;
+    });
+}
+
+/// Polls `done` every 100 ms until it holds; fails the test naming `what` after `bound`.
+async fn until(x: &Lx, what: &str, bound: Duration, mut done: impl FnMut() -> bool) {
+    let end = std::time::Instant::now() + bound;
+    while !done() {
+        x.assert_no_crash();
+        assert!(
+            std::time::Instant::now() < end,
+            "{what}: not within {bound:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }

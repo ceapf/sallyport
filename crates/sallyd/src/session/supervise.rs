@@ -14,7 +14,8 @@
 //!    flight get what is left of the same deadline, then the one `session.stop {reason,
 //!    in_flight}` is written, and every later write of the handle fails (an oplog line names
 //!    its session and event);
-//! 7. `Launcher::stop`, retried a bounded number of times;
+//! 7. `Launcher::stop`, in rounds of a bounded number of attempts, until the container is
+//!    confirmed gone (`retry_stop`);
 //! 8. once it succeeded (the container confirmed gone, the session released; its
 //!    `Confirmed` token): `session.closed {reason}`, the session's last entry, then its secrets
 //!    leave the logs' redactors (`Launcher::close`, #94, architect Q242, Q252); only then is
@@ -35,8 +36,10 @@
 //! bound is a file operation inside its blocking call, which is never cut: the stop then
 //! answers `Failed`, the session stays stop-failed with its claims and its watchdog, and the
 //! supervisor removes the container by itself once the operation returns (its `tool.result` is
-//! refused by the seal). A container that cannot be confirmed gone also stays stop-failed; a
-//! later request retries it.
+//! refused by the seal). A container that cannot be confirmed gone also stays stop-failed,
+//! whoever began the stop: `sandbox.stop_failed` is written once, and the supervisor retries by
+//! itself, its pauses backed off and capped, its rounds not, until the container is confirmed
+//! gone; a stop request meanwhile retries at once (RT-AUD-03).
 
 use std::time::Duration;
 
@@ -51,11 +54,11 @@ use crate::approvals::queue::Desk;
 use crate::daemon::crash::{Crash, CrashReceiver, CrashReporter};
 use crate::rpc::listen::Handle;
 use crate::rpc::record::Recorder;
-use crate::sandbox::{Confirmed, Running};
+use crate::sandbox::{Confirmed, Running, StopError};
 use crate::tools::ops::{Ops, STOP_DRAIN};
 
-/// `Launcher::stop` attempts per stop before the session is left stop-failed.
-const STOP_ATTEMPTS: u32 = 3;
+/// `Launcher::stop` attempts per round before the session is stop-failed until the next one.
+pub(super) const STOP_ATTEMPTS: u32 = 3;
 /// Pause between two `Launcher::stop` attempts.
 const STOP_RETRY: Duration = Duration::from_secs(2);
 
@@ -165,7 +168,7 @@ impl Registry {
         }
         // 7. A crash reported after the reason was chosen is not lost: `retry_stop` logs it
         // before the session's secrets leave the oplog's redactor.
-        self.retry_stop(sid, running, replies, requests, reason, Some(crashes))
+        self.retry_stop(sid, running, replies, requests, reason, Some(crashes), 0)
             .await;
     }
 
@@ -307,9 +310,19 @@ impl Registry {
         }
     }
 
-    /// `Launcher::stop` until the container is confirmed gone: bounded attempts, then
-    /// stop-failed, retried on each later request. Answers every request it has. `crashes`: a
-    /// supervised session's crash reports, logged before its secrets are released.
+    /// `Launcher::stop` until the container is confirmed gone, in rounds of at most
+    /// [`STOP_ATTEMPTS`] attempts. A round that ends unconfirmed sets the stop-failed state and
+    /// answers `Failed`; the next round starts at a stop request or after the launcher's pause
+    /// (`Launcher::stop_pause`: backed off and capped), whichever comes first, with no cap on
+    /// rounds. The first such round writes `sandbox.stop_failed`, whoever began the stop, before
+    /// the state is set and before any reply (RT-AUD-03).
+    /// `failed`: rounds that already failed (a failed start's discard ran one and wrote the
+    /// entry). Answers every request it has. `crashes`: a supervised session's crash reports,
+    /// logged before its secrets are released.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the supervisor's whole state, handed over once"
+    )]
     pub(super) async fn retry_stop(
         &self,
         sid: String,
@@ -318,10 +331,34 @@ impl Registry {
         mut requests: mpsc::Receiver<Request>,
         reason: StopReason,
         mut crashes: Option<CrashReceiver>,
+        failed: u32,
     ) {
         let mut running = running;
+        let mut failed = failed;
+        let mut open = true;
         loop {
-            match self.stop_bounded(running).await {
+            if failed > 0 {
+                let pause = self.p.launcher.stop_pause(failed);
+                tokio::select! {
+                    r = requests.recv(), if open => match r {
+                        Some((_, reply)) => {
+                            replies.extend(reply);
+                            // Requests queued meanwhile share this round.
+                            while let Ok((_, reply)) = requests.try_recv() {
+                                replies.extend(reply);
+                            }
+                        }
+                        // Unreachable while the registry holds the sender: the pauses alone
+                        // pace the rounds from here.
+                        None => {
+                            open = false;
+                            tokio::time::sleep(pause).await;
+                        }
+                    },
+                    () = tokio::time::sleep(pause) => {}
+                }
+            }
+            match self.stop_bounded(running, failed == 0).await {
                 Ok(done) => {
                     if let Some(c) = crashes.as_mut() {
                         // Before the release, so a payload is still redacted (architect Q228;
@@ -354,63 +391,69 @@ impl Registry {
                     }
                     return;
                 }
-                Err(r) => {
+                Err(e) => {
                     // No `session.closed` until a retry succeeds. TODO(#157): a stop that failed
-                    // only after the container was removed (the `sandbox.stop` append, the
-                    // scratch removal) is reported here as not confirmed gone, and its retry
-                    // writes a second `sandbox.stop`.
-                    running = *r;
+                    // only after the container was removed (the scratch removal) is reported here
+                    // as not confirmed gone.
+                    let StopError { running: r, error } = *e;
+                    if failed == 0 {
+                        self.p
+                            .launcher
+                            .audit_workspace_stop_failed(&r, STOP_ATTEMPTS, &error)
+                            .await;
+                    }
+                    failed = failed.saturating_add(1);
+                    running = r;
                     self.p.oplog.error(
                         LOG,
                         "session container not confirmed gone",
-                        &[("session", &sid)],
+                        &[("session", &sid), ("detail", &error.to_string())],
                     );
                     self.stop_failed(&sid);
                     let why = format!("the container of session {sid} could not be confirmed gone");
                     for r in replies.drain(..) {
                         let _ = r.send(StopOutcome::Failed(why.clone()));
                     }
-                    match requests.recv().await {
-                        Some((_, reply)) => {
-                            replies.extend(reply);
-                            // Requests queued meanwhile share this round (R5).
-                            while let Ok((_, reply)) = requests.try_recv() {
-                                replies.extend(reply);
-                            }
-                        }
-                        // Unreachable while the registry holds the sender; retry anyway.
-                        None => tokio::time::sleep(STOP_RETRY).await,
-                    }
                 }
             }
         }
     }
 
-    /// `Launcher::stop`, at most [`STOP_ATTEMPTS`] times; the token of the one that succeeded.
-    pub(super) async fn stop_bounded(&self, running: Running) -> Result<Confirmed, Box<Running>> {
+    /// `Launcher::stop`, at most [`STOP_ATTEMPTS`] times; the token of the one that succeeded,
+    /// or the handle back with the last attempt's error. Each failed attempt is an oplog warning
+    /// when `log_attempts` (a stop's first round only, so an unconfirmed stop that retries for
+    /// hours writes one error line per round, not four).
+    pub(super) async fn stop_bounded(
+        &self,
+        running: Running,
+        log_attempts: bool,
+    ) -> Result<Confirmed, Box<StopError>> {
         let mut r = running;
-        for attempt in 1..=STOP_ATTEMPTS {
-            match self.p.launcher.stop(r).await {
+        let mut attempt = 1;
+        loop {
+            let e = match self.p.launcher.stop(r).await {
                 Ok(done) => return Ok(done),
-                Err(e) => {
-                    let detail = e.error.to_string();
-                    self.p.oplog.warn(
-                        LOG,
-                        "workspace stop failed",
-                        &[
-                            ("session", e.running.paths().id().as_str()),
-                            ("attempt", &attempt.to_string()),
-                            ("detail", &detail),
-                        ],
-                    );
-                    r = e.running;
-                }
+                Err(e) => e,
+            };
+            if log_attempts {
+                let detail = e.error.to_string();
+                self.p.oplog.warn(
+                    LOG,
+                    "workspace stop failed",
+                    &[
+                        ("session", e.running.paths().id().as_str()),
+                        ("attempt", &attempt.to_string()),
+                        ("detail", &detail),
+                    ],
+                );
             }
-            if attempt < STOP_ATTEMPTS {
-                tokio::time::sleep(STOP_RETRY).await;
+            if attempt >= STOP_ATTEMPTS {
+                return Err(e);
             }
+            attempt += 1;
+            r = e.running;
+            tokio::time::sleep(STOP_RETRY).await;
         }
-        Err(Box::new(r))
     }
 
     /// Q47: the oplog line, then `session.crash`. A failed append still ends the session.
