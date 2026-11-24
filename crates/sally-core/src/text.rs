@@ -66,6 +66,51 @@ pub fn escape_backslash_quoted(raw: &[u8]) -> String {
     out
 }
 
+/// Equal units in a row up to which [`escape_runs_backslash_quoted`] writes each one (RT-AG-04).
+pub const RUN_SHOWN_WHOLE: usize = 16;
+
+/// [`escape_backslash_quoted`], with every run of more than [`RUN_SHOWN_WHOLE`] equal units
+/// written as the unit once and then `\{N}`, `N` the run's whole length in units (RT-AG-04). A
+/// unit is one character, or one byte that is not UTF-8; a run is taken whole, never split into
+/// two marks. A `\` the input holds is always `\\`, so `\{` comes only from here. For the text
+/// an approval prompt shows; the audit, the summary and the launch gate never use it.
+#[must_use]
+pub fn escape_runs_backslash_quoted(raw: &[u8]) -> String {
+    let mut out = String::with_capacity(raw.len().min(RUN_MARKED_CAPACITY));
+    let mut run: Option<(String, usize)> = None;
+    for piece in pieces(raw, Quote::Backslash) {
+        match &mut run {
+            Some((unit, n)) if *unit == piece.text => *n = n.saturating_add(1),
+            _ => {
+                if let Some((unit, n)) = run.take() {
+                    push_run(&unit, n, &mut out);
+                }
+                run = Some((piece.text, 1));
+            }
+        }
+    }
+    if let Some((unit, n)) = run {
+        push_run(&unit, n, &mut out);
+    }
+    out
+}
+
+/// What [`escape_runs_backslash_quoted`] reserves up front: a marked run can be far shorter than
+/// its input.
+const RUN_MARKED_CAPACITY: usize = 4096;
+
+/// `n` units of `unit`: each written when `n` is at most [`RUN_SHOWN_WHOLE`], else once and
+/// marked.
+fn push_run(unit: &str, n: usize, out: &mut String) {
+    if n > RUN_SHOWN_WHOLE {
+        let _ = write!(out, "{unit}\\{{{n}}}");
+    } else {
+        for _ in 0..n {
+            out.push_str(unit);
+        }
+    }
+}
+
 /// A host path between double quotes, from its bytes: [`escape_backslash_quoted`], so a byte
 /// that is not UTF-8 is `\xNN` (RT-MAN-05). Every line that names a folder uses this form, so
 /// the lines read alike, and a folder name holding `, ` or ` (at ` stays one name.
@@ -366,25 +411,9 @@ pub fn cut_escaped(text: &str, max: usize) -> (String, bool) {
 /// The largest offset at most `max` that does not fall inside a `\…` escape or a character of
 /// `text`.
 pub(crate) fn escape_boundary(text: &str, max: usize) -> usize {
-    let bytes = text.as_bytes();
     let mut i = 0usize;
-    while let Some(&b) = bytes.get(i) {
-        let len = match (b, bytes.get(i.saturating_add(1))) {
-            (b'\\', Some(b'x')) => 4,
-            (b'\\', Some(b'u')) => text
-                .get(i..)
-                .and_then(|r| r.find('}'))
-                .map_or(1, |e| e.saturating_add(1)),
-            (b'\\', Some(_)) => 2,
-            // One whole character. A literal piece is meant to be printable ASCII but is never
-            // escaped, so a stray character outside ASCII is not split here (a `\` just before it
-            // in the literal is still read as an escape's start).
-            _ => text
-                .get(i..)
-                .and_then(|r| r.chars().next())
-                .map_or(1, char::len_utf8),
-        };
-        let next = i.saturating_add(len);
+    while i < text.len() {
+        let next = i.saturating_add(unit_len(text, i));
         if next > max {
             break;
         }
@@ -392,6 +421,66 @@ pub(crate) fn escape_boundary(text: &str, max: usize) -> usize {
     }
     i
 }
+
+/// The length of the unit of escaped `text` at byte `i` (at least 1): one escape or one
+/// character, together with the run mark `\{N}` that follows it, if one does, so nothing splits
+/// a unit from its mark.
+fn unit_len(text: &str, i: usize) -> usize {
+    let len = escape_len(text, i);
+    let next = i.saturating_add(len);
+    match text.get(next..) {
+        Some(rest) if rest.starts_with("\\{") => {
+            len.saturating_add(rest.find('}').map_or(rest.len(), |e| e.saturating_add(1)))
+        }
+        _ => len,
+    }
+}
+
+/// The length of the escape or the character of escaped `text` at byte `i` (at least 1).
+fn escape_len(text: &str, i: usize) -> usize {
+    let bytes = text.as_bytes();
+    match (bytes.get(i), bytes.get(i.saturating_add(1))) {
+        (Some(b'\\'), Some(b'x')) => 4,
+        (Some(b'\\'), Some(b'u' | b'{')) => text
+            .get(i..)
+            .and_then(|r| r.find('}'))
+            .map_or(1, |e| e.saturating_add(1)),
+        (Some(b'\\'), Some(_)) => 2,
+        // One whole character. A literal piece is meant to be printable ASCII but is never
+        // escaped, so a stray character outside ASCII is not split here (a `\` just before it
+        // in the literal is still read as an escape's start).
+        _ => text
+            .get(i..)
+            .and_then(|r| r.chars().next())
+            .map_or(1, char::len_utf8),
+    }
+}
+
+/// Escaped `text` broken into rows of at most `width` bytes, never inside a unit (an escape or
+/// a character with its run mark, see [`escape_runs_backslash_quoted`]): the rows put together
+/// are `text`. A unit longer than `width` is a row of its own, so a caller keeps `width` at
+/// least [`LONGEST_UNIT`]. No row is empty; empty `text` has no rows.
+#[must_use]
+pub fn escaped_rows(text: &str, width: usize) -> Vec<&str> {
+    let mut rows = Vec::new();
+    let (mut start, mut i) = (0usize, 0usize);
+    while i < text.len() {
+        let next = i.saturating_add(unit_len(text, i));
+        if next.saturating_sub(start) > width && i > start {
+            rows.push(text.get(start..i).unwrap_or_default());
+            start = i;
+        }
+        i = next;
+    }
+    if start < text.len() {
+        rows.push(text.get(start..).unwrap_or_default());
+    }
+    rows
+}
+
+/// The longest unit [`escaped_rows`] keeps whole: `\u{10ffff}` and a run mark of the largest
+/// count, `\{18446744073709551615}`.
+pub const LONGEST_UNIT: usize = LONGEST_ESCAPE + 3 + 20;
 
 fn sha256_hex(data: &[u8]) -> String {
     let mut out = String::with_capacity(64);
@@ -601,6 +690,10 @@ fn push_unquoted(c: char, out: &mut String) {
 #[cfg(test)]
 #[path = "text_shown_tests.rs"]
 mod shown_tests;
+
+#[cfg(test)]
+#[path = "text_runs_tests.rs"]
+mod runs_tests;
 
 #[cfg(test)]
 #[path = "text_tests.rs"]
