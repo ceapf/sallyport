@@ -51,7 +51,7 @@ fn next_fetch_stops_when_complete() {
 
 /// Hosts: huggingface.co, hf.co and their subdomains on a label boundary; nothing else.
 #[test]
-fn redirect_hosts_are_hub_domains_on_a_label_boundary() {
+fn rt_mdl_11_redirect_hosts_are_hub_domains_on_a_label_boundary() {
     for ok in [
         "huggingface.co",
         "hf.co",
@@ -85,7 +85,7 @@ fn redirect_hosts_are_hub_domains_on_a_label_boundary() {
 /// An absolute https redirect to a Hub host is followed; the token goes only to
 /// huggingface.co itself; the range is kept.
 #[test]
-fn absolute_redirects_to_hub_hosts_are_followed() {
+fn rt_mdl_11_absolute_redirects_to_hub_hosts_are_followed() {
     let next = redirect(
         &file(5),
         "https://cdn-lfs.hf.co/repos/x/y?X-Amz=1&sig=a%2Fb",
@@ -145,7 +145,7 @@ fn relative_redirects_stay_on_the_host() {
 /// Anything else is refused: http, another port, userinfo, an IP literal, another domain, a
 /// scheme-relative or bare-relative location, a fragment, spaces, controls, or overlong.
 #[test]
-fn other_redirects_are_refused() {
+fn rt_mdl_11_other_redirects_are_refused() {
     for bad in [
         "",
         "http://cdn-lfs.hf.co/a",

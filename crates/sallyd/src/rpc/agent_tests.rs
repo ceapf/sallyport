@@ -938,7 +938,7 @@ async fn stop_ends_the_connection() {
 }
 
 #[tokio::test]
-async fn a_peer_with_another_uid_is_refused_and_recorded() {
+async fn rt_ag_19_a_peer_with_another_uid_is_refused_and_recorded() {
     let dir = std::env::temp_dir().join(format!("sp-agent-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir(&dir).unwrap();

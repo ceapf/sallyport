@@ -199,7 +199,7 @@ fn redirects_are_bounded_and_checked() {
 /// off the API host, whether its answer is a redirect on its own host or a body. Control: a
 /// relative Location and an absolute one on the API host (any case) are followed, with the token.
 #[test]
-fn a_list_redirect_off_the_api_host_is_refused() {
+fn rt_mdl_11_a_list_redirect_off_the_api_host_is_refused() {
     for off in [
         "https://cdn-lfs.hf.co/api/models/a/b/revision/main?blobs=true",
         "https://hf.co/x",

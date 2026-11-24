@@ -23,13 +23,14 @@
 //! or deleted; a refusal is `permission`, whether or not anything lies deeper. A file's last
 //! component is first reached `O_PATH`, checked regular and judged on that fd; only then is the
 //! same inode opened for I/O through `/proc/self/fd`, so a FIFO or device is never opened, read
-//! from or written to. That open is `O_NONBLOCK`, so a file another process holds a lease on
-//! fails at once instead of stalling the call (ruling Q40). An existing file is truncated by that
-//! open (`O_TRUNC`), after the checks, so a `staged` mount's lower file is never copied up with
-//! its data; a new one is created `O_EXCL`, so the case judged is the case that happened. On
-//! `brokered` mounts a regular file with more than one link is refused (`hard-link`): the broker
-//! would write through to a file outside the mount. Every check is repeated at run time from the
-//! pinned root (the window between prepare and run can last `approvals.timeout`).
+//! from or written to (RT-FS-21). That open is `O_NONBLOCK`, so a file another process holds a
+//! lease on fails at once instead of stalling the call (ruling Q40, RT-FS-23). An existing file
+//! is truncated by that open (`O_TRUNC`), after the checks, so a `staged` mount's lower file is
+//! never copied up with its data; a new one is created `O_EXCL`, so the case judged is the case
+//! that happened. On `brokered` mounts a regular file with more than one link is refused
+//! (`hard-link`, RT-FS-20): the broker would write through to a file outside the mount. Every
+//! check is repeated at run time from the pinned root (the window between prepare and run can
+//! last `approvals.timeout`; RT-FS-22).
 //!
 //! A write is held to the session's free-space floor (`sandbox::disk`) on the filesystem its
 //! parent directory is on, before it has any effect ([`write`]); a delete frees space and never is.
