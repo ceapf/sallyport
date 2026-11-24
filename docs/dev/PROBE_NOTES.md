@@ -195,6 +195,10 @@ line per fact, with where it was found. Check a note again before relying on it 
   watchdog freezes one) is killed at its deadline too, and the `--rm` cleanup then removes it
   with no podman process left running. Q60 assumed the clock starts at `start`; it starts at
   `init`. (#92, Q60, Q194)
+- Podman 4.9.3 rootless (cgroup v2), idle host: `podman rm --force --time 0 <id>` of a container
+  frozen with `podman pause` removes it, exit 0, without unpausing (not checked on cgroup v1).
+  A removal can fail on a frozen container on a loaded host (a process outlives podman's wait;
+  not measured), so the sweep's paused-orphan test injects the failure.
 - A rootless podman whose `XDG_RUNTIME_DIR` has no `bus` socket (the daemon tests' private
   runtime directory) warns "no systemd user session" and falls back to cgroupfs; its OCI config
   then has no `linux.cgroupsPath`, which the launcher's config check refuses

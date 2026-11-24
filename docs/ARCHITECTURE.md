@@ -297,7 +297,11 @@ failure audits `sandbox.refuse` (or `sandbox.mount_mismatch`) with a reason and 
 outcome. It removes the container by its name `sp-ws-<id>`, even when `create` printed no id,
 and removes only the directories this launch created: an id whose directories exist is refused
 before anything is created, so a stopped session's kept `stage/` is never touched. The claims
-are released only once the container is confirmed gone.
+are released only once the cleanup has finished, which needs the container confirmed gone. A
+cleanup that fails is retried in its own task, backed off and capped (ten tries, pauses 2 s
+doubling to 60 s); it ends with `sandbox.cleaned` (then the claims are released) or, when the
+probe or container is still not confirmed gone at the tenth try, `sandbox.cleanup_abandoned`,
+and the claims are held until `sallyd` exits.
 
 0. **Image** (architect Q58). The workspace image is resolved first: the manifest's
    `runtime.image`, else the bundled default. While no bundled image is installed (#88) the
@@ -315,7 +319,9 @@ are released only once the container is confirmed gone.
    previous `sallyd` of this installation left running (audited `sandbox.orphan_removed` with
    the name, the full ID it removes by, and `sweep: startup`); `sallyd` calls it before it accepts the first launch, then every 60 s
    (`sweep: periodic`, architect Q61): a `podman create` a killed `sallyd` left running can make
-   its container after the startup sweep. A container is removed only if it carries this
+   its container after the startup sweep. Each removal is one `podman rm` by full ID and an
+   existence check, never `unpause`; a failure is audited `sandbox.orphan_remove_failed` and the
+   sweep goes on to the others, then fails. A container is removed only if it carries this
    installation's label (`sallyport.installation`, a UUID v4 kept 0600 as `installation` in
    the state directory, created once under the single-instance lock, crash-safe (written and
    synced as `installation.new`, linked into place, which never replaces anything, directory
@@ -1223,13 +1229,18 @@ down meanwhile, the container outlives it with no watchdog until the next start'
 `podman init` (#92): a bound from `init`, not from the stop. A container that cannot be
 confirmed gone, whether its session started or not, also leaves the session listed as
 stop-failed. It keeps its claims and its disk watchdog until a later stop succeeds. At
-shutdown, which stops every session at once, it makes `sallyd` exit non-zero. The exception is
-a launch that failed and whose cleanup failed: it was never registered as a session (a harness
-launch's session was, but not the harness), so nothing lists it stop-failed and no disk watchdog
-watches it; it keeps its claims (a workspace's until `sallyd` exits, so no periodic sweep takes
-its container), and shutdown reports a clean stop with it left (THREAT_MODEL.md §6;
-TODO(#239)). A failed `session.start` append is followed by a best-effort `session.stop`
-(`start-failed`), since the entry may have reached the log.
+shutdown, which stops every session at once, it makes `sallyd` exit non-zero. A launch that
+failed was never registered as a session (a harness launch's session was, but not the harness),
+so nothing lists it stop-failed and no disk watchdog watches its container. Its cleanup is
+retried in its own task, backed off and capped (ten tries): the launch's claims are released when
+the cleanup finishes. After `sandbox.cleanup_abandoned` a workspace launch's claims are held until
+`sallyd` exits, so no periodic sweep takes its container; a harness launch's claim goes when its
+session stops, and the periodic sweep then takes its container. Shutdown does not wait for such
+a cleanup; while one has not confirmed its container gone (retrying or abandoned), `sallyd`
+exits non-zero naming it. Directories its cleanup could not remove stay: the next start's
+stale-state step removes a workspace launch's socket directory, and nothing removes the rest
+(THREAT_MODEL.md §6; TODO(#239)). A failed `session.start` append is followed by a best-effort
+`session.stop` (`start-failed`), since the entry may have reached the log.
 
 ## 6. Repository structure
 
