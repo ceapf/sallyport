@@ -510,14 +510,33 @@ mod tests {
         let whole = Prompt {
             id: "p".into(),
             session: "s1".into(),
+            call: 3,
             digest: "d".into(),
+            action: "a".into(),
             truncated: false,
-            text: "t".into(),
+            note: None,
+            risk_tags: vec![],
             full: None,
             full_unavailable: false,
         };
         let v = to_value(&whole).unwrap();
         assert!(v.get("full").is_none() && v.get("full_unavailable").is_none());
+        assert!(v.get("note").is_none() && v.get("risk_tags").is_none());
+        assert_eq!(
+            (v["call"].as_u64(), v["action"].as_str()),
+            (Some(3), Some("a"))
+        );
+        assert!(v.get("text").is_none());
+        let noted = Prompt {
+            note: Some("n".into()),
+            risk_tags: vec!["destructive".into()],
+            ..whole.clone()
+        };
+        let v = to_value(&noted).unwrap();
+        assert_eq!(
+            (v["note"].as_str(), v["risk_tags"][0].as_str()),
+            (Some("n"), Some("destructive"))
+        );
         let deny_only = Prompt {
             truncated: true,
             full_unavailable: true,

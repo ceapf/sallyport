@@ -487,3 +487,7 @@ fn decide(c: &mut Client, p: &Prompt, a: Answer, full_shown: bool) -> Result<(),
 #[cfg(test)]
 #[path = "approve_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "approve_layout_tests.rs"]
+mod layout_tests;
