@@ -112,8 +112,8 @@ fn unregistering_twice_or_an_unknown_id_changes_nothing() {
 }
 
 /// Architect Q220: concurrent changes end with the exact union, in every target, one swap per
-/// change. That the swap runs under the lock is covered by reading: a swap moved outside it
-/// fails this test only when a stale union happens to land last.
+/// change. A swap moved outside the lock fails this test only when a stale union happens to
+/// land last; `a_change_waits_for_a_swap_in_progress` holds that the swap runs under it.
 #[test]
 fn concurrent_changes_end_with_the_exact_union() {
     let (a, b, r) = two();
@@ -151,6 +151,75 @@ fn concurrent_changes_end_with_the_exact_union() {
     }
     // One swap per change, in each target.
     assert_eq!(a.1.load(Ordering::SeqCst), 24);
+}
+
+/// A target whose first swap parks until released; it counts every swap that began.
+struct Parked {
+    latest: Latest,
+    began: AtomicUsize,
+    entered: Mutex<std::sync::mpsc::Sender<()>>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl RedactorTarget for Parked {
+    fn set_redactor(&self, redactor: Redactor) {
+        if self.began.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.entered.lock().unwrap().send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+        }
+        self.latest.set_redactor(redactor);
+    }
+}
+
+/// Architect Q220: the swap runs under the lock. While one `register` is parked in its swap, a
+/// second on another thread does not reach its own; released, each target's last redactor is
+/// the union of both.
+#[test]
+fn a_change_waits_for_a_swap_in_progress() {
+    let (entered_tx, entered) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let gate = Arc::new(Parked {
+        latest: Latest::default(),
+        began: AtomicUsize::new(0),
+        entered: Mutex::new(entered_tx),
+        release: Mutex::new(release_rx),
+    });
+    let other = Arc::new(Latest::default());
+    let r = Arc::new(Redactors::new(vec![
+        Arc::clone(&other) as Arc<dyn RedactorTarget>,
+        Arc::clone(&gate) as Arc<dyn RedactorTarget>,
+    ]));
+    let (v1, v2) = (value("first"), value("second"));
+    let first = {
+        let (r, v) = (Arc::clone(&r), v1.clone());
+        std::thread::spawn(move || r.register("s1", forms("N1", &v)))
+    };
+    entered
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the first swap began");
+    let (started_tx, started) = std::sync::mpsc::channel();
+    let second = {
+        let (r, v) = (Arc::clone(&r), v2.clone());
+        std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            r.register("s2", forms("N2", &v));
+        })
+    };
+    started.recv().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert_eq!(
+        gate.began.load(Ordering::SeqCst),
+        1,
+        "a second swap began while the first was parked"
+    );
+    release.send(()).unwrap();
+    first.join().unwrap();
+    second.join().unwrap();
+    assert_eq!(gate.began.load(Ordering::SeqCst), 2);
+    for (t, name) in [(&*other, "other"), (&gate.latest, "gate")] {
+        assert_eq!(t.redact(&v1), "[REDACTED:N1]", "{name}");
+        assert_eq!(t.redact(&v2), "[REDACTED:N2]", "{name}");
+    }
 }
 
 #[test]

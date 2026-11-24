@@ -322,6 +322,44 @@ fn no_control_method_resolves_on_the_session_table() {
     for m in SESSION_METHODS {
         assert!(!families.iter().any(|f| m.starts_with(f)), "{m}");
     }
+    // The classifiers themselves, not only the constant: every control name and every family
+    // (a bare prefix and one name under it) is method-not-found to both, in both lifecycles.
+    let empty = Map::new();
+    let probes = CONTROL_METHODS.iter().map(|m| (*m).to_owned()).chain(
+        families
+            .iter()
+            .flat_map(|f| [(*f).to_owned(), format!("{f}list")]),
+    );
+    for m in probes {
+        for legacy in [false, true] {
+            assert_eq!(
+                classify(&m, &with_meta(json!({})), legacy).err(),
+                Some(Refusal::MethodNotFound),
+                "{m} legacy={legacy}"
+            );
+            assert_eq!(
+                classify(&m, &empty, legacy).err(),
+                Some(Refusal::MethodNotFound),
+                "{m} legacy={legacy}"
+            );
+            assert_eq!(
+                classify_note(&m, &empty, legacy).err(),
+                Some(Refusal::MethodNotFound),
+                "{m} legacy={legacy}"
+            );
+        }
+    }
+    // The constant and the code cannot drift: each name in the table is known to a classifier.
+    for m in SESSION_METHODS {
+        let known = [false, true].into_iter().any(|legacy| {
+            classify(m, &empty, legacy).err() != Some(Refusal::MethodNotFound)
+                || classify_note(m, &empty, legacy).err() != Some(Refusal::MethodNotFound)
+        });
+        assert!(
+            known,
+            "{m} is in SESSION_METHODS but no classifier knows it"
+        );
+    }
 }
 
 #[test]

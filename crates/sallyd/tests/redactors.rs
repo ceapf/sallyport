@@ -172,6 +172,61 @@ fn a_crash_reported_during_a_stop_is_logged_redacted() {
     });
 }
 
+/// Architect Q228: a crash a session task reports after the stop's late-crash check, while
+/// `session.closed` is still being written, is logged only after the session's secrets are
+/// released, so its payload is withheld whole: the oplog line names the task and says
+/// `withheld`, and holds no byte of the message. Control: the session is still registered
+/// when the crash is reported.
+#[test]
+fn a_crash_reported_after_the_release_check_is_logged_withheld() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let reg = x.registry_logged(
+            x.events.clone() as Arc<dyn AuditSink>,
+            Some(test_image()),
+            x.oplog.clone(),
+        );
+        let gh = canary("GITHUB_TOKEN");
+        let a = reg.start(manifest(&x, ONE)).await.unwrap();
+        let reporter = reg.reporter(&a.id).expect("a live session's reporter");
+        let _unhold = x.events.held(&["session.closed"]);
+        let stopping = {
+            let (reg, id) = (Arc::clone(&reg), a.id.clone());
+            tokio::spawn(async move { reg.stop(&id, StopReason::Request).await })
+        };
+        x.events.until_parked("session.closed", 1).await;
+        let payload = format!("late {gh}");
+        let panicked = tokio::spawn(async move { panic!("{payload}") })
+            .await
+            .unwrap_err();
+        reporter.joined("tool", panicked);
+        assert_eq!(
+            x.redactors.sessions(),
+            std::slice::from_ref(&a.id),
+            "control: registered when the crash is reported"
+        );
+        x.events.hold(&[]);
+        tokio::time::timeout(BOUND, stopping)
+            .await
+            .expect("the stop ends")
+            .unwrap()
+            .unwrap();
+        assert!(x.redactors.sessions().is_empty(), "released");
+        assert!(x.oplog.flush(BOUND));
+        let text = x.oplog_lines.text();
+        let lines: Vec<&str> = text.lines().filter(|l| l.contains(PANICKED)).collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        assert!(
+            lines[0].contains("tool") && lines[0].contains("withheld"),
+            "{}",
+            lines[0]
+        );
+        assert!(!lines[0].contains("late"), "{}", lines[0]);
+        assert!(!lines[0].contains("REDACTED"), "{}", lines[0]);
+        assert!(!text.contains(&gh), "{text}");
+    });
+}
+
 /// A start that fails after its workspace launched (here: `session.start` cannot be written)
 /// keeps the values redacted until the workspace's `sandbox.stop`, then releases them (Rust
 /// review M2: the registry's `discard`).

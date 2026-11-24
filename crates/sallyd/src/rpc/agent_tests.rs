@@ -879,20 +879,15 @@ async fn the_rate_is_shared_by_a_sessions_connections() {
 /// request on A's socket naming B's session id, in params, `_meta` or an extra member, reaches
 /// only A's handler, and every entry carries A's id. Nothing here routes by session id, so the
 /// controls this pins are the envelope's member check (message 3), `tools/call`'s parameter
-/// check (message 2) and the recorder's session stamping; B's server is built but not served.
-/// The same requests through the session registry with B live: `tests/session.rs`.
+/// check (message 2) and the recorder's session stamping. Only A exists here, so what B's
+/// handler saw and which entries carry B's id are asserted where B is live: the same requests
+/// through the session registry, `tests/session.rs`.
 #[tokio::test]
 async fn rt_ag_08_a_foreign_session_id_reaches_only_its_own_session() {
     let (sink, rec_a) = recorder("sess-a");
-    let rec_b = Recorder::new(
-        Arc::clone(&sink) as Arc<dyn crate::sandbox::AuditSink>,
-        "sess-b".into(),
-        sally_core::manifest::AuditLevel::Full,
-    );
-    let (fa, fb) = (Arc::new(Fake::default()), Arc::new(Fake::default()));
+    let fa = Arc::new(Fake::default());
     let crash = CrashReporter::channel().0;
-    let a = Arc::new(Agent::new(Arc::clone(&fa), rec_a, crash.clone()));
-    let _b = Arc::new(Agent::new(Arc::clone(&fb), rec_b, crash));
+    let a = Arc::new(Agent::new(Arc::clone(&fa), rec_a, crash));
     let mut c = start(&a);
     let mut m = meta();
     m["session"] = json!("sess-b");
@@ -913,14 +908,12 @@ async fn rt_ag_08_a_foreign_session_id_reaches_only_its_own_session() {
         1,
         "only the first is a valid call"
     );
-    assert_eq!(fb.calls.load(Ordering::SeqCst), 0);
     let rows = sink.rows();
     assert_eq!(rows.len(), 3);
     assert!(
         rows.iter()
             .all(|r| r.debug.contains("session: Some(\"sess-a\")"))
     );
-    assert!(!rows.iter().any(|r| r.debug.contains("Some(\"sess-b\")")));
 }
 
 #[tokio::test]

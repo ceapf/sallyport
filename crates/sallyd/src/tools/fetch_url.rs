@@ -191,17 +191,20 @@ mod tests {
 
     #[test]
     fn the_canonical_form_parses_to_itself() {
+        // Each URL must parse: a parser that refused them all would pass a loop that skips
+        // refusals. The ticket binds the canonical form and the run parses it again (SI-5).
         for url in [
             "https://a.mock.test",
             "HTTPS://A.mock.test.:443/x",
             "https://a.mock.test:8443?q=1",
-            "https://a.mock.test/%41/b?c#",
         ] {
-            let Ok(u) = parse(url) else { continue };
+            let u = parse(url).unwrap_or_else(|e| panic!("{url}: {e:?}"));
             let c = u.canonical();
             assert_eq!(parse(&c), Ok(u), "{url}");
             assert_eq!(parse(&c).unwrap().canonical(), c, "{url}");
         }
+        // A fragment is refused, so it has no canonical form.
+        assert!(parse("https://a.mock.test/%41/b?c#").is_err());
     }
 
     #[test]
