@@ -9,7 +9,10 @@
 //! escaped to printable ASCII by the shared [`crate::text`] alphabet before it is placed in a line,
 //! so no text can add a line, drive a terminal or hide behind a direction mark. A list a reader
 //! could misjoin is quoted item by item (globs, MCP arguments, the injection header and format),
-//! and a cut is marked outside the quoted text. Each setting that differs from its default, where
+//! and a cut is marked outside the quoted text. Realpaths are quoted from their bytes
+//! ([`text::quoted_path`]), in every line that names one, the `[data-can-leave]` line included.
+//! An escape here shows a character; whether a launch may show it is the CLI gate's check
+//! ([`text::refused_escape`]). Each setting that differs from its default, where
 //! that can widen what the session may do, gets a line naming the default.
 //! The manifest's `description` is not shown; if it ever is, it is one line through the same
 //! escape, its newlines and tabs included.
@@ -55,10 +58,10 @@ pub fn summary(v: &ValidatedManifest) -> String {
     let mut out = String::new();
     // TODO(#196): the summary does not mask token-shaped names the way diagnostics do.
     if let Some(finding) = data_can_leave(m, v.mounts(), v.egress()) {
-        // TODO(#323): the finding is built with Path::display(), so a realpath byte that is not
-        // UTF-8 shows here as \u{fffd}; the mount's own line shows it as \xNN.
+        // Printable ASCII where it is built: realpaths quoted from their bytes, as in the mount
+        // lines; every other name in it passed a check that keeps it to ASCII (RT-MAN-05).
         out.push_str("[data-can-leave] ");
-        out.push_str(&bare(&finding));
+        out.push_str(&finding);
         out.push('\n');
     }
     if let Some(line) = direct_write_line(v.mounts()) {
@@ -84,9 +87,10 @@ fn quoted(s: &str) -> String {
     format!("\"{}\"", text::escape_backslash_quoted(s.as_bytes()))
 }
 
-/// A host realpath, escaped from its bytes (RT-MAN-05).
+/// A host realpath, quoted and escaped from its bytes, as the `[data-can-leave]` line and the
+/// warning show it (RT-MAN-05).
 fn path(p: &Path) -> String {
-    text::escape(p.as_os_str().as_bytes())
+    text::quoted_path(p.as_os_str().as_bytes())
 }
 
 /// AMENDMENTS-02 B2(b): `rw` stays, with a warning that names the folders and the alternative.
@@ -121,8 +125,6 @@ fn model_line(m: &Manifest) -> String {
     }
 }
 
-// TODO(#322): realpaths are shown escaped but not quoted, so a folder name holding ", " or
-// " (at " can read as two folders or as a guest path.
 fn file_lines(m: &Manifest, mounts: &[ResolvedMount]) -> Vec<String> {
     if mounts.is_empty() {
         return vec!["sees no host files.".into()];

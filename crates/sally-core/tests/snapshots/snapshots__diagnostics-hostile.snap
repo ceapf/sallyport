@@ -1,6 +1,5 @@
 ---
 source: crates/sally-core/tests/snapshots.rs
-assertion_line: 52
 expression: "text.join(\"\\n\")"
 ---
 error: filesystem.mounts[0].host: "~/.ssh" is inside $ROOT/home/.ssh: credential folders are never mountable (denylisted) [denylisted]
@@ -14,4 +13,4 @@ error: tools.mcp[0].env.LD_PRELOAD: "LD_PRELOAD" changes how the workspace loads
 error: tools.mcp[0].env.OPENAI_API_KEY: "OPENAI_API_KEY" is a secret-like env name; grant secrets via `secrets:` injection, never env [secret-like-env]
 error: tools.acknowledge_unapproved: shell: allow with destructive_requires_approval: false runs every command without approval; add "shell" to tools.acknowledge_unapproved to accept this [unacknowledged-risk]
 warning: tools.shell: "allow": shell commands run without approval at all (destructive_requires_approval is false) [risky]
-warning: network.allow: Anything this agent reads ($ROOT/home/code/myproject and whatever the secret at secrets[0] unlocks) can be sent to any public hostname. [data-can-leave]
+warning: network.allow: Anything this agent reads ("$ROOT/home/code/myproject" and whatever the secret at secrets[0] unlocks) can be sent to any public hostname. [data-can-leave]

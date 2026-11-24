@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use crate::text;
+
 /// Stable, documented diagnostic codes (MANIFEST_SPEC §4). Tests and the UI match on these,
 /// never on message text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -193,12 +195,25 @@ fn flattened(s: &str) -> String {
 }
 
 /// At most [`MAX_TEXT`] characters, a cut one ending in [`CUT`]. Runs last, after every mask.
+///
+/// The cut never falls inside an escape the text holds (the `[data-can-leave]` finding quotes
+/// realpaths escaped), so what is kept still reads as whole escapes (RT-MAN-05): it backs off to
+/// the escape's start. A back-off of [`text::LONGEST_ESCAPE`] bytes or more means the `\` there
+/// starts no escape (raw text), and the character cut stands.
 fn bounded(s: String) -> String {
     if s.chars().nth(MAX_TEXT).is_none() {
         return s;
     }
     let keep = MAX_TEXT.saturating_sub(CUT.chars().count());
-    let mut cut: String = s.chars().take(keep).collect();
+    let at = s.char_indices().nth(keep).map_or(s.len(), |(i, _)| i);
+    let back = text::escape_boundary(&s, at);
+    // `back` is a character's edge whenever `at` is one; the check is defensive only.
+    let end = if at.saturating_sub(back) < text::LONGEST_ESCAPE && s.is_char_boundary(back) {
+        back
+    } else {
+        at
+    };
+    let mut cut = s.get(..end).unwrap_or_default().to_owned();
     cut.push_str(CUT);
     cut
 }
@@ -405,6 +420,62 @@ mod tests {
         let s = scrub(&format!("{}\"{token}\" tail", "a ".repeat(140)));
         assert!(s.chars().count() <= MAX_TEXT, "{s}");
         assert!(!s.contains("k9k9k9"), "{s}");
+    }
+
+    /// RT-MAN-05: a cut that would fall inside an escape the text holds backs off to the escape's
+    /// start, at each offset inside it, so the kept text still reads as whole escapes; an escape
+    /// that fits before the cut is kept whole. Two forms: `\u{4e2d}` and `\\`.
+    #[test]
+    fn the_cut_never_falls_inside_an_escape() {
+        let at = MAX_TEXT - CUT.len();
+        for escape in ["\\u{4e2d}", "\\\\"] {
+            for k in at - escape.len()..=at {
+                let s = bounded(format!("{}{escape}{}", "a".repeat(k), "b".repeat(400)));
+                assert!(s.chars().count() <= MAX_TEXT, "{k}: {s}");
+                let kept = s.strip_suffix(CUT).unwrap_or_default();
+                let whole = k + escape.len() <= at;
+                let expected = if whole {
+                    format!(
+                        "{}{escape}{}",
+                        "a".repeat(k),
+                        "b".repeat(at - k - escape.len())
+                    )
+                } else {
+                    "a".repeat(k)
+                };
+                assert_eq!(kept, expected, "{escape} at {k}");
+                assert_eq!(text::refused_escape(kept), None, "{escape} at {k}");
+            }
+        }
+    }
+
+    /// A `\u` that starts no escape (raw text, its `}` far away) never makes the cut back off more
+    /// than one escape's length: a back-off of 10 bytes or more keeps the character cut. At 9 it
+    /// backs off; at 10 it does not.
+    #[test]
+    fn a_backslash_that_starts_no_escape_keeps_the_character_cut() {
+        let at = MAX_TEXT - CUT.len();
+        for (back, backs_off) in [(9, true), (10, false), (40, false)] {
+            let s = bounded(format!(
+                "{}\\u{}{}",
+                "a".repeat(at - back),
+                "c".repeat(400),
+                "}"
+            ));
+            let kept = s.strip_suffix(CUT).unwrap_or_default();
+            let expected = if backs_off { at - back } else { at };
+            assert_eq!(kept.len(), expected, "{back}: {s}");
+        }
+        // A raw `\x` before a multi-byte character, at each place around the cut: the kept text
+        // ends on a character's edge, within the bound.
+        for k in at - 4..=at {
+            let s = bounded(format!("{}\\x\u{4e2d}{}", "a".repeat(k), "c".repeat(400)));
+            assert!(
+                s.chars().count() <= MAX_TEXT && s.ends_with(CUT),
+                "{k}: {s}"
+            );
+            assert!(s.len() > at - 4, "{k}: {s}");
+        }
     }
 
     /// A path of `len` characters: one long digit-free segment and a dot, so the next segment

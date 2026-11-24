@@ -128,7 +128,7 @@ channel** (`network.mode: proxy` with any allow rule), the validator emits a `da
 warning (path `network.allow`) and `summary()` opens with it, e.g.:
 
 ```
-[data-can-leave] Anything this agent reads (/home/u/code/p and whatever your "GITHUB_TOKEN" unlocks on api.github.com or github.com) can be sent to pypi.org, api.github.com (acting as you) and github.com (acting as you).
+[data-can-leave] Anything this agent reads ("/home/u/code/p" and whatever your "GITHUB_TOKEN" unlocks on api.github.com or github.com) can be sent to pypi.org, api.github.com (acting as you) and github.com (acting as you).
 ```
 
 Hosts with a secret grant are marked "acting as you". When `fetch` is granted the finding ends
@@ -158,8 +158,13 @@ it only reports). In order:
   with no regular-file check and no identity compare against what was inspected.
 - **What is shown.** Before anything is sent, the launch shows the summary, each warning and each
   acknowledged risk, on the terminal the answer is read from when a question follows and on
-  stderr otherwise. A line that fails the CLI's clean-check refuses the launch (exit 1).
-  Warnings and acknowledged risks decide only which lines follow the summary.
+  stderr otherwise. Manifest and host text reaches these lines escaped, so text outside ASCII
+  (letters, marks, symbols, private-use and unassigned code points) is shown escaped and can be
+  consented to. A line that fails the CLI's clean-check, or holds an escape of a control
+  character (a tab or a newline included), a direction mark or an invisible character
+  (whitespace other than the space, Unicode's default-ignorable and format characters,
+  noncharacters, a byte that is not UTF-8), refuses the launch (exit 1), naming the line and
+  why. Warnings and acknowledged risks decide only which lines follow the summary.
 - **Consent.** Every launch from a manifest needs it, whatever its warnings. A given
   `--accept-manifest <sha256>` is the consent, on a terminal too, in place of a typed `yes`: it
   must be the SHA-256 of the exact text read. A malformed value fails (exit 2) before anything
@@ -173,14 +178,13 @@ it only reports). In order:
   refused (exit 1). So a text changed after review (by a session that can write the folder
   that holds it, through this manifest's mounts or another's) launches only with consent given
   for that text; the consent is then the only defence, so a `yes` given without re-reading the
-  summary launches the rewrite (#322 for what the summary can still show ambiguously). A hash
-  that ships with a manifest (a script, a README line) launches it with no question; the summary
-  is still printed; none planned.
+  summary launches the rewrite. A hash that ships with a manifest (a script, a README line)
+  launches it with no question; the summary is still printed; none planned.
 
 `sally manifest summary` ends with the line `sha256 <hex>`, the hash a launch's
 `--accept-manifest` names. Its stderr carries the warnings and acknowledged risks a launch shows,
 and any mount host not written as its folder. A manifest whose launch block holds a line that
-cannot be shown prints no hash and exits 1.
+cannot be shown (as above) prints no hash and exits 1.
 
 Not covered (#255): what is shown, and what a typed `yes` or a hash accepts, comes from the CLI's
 own validation under its own host facts. `sallyd` validates the text it is sent again under its
@@ -405,10 +409,14 @@ argument bytes not shown (at least 1 after `inside`; 0 is possible after `before
 arguments). Env values are not shown.
 
 `summary()` escapes every string it takes from the manifest or the host to printable ASCII (the
-alphabet of `sally_core::text`: `\\`, `\xNN` for controls, `\u{…}` beyond ASCII), so no manifest
-text adds a line or drives a terminal; the `[data-can-leave]` line is escaped whole. Mount
-realpaths, hostnames, names and images are shown bare; globs, MCP arguments and the injection
-header and format are quoted. `description` is not shown. Besides the gates above, the summary
+alphabet of `sally_core::text`: `\\`, `\xNN` for controls and bytes that are not UTF-8,
+`\u{…}` beyond ASCII), so no manifest text adds a line or drives a terminal. Mount realpaths
+are quoted and escaped from their bytes (`"` as `\"`), the same form in the mount lines, the
+`[direct-write]` line and the `[data-can-leave]` finding, which is built that way, so the
+summary's first line and the validator's warning read alike. Hostnames, names and images are
+shown bare; globs, MCP arguments and the injection header and format are quoted. Escaped is not
+consentable by itself: the launch refuses a control, a direction mark or an invisible
+character in any shown line (§1.2). `description` is not shown. Besides the gates above, the summary
 names, with the default, each of `approvals.timeout`, `approvals.max_pending`,
 `runtime.tmp_size` and `runtime.stage_size` that differs from its default, and, while a host is
 reachable, each of `network.max_request_bytes`, `max_response_bytes` and `max_connections`. Each
@@ -582,7 +590,8 @@ yet (TODO(#231)).
 
 `sally manifest validate m.yaml` exits 0 for a valid manifest: its warnings, then the line
 `valid (sallyd checks again when a session starts)`, on standard output (1 instead if one of
-those lines fails the CLI's clean-check). It prints no summary: `sally manifest summary` does
+those lines fails the CLI's clean-check, or if a launch could not show its block, §1.2, which
+standard error then names). It prints no summary: `sally manifest summary` does
 (§1.2). A rejected manifest exits 1 with every error and warning on standard error; a manifest,
 host facts or secrets store that cannot be read exits 2. The errors look like:
 

@@ -167,19 +167,19 @@ fn a_secret_grant_needs_the_name_in_the_store() {
     );
 }
 
-/// Architect Q226, the twin of the test above: manifest text the CLI prints (here a mount's
-/// path, quoted by the `[data-can-leave]` warning and the summary) is still escaped, and a run
-/// that escaped something exits 1 although the manifest is valid.
-#[test]
-fn a_non_ascii_mount_path_is_escaped_and_the_run_exits_1() {
-    let s = Scratch::new("nonascii");
-    // Not below the temp dir: `/tmp` is denylisted as a mount.
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
-        "../../target/sc-loc-caf\u{e9}-{}",
-        std::process::id()
-    ));
+/// A manifest mounting a folder named `name` (made under the build's target folder, since `/tmp`
+/// is denylisted as a mount) with a grant, so the `[data-can-leave]` warning names it: (the
+/// scratch, the manifest, the folder as the summary quotes it, the folder's guard).
+fn mounting(tag: &str, name: &str) -> (Scratch, PathBuf, String, Gone) {
+    let s = Scratch::new(tag);
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target")
+        .join(format!("sc-loc-{tag}-{}", std::process::id()))
+        .join(name);
     std::fs::create_dir_all(&dir).unwrap();
-    let _gone = Gone(dir.clone());
+    let gone = Gone(dir.parent().unwrap().to_owned());
+    let real = std::fs::canonicalize(&dir).unwrap();
+    let quoted = sally_core::text::quoted_path(real.as_os_str().as_encoded_bytes());
     let m = granting_with(
         &s,
         &format!(
@@ -189,34 +189,92 @@ fn a_non_ascii_mount_path_is_escaped_and_the_run_exits_1() {
         ),
     );
     store_gh(&s);
+    (s, m, quoted, gone)
+}
+
+/// RT-MAN-05: a mount path with a letter outside ASCII is shown escaped, quoted alike in the
+/// `[data-can-leave]` warning, the summary's first line and its mount line, and can be consented
+/// to: `manifest validate` exits 0 and `manifest summary` prints the hash.
+#[test]
+fn a_non_ascii_letter_in_a_mount_path_is_shown_escaped_and_can_be_accepted() {
+    let (s, m, quoted, _gone) = mounting("letter", "caf\u{e9}");
+    assert!(quoted.ends_with("/caf\\u{e9}\""), "{quoted}");
     let (code, out, err) = run(|o| manifest_validate(&m, files(&s.store(), &s.config()), o));
-    assert_eq!((code, err.as_str()), (EXIT_REFUSED, ""), "{out}");
+    assert_eq!((code, err.as_str()), (EXIT_OK, ""), "{out}");
     assert!(
         out.contains("[data-can-leave]")
-            && out.contains("sc-loc-caf\\u{e9}-")
-            && out.is_ascii()
+            && out.contains(&quoted)
             && out.ends_with("valid (sallyd checks again when a session starts)\n"),
         "{out}"
     );
     let (code, out, err) = run(|o| manifest_summary(&m, files(&s.store(), &s.config()), o));
-    // The summary on stdout; the warning a launch shows, on stderr (escaped too).
-    assert_eq!(code, EXIT_REFUSED, "{out}");
+    // The summary on stdout; the warning a launch shows, on stderr.
+    assert_eq!(code, EXIT_OK, "{err}");
     assert!(
-        err.starts_with("warning: network.allow: ")
-            && err.contains("sc-loc-caf\\u{e9}-")
-            && err.is_ascii(),
+        err.starts_with("warning: network.allow: ") && err.contains(&quoted),
         "{err}"
     );
+    let first = out.lines().next().unwrap_or_default();
     assert!(
-        out.contains("sc-loc-caf\\u{e9}-") && out.is_ascii(),
+        first.starts_with("[data-can-leave] ") && first.contains(&quoted),
         "{out}"
     );
-    // A launch cannot show that line, so it starts nothing: no hash to accept it with.
-    assert!(!out.contains("sha256 "), "{out}");
     assert!(
-        err.contains("starts nothing: ") && err.contains("sc-loc-caf\\u{e9}-"),
+        out.contains(&format!("- can read {quoted} (at /workspace/p).")),
+        "{out}"
+    );
+    let hash = consent::digest(&std::fs::read_to_string(&m).unwrap());
+    assert!(
+        out.ends_with(&format!("sha256 {}\n", hash.as_hex())),
+        "{out}"
+    );
+}
+
+/// RT-MAN-05, the twin: a direction mark in a mount path (the validator accepts it) is shown
+/// escaped too, but a launch never shows it, so `manifest validate` prints `valid` and exits 1,
+/// and `manifest summary` prints no hash and exits 1, each naming the line and the escape.
+#[test]
+fn a_direction_mark_in_a_mount_path_is_shown_escaped_and_starts_nothing() {
+    let (s, m, quoted, _gone) = mounting("mark", "a\u{202e}b");
+    assert!(quoted.ends_with("/a\\u{202e}b\""), "{quoted}");
+    let (code, out, err) = run(|o| manifest_validate(&m, files(&s.store(), &s.config()), o));
+    assert_eq!(code, EXIT_REFUSED, "{out}{err}");
+    assert!(
+        out.contains(&quoted)
+            && out.ends_with("valid (sallyd checks again when a session starts)\n"),
+        "{out}"
+    );
+    let said = "sally: a launch cannot show this line, so it starts nothing: ";
+    assert!(
+        err.starts_with(said) && err.contains(&quoted) && err.contains("it holds \\u{202e}"),
         "{err}"
     );
+    let (code, out, err) = run(|o| manifest_summary(&m, files(&s.store(), &s.config()), o));
+    assert_eq!(code, EXIT_REFUSED, "{out}");
+    assert!(out.contains(&quoted) && !out.contains("sha256 "), "{out}");
+    assert!(
+        err.contains(said) && err.contains("it holds \\u{202e}"),
+        "{err}"
+    );
+}
+
+/// A long path of letters outside ASCII pushes the warning past the diagnostic cut (300
+/// characters, each letter written as an 8-byte escape): the cut ends before an escape, never
+/// inside one, so the block still reads and the manifest can be accepted.
+#[test]
+fn a_long_non_ascii_mount_path_is_cut_between_escapes_and_can_be_accepted() {
+    let (s, m, _, _gone) = mounting("long", &"\u{4e2d}".repeat(40));
+    let (code, out, err) = run(|o| manifest_validate(&m, files(&s.store(), &s.config()), o));
+    assert_eq!((code, err.as_str()), (EXIT_OK, ""), "{out}");
+    // The kept part ends on a whole escape, whichever byte the character cut fell on (the back-off
+    // at each offset inside an escape is the diagnostics unit test's).
+    assert!(
+        out.contains("}... [data-can-leave]"),
+        "the warning is cut after a whole escape: {out}"
+    );
+    let (code, out, err) = run(|o| manifest_summary(&m, files(&s.store(), &s.config()), o));
+    assert_eq!(code, EXIT_OK, "{err}");
+    assert!(out.contains("sha256 "), "{out}");
 }
 
 /// Architect Q221: a store that cannot be read fails a manifest naming a secret with 2 (could
