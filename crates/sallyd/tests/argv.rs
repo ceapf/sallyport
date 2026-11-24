@@ -478,9 +478,9 @@ fn fenced_blocks(section: &str) -> Vec<String> {
         .collect()
 }
 
-/// The whitespace-separated tokens of `block`, each line's `#` comment left out (no argv token
-/// in these blocks holds a `#`).
-fn block_tokens(block: &str) -> std::collections::BTreeSet<String> {
+/// The whitespace-separated tokens of `block` in order, each line's `#` comment left out (no
+/// argv token in these blocks holds a `#`).
+fn block_token_list(block: &str) -> Vec<&str> {
     block
         .lines()
         .flat_map(|l| {
@@ -488,6 +488,13 @@ fn block_tokens(block: &str) -> std::collections::BTreeSet<String> {
                 .map_or(l, |(code, _)| code)
                 .split_whitespace()
         })
+        .collect()
+}
+
+/// The set of `block`'s tokens (`block_token_list`).
+fn block_tokens(block: &str) -> std::collections::BTreeSet<String> {
+    block_token_list(block)
+        .into_iter()
         .map(str::to_owned)
         .collect()
 }
@@ -532,15 +539,7 @@ fn every_flag_all_roles_carry_is_in_the_architecture_argv_blocks() {
 /// The adjacent token pairs of `block`, in order, each line's `#` comment left out, so an option
 /// and the value written after it (on the same line or the next) form one pair.
 fn block_pairs(block: &str) -> std::collections::BTreeSet<(String, String)> {
-    let tokens: Vec<&str> = block
-        .lines()
-        .flat_map(|l| {
-            l.split_once('#')
-                .map_or(l, |(code, _)| code)
-                .split_whitespace()
-        })
-        .collect();
-    tokens
+    block_token_list(block)
         .windows(2)
         .filter_map(|w| match w {
             [a, b] => Some(((*a).to_owned(), (*b).to_owned())),
@@ -549,11 +548,41 @@ fn block_pairs(block: &str) -> std::collections::BTreeSet<(String, String)> {
         .collect()
 }
 
+/// Whether the value `doc` of a block stands for the argv value `v`: written out as `v`, or a
+/// placeholder (it holds a `<` or a `{`) whose literal text before its first `<` or `{` begins
+/// `v`. So `seccomp=<data>/…` stands for a `seccomp=` value and for no other `--security-opt`
+/// value. The text after a placeholder is not compared: the fixtures lay out their data
+/// directory in their own way (`<data>/podman/hooks` is the fixture's `…/hooks`).
+fn doc_value_stands_for(doc: &str, v: &str) -> bool {
+    doc == v
+        || doc
+            .find(['<', '{'])
+            .and_then(|open| doc.get(..open))
+            .is_some_and(|head| v.starts_with(head))
+}
+
+#[test]
+fn a_placeholder_stands_only_for_values_that_begin_as_it_does() {
+    assert!(doc_value_stands_for("core=0", "core=0"));
+    assert!(!doc_value_stands_for("core=0", "nofile=512:512"));
+    let seccomp = "seccomp=<data>/sessions/<id>/profiles/x.json";
+    assert!(doc_value_stands_for(seccomp, "seccomp=/d/s/1/p/x.json"));
+    assert!(!doc_value_stands_for(seccomp, "no-new-privileges"));
+    assert!(!doc_value_stands_for(seccomp, "label=disable"));
+    assert!(doc_value_stands_for("<uid>:<gid>", "1000:1000"));
+    let label = "sallyport.installation=<installation";
+    assert!(doc_value_stands_for(label, "sallyport.installation=ab"));
+    assert!(!doc_value_stands_for(label, "other=ab"));
+}
+
 /// Security review: the §3.2 block named `--ulimit core=0` but not `--ulimit nofile=512:512`,
 /// which every builder pushes; a flag check alone cannot see a missing value of a repeated
 /// option. Every two-token option (a `--` option without `=`, then a token that is not an option)
 /// whose value is the same in all three roles' argvs is in the §3.2 block as that pair, or in
-/// each of §3.3's role blocks.
+/// each of §3.3's role blocks. A `--x=y` option is one token, checked whole by the flag test
+/// above. A host- or install-specific value (a path, the uid, the installation id) is written in
+/// the blocks as a placeholder, which stands only for values of its shape
+/// (`doc_value_stands_for`): `seccomp=<…>` does not cover `--security-opt no-new-privileges`.
 #[test]
 fn every_option_value_all_roles_share_is_in_the_architecture_argv_blocks() {
     let f = Fx::new();
@@ -573,10 +602,16 @@ fn every_option_value_all_roles_share_is_in_the_architecture_argv_blocks() {
         .map(pairs)
         .reduce(|x, y| x.intersection(&y).cloned().collect())
         .expect("every_argv builds three roles");
-    assert!(
-        common.contains(&("--ulimit".to_owned(), "core=0".to_owned())),
-        "every role carries --ulimit core=0: {common:?}"
-    );
+    for (o, v) in [
+        ("--ulimit", "core=0"),
+        ("--ulimit", "nofile=512:512"),
+        ("--security-opt", "no-new-privileges"),
+    ] {
+        assert!(
+            common.contains(&(o.to_owned(), v.to_owned())),
+            "every role carries {o} {v}: {common:?}"
+        );
+    }
     let doc = architecture();
     let prologue = fenced_blocks(doc_section(&doc, "3.2"));
     assert_eq!(prologue.len(), 1, "§3.2 has one argv block");
@@ -586,13 +621,11 @@ fn every_option_value_all_roles_share_is_in_the_architecture_argv_blocks() {
         .map(|b| block_pairs(b))
         .collect();
     assert_eq!(roles.len(), 3, "§3.3 has one argv block per role");
-    // A host- or install-specific value (a path, the uid, the installation id) is written in
-    // the blocks as a `<…>` placeholder; any other value must be written as the argv has it.
     let covers = |block: &std::collections::BTreeSet<(String, String)>,
                   (o, v): &(String, String)| {
         block
             .iter()
-            .any(|(bo, bv)| bo == o && (bv == v || bv.contains('<')))
+            .any(|(bo, bv)| bo == o && doc_value_stands_for(bv, v))
     };
     let missing: Vec<_> = common
         .iter()
