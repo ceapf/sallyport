@@ -12,6 +12,9 @@
 //!   `{"tool": "fetch", "call": N}`); entries of accepted connections have none. The accept loop
 //!   serves the stream inside [`ORIGIN`]'s scope, and the proxy takes its audit sink through
 //!   [`sink`], which tags each entry while it is built, on the connection's task.
+//! - **Latch** ([`latching`]): every sink the proxy hands out, for accepted and broker-originated
+//!   connections alike, sets the session's latch on any append that does not return written (a
+//!   panic included); from then on the proxy closes egress (RT-AUD-04).
 //! - **TLS toward the proxy** ([`ClientTls::choose`]): a host the session CA has a leaf for is
 //!   intercepted, so the client trusts the session CA only; any other host is spliced, so the
 //!   client verifies the real upstream against the session's upstream trust roots only. Never a
@@ -19,6 +22,7 @@
 
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rustls::ClientConfig;
 use sally_core::audit::{AuditError, NewEntry};
@@ -75,6 +79,43 @@ impl AuditSink for Tagged {
         };
         args.insert("origin".to_owned(), self.origin.clone());
         self.inner.append(entry.args(Value::Object(args)), level)
+    }
+}
+
+/// `inner`, setting `latch` whenever an append does not return written (RT-AUD-04).
+pub fn latching(inner: Arc<dyn AuditSink>, latch: &Arc<AtomicBool>) -> Arc<dyn AuditSink> {
+    Arc::new(Latching {
+        inner,
+        latch: Arc::clone(latch),
+    })
+}
+
+/// Sets its latch on every append that fails or panics; never clears it.
+struct Latching {
+    inner: Arc<dyn AuditSink>,
+    latch: Arc<AtomicBool>,
+}
+
+impl AuditSink for Latching {
+    fn append(&self, entry: NewEntry, level: AuditLevel) -> Result<(), AuditError> {
+        let mut trip = Trip(Some(&self.latch));
+        let written = self.inner.append(entry, level);
+        if written.is_ok() {
+            trip.0 = None;
+        }
+        written
+    }
+}
+
+/// Sets the latch it holds when dropped, so an append that unwinds sets it too.
+struct Trip<'a>(Option<&'a AtomicBool>);
+
+impl Drop for Trip<'_> {
+    fn drop(&mut self) {
+        if let Some(latch) = self.0 {
+            // TODO(#342): report the session whose egress this closes in the operator log.
+            latch.store(true, Ordering::SeqCst);
+        }
     }
 }
 

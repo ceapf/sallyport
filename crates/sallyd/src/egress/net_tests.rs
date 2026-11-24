@@ -325,7 +325,11 @@ async fn audit_entries_are_written_while_every_lookup_slot_is_stuck() {
     assert!(got.1.starts_with("HTTP/1.1 403 "), "{}", got.1);
     assert_eq!(
         audit.rows(),
-        ["egress.deny resolve-failed", "egress.deny host-not-allowed"]
+        [
+            "egress.resolve ",
+            "egress.deny resolve-failed",
+            "egress.deny host-not-allowed"
+        ]
     );
     assert_eq!(gate.entered(), MAX_LOOKUPS, "no 65th lookup was made");
     gate.release();
@@ -482,7 +486,9 @@ async fn a_stop_writes_the_count_of_an_unfinished_interval() {
 }
 
 /// A count whose entry could not be written is kept, window and all, and goes into the next
-/// entry one interval later.
+/// entry one interval later. The failed entry also closes egress (RT-AUD-04): the connections
+/// admitted after it get no answer, each with its `egress.deny` `audit-failed`, and the count
+/// stays the over-rate closes only.
 #[tokio::test(start_paused = true)]
 async fn a_failed_count_entry_carries_its_count_into_the_next() {
     use super::super::server::{ADMISSION_BURST, ADMISSION_RATE};
@@ -500,13 +506,80 @@ async fn a_failed_count_entry_carries_its_count_into_the_next() {
     tokio::time::advance(SHED_INTERVAL).await;
     settle("the first try", || audit.shed_tries.load(SeqCst) == 1).await;
     assert!(!audit.rows().iter().any(|r| r.starts_with("egress.shed")));
-    // One interval gave the rate back: `rate` more are answered, 5 more closed.
-    assert_eq!(flood(&sock, rate + 5).await, (rate, 5));
+    // One interval gave the rate back: `rate` more are admitted and closed unanswered by the
+    // latch, 5 more closed over the rate.
+    let latched = |a: &Ends| {
+        let rows = a.rows();
+        rows.iter()
+            .filter(|r| *r == "egress.deny audit-failed")
+            .count()
+    };
+    assert_eq!(latched(&audit), 0);
+    assert_eq!(flood(&sock, rate + 5).await, (0, rate + 5));
+    assert_eq!(latched(&audit), rate);
     tokio::time::advance(SHED_INTERVAL).await;
     settle("the second try", || audit.shed_tries.load(SeqCst) == 2).await;
     assert_eq!(
         audit.rows().last().map(String::as_str),
         Some("egress.shed rate closed=10 window_ms=2000")
+    );
+    frozen.thaw().await;
+    handle.shutdown().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// RT-AUD-04 for broker-originated connections: after a failed append (here the count entry),
+/// a connector's connection is closed unread like an accepted one, and its `egress.deny`
+/// `audit-failed` carries its origin.
+#[tokio::test(start_paused = true)]
+async fn a_connectors_connection_after_the_latch_gets_no_byte_and_a_tagged_deny() {
+    use super::super::server::ADMISSION_BURST;
+    use std::sync::atomic::Ordering::SeqCst;
+    let dir = scratch("latchlocal");
+    let sock = dir.join("net.sock");
+    let audit = Arc::new(Ends {
+        fail_sheds: 1.into(),
+        ..Ends::default()
+    });
+    let roots = super::super::roots::Roots {
+        store: Arc::new(rustls::RootCertStore::empty()),
+        pem: String::new(),
+        skipped: 0,
+        path: "/test-roots.pem".into(),
+    };
+    let frozen = freeze();
+    let handle = start_with(
+        Arc::new(OnePublic),
+        Arc::clone(&audit),
+        32,
+        &sock,
+        Some(roots),
+    );
+    let burst = ADMISSION_BURST as usize;
+    assert_eq!(flood(&sock, burst + 5).await, (burst, 5));
+    tokio::time::advance(SHED_INTERVAL).await;
+    settle("the failed count entry", || {
+        audit.shed_tries.load(SeqCst) == 1
+    })
+    .await;
+    let mut open = handle
+        .connector()
+        .unwrap()
+        .open(serde_json::json!({"tool": "fetch", "call": 7}))
+        .unwrap();
+    let mut out = String::new();
+    bounded("the closed connection", async {
+        let _ = open
+            .write_all(b"CONNECT a.mock.test:443 HTTP/1.1\r\n\r\n")
+            .await;
+        open.read_to_string(&mut out).await.unwrap();
+    })
+    .await;
+    assert!(out.is_empty(), "{out}");
+    let tag = r#" origin={"call":7,"tool":"fetch"}"#;
+    assert_eq!(
+        audit.rows().last(),
+        Some(&format!("egress.deny audit-failed{tag}"))
     );
     frozen.thaw().await;
     handle.shutdown().await;
@@ -877,7 +950,11 @@ async fn dropping_the_handle_aborts_every_connection() {
     // The proxy and every connection task hold the sink: once they are gone, a graceful
     // stop (what a dropped handle without the abort gets) would have written its close.
     until("the proxy to go", || Arc::strong_count(&audit) == 1).await;
-    assert_eq!(audit.rows(), ["egress.allow "], "aborted: no close entry");
+    assert_eq!(
+        audit.rows(),
+        ["egress.resolve ", "egress.allow "],
+        "aborted: no close entry"
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -937,6 +1014,7 @@ async fn a_connectors_connections_are_served_tagged_and_stop_with_the_session() 
         [
             format!("egress.deny host-not-allowed{tag}"),
             "egress.deny host-not-allowed".to_owned(),
+            format!("egress.resolve {tag}"),
             format!("egress.allow {tag}"),
             format!("egress.close session-stopped{tag}"),
         ]
@@ -1255,6 +1333,7 @@ async fn the_listener_serves_each_connection_and_stops_in_order() {
         audit.rows(),
         [
             "egress.deny host-not-allowed",
+            "egress.resolve ",
             "egress.allow ",
             "egress.close session-stopped"
         ]

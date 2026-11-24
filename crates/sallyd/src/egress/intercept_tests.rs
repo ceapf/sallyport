@@ -64,6 +64,7 @@ async fn a_grant_host_is_intercepted_rewritten_forwarded_and_audited_in_order() 
     assert_eq!(
         r.sink.events(),
         [
+            "egress.resolve",
             "egress.allow",
             "egress.request",
             "egress.response",
@@ -294,6 +295,7 @@ async fn a_streamed_response_one_over_the_cap_is_cut_after_its_audit_entry() {
     assert_eq!(
         events,
         [
+            "egress.resolve",
             "egress.allow",
             "egress.request",
             "egress.limit",
@@ -422,9 +424,14 @@ async fn a_client_that_breaks_off_its_request_ends_closed() {
         assert!(out.is_empty(), "{raw:?}: {out}");
         let events = r.sink.events();
         let expected: &[&str] = if requests == 1 {
-            &["egress.allow", "egress.request", "egress.close"]
+            &[
+                "egress.resolve",
+                "egress.allow",
+                "egress.request",
+                "egress.close",
+            ]
         } else {
-            &["egress.allow", "egress.close"]
+            &["egress.resolve", "egress.allow", "egress.close"]
         };
         assert_eq!(events, expected, "{raw:?}");
         let close = r.sink.args("egress.close");
@@ -639,7 +646,12 @@ async fn an_upstream_that_closes_before_answering_gets_close_first_then_502() {
     assert_eq!(*r.dials.lock().unwrap(), 1);
     assert_eq!(
         r.sink.events(),
-        ["egress.allow", "egress.request", "egress.close"]
+        [
+            "egress.resolve",
+            "egress.allow",
+            "egress.request",
+            "egress.close"
+        ]
     );
     let close = r.sink.args("egress.close");
     assert_eq!(close["end"], json!("upstream-closed"));
@@ -874,7 +886,10 @@ async fn stopping_the_session_during_the_upstream_handshake_ends_session_stopped
     let out = drain(&mut c).await;
     join(task).await;
     assert!(out.is_empty(), "{out}");
-    assert_eq!(r.sink.events(), ["egress.allow", "egress.close"]);
+    assert_eq!(
+        r.sink.events(),
+        ["egress.resolve", "egress.allow", "egress.close"]
+    );
     let close = r.sink.args("egress.close");
     assert_eq!(
         (close["end"].clone(), close["connected"].clone()),
@@ -894,7 +909,10 @@ async fn an_upstream_that_fails_verification_gets_no_200() {
     assert!(tls.is_none());
     assert!(reply.starts_with("HTTP/1.1 502 "), "{reply}");
     assert!(reply.ends_with("upstream-tls-failed\n"), "{reply}");
-    assert_eq!(r.sink.events(), ["egress.allow", "egress.close"]);
+    assert_eq!(
+        r.sink.events(),
+        ["egress.resolve", "egress.allow", "egress.close"]
+    );
     let close = r.sink.args("egress.close");
     assert_eq!(
         (
@@ -1095,6 +1113,82 @@ async fn a_failed_response_limit_entry_still_cuts_and_ends_error() {
         "a cut sends no last chunk: {out}"
     );
     assert!(!r.sink.events().iter().any(|e| e == "egress.limit"));
+    assert_eq!(r.sink.args("egress.close")["end"], json!("error"));
+}
+
+/// After the failed append above, the session's next CONNECT gets no byte back (RT-AUD-04).
+async fn egress_is_closed(r: &Rig) {
+    let (head, tls, task) = r.open(443).await;
+    assert!(head.is_empty() && tls.is_none(), "{head}");
+    join(task).await;
+    let last = r.sink.rows().pop().unwrap();
+    assert_eq!(
+        last,
+        ("egress.deny".into(), json!({"reason": "audit-failed"}))
+    );
+}
+
+#[tokio::test]
+async fn a_failed_held_limit_entry_closes_egress() {
+    let r = rig(Opts {
+        fail_on: Some("egress.limit"),
+        ..Opts::default()
+    });
+    let out = r.talk(&get("/chunks/17", "")).await;
+    assert!(!out.contains(&"c".repeat(17)), "{out}");
+    egress_is_closed(&r).await;
+}
+
+#[tokio::test]
+async fn a_failed_response_entry_closes_egress() {
+    let r = rig(Opts {
+        fail_on: Some("egress.response"),
+        ..Opts::default()
+    });
+    let _ = r.talk(&get("/echo", "")).await;
+    assert!(!r.sink.events().iter().any(|e| e == "egress.response"));
+    egress_is_closed(&r).await;
+}
+
+/// RT-AUD-04's gate inside a tunnel: once another connection's append failed, the open
+/// intercepted tunnel forwards no further request and ends `error`. Control: in-test, the
+/// first request on the same tunnel is forwarded and answered.
+#[tokio::test]
+async fn an_open_tunnel_forwards_nothing_after_the_latch() {
+    let r = rig(Opts {
+        fail_on: Some("egress.deny"),
+        ..Opts::default()
+    });
+    let (head, tls, task) = r.open(443).await;
+    let mut tls = tls.unwrap_or_else(|| panic!("not opened: {head}"));
+    let mut out = Vec::new();
+    bounded("the first request", async {
+        tls.write_all(get("/echo", "").as_bytes()).await.unwrap();
+        let mut chunk = [0u8; 4096];
+        while !out.ends_with(b"ok") {
+            let n = tls.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "ended before the first answer");
+            out.extend_from_slice(chunk.get(..n).unwrap());
+        }
+    })
+    .await;
+    assert_eq!(
+        r.seen().len(),
+        1,
+        "control: the first request was forwarded"
+    );
+    let (denied_head, denied, denied_task) = r.open_to("evil.test:443").await;
+    assert!(denied_head.is_empty() && denied.is_none(), "{denied_head}");
+    join(denied_task).await;
+    bounded("the second request", async {
+        let _ = tls.write_all(get("/echo", "").as_bytes()).await;
+        let _ = tls.shutdown().await;
+    })
+    .await;
+    let rest = drain(&mut tls).await;
+    join(task).await;
+    assert!(rest.is_empty(), "{rest}");
+    assert_eq!(r.seen().len(), 1, "forwarded after the latch");
     assert_eq!(r.sink.args("egress.close")["end"], json!("error"));
 }
 
