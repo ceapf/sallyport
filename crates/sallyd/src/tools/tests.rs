@@ -774,7 +774,7 @@ async fn rw_writes_run_unasked_in_the_workspace_view_holding_the_exec_gate() {
 /// The hard-link refusal is the brokered mount's alone (the broker would write through to the
 /// other name); in the workspace's own view the sandbox could write it anyway.
 #[tokio::test]
-async fn only_a_brokered_write_refuses_a_hard_link() {
+async fn rt_fs_20_only_a_brokered_write_refuses_a_hard_link() {
     let f = fx("hard-link", opts(all_modes()));
     for guest in ["/workspace/notes", "/workspace/rw"] {
         let d = f.dir(guest).to_owned();

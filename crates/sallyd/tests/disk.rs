@@ -310,7 +310,10 @@ fn a_launch_below_the_configured_floor_is_refused() {
 }
 
 /// The re-review's HIGH: renaming files in a loop, within a directory and across directories,
-/// does not hide data from `stage_size`. The walk runs on the frozen container.
+/// does not hide data from `stage_size`. The walk runs on the frozen container, so it never
+/// meets an entry that vanished between its listing and its `stat`: the verdict is
+/// `stage-size`, never `unmeasurable`. A race that rarely fires cannot show a walk that is
+/// not frozen, so the host also watches the container's cgroup: it must be seen frozen.
 #[test]
 fn rt_ag_09_rename_churn_does_not_evade_stage_size() {
     let _serial = serial();
@@ -321,6 +324,18 @@ fn rt_ag_09_rename_churn_does_not_evade_stage_size() {
             mounts(&[mount("~/code/other", "/workspace/o", "staged")])
         ));
         let r = x.launch(&v, "churn").await.unwrap();
+        let path = x
+            .hermetic(&[
+                "inspect".into(),
+                "--format".into(),
+                "{{.State.CgroupPath}}".into(),
+                r.container().into(),
+            ])
+            .await;
+        let cg = std::path::Path::new("/sys/fs/cgroup").join(path.trim().trim_start_matches('/'));
+        assert!(cg.join("cgroup.events").exists(), "{}", cg.display());
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let frozen = watch_frozen(vec![cg.clone(), cg.join("container")], stop.clone());
         // The renamer starts first, so every file is moving (within d1, and between d1 and
         // d2) for the whole time the data grows past the limit. The writer opens all four
         // files before the renamer starts and writes through those fds: `dd of=<name>` would
@@ -341,14 +356,37 @@ fn rt_ag_09_rename_churn_does_not_evade_stage_size() {
             x.events.list(),
             x.events.args("session.resource_limit")
         );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let seen = frozen.join().unwrap();
         let a = x.events.args("session.resource_limit").expect("audited");
         assert_eq!(a["resource"], "stage_size", "{a}");
+        assert_eq!(a["reason"], "stage-size", "{a}");
         assert!(
-            a["reason"] == "stage-size" || a["reason"] == "unmeasurable",
-            "{a}"
+            seen > 0,
+            "the container was never seen frozen while it was walked"
         );
         x.stop(r).await;
     });
+}
+
+/// From the host, every millisecond until `stop`: how many polls found `frozen 1` in the
+/// `cgroup.events` of any of `dirs` (a directory gone reads as not frozen).
+fn watch_frozen(
+    dirs: Vec<std::path::PathBuf>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<u64> {
+    std::thread::spawn(move || {
+        let mut seen = 0;
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            let frozen = dirs.iter().any(|d| {
+                std::fs::read_to_string(d.join("cgroup.events"))
+                    .is_ok_and(|t| t.lines().any(|l| l == "frozen 1"))
+            });
+            seen += u64::from(frozen);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        seen
+    })
 }
 
 /// One session busy with walks of a large tree does not delay another session's floor check:

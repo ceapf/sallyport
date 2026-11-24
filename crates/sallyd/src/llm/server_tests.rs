@@ -613,7 +613,7 @@ async fn rt_aud_02_a_flood_of_bad_heads_is_read_at_the_session_rate() {
 }
 
 #[tokio::test]
-async fn a_peer_with_another_uid_is_refused_and_recorded() {
+async fn rt_ag_19_a_peer_with_another_uid_is_refused_and_recorded() {
     let dir = std::env::temp_dir().join(format!("sp-llm-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir(&dir).unwrap();

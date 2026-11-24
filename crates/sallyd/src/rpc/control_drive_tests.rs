@@ -69,6 +69,22 @@ async fn rt_drv_05_a_session_not_declared_driven_has_no_drive_methods() {
     assert!(own.events().is_empty(), "nothing is written to the session");
     let r = w.call("sessions.drive", json!({"id": "s-9"})).await;
     assert_eq!(reason(&r), "unknown-session");
+    // That refusal is in the control log too, with its own request entry.
+    assert_eq!(
+        f.events(),
+        [
+            "rpc.request",
+            "rpc.request",
+            "session.refuse",
+            "rpc.request",
+            "session.refuse"
+        ]
+    );
+    assert_eq!(
+        refused(&f, "session.refuse"),
+        json!({"method": "sessions.drive", "id": "s-9", "reason": "unknown-session",
+               "client": client()})
+    );
 }
 
 #[tokio::test]
@@ -353,6 +369,43 @@ async fn one_connection_drives_two_sessions_each_on_its_own_seat() {
     assert_eq!(one.events(), ["drive.turn"]);
     assert_eq!(two.events(), ["drive.turn"]);
     assert!(calls.lock().unwrap().is_empty());
+}
+
+/// A connection in the driver seat cannot attach a command (`driver-seat`, THREAT_MODEL's
+/// attach row): first, as the control, a plain connection's attach to a lined session runs its
+/// command; then the seat's attach is refused, logged, and the command runner sees nothing.
+#[tokio::test]
+async fn a_connection_in_the_driver_seat_cannot_attach() {
+    use super::line_mode::{attach, lined, until_reply};
+    use crate::rpc::testkit::Mode;
+    let f = fx("drive-attach");
+    driven(&f, "s-1", TWO);
+    let (_, exec, _) = lined(&f, "s-2", Mode::Exit(0));
+    let mut plain = f.connect();
+    plain.send("sessions.attach", attach("s-2", &["sh"])).await;
+    let (_, r) = until_reply(&mut plain, 1).await;
+    assert_eq!(r["result"], json!({"exit_code": 0}), "control: {r}");
+    assert_eq!(
+        exec.seen.lock().unwrap().len(),
+        1,
+        "control: the command ran"
+    );
+    let mut seat = f.connect();
+    let r = seat.call("sessions.drive", json!({"id": "s-1"})).await;
+    assert_eq!(r["result"]["turn"], json!(1), "{r}");
+    let r = seat.call("sessions.attach", attach("s-2", &["sh"])).await;
+    assert_eq!(r["error"]["code"], json!(REFUSED));
+    assert_eq!(reason(&r), "driver-seat");
+    assert_eq!(
+        refused(&f, "session.refuse"),
+        json!({"method": "sessions.attach", "id": "s-2", "reason": "driver-seat",
+               "client": client()})
+    );
+    assert_eq!(
+        exec.seen.lock().unwrap().len(),
+        1,
+        "the seat's attach ran nothing"
+    );
 }
 
 #[tokio::test]

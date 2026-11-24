@@ -478,7 +478,7 @@ mod tests {
     /// goes through the launcher's stdout check and parses; the cap refuses the listing one
     /// session's block past what fits, so the limit is what keeps the sweep working.
     #[test]
-    fn the_session_limit_keeps_the_worst_listing_under_the_cap() {
+    fn rt_ag_18_the_session_limit_keeps_the_worst_listing_under_the_cap() {
         let block = |n: usize| -> String {
             (0..LINES_PER_SESSION)
                 .map(|k| {

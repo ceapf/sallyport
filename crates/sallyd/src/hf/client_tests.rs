@@ -77,7 +77,7 @@ async fn files_asks_the_api_host_with_the_token() {
 /// A pull follows the redirect to the CDN host, which gets no token, and the library stores
 /// the file under its digest with downloads/ left empty.
 #[tokio::test]
-async fn a_pull_follows_the_cdn_redirect_without_the_token() {
+async fn rt_mdl_11_a_pull_follows_the_cdn_redirect_without_the_token() {
     let g = gguf("redirect");
     let served = g.clone();
     let hub = Hub::new(move |s, _| {
@@ -114,7 +114,7 @@ async fn a_pull_follows_the_cdn_redirect_without_the_token() {
 /// which is followed without the token (and answers 404 here). Control: the first request, to
 /// the API host before the chain left it, carries `Authorization`.
 #[tokio::test]
-async fn a_chain_that_left_the_api_host_never_carries_the_token_again() {
+async fn rt_mdl_11_a_chain_that_left_the_api_host_never_carries_the_token_again() {
     let g = gguf("bounce");
     let hub = Hub::new(move |s, i| match (i, s.host.as_str()) {
         (0, "huggingface.co") => found("https://cdn-lfs.hf.co/blobs/x"),
@@ -241,7 +241,7 @@ async fn a_file_that_does_not_fit_sends_no_request() {
 /// network this host is directly connected to is never dialled; the control, a public answer
 /// through the same recorder, records one lookup and one dial.
 #[tokio::test]
-async fn denied_addresses_are_never_dialled() {
+async fn rt_mdl_11_denied_addresses_are_never_dialled() {
     let body = list_json(&[]);
     let hub = Hub::new(move |_, _| reply("200 OK", &[], &body));
     let client = hub.client(None);
@@ -329,7 +329,7 @@ async fn denied_addresses_are_never_dialled() {
 
 /// A redirect to a host outside the Hub's domains is refused without a lookup or a dial of it.
 #[tokio::test]
-async fn a_redirect_off_the_hub_is_not_followed() {
+async fn rt_mdl_11_a_redirect_off_the_hub_is_not_followed() {
     let hub = Hub::new(|_, _| found("https://evil.test/x"));
     let g = gguf("evil");
     let lib = TmpLib::open("evil", 0);
@@ -350,7 +350,7 @@ async fn a_redirect_off_the_hub_is_not_followed() {
 /// host is refused, and that host is never looked up or dialled. Control: a relative redirect
 /// on the API host is followed, with the token, and the list is read.
 #[tokio::test]
-async fn a_list_redirected_off_the_api_host_is_refused() {
+async fn rt_mdl_11_a_list_redirected_off_the_api_host_is_refused() {
     let body = list_json(&[]);
     let hub = Hub::new(move |s, _| {
         if s.host == "huggingface.co" {
@@ -582,7 +582,7 @@ async fn a_poisoned_library_has_its_own_code() {
 /// could write, refuses the client; the control, the mock Hub's own bundle at 0644, gives a
 /// client that lists. (The owner check needs a second uid; `egress::roots`'s tests cover it.)
 #[tokio::test]
-async fn the_client_takes_its_roots_only_from_a_checked_bundle() {
+async fn rt_mdl_11_the_client_takes_its_roots_only_from_a_checked_bundle() {
     use std::os::unix::fs::PermissionsExt as _;
     let body = list_json(&[]);
     let hub = Hub::new(move |_, _| reply("200 OK", &[], &body));
@@ -608,7 +608,7 @@ async fn the_client_takes_its_roots_only_from_a_checked_bundle() {
 /// the handshake to the Hub fails and no request reaches it; the control, the Hub's own bundle
 /// through the same seams, lists.
 #[tokio::test]
-async fn the_client_trusts_no_anchor_but_its_bundle() {
+async fn rt_mdl_11_the_client_trusts_no_anchor_but_its_bundle() {
     let body = list_json(&[]);
     let hub = Hub::new(move |_, _| reply("200 OK", &[], &body));
     let foreign = hub.bundles().write("foreign.pem", &foreign_ca_pem());
@@ -655,9 +655,9 @@ async fn an_answer_outside_its_bounds_is_a_failed_lookup() {
 /// order, and at most `MAX_DIALS` of them: five public answers on another port, every dial
 /// failing, are the first three on 443, then a failed connect. Control: the same Hub with dials
 /// that succeed dials the first answer on 443 once. (Which answers may be dialled at all is
-/// `denied_addresses_are_never_dialled`.)
+/// `rt_mdl_11_denied_addresses_are_never_dialled`.)
 #[tokio::test]
-async fn answers_are_dialled_on_443_in_order_up_to_the_bound() {
+async fn rt_mdl_11_answers_are_dialled_on_443_in_order_up_to_the_bound() {
     use crate::egress::server::MAX_DIALS;
     let body = list_json(&[]);
     let hub = Hub::new(move |_, _| reply("200 OK", &[], &body));
