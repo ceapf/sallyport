@@ -511,6 +511,45 @@ fn file_tools_write_where_the_workspace_writes() {
     });
 }
 
+/// A `staged` root must be a mount root on overlayfs: the staged mount's own root source,
+/// pointed at a directory inside the mount (on overlayfs, but not a mount root), is refused
+/// `mount-changed`. Control, first: the same source with the mount's own guest opens.
+#[test]
+fn a_staged_root_must_be_a_mount_root() {
+    use sallyd::tools::exec::session_mounts;
+    use sallyd::tools::fs::{FsError, RootSource};
+    rt().block_on(async {
+        let x = Lx::new();
+        std::fs::create_dir_all(x.f.root.join("home/code/other/sub")).unwrap();
+        let v = manifest(
+            &x,
+            &mounts(&[mount("~/code/other", "/workspace/o", "staged")]),
+            "deny",
+        );
+        let r = x.launch(&v, "staged-root").await.unwrap();
+        let m = session_mounts(&v, &r)
+            .into_iter()
+            .find(|m| m.guest == "/workspace/o")
+            .unwrap();
+        let RootSource::Overlay { proc_dir, guest } = m.root else {
+            panic!("not an overlay root: {:?}", m.root)
+        };
+        let own = RootSource::Overlay {
+            proc_dir: Arc::clone(&proc_dir),
+            guest: guest.clone(),
+        };
+        if let Err(e) = own.open(ids()) {
+            panic!("control: the mount's own guest root: {e:?}");
+        }
+        let inner = RootSource::Overlay {
+            proc_dir,
+            guest: format!("{guest}/sub"),
+        };
+        assert_eq!(inner.open(ids()).err(), Some(FsError::MountChanged));
+        x.stop(r).await;
+    });
+}
+
 /// RT-AG-05, the sandbox's half: in a brokered mount the sandbox's own write fails (read-only);
 /// only the broker's approved `fs_write` reaches the folder.
 #[test]

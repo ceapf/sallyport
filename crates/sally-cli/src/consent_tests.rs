@@ -13,7 +13,13 @@ const RISKY: &str = "tools:\n  builtin: [shell]\n  shell: allow\n  \
                      destructive_requires_approval: false\n  acknowledge_unapproved: [shell]\n";
 
 fn validated(body: &str) -> Validated {
-    let env = HostEnv {
+    let names = std::collections::BTreeSet::<String>::new();
+    load(&format!("{HEAD}{body}"), &validated_env(), &names).unwrap()
+}
+
+/// Host facts with the temp folder as home.
+fn validated_env() -> HostEnv {
+    HostEnv {
         home: std::env::temp_dir(),
         other_homes: Vec::new(),
         xdg_config_home: None,
@@ -26,9 +32,7 @@ fn validated(body: &str) -> Validated {
         env_dirs: Vec::new(),
         nproc: 8,
         mem_bytes: 16 << 30,
-    };
-    let names = std::collections::BTreeSet::<String>::new();
-    load(&format!("{HEAD}{body}"), &env, &names).unwrap()
+    }
 }
 
 /// Asks on a terminal whose input is `typed`: (the answer, what was shown, how many times
@@ -127,6 +131,77 @@ fn the_block_is_the_summary_then_the_warnings_then_the_acknowledged_risks() {
     assert!(besides_summary(&validated("")).is_empty());
 }
 
+/// A manifest showing a brokered mount's approve glob, a grant's injection format and an MCP
+/// server's argument, validated with a home under the build's target folder (`/tmp` is
+/// denylisted as a mount), its folder removed on drop.
+fn showing(tag: &str, glob: &str, format: &str, arg: &str) -> (Validated, Gone) {
+    let home = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target")
+        .join(format!("sc-con-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(home.join("p")).unwrap();
+    let gone = Gone(home.clone());
+    let mut env = validated_env();
+    env.home = std::fs::canonicalize(&home).unwrap();
+    let names: std::collections::BTreeSet<String> =
+        std::iter::once("GITHUB_TOKEN".to_owned()).collect();
+    let body = format!(
+        "{HEAD}filesystem:\n  mounts:\n    - host: \"~/p\"\n      guest: /workspace/p\n      \
+         mode: brokered\n      approve:\n        writes: [\"{glob}\"]\nnetwork:\n  mode: proxy\n  \
+         allow:\n    - host: api.github.com\nsecrets:\n  - name: GITHUB_TOKEN\n    inject: {{host: \
+         api.github.com, header: Authorization, format: \"{format}\"}}\ntools:\n  builtin: \
+         [fs_write]\n  mcp:\n    - {{name: x, command: [srv, \"{arg}\"]}}\n"
+    );
+    let v = load(&body, &env, &names).unwrap_or_else(|e| panic!("{tag}: {e:#?}"));
+    (v, gone)
+}
+
+/// RT-MAN-05: each field the summary quotes refuses the block when it holds a direction mark
+/// (a glob), an invisible character (the injection format) or a terminal control (an MCP
+/// argument), naming the line and the escape; letters outside ASCII in the same fields are shown
+/// escaped and accepted.
+#[test]
+fn a_refused_character_in_any_quoted_field_withholds_the_block() {
+    let plain = ("drafts/*.md", "Bearer {value}", "clear");
+    let (v, _gone) = showing("plain", plain.0, plain.1, plain.2);
+    assert!(block(&v).is_ok(), "{:?}", block(&v));
+    let (v, _gone) = showing(
+        "letters",
+        "caf\\u00e9/*.md",
+        "Bearer\\u00e9 {value}",
+        "\\u00e9t\\u00e9",
+    );
+    let lines = block(&v).unwrap().join("\n");
+    for escaped in [
+        "\"caf\\u{e9}/*.md\"",
+        "\"Bearer\\u{e9} {value}\"",
+        "\"\\u{e9}t\\u{e9}\"",
+    ] {
+        assert!(lines.contains(escaped), "{escaped}: {lines}");
+    }
+    for (tag, glob, format, arg, escape) in [
+        ("glob", "dr\\u202eafts/*.md", plain.1, plain.2, "\\u{202e}"),
+        (
+            "format",
+            plain.0,
+            "Bearer\\u200b {value}",
+            plain.2,
+            "\\u{200b}",
+        ),
+        ("arg", plain.0, plain.1, "\\e[2J", "\\x1b"),
+    ] {
+        let (v, _gone) = showing(tag, glob, format, arg);
+        let dirty = block(&v).unwrap_err();
+        assert!(
+            dirty.contains(&format!("it holds {escape}:")),
+            "{tag}: {dirty}"
+        );
+        assert!(
+            dirty.chars().all(|c| c.is_ascii_graphic() || c == ' '),
+            "{tag}: {dirty:?}"
+        );
+    }
+}
+
 /// A line that fails the clean-check withholds the block and is named, escaped: the first one.
 #[test]
 fn a_line_that_cannot_be_shown_withholds_the_block_and_is_named() {
@@ -138,6 +213,7 @@ fn a_line_that_cannot_be_shown_withholds_the_block_and_is_named() {
         dirty.contains("caf") && dirty.contains(&v.warnings[0].path),
         "{dirty}"
     );
+    assert!(dirty.ends_with(" (not printable ASCII)"), "{dirty}");
     assert!(
         dirty.chars().all(|c| c.is_ascii_graphic() || c == ' '),
         "{dirty:?}"

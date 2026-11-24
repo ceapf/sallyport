@@ -974,12 +974,19 @@ fn rt_sup_04_hostile_variables_in_sallyd_s_environment_never_reach_podman() {
         .args(["-e", "signal=none", "-o"])
         .arg(&trace)
         .arg(env!("CARGO_BIN_EXE_sallyd"));
-    let mut c = env.command(strace);
     let path = format!(
         "{}:{}",
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
+    // Control, in-test (first): a `PATH` lookup with the same `PATH` runs the decoy, and the
+    // same canary shows it.
+    let mut lookup = env.command(Command::new("podman"));
+    let status = lookup.env("PATH", &path).arg("--version").status().unwrap();
+    assert!(status.success(), "control: the decoy podman failed");
+    assert!(canary.exists(), "control: a PATH lookup left no canary");
+    std::fs::remove_file(&canary).unwrap();
+    let mut c = env.command(strace);
     c.envs(hostile.iter().map(|(k, v)| (k, v)))
         .env("PATH", path);
     let mut tracer = Guard::spawn(c);

@@ -69,6 +69,22 @@ async fn rt_drv_05_a_session_not_declared_driven_has_no_drive_methods() {
     assert!(own.events().is_empty(), "nothing is written to the session");
     let r = w.call("sessions.drive", json!({"id": "s-9"})).await;
     assert_eq!(reason(&r), "unknown-session");
+    // That refusal is in the control log too, with its own request entry.
+    assert_eq!(
+        f.events(),
+        [
+            "rpc.request",
+            "rpc.request",
+            "session.refuse",
+            "rpc.request",
+            "session.refuse"
+        ]
+    );
+    assert_eq!(
+        refused(&f, "session.refuse"),
+        json!({"method": "sessions.drive", "id": "s-9", "reason": "unknown-session",
+               "client": client()})
+    );
 }
 
 #[tokio::test]
@@ -94,17 +110,23 @@ async fn a_drive_step_runs_one_scripted_turn_and_answers_with_it() {
     assert_eq!(f.events(), ["rpc.request", "rpc.request", "rpc.request"]);
 }
 
+/// Control, in-test (first): the first connection's drive takes the seat and moves the cursor,
+/// seen through the same probe (the session's own `drive.turn` entries) that shows the refused
+/// ones leave it where it was.
 #[tokio::test]
 async fn rt_drv_06_a_second_connection_is_refused_and_a_closed_driver_leaves_the_seat_gone() {
     let f = fx("drive-seat");
     let (own, _) = driven(&f, "s-1", THREE);
     let mut first = f.connect();
-    first.call("sessions.drive", json!({"id": "s-1"})).await;
+    let r = first.call("sessions.drive", json!({"id": "s-1"})).await;
+    assert_eq!(r["result"]["turn"], json!(1), "control: {r}");
+    assert_eq!(own.events(), ["drive.turn"], "control: the cursor moved");
     let r = f
         .connect()
         .call("sessions.drive", json!({"id": "s-1"}))
         .await;
     assert_eq!(reason(&r), "driver-busy");
+    assert_eq!(own.events(), ["drive.turn"], "the refused drive moved it");
     first.call("sessions.drive", json!({"id": "s-1"})).await;
     drop(first);
     let mut gone = false;
@@ -187,6 +209,37 @@ async fn begun(began: &tokio::sync::Notify) {
         .expect("the step never began");
 }
 
+/// Yields as often as the closed-driver tests wait for `dropped`, then says whether it is set.
+async fn dropped_after_waiting(dropped: &std::sync::atomic::AtomicBool) -> bool {
+    for _ in 0..200 {
+        if dropped.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    dropped.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The closed-driver tests' control, in-test (first): on another session's seat that stays
+/// open, the same wait on the same flag finds the step kept, and the same drive request from
+/// another connection is told `driver-busy`, not `driver-gone`.
+async fn an_open_driver_keeps_its_step(f: &Fx) {
+    let (began, _release, dropped) = held(f, "s-0");
+    let mut open = f.connect();
+    open.send("sessions.drive", json!({"id": "s-0"})).await;
+    begun(&began).await;
+    assert!(
+        !dropped_after_waiting(&dropped).await,
+        "control: an open driver's step was dropped"
+    );
+    let r = f
+        .connect()
+        .call("sessions.drive", json!({"id": "s-0"}))
+        .await;
+    assert_eq!(reason(&r), "driver-busy", "control: {r}");
+    drop(open);
+}
+
 /// A driver that closes while its step waits (on a prompt, say) drops the step at once, and the
 /// seat is gone; it is not left held by a connection nobody reads. That a dropped driven call
 /// withdraws its prompt is `agent_tests.rs`'s
@@ -194,21 +247,13 @@ async fn begun(began: &tokio::sync::Notify) {
 #[tokio::test]
 async fn rt_drv_06_a_driver_that_closes_mid_step_drops_the_step_and_leaves_the_seat_gone() {
     let f = fx("drive-away");
+    an_open_driver_keeps_its_step(&f).await;
     let (began, _release, dropped) = held(&f, "s-1");
     let mut seat = f.connect();
     seat.send("sessions.drive", json!({"id": "s-1"})).await;
     begun(&began).await;
     drop(seat);
-    for _ in 0..200 {
-        if dropped.load(std::sync::atomic::Ordering::SeqCst) {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    assert!(
-        dropped.load(std::sync::atomic::Ordering::SeqCst),
-        "the step was kept"
-    );
+    assert!(dropped_after_waiting(&dropped).await, "the step was kept");
     let r = f
         .connect()
         .call("sessions.drive", json!({"id": "s-1"}))
@@ -221,21 +266,13 @@ async fn rt_drv_06_a_driver_that_closes_mid_step_drops_the_step_and_leaves_the_s
 #[tokio::test]
 async fn rt_drv_06_a_driver_that_half_closes_mid_step_is_a_closed_driver() {
     let f = fx("drive-half");
+    an_open_driver_keeps_its_step(&f).await;
     let (began, _release, dropped) = held(&f, "s-1");
     let mut seat = f.connect();
     seat.send("sessions.drive", json!({"id": "s-1"})).await;
     begun(&began).await;
     seat.w.shutdown().await.unwrap();
-    for _ in 0..200 {
-        if dropped.load(std::sync::atomic::Ordering::SeqCst) {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    assert!(
-        dropped.load(std::sync::atomic::Ordering::SeqCst),
-        "the step was kept"
-    );
+    assert!(dropped_after_waiting(&dropped).await, "the step was kept");
     assert!(
         seat.frame().await.is_none(),
         "a closed driver gets no reply"
@@ -355,10 +392,55 @@ async fn one_connection_drives_two_sessions_each_on_its_own_seat() {
     assert!(calls.lock().unwrap().is_empty());
 }
 
+/// A connection in the driver seat cannot attach a command (`driver-seat`, THREAT_MODEL's
+/// attach row): first, as the control, a plain connection's attach to a lined session runs its
+/// command; then the seat's attach is refused, logged, and the command runner sees nothing.
+#[tokio::test]
+async fn a_connection_in_the_driver_seat_cannot_attach() {
+    use super::line_mode::{attach, lined, until_reply};
+    use crate::rpc::testkit::Mode;
+    let f = fx("drive-attach");
+    driven(&f, "s-1", TWO);
+    let (_, exec, _) = lined(&f, "s-2", Mode::Exit(0));
+    let mut plain = f.connect();
+    plain.send("sessions.attach", attach("s-2", &["sh"])).await;
+    let (_, r) = until_reply(&mut plain, 1).await;
+    assert_eq!(r["result"], json!({"exit_code": 0}), "control: {r}");
+    assert_eq!(
+        exec.seen.lock().unwrap().len(),
+        1,
+        "control: the command ran"
+    );
+    let mut seat = f.connect();
+    let r = seat.call("sessions.drive", json!({"id": "s-1"})).await;
+    assert_eq!(r["result"]["turn"], json!(1), "{r}");
+    let r = seat.call("sessions.attach", attach("s-2", &["sh"])).await;
+    assert_eq!(r["error"]["code"], json!(REFUSED));
+    assert_eq!(reason(&r), "driver-seat");
+    assert_eq!(
+        refused(&f, "session.refuse"),
+        json!({"method": "sessions.attach", "id": "s-2", "reason": "driver-seat",
+               "client": client()})
+    );
+    assert_eq!(
+        exec.seen.lock().unwrap().len(),
+        1,
+        "the seat's attach ran nothing"
+    );
+}
+
+/// Control, in-test (first): a connection that has not watched takes another driven session's
+/// seat through the same request (turn 1).
 #[tokio::test]
 async fn rt_drv_06_a_connection_that_watches_cannot_take_the_seat() {
     let f = fx("drive-watching");
+    driven(&f, "s-0", TWO);
     driven(&f, "s-1", TWO);
+    let r = f
+        .connect()
+        .call("sessions.drive", json!({"id": "s-0"}))
+        .await;
+    assert_eq!(r["result"]["turn"], json!(1), "control: {r}");
     let mut w = f.connect();
     w.call("approvals.watch", json!({})).await;
     let r = w.call("sessions.drive", json!({"id": "s-1"})).await;

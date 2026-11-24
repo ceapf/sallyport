@@ -167,6 +167,7 @@ async fn a_credential_in_a_response_header_name_is_refused_unforwarded() {
     assert_eq!(
         r.sink.events(),
         [
+            "egress.resolve",
             "egress.allow",
             "egress.request",
             "egress.deny",

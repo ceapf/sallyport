@@ -4,8 +4,9 @@
 //! `session.resource_limit` (`pids-max`, `oom-kill`) and the session runs on (#27). The fork
 //! bomb runs with `runtime.memory` 256 MiB, memory to spare; the memory bomb and the `/tmp`
 //! filler run with 64 MiB (#141). The `/tmp` filler is contained only: a tmpfs has no
-//! kernel event. The stage-size and floor parts of the row are in `disk.rs` and `launch.rs`. The
-//! fixture is `common::container`; these tests never skip.
+//! kernel event. Two more legs: the container's `cpu.max` is `runtime.cpus`, and the sandbox
+//! cannot rewrite its own cgroup limits. The stage-size and floor parts of the row are in
+//! `disk.rs` and `launch.rs`. The fixture is `common::container`; these tests never skip.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::time::Duration;
@@ -344,6 +345,63 @@ fn rt_ag_09_a_memory_bomb_is_oom_killed_inside_the_container() {
         );
         // The control: the marker is written, into hermetic podman's state directory.
         assert!(state.exists(), "conmon's oom marker in the state directory");
+    });
+}
+
+/// The CPU limit: `runtime.cpus` 1.5 is the container's `cpu.max` (quota over period), read
+/// from the host and from inside. Without `--cpus` the file reads `max`.
+#[test]
+fn rt_ag_09_the_cpu_limit_is_the_manifests() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let v = x.f.load(&format!(
+            "{}runtime:\n  cpus: 1.5\n",
+            mounts(&[mount("~/code/myproject", "/workspace/p", "ro")])
+        ));
+        let r = x.launch(&v, "cpus").await.unwrap();
+        let cg = cgroup(&x, &r).await;
+        let host = read(&x, &r, &cg, "cpu.max");
+        let (code, inside) = exec(&r, "cat /sys/fs/cgroup/cpu.max").await;
+        assert_eq!(code, 0, "{inside}");
+        for text in [&host, &inside] {
+            let mut it = text.split_whitespace().map(|n| n.parse::<u64>());
+            let (Some(Ok(quota)), Some(Ok(period)), None) = (it.next(), it.next(), it.next())
+            else {
+                panic!("cpu.max {text:?}, host {host:?}")
+            };
+            assert_eq!(quota * 1000, 1500 * period, "cpu.max {text:?}");
+        }
+        x.stop(r).await;
+    });
+}
+
+/// The sandbox cannot rewrite its own cgroup limits: from inside, a write to `pids.max` and to
+/// `memory.max` fails on the read-only cgroup mount, and the host still reads the manifest's
+/// values. Control, first: the same write form to `/tmp` succeeds.
+#[test]
+fn rt_ag_09_the_sandbox_cannot_rewrite_its_own_limits() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let r = launch_small(&x, "cgwrite", MEMORY_MIB).await;
+        let cg = cgroup(&x, &r).await;
+        let write =
+            |dir: &str, file: &str| format!("{{ echo 1 > {dir}/{file}; }} 2>&1; echo rc=$?");
+        for file in ["pids.max", "memory.max"] {
+            let (_, out) = exec(&r, &write("/tmp", file)).await;
+            assert!(
+                out.trim_end().ends_with("rc=0"),
+                "control: {file} in /tmp: {out}"
+            );
+            let (_, out) = exec(&r, &write("/sys/fs/cgroup", file)).await;
+            assert!(out.contains("Read-only file system"), "{file}: {out}");
+            assert!(!out.trim_end().ends_with("rc=0"), "{file}: {out}");
+        }
+        assert_eq!(read(&x, &r, &cg, "pids.max").trim(), PIDS.to_string());
+        assert_eq!(
+            read(&x, &r, &cg, "memory.max").trim(),
+            (MEMORY_MIB << 20).to_string()
+        );
+        x.stop(r).await;
     });
 }
 

@@ -227,7 +227,7 @@ zizmor:
 # Fuzz smoke: 60 s per target (needs nightly + cargo-fuzz; CI pins both).
 FUZZ_TARGETS := manifest secrets audit_line egress_head egress_rewrite egress_redact \
                 jsonrpc_message llm_request tool_path tool_args proc_stat fetch_url cli_frame \
-                oci_config oci_facts model_script gguf hf host_tables mountinfo
+                oci_config oci_facts model_script gguf hf host_tables mountinfo shown_line
 FUZZ_SECS ?= 60
 CARGO_FUZZ_TOOLCHAIN ?= +nightly
 fuzz:
@@ -267,7 +267,7 @@ doctor:
 REDTEAM_FILTER := test(/(^|::)rt_/)
 REDTEAM_WSL_TEST := rt_fs_11_wsl_a_windows_executable_does_not_reach_windows
 REDTEAM_WSL_FILTER := test(=$(REDTEAM_WSL_TEST))
-REDTEAM_COUNT := 209
+REDTEAM_COUNT := 247
 REDTEAM_LISTS := target/redteam-lists
 redteam:
 	@v=$$(podman info --format '{{.Host.CgroupsVersion}}'); \

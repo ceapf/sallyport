@@ -9,7 +9,7 @@ use crate::tools::ops::Ops;
 use super::*;
 
 /// Adds live session `id` with line mode over a fake command; its sink is the session's log.
-fn lined(f: &Fx, id: &str, mode: Mode) -> (Arc<Sink>, Arc<FakeExec>, Ops) {
+pub(super) fn lined(f: &Fx, id: &str, mode: Mode) -> (Arc<Sink>, Arc<FakeExec>, Ops) {
     f.fake.live.lock().unwrap().push((info(id), None));
     let (sink, record) = recorder(id);
     let exec = FakeExec::new(mode);
@@ -30,12 +30,12 @@ fn lined(f: &Fx, id: &str, mode: Mode) -> (Arc<Sink>, Arc<FakeExec>, Ops) {
     (sink, exec, ops)
 }
 
-fn attach(id: &str, argv: &[&str]) -> Value {
+pub(super) fn attach(id: &str, argv: &[&str]) -> Value {
     json!({"id": id, "argv": argv})
 }
 
 /// Frames until the one with request id `id`; the notifications before it.
-async fn until_reply(w: &mut Wire, id: i64) -> (Vec<Value>, Value) {
+pub(super) async fn until_reply(w: &mut Wire, id: i64) -> (Vec<Value>, Value) {
     let mut notes = Vec::new();
     loop {
         let f = w.frame().await.expect("the connection closed");

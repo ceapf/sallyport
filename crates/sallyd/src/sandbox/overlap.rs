@@ -565,7 +565,7 @@ mod tests {
     /// The daemon's sessions (what `serve` builds) admit exactly `MAX_LIVE_SESSIONS` sessions
     /// and share half of the descriptor limit.
     #[test]
-    fn the_daemons_sessions_hold_the_session_limit_and_half_the_descriptors() {
+    fn rt_ag_18_the_daemons_sessions_hold_the_session_limit_and_half_the_descriptors() {
         let s = Sessions::for_daemon(1 << 20);
         for n in 0..MAX_LIVE_SESSIONS {
             s.reserve(&format!("s{n}"), vec![], 0).unwrap();

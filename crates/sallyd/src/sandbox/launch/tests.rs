@@ -122,7 +122,7 @@ fn an_fd_budget_refusal_has_its_own_reason() {
 /// naming both numbers and the way out. TODO(#203): a container test of the audit entry and
 /// that nothing is created, for this reason and `fd-budget`.
 #[test]
-fn a_session_limit_refusal_has_its_own_reason() {
+fn rt_ag_18_a_session_limit_refusal_has_its_own_reason() {
     use crate::sandbox::budget::SessionLimit;
     use crate::sandbox::overlap::ReserveError;
     let e = LaunchError::from(ReserveError::SessionLimit(SessionLimit {

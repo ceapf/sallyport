@@ -7,6 +7,7 @@
 //! Location alone. The token goes only to a hop whose host is exactly [`API_HOST`], and only
 //! while the chain has never left it: once one hop has gone to another host, no later hop of
 //! that chain carries the token, a return to [`API_HOST`] included (it is followed without it).
+//! RT-MDL-11.
 #![deny(clippy::indexing_slicing)]
 
 use super::HfError;

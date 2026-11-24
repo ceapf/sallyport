@@ -70,7 +70,8 @@ pub(crate) fn admit(limit: u64, used: u64, needed: u64) -> Result<(), FdRefusal>
 /// The most sessions one `sallyd` keeps live at once. Every live session can leave containers
 /// in the orphan sweep's `podman ps` listing, and a listing over the launcher's stdout cap fails
 /// the whole sweep, so the count is bounded where a session is admitted, not where the listing
-/// is read (`orphans::tests::the_session_limit_keeps_the_worst_listing_under_the_cap`).
+/// is read (`orphans::tests::rt_ag_18_the_session_limit_keeps_the_worst_listing_under_the_cap`;
+/// RT-AG-18).
 pub const MAX_LIVE_SESSIONS: usize = 64;
 
 /// A session refused because `limit` sessions are already live

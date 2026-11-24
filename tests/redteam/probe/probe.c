@@ -1,5 +1,5 @@
 /*
- * Red-team syscall probe (RT-NET-01, RT-NET-08, RT-NET-12, RT-FS-17). Test-only: built at test time with
+ * Red-team syscall probe (RT-NET-01, RT-NET-08, RT-NET-12, RT-FS-17, RT-FS-24). Test-only: built at test time with
  * `cc -static`, copied into the throwaway test image, never linked into or shipped with any
  * Sallyport binary or release image (CLAUDE.md, exception to the no-unsafe rule). Keep it one
  * small file.
@@ -15,6 +15,8 @@
  *                                             or IPv6 (family 10) literal; the first error wins
  *   probe send <family> <type> <protocol> <address> <port>
  *                                             socket(2), then sendto(2) of one ICMP echo request
+ *   probe syscall <name> [<first>]            syscall(2) by name (`calls` below): its first
+ *                                             argument `first` (default 0), every other 0
  *
  * Numbers are decimal or 0x-hex. Prints "ok" or "errno=<n>" (send: "sent", "socket errno=<n>" or
  * "sendto errno=<n>") and exits 0 or 1; usage errors exit 2.
@@ -57,6 +59,33 @@ static int report(long rc) {
     }
     printf("ok\n");
     return 0;
+}
+
+#ifndef SYS_io_uring_setup
+#define SYS_io_uring_setup 425 /* the same number on every architecture */
+#endif
+
+/* System calls by name for `probe syscall`: `getpid` (allowed, the control) and one call of each
+ * class the profiles remove (RT-FS-24). */
+static const struct {
+    const char *name;
+    long nr;
+} calls[] = {
+    {"getpid", SYS_getpid},           {"mount", SYS_mount},
+    {"ptrace", SYS_ptrace},           {"bpf", SYS_bpf},
+    {"io_uring_setup", SYS_io_uring_setup}, {"keyctl", SYS_keyctl},
+    {"userfaultfd", SYS_userfaultfd}, {"open_by_handle_at", SYS_open_by_handle_at},
+};
+
+/* syscall(2) `name` with `first` as its first argument and every other argument 0. */
+static long by_name(const char *name, long first) {
+    for (size_t i = 0; i < sizeof calls / sizeof calls[0]; i++) {
+        if (strcmp(calls[i].name, name) == 0) {
+            return syscall(calls[i].nr, first, 0, 0, 0, 0, 0);
+        }
+    }
+    fprintf(stderr, "unknown system call: %s\n", name);
+    exit(2);
 }
 
 /* Parent side of a fork-like clone: reap the child, which exits 0 at once. */
@@ -152,8 +181,11 @@ int main(int argc, char **argv) {
     if (argc == 7 && strcmp(argv[1], "send") == 0) {
         return send_to(argv + 2);
     }
+    if ((argc == 3 || argc == 4) && strcmp(argv[1], "syscall") == 0) {
+        return report(by_name(argv[2], argc == 4 ? num(argv[3]) : 0));
+    }
     fprintf(stderr, "usage: probe socket|socketpair <family> <type> <protocol>"
-                    " | unshare|clone|clone3 <flags>"
+                    " | unshare|clone|clone3 <flags> | syscall <name> [<first>]"
                     " | connect|send <family> <type> <protocol> <address> <port>\n");
     return 2;
 }

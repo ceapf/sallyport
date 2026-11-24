@@ -382,6 +382,7 @@ fn rt_ag_10_driven_an_injected_readmes_instructions_are_each_denied() {
             seq,
             [
                 ("tool.run", "fetch"),
+                ("egress.resolve", "mock.test"),
                 ("egress.allow", "mock.test"),
                 ("egress.request", "mock.test"),
                 ("egress.response", "mock.test"),

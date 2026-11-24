@@ -524,7 +524,7 @@ async fn stop_ends_a_live_connection() {
 }
 
 #[tokio::test]
-async fn a_peer_with_another_uid_is_refused_and_recorded() {
+async fn rt_ag_19_a_peer_with_another_uid_is_refused_and_recorded() {
     let f = fx("peer");
     let dir = SockDir::new("peer");
     let path = dir.0.join("control.sock");

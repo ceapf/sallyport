@@ -1083,6 +1083,7 @@ sequenceDiagram
     P->>S: CONNECT api.github.com:443  (HTTPS_PROXY=127.0.0.1:3128)
     S->>E: new UDS connection, bytes copied
     E->>E: authority → policy: allowed, grant host → route Intercept
+    E->>E: audit egress.resolve {host, port}
     E->>E: resolve → filter (no loopback/private/link-local/own/connected-network) → pin IPs
     E->>E: audit egress.allow {host, port, addresses, intercept: true}
     E->>X: TCP to a pinned IP, TLS (rustls, SNI api.github.com, session trust roots)
@@ -1368,8 +1369,8 @@ sallyport/
   `head-too-large`), so a client sending a byte at a time costs no more than one sending a line
   at a time. Then policy, the host's own addresses and connected networks (`/proc/net/fib_trie`,
   `if_inet6` and `ipv6_route`, read together; a file over 1 MiB, unreadable or not understood,
-  or only one of the two IPv6 files present, refuses every connection as `ip-range-denied`), one
-  lookup (5 s) of the absolute name
+  or only one of the two IPv6 files present, refuses every connection as `ip-range-denied`),
+  `egress.resolve` (no lookup without it, RT-AUD-04), one lookup (5 s) of the absolute name
   `host.` (no search list), the address filter over every address (any denied address refuses
   the name; an answer of more than 64 addresses is `resolve-failed`, before duplicates are
   dropped), at most 3 pinned addresses tried (10 s each), `200`, and a tunnel with one 16 KiB
@@ -1412,7 +1413,9 @@ sallyport/
   no reply and no entry of its own, and its slot is freed. An over-rate connection is closed
   unread and has no effect; it is counted, not entered one by one: one `egress.shed` per second
   (`SHED_INTERVAL`) while any were closed, and one at the stop for an unfinished second. A count
-  whose entry fails to append is kept and goes into the next one; at the stop there is no next
+  whose entry fails to append is kept and goes into the next one (that failure also closes the
+  session's egress, as any failed egress append does: see "Egress audit events"); at the stop
+  there is no next
   one, so a failed final entry loses its count, and an abort of the accept task before that
   entry is written (past the stop grace, or a dropped handle) loses it unwritten, as either
   loses a connection's `egress.close` (RT-AUD-03's residual). Broker-originated connections
@@ -1435,6 +1438,18 @@ sallyport/
   before that, and its entry is not lost.
 - **Egress audit events** (Task 8). Written at every `audit.level`, each before its effect;
   `egress.response` and `egress.close` are records of what happened, written as below:
+  - `egress.resolve` (no decision), right before the one lookup: `{host, port}`; without it
+    there is no lookup (RT-AUD-04). An `egress.resolve` followed by neither `egress.allow` nor
+    `egress.deny` for its target, or an `egress.allow` followed by no `egress.close`, means a
+    stop, a failed append or the latch below ended the request.
+  - Once any of a session's egress appends has failed (a panic included), its egress is closed
+    for the rest of the session (RT-AUD-04): every later connection is closed at once, unread
+    and with no reply, after one best-effort `egress.deny {reason: "audit-failed"}` (none once
+    the session has stopped); `egress.resolve`,
+    `egress.allow` and an in-tunnel `egress.request` are no longer started, and one already
+    being written when the latch set has no effect after it, so nothing more is looked up,
+    dialled or forwarded (an open intercepted tunnel ends `error` at its next request; an open
+    spliced tunnel runs on to its end). Not reported beyond the log (#342).
   - `egress.allow` (decision `allow`), before the first dial and the `200`: `{host, port,
     addresses, intercept}` — the addresses that passed the filter, at most 16, in the order they
     are tried; `intercept` is true for a grant host (Task 9a-2).
@@ -1459,12 +1474,13 @@ sallyport/
   - `egress.deny` (decision `deny`), before the reply: `{reason, target, target_bytes,
     target_cut}` (the request-target masked with the session's own forms first, then cut at 256
     bytes and escaped, never a header; §7 Redaction), or `{reason, head_bytes}` when no target
-    was parsed; `filter: "host-addresses-unavailable"` when the host's own addresses could not
-    be read, with `cause` from a closed set: a table could not be read (which, and the I/O
-    error kind), was over the bound, or has a malformed line (which, and its number); the
-    `fib_trie` has no loopback address; only one of the two IPv6 tables exists; or the reader
-    task failed. Never a line's content or a path. When
-    the address filter refused, `address` (the first refused address of the
+    was parsed, or `{reason: "audit-failed"}` alone, with no reply, for a connection closed
+    because the session's egress is closed (RT-AUD-04); `filter: "host-addresses-unavailable"`
+    when the host's own addresses could not be read, with `cause` from a closed set: a table
+    could not be read (which, and the I/O error kind), was over the bound, or has a malformed
+    line (which, and its number); the `fib_trie` has no loopback address; only one of the two
+    IPv6 tables exists; or the reader task failed. Never a line's content or a path. When the
+    address filter refused, `address` (the first refused address of the
     answer, as resolved) and `rule` (`reserved-range`, `own-address` or `connected-network`).
     The reply to the sandbox carries the reason only.
   - `egress.limit` (decision `deny`): as `egress.deny`, for `too-many-connections` (decided at

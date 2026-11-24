@@ -243,7 +243,7 @@ fn the_read_and_list_checks_resolve_as_the_effects_do() {
 }
 
 #[test]
-fn only_regular_files_are_read() {
+fn rt_fs_21_only_regular_files_are_read() {
     let (m, _) = mount("read-kind");
     std::fs::create_dir(m.join("d")).unwrap();
     mkfifo(&m.join("fifo"));
@@ -447,7 +447,7 @@ fn a_write_below_the_free_space_floor_is_refused_before_any_effect() {
 }
 
 #[test]
-fn a_write_creates_or_replaces_a_regular_file_only() {
+fn rt_fs_21_a_write_creates_or_replaces_a_regular_file_only() {
     let (m, _) = mount("write");
     let root = host(&m).open(me()).unwrap();
     check_write(&root, "new", true).unwrap();
@@ -503,7 +503,7 @@ fn a_write_never_follows_a_symlink_out() {
 /// target escapes, and a name created by someone else between the probe and the create is
 /// refused rather than judged as the wrong case.
 #[test]
-fn a_symlink_target_escapes_and_a_lost_create_race_is_refused() {
+fn rt_fs_22_a_symlink_target_escapes_and_a_lost_create_race_is_refused() {
     let (m, _) = mount("guards");
     std::os::unix::fs::symlink("x", m.join("l")).unwrap();
     std::fs::write(m.join("f"), b"").unwrap();
@@ -523,7 +523,7 @@ fn a_symlink_target_escapes_and_a_lost_create_race_is_refused() {
 }
 
 #[test]
-fn a_brokered_write_refuses_a_hard_link_and_leaves_its_other_name_untouched() {
+fn rt_fs_20_a_brokered_write_refuses_a_hard_link_and_leaves_its_other_name_untouched() {
     let (m, out) = mount("hardlink");
     std::fs::hard_link(out.join("secret"), m.join("h")).unwrap();
     let root = host(&m).open(me()).unwrap();
@@ -541,7 +541,7 @@ fn a_brokered_write_refuses_a_hard_link_and_leaves_its_other_name_untouched() {
 
 /// Architect ruling Q37: the target is re-resolved from the pinned root at run time.
 #[test]
-fn a_directory_swapped_for_a_symlink_after_prepare_is_refused_at_run() {
+fn rt_fs_22_a_directory_swapped_for_a_symlink_after_prepare_is_refused_at_run() {
     let (m, out) = mount("swap");
     std::fs::create_dir(m.join("d")).unwrap();
     std::fs::write(m.join("d/f"), b"old").unwrap();
@@ -558,7 +558,7 @@ fn a_directory_swapped_for_a_symlink_after_prepare_is_refused_at_run() {
 }
 
 #[test]
-fn a_delete_takes_a_file_or_an_empty_directory_only() {
+fn rt_fs_21_a_delete_takes_a_file_or_an_empty_directory_only() {
     let (m, out) = mount("delete");
     std::fs::write(m.join("f"), b"x").unwrap();
     std::fs::create_dir(m.join("empty")).unwrap();
@@ -844,7 +844,7 @@ impl Drop for Lease {
 /// Q40: a file another process holds a lease on fails at once (`O_NONBLOCK`) instead of parking
 /// a broker thread, and with it the exec gate on a write, until the lease breaks.
 #[test]
-fn a_leased_file_fails_at_once_instead_of_stalling_the_broker() {
+fn rt_fs_23_a_leased_file_fails_at_once_instead_of_stalling_the_broker() {
     let (m, _) = mount("lease");
     std::fs::write(m.join("f"), b"x").unwrap();
     let root = host(&m).open(me()).unwrap();

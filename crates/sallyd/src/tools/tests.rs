@@ -618,8 +618,29 @@ async fn rt_fs_12_git_paths_are_protected_in_every_mode() {
 }
 
 /// RT-AG-05: a brokered write waits for approval; an ungranted delete is refused.
+///
+/// In-test control for the delete (first): a fixture from the same builder, differing only in
+/// `fs_delete` being granted, takes the same delete on the same brokered mount; it waits for its
+/// prompt (`deletes: **`) and, approved, the file is gone.
 #[tokio::test]
 async fn rt_ag_05_brokered_writes_wait_for_approval() {
+    let granted = Arc::new(fx("rt-ag-05-control", opts(all_modes())));
+    let kept = granted.dir("/workspace/notes").join("b.md");
+    std::fs::write(&kept, b"keep").unwrap();
+    let g2 = Arc::clone(&granted);
+    let h = tokio::spawn(async move {
+        g2.text("fs_delete", json!({"path": "/workspace/notes/b.md"}))
+            .await
+    });
+    let p = granted.until_shown(1).await;
+    assert_eq!(p.tool, "fs_delete", "control: the prompt");
+    decide(&granted.desk, &p.id, Decision::Approve, ME)
+        .await
+        .unwrap();
+    let out = h.await.unwrap();
+    assert!(!out.starts_with("denied"), "control: {out}");
+    assert!(!kept.exists(), "control: the granted delete left the file");
+
     let mut o = opts(all_modes());
     o.builtin.retain(|t| *t != BuiltinTool::FsDelete);
     let f = Arc::new(fx("rt-ag-05", o));
@@ -774,7 +795,7 @@ async fn rw_writes_run_unasked_in_the_workspace_view_holding_the_exec_gate() {
 /// The hard-link refusal is the brokered mount's alone (the broker would write through to the
 /// other name); in the workspace's own view the sandbox could write it anyway.
 #[tokio::test]
-async fn only_a_brokered_write_refuses_a_hard_link() {
+async fn rt_fs_20_only_a_brokered_write_refuses_a_hard_link() {
     let f = fx("hard-link", opts(all_modes()));
     for guest in ["/workspace/notes", "/workspace/rw"] {
         let d = f.dir(guest).to_owned();

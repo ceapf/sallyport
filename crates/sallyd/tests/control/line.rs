@@ -132,13 +132,38 @@ async fn sleeping(container: &str) -> bool {
 /// What the RT-CLI-01 commands print on stderr: plain text, so stderr is compared by equality
 /// against a stream that carries something (the allowed case), never only checked for absence.
 const STDERR_MARK: &str = "cli01-stderr\n";
-/// Prints the hostile `$1` on stdout, then [`STDERR_MARK`] on stderr.
-const STDERR_SCRIPT: &str = "printf \"$1\"; echo cli01-stderr >&2";
+/// Writes the hostile `$1` to [`RAW_FILE`] in the session's `rw` mount, prints it on stdout,
+/// then [`STDERR_MARK`] on stderr.
+const STDERR_SCRIPT: &str =
+    "printf \"$1\" > /workspace/p/raw; printf \"$1\"; echo cli01-stderr >&2";
+/// The file [`STDERR_SCRIPT`] writes, relative to the mount's host folder.
+const RAW_FILE: &str = "raw";
+
+/// The RT-CLI-01 probe: printable ASCII and `\n` only.
+fn printable(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .all(|b| *b == b'\n' || (0x20..0x7f).contains(b))
+}
+
+/// RT-CLI-01's control, in-test (the escaper left out of the path): the bytes the command
+/// printed, written by the same `printf` to a file in the `rw` mount and read on the host,
+/// fail the same [`printable`] probe, and are the [`HOSTILE_RAW_LEN`] bytes `sandbox.exec_result`
+/// counts.
+fn raw_bytes_fail_the_probe(host_dir: &std::path::Path) {
+    let raw = std::fs::read(host_dir.join(RAW_FILE)).expect("control: the raw file");
+    assert_eq!(raw.len() as u64, HOSTILE_RAW_LEN, "control: {raw:?}");
+    assert!(
+        !printable(&raw),
+        "control: the probe passes raw bytes: {raw:?}"
+    );
+}
 
 /// RT-CLI-01, the notification half: every terminal control the command prints reaches the
-/// client as printable text. Control: `sallyd`'s per-stream `StreamEscaper` (`tools/pipe.rs`);
-/// without it the raw bytes (or their lossy UTF-8) arrive and the text comparison fails.
-/// Allowed case: the command's plain stderr line arrives on stderr exactly, and nothing else.
+/// client as printable text. The defence: `sallyd`'s per-stream `StreamEscaper`
+/// (`tools/pipe.rs`); without it the raw bytes (or their lossy UTF-8) arrive and the text
+/// comparison fails. Control, in-test (first): [`raw_bytes_fail_the_probe`]. Allowed case: the
+/// command's plain stderr line arrives on stderr exactly, and nothing else.
 #[test]
 fn rt_cli_01_terminal_controls_reach_the_client_escaped() {
     rt().block_on(async {
@@ -151,14 +176,12 @@ fn rt_cli_01_terminal_controls_reach_the_client_escaped() {
             .await;
         let (reply, notes) = w.until_reply(n).await;
         assert_eq!(reply["result"], json!({"exit_code": 0}), "{reply}");
+        raw_bytes_fail_the_probe(&c.x.f.root.join("home/code/cli01"));
         assert_eq!(joined(&notes, "stdout"), HOSTILE_ESCAPED);
         assert_eq!(joined(&notes, "stderr"), STDERR_MARK);
         for n in &notes {
             let t = n["text"].as_str().unwrap();
-            assert!(
-                t.bytes().all(|b| b == b'\n' || (0x20..0x7f).contains(&b)),
-                "{t:?}"
-            );
+            assert!(printable(t.as_bytes()), "{t:?}");
         }
         let result = until_entry(&c, "sandbox.exec_result", |_| true).await;
         let all = c.x.events.all();
@@ -170,11 +193,12 @@ fn rt_cli_01_terminal_controls_reach_the_client_escaped() {
 
 /// RT-CLI-01, the CLI half: `sally sandbox run` over a real `control.sock` prints exactly the
 /// escaped text, on stderr exactly the command's own plain line (the allowed case) and nothing
-/// of its own, and exits with the command's code. Control: the `StreamEscaper` (as above);
+/// of its own, and exits with the command's code. The defence: the `StreamEscaper` (as above);
 /// without it the CLI's clean-check (`run::show`, through `clean::text`) still escapes, but
 /// differently (`\u{fffd}`, `\x0a`), adds its not-clean line on stderr and exits 1, so the
 /// stdout, stderr and code assertions all fail. The clean-check, the second layer, has its own
-/// tests in sally-cli (`run_tests.rs`).
+/// tests in sally-cli (`run_tests.rs`). Control, in-test (first): [`raw_bytes_fail_the_probe`],
+/// and the printed text passes the same probe.
 #[test]
 fn rt_cli_01_sally_sandbox_run_prints_the_escaped_text() {
     let c = cx();
@@ -203,6 +227,8 @@ fn rt_cli_01_sally_sandbox_run_prints_the_escaped_text() {
         let text = std::fs::read_to_string(&manifest).unwrap();
         sally_cli::run::sandbox_run(&mut client, &text, &argv, std::io::empty(), &mut o)
     };
+    raw_bytes_fail_the_probe(&c.x.f.root.join("home/code/cli01b"));
+    assert!(printable(&out), "{out:?}");
     let (out, err) = (
         String::from_utf8(out).unwrap(),
         String::from_utf8(err).unwrap(),

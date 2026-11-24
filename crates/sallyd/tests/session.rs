@@ -540,19 +540,26 @@ fn a_panicking_session_task_ends_only_its_session() {
     });
 }
 
-/// `runtime.timeout` (1m, the least the manifest allows): `session.timeout` before
-/// `session.stop timeout`, and the container is gone.
+/// RT-AG-09, the live `runtime.timeout` stop (1m, the least the manifest allows):
+/// `session.timeout` before `session.stop timeout`, and the container is gone. Control: the
+/// same session with a 10m timeout, started alongside, is still running at that moment.
 #[test]
-fn a_session_past_its_timeout_is_stopped() {
+fn rt_ag_09_a_session_past_its_timeout_is_stopped() {
     rt().block_on(async {
         let r = registry();
+        let long = Arc::new(r.x.f.validated("runtime:\n  timeout: 10m\n"));
+        let control = r.reg.start(long).await.unwrap();
         let v = Arc::new(r.x.f.validated("runtime:\n  timeout: 1m\n"));
         let info = r.reg.start(v).await.unwrap();
         until("the timeout", Duration::from_secs(90), || {
-            r.reg.list().is_empty()
+            r.reg.list().iter().all(|s| s.id != info.id)
         })
         .await;
         assert!(!exists(&info.container));
+        assert!(
+            r.reg.list().iter().any(|s| s.id == control.id) && exists(&control.container),
+            "control: the 10m session still runs"
+        );
         let all = session_events(&r.x);
         let at = all.iter().position(|e| e == "session.timeout").unwrap();
         assert_eq!(all.get(at + 1).map(String::as_str), Some("session.stop"));
@@ -560,6 +567,10 @@ fn a_session_past_its_timeout_is_stopped() {
         assert_eq!(
             r.x.events.args("session.timeout").unwrap()["timeout_secs"],
             60
+        );
+        assert_eq!(
+            r.reg.stop(&control.id, StopReason::Request).await,
+            Some(StopOutcome::Stopped)
         );
     });
 }
@@ -911,17 +922,21 @@ fn rt_ag_15_a_prompt_pending_at_the_stop_is_withdrawn_before_it() {
         let hub = Arc::new(Hub::default());
         let r = registry_hub(Some(test_image()), Arc::clone(&hub));
         let mut watch = hub.watch();
-        let v = Arc::new(
-            r.x.f
-                .validated("tools:\n  builtin: [shell]\n  shell: approve\n"),
-        );
+        // The command has an effect the host can see: a file in an `rw` mount.
+        let at = r.x.f.root.join("home/code/ag15p");
+        std::fs::create_dir_all(&at).unwrap();
+        let v = Arc::new(r.x.f.validated(&format!(
+            "{}tools:\n  builtin: [shell]\n  shell: approve\n",
+            mounts(&[mount("~/code/ag15p", "/workspace/p", "rw")])
+        )));
         let s = r.reg.start(v).await.unwrap();
         let sock = r.x.session_paths(&s.id).harness_sockets().join(AGENT_SOCK);
         let (conn, _dir) = connect(&sock).await;
         let (rd, mut wr) = conn.into_split();
         let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": {"_meta": meta(), "name": "shell",
-                       "arguments": {"cmd": ["true"], "cwd": "/workspace"}}});
+                       "arguments": {"cmd": ["touch", "/workspace/p/ran"],
+                                     "cwd": "/workspace/p"}}});
         wr.write_all(format!("{call}\n").as_bytes()).await.unwrap();
         let note = tokio::time::timeout(Duration::from_secs(30), watch.rx.recv())
             .await
@@ -967,6 +982,12 @@ fn rt_ag_15_a_prompt_pending_at_the_stop_is_withdrawn_before_it() {
             !all.iter().any(|(e, _)| e == "approval.decide"),
             "nobody answered: {all:#?}"
         );
+        // Whatever the reply did or did not say, the call never ran: no `tool.run`, no file.
+        assert!(
+            !all.iter().any(|(e, _)| e == "tool.run"),
+            "the waiting call ran: {all:#?}"
+        );
+        assert!(!at.join("ran").exists(), "the waiting command ran");
         let (_, after) = after_stop(&r.x);
         assert!(after.is_empty(), "entries after session.stop: {after:?}");
     });

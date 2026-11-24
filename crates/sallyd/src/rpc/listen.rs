@@ -2,7 +2,7 @@
 //! connections at once (past that nothing more is accepted until one ends), and a peer-UID check
 //! before a single byte is read. Rootless Podman runs the sandboxes with `--userns=keep-id` and
 //! the user's own UID, so a legitimate peer is always that UID; any other peer is refused, its
-//! refusal recorded by the server, and its stream closed.
+//! refusal recorded by the server, and its stream closed (RT-AG-19).
 
 use std::future::Future;
 use std::io;
@@ -270,7 +270,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn another_uid_is_refused_before_a_byte_is_read() {
+    async fn rt_ag_19_another_uid_is_refused_before_a_byte_is_read() {
         let (d, l) = listener();
         let p = Arc::new(Probe::default());
         let other = me().wrapping_add(1);

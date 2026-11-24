@@ -8,7 +8,8 @@
 //! 3. A manifest kept inside one of its own `rw` or `brokered` mounts is refused (1).
 //! 4. The block (the summary, each warning, each acknowledged risk) is shown on the terminal the
 //!    answer is read from when a question follows, and on stderr otherwise. A block line that
-//!    fails the clean-check refuses the launch (1), naming the first such line, escaped.
+//!    fails the clean-check, or holds an escape of a control, direction or invisible character
+//!    (RT-MAN-05), refuses the launch (1), naming the first such line, escaped, and why.
 //!    Warnings and acknowledged risks decide only which lines follow the summary.
 //! 5. Every launch needs consent. A given `--accept-manifest` is the consent, on a terminal too:
 //!    it must name the SHA-256 of the text read (1 otherwise, never a question instead), and
@@ -26,6 +27,7 @@ use std::path::Path;
 
 use sally_core::manifest::{HostEnv, ManifestPlace, Validated, summary};
 use sally_core::model::hash::{Digest, Hasher};
+use sally_core::text;
 
 use crate::approve::Tty;
 use crate::commands::read_manifest;
@@ -202,23 +204,39 @@ pub fn besides_summary(v: &Validated) -> Vec<String> {
 
 /// The lines shown before a launch of `v`: the summary's, then [`besides_summary`].
 ///
-/// TODO(#257): the summary's lines are printable ASCII, but the data-can-leave warning shown
-/// after it shows realpaths raw, so a manifest with a mount whose realpath holds non-ASCII text,
-/// which the spec accepts, cannot be launched from the CLI.
+/// Manifest and host text reaches these lines escaped, so text outside ASCII (letters, marks,
+/// symbols, private-use and unassigned code points) is shown escaped and can be consented to. A
+/// launch still never shows a control (a tab or a newline included), a direction mark or an
+/// invisible character, escaped or not (RT-MAN-05): each line passes the clean-check, then
+/// [`text::refused_escape`].
 ///
 /// # Errors
-/// The first line that fails the clean-check, escaped (printable ASCII): such a manifest starts
+/// The first line that cannot be shown, escaped (printable ASCII), with the reason: not
+/// printable ASCII, or the escape it holds of a refused character. Such a manifest starts
 /// nothing, and `sally manifest summary` prints no hash for it.
 pub fn block(v: &Validated) -> Result<Vec<String>, String> {
     let s = summary(&v.manifest);
     s.lines()
         .map(ToOwned::to_owned)
         .chain(besides_summary(v))
-        .map(|l| {
-            let c = clean::line(&l);
-            if c.clean { Ok(c.text) } else { Err(c.text) }
-        })
+        .map(|l| shown(&l))
         .collect()
+}
+
+/// `line` as a launch shows it, or why it cannot be shown.
+fn shown(line: &str) -> Result<String, String> {
+    let c = clean::line(line);
+    if !c.clean {
+        return Err(format!("{} (not printable ASCII)", c.text));
+    }
+    match text::refused_escape(&c.text) {
+        None => Ok(c.text),
+        Some(escape) => Err(format!(
+            "{} (it holds {escape}: a control, direction or invisible character, which a launch \
+             never shows)",
+            c.text
+        )),
+    }
 }
 
 /// The SHA-256 of `text`, as `--accept-manifest` names it.

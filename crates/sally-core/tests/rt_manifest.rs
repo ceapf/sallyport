@@ -232,8 +232,30 @@ fn rt_man_01_the_parts_cover_every_case_once() {
     assert_eq!(PART_INDICES, (0..PARTS).collect::<Vec<_>>());
 }
 
+/// The ladder's top-level keys are unknown fields too, so through `parse` only the in-field
+/// cases show the anchor limit answering; the ladder against the limit alone is
+/// `manifest::parse::tests::rt_man_01_an_alias_ladder_is_refused_by_the_anchor_limit`.
+/// Control: return value, in-test (first): each in-field case without its anchor and aliases,
+/// the values written out, through the same `parse`, is accepted.
 #[test]
 fn rt_man_01_alias_bombs_are_refused() {
+    for twin in [
+        format!("{HEADER}description: hi\nfilesystem:\n  deny: [hi, hi]\n"),
+        format!("{HEADER}description: hi\n"),
+    ] {
+        parse(&twin).unwrap_or_else(|e| panic!("control: {twin:?}: {e:?}"));
+    }
+    for anchored in [
+        format!("{HEADER}description: &x hi\nfilesystem:\n  deny: [*x, *x]\n"),
+        format!("{HEADER}description: &x hi\n"),
+    ] {
+        let e = parse(&anchored).unwrap_err();
+        assert_eq!(e.errors[0].code, Code::Syntax, "{e:?}");
+        assert!(
+            e.errors[0].message.contains("budget breached: Anchors"),
+            "{e:?}"
+        );
+    }
     let laughs = "a: &a [x, x, x, x, x, x, x, x, x, x]\n\
                   b: &b [*a, *a, *a, *a, *a, *a, *a, *a, *a, *a]\n\
                   c: &c [*b, *b, *b, *b, *b, *b, *b, *b, *b, *b]\n\
@@ -284,6 +306,10 @@ fn rt_man_01_the_size_limit_is_inclusive() {
     assert_eq!(e.errors[0].code, Code::TooLarge);
 }
 
+/// Through `parse` these inputs are refused, in time, by whatever answers first: the schema
+/// (a list where `description`'s string goes, an unknown field) or the scanner's recursion
+/// limit. The depth limit with its own error, beside an accepted twin at depth 16, is
+/// `manifest::parse::tests::rt_man_01_nesting_past_the_depth_limit_is_refused_by_it`.
 #[test]
 fn rt_man_01_deep_nesting_is_refused() {
     for text in [
@@ -350,6 +376,32 @@ fn rt_man_01_duplicate_keys_tags_and_documents() {
             (e.errors[0].code, e.errors[0].path.as_str()),
             (*code, *path),
             "{text}"
+        );
+    }
+    // The duplicate-key clause, with its own error. Control: return value, in-test: each twin
+    // differs from its case only in the second key's name, through the same `parse`, and is
+    // accepted.
+    let env = |second: &str| {
+        format!(
+            "{HEADER}tools:\n  mcp:\n    - {{name: a, command: [x], env: {{A: \"1\", {second}: \"2\"}}}}\n"
+        )
+    };
+    for (twin, duplicate) in [
+        (
+            format!("{HEADER}description: other\n"),
+            format!("{HEADER}name: other\n"),
+        ),
+        (
+            format!("{HEADER}runtime:\n  pids: 64\n  cpus: 2\n"),
+            format!("{HEADER}runtime:\n  pids: 64\n  pids: 2\n"),
+        ),
+        (env("B"), env("A")),
+    ] {
+        parse(&twin).unwrap_or_else(|e| panic!("control: {twin:?}: {e:?}"));
+        let e = parse(&duplicate).expect_err(&duplicate);
+        assert!(
+            e.errors[0].message.contains("duplicate mapping key"),
+            "{e:?}"
         );
     }
     // `!!binary` never silently decodes into a string: the literal text is what is validated.
@@ -612,9 +664,22 @@ fn the_place_check_refuses_a_manifest_inside_its_own_writable_mount() {
 
 // ---- RT-FS-05: denylisted mounts ---------------------------------------------------------------
 
+/// Control: return value, in-test (first): the same body, through the same `load`, differing
+/// only in the host (an ordinary folder in the home, and one by absolute path outside it), is
+/// accepted.
 #[test]
 fn rt_fs_05_denylisted_mounts_rejected() {
     let f = Fixture::new();
+    let body = |host: &str| {
+        format!(
+            "filesystem:\n  mounts:\n    - {{host: \"{host}\", guest: /workspace/x, mode: ro}}\n"
+        )
+    };
+    let outside = f.root.join("elsewhere");
+    std::fs::create_dir(&outside).unwrap();
+    for host in ["~/code/myproject".to_owned(), outside.display().to_string()] {
+        twin_ok(&f, &body(&host));
+    }
     let runtime_dir = f.env.xdg_runtime_dir.clone().unwrap();
     for host in [
         "~".to_owned(),
@@ -654,10 +719,7 @@ fn rt_fs_05_denylisted_mounts_rejected() {
         "/tmp/.X11-unix".to_owned(),
         "/var/tmp".to_owned(),
     ] {
-        let body = format!(
-            "filesystem:\n  mounts:\n    - {{host: \"{host}\", guest: /workspace/x, mode: ro}}\n"
-        );
-        let r = f.load(&body);
+        let r = f.load(&body(&host));
         assert_rejects(&r, "filesystem.mounts[0].host", Code::Denylisted);
         assert!(rendered(&r)[0].contains("denylisted"), "{host}");
     }
@@ -874,22 +936,33 @@ fn rt_sec_08_secret_values_cannot_enter_through_the_manifest() {
 /// A token pasted as a secret name that its check refuses, with a slash, a space or a quote in
 /// it, is not echoed by the warnings either: with an allow rule, the `[data-can-leave]` warning
 /// names grants, and only a checked name is masked whole when quoted (architect Q376). Control:
-/// the name guard in `validate/exposure.rs` (without it the warning echoes the token).
+/// in-test (first), the same body with a name its check accepts, holding the token's upper-case
+/// run, through the same `load` and `rendered_all`, shows that run in the warning; so the
+/// warning names a grant's secret and only the name guard in `validate/exposure.rs` keeps the
+/// malformed ones out.
 fn rt_sec_08_malformed_names_in_warnings(f: &Fixture) {
     let tok = fake_token(&["gh", "p_"], "0123456789abcdefghijABCDEFGHIJ");
+    let body = |name: &str| {
+        format!(
+            "network:\n  mode: proxy\n  allow:\n    - host: api.github.com\nsecrets:\n  - name: \
+             '{name}'\n    inject: {{host: api.github.com, header: H, format: \"{{value}}\"}}\n"
+        )
+    };
+    let shown = rendered_all(&f.load(&body("T_ABCDEFGHIJ"))).join("\n");
+    assert!(shown.contains("[data-can-leave]"), "control: {shown}");
+    assert!(
+        shown.contains("ABCDEFGHIJ"),
+        "control: a checked name is not shown: {shown}"
+    );
     for name in [
         format!("A/{tok}"),
         format!("Bearer {tok}"),
         format!("X\"{tok}"),
     ] {
-        let body = format!(
-            "network:\n  mode: proxy\n  allow:\n    - host: api.github.com\nsecrets:\n  - name: \
-             '{name}'\n    inject: {{host: api.github.com, header: H, format: \"{{value}}\"}}\n"
-        );
-        let shown = rendered_all(&f.load(&body)).join("\n");
+        let shown = rendered_all(&f.load(&body(&name))).join("\n");
         assert!(shown.contains("[data-can-leave]"), "{shown}");
         assert!(
-            !shown.contains("0123456789abcdefghij"),
+            !shown.contains("0123456789abcdefghij") && !shown.contains("ABCDEFGHIJ"),
             "token echoed: {shown}"
         );
     }
@@ -1028,7 +1101,7 @@ const PINNED_IMAGE: &str =
 
 /// For each setting that loosens a default: `(field, default text, changed text, phrase)`, the
 /// field as the JSON schema names it (`Type.field`). The variant replaces the default text once;
-/// its summary must hold the phrase, the base's must not. Every field `FIELDS` marks
+/// its summary must hold the phrase, the base's must not. Every field [`classes`] marks
 /// `WhenNotDefault` has a row.
 const LOOSENED: &[(&str, &str, &str, &str)] = &[
     (
@@ -1240,6 +1313,19 @@ fn rt_man_05_hostile_manifest_text_is_shown_escaped_on_one_line_each() {
         plain.lines().count(),
         "{s}\n---\n{plain}"
     );
+    // Shown escaped is not consentable: the launch gate reads each line's escapes and refuses one
+    // showing a control, a direction mark or an invisible character; the plain twin reads clean.
+    assert!(
+        s.lines()
+            .any(|l| sally_core::text::refused_escape(l).is_some()),
+        "{s}"
+    );
+    assert!(
+        plain
+            .lines()
+            .all(|l| sally_core::text::refused_escape(l).is_none()),
+        "{plain}"
+    );
     for escaped in [
         // The folder name, in the data-can-leave line and the mount's line.
         r"my\u{202e}proj\u{200b}ect",
@@ -1272,6 +1358,54 @@ fn rt_man_05_hostile_manifest_text_is_shown_escaped_on_one_line_each() {
         let n: usize = n.parse().unwrap();
         assert!(n > 0 && n < 4096, "{line}");
         assert!(rest.starts_with("each of its tool calls"), "{line}");
+    }
+}
+
+/// The launch gate's reader rests on one premise: every backslash in a shown line was written by
+/// an escaper. For manifests with no backslash, quote or non-printable text in any value or path
+/// (the shipped examples, `LOOSEN_BASE` and the plain disguise twin), no summary line, warning
+/// or acknowledged risk holds a backslash (RT-MAN-05).
+#[test]
+fn only_an_escaper_writes_a_backslash_in_a_shown_line() {
+    let f = Fixture::new();
+    let catalog: std::collections::BTreeSet<String> = ["GITHUB_TOKEN", "BRAVE_SEARCH_KEY"]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    let p = concat!(env!("CARGO_MANIFEST_DIR"), "/../../manifests/examples/");
+    let mut texts: Vec<(String, String)> =
+        ["coding-agent.yaml", "web-research.yaml", "chat-only.yaml"]
+            .iter()
+            .map(|n| {
+                (
+                    (*n).to_owned(),
+                    std::fs::read_to_string(format!("{p}{n}")).unwrap(),
+                )
+            })
+            .collect();
+    texts.push(("LOOSEN_BASE".to_owned(), format!("{HEADER}{LOOSEN_BASE}")));
+    texts.push((
+        "plain disguise twin".to_owned(),
+        format!("{HEADER}{}", disguise_body("myproject", "other", false)),
+    ));
+    for (name, text) in texts {
+        let v = sally_core::manifest::load(&text, &f.env, &catalog)
+            .unwrap_or_else(|e| panic!("{name}: {e:#?}"));
+        let shown: Vec<String> = sally_core::manifest::summary(&v.manifest)
+            .lines()
+            .map(ToOwned::to_owned)
+            .chain(v.warnings.iter().map(ToString::to_string))
+            .chain(
+                v.manifest
+                    .acknowledged_risks()
+                    .iter()
+                    .map(ToString::to_string),
+            )
+            .collect();
+        assert!(shown.len() > 2, "{name}: {shown:#?}");
+        for line in &shown {
+            assert!(!line.contains('\\'), "{name}: {line}");
+        }
     }
 }
 
@@ -1309,83 +1443,335 @@ enum Shown {
     Section,
 }
 
-/// Every field of the manifest, classified. A new field fails
-/// `rt_man_05_every_manifest_field_is_classified_for_the_summary` until it is added here.
-const FIELDS: &[(&str, Shown)] = &[
-    ("Manifest.apiVersion", Shown::NotALoosening),
-    ("Manifest.kind", Shown::NotALoosening),
-    ("Manifest.name", Shown::NotALoosening),
-    ("Manifest.description", Shown::NotALoosening),
-    ("Manifest.model", Shown::Section),
-    ("Manifest.harness", Shown::WhenNotDefault),
-    ("Manifest.runtime", Shown::Section),
-    ("Manifest.filesystem", Shown::Section),
-    ("Manifest.network", Shown::Section),
-    ("Manifest.secrets", Shown::Section),
-    ("Manifest.tools", Shown::Section),
-    ("Manifest.approvals", Shown::Section),
-    ("Manifest.audit", Shown::Section),
-    ("Manifest.policy", Shown::Section),
-    ("Approvals.timeout", Shown::WhenNotDefault),
-    ("Approvals.max_pending", Shown::WhenNotDefault),
-    ("ApproveGlobs.writes", Shown::Always),
-    ("ApproveGlobs.deletes", Shown::Always),
-    ("Audit.level", Shown::WhenNotDefault),
-    ("Filesystem.mounts", Shown::Always),
-    ("Filesystem.deny", Shown::NotALoosening),
-    ("Harness.image", Shown::Always),
-    ("HostRule.host", Shown::Always),
-    ("HostRule.ports", Shown::Always),
-    ("Inject.host", Shown::Always),
-    ("Inject.header", Shown::Always),
-    ("Inject.format", Shown::Always),
-    ("Inject.basic_user", Shown::NotALoosening),
-    ("McpServer.name", Shown::Always),
-    ("McpServer.command", Shown::Always),
-    // Its keys are shown; its values are not a loosening.
-    ("McpServer.env", Shown::Always),
-    ("McpServer.approve", Shown::Always),
-    ("Model.ref", Shown::Always),
-    ("Model.context", Shown::NotALoosening),
-    ("Model.gpu_layers", Shown::NotALoosening),
-    ("Mount.host", Shown::Always),
-    ("Mount.guest", Shown::Always),
-    ("Mount.mode", Shown::Always),
-    ("Mount.approve", Shown::Always),
-    ("Network.mode", Shown::Always),
-    ("Network.allow", Shown::Always),
-    (
-        "Network.acknowledge_unrestricted_egress",
+/// Each field's class, as `Type.field` names it in the JSON schema.
+type Classed = Vec<(&'static str, Shown)>;
+
+/// Records `name`'s class. `_value` is the field's binding, so a field bound but used nowhere is
+/// an unused variable, which each function below refuses (`deny(unused_variables)`). A field
+/// also handed to a nested function or an `if let` (each section, `mounts`, `approve`, `allow`,
+/// `inject`, `mcp`) is used there too; for those the schema comparison is the guard.
+fn class<T: ?Sized>(out: &mut Classed, name: &'static str, _value: &T, shown: Shown) {
+    out.push((name, shown));
+}
+
+/// A manifest holding a value of every struct type of the manifest, so each function below runs
+/// (parsed only: no host facts are needed to take it apart).
+fn every_type() -> sally_core::manifest::Manifest {
+    let text = format!(
+        "{HEADER}harness:\n  image: {PINNED_IMAGE}\nruntime:\n  image: {PINNED_IMAGE}\n\
+         filesystem:\n  mounts:\n    - host: \"~/p\"\n      guest: /workspace/p\n      \
+         mode: brokered\n      approve:\n        writes: [\"*\"]\nnetwork:\n  mode: proxy\n  \
+         allow:\n    - host: api.github.com\nsecrets:\n  - name: GITHUB_TOKEN\n    inject: \
+         {{host: api.github.com, header: Authorization, format: \"Bearer {{value}}\"}}\n\
+         tools:\n  mcp:\n    - {{name: x, command: [srv]}}\n"
+    );
+    parse(&text).unwrap_or_else(|e| panic!("{e:#?}"))
+}
+
+/// Every field of the manifest, classified. Each function below takes one struct type of the
+/// manifest apart field by field, with no `..` and no `_` pattern (keep it so), so a field added
+/// to a type does not compile until it is bound and classed here (RT-MAN-05).
+fn classes() -> Classed {
+    let mut out = Classed::new();
+    manifest_classes(&every_type(), &mut out);
+    out
+}
+
+#[deny(unused_variables)]
+fn manifest_classes(m: &sally_core::manifest::Manifest, out: &mut Classed) {
+    let sally_core::manifest::Manifest {
+        api_version,
+        kind,
+        name,
+        description,
+        harness,
+        runtime,
+        model,
+        filesystem,
+        network,
+        secrets,
+        tools,
+        approvals,
+        audit,
+        policy,
+    } = m;
+    class(
+        out,
+        "Manifest.apiVersion",
+        api_version,
         Shown::NotALoosening,
-    ),
-    ("Network.max_request_bytes", Shown::WhenNotDefault),
-    ("Network.max_response_bytes", Shown::WhenNotDefault),
-    ("Network.max_connections", Shown::WhenNotDefault),
-    ("Policy.signed_by", Shown::NotALoosening),
-    ("Policy.signature", Shown::NotALoosening),
-    ("Runtime.image", Shown::WhenNotDefault),
-    ("Runtime.cpus", Shown::Always),
-    ("Runtime.memory", Shown::Always),
-    ("Runtime.pids", Shown::Always),
-    ("Runtime.timeout", Shown::Always),
-    ("Runtime.tmp_size", Shown::WhenNotDefault),
-    ("Runtime.tmp_exec", Shown::WhenNotDefault),
-    ("Runtime.stage_size", Shown::WhenNotDefault),
-    ("SecretGrant.name", Shown::Always),
-    ("SecretGrant.inject", Shown::Section),
-    ("SecretGrant.expose_env", Shown::WhenNotDefault),
-    ("Tools.builtin", Shown::Always),
-    ("Tools.shell", Shown::Always),
-    ("Tools.destructive_requires_approval", Shown::Always),
-    ("Tools.fetch_writes", Shown::Always),
-    ("Tools.acknowledge_unapproved", Shown::NotALoosening),
-    ("Tools.mcp", Shown::Always),
-];
+    );
+    class(out, "Manifest.kind", kind, Shown::NotALoosening);
+    class(out, "Manifest.name", name, Shown::NotALoosening);
+    class(
+        out,
+        "Manifest.description",
+        description,
+        Shown::NotALoosening,
+    );
+    class(out, "Manifest.model", model, Shown::Section);
+    class(out, "Manifest.harness", harness, Shown::WhenNotDefault);
+    class(out, "Manifest.runtime", runtime, Shown::Section);
+    class(out, "Manifest.filesystem", filesystem, Shown::Section);
+    class(out, "Manifest.network", network, Shown::Section);
+    class(out, "Manifest.secrets", secrets, Shown::Section);
+    class(out, "Manifest.tools", tools, Shown::Section);
+    class(out, "Manifest.approvals", approvals, Shown::Section);
+    class(out, "Manifest.audit", audit, Shown::Section);
+    class(out, "Manifest.policy", policy, Shown::Section);
+    model_classes(model, out);
+    if let Some(h) = harness {
+        harness_classes(h, out);
+    }
+    runtime_classes(runtime, out);
+    filesystem_classes(filesystem, out);
+    network_classes(network, out);
+    if let Some(s) = secrets.first() {
+        secret_classes(s, out);
+    }
+    tools_classes(tools, out);
+    approvals_classes(approvals, out);
+    audit_classes(audit, out);
+    policy_classes(policy, out);
+}
+
+#[deny(unused_variables)]
+fn model_classes(m: &sally_core::manifest::Model, out: &mut Classed) {
+    let sally_core::manifest::Model {
+        reference,
+        context,
+        gpu_layers,
+    } = m;
+    class(out, "Model.ref", reference, Shown::Always);
+    class(out, "Model.context", context, Shown::NotALoosening);
+    class(out, "Model.gpu_layers", gpu_layers, Shown::NotALoosening);
+}
+
+#[deny(unused_variables)]
+fn harness_classes(h: &sally_core::manifest::Harness, out: &mut Classed) {
+    let sally_core::manifest::Harness { image } = h;
+    class(out, "Harness.image", image, Shown::Always);
+}
+
+#[deny(unused_variables)]
+fn runtime_classes(r: &sally_core::manifest::Runtime, out: &mut Classed) {
+    let sally_core::manifest::Runtime {
+        image,
+        cpus,
+        memory,
+        pids,
+        timeout,
+        tmp_size,
+        tmp_exec,
+        stage_size,
+    } = r;
+    class(out, "Runtime.image", image, Shown::WhenNotDefault);
+    class(out, "Runtime.cpus", cpus, Shown::Always);
+    class(out, "Runtime.memory", memory, Shown::Always);
+    class(out, "Runtime.pids", pids, Shown::Always);
+    class(out, "Runtime.timeout", timeout, Shown::Always);
+    class(out, "Runtime.tmp_size", tmp_size, Shown::WhenNotDefault);
+    class(out, "Runtime.tmp_exec", tmp_exec, Shown::WhenNotDefault);
+    class(out, "Runtime.stage_size", stage_size, Shown::WhenNotDefault);
+}
+
+#[deny(unused_variables)]
+fn filesystem_classes(f: &sally_core::manifest::Filesystem, out: &mut Classed) {
+    let sally_core::manifest::Filesystem { mounts, deny } = f;
+    class(out, "Filesystem.mounts", mounts, Shown::Always);
+    class(out, "Filesystem.deny", deny, Shown::NotALoosening);
+    if let Some(m) = mounts.first() {
+        mount_classes(m, out);
+    }
+}
+
+#[deny(unused_variables)]
+fn mount_classes(m: &sally_core::manifest::Mount, out: &mut Classed) {
+    let sally_core::manifest::Mount {
+        host,
+        guest,
+        mode,
+        approve,
+    } = m;
+    class(out, "Mount.host", host, Shown::Always);
+    class(out, "Mount.guest", guest, Shown::Always);
+    class(out, "Mount.mode", mode, Shown::Always);
+    class(out, "Mount.approve", approve, Shown::Always);
+    if let Some(a) = approve {
+        approve_classes(a, out);
+    }
+}
+
+#[deny(unused_variables)]
+fn approve_classes(a: &sally_core::manifest::ApproveGlobs, out: &mut Classed) {
+    let sally_core::manifest::ApproveGlobs { writes, deletes } = a;
+    class(out, "ApproveGlobs.writes", writes, Shown::Always);
+    class(out, "ApproveGlobs.deletes", deletes, Shown::Always);
+}
+
+#[deny(unused_variables)]
+fn network_classes(n: &sally_core::manifest::Network, out: &mut Classed) {
+    let sally_core::manifest::Network {
+        mode,
+        allow,
+        acknowledge_unrestricted_egress,
+        max_request_bytes,
+        max_response_bytes,
+        max_connections,
+    } = n;
+    class(out, "Network.mode", mode, Shown::Always);
+    class(out, "Network.allow", allow, Shown::Always);
+    class(
+        out,
+        "Network.acknowledge_unrestricted_egress",
+        acknowledge_unrestricted_egress,
+        Shown::NotALoosening,
+    );
+    class(
+        out,
+        "Network.max_request_bytes",
+        max_request_bytes,
+        Shown::WhenNotDefault,
+    );
+    class(
+        out,
+        "Network.max_response_bytes",
+        max_response_bytes,
+        Shown::WhenNotDefault,
+    );
+    class(
+        out,
+        "Network.max_connections",
+        max_connections,
+        Shown::WhenNotDefault,
+    );
+    if let Some(r) = allow.first() {
+        host_rule_classes(r, out);
+    }
+}
+
+#[deny(unused_variables)]
+fn host_rule_classes(r: &sally_core::manifest::HostRule, out: &mut Classed) {
+    let sally_core::manifest::HostRule { host, ports } = r;
+    class(out, "HostRule.host", host, Shown::Always);
+    class(out, "HostRule.ports", ports, Shown::Always);
+}
+
+#[deny(unused_variables)]
+fn secret_classes(s: &sally_core::manifest::SecretGrant, out: &mut Classed) {
+    let sally_core::manifest::SecretGrant {
+        name,
+        inject,
+        expose_env,
+    } = s;
+    class(out, "SecretGrant.name", name, Shown::Always);
+    class(out, "SecretGrant.inject", inject, Shown::Section);
+    class(
+        out,
+        "SecretGrant.expose_env",
+        expose_env,
+        Shown::WhenNotDefault,
+    );
+    inject_classes(inject, out);
+}
+
+#[deny(unused_variables)]
+fn inject_classes(i: &sally_core::manifest::Inject, out: &mut Classed) {
+    let sally_core::manifest::Inject {
+        host,
+        header,
+        format,
+        basic_user,
+    } = i;
+    class(out, "Inject.host", host, Shown::Always);
+    class(out, "Inject.header", header, Shown::Always);
+    class(out, "Inject.format", format, Shown::Always);
+    class(out, "Inject.basic_user", basic_user, Shown::NotALoosening);
+}
+
+#[deny(unused_variables)]
+fn tools_classes(t: &sally_core::manifest::Tools, out: &mut Classed) {
+    let sally_core::manifest::Tools {
+        builtin,
+        shell,
+        destructive_requires_approval,
+        fetch_writes,
+        acknowledge_unapproved,
+        mcp,
+    } = t;
+    class(out, "Tools.builtin", builtin, Shown::Always);
+    class(out, "Tools.shell", shell, Shown::Always);
+    class(
+        out,
+        "Tools.destructive_requires_approval",
+        destructive_requires_approval,
+        Shown::Always,
+    );
+    class(out, "Tools.fetch_writes", fetch_writes, Shown::Always);
+    class(
+        out,
+        "Tools.acknowledge_unapproved",
+        acknowledge_unapproved,
+        Shown::NotALoosening,
+    );
+    class(out, "Tools.mcp", mcp, Shown::Always);
+    if let Some(s) = mcp.first() {
+        mcp_classes(s, out);
+    }
+}
+
+#[deny(unused_variables)]
+fn mcp_classes(s: &sally_core::manifest::McpServer, out: &mut Classed) {
+    let sally_core::manifest::McpServer {
+        name,
+        command,
+        env,
+        approve,
+    } = s;
+    class(out, "McpServer.name", name, Shown::Always);
+    class(out, "McpServer.command", command, Shown::Always);
+    // Its keys are shown; its values are not a loosening.
+    class(out, "McpServer.env", env, Shown::Always);
+    class(out, "McpServer.approve", approve, Shown::Always);
+}
+
+#[deny(unused_variables)]
+fn approvals_classes(a: &sally_core::manifest::Approvals, out: &mut Classed) {
+    let sally_core::manifest::Approvals {
+        timeout,
+        max_pending,
+    } = a;
+    class(out, "Approvals.timeout", timeout, Shown::WhenNotDefault);
+    class(
+        out,
+        "Approvals.max_pending",
+        max_pending,
+        Shown::WhenNotDefault,
+    );
+}
+
+#[deny(unused_variables)]
+fn audit_classes(a: &sally_core::manifest::Audit, out: &mut Classed) {
+    let sally_core::manifest::Audit { level } = a;
+    class(out, "Audit.level", level, Shown::WhenNotDefault);
+}
+
+#[deny(unused_variables)]
+fn policy_classes(p: &sally_core::manifest::Policy, out: &mut Classed) {
+    let sally_core::manifest::Policy {
+        signed_by,
+        signature,
+    } = p;
+    class(out, "Policy.signed_by", signed_by, Shown::NotALoosening);
+    class(out, "Policy.signature", signature, Shown::NotALoosening);
+}
 
 /// A field added to the manifest must be classified for the summary, so a new setting cannot widen
 /// the session without a decision on whether the summary names it, and every field classified as
-/// named when not default has a row in the table that proves it is named. A tripwire on the schema
-/// and the tables, not on summary code: that is what
+/// named when not default has a row in the table that proves it is named. The classes are tied to
+/// the manifest's types ([`classes`]: a new field does not compile until it is classed); the
+/// schema comparison holds their names and proves each function ran. A tripwire on the types,
+/// the schema and the tables, not on summary code: that is what
 /// `rt_man_05_each_setting_that_loosens_a_default_is_named` checks. The schema's field set holds a
 /// known field, so the comparison is not of two empty sets.
 #[test]
@@ -1407,9 +1793,10 @@ fn rt_man_05_every_manifest_field_is_classified_for_the_summary() {
         props(t, def, &mut fields);
     }
     assert!(fields.contains("Approvals.timeout"), "{fields:#?}");
+    let classed = classes();
     let table: std::collections::BTreeSet<String> =
-        FIELDS.iter().map(|(k, _)| (*k).to_owned()).collect();
-    assert_eq!(FIELDS.len(), table.len(), "a field is listed twice");
+        classed.iter().map(|(k, _)| (*k).to_owned()).collect();
+    assert_eq!(classed.len(), table.len(), "a field is classed twice");
     let unclassified: Vec<&String> = fields.difference(&table).collect();
     let stale: Vec<&String> = table.difference(&fields).collect();
     assert!(
@@ -1418,7 +1805,7 @@ fn rt_man_05_every_manifest_field_is_classified_for_the_summary() {
     );
     let rows: std::collections::BTreeSet<&str> =
         loosened_rows().into_iter().map(|(f, ..)| f).collect();
-    let untested: Vec<&str> = FIELDS
+    let untested: Vec<&str> = classed
         .iter()
         .filter(|(k, shown)| matches!(shown, Shown::WhenNotDefault) && !rows.contains(k))
         .map(|(k, _)| *k)
@@ -1426,10 +1813,7 @@ fn rt_man_05_every_manifest_field_is_classified_for_the_summary() {
     assert!(untested.is_empty(), "no LOOSENED row: {untested:?}");
     // And every row names a field of the table, so a renamed or misspelled row is not left stale.
     let unknown: Vec<&&str> = rows.iter().filter(|r| !table.contains(**r)).collect();
-    assert!(
-        unknown.is_empty(),
-        "LOOSENED rows not in FIELDS: {unknown:?}"
-    );
+    assert!(unknown.is_empty(), "LOOSENED rows not classed: {unknown:?}");
 }
 
 // ---- RT-FS-19: a link out of a protected folder ------------------------------------------------

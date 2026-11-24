@@ -127,10 +127,11 @@ async fn a_grant_host_gets_the_credential_and_a_redacted_response_with_every_ent
     );
     assert!(!got.truncated);
     // The proxy writes its close entry once its side of the connection ends, after the call.
-    until("egress.close", || r.sink.events().len() == 4).await;
+    until("egress.close", || r.sink.events().len() == 5).await;
     assert_eq!(
         r.sink.events(),
         [
+            "egress.resolve",
             "egress.allow",
             "egress.request",
             "egress.response",
@@ -188,8 +189,11 @@ async fn a_spliced_host_is_verified_against_the_upstream_roots_and_gets_no_crede
         !body.to_ascii_lowercase().contains("authorization"),
         "{body}"
     );
-    until("egress.close", || r.sink.events().len() == 2).await;
-    assert_eq!(r.sink.events(), ["egress.allow", "egress.close"]);
+    until("egress.close", || r.sink.events().len() == 3).await;
+    assert_eq!(
+        r.sink.events(),
+        ["egress.resolve", "egress.allow", "egress.close"]
+    );
     assert_eq!(r.sink.args("egress.allow")["intercept"], false);
     origin_on_every_egress_entry(&r);
 }

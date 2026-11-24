@@ -7,11 +7,13 @@
 //! point is that the user sees it, every time.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::os::unix::ffi::OsStrExt as _;
 
 use super::super::host::{HostPattern, parse_hostname};
 use super::super::types::{BuiltinTool, Manifest, NetworkMode};
 use super::{EgressRule, ResolvedMount};
 use crate::secrets::is_secret_name;
+use crate::text;
 
 /// The finding's sentence, or `None` when private data and an outward channel do not coexist.
 /// `egress` must already be empty when `network.mode` is `none`.
@@ -52,13 +54,17 @@ const FETCH_GET: &str =
 /// Mount realpaths, then what each secret unlocks (one entry per secret, all its hosts), then
 /// one unnamed entry per grant that cannot be named, in manifest order.
 ///
+/// Each realpath is quoted from its bytes ([`text::quoted_path`]), the same form as the
+/// summary's mount lines, so the finding is printable ASCII and the summary's first line, its
+/// mount lines and this warning name a folder alike (RT-MAN-05).
+///
 /// A grant is named only when its secret name and its host both passed their own checks
 /// (architect Q376): on a rejected manifest either may hold a pasted credential with a quote,
 /// backslash, space or slash, which the diagnostic mask does not cover.
 fn readable(m: &Manifest, mounts: &[ResolvedMount]) -> Vec<String> {
     let mut out: Vec<String> = mounts
         .iter()
-        .map(|mt| mt.host.display().to_string())
+        .map(|mt| text::quoted_path(mt.host.as_os_str().as_bytes()))
         .collect();
     let mut by_secret: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     let mut unnamed = Vec::new();
@@ -104,7 +110,51 @@ fn join(items: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::join;
+    use std::ffi::OsStr;
+    use std::path::PathBuf;
+
+    use super::super::super::paths::DirId;
+    use super::super::super::types::{ApproveGlobs, MountMode};
+    use super::*;
+
+    fn mount(host: &[u8]) -> ResolvedMount {
+        ResolvedMount {
+            host: PathBuf::from(OsStr::from_bytes(host)),
+            guest: "/workspace/p".to_owned(),
+            mode: MountMode::Ro,
+            approve: ApproveGlobs::not_applicable(),
+            id: DirId { dev: 0, ino: 0 },
+        }
+    }
+
+    /// RT-MAN-05: the finding quotes each realpath from its bytes, so it is printable ASCII for a
+    /// letter outside ASCII, a quote, a backslash and a byte that is not UTF-8, and names each
+    /// as the summary's mount line does.
+    #[test]
+    fn the_finding_quotes_each_realpath_from_its_bytes() {
+        #[allow(clippy::unwrap_used)]
+        let m = super::super::super::parse::parse(
+            "apiVersion: sallyport/v1\nkind: Manifest\nname: t\nmodel:\n  ref: any\n\
+             network:\n  mode: proxy\n  allow:\n    - host: api.github.com\n",
+        )
+        .unwrap();
+        let hosts: [&[u8]; 3] = [b"/h/caf\xc3\xa9", b"/h/a \"b\\c", b"/h/x\xffy"];
+        let mounts: Vec<ResolvedMount> = hosts.iter().map(|h| mount(h)).collect();
+        let egress = [EgressRule {
+            host: HostPattern::Exact("api.github.com".to_owned()),
+            ports: vec![443],
+        }];
+        let finding = data_can_leave(&m, &mounts, &egress).unwrap_or_default();
+        assert!(
+            finding.bytes().all(|b| (b' '..=b'~').contains(&b)),
+            "{finding:?}"
+        );
+        assert_eq!(
+            finding,
+            "Anything this agent reads (\"/h/caf\\u{e9}\", \"/h/a \\\"b\\\\c\" and \
+             \"/h/x\\xffy\") can be sent to api.github.com."
+        );
+    }
 
     #[test]
     fn join_reads_like_english() {

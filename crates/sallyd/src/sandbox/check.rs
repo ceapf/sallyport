@@ -9,7 +9,8 @@
 //! a session's container (workspace, harness) carries exactly the conmon backstop `--timeout` its
 //! policy names, an inference container none (#92, RT-AG-16). An unforeseen flag fails closed
 //! instead of slipping past a denylist. The red-team harness also
-//! greps argv for the forbidden flags; this is the same rule enforced in-process before launch.
+//! greps argv for the forbidden flags; this is the same rule enforced in-process before launch
+//! (RT-SUP-01: each forbidden flag spliced into a builder's argv is refused).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
