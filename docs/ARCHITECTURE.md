@@ -172,7 +172,7 @@ podman --runtime <checked runtime_path>          # AMENDMENTS-02 B5: never the d
   create --rm --name sp-{ws|h|infer}-<id>
   --label sallyport.installation=<installation id>   # Q64: the orphan sweeps match it
   --pull=never --http-proxy=false --log-driver=none --ulimit core=0   # AMENDMENTS-01 §6.1
-  --ulimit nofile=512:512   # descriptor limit, soft = hard, every role; it does not bound every way of holding descriptors in flight (THREAT_MODEL §6, #271)
+  --ulimit nofile=512:512   # descriptor limit, soft = hard, every role; it does not bound descriptors in flight (#271)
   --network=none --no-hosts          # NOT --dns=none: Podman 4.9 rejects it with --network=none (preflight V4)
   --read-only --read-only-tmpfs=false
   --cap-drop=ALL --security-opt no-new-privileges
@@ -1241,8 +1241,8 @@ the cleanup finishes. After `sandbox.cleanup_abandoned` a workspace launch's cla
 session stops, and the periodic sweep then takes its container. Shutdown does not wait for such
 a cleanup; while one has not confirmed its container gone (retrying or abandoned), `sallyd`
 exits non-zero naming it. Directories its cleanup could not remove stay: the next start's
-stale-state step removes a workspace launch's socket directory, and nothing removes the rest
-(THREAT_MODEL.md §6; TODO(#239)). A failed `session.start` append is followed by a best-effort
+stale-state step removes a workspace launch's socket directory; the rest are recorded and not
+swept, and the command that will discard kept stages removes them (THREAT_MODEL.md §6; TODO(#216)). A failed `session.start` append is followed by a best-effort
 `session.stop` (`start-failed`), since the entry may have reached the log.
 
 ## 6. Repository structure

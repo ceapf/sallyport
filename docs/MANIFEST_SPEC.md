@@ -648,7 +648,7 @@ generated type. Deferred from Task 7 to M5 (Task 7 ruling Q12).
 
 See `manifests/examples/`:
 - `chat-only.yaml` — no mounts, no network, no tools. The safest possible session.
-- `coding-agent.yaml` — one `rw` project mount, PyPI/GitHub egress, GitHub token injected
+- `coding-agent.yaml` — one `staged` project mount, PyPI/GitHub egress, GitHub token injected
   (Bearer for the API, Basic for git over HTTPS, placeholder `GH_TOKEN`), shell with approval.
   `[data-can-leave]`.
 - `web-research.yaml` — search API key injected, unrestricted egress (acknowledged), a `brokered`
