@@ -52,6 +52,13 @@ impl Executor for std::sync::Arc<Recording> {
         if a.get("hold") == Some(&Value::Bool(true)) {
             self.release.notified().await;
         }
+        // A preparation whose blocking section panics (a path resolution's), joined as the
+        // file tools join theirs.
+        if name == PREPARE_PANICS {
+            let section =
+                tokio::task::spawn_blocking(|| -> () { panic!("the preparation panics") });
+            let _ = crate::tools::joined(section.await);
+        }
         let action = match name {
             "shell" => Action::Shell {
                 argv: strings(a.get("cmd")).ok_or("bad-arguments")?,
@@ -123,6 +130,8 @@ struct Fx {
     exec: std::sync::Arc<Recording>,
     shown: std::sync::Arc<Shown>,
     sink: std::sync::Arc<Sink>,
+    /// The agent's crash reports: a call's panic shows here as the daemon would read it.
+    crashes: crate::daemon::crash::CrashReceiver,
 }
 
 fn fx(timeout: Duration, max_pending: usize) -> Fx {
@@ -155,8 +164,8 @@ fn fx(timeout: Duration, max_pending: usize) -> Fx {
     );
     let exec = std::sync::Arc::new(Recording::default());
     let handler = Gated::new(gate.clone(), std::sync::Arc::clone(&exec));
-    // A panic fails the test through its missing reply; nobody reads the reports here.
-    let crash = crate::daemon::crash::CrashReporter::channel().0;
+    // Kept, so a test can read a call's panic as the daemon does (RT-AG-15).
+    let (crash, crashes) = crate::daemon::crash::CrashReporter::channel();
     let agent = std::sync::Arc::new(Agent::new(handler, rec, crash));
     Fx {
         agent,
@@ -165,6 +174,7 @@ fn fx(timeout: Duration, max_pending: usize) -> Fx {
         exec,
         shown,
         sink,
+        crashes,
     }
 }
 
@@ -637,6 +647,37 @@ async fn a_call_the_executor_cannot_prepare_is_denied_and_audited() {
     c.send(&call(2, "shell", json!({"cmd": "not a list"})))
         .await;
     assert_eq!(text(&c.recv().await), "denied: bad-arguments");
+}
+
+/// The tool name whose preparation panics in [`Recording`].
+const PREPARE_PANICS: &str = "prepare-panics";
+
+/// RT-AG-15 (a panic is a `session.crash`): a call whose preparation panics inside the production
+/// handler (`Gated`) is reported as a crash of `agent.call` within 5 s, which ends a real
+/// session, and gets no reply: it is never answered as an ordinary refusal.
+#[tokio::test]
+async fn a_call_whose_preparation_panics_is_a_crash_with_no_reply() {
+    let mut f = fx(Duration::from_secs(30), 5);
+    let mut c = open(&f);
+    c.send(&call(1, PREPARE_PANICS, json!({}))).await;
+    let crash = tokio::time::timeout(Duration::from_secs(5), f.crashes.recv())
+        .await
+        .expect("a crash report within 5 s")
+        .expect("the reporter is alive");
+    assert_eq!(crash.task, "agent.call");
+    assert!(
+        crash.payload.contains("the preparation panics"),
+        "{}",
+        crash.payload
+    );
+    let mut line = String::new();
+    let late = tokio::time::timeout(Duration::from_millis(500), c.r.read_line(&mut line)).await;
+    assert!(late.is_err(), "the panicked call was answered: {line}");
+    assert!(
+        !f.sink.events().iter().any(|e| e == "tool.deny"),
+        "{:?}",
+        f.sink.events()
+    );
 }
 
 #[tokio::test]

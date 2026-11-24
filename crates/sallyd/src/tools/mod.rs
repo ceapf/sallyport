@@ -210,16 +210,32 @@ fn mode_str(m: MountMode) -> &'static str {
     }
 }
 
-/// Runs `f` on the opened root of `src` (objects judged as `ids`), off the runtime.
+/// Runs `f` on the opened root of `src` (objects judged as `ids`), off the runtime. A panic in
+/// `f` continues in the calling task ([`joined`]); a cancelled section is an I/O error.
 async fn on_root<T: Send + 'static>(
     src: &RootSource,
     ids: UserIds,
     f: impl FnOnce(&fs::Root) -> Result<T, FsError> + Send + 'static,
 ) -> Result<T, FsError> {
     let src = src.clone();
-    tokio::task::spawn_blocking(move || f(&src.open(ids)?))
-        .await
+    joined(tokio::task::spawn_blocking(move || f(&src.open(ids)?)).await)
         .unwrap_or(Err(FsError::Io(rustix::io::Errno::IO)))
+}
+
+/// The value of a blocking section's join, or `None` when it was cancelled (a runtime shutting
+/// down). A panic in it is resumed in the calling task (RT-AG-15):
+/// every caller runs in a task on the session's crash reporter (`agent.call` for a call's
+/// preparation, `tool` for its run section, `sandbox.exec` for the control socket's), so the
+/// panic is reported as a session crash, which ends the session, and the call gets no reply
+/// and no `tool.result`, never an ordinary error answer.
+pub(crate) fn joined<T>(r: Result<T, tokio::task::JoinError>) -> Option<T> {
+    match r {
+        Ok(v) => Some(v),
+        Err(e) => match e.try_into_panic() {
+            Ok(panic) => std::panic::resume_unwind(panic),
+            Err(_cancelled) => None,
+        },
+    }
 }
 
 fn add(v: &mut Value, key: &str, value: Value) {

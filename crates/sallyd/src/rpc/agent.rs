@@ -99,6 +99,7 @@ impl<T: ToolHandler> Drop for WithdrawOnDrop<T> {
         // session's stop withdraws every prompt (architect Q59).
         if let (true, Ok(rt)) = (self.armed, tokio::runtime::Handle::try_current()) {
             let (handler, call) = (Arc::clone(&self.handler), self.call);
+            // TODO(#343): a bare spawn, so a panic in this withdraw is not a session crash.
             rt.spawn(async move { handler.withdraw(call, Withdraw::Closed).await });
         }
     }
@@ -336,6 +337,8 @@ impl<T: ToolHandler> Agent<T> {
         // session teardown aborts them), but a prompt one waits on is withdrawn: nobody is
         // left to receive its result (architect ruling Q27). Then the writer drains and closes,
         // awaited through its guard, so a teardown during the drain still aborts it.
+        // TODO(#343): a call that panics while this loop runs during the stop's grace, and is
+        // then aborted with the listener, is dropped unreported.
         let open: Vec<u64> = lock(&conn.pending).values().map(|f| f.call).collect();
         for call in open {
             self.handler.withdraw(call, Withdraw::Closed).await;
@@ -345,6 +348,7 @@ impl<T: ToolHandler> Agent<T> {
         while let Some(r) = tasks.join_next().await {
             self.reaped(r);
         }
+        // TODO(#343): the writer's join result, a panic included, is dropped.
         let _ = (&mut writer.0).await;
     }
 
