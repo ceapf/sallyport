@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use sally_cli::approve::{Tty, approve};
+use sally_cli::approve::{Size, Tty, approve};
 use sally_cli::client::{Client, socket_path};
 use sally_cli::commands::{self, Out, failed};
 use sally_cli::{EXIT_FAILED, EXIT_OK, clean, consent, doctor, drive, local, run, secrets, usage};
@@ -324,7 +324,11 @@ fn run_remote(cmd: Remote, paths: &Paths) -> u8 {
                 EXIT_FAILED
             }
         },
-        (Remote::Approvals, _) => commands::approvals(&mut client, &mut o),
+        (Remote::Approvals, _) => {
+            let size = rustix::termios::isatty(std::io::stdout())
+                .then(|| terminal_size(std::io::stdout()));
+            commands::approvals(&mut client, size, &mut o)
+        }
         (Remote::Approve, Some(tty)) => approve_on(&tty, &mut client, o.err),
         (Remote::Approve, None) => EXIT_FAILED,
     }
@@ -371,10 +375,12 @@ fn gated(
     let mut flush = || {
         rustix::termios::tcflush(&tty, rustix::termios::QueueSelector::IFlush).map_err(Into::into)
     };
+    let mut size = || terminal_size(&tty);
     let mut t = Tty {
         input: &mut input,
         output: &mut w,
         flush: &mut flush,
+        size: &mut size,
     };
     let g = consent::Gate {
         files,
@@ -394,12 +400,28 @@ fn approve_on(tty: &std::fs::File, client: &mut Client, err: &mut dyn std::io::W
     let mut flush = || {
         rustix::termios::tcflush(tty, rustix::termios::QueueSelector::IFlush).map_err(Into::into)
     };
+    let mut size = || terminal_size(tty);
     let mut t = Tty {
         input: &mut input,
         output: &mut w,
         flush: &mut flush,
+        size: &mut size,
     };
     approve(client, &mut t, err)
+}
+
+/// `fd`'s terminal size; 0 by 0 (not known) when it cannot be read.
+fn terminal_size(fd: impl rustix::fd::AsFd) -> Size {
+    rustix::termios::tcgetwinsize(fd).map_or(
+        Size {
+            columns: 0,
+            rows: 0,
+        },
+        |w| Size {
+            columns: w.ws_col,
+            rows: w.ws_row,
+        },
+    )
 }
 
 /// The secret's value: a prompt with echo off when stdin is a terminal, else piped stdin.

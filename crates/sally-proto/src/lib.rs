@@ -394,12 +394,22 @@ pub struct Prompt {
     pub id: String,
     /// The session.
     pub session: String,
+    /// The broker's call number.
+    pub call: u64,
     /// The digest an approve must name.
     pub digest: String,
-    /// Whether the action text in `text` was cut.
+    /// The action text, escaped ASCII from the request, runs of one unit marked (`\{N}`),
+    /// cut at the broker's bound with an explicit tail when `truncated`. A client shows it apart
+    /// from its own lines (RT-AG-04).
+    pub action: String,
+    /// Whether `action` was cut.
     pub truncated: bool,
-    /// The broker-built prompt, for a terminal: escaped ASCII lines.
-    pub text: String,
+    /// The agent's note, quoted and escaped: untrusted text, never the action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Risk tags (`destructive`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub risk_tags: Vec<String>,
     /// The full action text, sent only for a cut prompt and only up to the wire cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full: Option<String>,

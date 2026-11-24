@@ -77,38 +77,62 @@ pub const RUN_SHOWN_WHOLE: usize = 16;
 #[must_use]
 pub fn escape_runs_backslash_quoted(raw: &[u8]) -> String {
     let mut out = String::with_capacity(raw.len().min(RUN_MARKED_CAPACITY));
-    let mut run: Option<(String, usize)> = None;
-    for piece in pieces(raw, Quote::Backslash) {
-        match &mut run {
-            Some((unit, n)) if *unit == piece.text => *n = n.saturating_add(1),
-            _ => {
-                if let Some((unit, n)) = run.take() {
-                    push_run(&unit, n, &mut out);
-                }
-                run = Some((piece.text, 1));
-            }
-        }
-    }
-    if let Some((unit, n)) = run {
-        push_run(&unit, n, &mut out);
+    for piece in marked_pieces(raw) {
+        out.push_str(&piece.text);
     }
     out
+}
+
+/// [`escape_runs_backslash_quoted`] kept to at most `max` bytes, stopping before the first unit
+/// (with its mark) that would pass it; and how many input bytes the kept text shows. Bounds
+/// first: the input is read only as far as the end of the run the text stops in.
+#[must_use]
+pub fn escape_runs_capped(raw: &[u8], max: usize) -> (String, usize) {
+    let mut out = String::new();
+    let mut shown = 0usize;
+    for piece in marked_pieces(raw) {
+        if out.len().saturating_add(piece.text.len()) > max {
+            break;
+        }
+        out.push_str(&piece.text);
+        shown = shown.saturating_add(piece.input);
+    }
+    (out, shown)
 }
 
 /// What [`escape_runs_backslash_quoted`] reserves up front: a marked run can be far shorter than
 /// its input.
 const RUN_MARKED_CAPACITY: usize = 4096;
 
-/// `n` units of `unit`: each written when `n` is at most [`RUN_SHOWN_WHOLE`], else once and
-/// marked.
-fn push_run(unit: &str, n: usize, out: &mut String) {
-    if n > RUN_SHOWN_WHOLE {
-        let _ = write!(out, "{unit}\\{{{n}}}");
-    } else {
-        for _ in 0..n {
-            out.push_str(unit);
+/// The units of `raw` (`"` as `\"`), each run of more than [`RUN_SHOWN_WHOLE`] as one piece:
+/// the unit and its mark.
+fn marked_pieces(raw: &[u8]) -> impl Iterator<Item = Piece> + '_ {
+    let mut units = pieces(raw, Quote::Backslash).peekable();
+    std::iter::from_fn(move || {
+        let first = units.next()?;
+        let mut n = 1usize;
+        while units.next_if(|p| p.text == first.text).is_some() {
+            n = n.saturating_add(1);
         }
+        Some(run_pieces(first, n))
+    })
+    .flatten()
+}
+
+/// `n` units of `unit`: one piece each when `n` is at most [`RUN_SHOWN_WHOLE`], else one marked
+/// piece.
+fn run_pieces(unit: Piece, n: usize) -> Vec<Piece> {
+    if n > RUN_SHOWN_WHOLE {
+        let text = format!("{}\\{{{n}}}", unit.text);
+        let input = unit.input.saturating_mul(n);
+        return vec![Piece { text, input }];
     }
+    (0..n)
+        .map(|_| Piece {
+            text: unit.text.clone(),
+            input: unit.input,
+        })
+        .collect()
 }
 
 /// A host path between double quotes, from its bytes: [`escape_backslash_quoted`], so a byte

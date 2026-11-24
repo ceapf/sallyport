@@ -130,8 +130,8 @@ fn ok(req: &Value, result: Value) -> Value {
 
 fn prompt(id: &str) -> Value {
     json!({
-        "id": id, "session": "s-1", "digest": format!("d-{id}"), "truncated": false,
-        "text": format!("approval {id}\n  action: run [\"ls\"]\n"),
+        "id": id, "session": "s-1", "call": 3, "digest": format!("d-{id}"), "truncated": false,
+        "action": "run [\"ls\"]",
     })
 }
 
@@ -241,11 +241,13 @@ fn run_flushing(
                 Err(std::io::Error::other("tcflush failed"))
             }
         };
+        let mut size = || SCREEN_SIZE;
         let code = {
             let mut tty = Tty {
                 input: &mut input,
                 output: &mut shown,
                 flush: &mut flush,
+                size: &mut size,
             };
             approve(&mut c, &mut tty, &mut err)
         };
@@ -301,7 +303,14 @@ fn anything_but_an_answer_asks_again() {
     let f = daemon("reask", vec![prompt("p1")], 1);
     let r = run_with(&f, &["a", "y", "approve"], None);
     assert_eq!(r.code, EXIT_FAILED, "the daemon closed after the decision");
-    assert_eq!(r.shown.matches("approval p1").count(), 1, "{}", r.shown);
+    // Shown once, then its start again above each of the two questions asked again.
+    assert_eq!(r.shown.matches("approval p1").count(), 3, "{}", r.shown);
+    assert_eq!(
+        r.shown.matches("the start of its action again").count(),
+        2,
+        "{}",
+        r.shown
+    );
     assert_eq!(r.shown.matches("approve, deny or deny-all? ").count(), 3);
     assert_eq!(r.flushes, 3);
     assert_eq!(
@@ -546,7 +555,7 @@ fn a_flood_is_told() {
 #[test]
 fn a_dirty_prompt_is_escaped_and_deny_only() {
     let mut p = prompt("p1");
-    p["text"] = json!("approval p1\x1b[2J\n");
+    p["action"] = json!("run [\"\x1b[2J\"]");
     let f = daemon("dirty", vec![p], 1);
     let r = run_with(&f, &["approve", "deny-all"], None);
     assert!(!r.shown.contains('\x1b'));
@@ -605,6 +614,11 @@ fn a_cut_list_is_listed_again_when_empty() {
 
 /// Columns and rows of the screen RT-AG-04's padded case is judged on.
 const SCREEN: (usize, usize) = (80, 24);
+/// [`SCREEN`] as the terminal reports it to `approve()`.
+const SCREEN_SIZE: Size = Size {
+    columns: 80,
+    rows: 24,
+};
 const APPROVE_QUESTION: &str = "approve, deny or deny-all? ";
 const DENY_QUESTION: &str = "deny or deny-all? ";
 
@@ -670,9 +684,7 @@ fn rt_ag_04_a_padded_prompt_keeps_its_command_above_every_question() {
     let marker = "marker-cmd";
     let action = format!("run [\"{marker}\" \"w0 w1 w2\"]");
     let mut plain = prompt("p0");
-    plain["text"] = json!(format!(
-        "approval p0 (session s-1, call 3)\n  action: {action}\n"
-    ));
+    plain["action"] = json!(action);
     let f = daemon("padded-control", vec![plain], 1);
     let r = run_with(&f, &["maybe", "deny"], None);
     for (approvable, seen) in questions(&r.shown, marker) {
@@ -690,11 +702,7 @@ fn rt_ag_04_a_padded_prompt_keeps_its_command_above_every_question() {
     let cut: String = full.chars().take(2000).collect();
     let mut p = prompt("p1");
     p["truncated"] = json!(true);
-    p["text"] = json!(format!(
-        "approval p1 (session s-1, call 3)\n  action: {cut}... (+{} bytes)\n  \
-         (cut: the full action must be shown before it can be approved)\n  digest: d-p1\n",
-        full.len() - cut.len()
-    ));
+    p["action"] = json!(format!("{cut}... (+{} bytes)", full.len() - cut.len()));
     p["full"] = json!(full);
     let f = daemon("padded", vec![p], 1);
     let r = run_with(&f, &["maybe", "deny"], None);

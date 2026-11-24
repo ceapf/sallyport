@@ -6,6 +6,15 @@ use std::io::Cursor;
 use sally_core::manifest::{HostEnv, load};
 
 use super::*;
+use crate::approve::Size;
+
+/// The launch gate never reads the terminal's size.
+fn no_size() -> Size {
+    Size {
+        columns: 0,
+        rows: 0,
+    }
+}
 
 const HEAD: &str = "apiVersion: sallyport/v1\nkind: Manifest\nname: t\nmodel:\n  ref: any\n";
 
@@ -56,11 +65,13 @@ fn ask_flushing(typed: &[u8], flush_ok: bool) -> (bool, String, usize, u64) {
             Err(std::io::Error::other("tcflush failed"))
         }
     };
+    let mut size = no_size;
     let answer = {
         let mut t = Tty {
             input: &mut input,
             output: &mut output,
             flush: &mut flush,
+            size: &mut size,
         };
         asked_yes(&mut t)
     };
@@ -340,11 +351,13 @@ fn launch_on(
         Ok(())
     };
     let mut err = Vec::new();
+    let mut size = no_size;
     let r = {
         let mut t = Tty {
             input: &mut input,
             output: &mut output,
             flush: &mut flush,
+            size: &mut size,
         };
         let g = Gate {
             files: Files {

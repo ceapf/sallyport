@@ -1236,11 +1236,17 @@ fn raw_prompt(action: String, full: String, truncated: bool) -> Prompt {
     }
 }
 
+/// `n` characters with no run of one character longer than 16, so a prompt's run mark
+/// (RT-AG-04) does not shorten a filler that must fill the reply budget.
+fn unrun(n: usize) -> String {
+    "ab".chars().cycle().take(n).collect()
+}
+
 #[test]
 fn a_prompt_carries_its_full_text_only_when_cut_and_it_fits_the_wire() {
     let whole = prompt(&raw_prompt("a".into(), "a".into(), false));
     assert_eq!((whole.full, whole.full_unavailable), (None, false));
-    assert!(whole.text.contains("action: a"));
+    assert_eq!(whole.action, "a");
     let fits = prompt(&raw_prompt("a".into(), "b".repeat(FULL_WIRE_BYTES), true));
     assert_eq!(fits.full.as_deref().map(str::len), Some(FULL_WIRE_BYTES));
     assert!(!fits.full_unavailable);
@@ -1303,7 +1309,7 @@ async fn a_watcher_hears_a_prompt_and_approves_it() {
     let p = n["params"].clone();
     assert_eq!(p["session"], json!("s-1"));
     assert!(
-        p["text"]
+        p["action"]
             .as_str()
             .unwrap()
             .contains(r#"run ["rm" "-rf" "x"]"#),
@@ -1489,7 +1495,7 @@ async fn a_prompt_list_over_the_budget_is_cut_and_says_so() {
     w.call("approvals.watch", json!({})).await;
     // Each prompt about 200 KiB on the wire (its full text): three fit 768 KiB, the fourth
     // does not.
-    let big = "a".repeat(200 * 1024);
+    let big = unrun(200 * 1024);
     let mut asks = Vec::new();
     for (i, s) in ["s-1", "s-2", "s-3", "s-4"].iter().enumerate() {
         asks.push(f.ask(s, i as u64, &["echo", &big]));
@@ -1517,7 +1523,7 @@ async fn a_cut_list_keeps_the_oldest_after_a_take() {
     f.session("s-1");
     let mut w = f.connect();
     w.call("approvals.watch", json!({})).await;
-    let big = "a".repeat(200 * 1024);
+    let big = unrun(200 * 1024);
     let mut ids = Vec::new();
     let mut asks = Vec::new();
     // Five prompts of about 200 KiB: after one is answered, three of the four fit the budget.

@@ -255,17 +255,17 @@ fn a_manifest_at_the_cap_is_sent() {
     assert_eq!(f.methods(), ["sessions.create"], "{}", stderr(&o));
 }
 
-/// A complete, clean prompt list exits 0; one with a dirty prompt text is printed escaped and
+/// A complete, clean prompt list exits 0; one with a dirty action text is printed escaped and
 /// exits 1.
 #[test]
 fn a_dirty_prompt_text_fails_the_listing() {
-    for (tag, text, code) in [
-        ("clean", "approval p1\n", 0),
-        ("dirty", "approval p1\x1b[2J\n", 1),
+    for (tag, action, code) in [
+        ("clean", "run [\"ls\"]", 0),
+        ("dirty", "run [\"\x1b[2J\"]", 1),
     ] {
         let f = Fake::new(tag, move |req| {
-            let p = json!({"id": "p1", "session": "s-1", "digest": "d", "truncated": false,
-                           "text": text});
+            let p = json!({"id": "p1", "session": "s-1", "call": 3, "digest": "d",
+                           "truncated": false, "action": action});
             result(req, json!({"prompts": [p], "complete": true, "total": 1}))
         });
         let o = f.sally(&["approvals"]);
@@ -277,14 +277,16 @@ fn a_dirty_prompt_text_fails_the_listing() {
 #[test]
 fn approvals_lists_prompt_text_and_says_when_cut() {
     let f = Fake::new("prompts", |req| {
-        let p = json!({"id": "p1", "session": "s-1", "digest": "d", "truncated": false,
-                       "text": "approval p1\n  action: run [\"ls\"]\n"});
+        let p = json!({"id": "p1", "session": "s-1", "call": 3, "digest": "d",
+                       "truncated": false, "action": "run [\"ls\"]"});
         result(req, json!({"prompts": [p], "complete": false, "total": 3}))
     });
+    // Not a terminal: the action's rows are left whole, behind the gutter.
     let o = f.sally(&["approvals"]);
     assert_eq!(
         stdout(&o),
-        "approval p1\n  action: run [\"ls\"]\n2 more pending not shown; list again after answering these\n"
+        "\napproval p1 (session s-1, call 3)\n  action:\n  | run [\"ls\"]\n  digest: d\n\
+         2 more pending not shown; list again after answering these\n"
     );
     assert_eq!(o.status.code(), Some(1));
 }

@@ -283,7 +283,7 @@ async fn an_approve_with_another_digest_is_refused_and_leaves_the_prompt() {
 #[tokio::test]
 async fn a_cut_prompt_is_approved_only_after_its_full_text_was_shown() {
     let f = fx(5);
-    let long = "y".repeat(render::ACTION_CHARS);
+    let long = unrun(render::ACTION_CHARS);
     let b = shell(1, &["echo", &long]);
     let (id, h) = asking(&f, b.clone()).await;
     assert!(f.desk.list()[0].truncated);
@@ -323,7 +323,7 @@ async fn a_cut_prompt_is_approved_only_after_its_full_text_was_shown() {
 #[tokio::test]
 async fn a_prompt_whose_full_text_is_over_the_wire_cap_is_deny_only() {
     let f = fx(5);
-    let huge = "y".repeat(render::FULL_WIRE_BYTES);
+    let huge = unrun(render::FULL_WIRE_BYTES);
     let b = shell(1, &["echo", &huge]);
     let (id, h) = asking(&f, b.clone()).await;
     assert!(f.desk.list()[0].full_on_wire().is_none());
@@ -1185,6 +1185,12 @@ fn file_at(host: &str) -> Target {
         rel: "a".to_owned(),
         host: host.to_owned(),
     }
+}
+
+/// `n` characters with no run of one character longer than 16, so a prompt's run mark
+/// (RT-AG-04) does not shorten a filler that must reach a cut or the wire cap.
+fn unrun(n: usize) -> String {
+    "yz".chars().cycle().take(n).collect()
 }
 
 /// Raw text whose action text puts `FORM` at byte `at` of a shell action: `run ["<pad>" "FORM"]`.

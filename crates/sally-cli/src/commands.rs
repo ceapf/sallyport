@@ -12,6 +12,7 @@ use sally_proto::{
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
+use crate::approve::Size;
 use crate::clean;
 use crate::client::{Client, Error};
 use crate::{EXIT_FAILED, EXIT_OK, EXIT_REFUSED};
@@ -54,6 +55,12 @@ impl<'a, 'b> Printer<'a, 'b> {
         if !c.text.ends_with('\n') {
             let _ = writeln!(self.o.out);
         }
+    }
+
+    /// A laid-out prompt ([`crate::approve::layout`]): its fields were checked there.
+    pub(crate) fn laid_out(&mut self, l: &crate::approve::Layout) {
+        self.dirty |= l.dirty;
+        let _ = write!(self.o.out, "{}", l.shown);
     }
 
     /// `EXIT_OK`, or `EXIT_REFUSED` when something printed was not clean.
@@ -226,15 +233,17 @@ pub fn session_changes(c: &mut Client, id: &str, o: &mut Out<'_>) -> u8 {
     EXIT_REFUSED
 }
 
-/// `sally approvals`: every waiting prompt, as the approver would show it.
-pub fn approvals(c: &mut Client, o: &mut Out<'_>) -> u8 {
+/// `sally approvals`: every waiting prompt, laid out as the approver lays it out
+/// ([`crate::approve::layout`]) for a terminal of `size`, or with its guttered rows whole when
+/// the output is not a terminal (`None`).
+pub fn approvals(c: &mut Client, size: Option<Size>, o: &mut Out<'_>) -> u8 {
     let all = match call::<Prompts>(c, method::APPROVALS_LIST, json!({})) {
         Ok(all) => all,
         Err(e) => return failed(&e, o.err),
     };
     let mut p = Printer::new(o);
     for prompt in &all.prompts {
-        p.text(&prompt.text);
+        p.laid_out(&crate::approve::layout(prompt, size));
     }
     let code = p.code();
     if all.complete {

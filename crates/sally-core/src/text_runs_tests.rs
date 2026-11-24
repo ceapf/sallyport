@@ -108,6 +108,25 @@ fn request_text_cannot_write_a_mark() {
 }
 
 #[test]
+fn the_capped_form_keeps_whole_units_and_counts_what_it_shows() {
+    let raw = format!("ab{}c\"", " ".repeat(1000));
+    assert_eq!(
+        escape_runs_capped(raw.as_bytes(), 100),
+        ("ab \\{1000}c\\\"".to_owned(), raw.len())
+    );
+    // `ab \{1000}` is 10 bytes: one byte short of it keeps only `ab`.
+    assert_eq!(escape_runs_capped(raw.as_bytes(), 9), ("ab".to_owned(), 2));
+    assert_eq!(
+        escape_runs_capped(raw.as_bytes(), 10),
+        ("ab \\{1000}".to_owned(), 1002)
+    );
+    // An unmarked run is cut unit by unit.
+    assert_eq!(escape_runs_capped(b"aaaab", 2), ("aa".to_owned(), 2));
+    assert_eq!(escape_runs_capped(b"\"\"", 3), ("\\\"".to_owned(), 1));
+    assert_eq!(escape_runs_capped(b"", 3), (String::new(), 0));
+}
+
+#[test]
 fn a_line_holding_a_mark_is_refused_by_the_launch_gate() {
     assert_eq!(refused_escape(" \\{17}"), Some("\\{"));
 }

@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use super::control_methods::{DETAIL_CHARS, MAX_ERROR_LINES};
 use crate::approvals::Decision;
-use crate::approvals::render::{self, Prompt};
+use crate::approvals::render::Prompt;
 use crate::sandbox::{Change, ChangeKind};
 use crate::session::{SessionInfo, SessionState};
 
@@ -137,7 +137,8 @@ pub(crate) fn change(c: &Change) -> WireChange {
     }
 }
 
-/// A prompt on the wire (architect Q74): the terminal text, and for a cut prompt its full text
+/// A prompt on the wire (architect Q74): its fields, laid out by the client (RT-AG-04: request
+/// text apart from the client's own lines), and for a cut prompt its full text
 /// when it fits the wire, else `full_unavailable` (the prompt can then only be denied;
 /// TODO(#108): a way to review and approve such an action).
 pub(crate) fn prompt(p: &Prompt) -> WirePrompt {
@@ -145,9 +146,12 @@ pub(crate) fn prompt(p: &Prompt) -> WirePrompt {
     WirePrompt {
         id: p.id.clone(),
         session: p.session.clone(),
+        call: p.call,
         digest: p.digest.clone(),
+        action: p.action.clone(),
         truncated: p.truncated,
-        text: render::terminal(p),
+        note: p.note.clone(),
+        risk_tags: p.risk_tags.clone(),
         full: full.map(str::to_owned),
         full_unavailable: p.truncated && full.is_none(),
     }
