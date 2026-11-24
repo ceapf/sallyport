@@ -91,12 +91,13 @@ policy:                           # reserved for v2 signed org policies; parsed 
 which `full` adds. Every other entry is kept at both levels: one per tool call (`fs_read`
 included), egress connection (`egress.resolve` with host:port before the name is looked up,
 `egress.allow` with host:port and the pinned addresses, `egress.deny`/`egress.limit` with the
-reason (`audit-failed` once a failed append has closed the session's egress), `egress.shed` for over-rate connections closed
-unread, `egress.close` with the address used and the byte counts, and per intercepted request
-`egress.request` (method + path, never bodies) and response `egress.response` with the secrets
-redacted and the bytes, names only; ARCHITECTURE §7 "Egress audit events"), approval, launch
-and teardown (`sandbox.cleaned`, `sandbox.cleanup_abandoned` after a failed launch's retried
-cleanup, `sandbox.orphan_remove_failed`; ARCHITECTURE §3.5), and model import. The audit writer
+reason (`audit-failed` once a failed egress append has closed the session's egress),
+`egress.shed` for over-rate connections closed unread, `egress.close` with the address used and
+the byte counts, and per intercepted request `egress.request` (method + path, never bodies) and
+response `egress.response` with the secrets redacted and the bytes, names only; ARCHITECTURE §7
+"Egress audit events"), approval, launch and teardown (`sandbox.cleaned`,
+`sandbox.cleanup_abandoned` after a failed launch's retried cleanup,
+`sandbox.orphan_remove_failed`; ARCHITECTURE §3.5), and model import. The audit writer
 refuses the detail mark on any other event.
 
 ### 1.1 Approval gates, acknowledgements, and `[data-can-leave]` (SI-5)

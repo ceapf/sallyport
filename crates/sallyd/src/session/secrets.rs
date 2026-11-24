@@ -48,9 +48,8 @@ use crate::sandbox::{AuditSink, SharedAudit};
 /// pass masks declared texts too, uncut; Q276); this pass is the only one after the release for
 /// the `host` of `egress.resolve`, `egress.allow` and `egress.close` (a host a wildcard rule
 /// allowed, which no builder masks) and for any field a later builder adds without
-/// `own_masked` (Q266). The
-/// launcher wraps the session's sink right after its egress
-/// loaded the forms. Append-only: it swaps no redactor.
+/// `own_masked` (Q266). The launcher wraps the session's sink right after its egress loaded the
+/// forms. Append-only: it swaps no redactor.
 pub(crate) struct SessionRedacted {
     inner: Arc<dyn AuditSink>,
     redaction: Arc<Redaction>,

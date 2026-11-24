@@ -114,18 +114,34 @@ impl HostAddrs for FakeHost {
 }
 
 /// Records (event, decision, arguments); while `fail` holds it refuses every append, and while
-/// `panic` holds it panics. Each entry is resolved with `redactor` as the writer resolves it
-/// (empty by default; architect Q301).
+/// `panic` holds it panics. An append of the event `hold_on` names waits until `release`
+/// (counted in `held` while it waits). Each entry is resolved with `redactor` as the writer
+/// resolves it (empty by default; architect Q301).
 #[derive(Default)]
 struct Sink {
     entries: Mutex<Vec<(String, Option<String>, Value)>>,
     fail: AtomicBool,
     panic: AtomicBool,
+    hold_on: Option<&'static str>,
+    held: std::sync::atomic::AtomicUsize,
+    gate: (Mutex<bool>, std::sync::Condvar),
     redactor: sally_core::audit::Redactor,
+}
+
+impl Sink {
+    fn release(&self) {
+        *self.gate.0.lock().unwrap() = true;
+        self.gate.1.notify_all();
+    }
 }
 
 impl AuditSink for Sink {
     fn append(&self, e: NewEntry, _: AuditLevel) -> Result<(), AuditError> {
+        if self.hold_on == Some(e.event()) {
+            self.held.fetch_add(1, Ordering::SeqCst);
+            let open = self.gate.0.lock().unwrap();
+            drop(self.gate.1.wait_while(open, |open| !*open).unwrap());
+        }
         assert!(!self.panic.load(Ordering::SeqCst), "fake panic");
         if self.fail.load(Ordering::SeqCst) {
             return Err(AuditError::InvalidEntry("fake failure"));
@@ -261,8 +277,9 @@ fn connect(target: &str) -> Vec<u8> {
 /// RT-SEC-15, the host case (#162, architect Q289 (2), Q301 (i)): session X, without grants,
 /// CONNECTs under the `*.mock.test` rule to a host whose label is live session Y's value. The
 /// proxy's own `egress.resolve`, `egress.allow` and `egress.close` builders put the host in
-/// plain args in its parsed spelling, and the writer's pass with Y's forms masks it whole. Control: the same
-/// flow without Y's forms logs the label. What it pins: the writer's whole-args pass, and a
+/// plain args in its parsed spelling, and the writer's pass with Y's forms masks it whole.
+/// Control: the same flow without Y's forms logs the label. What it pins: the writer's
+/// whole-args pass, and a
 /// builder that keeps the label whole (dropping the host, respelling it, or cutting it short of
 /// the label fails it). A DNS-safe label holds nothing an escape would change, and a cut longer
 /// than the label changes nothing either; neither is something this test can show.
@@ -965,6 +982,45 @@ async fn a_lookup_that_returns_after_the_latch_is_not_dialled() {
     assert!(out.is_empty());
     assert!(rig.dials().is_empty());
     assert_eq!(rig.sink.events(), ["egress.resolve"]);
+}
+
+/// RT-AUD-04's gate after the entry: an `egress.resolve` being written when another
+/// connection's append fails is written, and then nothing follows it, no lookup.
+#[tokio::test(start_paused = true)]
+async fn an_entry_written_while_the_latch_set_is_not_followed_by_a_lookup() {
+    let rig = Setup {
+        sink: Sink {
+            hold_on: Some("egress.resolve"),
+            ..Sink::default()
+        },
+        ..Setup::default()
+    }
+    .rig();
+    let (mut client, server) = duplex(4096);
+    let proxy = Arc::clone(&rig.proxy);
+    let task = tokio::spawn(async move { proxy.serve(server).await });
+    client.write_all(&connect("a.mock.test:443")).await.unwrap();
+    let held = || rig.sink.held.load(Ordering::SeqCst) == 1;
+    spin_until("the entry to be held", held).await;
+    latch_with(&rig, &connect("evil.test:443")).await;
+    rig.sink.release();
+    client.shutdown().await.unwrap();
+    let mut out = Vec::new();
+    client.read_to_end(&mut out).await.unwrap();
+    task.await.unwrap();
+    assert!(out.is_empty());
+    assert_eq!(rig.lookups(), 0);
+    assert_eq!(rig.sink.events(), ["egress.resolve"]);
+}
+
+/// A latched session that has stopped closes a late connection without entering anything.
+#[tokio::test]
+async fn a_stopped_latched_session_enters_nothing_new() {
+    let rig = Setup::default().rig();
+    latch_with(&rig, &connect("evil.test:443")).await;
+    rig.proxy.stop();
+    assert_eq!(rig.send(&connect("evil.test:443")).await, "");
+    assert!(rig.sink.events().is_empty(), "{:?}", rig.sink.events());
 }
 
 /// An append that panics sets the latch as a failed one does.

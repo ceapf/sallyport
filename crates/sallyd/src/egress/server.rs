@@ -9,10 +9,11 @@
 //! to the pinned addresses in order, `200`, tunnel, `egress.close`. Every refusal is audited
 //! before its reply; a failed audit append closes without a reply, a lookup or a dial.
 //!
-//! Latch (RT-AUD-04): once any append of the session has failed, egress stays closed. Every
-//! later connection is closed unread, without a reply, after one best-effort `egress.deny`
-//! (`audit-failed`), and no entry that would permit an effect (`egress.resolve`, `egress.allow`,
-//! an in-tunnel `egress.request`) is written: no lookup, dial or forwarded request follows.
+//! Latch (RT-AUD-04): once any of the session's egress appends has failed, egress stays
+//! closed. Every later connection is closed unread, without a reply, after one best-effort
+//! `egress.deny` (`audit-failed`), and no entry that would permit an effect (`egress.resolve`,
+//! `egress.allow`, an in-tunnel `egress.request`) is written: no lookup, dial or forwarded
+//! request follows.
 
 use std::future::Future;
 use std::io;
@@ -367,11 +368,15 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
     /// audited before the connection closes.
     pub async fn serve<C: AsyncRead + AsyncWrite + Unpin + Send>(&self, mut client: C) {
         if self.latched() {
-            // RT-AUD-04: closed unread, no reply; recorded when the log takes it.
-            let deny = self.entry("egress.deny", Some("deny"));
-            let _ = self
-                .append(deny.args(json!({"reason": AUDIT_FAILED})))
-                .await;
+            // RT-AUD-04: closed unread, no reply; recorded when the log takes it, unless the
+            // session stopped (nothing new is entered then). Before the slot: the accept loop
+            // already holds an in-flight slot for every connection it serves.
+            if !*self.stop.borrow() {
+                let deny = self.entry("egress.deny", Some("deny"));
+                let _ = self
+                    .append(deny.args(json!({"reason": AUDIT_FAILED})))
+                    .await;
+            }
             return;
         }
         let Ok(_slot) = Arc::clone(&self.slots).try_acquire_owned() else {
@@ -621,9 +626,11 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
     }
 
     /// Appends an entry that permits an effect (a lookup, a dial, a forwarded request) unless the
-    /// latch is set; whether the effect may follow (RT-AUD-04).
+    /// latch is set; whether the effect may follow (RT-AUD-04). Read again after the append: an
+    /// append of another connection may have failed while this one was being written, and then
+    /// the entry stands with nothing after it.
     async fn gated(&self, entry: NewEntry) -> bool {
-        !self.latched() && self.append(entry).await
+        !self.latched() && self.append(entry).await && !self.latched()
     }
 
     /// Writes `egress.shed`: `closed` connections over the admission rate were closed unread in

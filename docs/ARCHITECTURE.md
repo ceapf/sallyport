@@ -1414,7 +1414,8 @@ sallyport/
   unread and has no effect; it is counted, not entered one by one: one `egress.shed` per second
   (`SHED_INTERVAL`) while any were closed, and one at the stop for an unfinished second. A count
   whose entry fails to append is kept and goes into the next one (that failure also closes the
-  session's egress, as any failed append does: see "Egress audit events"); at the stop there is no next
+  session's egress, as any failed egress append does: see "Egress audit events"); at the stop
+  there is no next
   one, so a failed final entry loses its count, and an abort of the accept task before that
   entry is written (past the stop grace, or a dropped handle) loses it unwritten, as either
   loses a connection's `egress.close` (RT-AUD-03's residual). Broker-originated connections
@@ -1440,9 +1441,10 @@ sallyport/
   - `egress.resolve` (no decision), right before the one lookup: `{host, port}`; without it
     there is no lookup (RT-AUD-04). An `egress.resolve` followed by neither `egress.allow` nor
     `egress.deny` for its target means a stop or a failed append ended the request.
-  - Once any append of a session has failed (a panic included), its egress is closed for the
-    rest of the session (RT-AUD-04): every later connection is closed at once, unread and with
-    no reply, after one best-effort `egress.deny {reason: "audit-failed"}`; `egress.resolve`,
+  - Once any of a session's egress appends has failed (a panic included), its egress is closed
+    for the rest of the session (RT-AUD-04): every later connection is closed at once, unread
+    and with no reply, after one best-effort `egress.deny {reason: "audit-failed"}` (none once
+    the session has stopped); `egress.resolve`,
     `egress.allow` and an in-tunnel `egress.request` are no longer written, so nothing more is
     looked up, dialled or forwarded (an open intercepted tunnel ends `error` at its next
     request; an open spliced tunnel runs on to its end). Not reported beyond the log (#342).
@@ -1471,12 +1473,12 @@ sallyport/
     target_cut}` (the request-target masked with the session's own forms first, then cut at 256
     bytes and escaped, never a header; §7 Redaction), or `{reason, head_bytes}` when no target
     was parsed, or `{reason: "audit-failed"}` alone, with no reply, for a connection closed
-    because the session's egress is closed (RT-AUD-04); `filter: "host-addresses-unavailable"` when the host's own addresses could not
-    be read, with `cause` from a closed set: a table could not be read (which, and the I/O
-    error kind), was over the bound, or has a malformed line (which, and its number); the
-    `fib_trie` has no loopback address; only one of the two IPv6 tables exists; or the reader
-    task failed. Never a line's content or a path. When
-    the address filter refused, `address` (the first refused address of the
+    because the session's egress is closed (RT-AUD-04); `filter: "host-addresses-unavailable"`
+    when the host's own addresses could not be read, with `cause` from a closed set: a table
+    could not be read (which, and the I/O error kind), was over the bound, or has a malformed
+    line (which, and its number); the `fib_trie` has no loopback address; only one of the two
+    IPv6 tables exists; or the reader task failed. Never a line's content or a path. When the
+    address filter refused, `address` (the first refused address of the
     answer, as resolved) and `rule` (`reserved-range`, `own-address` or `connected-network`).
     The reply to the sandbox carries the reason only.
   - `egress.limit` (decision `deny`): as `egress.deny`, for `too-many-connections` (decided at

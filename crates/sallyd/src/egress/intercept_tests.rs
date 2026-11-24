@@ -1097,6 +1097,7 @@ async fn a_failed_request_limit_entry_ends_error_without_a_413() {
     assert!(!out.contains("413"), "{out}");
     assert!(!r.sink.events().iter().any(|e| e == "egress.limit"));
     assert_eq!(r.sink.args("egress.close")["end"], json!("error"));
+    egress_is_closed(&r).await;
 }
 
 /// Architect ruling RQ2, response side: the cut still happens, and the tunnel ends `error`.

@@ -489,7 +489,7 @@ impl<R: Resolver, D: Dialer, H: HostAddrs> Proxy<R, D, H> {
             st.credentials.redaction(),
         );
         // TODO(#72): on a session stop this append may land after `egress.close`.
-        // RT-AUD-04: after any failed append of the session, nothing more is forwarded.
+        // RT-AUD-04: after any failed egress append of the session, nothing more is forwarded.
         if !self.gated(audited).await {
             st.set_end(End::Error);
             return Err("audit append failed".into());
