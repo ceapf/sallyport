@@ -11,6 +11,14 @@
 //! [`StreamEscaper`] is the line-mode form (architect Q100): the same alphabet plus `\n`, for
 //! output that arrives in chunks.
 //!
+//! What a launch may show a person who consents to it (RT-MAN-05): [`quoted_path`] writes a host
+//! path between quotes, byte for byte, the one form for every line that names a folder.
+//! [`is_refused`] is the class of characters a launch never shows: controls, whitespace other
+//! than the space, Unicode's default-ignorable and format characters (direction marks and
+//! invisible characters among them) and noncharacters. [`refused_escape`] reads a line these
+//! escapers wrote and names its first escape of a refused character or of a byte that is not
+//! UTF-8. It fails closed: a backslash that starts no escape an escaper writes refuses too.
+//!
 //! Every cut and escape of sandbox-chosen audit text lives here too (architect Q276, Q288), as
 //! the closed set [`Style`]: the hex formats ([`hex_capped`], [`hex_counted`]), the text format
 //! above, and the plain cut ([`plain_capped`]); plus the approval action text's
@@ -55,6 +63,167 @@ pub fn escape_backslash_quoted(raw: &[u8]) -> String {
         out.push_str(&piece.text);
     }
     out
+}
+
+/// A host path between double quotes, from its bytes: [`escape_backslash_quoted`], so a byte
+/// that is not UTF-8 is `\xNN` (RT-MAN-05). Every line that names a folder uses this form, so
+/// the lines read alike, and a folder name holding `, ` or ` (at ` stays one name.
+#[must_use]
+pub fn quoted_path(raw: &[u8]) -> String {
+    format!("\"{}\"", escape_backslash_quoted(raw))
+}
+
+/// Unicode 17.0.0's `Default_Ignorable_Code_Point` (DerivedCoreProperties-17.0.0.txt, "Total
+/// code points: 4174"), ranges that touch merged.
+const DEFAULT_IGNORABLE: &[(u32, u32)] = &[
+    (0x00ad, 0x00ad),
+    (0x034f, 0x034f),
+    (0x061c, 0x061c),
+    (0x115f, 0x1160),
+    (0x17b4, 0x17b5),
+    (0x180b, 0x180f),
+    (0x200b, 0x200f),
+    (0x202a, 0x202e),
+    (0x2060, 0x206f),
+    (0x3164, 0x3164),
+    (0xfe00, 0xfe0f),
+    (0xfeff, 0xfeff),
+    (0xffa0, 0xffa0),
+    (0xfff0, 0xfff8),
+    (0x1bca0, 0x1bca3),
+    (0x1d173, 0x1d17a),
+    (0xe0000, 0xe0fff),
+];
+
+/// Unicode 17.0.0's general category `Cf`, format characters
+/// (extracted/DerivedGeneralCategory-17.0.0.txt, "Total code points: 170").
+const FORMAT: &[(u32, u32)] = &[
+    (0x00ad, 0x00ad),
+    (0x0600, 0x0605),
+    (0x061c, 0x061c),
+    (0x06dd, 0x06dd),
+    (0x070f, 0x070f),
+    (0x0890, 0x0891),
+    (0x08e2, 0x08e2),
+    (0x180e, 0x180e),
+    (0x200b, 0x200f),
+    (0x202a, 0x202e),
+    (0x2060, 0x2064),
+    (0x2066, 0x206f),
+    (0xfeff, 0xfeff),
+    (0xfff9, 0xfffb),
+    (0x110bd, 0x110bd),
+    (0x110cd, 0x110cd),
+    (0x13430, 0x1343f),
+    (0x1bca0, 0x1bca3),
+    (0x1d173, 0x1d17a),
+    (0xe0001, 0xe0001),
+    (0xe0020, 0xe007f),
+];
+
+/// Whether a launch refuses to show `c` (RT-MAN-05): a control (C1 included), whitespace other
+/// than the space, a default-ignorable or format character (direction marks, zero-width and
+/// other invisible characters) or a noncharacter. std's two classes follow the pinned
+/// toolchain's Unicode version; the two tables are Unicode 17.0.0. Letters, marks, symbols,
+/// private-use and unassigned code points are not refused: they are shown escaped.
+#[must_use]
+pub fn is_refused(c: char) -> bool {
+    c.is_control()
+        || (c.is_whitespace() && c != ' ')
+        || in_table(DEFAULT_IGNORABLE, c)
+        || in_table(FORMAT, c)
+        || is_noncharacter(c)
+}
+
+fn in_table(table: &[(u32, u32)], c: char) -> bool {
+    let n = u32::from(c);
+    table
+        .binary_search_by(|&(lo, hi)| {
+            if hi < n {
+                std::cmp::Ordering::Less
+            } else if lo > n {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
+}
+
+/// U+FDD0..=U+FDEF and the last two code points of every plane.
+fn is_noncharacter(c: char) -> bool {
+    let n = u32::from(c);
+    (0xfdd0..=0xfdef).contains(&n) || n & 0xfffe == 0xfffe
+}
+
+/// The longest `\u{…}`: six hex digits.
+const MAX_U_ESCAPE: usize = 10;
+
+/// The first escape in `line`, text the escapers here wrote, that shows a character
+/// [`is_refused`] takes or a byte that is not UTF-8, as written in the line (RT-MAN-05). Fails
+/// closed: a backslash that does not start `\\`, `\"`, `\xHH` (lowercase hex) or `\u{H…}` (one to
+/// six lowercase hex digits naming a character) refuses, shown up to where it stopped reading.
+/// `None` when every escape shows a character a launch may show.
+#[must_use]
+pub fn refused_escape(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    while let Some(off) = bytes
+        .get(i..)
+        .and_then(|rest| rest.iter().position(|&b| b == b'\\'))
+    {
+        let start = i.saturating_add(off);
+        let rest = bytes.get(start..).unwrap_or_default();
+        match read_escape(rest) {
+            Ok(len) => i = start.saturating_add(len),
+            Err(len) => {
+                let end = (start.saturating_add(len)..=line.len())
+                    .find(|&e| line.is_char_boundary(e))
+                    .unwrap_or(line.len());
+                return line.get(start..end);
+            }
+        }
+    }
+    None
+}
+
+/// The length of the escape `rest` starts with: `Ok` for one that shows a character a launch may
+/// show, `Err` (at least 1) for any other.
+fn read_escape(rest: &[u8]) -> Result<usize, usize> {
+    match rest.get(1) {
+        Some(b'\\' | b'"') => Ok(2),
+        Some(b'x') => match rest.get(2..4).and_then(hex_value) {
+            Some(v) if (0x20..=0x7e).contains(&v) => Ok(4),
+            _ => Err(rest.len().min(4)),
+        },
+        Some(b'u') if rest.get(2) == Some(&b'{') => {
+            let Some(close) = rest.iter().take(MAX_U_ESCAPE).position(|&b| b == b'}') else {
+                return Err(rest.len().min(MAX_U_ESCAPE));
+            };
+            let shown = rest
+                .get(3..close)
+                .and_then(hex_value)
+                .and_then(char::from_u32)
+                .is_some_and(|c| !is_refused(c));
+            let len = close.saturating_add(1);
+            if shown { Ok(len) } else { Err(len) }
+        }
+        _ => Err(rest.len().min(2)),
+    }
+}
+
+/// `digits` as lowercase hex, one to six of them; `None` for anything else.
+fn hex_value(digits: &[u8]) -> Option<u32> {
+    if digits.is_empty() || digits.len() > 6 {
+        return None;
+    }
+    digits.iter().try_fold(0u32, |v, &d| {
+        if !matches!(d, b'0'..=b'9' | b'a'..=b'f') {
+            return None;
+        }
+        let n = char::from(d).to_digit(16)?;
+        v.checked_mul(16)?.checked_add(n)
+    })
 }
 
 /// Where [`quoted_args_capped`] cut a list of arguments (RT-MAN-05).
@@ -193,7 +362,7 @@ pub fn cut_escaped(text: &str, max: usize) -> (String, bool) {
 
 /// The largest offset at most `max` that does not fall inside a `\…` escape or a character of
 /// `text`.
-fn escape_boundary(text: &str, max: usize) -> usize {
+pub(crate) fn escape_boundary(text: &str, max: usize) -> usize {
     let bytes = text.as_bytes();
     let mut i = 0usize;
     while let Some(&b) = bytes.get(i) {
@@ -425,6 +594,10 @@ fn push_unquoted(c: char, out: &mut String) {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "text_shown_tests.rs"]
+mod shown_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
