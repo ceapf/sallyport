@@ -70,6 +70,28 @@ impl Subject {
 /// (`stop_role_unreceived`).
 pub(crate) const STOP_RETRIES_AFTER_REMOVAL: u32 = 3;
 
+/// How many failed attempts of one stop are each an oplog line; after these, only each doubling
+/// of the count is ([`logs_failed_stop_attempt`]).
+pub(crate) const STOP_ATTEMPTS_LOGGED: u32 = 10;
+
+/// Whether failed attempt `n` (1-based, counted over all the rounds of one stop that retries
+/// until its container is confirmed gone) is an oplog line: each of the first
+/// [`STOP_ATTEMPTS_LOGGED`], then one each time the count doubles (20, 40, 80 and so on), each
+/// line carrying the count so far. The attempts are never capped (a running container is never
+/// given up on); their lines are, at most 38 over the whole `u32` range of the count.
+#[must_use]
+pub(crate) fn logs_failed_stop_attempt(n: u32) -> bool {
+    n <= STOP_ATTEMPTS_LOGGED
+        || (n.is_multiple_of(STOP_ATTEMPTS_LOGGED) && (n / STOP_ATTEMPTS_LOGGED).is_power_of_two())
+}
+
+/// Whether a round of `attempts` failed attempts, after `before` failed attempts of the same
+/// stop, holds one that [`logs_failed_stop_attempt`]: the round's own line is logged only then.
+#[must_use]
+pub(crate) fn logs_a_failed_round(before: u32, attempts: u32) -> bool {
+    (1..=attempts).any(|i| before.checked_add(i).is_some_and(logs_failed_stop_attempt))
+}
+
 /// How many tries a failed launch's cleanup gets in all, the first (in the launch) included.
 pub const CLEANUP_TRIES: usize = 10;
 
@@ -785,6 +807,46 @@ mod tests {
         let p = CleanupSchedule::PRODUCTION;
         assert_eq!(p.stop_pause(1), Duration::from_secs(2));
         assert_eq!(p.stop_pause(u32::MAX), Duration::from_secs(60));
+    }
+
+    /// A stop's failed attempts are each logged up to the tenth, then only at each doubling of
+    /// the count (20, 40, 80 and so on), however long the stop retries.
+    #[test]
+    fn a_stops_failed_attempts_are_logged_to_the_tenth_then_at_each_doubling() {
+        for n in 1..=10 {
+            assert!(logs_failed_stop_attempt(n), "attempt {n}");
+        }
+        // 10 << 28: the last doubling below `u32::MAX`.
+        let doublings = [20, 40, 80, 160, 320, 640, 1280, 10 << 28];
+        for n in doublings {
+            assert!(logs_failed_stop_attempt(n), "attempt {n}");
+        }
+        for n in [11, 19, 21, 25, 30, 39, 41, 60, 79, 100, 120, 1000, u32::MAX] {
+            assert!(!logs_failed_stop_attempt(n), "attempt {n}");
+        }
+        let logged = (1..=100_000)
+            .filter(|&n| logs_failed_stop_attempt(n))
+            .count();
+        assert_eq!(logged, 10 + 13, "1..=10, then 20 .. 81920");
+        assert_eq!(STOP_ATTEMPTS_LOGGED, 10);
+    }
+
+    /// A round of failed attempts is logged when any of its attempts is: its round line goes
+    /// with the attempt lines, under the same bound.
+    #[test]
+    fn a_failed_round_is_logged_when_one_of_its_attempts_is() {
+        assert!(logs_a_failed_round(0, 3), "attempts 1-3");
+        assert!(logs_a_failed_round(9, 3), "attempts 10-12: the tenth");
+        assert!(!logs_a_failed_round(10, 3), "attempts 11-13");
+        assert!(!logs_a_failed_round(16, 3), "attempts 17-19");
+        assert!(logs_a_failed_round(17, 3), "attempts 18-20: the twentieth");
+        assert!(logs_a_failed_round(19, 1), "attempt 20 alone");
+        assert!(!logs_a_failed_round(20, 1), "attempt 21 alone");
+        assert!(!logs_a_failed_round(9, 0), "a round of no attempts");
+        assert!(
+            !logs_a_failed_round(u32::MAX, 3),
+            "past u32::MAX nothing is logged"
+        );
     }
 
     /// Only a caller's handle is stopped on drop, and only with a runtime; a launcher's stop

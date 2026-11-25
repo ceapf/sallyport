@@ -55,7 +55,9 @@ use crate::approvals::queue::Desk;
 use crate::daemon::crash::{Crash, CrashReceiver, CrashReporter};
 use crate::rpc::listen::Handle;
 use crate::rpc::record::Recorder;
-use crate::sandbox::{Confirmed, Running, StopError};
+use crate::sandbox::{
+    Confirmed, Running, StopError, logs_a_failed_round, logs_failed_stop_attempt,
+};
 use crate::tools::ops::{Ops, STOP_DRAIN};
 
 /// `Launcher::stop` attempts per round before the session is stop-failed until the next one.
@@ -388,7 +390,9 @@ impl Registry {
                     () = tokio::time::sleep(pause) => {}
                 }
             }
-            match self.stop_bounded(running, failed == 0).await {
+            // Every failed round made `STOP_ATTEMPTS` attempts.
+            let before = failed.saturating_mul(STOP_ATTEMPTS);
+            match self.stop_bounded(running, before).await {
                 Ok(done) => {
                     if let Some(c) = crashes.as_mut() {
                         // Before the release, so a payload is still redacted (architect Q228;
@@ -436,11 +440,13 @@ impl Registry {
                     }
                     failed = failed.saturating_add(1);
                     running = r;
-                    self.p.oplog.error(
-                        LOG,
-                        "session container not confirmed gone",
-                        &[("session", &sid), ("detail", &error.to_string())],
-                    );
+                    if logs_a_failed_round(before, STOP_ATTEMPTS) {
+                        self.p.oplog.error(
+                            LOG,
+                            "session container not confirmed gone",
+                            &[("session", &sid), ("detail", &error.to_string())],
+                        );
+                    }
                     self.stop_failed(&sid);
                     let why = format!("the container of session {sid} could not be confirmed gone");
                     for r in replies.drain(..) {
@@ -452,13 +458,14 @@ impl Registry {
     }
 
     /// `Launcher::stop`, at most [`STOP_ATTEMPTS`] times; the token of the one that succeeded,
-    /// or the handle back with the last attempt's error. Each failed attempt is an oplog warning
-    /// when `log_attempts` (a stop's first round only, so an unconfirmed stop that retries for
-    /// hours writes one error line per round, not four).
+    /// or the handle back with the last attempt's error. `before`: the stop's attempts that
+    /// already failed, in earlier rounds. A failed attempt is an oplog warning carrying the
+    /// stop's count so far when [`logs_failed_stop_attempt`] says so: each up to the tenth, then
+    /// each doubling, so a stop that retries for days writes a few dozen of these lines.
     pub(super) async fn stop_bounded(
         &self,
         running: Running,
-        log_attempts: bool,
+        before: u32,
     ) -> Result<Confirmed, Box<StopError>> {
         let mut r = running;
         let mut attempt = 1;
@@ -467,14 +474,15 @@ impl Registry {
                 Ok(done) => return Ok(done),
                 Err(e) => e,
             };
-            if log_attempts {
+            let count = before.saturating_add(attempt);
+            if logs_failed_stop_attempt(count) {
                 let detail = e.error.to_string();
                 self.p.oplog.warn(
                     LOG,
                     "workspace stop failed",
                     &[
                         ("session", e.running.paths().id().as_str()),
-                        ("attempt", &attempt.to_string()),
+                        ("attempt", &count.to_string()),
                         ("detail", &detail),
                     ],
                 );

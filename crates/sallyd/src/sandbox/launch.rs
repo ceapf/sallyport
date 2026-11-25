@@ -74,6 +74,7 @@ pub use harness::HarnessRequest;
 pub use inference::InferenceRequest;
 pub use parts::{CLEANUP_TRIES, CleanupSchedule, PinError};
 use parts::{OnDrop, Owner, Subject, on_drop};
+pub(crate) use parts::{logs_a_failed_round, logs_failed_stop_attempt};
 pub use start::RoleRunning;
 use start::{Extra, Launched, Prepared, Recheck, Request};
 pub use teardown::Sweep;

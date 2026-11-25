@@ -518,7 +518,8 @@ impl Registry {
     /// that retries it by itself, backed off and capped, and at once on a request (RT-AUD-03).
     async fn discard(self: &Arc<Self>, running: Running, manifest: &str) {
         let sid = running.paths().id().as_str().to_owned();
-        let e = match self.stop_bounded(running, true).await {
+        // No attempt of this stop has failed yet: its count starts here.
+        let e = match self.stop_bounded(running, 0).await {
             Ok(done) => {
                 // It is gone: `session.closed`, then its forms leave the redactors (#94,
                 // architect Q219, Q245, Q252).

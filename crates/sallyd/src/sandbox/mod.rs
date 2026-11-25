@@ -50,6 +50,7 @@ pub use launch::{
     LaunchError, Launcher, LauncherParts, PinError, RoleRunning, RoleStopError, Running,
     SharedAudit, StopError, Sweep, WorkspaceRequest,
 };
+pub(crate) use launch::{logs_a_failed_round, logs_failed_stop_attempt};
 pub use overlap::{Claim, Conflict, HarnessClaimError, ReserveError, Sessions, claims};
 pub use podman::{PODMAN_PATH_VAR, Podman, PodmanError, PodmanHost};
 pub use profiles::profile;

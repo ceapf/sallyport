@@ -8,7 +8,7 @@ use serde_json::json;
 
 use super::parts::{
     CleanupTries, Directories, Made, NextTry, Owner, Presence, STOP_RETRIES_AFTER_REMOVAL, Subject,
-    abandoned_entry, cleaned_entry, containers_gone, stop_failed_entry,
+    abandoned_entry, cleaned_entry, containers_gone, logs_failed_stop_attempt, stop_failed_entry,
 };
 use super::start::Held;
 use super::{
@@ -168,12 +168,16 @@ impl Launcher {
                 Ok(_) => return self.cleanup_confirmed(Role::Workspace, &id),
                 Err(e) => e,
             };
+            let logs = logs_failed_stop_attempt(tries);
+            if logs {
+                self.stop_attempt_failed(Role::Workspace, &e.running.name, tries, &e.error);
+            }
             // `stop` also fails with the container gone (scratch removal, or a container that
             // went by itself): nothing runs, so no entry. A bounded number of retries remain,
             // which release the claims and remove the scratch once `stop` gets that far. A retry
             // finds the container by name, which is safe: session ids are fresh random ids minted
             // once, so no other workspace ever carries this name.
-            if self.presence(&e.running.name).await == Presence::Absent {
+            if self.presence(&e.running.name, logs).await == Presence::Absent {
                 if after_removal >= STOP_RETRIES_AFTER_REMOVAL {
                     e.running.owner = Owner::Ended;
                     return self.cleanup_confirmed(Role::Workspace, &id);
@@ -191,11 +195,27 @@ impl Launcher {
         }
     }
 
+    /// One oplog warning for failed attempt `attempt` (the count so far) of a stop of `role`'s
+    /// `container` that nobody holds; [`logs_failed_stop_attempt`] decides which are written.
+    fn stop_attempt_failed(&self, role: Role, container: &str, attempt: u32, error: &LaunchError) {
+        self.oplog.warn(
+            "sandbox",
+            "container stop failed",
+            &[
+                ("role", role.as_str()),
+                ("container", container),
+                ("attempt", &attempt.to_string()),
+                ("detail", &error.to_string()),
+            ],
+        );
+    }
+
     /// The strict probe of `container` after a failed stop: present, absent or unknown. An
-    /// unknown answer's error is an oplog warning, since the entry carries the stop's error.
-    async fn presence(&self, container: &str) -> Presence {
+    /// unknown answer's error is an oplog warning when `log` (the failed attempt is logged too,
+    /// so the warnings keep the attempts' bound), since the entry carries the stop's error.
+    async fn presence(&self, container: &str, log: bool) -> Presence {
         let probe = self.container_exists(container).await;
-        if let Err(e) = &probe {
+        if log && let Err(e) = &probe {
             self.oplog.warn(
                 "sandbox",
                 "container probe failed",
@@ -214,7 +234,9 @@ impl Launcher {
         attempts: u32,
         error: &LaunchError,
     ) -> bool {
-        let due = self.presence(&r.name).await.audits_a_failed_stop();
+        // Probed only until the entry is written: an unknown answer writes it, so its warning
+        // comes at most once per stop.
+        let due = self.presence(&r.name, true).await.audits_a_failed_stop();
         if due {
             self.audit_workspace_stop_failed(r, attempts, error).await;
         }
@@ -481,12 +503,16 @@ impl Launcher {
                 Ok(()) => return,
                 Err(e) => e,
             };
+            let logs = logs_failed_stop_attempt(tries);
+            if logs {
+                self.stop_attempt_failed(role, &e.running.name, tries, &e.error);
+            }
             // `stop_role` also fails with the container gone (the entry, the directories, or a
             // container that went by itself): nothing runs any more, so no entry, and only a
             // bounded number of retries remain, for what the retry still does (the claim, an
             // instance's directories, which no sweep removes). Checked by id.
-            let gone =
-                e.running.removed || self.presence(&e.running.container).await == Presence::Absent;
+            let gone = e.running.removed
+                || self.presence(&e.running.container, logs).await == Presence::Absent;
             if gone {
                 if after_removal >= STOP_RETRIES_AFTER_REMOVAL {
                     e.running.owner = Owner::Ended;
