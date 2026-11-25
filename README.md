@@ -1,9 +1,9 @@
 # Sallyport
 
 > **Status: pre-alpha. Not ready for use. No security guarantees yet.**
-> The security core is under construction (milestone M1 of 6). Nothing here is released, the
-> interfaces will change, and the invariants below are design goals until the red-team suite
-> proves each one in CI. Do not rely on Sallyport to contain anything today.
+> The security core and a minimal command line are built and tested (milestone M1 of 6, exited
+> 24 November 2026). No model runs in Sallyport yet, nothing is released, and the interfaces
+> will change. Do not rely on Sallyport to contain anything today.
 
 Sallyport is a desktop suite for running local LLMs and agent harnesses inside rootless Podman
 sandboxes. A strict permission manifest says what each session may touch (folders, hosts,
@@ -17,6 +17,57 @@ audited.
 - **Manifest format:** [`docs/MANIFEST_SPEC.md`](docs/MANIFEST_SPEC.md)
 - **Plan:** [`docs/MILESTONES.md`](docs/MILESTONES.md)
 - **Red-team suite:** [`tests/redteam/REDTEAM_SUITE.md`](tests/redteam/REDTEAM_SUITE.md)
+- **M1 exit report:** [`docs/reports/M1.md`](docs/reports/M1.md)
+
+## What works today
+
+M1 is the security core with no model in it. On a Linux or WSL2 host with rootless Podman you
+can:
+
+- build it and run its tests, including the red-team suite (`make lint test`, `make redteam`);
+  many of its tests attack real containers;
+- check a host with `sally doctor`;
+- validate a manifest and read what it grants in plain English (`sally manifest validate`,
+  `sally manifest summary`), using the examples in `manifests/examples/`.
+
+The broker and the command line can also launch a sandbox from a manifest, with brokered file
+tools and a shell tool, egress through an allowlist proxy, credentials injected outside the
+sandbox, approvals answered on a terminal, and a hash-chained audit log (`sally audit verify`).
+There is no published sandbox image yet, so today that path is exercised by the test suite,
+which builds its own image.
+
+There is no model, no agent harness, no installer and no UI.
+
+## How it has been checked
+
+- The red-team suite document lists every attack row with its test and its control, and marks
+  the rows, tests and controls that are not built yet. The M1 rows' tests run in CI, except one
+  that needs WSL.
+- A mutation gate runs every night.
+- A security review of the trusted core ran during M1. It found three high-severity
+  weaknesses; all three were fixed and checked again. The findings still open, none of them
+  high, are listed in the exit report with the stage each is due.
+
+## Known limits
+
+- **Shared kernel.** Sandboxes are rootless containers. A flaw in the Linux kernel is outside
+  what Sallyport defends against. A stronger isolation tier is planned.
+- **Same account.** To the kernel a sandbox runs as your own account, so it shares some of your
+  account's kernel allowances. A misbehaving sandbox can make your other programs fail until
+  its session is stopped. `THREAT_MODEL.md` section 6 lists this and the other accepted risks.
+- **Linux and WSL2 only, command line only.**
+
+## What comes next
+
+Next is first light: the first real local model running end to end inside the sandboxes. In
+order:
+
+1. Close the security items the exit report lists as due before a real model runs.
+2. Sandbox images, the rest of the model library, and the inference container.
+3. An agent harness in its own container, with review of staged changes before they reach your
+   files.
+
+The full plan is in [`docs/MILESTONES.md`](docs/MILESTONES.md).
 
 ## Platform
 
