@@ -270,7 +270,8 @@ fn good(i: &Intent, f: &Facts) -> Value {
             "rlimits": [
                 {"type": "RLIMIT_CORE", "hard": 0, "soft": 0},
                 {"type": "RLIMIT_NOFILE", "hard": SANDBOX_NOFILE, "soft": SANDBOX_NOFILE},
-                {"type": "RLIMIT_NPROC", "hard": OWN_NPROC, "soft": OWN_NPROC}
+                {"type": "RLIMIT_NPROC", "hard": OWN_NPROC, "soft": OWN_NPROC},
+                {"type": "RLIMIT_MSGQUEUE", "hard": SANDBOX_MSGQUEUE, "soft": SANDBOX_MSGQUEUE}
             ],
             "noNewPrivileges": true
         },
@@ -611,8 +612,12 @@ fn rlimits(v: &mut Value) -> &mut Vec<Value> {
 /// value, not the constant.
 const SANDBOX_NOFILE: u64 = 512;
 
+/// The launcher's message-queue limit (`--ulimit msgqueue=0:0`), written out likewise.
+const SANDBOX_MSGQUEUE: u64 = 0;
+
 #[test]
-fn rlimits_are_core_zero_the_launcher_s_nofile_and_podman_s_nproc_within_sallyd_s_own() {
+fn rlimits_are_core_zero_the_launcher_s_nofile_and_msgqueue_and_podman_s_nproc_within_sallyd_s_own()
+{
     let set = |k: usize, hard: u64, soft: u64| {
         move |v: &mut Value| {
             rlimits(v)[k]["hard"] = json!(hard);
@@ -647,7 +652,15 @@ fn rlimits_are_core_zero_the_launcher_s_nofile_and_podman_s_nproc_within_sallyd_
     refused("process.rlimits.RLIMIT_CORE", |v| {
         rlimits(v).push(json!({"type": "RLIMIT_CORE", "hard": 0, "soft": 0}));
     });
-    for k in 0..3 {
+    // RLIMIT_MSGQUEUE is exactly the launcher's 0/0, soft and hard each (RT-AG-09).
+    for (hard, soft) in [
+        (SANDBOX_MSGQUEUE + 1, SANDBOX_MSGQUEUE),
+        (SANDBOX_MSGQUEUE, SANDBOX_MSGQUEUE + 1),
+        (819_200, 819_200),
+    ] {
+        refused("process.rlimits.RLIMIT_MSGQUEUE", set(3, hard, soft));
+    }
+    for k in 0..4 {
         refused("process.rlimits", |v| {
             rlimits(v).remove(k);
         });

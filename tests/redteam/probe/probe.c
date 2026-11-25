@@ -1,5 +1,5 @@
 /*
- * Red-team syscall probe (RT-NET-01, RT-NET-08, RT-NET-12, RT-FS-17, RT-FS-24). Test-only: built at test time with
+ * Red-team syscall probe (RT-NET-01, RT-NET-08, RT-NET-12, RT-FS-17, RT-FS-24, RT-AG-09). Test-only: built at test time with
  * `cc -static`, copied into the throwaway test image, never linked into or shipped with any
  * Sallyport binary or release image (CLAUDE.md, exception to the no-unsafe rule). Keep it one
  * small file.
@@ -17,6 +17,8 @@
  *                                             socket(2), then sendto(2) of one ICMP echo request
  *   probe syscall <name> [<first>]            syscall(2) by name (`calls` below): its first
  *                                             argument `first` (default 0), every other 0
+ *   probe mqueue                              mq_open(2) of a new POSIX message queue with room
+ *                                             for one 1-byte message, then mq_unlink(2) (RT-AG-09)
  *
  * Numbers are decimal or 0x-hex. Prints "ok" or "errno=<n>" (send: "sent", "socket errno=<n>" or
  * "sendto errno=<n>") and exits 0 or 1; usage errors exit 2.
@@ -24,6 +26,8 @@
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <mqueue.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdint.h>
@@ -152,6 +156,22 @@ static int send_to(char **a) {
     return 0;
 }
 
+/* A new queue charges its bytes to the caller's user, up to RLIMIT_MSGQUEUE (EMFILE past it).
+ * A leftover queue of the same name is removed first, so the open always creates one. */
+static long mqueue(void) {
+    struct mq_attr attr;
+    memset(&attr, 0, sizeof attr);
+    attr.mq_maxmsg = 1;
+    attr.mq_msgsize = 1;
+    syscall(SYS_mq_unlink, "sp-probe");
+    long fd = syscall(SYS_mq_open, "sp-probe", O_CREAT | O_EXCL | O_RDWR, 0600, &attr);
+    if (fd >= 0) {
+        close((int)fd);
+        syscall(SYS_mq_unlink, "sp-probe");
+    }
+    return fd;
+}
+
 int main(int argc, char **argv) {
     if (argc == 5 && strcmp(argv[1], "socket") == 0) {
         long fd = socket((int)num(argv[2]), (int)num(argv[3]), (int)num(argv[4]));
@@ -184,8 +204,11 @@ int main(int argc, char **argv) {
     if ((argc == 3 || argc == 4) && strcmp(argv[1], "syscall") == 0) {
         return report(by_name(argv[2], argc == 4 ? num(argv[3]) : 0));
     }
+    if (argc == 2 && strcmp(argv[1], "mqueue") == 0) {
+        return report(mqueue());
+    }
     fprintf(stderr, "usage: probe socket|socketpair <family> <type> <protocol>"
-                    " | unshare|clone|clone3 <flags> | syscall <name> [<first>]"
+                    " | unshare|clone|clone3 <flags> | syscall <name> [<first>] | mqueue"
                     " | connect|send <family> <type> <protocol> <address> <port>\n");
     return 2;
 }

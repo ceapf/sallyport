@@ -1113,3 +1113,85 @@ fn a_tampered_podman_state_refuses_the_launch() {
         assert_eq!(x.events.list(), ["sandbox.refuse"]);
     });
 }
+
+/// The open-file limits, soft and hard, of the container's init and of a process `podman exec`
+/// starts (as a tool's command is started), then whether setting the limit, soft and hard, to
+/// 513 succeeded (`set`) or not (`refused`).
+const NOFILE_PROBE: &str = "grep 'Max open files' /proc/1/limits; \
+     grep 'Max open files' /proc/self/limits; \
+     if ulimit -n 513 2>/dev/null; then echo set; else echo refused; fi";
+
+/// Soft and hard, as `/proc/<pid>/limits` prints them.
+type Limit = (String, String);
+
+/// The init's and the exec'd process's [`Limit`], and the last line, from [`NOFILE_PROBE`]'s
+/// output.
+fn nofile_read(out: &str) -> (Limit, Limit, String) {
+    let limits: Vec<Limit> = out
+        .lines()
+        .filter(|l| l.starts_with("Max open files"))
+        .map(|l| {
+            let t: Vec<&str> = l.split_whitespace().collect();
+            let field = |i: usize| (*t.get(i).unwrap_or_else(|| panic!("{l}: {out}"))).to_owned();
+            (field(3), field(4))
+        })
+        .collect();
+    assert_eq!(limits.len(), 2, "{out}");
+    let last = out.lines().last().unwrap_or_default().to_owned();
+    (limits[0].clone(), limits[1].clone(), last)
+}
+
+/// RT-AG-09: in a launched workspace, the init and a process `podman exec` starts both have 512
+/// open files, soft and hard, and raising the limit to 513 is refused. Control first: the
+/// product argv with the `nofile` pair left out shows podman's inherited limit, above 512,
+/// through the same reads, and there the same `ulimit -n 513` (no raise) succeeds.
+#[test]
+fn rt_ag_09_the_descriptor_limit_holds_for_init_and_exec() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let v =
+            x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "ro")]));
+        let control = x.control_workspace(&v, "ctl", LeaveOut::Nofile).await;
+        let (code, out) = exec_in(&control, &["sh", "-c", NOFILE_PROBE]);
+        assert_eq!(code, 0, "control: {out}");
+        let (init, execd, last) = nofile_read(&out);
+        let inherited: u64 = init.1.parse().expect("control: a number");
+        assert!(inherited > 512, "control: podman's inherited limit: {out}");
+        assert_eq!(init, execd, "control: {out}");
+        assert_eq!(
+            last, "set",
+            "control: 513 is within the inherited limit: {out}"
+        );
+
+        let r = x.launch(&v, "nofile").await.unwrap();
+        let (code, out) = exec(&r, NOFILE_PROBE).await;
+        assert_eq!(code, 0, "{out}");
+        let (init, execd, last) = nofile_read(&out);
+        let limit = ("512".to_owned(), "512".to_owned());
+        assert_eq!(init, limit, "the init: {out}");
+        assert_eq!(execd, limit, "a process exec started: {out}");
+        assert_eq!(last, "refused", "raising the limit: {out}");
+        x.stop(r).await;
+    });
+}
+
+/// RT-AG-09: a launched workspace creates no POSIX message queue. A queue's bytes are charged up
+/// to the host account's allowance, so every role's limit is zero and `mq_open` is refused
+/// (EMFILE, 24), from a process `podman exec` starts. Control
+/// first: the product argv with the `msgqueue` pair left out creates one through the same probe.
+#[test]
+fn rt_ag_09_a_workspace_creates_no_message_queue() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let v =
+            x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "ro")]));
+        let control = x.control_workspace(&v, "ctl", LeaveOut::Msgqueue).await;
+        let (code, out) = exec_in(&control, &[PROBE, "mqueue"]);
+        assert_eq!((code, out.trim()), (0, "ok"), "control: {out}");
+
+        let r = x.launch(&v, "mqueue").await.unwrap();
+        let (code, out) = exec(&r, &format!("{PROBE} mqueue")).await;
+        assert_eq!((code, out.trim()), (1, "errno=24"), "{out}");
+        x.stop(r).await;
+    });
+}

@@ -154,7 +154,8 @@ policy (`Allowed`), an **allowlist**:
   tokens), `--image-volume=ignore` and a bare `--no-healthcheck` are required, and every other
   health-check option is refused;
 - every option at most once (mounts, variables, `--security-opt` and `--ulimit` kinds included),
-  every hardening option exactly once, `--ulimit` as exactly `core=0` and `nofile=512:512`;
+  every hardening option exactly once, `--ulimit` as exactly `core=0`, `nofile=512:512` and
+  `msgqueue=0:0`;
 - every `-v` source a declared source of that role at its declared guest path: `ro` grants only a
   read-only bind, `rw` a read-write bind plus binds and overlays of paths inside it at the
   matching guest path, `staged` only an overlay; overlay upper and work directories only inside
@@ -173,6 +174,7 @@ podman --runtime <checked runtime_path>          # AMENDMENTS-02 B5: never the d
   --label sallyport.installation=<installation id>   # Q64: the orphan sweeps match it
   --pull=never --http-proxy=false --log-driver=none --ulimit core=0   # AMENDMENTS-01 §6.1
   --ulimit nofile=512:512   # descriptor limit, soft = hard, every role; it does not bound descriptors in flight (#271)
+  --ulimit msgqueue=0:0     # no POSIX message queue, every role: its bytes count against the host account (RT-AG-09)
   --network=none --no-hosts          # NOT --dns=none: Podman 4.9 rejects it with --network=none (preflight V4)
   --read-only --read-only-tmpfs=false
   --cap-drop=ALL --security-opt no-new-privileges
@@ -415,8 +417,8 @@ and the claims are held until `sallyd` exits.
    native architecture), exactly the mounts with their options (each overlay's `lowerdir`
    included, parents before children), the args and environment as built plus the image's
    `Env`, the working directory `/` whatever the image declares (`--workdir /`), rlimits
-   (exactly these three: CORE 0/0, NOFILE exactly 512/512, NPROC within `sallyd`'s own hard
-   limit), cgroup limits with swap equal to memory, `cgroupsPath` in the systemd form only (doctor
+   (exactly these four: CORE 0/0, NOFILE exactly 512/512, MSGQUEUE 0/0, NPROC within `sallyd`'s
+   own hard limit), cgroup limits with swap equal to memory, `cgroupsPath` in the systemd form only (doctor
    requires systemd), masked and read-only paths, annotations and hostname. Beside the config,
    podman's `.Config.Timeout` (read by the same `podman inspect`) must equal the argv's
    `--timeout`, and 0 when it has none (#92, Q193), and its

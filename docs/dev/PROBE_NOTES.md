@@ -116,7 +116,8 @@ line per fact, with where it was found. Check a note again before relying on it 
   were not kept saw 0 in 6 (3 runs) and 2 to 7 in 40. rt_sup_04 counts a split blind exec as
   one exec (Q393).
 - The OCI config, Podman 4.9.3 rootless crun: `capabilities: {}`; rlimits CORE, NOFILE, NPROC
-  (NPROC podman's own hard limit; NOFILE the argv's `--ulimit nofile=512:512` since PR #335); hostname = 12-hex short id without `--hostname`;
+  (NPROC podman's own hard limit; NOFILE the argv's `--ulimit nofile=512:512` since PR #335), and
+  MSGQUEUE 0/0 from `--ulimit msgqueue=0:0`; hostname = 12-hex short id without `--hostname`;
   `/etc/passwd`, `/etc/group`, `/dev/shm` bind from `<graphroot>/…/userdata`, `/etc/hostname`
   and `/run/.containerenv` from `<runroot>/…/userdata`; `:O` overlays are `type: overlay` with
   source `<graphroot>/…/userdata/overlay/<n>/merge`. The seccomp section is the profile filtered
@@ -288,6 +289,12 @@ line per fact, with where it was found. Check a note again before relying on it 
   `socketpair(AF_VSOCK, SOCK_STREAM, 0)` gave errno 95 (`EOPNOTSUPP`). So RT-NET-12's `ENOSYS`
   for every refused `socketpair` family can only come from the profile; its `AF_UNIX` pairs are
   made in every role on every `make redteam` run. (PR #226; kernel version not recorded)
+- POSIX message queues in a launched workspace: without a `msgqueue` limit,
+  `mq_open(O_CREAT)` from an exec'd process succeeds (the limit is podman's inherited
+  `RLIMIT_MSGQUEUE`, and the bytes count against the host account's allowance under keep-id);
+  with `--ulimit msgqueue=0:0` it fails with errno 24 (`EMFILE`). The probe's `mqueue` mode
+  (`tests/redteam/probe/probe.c`) prints `ok` or `errno=N`. (Kernel 6.18 WSL2, Podman 4.9.3;
+  RT-AG-09)
 
 ## Busybox (test image)
 

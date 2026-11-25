@@ -83,19 +83,28 @@ pub const INSTALLATION_LABEL: &str = "sallyport.installation";
 /// image-chosen one below a mount's guest path would land in the host folder (RT-FS-02).
 pub const WORKDIR: &str = "/";
 
-/// Every container's descriptor limit, soft and hard (`--ulimit nofile=512:512`). The kernel
-/// counts descriptors in flight over Unix sockets per kernel user, which `--userns=keep-id`
-/// shares with the host user, and refuses a pass once the sender's user has more in flight
-/// than the sender's own limit. So one sender in a sandbox holds at most this plus one
-/// message's 253, below the 1024 soft limit ordinary host programs get (security review). It
-/// does not bound every way of queueing descriptors (#271). Hard equals soft: every seccomp
-/// profile allows `setrlimit` and `prlimit64`, so a lower soft limit alone could be raised.
+/// Every container's descriptor limit, soft and hard (`--ulimit nofile=512:512`, RT-AG-09): the
+/// most open files one sandbox process has. It does not bound descriptors in flight (#271).
+/// Hard equals soft: every seccomp profile allows `setrlimit` and `prlimit64`, so a lower soft
+/// limit alone could be raised.
 pub const NOFILE_LIMIT: u64 = 512;
 
 /// The `--ulimit` value that sets [`NOFILE_LIMIT`] (`nofile=512:512`).
 #[must_use]
 pub fn nofile_ulimit() -> String {
     format!("nofile={NOFILE_LIMIT}:{NOFILE_LIMIT}")
+}
+
+/// Every container's POSIX message-queue limit in bytes, soft and hard (`--ulimit
+/// msgqueue=0:0`, RT-AG-09): none. A queue's bytes are charged up to the host account (the
+/// owner of the sandbox's user namespace; under keep-id, the same kernel uid), and no role
+/// uses POSIX message queues.
+pub const MSGQUEUE_LIMIT: u64 = 0;
+
+/// The `--ulimit` value that sets [`MSGQUEUE_LIMIT`] (`msgqueue=0:0`).
+#[must_use]
+pub fn msgqueue_ulimit() -> String {
+    format!("msgqueue={MSGQUEUE_LIMIT}:{MSGQUEUE_LIMIT}")
 }
 
 /// The id of one Sallyport installation (one state directory): a random UUID v4 in its
@@ -552,14 +561,19 @@ mod tests {
         }
     }
 
-    /// The limit is 512, soft and hard, and one sender's most in flight (the limit plus one
-    /// message of 253, the kernel's per-message maximum) stays below host programs' usual soft
-    /// 1024 (security review).
+    /// The limit is 512 open files, soft and hard (RT-AG-09). It bounds no descriptors in flight
+    /// (#271), so the test claims no such bound.
     #[test]
-    fn the_descriptor_limit_stays_below_host_programs_soft_limit() {
+    fn the_descriptor_limit_is_512_soft_and_hard() {
         assert_eq!(nofile_ulimit(), "nofile=512:512");
         assert_eq!(NOFILE_LIMIT, 512);
-        const { assert!(NOFILE_LIMIT + 253 < 1024) };
+    }
+
+    /// No message-queue bytes, soft and hard (RT-AG-09).
+    #[test]
+    fn the_message_queue_limit_is_zero_soft_and_hard() {
+        assert_eq!(msgqueue_ulimit(), "msgqueue=0:0");
+        assert_eq!(MSGQUEUE_LIMIT, 0);
     }
 
     #[test]

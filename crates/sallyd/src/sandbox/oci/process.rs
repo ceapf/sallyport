@@ -7,7 +7,7 @@ use super::config::{Capabilities, Process, Rlimit, User};
 use super::facts::Facts;
 use super::intent::Intent;
 use super::{Mismatch, ensure};
-use crate::sandbox::types::{NOFILE_LIMIT, WORKDIR};
+use crate::sandbox::types::{MSGQUEUE_LIMIT, NOFILE_LIMIT, WORKDIR};
 
 /// `--init`: podman runs the checked catatonit at this path, then the command.
 pub const INIT_GUEST: &str = "/run/podman-init";
@@ -134,9 +134,10 @@ fn check_caps(c: &Capabilities) -> Result<(), Mismatch> {
     Ok(())
 }
 
-/// Exactly `RLIMIT_CORE` 0/0 (`--ulimit core=0`), `RLIMIT_NOFILE` at the launcher's
-/// [`NOFILE_LIMIT`] soft and hard (`--ulimit nofile=…`; a sandbox's descriptor limit also bounds
-/// what it can hold in flight, so a lower or higher value is refused alike), and podman's
+/// Exactly `RLIMIT_CORE` 0/0 (`--ulimit core=0`), `RLIMIT_MSGQUEUE` at the launcher's
+/// [`MSGQUEUE_LIMIT`] soft and hard (`--ulimit msgqueue=0:0`, RT-AG-09), `RLIMIT_NOFILE` at the
+/// launcher's [`NOFILE_LIMIT`] soft and hard (`--ulimit nofile=…`, a lower or higher value
+/// refused alike; it does not bound descriptors in flight (#271)), and podman's
 /// inherited `RLIMIT_NPROC` with soft ≤ hard ≤ `sallyd`'s own hard limit (architect Q103).
 fn check_rlimits(limits: &[Rlimit], f: &Facts) -> Result<(), Mismatch> {
     let mut seen = Vec::new();
@@ -157,6 +158,14 @@ fn check_rlimits(limits: &[Rlimit], f: &Facts) -> Result<(), Mismatch> {
                 )?;
                 continue;
             }
+            "RLIMIT_MSGQUEUE" => {
+                ensure(
+                    r.hard == MSGQUEUE_LIMIT && r.soft == MSGQUEUE_LIMIT,
+                    &field,
+                    "not the launcher's message-queue limit",
+                )?;
+                continue;
+            }
             "RLIMIT_NPROC" => f.own_nproc,
             _ => return Err(Mismatch::new(field, "not a limit podman sets")),
         };
@@ -164,8 +173,8 @@ fn check_rlimits(limits: &[Rlimit], f: &Facts) -> Result<(), Mismatch> {
         ensure(r.hard <= own, &field, "above sallyd's own hard limit")?;
     }
     ensure(
-        seen.len() == 3,
+        seen.len() == 4,
         "process.rlimits",
-        "not exactly RLIMIT_CORE, RLIMIT_NOFILE and RLIMIT_NPROC",
+        "not exactly RLIMIT_CORE, RLIMIT_MSGQUEUE, RLIMIT_NOFILE and RLIMIT_NPROC",
     )
 }
