@@ -15,8 +15,9 @@ pub mod sweep;
 pub const MAX_BLOCKING_THREADS: usize = 512;
 
 /// Shutdown's verdict (#239): the ids whose containers were not confirmed gone, from the
-/// sessions' stops and from failed launches' cleanups not finished at that moment, merged,
-/// sorted and each once. Empty: a clean stop.
+/// sessions' stops and from the launcher's removals not finished at that moment (a failed
+/// launch's cleanup, the stop of a container nobody holds), merged, sorted and each once.
+/// Empty: a clean stop.
 #[must_use]
 pub fn not_stopped_cleanly(sessions: Vec<String>, cleanups: Vec<String>) -> Vec<String> {
     let all: std::collections::BTreeSet<String> = sessions.into_iter().chain(cleanups).collect();
@@ -64,6 +65,18 @@ mod tests {
         assert_eq!(
             not_stopped_cleanly(ids(&["z", "b"]), ids(&["c", "b", "a"])),
             ids(&["a", "b", "c", "z"])
+        );
+    }
+
+    /// The unclean exit names every kind of id it can carry: a session's, a failed launch's,
+    /// and that of a launch nobody holds (RT-AG-08b).
+    #[test]
+    fn the_unclean_exit_names_what_it_covers() {
+        let e = serve::DaemonError::Unconfirmed(ids(&["s-1", "i-2"]));
+        assert_eq!(
+            e.to_string(),
+            "containers not confirmed gone (sessions, failed launches or launches nobody \
+             holds): [\"s-1\", \"i-2\"]"
         );
     }
 }

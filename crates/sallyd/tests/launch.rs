@@ -9,7 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use sallyd::sandbox::{Expect, LaunchError, Sweep, check_in_container};
+use sallyd::sandbox::{Expect, LaunchError, Running, Sweep, check_in_container};
 
 mod common;
 use common::container::*;
@@ -658,7 +658,8 @@ fn orphans_of_a_previous_sallyd_are_removed() {
             x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "rw")]));
         let r = x.launch(&v, "orphan").await.unwrap();
         let name = r.name().to_owned();
-        drop(r); // the handle dies with the "crashed" sallyd; the container keeps running
+        // The handle dies with the "crashed" sallyd; the container keeps running.
+        x.drop_as_killed(r);
         assert!(exists(&name));
         // A session live in this launcher is never an orphan.
         assert!(
@@ -886,6 +887,208 @@ fn a_dropped_launch_cleans_up_after_itself() {
         }
         let again = again.expect("the cancelled launch released its claims");
         assert!(!exists(&name));
+        x.stop(again).await;
+    });
+}
+
+/// The longest a test waits for the launcher to stop a container nobody holds.
+const STOP_BOUND: Duration = Duration::from_secs(60);
+
+/// How long a test lets a launch it polled once run on unpolled: well past the start grace, so
+/// its task has sent its result into the channel the caller no longer polls.
+const PAST_THE_SEND: Duration = Duration::from_secs(5);
+
+/// Polls `done` every 100 ms until it holds; fails the test naming `what` after `bound`.
+async fn until(what: &str, bound: Duration, mut done: impl FnMut() -> bool) {
+    let end = std::time::Instant::now() + bound;
+    while !done() {
+        assert!(
+            std::time::Instant::now() < end,
+            "{what}: not within {bound:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The positions of the entries named `event` whose `role` is `role`, oldest first.
+fn role_entries(x: &Lx, event: &str, role: &str) -> Vec<usize> {
+    x.events
+        .all()
+        .iter()
+        .enumerate()
+        .filter(|(_, (e, a))| e == event && a["role"] == role)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Asserts one `sandbox.stop` of `role`, after the one `sandbox.launch` of `role`.
+fn assert_stopped_after_launch(x: &Lx, role: &str) {
+    let launched = role_entries(x, "sandbox.launch", role);
+    let stopped = role_entries(x, "sandbox.stop", role);
+    assert_eq!(launched.len(), 1, "{:?}", x.events.list());
+    assert_eq!(stopped.len(), 1, "{:?}", x.events.list());
+    assert!(launched[0] < stopped[0], "{:?}", x.events.list());
+}
+
+/// Asserts the oplog line only a dropped handle's guard writes, naming `container`: the stop
+/// came from the drop, not from a launch task whose send failed (so the test cannot pass on
+/// timing alone).
+fn assert_stopped_by_the_drop(x: &Lx, container: &str) {
+    let log = x.oplog_text();
+    assert!(
+        log.lines().any(|l| l
+            .contains("a container's handle was dropped without a stop; the launcher stops it")
+            && l.contains(container)),
+        "{log}"
+    );
+}
+
+/// Launches `v` as `tag`, retrying while the folder is still claimed (a stop releases the
+/// claim after the container is gone); fails the test past [`STOP_BOUND`].
+async fn relaunch(x: &Lx, v: &sally_core::manifest::ValidatedManifest, tag: &str) -> Running {
+    let end = std::time::Instant::now() + STOP_BOUND;
+    loop {
+        match x.launch(v, tag).await {
+            Ok(r) => return r,
+            Err(LaunchError::Overlap(_)) if std::time::Instant::now() < end => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("the folder is still refused: {e}"),
+        }
+    }
+}
+
+/// Polls `launch` once, so its task starts; the caller then never polls it again.
+async fn poll_once<F: std::future::Future + Unpin>(launch: &mut F) {
+    tokio::select! {
+        biased;
+        _ = launch => panic!("the launch finished at its first poll"),
+        () = std::future::ready(()) => {}
+    }
+}
+
+/// RT-AG-08b: a workspace launch whose result was sent while its
+/// caller still existed, but never received (the caller's future dropped after the send), is
+/// stopped: its container goes, `sandbox.stop` follows `sandbox.launch`, and its claim is
+/// freed, so the same folder launches again. Control first: before the drop the container
+/// runs and the folder is refused.
+#[test]
+fn rt_ag_08b_a_launch_result_sent_but_never_received_is_stopped() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let v =
+            x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "rw")]));
+        let req = x.request(&v, "unreceived");
+        let name = format!("sp-ws-{}", req.paths.id().as_str());
+        let mut launch = Box::pin(x.launcher.launch_workspace(req));
+        poll_once(&mut launch).await;
+        until("control: the container runs", STOP_BOUND, || exists(&name)).await;
+        tokio::time::sleep(PAST_THE_SEND).await;
+        assert!(exists(&name), "control: the container runs before the drop");
+        let refused = x.launch(&v, "unreceived-2").await;
+        assert!(
+            matches!(refused, Err(LaunchError::Overlap(_))),
+            "control: the folder is refused while the launch holds it: {:?}",
+            refused.map(|r| r.name().to_owned())
+        );
+        drop(launch);
+        until("the container nobody received is gone", STOP_BOUND, || {
+            !exists(&name)
+        })
+        .await;
+        assert_stopped_by_the_drop(&x, &name);
+        assert_stopped_after_launch(&x, "workspace");
+        let again = relaunch(&x, &v, "unreceived-3").await;
+        x.stop(again).await;
+    });
+}
+
+/// RT-AG-08b, the harness twin: a harness launch whose result was
+/// sent but never received is stopped, and a second harness of the session is admitted after.
+/// Control first: before the drop the container runs and a second harness is refused.
+#[test]
+fn rt_ag_08b_a_harness_launch_result_sent_but_never_received_is_stopped() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let v = x.f.load("");
+        let ws = x.launch(&v, "h-unreceived").await.unwrap();
+        let req = x.harness(&v, "h-unreceived");
+        let name = format!("sp-h-{}", req.paths.id().as_str());
+        let mut launch = Box::pin(x.launcher.launch_harness(req));
+        poll_once(&mut launch).await;
+        until("control: the harness runs", STOP_BOUND, || exists(&name)).await;
+        tokio::time::sleep(PAST_THE_SEND).await;
+        assert!(exists(&name), "control: the harness runs before the drop");
+        let refused = x
+            .launcher
+            .launch_harness(x.harness(&v, "h-unreceived"))
+            .await;
+        assert!(
+            matches!(refused, Err(LaunchError::Harness(_))),
+            "control: a second harness is refused while the launch holds it: {:?}",
+            refused.map(|r| r.name().to_owned())
+        );
+        drop(launch);
+        until("the harness nobody received is gone", STOP_BOUND, || {
+            !exists(&name)
+        })
+        .await;
+        assert_stopped_by_the_drop(&x, &name);
+        assert_stopped_after_launch(&x, "harness");
+        let end = std::time::Instant::now() + STOP_BOUND;
+        let second = loop {
+            match x
+                .launcher
+                .launch_harness(x.harness(&v, "h-unreceived"))
+                .await
+            {
+                Ok(h) => break h,
+                Err(LaunchError::Harness(_)) if std::time::Instant::now() < end => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(e) => panic!("the session's harness claim is still held: {e}"),
+            }
+        };
+        x.launcher.stop_role(second).await.unwrap();
+        x.stop(ws).await;
+    });
+}
+
+/// RT-AG-08b: a workspace handle its caller received and then dropped
+/// without a stop (a lost owner) stops its container, writes `sandbox.stop` and frees its
+/// claim. A guard on the launch channel alone would not do this. Control first: before the
+/// drop the container runs and the folder is refused.
+#[test]
+fn rt_ag_08b_a_received_workspace_dropped_without_a_stop_is_stopped() {
+    rt().block_on(async {
+        let x = Lx::new();
+        let v =
+            x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "rw")]));
+        let r = x.launch(&v, "dropped").await.unwrap();
+        let name = r.name().to_owned();
+        assert!(exists(&name), "control: the container runs before the drop");
+        let refused = x.launch(&v, "dropped-2").await;
+        assert!(
+            matches!(refused, Err(LaunchError::Overlap(_))),
+            "control: the folder is refused while the handle lives: {:?}",
+            refused.map(|r| r.name().to_owned())
+        );
+        let id = name.trim_start_matches("sp-ws-").to_owned();
+        assert!(x.launcher.unconfirmed_containers().is_empty(), "control");
+        drop(r);
+        // Recorded at the drop, so a shutdown meanwhile exits naming it.
+        assert_eq!(x.launcher.unconfirmed_containers(), [id]);
+        until("the dropped handle's container is gone", STOP_BOUND, || {
+            !exists(&name)
+        })
+        .await;
+        until("the stop confirmed", STOP_BOUND, || {
+            x.launcher.unconfirmed_containers().is_empty()
+        })
+        .await;
+        assert_stopped_by_the_drop(&x, &name);
+        assert_stopped_after_launch(&x, "workspace");
+        let again = relaunch(&x, &v, "dropped-3").await;
         x.stop(again).await;
     });
 }

@@ -1676,3 +1676,51 @@ async fn a_panicking_run_is_reported_and_ends_its_operation() {
     assert_eq!(c.task, "tool");
     assert_eq!(ops.in_flight(), 0);
 }
+
+/// RT-AG-15 (a panic is a `session.crash`): a panic in a file tool's blocking section continues in
+/// the calling task. Inside a run section's task (`tool`) it is reported as a crash with its
+/// payload, which ends the session, and the task gives no result: never an I/O error. No input
+/// is known to panic there, so the section is a closure that does. Control first: the same
+/// root answers a closure that returns.
+#[tokio::test]
+async fn a_panic_in_a_file_tools_blocking_section_is_a_crash_not_an_io_error() {
+    let dir = crate::egress::scratch::scratch("tools-unit", "section-panic");
+    let md = std::fs::metadata(&*dir).unwrap();
+    let src = RootSource::Host {
+        path: std::fs::canonicalize(&*dir).unwrap(),
+        dev: md.dev(),
+        ino: md.ino(),
+    };
+    let ids = UserIds {
+        uid: rustix::process::getuid().as_raw(),
+        gid: rustix::process::getgid().as_raw(),
+    };
+    let answered = on_root(&src, ids, |_| Ok(7_u8)).await;
+    assert!(matches!(answered, Ok(7)), "control: the section answers");
+    let (crash, mut crashes) = crate::daemon::crash::CrashReporter::channel();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    crash.spawn("tool", async move {
+        let r = on_root(&src, ids, |_| -> Result<u8, fs::FsError> {
+            panic!("the section panics")
+        })
+        .await;
+        let _ = tx.send(r.is_ok());
+    });
+    let c = tokio::time::timeout(Duration::from_secs(5), crashes.recv())
+        .await
+        .expect("a crash report within 5 s")
+        .expect("the reporter is alive");
+    assert_eq!(c.task, "tool");
+    assert!(c.payload.contains("the section panics"), "{}", c.payload);
+    assert!(rx.await.is_err(), "the panicked section gave a result");
+}
+
+/// A blocking section that is cancelled (a runtime shutting down), not panicked, joins as
+/// `None`: the caller keeps its own answer.
+#[tokio::test]
+async fn a_cancelled_blocking_section_joins_as_none() {
+    let pending = tokio::spawn(std::future::pending::<u8>());
+    pending.abort();
+    assert_eq!(joined(pending.await), None);
+    assert_eq!(joined(tokio::spawn(async { 5_u8 }).await), Some(5));
+}

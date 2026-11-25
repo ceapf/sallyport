@@ -254,6 +254,7 @@ impl Drop for KillOnDrop {
         if let (Some((inner, call)), Ok(rt)) =
             (self.session.take(), tokio::runtime::Handle::try_current())
         {
+            // TODO(#343): a panic in this kill is not reported as a session crash.
             drop(rt.spawn_blocking(move || inner.kill_call(call)));
         }
     }
@@ -576,12 +577,16 @@ impl PodmanExec {
     }
 }
 
-async fn blocking<T: Send + 'static>(
-    inner: &Arc<Inner>,
-    f: impl FnOnce(&Inner) -> T + Send + 'static,
+/// Runs `f` on the runner's shared state off the runtime; `None` when cancelled. A panic in it
+/// continues in the calling task (`super::joined`, RT-AG-15), which runs on the
+/// session's crash reporter: a session crash, not a silent `None`. Generic over the shared
+/// state only so a unit test can run it without a container; production passes [`Inner`].
+async fn blocking<S: Send + Sync + 'static, T: Send + 'static>(
+    inner: &Arc<S>,
+    f: impl FnOnce(&S) -> T + Send + 'static,
 ) -> Option<T> {
     let i = Arc::clone(inner);
-    tokio::task::spawn_blocking(move || f(&i)).await.ok()
+    super::joined(tokio::task::spawn_blocking(move || f(&i)).await)
 }
 
 /// [`Inner::kill_call`] off the runtime, for a call whose session is known.
@@ -612,4 +617,35 @@ fn drain(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::blocking;
+
+    /// RT-AG-15 (a panic is a `session.crash`): a panic in the shell runner's blocking section
+    /// continues in the calling task. Inside a run section's task (`tool`) it is reported as a
+    /// crash with its payload and the task gives no result; it is never a silent `None`.
+    /// Control first: a section that returns answers.
+    #[tokio::test]
+    async fn a_panic_in_the_shell_runners_blocking_section_is_a_crash() {
+        let shared = Arc::new(3_u8);
+        assert_eq!(blocking(&shared, |n| *n + 1).await, Some(4), "control");
+        let (crash, mut crashes) = crate::daemon::crash::CrashReporter::channel();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        crash.spawn("tool", async move {
+            let r = blocking(&shared, |_| -> u8 { panic!("the runner panics") }).await;
+            let _ = tx.send(r);
+        });
+        let c = tokio::time::timeout(Duration::from_secs(5), crashes.recv())
+            .await
+            .expect("a crash report within 5 s")
+            .expect("the reporter is alive");
+        assert_eq!(c.task, "tool");
+        assert!(c.payload.contains("the runner panics"), "{}", c.payload);
+        assert!(rx.await.is_err(), "the panicked section gave a result");
+    }
 }

@@ -34,14 +34,13 @@ use sally_core::manifest::{AuditLevel, ValidatedManifest};
 use serde_json::Value;
 
 use super::error::{cpu_only, running_as};
-use super::parts::{CleanupTries, HostPin, Made, Subject, containers_gone};
+use super::parts::{CleanupTries, HostPin, Made, OnDrop, Owner, Subject, containers_gone, on_drop};
 use super::{
     HarnessRequest, InferenceRequest, LaunchError, Launcher, Progress, Running, START_GRACE,
-    WorkspaceRequest, blocking,
+    Stopper, WorkspaceRequest, blocking,
 };
 use crate::egress::net::EgressHandle;
 use crate::sandbox::commands::container_id;
-use crate::sandbox::disk::DiskFloor;
 use crate::sandbox::images::PresentImage;
 use crate::sandbox::inside::{Expect, check_in_container};
 use crate::sandbox::mount_probe::{
@@ -106,9 +105,12 @@ pub(super) struct Started {
 }
 
 /// A started harness or inference container. Only [`Launcher::launch_harness`] and
-/// [`Launcher::launch_inference`] make one, and only [`Launcher::stop_role`] ends it.
+/// [`Launcher::launch_inference`] make one. [`Launcher::stop_role`] ends it; a handle dropped
+/// without a confirmed stop hands its container to the launcher, which stops it in the
+/// background until it is confirmed gone, holding its claim meanwhile (RT-AG-08b).
 #[derive(Debug)]
-#[must_use = "dropping it leaves the container running; call Launcher::stop_role"]
+#[must_use = "dropping it stops the container in the background; call Launcher::stop_role to \
+              know when it is gone"]
 pub struct RoleRunning {
     pub(super) container: String,
     pub(super) name: String,
@@ -124,6 +126,58 @@ pub struct RoleRunning {
     /// A stop confirmed the container gone and freed the claim: a retry touches neither (a new
     /// harness of the session may hold both by then).
     pub(super) removed: bool,
+    /// Who stops it ([`Owner`]): what a drop does.
+    pub(super) owner: Owner,
+    /// The launcher that stops it when it is dropped.
+    pub(super) launcher: Stopper,
+}
+
+impl Drop for RoleRunning {
+    /// RT-AG-08b: a caller's handle dropped without a
+    /// confirmed stop (a launch result nobody received, a lost owner) is handed whole to a
+    /// launcher task that stops it until confirmed gone; a launcher's stop that is itself
+    /// dropped is reported, never spawned again.
+    fn drop(&mut self) {
+        let runtime = tokio::runtime::Handle::try_current().is_ok();
+        let (role, id) = (self.role, self.subject.id().as_str().to_owned());
+        // A container an earlier stop removed is not recorded as unconfirmed: its stop only
+        // has the entry or the directories left.
+        let may_exist = !self.removed;
+        let launcher = Arc::clone(&self.launcher.0);
+        match on_drop(self.owner, runtime) {
+            OnDrop::Nothing => {}
+            OnDrop::Stop => {
+                let handle = self.hand_over();
+                launcher.dropped(role, &id, &handle.name, may_exist);
+                let stopper = Arc::clone(&launcher);
+                launcher.crash.spawn("sandbox.stop", async move {
+                    stopper.stop_role_unreceived(handle).await;
+                });
+            }
+            OnDrop::Report => launcher.left_running(role, &id, &self.name, may_exist),
+        }
+    }
+}
+
+impl RoleRunning {
+    /// Everything of this handle, moved into a new one the launcher owns; this one is ended
+    /// (documentation only: it is being dropped).
+    fn hand_over(&mut self) -> Self {
+        self.owner = Owner::Ended;
+        Self {
+            container: std::mem::take(&mut self.container),
+            name: std::mem::take(&mut self.name),
+            role: self.role,
+            subject: self.subject.clone(),
+            level: self.level,
+            dirs: std::mem::take(&mut self.dirs),
+            init_pid: self.init_pid,
+            stop_audited: self.stop_audited,
+            removed: self.removed,
+            owner: Owner::Launcher,
+            launcher: Stopper(Arc::clone(&self.launcher.0)),
+        }
+    }
 }
 
 impl RoleRunning {
@@ -264,7 +318,9 @@ impl Launcher {
                 this.stop_role_unreceived(orphan).await;
             }
         });
-        // TODO(#113): what a panicked launch task leaves behind.
+        // A result sent but never received is stopped by its handle's drop (RT-AG-08b).
+        // TODO(#113): a panic in the launch task before its handle exists (between `podman
+        // create` and the handle) leaves its container, claim and live id to the next start.
         super::error::received(rx, id).await
     }
 
@@ -314,9 +370,10 @@ impl Launcher {
     /// when the caller stopped a handle first). When the cleanup removed everything the claim
     /// is freed before the entry and the forms released after it. Otherwise the rest of the
     /// cleanup goes on in its own task on the daemon's crash reporter, backed off and capped
-    /// (`finish_failed`): the session stays live, its claim held, while a container may exist
-    /// (ARCHITECTURE §3.5, RT-AG-08b). Its id is among [`Launcher::unfinished_cleanups`] from
-    /// before the first try until its probe and container are confirmed gone.
+    /// (`finish_failed`): its claim stays held while a container may exist (a workspace's
+    /// session stays live; a harness keeps its session's harness claim; ARCHITECTURE §3.5,
+    /// RT-AG-08b). Its id is among [`Launcher::unconfirmed_containers`] from before the first
+    /// try until its probe and container are confirmed gone.
     async fn failed(
         self: &Arc<Self>,
         req: &Request,
@@ -402,7 +459,7 @@ impl Launcher {
     }
 
     async fn prepare_and_start(
-        &self,
+        self: &Arc<Self>,
         req: &Request,
         image: &ImageRef,
         progress: &mut Progress,
@@ -431,9 +488,7 @@ impl Launcher {
             prepared.name.clone(),
         );
         match self.start_prepared(prepared, progress).await {
-            Ok(started) => {
-                finish(extra, started, name, subject, level, role, self.disk_floor).await
-            }
+            Ok(started) => finish(extra, started, name, subject, level, role, self).await,
             Err(e) => {
                 extra.shut_down().await;
                 Err(e)
@@ -662,8 +717,9 @@ impl Extra {
     }
 }
 
-/// The handle of a started container. An `Err` here comes back through the one cleanup path.
-/// A workspace's `Running` carries the launcher's free-space floor (`floor`) for the file tools.
+/// The handle of a started container, held by the caller: from here on a drop stops it
+/// (RT-AG-08b). An `Err` here comes back through the one cleanup path. A workspace's `Running`
+/// carries the launcher's free-space floor for the file tools.
 async fn finish(
     extra: Extra,
     started: Started,
@@ -671,8 +727,9 @@ async fn finish(
     subject: Subject,
     level: AuditLevel,
     role: Role,
-    floor: DiskFloor,
+    launcher: &Arc<Launcher>,
 ) -> Result<Launched, LaunchError> {
+    let floor = launcher.disk_floor;
     let Started {
         container,
         init_pid,
@@ -699,6 +756,9 @@ async fn finish(
                 init_pid,
                 init_dir: Arc::new(init_dir),
                 disk_floor: floor,
+                stop_audited: false,
+                owner: Owner::Caller,
+                launcher: Stopper(Arc::clone(launcher)),
             },
             Watch { plan, observed },
         )))),
@@ -718,6 +778,8 @@ async fn finish(
             init_pid,
             stop_audited: false,
             removed: false,
+            owner: Owner::Caller,
+            launcher: Stopper(Arc::clone(launcher)),
         })),
     }
 }

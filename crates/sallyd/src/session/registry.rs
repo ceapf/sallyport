@@ -36,7 +36,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::accepted;
 use super::exit::Exit;
-use super::supervise::{Request, Supervised};
+use super::supervise::{Request, Rounds, Supervised};
 use super::types::{StopReason, fresh_id};
 use crate::approvals::Gated;
 use crate::approvals::policy::Policy;
@@ -513,19 +513,28 @@ impl Registry {
     }
 
     /// Stops a workspace whose session never started (no `session.start`, so no
-    /// `session.stop`). One that cannot be confirmed gone stays listed as stop-failed, under a
-    /// supervisor that retries it on request (and at shutdown).
+    /// `session.stop`). One that cannot be confirmed gone writes `sandbox.stop_failed` (none when
+    /// the probe finds the container gone) and stays listed as stop-failed, under a supervisor
+    /// that retries it by itself, backed off and capped, and at once on a request (RT-AUD-03).
     async fn discard(self: &Arc<Self>, running: Running, manifest: &str) {
         let sid = running.paths().id().as_str().to_owned();
-        let r = match self.stop_bounded(running).await {
+        // No attempt of this stop has failed yet: its count starts here.
+        let e = match self.stop_bounded(running, 0).await {
             Ok(done) => {
                 // It is gone: `session.closed`, then its forms leave the redactors (#94,
                 // architect Q219, Q245, Q252).
                 self.p.launcher.close(done, StopReason::StartFailed).await;
                 return;
             }
-            Err(r) => r,
+            Err(e) => e,
         };
+        // Before the stop-failed state is listed; none when the container is gone.
+        let reported = self
+            .p
+            .launcher
+            .report_workspace_stop_failed(&e.running, super::supervise::STOP_ATTEMPTS, &e.error)
+            .await;
+        let r = e.running;
         self.p.oplog.error(
             LOG,
             "workspace of a failed start not confirmed gone",
@@ -551,14 +560,21 @@ impl Registry {
         );
         let this = Arc::clone(self);
         self.p.crash.spawn("session", async move {
-            // Its bounded round has just failed: the next one waits for a request (R6).
-            let mut rx = rx;
-            let replies: Vec<Reply> = match rx.recv().await {
-                Some((_, reply)) => reply.into_iter().collect(),
-                None => Vec::new(),
-            };
-            this.retry_stop(sid, *r, replies, rx, StopReason::StartFailed, None)
-                .await;
+            // Its first round has just failed (and written its entry unless the container is
+            // gone): the next one comes at a request or after the first pause.
+            this.retry_stop(
+                sid,
+                r,
+                Vec::new(),
+                rx,
+                StopReason::StartFailed,
+                None,
+                Rounds {
+                    failed: 1,
+                    reported,
+                },
+            )
+            .await;
         });
     }
 

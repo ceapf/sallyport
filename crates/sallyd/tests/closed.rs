@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sally_core::audit::{Actor, NewEntry};
-use sallyd::sandbox::AuditSink;
-use sallyd::session::{Registry, StopOutcome, StopReason};
+use sallyd::sandbox::{AuditSink, CLEANUP_TRIES, CleanupSchedule, LaunchError};
+use sallyd::session::{Registry, SessionInfo, SessionState, StopOutcome, StopReason};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -19,6 +19,7 @@ mod common;
 use common::container::*;
 use common::egress::{canary, public};
 use common::intercept::connect;
+use common::{mount, mounts};
 
 /// A proxy-mode session allowed `mock2.test`, which is spliced (no grant): its tunnel stays open
 /// until the session stops.
@@ -34,6 +35,15 @@ const BOUND: Duration = Duration::from_secs(60);
 
 fn registry(x: &Lx) -> Arc<Registry> {
     x.registry(x.events.clone() as Arc<dyn AuditSink>, Some(test_image()))
+}
+
+/// [`registry`] writing to the fixture's readable oplog ([`Lx::oplog_text`]).
+fn logged_registry(x: &Lx) -> Arc<Registry> {
+    x.registry_logged(
+        x.events.clone() as Arc<dyn AuditSink>,
+        Some(test_image()),
+        x.oplog.clone(),
+    )
 }
 
 /// The positions of `event` in `all`.
@@ -255,15 +265,25 @@ fn a_refused_session_closed_still_answers_stopped_and_releases_the_forms() {
 }
 
 /// A podman that fails every `rm` while `<at>/fail-rm` exists, so a container cannot be
-/// confirmed gone; otherwise the real one.
+/// confirmed gone, and only a workspace's (`sp-ws-…`, the last argument) while
+/// `<at>/fail-rm-ws` exists, so a launch's own probe container is still removed; every
+/// `unshare rm` while `<at>/fail-unshare` exists, so a stop fails at the scratch removal after
+/// the container is gone; and every `container` command (the probe `container exists` among
+/// them) while `<at>/probe-unknown` exists, so the probe answers neither present nor absent.
+/// Otherwise the real one.
 fn rm_failing_podman(at: &Path, real: &Path) -> PathBuf {
     wrap_podman(at, real, |at, real| {
         format!(
-            "#!/bin/sh\nv=; skip=\nfor a; do\n\
+            "#!/bin/sh\nv=; skip=; l=; r=\nfor a; do\n\
+             l=$a; [ \"$a\" = rm ] && r=1\n\
              if [ -n \"$skip\" ]; then skip=; continue; fi\n\
              case \"$a\" in --*) [ -z \"$v\" ] && skip=1 ;; *) [ -z \"$v\" ] && v=$a ;; esac\n\
              done\n\
              if [ \"$v\" = rm ] && [ -e '{at}/fail-rm' ]; then exit 125; fi\n\
+             if [ \"$v\" = rm ] && [ -e '{at}/fail-rm-ws' ]; then\n\
+             case \"$l\" in sp-ws-*) exit 125 ;; esac; fi\n\
+             if [ \"$v\" = unshare ] && [ -n \"$r\" ] && [ -e '{at}/fail-unshare' ]; then exit 125; fi\n\
+             if [ \"$v\" = container ] && [ -e '{at}/probe-unknown' ]; then exit 125; fi\n\
              exec '{real}' \"$@\"\n"
         )
     })
@@ -300,4 +320,373 @@ fn an_unconfirmed_container_gets_session_closed_only_once_it_is_gone() {
         assert!(!exists(&s.container));
         assert_closed_last(&x, &s.id, "request");
     });
+}
+
+/// Short pauses between a failed stop's rounds (and a failed launch's cleanup tries), passed in
+/// as `sallyd` passes its own schedule.
+const SHORT: CleanupSchedule = CleanupSchedule::with_pauses([Duration::from_millis(100); 9]);
+
+/// How long the session runs before its timeout begins the stop (the least the manifest allows),
+/// and then at most how long until that stop's first round has failed.
+const TIMEOUT_AND_ROUND: Duration = Duration::from_secs(150);
+
+/// One failed stop attempt takes about eight seconds here: the container removal's own tries
+/// pause three times two seconds, and the attempt makes about eight podman calls besides. So at
+/// most how long, after the first round, until a stop's seventh round of three attempts has
+/// failed: about 170 seconds unloaded; the rest is room for podman under a loaded test run (a
+/// met condition ends the wait at once).
+const SEVEN_ROUNDS: Duration = Duration::from_secs(480);
+
+/// At most how long until the twentieth failed attempt of a stop of one attempt a round at
+/// [`SHORT`] pauses: about 170 seconds unloaded, with room as for [`SEVEN_ROUNDS`].
+const ATTEMPT_20: Duration = Duration::from_secs(480);
+
+/// The entries named `event`.
+fn count(x: &Lx, event: &str) -> usize {
+    x.events.list().iter().filter(|e| *e == event).count()
+}
+
+/// The oplog lines whose message is `msg` and whose field `key` is `value`.
+fn oplog_lines(x: &Lx, msg: &str, key: &str, value: &str) -> Vec<String> {
+    let (msg, field) = (format!("\"{msg}\""), format!(" {key}=\"{value}\""));
+    x.oplog_text()
+        .lines()
+        .filter(|l| l.contains(&msg) && l.contains(&field))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The `attempt` counts of `lines`, in order.
+fn attempts_of(lines: &[String]) -> Vec<u32> {
+    lines
+        .iter()
+        .filter_map(|l| {
+            l.split(" attempt=\"")
+                .nth(1)?
+                .split('"')
+                .next()?
+                .parse()
+                .ok()
+        })
+        .collect()
+}
+
+/// The `attempt` counts of session `id`'s logged failed stop attempts, in order.
+fn logged_attempts(x: &Lx, id: &str) -> Vec<u32> {
+    attempts_of(&oplog_lines(x, "workspace stop failed", "session", id))
+}
+
+/// The failed attempts a stop that never succeeds logs by its twentieth.
+const LOGGED_BY_20: [u32; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20];
+
+/// RT-AUD-03: a stop begun by the session's timeout, with no
+/// requester, whose container cannot be confirmed gone writes one `sandbox.stop_failed`
+/// (denied, naming the role, the container and the attempts) and exactly one `sandbox.stop`,
+/// however many rounds it takes; the session's folder stays refused; and the supervisor
+/// retries by itself, so once the container can be removed `session.closed` follows, last,
+/// with no stop request. Its failed attempts are counted over all its rounds and logged up to
+/// the tenth, then only at each doubling (the twentieth here), and a round's own line only with
+/// a logged attempt. Control: the folder launches once the stop is confirmed.
+#[test]
+fn rt_aud_03_a_stop_that_cannot_be_confirmed_is_audited_and_retried_until_it_is() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("closed-stop-failed-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _cleanup = RemoveOnDrop(dir.clone());
+    rt().block_on(async {
+        let x = Lx::with_podman_and_cleanup(|real| rm_failing_podman(&dir, real), SHORT);
+        let reg = logged_registry(&x);
+        let folder = mounts(&[mount("~/code/myproject", "/workspace/p", "rw")]);
+        let timed = format!("{folder}runtime:\n  timeout: 1m\n");
+        let s = reg.start(Arc::new(x.f.validated(&timed))).await.unwrap();
+        std::fs::write(dir.join("fail-rm"), b"").unwrap();
+        until(&x, "sandbox.stop_failed", TIMEOUT_AND_ROUND, || {
+            count(&x, "sandbox.stop_failed") > 0
+        })
+        .await;
+        let failed = x.events.args("sandbox.stop_failed").unwrap();
+        assert_eq!(failed["role"], "workspace", "{failed}");
+        assert_eq!(failed["container"], format!("sp-ws-{}", s.id), "{failed}");
+        assert_eq!(failed["attempts"], 3, "{failed}");
+        let shape = x
+            .events
+            .debug()
+            .into_iter()
+            .find(|d| d.contains("\"sandbox.stop_failed\""))
+            .unwrap();
+        assert!(shape.contains("decision: Some(\"deny\")"), "{shape}");
+        // Rounds of three attempts: 1-3, 4-6, 7-9 and 10-12 each hold a logged attempt, so each
+        // writes its round line; 13-15 and 16-18 hold none and write none; 19-21 holds the
+        // twentieth. So the fifth round line follows the twenty-first attempt, with attempts
+        // 1-10 and 20 logged (a line for every round would come after the fifteenth, with only
+        // 1-10 logged).
+        let rounds = || oplog_lines(&x, "session container not confirmed gone", "session", &s.id);
+        settle(&x, SEVEN_ROUNDS, || rounds().len() >= 5).await;
+        assert_eq!(rounds().len(), 5, "{:?}", rounds());
+        assert_eq!(logged_attempts(&x, &s.id), LOGGED_BY_20);
+        assert_eq!(count(&x, "sandbox.stop_failed"), 1, "{:?}", x.events.list());
+        assert_eq!(count(&x, "sandbox.stop"), 1, "{:?}", x.events.list());
+        assert_eq!(count(&x, "session.closed"), 0, "{:?}", x.events.list());
+        assert!(exists(&s.container), "the container is still there");
+        let v = x.f.load(&folder);
+        let refused = x.launch(&v, "while-unconfirmed").await;
+        assert!(
+            matches!(refused, Err(LaunchError::Overlap(_))),
+            "the folder is refused while the stop is unconfirmed: {:?}",
+            refused.map(|r| r.name().to_owned())
+        );
+        std::fs::remove_file(dir.join("fail-rm")).unwrap();
+        until(&x, "session.closed with no stop request", BOUND, || {
+            count(&x, "session.closed") > 0
+        })
+        .await;
+        assert!(!exists(&s.container));
+        assert_closed_last(&x, &s.id, "timeout");
+        let r = x
+            .launch(&v, "after-confirmed")
+            .await
+            .expect("control: the folder launches once the stop is confirmed");
+        x.stop(r).await;
+    });
+}
+
+/// A workspace handle dropped without a stop whose container cannot be confirmed gone: the
+/// launcher's own stop retries one attempt a round with no cap, writes one `sandbox.stop_failed`,
+/// and logs its failed attempts up to the tenth, then only at each doubling (the twentieth
+/// here). Once podman can remove the container, the stop is confirmed and it is gone.
+#[test]
+fn a_dropped_handles_failed_stop_attempts_are_logged_to_the_tenth_then_at_each_doubling() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("closed-dropped-log-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _cleanup = RemoveOnDrop(dir.clone());
+    rt().block_on(async {
+        let x = Lx::with_podman_and_cleanup(|real| rm_failing_podman(&dir, real), SHORT);
+        let v =
+            x.f.load(&mounts(&[mount("~/code/myproject", "/workspace/p", "rw")]));
+        let r = x.launch(&v, "dropped-unconfirmed").await.unwrap();
+        let name = r.name().to_owned();
+        std::fs::write(dir.join("fail-rm"), b"").unwrap();
+        drop(r);
+        let logged = || {
+            attempts_of(&oplog_lines(
+                &x,
+                "container stop failed",
+                "container",
+                &name,
+            ))
+        };
+        settle(&x, ATTEMPT_20, || logged().contains(&20)).await;
+        assert_eq!(logged(), LOGGED_BY_20);
+        assert!(exists(&name), "the container is still there");
+        assert_eq!(count(&x, "sandbox.stop_failed"), 1, "{:?}", x.events.list());
+        std::fs::remove_file(dir.join("fail-rm")).unwrap();
+        until(&x, "the dropped handle's stop confirmed", BOUND, || {
+            x.launcher.unconfirmed_containers().is_empty()
+        })
+        .await;
+        assert!(!exists(&name), "the container is gone");
+    });
+}
+
+/// RT-AUD-03: a stop round that fails writes `sandbox.stop_failed` only when the container may
+/// still be there. The probe answers present (control: the entry, naming the container), absent
+/// (the stop failed at the scratch removal after the container went: no entry), or neither (the
+/// entry). Each session's stop then succeeds at a request once podman works again.
+#[test]
+fn rt_aud_03_a_failed_stop_is_audited_only_while_the_container_may_be_there() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("closed-stop-probe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _cleanup = RemoveOnDrop(dir.clone());
+    rt().block_on(async {
+        let x = Lx::with_podman_and_cleanup(|real| rm_failing_podman(&dir, real), LONG);
+        let reg = registry(&x);
+
+        let present = failed_stop(&x, &reg, &dir, &["fail-rm"]).await;
+        assert!(exists(&present.container), "the container is still there");
+        assert_eq!(
+            count(&x, "sandbox.stop_failed"),
+            1,
+            "control: a stop failed with the container there is audited: {:?}",
+            x.events.list()
+        );
+        let entry = x.events.args("sandbox.stop_failed").unwrap();
+        assert_eq!(entry["container"], present.container, "{entry}");
+        let again = stop_with(&reg, &dir, &present.id, &["fail-rm"]).await;
+        assert!(matches!(again, Some(StopOutcome::Failed(_))), "{again:?}");
+        assert_eq!(
+            count(&x, "sandbox.stop_failed"),
+            1,
+            "a later failed round of the same stop writes no second entry: {:?}",
+            x.events.list()
+        );
+
+        let gone = failed_stop(&x, &reg, &dir, &["fail-unshare"]).await;
+        assert!(
+            !exists(&gone.container),
+            "the container went before the failure"
+        );
+        assert_eq!(
+            count(&x, "sandbox.stop_failed"),
+            1,
+            "a stop failed after the container went writes no entry: {:?}",
+            x.events.list()
+        );
+
+        let unknown = failed_stop(&x, &reg, &dir, &["fail-rm", "probe-unknown"]).await;
+        assert!(exists(&unknown.container), "the container is still there");
+        assert_eq!(
+            count(&x, "sandbox.stop_failed"),
+            2,
+            "a stop whose probe answers neither way is audited: {:?}",
+            x.events.list()
+        );
+        let entry = x.events.args("sandbox.stop_failed").unwrap();
+        assert_eq!(entry["container"], unknown.container, "{entry}");
+        assert!(
+            entry["detail"]
+                .as_str()
+                .unwrap()
+                .contains("container exists"),
+            "container commands failed during the stop: {entry}"
+        );
+
+        for s in [&present, &gone, &unknown] {
+            let outcome = reg.stop(&s.id, StopReason::Request).await;
+            assert!(
+                matches!(outcome, Some(StopOutcome::Stopped)),
+                "{} stops once podman works: {outcome:?}",
+                s.id
+            );
+            assert!(!exists(&s.container));
+        }
+    });
+}
+
+/// RT-AUD-03, failed start: a workspace whose session never started and whose stop then fails
+/// writes `sandbox.stop_failed` while the container is there (once: a later failed round writes
+/// none), and none when the container went before the failure. Each is listed stop-failed and
+/// stops at a request once podman works.
+#[test]
+fn a_failed_starts_failed_stop_is_audited_once_while_the_container_is_there() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("closed-discard-probe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _cleanup = RemoveOnDrop(dir.clone());
+    rt().block_on(async {
+        let x = Lx::with_podman_and_cleanup(|real| rm_failing_podman(&dir, real), LONG);
+        let reg = logged_registry(&x);
+        x.events.fail(&["session.start", "session.stop"]);
+        // (flags, entries so far, whether the container is still there after the failure): the
+        // first leg writes the one entry, the second none.
+        for (flags, entries, there) in [
+            (&["fail-rm-ws"][..], 1, true),
+            (&["fail-unshare"][..], 1, false),
+        ] {
+            {
+                let _flags = Flags::set(&dir, flags);
+                reg.start(Arc::new(x.f.validated(""))).await.unwrap_err();
+            }
+            let listed = reg.list();
+            assert_eq!(listed.len(), 1, "{flags:?}: {listed:?}");
+            let s = &listed[0];
+            assert_eq!(s.state, SessionState::StopFailed, "{flags:?}");
+            assert_eq!(exists(&s.container), there, "{flags:?}");
+            assert_eq!(
+                count(&x, "sandbox.stop_failed"),
+                entries,
+                "{flags:?}: {:?}",
+                x.events.list()
+            );
+            let again = stop_with(&reg, &dir, &s.id, flags).await;
+            assert!(matches!(again, Some(StopOutcome::Failed(_))), "{again:?}");
+            assert_eq!(
+                count(&x, "sandbox.stop_failed"),
+                entries,
+                "{flags:?}: a later failed round writes none: {:?}",
+                x.events.list()
+            );
+            // The discard's round made attempts 1-3; the supervisor's count goes on from there.
+            assert_eq!(logged_attempts(&x, &s.id), [1, 2, 3, 4, 5, 6], "{flags:?}");
+            let outcome = reg.stop(&s.id, StopReason::Request).await;
+            assert!(matches!(outcome, Some(StopOutcome::Stopped)), "{outcome:?}");
+            assert!(!exists(&s.container));
+        }
+    });
+}
+
+/// Pauses between a failed stop's rounds long enough that only requests drive them.
+const LONG: CleanupSchedule =
+    CleanupSchedule::with_pauses([Duration::from_secs(600); CLEANUP_TRIES - 1]);
+
+/// Flag files of [`rm_failing_podman`] in a folder, present while this lives.
+struct Flags<'a>(&'a Path, &'a [&'a str]);
+
+impl<'a> Flags<'a> {
+    fn set(dir: &'a Path, flags: &'a [&'a str]) -> Self {
+        let set = Self(dir, flags);
+        for f in flags {
+            std::fs::write(dir.join(f), b"").unwrap();
+        }
+        set
+    }
+}
+
+impl Drop for Flags<'_> {
+    fn drop(&mut self) {
+        for f in self.1 {
+            let _ = std::fs::remove_file(self.0.join(f));
+        }
+    }
+}
+
+/// A stop of session `id` at a request, with `flags` set in `dir` while it runs.
+async fn stop_with(
+    reg: &Arc<Registry>,
+    dir: &Path,
+    id: &str,
+    flags: &[&str],
+) -> Option<StopOutcome> {
+    let _flags = Flags::set(dir, flags);
+    reg.stop(id, StopReason::Request).await
+}
+
+/// Starts a session, then stops it at a request with `flags` set (see [`rm_failing_podman`]);
+/// the stop must fail.
+async fn failed_stop(x: &Lx, reg: &Arc<Registry>, dir: &Path, flags: &[&str]) -> SessionInfo {
+    let s = reg.start(Arc::new(x.f.validated(""))).await.unwrap();
+    let outcome = stop_with(reg, dir, &s.id, flags).await;
+    assert!(
+        matches!(outcome, Some(StopOutcome::Failed(_))),
+        "{flags:?}: {outcome:?}"
+    );
+    s
+}
+
+/// Polls `done` every 100 ms for at most `bound`, without failing: the caller's assertion then
+/// shows what there is.
+async fn settle(x: &Lx, bound: Duration, mut done: impl FnMut() -> bool) {
+    let end = std::time::Instant::now() + bound;
+    while !done() && std::time::Instant::now() < end {
+        x.assert_no_crash();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Polls `done` every 100 ms until it holds; fails the test naming `what` after `bound`.
+async fn until(x: &Lx, what: &str, bound: Duration, mut done: impl FnMut() -> bool) {
+    let end = std::time::Instant::now() + bound;
+    while !done() {
+        x.assert_no_crash();
+        assert!(
+            std::time::Instant::now() < end,
+            "{what}: not within {bound:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
