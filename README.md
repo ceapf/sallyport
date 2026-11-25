@@ -24,8 +24,8 @@ audited.
 M1 is the security core with no model in it. On a Linux or WSL2 host with rootless Podman you
 can:
 
-- build it and run its tests, including the red-team suite, which runs attacks against real
-  containers (`make lint test`, `make redteam`);
+- build it and run its tests, including the red-team suite (`make lint test`, `make redteam`);
+  many of its tests attack real containers;
 - check a host with `sally doctor`;
 - validate a manifest and read what it grants in plain English (`sally manifest validate`,
   `sally manifest summary`), using the examples in `manifests/examples/`.
@@ -40,8 +40,9 @@ There is no model, no agent harness, no installer and no UI.
 
 ## How it has been checked
 
-- Every M1 row of the red-team suite has a test that runs in CI. Most of those tests have a
-  control that shows they can fail; the suite marks the ones that do not yet.
+- The red-team suite document lists every attack row with its test and its control, and marks
+  the rows, tests and controls that are not built yet. The M1 rows' tests run in CI, except one
+  that needs WSL.
 - A mutation gate runs every night.
 - A security review of the trusted core ran during M1. It found three high-severity
   weaknesses; all three were fixed and checked again. The findings still open, none of them
